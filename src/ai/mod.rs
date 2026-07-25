@@ -345,6 +345,8 @@ pub struct AiSettings {
     pub model: String,
     pub base_url: String,
     pub max_tokens: u32,
+    /// Optional sampling temperature; `None` keeps the provider default.
+    pub temperature: Option<f32>,
     pub redact_secrets: bool,
 }
 
@@ -357,6 +359,7 @@ pub struct AiClient {
     pub model: String,
     pub base_url: String,
     pub max_tokens: u32,
+    pub temperature: Option<f32>,
     pub redact_secrets: bool,
 }
 
@@ -367,11 +370,19 @@ impl AiClient {
         model: impl Into<String>,
         base_url: impl Into<String>,
         max_tokens: u32,
+        temperature: Option<f32>,
         redact_secrets: bool,
     ) -> Result<Self, AiError> {
         let model = model.into();
         let base_url = base_url.into();
         validate_client_values(&model, &base_url, max_tokens)?;
+        if let Some(temperature) = temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err(AiError::InvalidConfiguration(
+                    "temperature must be a finite value in 0.0..=2.0".into(),
+                ));
+            }
+        }
         if provider == Provider::Anthropic
             && api_key.as_deref().is_none_or(|key| key.trim().is_empty())
         {
@@ -383,6 +394,7 @@ impl AiClient {
             model,
             base_url: base_url.trim_end_matches('/').to_string(),
             max_tokens,
+            temperature,
             redact_secrets,
         })
     }
@@ -408,6 +420,7 @@ impl AiClient {
             settings.model.clone(),
             settings.base_url.clone(),
             settings.max_tokens,
+            settings.temperature,
             settings.redact_secrets,
         )
     }
@@ -428,6 +441,8 @@ impl AiClient {
         let max_tokens = nonempty_env(&app_env_name("AI_MAX_TOKENS"))
             .and_then(|value| value.parse().ok())
             .unwrap_or(1024);
+        let temperature = nonempty_env(&app_env_name("AI_TEMPERATURE"))
+            .and_then(|value| value.parse::<f32>().ok());
         let api_key = match provider.provider_api_key() {
             Some(key) => Some(key),
             None => nonempty_env(&app_env_name("AI_API_KEY_FILE"))
@@ -435,7 +450,15 @@ impl AiClient {
                 .map(read_api_key_file)
                 .transpose()?,
         };
-        Self::new(provider, api_key, model, base_url, max_tokens, true)
+        Self::new(
+            provider,
+            api_key,
+            model,
+            base_url,
+            max_tokens,
+            temperature,
+            true,
+        )
     }
 
     pub fn display_name(&self) -> String {
@@ -571,27 +594,38 @@ impl AiClient {
                 if let Some(system) = system {
                     body["system"] = Value::String(system.to_string());
                 }
+                if let Some(temperature) = self.temperature {
+                    body["temperature"] = json!(temperature);
+                }
                 body
             }
             Provider::OpenAiCompatible => {
                 if let Some(system) = system {
                     messages.insert(0, json!({"role": "system", "content": system}));
                 }
-                json!({
+                let mut body = json!({
                     "model": self.model,
                     "max_tokens": self.max_tokens,
                     "messages": messages,
-                })
+                });
+                if let Some(temperature) = self.temperature {
+                    body["temperature"] = json!(temperature);
+                }
+                body
             }
             Provider::Ollama => {
                 if let Some(system) = system {
                     messages.insert(0, json!({"role": "system", "content": system}));
                 }
+                let mut options = json!({"num_predict": self.max_tokens});
+                if let Some(temperature) = self.temperature {
+                    options["temperature"] = json!(temperature);
+                }
                 json!({
                     "model": self.model,
                     "messages": messages,
                     "stream": false,
-                    "options": {"num_predict": self.max_tokens},
+                    "options": options,
                 })
             }
         }
@@ -1330,6 +1364,7 @@ pub fn send_blocking(
         model,
         base_url,
         max_tokens,
+        None,
         false,
     )?;
     client.send_turns_blocking(system, history)
@@ -1645,6 +1680,7 @@ mod tests {
             model: "test-model".into(),
             base_url: provider.default_base_url().into(),
             max_tokens: 512,
+            temperature: None,
             redact_secrets: false,
         }
     }
@@ -2012,6 +2048,7 @@ mod tests {
             "model",
             "file:///tmp/socket",
             512,
+            None,
             true
         )
         .is_err());
@@ -2021,9 +2058,54 @@ mod tests {
             "model",
             "http://localhost:11434",
             2,
+            None,
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn temperature_is_validated_and_forwarded_to_every_provider_body() {
+        assert!(AiClient::new(
+            Provider::Ollama,
+            None,
+            "model",
+            "http://localhost:11434",
+            512,
+            Some(f32::NAN),
+            true
+        )
+        .is_err());
+        assert!(AiClient::new(
+            Provider::Ollama,
+            None,
+            "model",
+            "http://localhost:11434",
+            512,
+            Some(2.5),
+            true
+        )
+        .is_err());
+
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let mut c = client(provider);
+            c.temperature = Some(0.2);
+            let body = c.request_body(None, &[]);
+            let forwarded = match provider {
+                Provider::Ollama => body.pointer("/options/temperature").cloned(),
+                _ => body.get("temperature").cloned(),
+            };
+            assert_eq!(forwarded, Some(serde_json::json!(0.2_f32)), "{provider:?}");
+            // None keeps the provider default: no key at all.
+            let c = client(provider);
+            let body = c.request_body(None, &[]);
+            assert!(body.get("temperature").is_none());
+            assert!(body.pointer("/options/temperature").is_none());
+        }
     }
 
     #[cfg(unix)]
