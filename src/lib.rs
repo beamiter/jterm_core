@@ -5,10 +5,12 @@
 //! is injected once at startup via [`identity::init`] instead of hardcoding a
 //! binary name in shared code.
 
+pub mod command_history;
 pub mod exit_status;
 pub mod git_meta;
 pub mod host;
 pub mod identity;
+pub mod notebook_text;
 pub mod notify;
 pub mod parser;
 pub mod review_input;
