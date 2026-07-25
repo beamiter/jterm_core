@@ -10,6 +10,7 @@ pub mod ai;
 pub mod atomic_file;
 pub mod char_width;
 pub mod command_history;
+pub mod execution_journal;
 pub mod exit_status;
 pub mod git_meta;
 pub mod host;
