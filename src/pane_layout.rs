@@ -48,7 +48,8 @@ pub enum PaneTree {
 
 /// Identifies one divider: the child-index `path` from the root to the owning
 /// `Split` node, plus which `gap` (between children `gap` and `gap + 1`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Hash lets UI layers key per-divider widget state off the id directly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DividerId {
     pub path: Vec<usize>,
     pub gap: usize,
