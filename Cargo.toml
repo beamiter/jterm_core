@@ -1,0 +1,10 @@
+[package]
+name = "jterm_core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared UI-independent core for the jterm family of terminal emulators"
+license = "MIT"
+
+[dependencies]
+log = "0.4"
+memchr = "2.8.3"
