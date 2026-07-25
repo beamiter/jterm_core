@@ -488,6 +488,7 @@ pub fn read_recent(
     read_recent_from(&mut input, file_len, max_entries)
 }
 
+#[cfg(test)]
 fn compact(path: &Path, max_entries: usize) -> io::Result<()> {
     let _lock = HistoryFileLock::acquire(path, LOCK_TIMEOUT)?;
     compact_locked(path, max_entries.max(1))
