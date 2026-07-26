@@ -85,13 +85,17 @@ pub struct HistoryLoad {
     receiver: Receiver<HistorySnapshot>,
 }
 
+/// The background reader hung up without ever delivering a snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryLoadDisconnected;
+
 impl HistoryLoad {
     /// Poll a one-shot background read without ever waiting on the UI thread.
-    pub fn try_snapshot(&self) -> Result<Option<HistorySnapshot>, ()> {
+    pub fn try_snapshot(&self) -> Result<Option<HistorySnapshot>, HistoryLoadDisconnected> {
         match self.receiver.try_recv() {
             Ok(snapshot) => Ok(Some(snapshot)),
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(()),
+            Err(TryRecvError::Disconnected) => Err(HistoryLoadDisconnected),
         }
     }
 }
@@ -712,10 +716,7 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
 fn encode_event(mut event: OutputEvent) -> io::Result<Vec<u8>> {
     let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
     if encoded.len() > MAX_EVENT_LINE_BYTES {
-        event.text = bounded_text(
-            &event.text,
-            MAX_OUTPUT_BYTES / 2,
-        );
+        event.text = bounded_text(&event.text, MAX_OUTPUT_BYTES / 2);
         event.truncated = true;
         event.total_bytes = event.total_bytes.max(event.text.len() as u64);
         encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
@@ -889,10 +890,7 @@ mod tests {
             serde_json::from_slice(&encoded[..encoded.len() - 1]).unwrap();
         assert_eq!(value["truncated"], true);
         assert_eq!(value["total_bytes"], total_bytes as u64);
-        assert!(
-            value["text"].as_str().unwrap().len()
-                <= MAX_OUTPUT_BYTES / 2
-        );
+        assert!(value["text"].as_str().unwrap().len() <= MAX_OUTPUT_BYTES / 2);
     }
 
     #[test]

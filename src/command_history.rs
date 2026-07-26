@@ -57,8 +57,7 @@ fn lock_path_for(path: &Path) -> io::Result<PathBuf> {
 fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     // SAFETY: `file` owns a live descriptor for this call. flock retains no
     // pointer and the descriptor remains owned by HistoryFileLock on success.
-    let result =
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
         return Ok(true);
     }
@@ -479,10 +478,7 @@ fn read_recent_from<R: Read + Seek>(
 /// Read newest-first from a bounded tail window, deduplicating commands while
 /// retaining newest metadata. Corrupt, oversized, incomplete, and unsafe
 /// review-only records are ignored.
-pub fn read_recent(
-    path: &Path,
-    max_entries: usize,
-) -> io::Result<Vec<CommandHistoryRecord>> {
+pub fn read_recent(path: &Path, max_entries: usize) -> io::Result<Vec<CommandHistoryRecord>> {
     let mut input = File::open(path)?;
     let file_len = input.metadata()?.len();
     read_recent_from(&mut input, file_len, max_entries)

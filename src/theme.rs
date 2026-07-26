@@ -952,7 +952,9 @@ impl Theme {
 
     fn save_custom_theme_in(&self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         if Self::is_builtin(&self.name) {
-            return Err(Self::invalid_theme_name("theme name collides with a builtin theme").into());
+            return Err(
+                Self::invalid_theme_name("theme name collides with a builtin theme").into(),
+            );
         }
         let path = Self::custom_theme_path_in(dir, &self.name)?;
         Self::ensure_custom_themes_dir(dir)?;
@@ -1355,6 +1357,9 @@ mod extra_tests {
         assert_eq!(theme.terminal.ansi_colors[15], [0xAA, 0xBB, 0xCC]);
         assert!(!theme.set_editable_color(19, "#102030"));
         assert!(!theme.set_editable_color(0, "#12345"));
-        assert_eq!(Theme::hex_to_rgb(&Theme::rgb_to_hex([1, 2, 3])), Some([1, 2, 3]));
+        assert_eq!(
+            Theme::hex_to_rgb(&Theme::rgb_to_hex([1, 2, 3])),
+            Some([1, 2, 3])
+        );
     }
 }

@@ -736,6 +736,44 @@ fn nonempty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Family-wide default provider-key file: `<XDG config>/<app>/ai.key`.
+/// The natural write target when a settings panel stores a pasted key and no
+/// explicit key path is configured.
+pub fn default_api_key_path(app: &str) -> String {
+    dirs::config_dir()
+        .map(|dir| dir.join(app).join("ai.key"))
+        .unwrap_or_else(|| PathBuf::from(format!("~/.config/{app}/ai.key")))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `<APP>_AI_API_KEY_FILE` (e.g. `JTERM4_AI_API_KEY_FILE`) overrides the
+/// configured key path. Callers must treat it as read-only: never persist it
+/// back to config, never choose it as a key-store write target.
+pub fn api_key_file_env_override(app: &str) -> Option<String> {
+    nonempty_env(&format!("{}_AI_API_KEY_FILE", app.to_uppercase()))
+}
+
+/// Effective key-file path: environment override first, then the configured
+/// value; blank strings on either side never mask "not configured".
+pub fn resolve_api_key_file(app: &str, configured: Option<&str>) -> Option<String> {
+    resolve_api_key_file_from(api_key_file_env_override(app), configured)
+}
+
+fn resolve_api_key_file_from(
+    env_override: Option<String>,
+    configured: Option<&str>,
+) -> Option<String> {
+    env_override
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            configured
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+}
+
 fn expand_api_key_path(raw: &str) -> Result<PathBuf, AiError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -1610,6 +1648,49 @@ context when present, and use no filler or markdown headers."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_file_resolution_prefers_env_and_ignores_blanks() {
+        assert_eq!(
+            resolve_api_key_file_from(Some("/run/secret".into()), Some("/cfg/ai.key")),
+            Some("/run/secret".to_string())
+        );
+        assert_eq!(
+            resolve_api_key_file_from(None, Some("/cfg/ai.key")),
+            Some("/cfg/ai.key".to_string())
+        );
+        assert_eq!(
+            resolve_api_key_file_from(Some("   ".into()), Some(" /cfg/ai.key ")),
+            Some("/cfg/ai.key".to_string())
+        );
+        assert_eq!(resolve_api_key_file_from(None, Some("   ")), None);
+        assert_eq!(resolve_api_key_file_from(None, None), None);
+    }
+
+    #[test]
+    fn default_api_key_path_is_per_app() {
+        let path = default_api_key_path("jterm9");
+        assert!(path.ends_with("jterm9/ai.key"), "unexpected path: {path}");
+    }
+
+    #[test]
+    fn api_key_env_override_uses_the_uppercased_app_prefix() {
+        // A unique app name keeps this env mutation invisible to other tests.
+        let app = "jterm_core_env_override_probe";
+        let var = "JTERM_CORE_ENV_OVERRIDE_PROBE_AI_API_KEY_FILE";
+        std::env::set_var(var, " /run/probe.key ");
+        assert_eq!(
+            api_key_file_env_override(app),
+            Some("/run/probe.key".to_string())
+        );
+        assert_eq!(
+            resolve_api_key_file(app, Some("/cfg/ai.key")),
+            Some("/run/probe.key".to_string())
+        );
+        std::env::set_var(var, "   ");
+        assert_eq!(api_key_file_env_override(app), None);
+        std::env::remove_var(var);
+    }
 
     fn client(provider: Provider) -> AiClient {
         AiClient {

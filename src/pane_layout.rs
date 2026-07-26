@@ -729,7 +729,13 @@ mod tests {
             Some(0)
         );
         // No wrap at the edges.
-        assert_eq!(directional_focus_target(&rects, 0, PaneDirection::Left), None);
-        assert_eq!(directional_focus_target(&rects, 2, PaneDirection::Down), None);
+        assert_eq!(
+            directional_focus_target(&rects, 0, PaneDirection::Left),
+            None
+        );
+        assert_eq!(
+            directional_focus_target(&rects, 2, PaneDirection::Down),
+            None
+        );
     }
 }
