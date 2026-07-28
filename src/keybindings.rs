@@ -248,14 +248,20 @@ pub fn parse(s: &str) -> Result<Chord, ParseError> {
     }
     let parts: Vec<&str> = trimmed.split('+').map(str::trim).collect();
 
-    // The last part is the key, but a literal '+' key needs the two
-    // special cases described above ("ctrl+shift++" and "ctrl++" forms).
-    let plus_key = (trimmed.ends_with("++") && parts.len() >= 3)
-        || (parts.last() == Some(&"") && parts.len() >= 2);
-    let (mod_parts, key_token) = if plus_key {
+    // The last part is the key, but a literal '+' key needs special cases:
+    // a bare "+" splits into two empty parts, and "ctrl++"/"ctrl+shift++"
+    // carry two trailing empties. A single trailing '+' with no key (e.g.
+    // "ctrl+") is a malformed chord, not a plus key — the historical jterm1/4
+    // branch silently dropped the modifier there.
+    let (mod_parts, key_token) = if trimmed == "+" {
+        (&parts[..0], "+")
+    } else if trimmed.ends_with("++") && parts.len() >= 3 {
         (&parts[..parts.len() - 2], "+")
     } else {
         let (last, rest) = parts.split_last().expect("split always yields one part");
+        if last.is_empty() {
+            return Err(ParseError::MissingKey);
+        }
         (rest, *last)
     };
 
@@ -559,6 +565,23 @@ mod tests {
             Ok(c),
             "canonical form {canonical:?} must re-parse to {c:?}"
         );
+    }
+
+    #[test]
+    fn trailing_separator_without_a_key_is_rejected_not_modifier_dropping() {
+        // "ctrl+" historically parsed as a bare '+' with the modifier lost.
+        assert_eq!(parse("ctrl+"), Err(ParseError::MissingKey));
+        assert_eq!(parse("ctrl+shift+"), Err(ParseError::MissingKey));
+        // The legitimate plus-key spellings are unaffected.
+        assert_eq!(
+            parse("+"),
+            Ok(Chord {
+                mods: Mods::default(),
+                key: KeySym::Char('+'),
+            })
+        );
+        assert!(parse("ctrl++").is_ok());
+        assert!(parse("ctrl+shift++").is_ok());
     }
 
     // ---- DEFAULT_CHORDS contract -------------------------------------
