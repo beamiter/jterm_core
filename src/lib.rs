@@ -21,4 +21,5 @@ pub mod pane_layout;
 pub mod parser;
 pub mod redact;
 pub mod review_input;
+pub mod rsh_install;
 pub mod theme;
