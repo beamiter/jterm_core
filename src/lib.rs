@@ -15,6 +15,7 @@ pub mod exit_status;
 pub mod git_meta;
 pub mod host;
 pub mod identity;
+pub mod keybindings;
 pub mod notebook_text;
 pub mod notify;
 pub mod pane_layout;
