@@ -40,10 +40,30 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
     // a moment of attention.
     let timeout_ms = if exit_code == 0 { "5000" } else { "10000" };
 
+    spawn_notify_send(urgency, timeout_ms, &title, &body);
+}
+
+/// Post an application-driven desktop notification (OSC 9 / OSC 777). The
+/// shared parser has already bounded the fields and stripped control bytes
+/// (`parser::MAX_NOTIFICATION_CHARS`); callers are expected to rate-limit.
+/// A missing title falls back to the app identity so toasts stay attributable.
+pub fn app_notification(title: Option<&str>, body: &str) {
+    let title = title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(crate::identity::get().app_name);
+    spawn_notify_send("normal", "5000", title, body);
+}
+
+/// Spawn notify-send and reap it from a short-lived thread. notify-send exits
+/// as soon as D-Bus accepts the toast, but a dropped Child stays a zombie
+/// until waited on; callers rate-limit launches, so one reaper thread per
+/// notification is bounded and keeps the process table clean.
+fn spawn_notify_send(urgency: &str, timeout_ms: &str, title: &str, body: &str) {
     let identity = crate::identity::get();
     let app_name_arg = format!("--app-name={}", identity.app_name);
     let icon_arg = format!("--icon={}", identity.app_id);
-    let _ = crate::host::command("notify-send")
+    let spawned = crate::host::command("notify-send")
         .args([
             app_name_arg.as_str(),
             icon_arg.as_str(),
@@ -52,36 +72,6 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
             "--expire-time",
             timeout_ms,
             "--",
-            &title,
-            &body,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-}
-
-/// Post an application-driven desktop notification (OSC 9 / OSC 777). The
-/// shared parser has already bounded the fields and stripped control bytes
-/// (`parser::MAX_NOTIFICATION_CHARS`); callers are expected to rate-limit.
-/// A missing title falls back to the app identity so toasts stay attributable.
-pub fn app_notification(title: Option<&str>, body: &str) {
-    let identity = crate::identity::get();
-    let title = title
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .unwrap_or(identity.app_name);
-    let app_name_arg = format!("--app-name={}", identity.app_name);
-    let icon_arg = format!("--icon={}", identity.app_id);
-    let _ = crate::host::command("notify-send")
-        .args([
-            app_name_arg.as_str(),
-            icon_arg.as_str(),
-            "--urgency",
-            "normal",
-            "--expire-time",
-            "5000",
-            "--",
             title,
             body,
         ])
@@ -89,6 +79,11 @@ pub fn app_notification(title: Option<&str>, body: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+    if let Ok(mut child) = spawned {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 fn notification_title(cmd: &str) -> String {
