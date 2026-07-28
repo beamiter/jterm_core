@@ -5,6 +5,10 @@
 //! and avoids adding a second TLS stack. Every API here only returns text; no
 //! function in this module executes or submits a generated command.
 
+use jagent::provider::{
+    bound_history_with, build_chat_request, parse_chat_response_full, ChatConfig, HttpRequest,
+    ProviderError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -17,7 +21,6 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const CURL_STATUS_MARKER: &str = "\n__JTERM_STATUS__:";
 const MAX_ERROR_BODY_BYTES: usize = 2 * 1024;
 const MAX_GENERATED_COMMAND_BYTES: usize = 16 * 1024;
@@ -27,10 +30,6 @@ const MAX_BLOCK_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_BLOCK_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_CWD_BYTES: usize = 4 * 1024;
 const MAX_AGENT_ENV_VALUE_BYTES: usize = 4 * 1024;
-const MAX_REQUEST_HISTORY_TURNS: usize = 40;
-const MAX_REQUEST_HISTORY_BYTES: usize = 256 * 1024;
-const MAX_REQUEST_TURN_BYTES: usize = 192 * 1024;
-const MAX_MODEL_TEXT_BYTES: usize = 256 * 1024;
 const MAX_CURL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CURL_STDERR_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_AI_REQUESTS: usize = 4;
@@ -73,50 +72,38 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub fn as_config_value(self) -> &'static str {
+    /// The wire-format logic lives in `jagent::provider`; this enum stays a
+    /// distinct type so app configs and `AiError` keep their historical shape.
+    fn to_jagent(self) -> jagent::Provider {
         match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAiCompatible => "openai-compatible",
-            Self::Ollama => "ollama",
+            Self::Anthropic => jagent::Provider::Anthropic,
+            Self::OpenAiCompatible => jagent::Provider::OpenAiCompatible,
+            Self::Ollama => jagent::Provider::Ollama,
         }
+    }
+
+    fn from_jagent(provider: jagent::Provider) -> Self {
+        match provider {
+            jagent::Provider::Anthropic => Self::Anthropic,
+            jagent::Provider::OpenAiCompatible => Self::OpenAiCompatible,
+            jagent::Provider::Ollama => Self::Ollama,
+        }
+    }
+
+    pub fn as_config_value(self) -> &'static str {
+        self.to_jagent().as_config_value()
     }
 
     pub fn display_name(self) -> &'static str {
-        match self {
-            Self::Anthropic => "Anthropic",
-            Self::OpenAiCompatible => "OpenAI-compatible",
-            Self::Ollama => "Ollama",
-        }
+        self.to_jagent().display_name()
     }
 
     pub fn default_model(self) -> &'static str {
-        match self {
-            Self::Anthropic => "claude-sonnet-4-6",
-            Self::OpenAiCompatible => "gpt-4o-mini",
-            Self::Ollama => "codellama:7b",
-        }
+        self.to_jagent().default_model()
     }
 
     pub fn default_base_url(self) -> &'static str {
-        match self {
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::OpenAiCompatible => "https://api.openai.com/v1",
-            Self::Ollama => "http://localhost:11434",
-        }
-    }
-
-    fn endpoint(self, base_url: &str) -> String {
-        let base = base_url.trim_end_matches('/');
-        match self {
-            Self::Anthropic if base.ends_with("/v1/messages") => base.to_string(),
-            Self::Anthropic if base.ends_with("/v1") => format!("{base}/messages"),
-            Self::Anthropic => format!("{base}/v1/messages"),
-            Self::OpenAiCompatible if base.ends_with("/chat/completions") => base.to_string(),
-            Self::OpenAiCompatible => format!("{base}/chat/completions"),
-            Self::Ollama if base.ends_with("/api/chat") => base.to_string(),
-            Self::Ollama if base.ends_with("/api") => format!("{base}/chat"),
-            Self::Ollama => format!("{base}/api/chat"),
-        }
+        self.to_jagent().default_base_url()
     }
 
     fn provider_api_key(self) -> Option<String> {
@@ -152,10 +139,10 @@ pub enum Role {
 }
 
 impl Role {
-    fn as_str(self) -> &'static str {
+    fn to_jagent(self) -> jagent::Role {
         match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
+            Self::User => jagent::Role::User,
+            Self::Assistant => jagent::Role::Assistant,
         }
     }
 }
@@ -335,6 +322,19 @@ impl std::fmt::Display for AiError {
 
 impl std::error::Error for AiError {}
 
+impl From<ProviderError> for AiError {
+    fn from(error: ProviderError) -> Self {
+        match error {
+            ProviderError::InvalidConfiguration(message) => Self::InvalidConfiguration(message),
+            ProviderError::MissingApiKey(provider) => Self::MissingProviderApiKey {
+                provider: Provider::from_jagent(provider),
+            },
+            ProviderError::EmptyResponse => Self::Empty,
+            ProviderError::ResponseTooLarge { limit } => Self::ResponseTooLarge { limit },
+        }
+    }
+}
+
 /// Provider-neutral AI settings as persisted by an application's config.
 /// Carries only a credential-file path, never key material.
 #[derive(Debug, Clone, Default)]
@@ -489,8 +489,37 @@ impl AiClient {
             return Err(AiError::Cancelled);
         }
         let _permit = acquire_request_permit(cancellation)?;
+        let request = self.build_request(system, history)?;
+        let response = curl_json_post(&request.url, &request.headers, &request.body, cancellation)?;
+        self.parse_response(response)
+    }
+
+    fn prepare_text(&self, text: &str) -> String {
+        if self.redact_secrets {
+            crate::redact::redact_secrets(text)
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// Assemble the provider POST through `jagent::provider`: redact, bound
+    /// the history, note omissions in the system text, and build the wire
+    /// request. Split from the transport so tests cover it without a network.
+    fn build_request(
+        &self,
+        system: Option<&str>,
+        history: &[Turn],
+    ) -> Result<HttpRequest, AiError> {
         let mut system = system.map(|text| self.prepare_text(text));
-        let (history, omitted_turns) = self.prepare_request_history(history);
+        let messages: Vec<jagent::Message> = history
+            .iter()
+            .map(|turn| jagent::Message {
+                role: turn.role.to_jagent(),
+                text: turn.text.clone(),
+            })
+            .collect();
+        let (bounded, omitted_turns) =
+            bound_history_with(&messages, |text| self.prepare_text(text));
         if omitted_turns > 0 {
             let note = format!(
                 "{omitted_turns} older conversation turn(s) were omitted by \
@@ -505,203 +534,28 @@ impl AiClient {
                 None => system = Some(note),
             }
         }
-        let body = self.request_body(system.as_deref(), &history);
-        let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
-        match self.provider {
-            Provider::Anthropic => {
-                let key = self
-                    .api_key
-                    .as_deref()
-                    .filter(|key| !key.trim().is_empty())
-                    .ok_or(AiError::MissingProviderApiKey {
-                        provider: self.provider,
-                    })?;
-                headers.push(("x-api-key".to_string(), key.to_string()));
-                headers.push((
-                    "anthropic-version".to_string(),
-                    ANTHROPIC_API_VERSION.to_string(),
-                ));
-            }
-            Provider::OpenAiCompatible | Provider::Ollama => {
-                if let Some(key) = self.api_key.as_deref().filter(|key| !key.trim().is_empty()) {
-                    headers.push(("authorization".to_string(), format!("Bearer {key}")));
-                }
-            }
-        }
-        let response = curl_json_post(
-            &self.provider.endpoint(&self.base_url),
-            &headers,
-            &body,
-            cancellation,
-        )?;
-        self.parse_response(response)
-    }
-
-    fn prepare_text(&self, text: &str) -> String {
-        if self.redact_secrets {
-            crate::redact::redact_secrets(text)
-        } else {
-            text.to_string()
-        }
-    }
-
-    fn prepare_request_history(&self, history: &[Turn]) -> (Vec<Turn>, usize) {
-        let mut retained_reversed = Vec::new();
-        let mut retained_bytes = 0_usize;
-        for turn in history.iter().rev() {
-            if retained_reversed.len() >= MAX_REQUEST_HISTORY_TURNS {
-                break;
-            }
-            let prepared = self.prepare_text(&turn.text);
-            let text = sample_output(&prepared, MAX_REQUEST_TURN_BYTES);
-            let cost = text.len().saturating_add(32);
-            if !retained_reversed.is_empty()
-                && retained_bytes.saturating_add(cost) > MAX_REQUEST_HISTORY_BYTES
-            {
-                break;
-            }
-            retained_bytes = retained_bytes.saturating_add(cost);
-            retained_reversed.push(Turn {
-                role: turn.role,
-                text,
-            });
-        }
-        retained_reversed.reverse();
-        let mut omitted = history.len().saturating_sub(retained_reversed.len());
-        while retained_reversed.len() > 1
-            && retained_reversed
-                .first()
-                .is_some_and(|turn| turn.role == Role::Assistant)
-        {
-            retained_reversed.remove(0);
-            omitted = omitted.saturating_add(1);
-        }
-        (retained_reversed, omitted)
-    }
-
-    fn request_body(&self, system: Option<&str>, history: &[Turn]) -> Value {
-        let mut messages: Vec<Value> = history
-            .iter()
-            .map(|turn| json!({"role": turn.role.as_str(), "content": turn.text}))
-            .collect();
-        match self.provider {
-            Provider::Anthropic => {
-                let mut body = json!({
-                    "model": self.model,
-                    "max_tokens": self.max_tokens,
-                    "messages": messages,
-                });
-                if let Some(system) = system {
-                    body["system"] = Value::String(system.to_string());
-                }
-                if let Some(temperature) = self.temperature {
-                    body["temperature"] = json!(temperature);
-                }
-                body
-            }
-            Provider::OpenAiCompatible => {
-                if let Some(system) = system {
-                    messages.insert(0, json!({"role": "system", "content": system}));
-                }
-                let mut body = json!({
-                    "model": self.model,
-                    "max_tokens": self.max_tokens,
-                    "messages": messages,
-                });
-                if let Some(temperature) = self.temperature {
-                    body["temperature"] = json!(temperature);
-                }
-                body
-            }
-            Provider::Ollama => {
-                if let Some(system) = system {
-                    messages.insert(0, json!({"role": "system", "content": system}));
-                }
-                let mut options = json!({"num_predict": self.max_tokens});
-                if let Some(temperature) = self.temperature {
-                    options["temperature"] = json!(temperature);
-                }
-                json!({
-                    "model": self.model,
-                    "messages": messages,
-                    "stream": false,
-                    "options": options,
-                })
-            }
-        }
+        let config = ChatConfig {
+            provider: self.provider.to_jagent(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+        };
+        build_chat_request(&config, system.as_deref(), &bounded).map_err(AiError::from)
     }
 
     fn parse_response(&self, response: Value) -> Result<String, AiError> {
-        let reached_token_limit = match self.provider {
-            Provider::Anthropic => {
-                response.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
-            }
-            Provider::OpenAiCompatible => {
-                response
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(Value::as_str)
-                    == Some("length")
-            }
-            Provider::Ollama => {
-                response.get("done_reason").and_then(Value::as_str) == Some("length")
-            }
-        };
-        let mut text = match self.provider {
-            Provider::Anthropic => response
-                .get("content")
-                .and_then(Value::as_array)
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|part| part.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }),
-            Provider::OpenAiCompatible => response
-                .pointer("/choices/0/message/content")
-                .and_then(content_text),
-            Provider::Ollama => response
-                .pointer("/message/content")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    response
-                        .get("response")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                }),
-        }
-        .unwrap_or_default();
-        if text.trim().is_empty() {
-            return Err(AiError::Empty);
-        }
-        if reached_token_limit {
+        let parsed = parse_chat_response_full(self.provider.to_jagent(), &response)?;
+        let mut text = parsed.text;
+        if parsed.reached_token_limit {
             text.push_str(
                 "\n\n[Response reached the configured output limit. Ask to continue or \
                  increase ai_max_tokens.]",
             );
         }
-        if text.len() > MAX_MODEL_TEXT_BYTES {
-            return Err(AiError::ResponseTooLarge {
-                limit: MAX_MODEL_TEXT_BYTES,
-            });
-        }
         Ok(text)
     }
-}
-
-fn content_text(value: &Value) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        return Some(text.to_string());
-    }
-    value.as_array().map(|parts| {
-        parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
 }
 
 fn validate_client_values(model: &str, base_url: &str, max_tokens: u32) -> Result<(), AiError> {
@@ -1209,15 +1063,13 @@ fn wait_with_bounded_output(
 fn curl_json_post(
     url: &str,
     headers: &[(String, String)],
-    body: &Value,
+    body: &str,
     cancellation: &AiCancellationToken,
 ) -> Result<Value, AiError> {
     if cancellation.is_cancelled() {
         return Err(AiError::Cancelled);
     }
-    let body = serde_json::to_string(body)
-        .map_err(|error| AiError::Transport(format!("encode request: {error}")))?;
-    let config = build_curl_stdin_config(url, headers, &body)?;
+    let config = build_curl_stdin_config(url, headers, body)?;
     let mut command = crate::host::command("curl");
     for name in api_key_env_names() {
         // The already-resolved credential is carried in the private stdin
@@ -1721,24 +1573,28 @@ mod tests {
     }
 
     #[test]
-    fn provider_aliases_and_endpoints_are_normalized() {
+    fn provider_aliases_and_wire_logic_delegate_to_jagent() {
         assert_eq!(Provider::from_str("claude").unwrap(), Provider::Anthropic);
         assert_eq!(
             Provider::from_str("openai").unwrap(),
             Provider::OpenAiCompatible
         );
-        assert_eq!(
-            Provider::Anthropic.endpoint("https://api.anthropic.com/v1"),
-            "https://api.anthropic.com/v1/messages"
-        );
-        assert_eq!(
-            Provider::OpenAiCompatible.endpoint("http://localhost:8000/v1"),
-            "http://localhost:8000/v1/chat/completions"
-        );
-        assert_eq!(
-            Provider::Ollama.endpoint("http://localhost:11434/api/chat"),
-            "http://localhost:11434/api/chat"
-        );
+        // The wire values must stay in lockstep with jagent, which owns them.
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            assert_eq!(
+                provider.as_config_value(),
+                provider.to_jagent().as_config_value()
+            );
+            assert_eq!(
+                provider.default_base_url(),
+                provider.to_jagent().default_base_url()
+            );
+            assert_eq!(provider, Provider::from_jagent(provider.to_jagent()));
+        }
     }
 
     #[test]
@@ -1753,12 +1609,26 @@ mod tests {
                 text: "hi".into(),
             },
         ];
-        let anthropic = client(Provider::Anthropic).request_body(Some("system"), &turns);
+        let request = client(Provider::Anthropic)
+            .build_request(Some("system"), &turns)
+            .unwrap();
+        assert_eq!(request.url, "https://api.anthropic.com/v1/messages");
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-api-key" && value == "test-key"));
+        let anthropic: Value = serde_json::from_str(&request.body).unwrap();
         assert_eq!(anthropic["system"], "system");
         assert_eq!(anthropic["messages"].as_array().unwrap().len(), 2);
-        let openai = client(Provider::OpenAiCompatible).request_body(Some("system"), &turns);
+        let request = client(Provider::OpenAiCompatible)
+            .build_request(Some("system"), &turns)
+            .unwrap();
+        let openai: Value = serde_json::from_str(&request.body).unwrap();
         assert_eq!(openai["messages"][0]["role"], "system");
-        let ollama = client(Provider::Ollama).request_body(Some("system"), &turns);
+        let request = client(Provider::Ollama)
+            .build_request(Some("system"), &turns)
+            .unwrap();
+        let ollama: Value = serde_json::from_str(&request.body).unwrap();
         assert_eq!(ollama["stream"], false);
         assert_eq!(ollama["options"]["num_predict"], 512);
     }
@@ -1779,22 +1649,46 @@ mod tests {
         }
         turns.push(Turn {
             role: Role::User,
-            text: "界".repeat(MAX_REQUEST_TURN_BYTES),
+            text: "界".repeat(jagent::provider::MAX_REQUEST_TURN_BYTES),
         });
 
-        let (prepared, omitted) = client.prepare_request_history(&turns);
-        assert!(omitted > 0);
-        assert!(prepared.len() <= MAX_REQUEST_HISTORY_TURNS);
-        assert_eq!(prepared.first().map(|turn| turn.role), Some(Role::User));
-        assert_eq!(prepared.last().map(|turn| turn.role), Some(Role::User));
-        assert!(prepared.last().unwrap().text.contains("bytes elided"));
-        assert!(
-            prepared
-                .iter()
-                .map(|turn| turn.text.len() + 32)
-                .sum::<usize>()
-                <= MAX_REQUEST_HISTORY_BYTES
-        );
+        let request = client.build_request(Some("system"), &turns).unwrap();
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // Leading system message plus a bounded window of history.
+        assert!(messages.len() <= jagent::provider::MAX_REQUEST_HISTORY_TURNS + 1);
+        assert_eq!(messages[0]["role"], "system");
+        // The omission note lands in the system text with the app identity.
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("omitted"));
+        assert!(system.contains("request safety budget"));
+        // The retained window starts with a user turn and the oversized final
+        // turn was elided, not dropped.
+        assert_eq!(messages[1]["role"], "user");
+        let last = messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.contains("bytes elided"));
+    }
+
+    #[test]
+    fn redaction_applies_to_history_and_system_before_sending() {
+        let secret = "ghp_1234567890abcdefghijABCDEFGHIJ123456";
+        let mut redacting = client(Provider::OpenAiCompatible);
+        redacting.redact_secrets = true;
+        let turns = vec![Turn {
+            role: Role::User,
+            text: format!("please use {secret} to push"),
+        }];
+        let request = redacting
+            .build_request(Some(&format!("system with {secret}")), &turns)
+            .unwrap();
+        assert!(!request.body.contains(secret));
+        assert!(request.body.contains("[REDACTED:github-token]"));
+
+        // Off by default: the raw text passes through untouched.
+        let mut plain = client(Provider::OpenAiCompatible);
+        plain.redact_secrets = false;
+        let request = plain.build_request(None, &turns).unwrap();
+        assert!(request.body.contains(secret));
     }
 
     #[test]
@@ -1921,10 +1815,10 @@ mod tests {
         );
         assert!(matches!(
             client(Provider::Ollama).parse_response(
-                json!({"message":{"content":"x".repeat(MAX_MODEL_TEXT_BYTES + 1)}})
+                json!({"message":{"content":"x".repeat(jagent::provider::MAX_MODEL_TEXT_BYTES + 1)}})
             ),
             Err(AiError::ResponseTooLarge {
-                limit: MAX_MODEL_TEXT_BYTES
+                limit: jagent::provider::MAX_MODEL_TEXT_BYTES
             })
         ));
     }
@@ -2114,7 +2008,8 @@ mod tests {
         ] {
             let mut c = client(provider);
             c.temperature = Some(0.2);
-            let body = c.request_body(None, &[]);
+            let request = c.build_request(None, &[]).unwrap();
+            let body: Value = serde_json::from_str(&request.body).unwrap();
             let forwarded = match provider {
                 Provider::Ollama => body.pointer("/options/temperature").cloned(),
                 _ => body.get("temperature").cloned(),
@@ -2122,7 +2017,8 @@ mod tests {
             assert_eq!(forwarded, Some(serde_json::json!(0.2_f32)), "{provider:?}");
             // None keeps the provider default: no key at all.
             let c = client(provider);
-            let body = c.request_body(None, &[]);
+            let request = c.build_request(None, &[]).unwrap();
+            let body: Value = serde_json::from_str(&request.body).unwrap();
             assert!(body.get("temperature").is_none());
             assert!(body.pointer("/options/temperature").is_none());
         }
