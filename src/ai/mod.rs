@@ -338,6 +338,12 @@ impl From<ProviderError> for AiError {
             },
             ProviderError::EmptyResponse => Self::Empty,
             ProviderError::ResponseTooLarge { limit } => Self::ResponseTooLarge { limit },
+            // A reply that violates the provider's own wire format. Transport
+            // is where this module already reports protocol-shaped failures
+            // (see the streaming path's "response stream:" errors).
+            ProviderError::MalformedResponse(detail) => {
+                Self::Transport(format!("malformed response: {detail}"))
+            }
         }
     }
 }
@@ -1208,6 +1214,12 @@ fn fold_stream_events(
             }
             StreamEvent::ReachedTokenLimit => fold.reached_token_limit = true,
             StreamEvent::Usage(_) => {}
+            // Chat requests from this module never declare tools, so a tool
+            // call here means the provider ignored that. Dropping it keeps the
+            // visible answer honest: this path has no way to run one.
+            StreamEvent::ToolCall(call) => {
+                log::debug!("ignoring an unsolicited tool call for '{}'", call.name);
+            }
             StreamEvent::Done => fold.done = true,
             StreamEvent::Protocol(message) => {
                 if fold.protocol_error.is_none() {
