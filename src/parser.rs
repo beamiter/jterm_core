@@ -101,7 +101,21 @@ pub enum ParserEvent {
     /// bounded to [`MAX_NOTIFICATION_CHARS`] with control characters removed;
     /// the UI must still rate-limit before showing anything.
     Notification { title: Option<String>, body: String },
+    /// OSC 10/11/12 with a color value — the app SET a dynamic color (theme
+    /// switching tools, vim `background=`). The raw spec is forwarded verbatim
+    /// (apps parse `#RRGGBB`, `rgb:RR/GG/BB`, or X11 names with their toolkit)
+    /// and the original bytes still pass through to the live view; the caller
+    /// tracks the dynamic value so later [`ParserEvent::ColorQuery`] replies
+    /// report it instead of the static theme color.
+    ColorSet { kind: ColorKind, spec: String },
+    /// OSC 110/111/112 — the app reset a dynamic color back to the default.
+    /// Bytes also pass through; the caller drops its tracked dynamic value.
+    ColorReset(ColorKind),
 }
+
+/// Longest accepted OSC 10/11/12 color spec. X11 names and rgb: forms are
+/// short; anything longer is malformed and only passes through.
+pub const MAX_COLOR_SPEC_CHARS: usize = 128;
 
 #[derive(Default)]
 enum State {
@@ -788,7 +802,9 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     // OSC 10 ; ? / OSC 11 ; ? / OSC 12 ; ?  — color queries (XParseColor reply).
     // The active VTE in block view has no return PTY, so the response we'd
     // expect VTE to emit never reaches the app. Emit a semantic event and let
-    // the caller write a reply on the real PTY.
+    // the caller write a reply on the real PTY. A SET (any non-`?` value)
+    // additionally emits ColorSet and falls through to the byte pass-through
+    // so the live view recolors natively while the caller tracks the value.
     for (prefix, kind) in [
         ("10;", ColorKind::Foreground),
         ("11;", ColorKind::Background),
@@ -799,6 +815,27 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
                 events.push(ParserEvent::ColorQuery(kind));
                 return;
             }
+            let spec = rest.trim();
+            if !spec.is_empty() && spec.chars().count() <= MAX_COLOR_SPEC_CHARS {
+                events.push(ParserEvent::ColorSet {
+                    kind,
+                    spec: spec.to_string(),
+                });
+            }
+        }
+    }
+
+    // OSC 110/111/112 — reset a dynamic color; bytes also pass through.
+    for (code, kind) in [
+        ("110", ColorKind::Foreground),
+        ("111", ColorKind::Background),
+        ("112", ColorKind::Cursor),
+    ] {
+        if s == code
+            || s.strip_prefix(code)
+                .is_some_and(|rest| rest.starts_with(';'))
+        {
+            events.push(ParserEvent::ColorReset(kind));
         }
     }
 
@@ -990,6 +1027,65 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| !matches!(event, ParserEvent::Notification { .. })));
+    }
+
+    #[test]
+    fn dynamic_color_set_and_reset_emit_events_and_pass_through() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b]11;#1e1e2e\x07", &mut events);
+        assert!(matches!(
+            &events[..],
+            [
+                ParserEvent::ColorSet { kind: ColorKind::Background, spec },
+                ParserEvent::Bytes(bytes),
+            ] if spec == "#1e1e2e" && bytes.starts_with(b"\x1b]11;#1e1e2e")
+        ));
+
+        // Named specs forward verbatim for the app's toolkit to parse.
+        events.clear();
+        parser.feed(b"\x1b]10;rebeccapurple\x1b\\", &mut events);
+        assert!(matches!(
+            &events[..],
+            [ParserEvent::ColorSet { kind: ColorKind::Foreground, spec }, ParserEvent::Bytes(_)]
+                if spec == "rebeccapurple"
+        ));
+
+        // Queries stay consumed semantic events, exactly as before.
+        events.clear();
+        parser.feed(b"\x1b]12;?\x07", &mut events);
+        assert!(matches!(
+            &events[..],
+            [ParserEvent::ColorQuery(ColorKind::Cursor)]
+        ));
+
+        // Resets emit the event and still pass through to the live view.
+        events.clear();
+        parser.feed(b"\x1b]110\x07\x1b]112;\x07", &mut events);
+        let resets: Vec<&ColorKind> = events
+            .iter()
+            .filter_map(|event| match event {
+                ParserEvent::ColorReset(kind) => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resets, [&ColorKind::Foreground, &ColorKind::Cursor]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ParserEvent::Bytes(_)))
+                .count(),
+            2
+        );
+
+        // Oversized specs only pass through — no semantic event.
+        events.clear();
+        let long = "x".repeat(MAX_COLOR_SPEC_CHARS + 1);
+        parser.feed(format!("\x1b]11;{long}\x07").as_bytes(), &mut events);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::ColorSet { .. })));
+        assert!(matches!(&events[..], [ParserEvent::Bytes(_)]));
     }
 
     #[test]
