@@ -7,6 +7,10 @@
 /// OSC carries titles and clipboard data. One MiB is ample for supported
 /// payloads while bounding malformed strings that never send a terminator.
 const MAX_OSC_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Per-field cap for app-driven desktop notifications (OSC 9 / OSC 777),
+/// matching the jterm3 in-engine limit so the family behaves identically.
+pub const MAX_NOTIFICATION_CHARS: usize = 256;
 /// Kitty graphics uses APC. Keep a practical encoded-image ceiling while
 /// preventing one unterminated sequence from retaining arbitrary PTY output.
 const MAX_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -92,6 +96,11 @@ pub enum ParserEvent {
     /// with a canned "not supported" / level-0 response so the app falls back
     /// gracefully (otherwise neovim, helix, etc. hang waiting on the reply).
     KeyboardProtocolQuery(KeyboardProtocolQuery),
+    /// OSC 9 ; <body> (iTerm2/ConEmu) or OSC 777 ; notify ; <title> ; <body>
+    /// (urxvt) — the application requests a desktop notification. Fields are
+    /// bounded to [`MAX_NOTIFICATION_CHARS`] with control characters removed;
+    /// the UI must still rate-limit before showing anything.
+    Notification { title: Option<String>, body: String },
 }
 
 #[derive(Default)]
@@ -750,6 +759,32 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
+    // OSC 9 ; <text> — iTerm2/ConEmu-style desktop notification request.
+    if let Some(rest) = s.strip_prefix("9;") {
+        let body = bounded_notification_field(rest);
+        if !body.is_empty() {
+            events.push(ParserEvent::Notification { title: None, body });
+        }
+        return;
+    }
+
+    // OSC 777 ; notify ; <title> ; <body> — urxvt notification extension.
+    // Other OSC 777 subcommands fall through to the generic pass-through.
+    if let Some(rest) = s.strip_prefix("777;") {
+        let mut fields = rest.splitn(3, ';');
+        if fields.next() == Some("notify") {
+            let title = bounded_notification_field(fields.next().unwrap_or(""));
+            let body = bounded_notification_field(fields.next().unwrap_or(""));
+            if !(title.is_empty() && body.is_empty()) {
+                events.push(ParserEvent::Notification {
+                    title: (!title.is_empty()).then_some(title),
+                    body,
+                });
+            }
+            return;
+        }
+    }
+
     // OSC 10 ; ? / OSC 11 ; ? / OSC 12 ; ?  — color queries (XParseColor reply).
     // The active VTE in block view has no return PTY, so the response we'd
     // expect VTE to emit never reaches the app. Emit a semantic event and let
@@ -808,6 +843,18 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     bytes.extend_from_slice(payload);
     bytes.push(0x07);
     events.push(ParserEvent::Bytes(bytes));
+}
+
+/// Bound one OSC 9/777 field: strip control characters (the text reaches
+/// notification daemons verbatim), collapse surrounding whitespace, and cap
+/// the length. Applications, not users, author these strings.
+fn bounded_notification_field(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_NOTIFICATION_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
@@ -901,6 +948,48 @@ mod tests {
 
         assert!(matches!(parser.state, State::Ground));
         assert_eq!(collect_bytes(&events), b"visible");
+    }
+
+    #[test]
+    fn osc_9_and_777_become_bounded_notification_events() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b]9;build finished\x07", &mut events);
+        assert!(matches!(
+            &events[..],
+            [ParserEvent::Notification { title: None, body }] if body == "build finished"
+        ));
+
+        events.clear();
+        parser.feed(b"\x1b]777;notify;CI;tests green\x1b\\", &mut events);
+        assert!(matches!(
+            &events[..],
+            [ParserEvent::Notification { title: Some(title), body }]
+                if title == "CI" && body == "tests green"
+        ));
+
+        // Control characters are stripped and fields are capped, so a hostile
+        // app cannot inject control bytes into the notification daemon.
+        events.clear();
+        let long = "x".repeat(2 * MAX_NOTIFICATION_CHARS);
+        parser.feed(b"\x1b]9;evil\ttab\x1b\\", &mut events);
+        parser.feed(format!("\x1b]9;{long}\x07").as_bytes(), &mut events);
+        let bodies: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ParserEvent::Notification { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies[0], "eviltab");
+        assert_eq!(bodies[1].chars().count(), MAX_NOTIFICATION_CHARS);
+
+        // Empty notifications and non-notify OSC 777 subcommands emit nothing.
+        events.clear();
+        parser.feed(b"\x1b]9; \x07\x1b]777;other;a;b\x07", &mut events);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::Notification { .. })));
     }
 
     #[test]

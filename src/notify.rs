@@ -61,6 +61,36 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
         .spawn();
 }
 
+/// Post an application-driven desktop notification (OSC 9 / OSC 777). The
+/// shared parser has already bounded the fields and stripped control bytes
+/// (`parser::MAX_NOTIFICATION_CHARS`); callers are expected to rate-limit.
+/// A missing title falls back to the app identity so toasts stay attributable.
+pub fn app_notification(title: Option<&str>, body: &str) {
+    let identity = crate::identity::get();
+    let title = title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(identity.app_name);
+    let app_name_arg = format!("--app-name={}", identity.app_name);
+    let icon_arg = format!("--icon={}", identity.app_id);
+    let _ = crate::host::command("notify-send")
+        .args([
+            app_name_arg.as_str(),
+            icon_arg.as_str(),
+            "--urgency",
+            "normal",
+            "--expire-time",
+            "5000",
+            "--",
+            title,
+            body,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 fn notification_title(cmd: &str) -> String {
     const MAX_CHARS: usize = 60;
 
