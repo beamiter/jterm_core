@@ -16,6 +16,7 @@ pub mod git_meta;
 pub mod host;
 pub mod identity;
 pub mod keybindings;
+pub mod kitty_graphics;
 pub mod notebook_text;
 pub mod notify;
 pub mod pane_layout;
