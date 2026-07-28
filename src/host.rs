@@ -19,7 +19,8 @@ pub fn is_flatpak() -> bool {
     })
 }
 
-fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+/// First `$PATH` entry containing an executable file named `name`.
+pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .map(|directory| directory.join(name))
@@ -179,6 +180,38 @@ fn wrap_argv_for(
 
 pub fn wrap_argv(argv: &[String], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> Vec<String> {
     wrap_argv_for(is_flatpak(), argv, cwd, env_extra)
+}
+
+/// Whether an argv is a `flatpak-spawn --host` wrapper produced by
+/// [`wrap_argv`] (or equivalent).
+pub fn is_host_wrapper_argv(args: &[String]) -> bool {
+    args.first().is_some_and(|command| {
+        Path::new(command)
+            .file_name()
+            .is_some_and(|name| name == "flatpak-spawn")
+    }) && args.iter().any(|argument| argument == "--host")
+}
+
+/// Reverse of [`wrap_argv`]: skip the `flatpak-spawn --host` prefix and the
+/// exact option forms that wrapper emits, recovering the host command argv so
+/// process-based checks work identically inside and outside the sandbox.
+/// Non-wrapper argv is returned unchanged.
+pub fn unwrap_host_argv(args: &[String]) -> &[String] {
+    if !is_host_wrapper_argv(args) {
+        return args;
+    }
+    let start = args
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, argument)| {
+            !matches!(argument.as_str(), "--host" | "--watch-bus")
+                && !argument.starts_with("--directory=")
+                && !argument.starts_with("--env=")
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(args.len());
+    &args[start..]
 }
 
 pub fn command(program: impl AsRef<OsStr>) -> Command {
