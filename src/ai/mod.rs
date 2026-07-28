@@ -6,9 +6,10 @@
 //! function in this module executes or submits a generated command.
 
 use jagent::provider::{
-    bound_history_with, build_chat_request, parse_chat_response_full, ChatConfig, HttpRequest,
-    ProviderError,
+    bound_history_with, build_chat_request, build_chat_request_streaming, parse_chat_response_full,
+    ChatConfig, HttpRequest, ProviderError,
 };
+use jagent::stream::{StreamEvent, StreamParser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -31,6 +32,12 @@ const MAX_BLOCK_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_CWD_BYTES: usize = 4 * 1024;
 const MAX_AGENT_ENV_VALUE_BYTES: usize = 4 * 1024;
 const MAX_CURL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+/// Streaming responses take as long as generation does; allow well beyond the
+/// non-streaming 75s but still bound a wedged connection.
+const MAX_STREAM_SECONDS: u32 = 300;
+/// Bounded head of raw stdout kept for API error bodies (non-2xx responses
+/// are plain JSON, not stream frames).
+const STREAM_ERROR_PREFIX_BYTES: usize = 8 * 1024;
 const MAX_CURL_STDERR_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_AI_REQUESTS: usize = 4;
 const CURL_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -494,6 +501,34 @@ impl AiClient {
         self.parse_response(response)
     }
 
+    /// Send a transcript with incremental delivery: `on_delta` receives each
+    /// assistant text fragment as it arrives (on this worker thread — the
+    /// caller marshals to its UI thread), and the complete text is returned so
+    /// error handling and history recording stay identical to the blocking
+    /// path. Cancellation kills the in-flight curl mid-stream.
+    pub fn send_turns_streaming_cancellable(
+        &self,
+        system: Option<&str>,
+        history: &[Turn],
+        cancellation: &AiCancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String, AiError> {
+        let _activity = cancellation.begin_request();
+        if cancellation.is_cancelled() {
+            return Err(AiError::Cancelled);
+        }
+        let _permit = acquire_request_permit(cancellation)?;
+        let request = self.build_request_with(system, history, true)?;
+        curl_stream_post(
+            &request.url,
+            &request.headers,
+            &request.body,
+            self.provider.to_jagent(),
+            cancellation,
+            on_delta,
+        )
+    }
+
     fn prepare_text(&self, text: &str) -> String {
         if self.redact_secrets {
             crate::redact::redact_secrets(text)
@@ -509,6 +544,15 @@ impl AiClient {
         &self,
         system: Option<&str>,
         history: &[Turn],
+    ) -> Result<HttpRequest, AiError> {
+        self.build_request_with(system, history, false)
+    }
+
+    fn build_request_with(
+        &self,
+        system: Option<&str>,
+        history: &[Turn],
+        streaming: bool,
     ) -> Result<HttpRequest, AiError> {
         let mut system = system.map(|text| self.prepare_text(text));
         let messages: Vec<jagent::Message> = history
@@ -542,7 +586,12 @@ impl AiClient {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
         };
-        build_chat_request(&config, system.as_deref(), &bounded).map_err(AiError::from)
+        if streaming {
+            build_chat_request_streaming(&config, system.as_deref(), &bounded)
+                .map_err(AiError::from)
+        } else {
+            build_chat_request(&config, system.as_deref(), &bounded).map_err(AiError::from)
+        }
     }
 
     fn parse_response(&self, response: Value) -> Result<String, AiError> {
@@ -1060,27 +1109,16 @@ fn wait_with_bounded_output(
     })
 }
 
-fn curl_json_post(
-    url: &str,
-    headers: &[(String, String)],
-    body: &str,
-    cancellation: &AiCancellationToken,
-) -> Result<Value, AiError> {
-    if cancellation.is_cancelled() {
-        return Err(AiError::Cancelled);
-    }
-    let config = build_curl_stdin_config(url, headers, body)?;
+/// Spawn curl with its complete per-request config delivered over stdin.
+/// The URL, request body, and especially authentication headers stay out of
+/// the child argv (and therefore out of `ps`/`/proc/*/cmdline`); provider
+/// credentials are also scrubbed from the inherited environment. This works
+/// through `flatpak-spawn --host`, which forwards the standard streams.
+fn spawn_curl(config: &str, cancellation: &AiCancellationToken) -> Result<Child, AiError> {
     let mut command = crate::host::command("curl");
     for name in api_key_env_names() {
-        // The already-resolved credential is carried in the private stdin
-        // pipe. There is no reason to duplicate any provider credential in
-        // curl/flatpak-spawn's inherited environment.
         command.env_remove(name);
     }
-    // Keep the URL, request body, and especially authentication headers out of
-    // the child argv (and therefore out of `ps`/`/proc/*/cmdline`). curl reads
-    // its complete per-request config from stdin instead. This also works
-    // through `flatpak-spawn --host`, which forwards the standard streams.
     command
         // `--disable` must be curl's first option. It prevents a user curlrc
         // from adding headers, changing the destination, or redirecting the
@@ -1107,6 +1145,20 @@ fn curl_json_post(
         let _ = kill_and_reap(&mut child);
         return Err(AiError::Transport(format!("write request: {error}")));
     }
+    Ok(child)
+}
+
+fn curl_json_post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    cancellation: &AiCancellationToken,
+) -> Result<Value, AiError> {
+    if cancellation.is_cancelled() {
+        return Err(AiError::Cancelled);
+    }
+    let config = build_curl_stdin_config(url, headers, body)?;
+    let child = spawn_curl(&config, cancellation)?;
     let output = wait_with_bounded_output(child, cancellation)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1132,6 +1184,248 @@ fn curl_json_post(
     }
     serde_json::from_str(body)
         .map_err(|error| AiError::Transport(format!("decode response: {error}")))
+}
+
+/// Result of folding one response's stream events.
+#[derive(Debug, Default)]
+struct StreamFold {
+    text: String,
+    reached_token_limit: bool,
+    done: bool,
+    protocol_error: Option<String>,
+}
+
+fn fold_stream_events(
+    fold: &mut StreamFold,
+    events: Vec<StreamEvent>,
+    on_delta: &mut dyn FnMut(&str),
+) {
+    for event in events {
+        match event {
+            StreamEvent::TextDelta(delta) => {
+                fold.text.push_str(&delta);
+                on_delta(&delta);
+            }
+            StreamEvent::ReachedTokenLimit => fold.reached_token_limit = true,
+            StreamEvent::Usage(_) => {}
+            StreamEvent::Done => fold.done = true,
+            StreamEvent::Protocol(message) => {
+                if fold.protocol_error.is_none() {
+                    fold.protocol_error = Some(message);
+                }
+            }
+        }
+    }
+}
+
+/// Read a spawned child's stdout incrementally, feeding jagent's stream
+/// parser and delivering text deltas as they arrive. Returns the fold, the
+/// bounded head of raw stdout (for API error bodies that are not stream
+/// frames), the child's exit status, and captured stderr.
+fn stream_child_stdout(
+    mut child: Child,
+    provider: jagent::Provider,
+    cancellation: &AiCancellationToken,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<(StreamFold, Vec<u8>, ExitStatus, Vec<u8>), AiError> {
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = kill_and_reap(&mut child);
+            return Err(AiError::Transport("curl stdout unavailable".into()));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            let _ = kill_and_reap(&mut child);
+            return Err(AiError::Transport("curl stderr unavailable".into()));
+        }
+    };
+
+    let (failure_tx, _failure_rx) = mpsc::channel();
+    let stderr_reader = spawn_bounded_capture(
+        stderr,
+        CapturedStream::Stderr,
+        MAX_CURL_STDERR_BYTES,
+        failure_tx,
+    );
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>();
+    let stdout_reader = thread::spawn(move || {
+        let mut reader = stdout;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    if chunk_tx.send(buffer[..count].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut parser = StreamParser::new(provider);
+    let mut fold = StreamFold::default();
+    let mut error_prefix: Vec<u8> = Vec::new();
+    let mut total_bytes = 0_usize;
+    let cleanup = |child: &mut Child| {
+        let _ = kill_and_reap(child);
+    };
+    loop {
+        if cancellation.is_cancelled() {
+            cleanup(&mut child);
+            drop(chunk_rx);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(AiError::Cancelled);
+        }
+        match chunk_rx.recv_timeout(CURL_WAIT_POLL_INTERVAL) {
+            Ok(chunk) => {
+                total_bytes = total_bytes.saturating_add(chunk.len());
+                if total_bytes > MAX_CURL_STDOUT_BYTES {
+                    cleanup(&mut child);
+                    drop(chunk_rx);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(AiError::Transport(format!(
+                        "curl stdout exceeded the {MAX_CURL_STDOUT_BYTES}-byte safety limit"
+                    )));
+                }
+                if error_prefix.len() < STREAM_ERROR_PREFIX_BYTES {
+                    let room = STREAM_ERROR_PREFIX_BYTES - error_prefix.len();
+                    error_prefix.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
+                let events = parser.push(&chunk);
+                fold_stream_events(&mut fold, events, on_delta);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let final_events = parser.finish();
+    fold_stream_events(&mut fold, final_events, on_delta);
+    let _ = stdout_reader.join();
+
+    // stdout closed; wait for exit, still honoring cancellation.
+    let status: ExitStatus = loop {
+        if cancellation.is_cancelled() {
+            cleanup(&mut child);
+            let _ = stderr_reader.join();
+            return Err(AiError::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(CURL_WAIT_POLL_INTERVAL),
+            Err(error) => {
+                cleanup(&mut child);
+                let _ = stderr_reader.join();
+                return Err(AiError::Transport(format!("wait for curl: {error}")));
+            }
+        }
+    };
+    let stderr = join_capture(stderr_reader, CapturedStream::Stderr).unwrap_or_default();
+    if cancellation.is_cancelled() {
+        return Err(AiError::Cancelled);
+    }
+    Ok((fold, error_prefix, status, stderr))
+}
+
+fn curl_stream_post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    provider: jagent::Provider,
+    cancellation: &AiCancellationToken,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<String, AiError> {
+    if cancellation.is_cancelled() {
+        return Err(AiError::Cancelled);
+    }
+    let config = build_curl_stream_config(url, headers, body)?;
+    let child = spawn_curl(&config, cancellation)?;
+    let (fold, error_prefix, status, stderr) =
+        stream_child_stdout(child, provider, cancellation, on_delta)?;
+
+    // The HTTP status marker is written to stderr so stdout stays a pure
+    // response body for the stream parser.
+    let stderr_text = String::from_utf8_lossy(&stderr);
+    let marker = split_curl_w(&stderr_text);
+    if !status.success() {
+        let noise = marker
+            .map(|(rest, _)| rest.to_string())
+            .unwrap_or_else(|| stderr_text.to_string());
+        return Err(AiError::Transport(format!(
+            "curl exit {}: {}",
+            status.code().unwrap_or(-1),
+            trim_for_log(noise.trim(), MAX_ERROR_BODY_BYTES)
+        )));
+    }
+    let http_status = marker
+        .map(|(_, status)| status)
+        .ok_or_else(|| AiError::Transport("malformed curl status output".into()))?;
+    if !(200..300).contains(&http_status) {
+        let body_prefix = String::from_utf8_lossy(&error_prefix);
+        return Err(AiError::Api {
+            status: http_status,
+            message: api_error_message(&body_prefix, http_status),
+        });
+    }
+    if let Some(message) = fold.protocol_error {
+        return Err(AiError::Transport(format!("response stream: {message}")));
+    }
+    if !fold.done {
+        return Err(AiError::Transport(
+            "response stream ended before completion".into(),
+        ));
+    }
+    if fold.text.trim().is_empty() {
+        return Err(AiError::Empty);
+    }
+    let mut text = fold.text;
+    if fold.reached_token_limit {
+        text.push_str(
+            "\n\n[Response reached the configured output limit. Ask to continue or \
+             increase ai_max_tokens.]",
+        );
+    }
+    Ok(text)
+}
+
+fn build_curl_stream_config(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<String, AiError> {
+    let mut config = format!(
+        "silent\nshow-error\nno-buffer\nconnect-timeout = 10\nmax-time = {MAX_STREAM_SECONDS}\nmax-filesize = {MAX_CURL_STDOUT_BYTES}\nrequest = \"POST\"\n"
+    );
+    config.push_str("url = ");
+    config.push_str(&curl_config_quote(url));
+    config.push('\n');
+    for (name, value) in headers {
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err(AiError::InvalidConfiguration(
+                "AI HTTP headers must not contain newlines".into(),
+            ));
+        }
+        config.push_str("header = ");
+        config.push_str(&curl_config_quote(&format!("{name}: {value}")));
+        config.push('\n');
+    }
+    config.push_str("data-binary = ");
+    config.push_str(&curl_config_quote(body));
+    config.push('\n');
+    // `%{stderr}` routes the status marker to stderr so stdout stays a pure
+    // stream body (an in-band marker would be fed to the stream parser).
+    config.push_str("write-out = ");
+    config.push_str(&curl_config_quote(&format!(
+        "%{{stderr}}{CURL_STATUS_MARKER}%{{http_code}}"
+    )));
+    config.push('\n');
+    Ok(config)
 }
 
 /// Quote one value for curl's double-quoted config-file grammar. curl expands
@@ -1755,6 +2049,102 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_folds_child_ndjson_and_reports_completion() {
+        let body =
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"Hello, \"},\"done\":false}\n\
+                    {\"message\":{\"role\":\"assistant\",\"content\":\"world\"},\"done\":false}\n\
+                    {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\
+                    \"done_reason\":\"stop\",\"prompt_eval_count\":2,\"eval_count\":3}\n";
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", &format!("printf '%s' '{body}'")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let token = AiCancellationToken::new();
+        let mut deltas: Vec<String> = Vec::new();
+        let (fold, prefix, status, _stderr) = stream_child_stdout(
+            child,
+            jagent::Provider::Ollama,
+            &token,
+            &mut |delta: &str| deltas.push(delta.to_string()),
+        )
+        .expect("stream folds");
+        assert!(status.success());
+        assert!(fold.done);
+        assert!(!fold.reached_token_limit);
+        assert!(fold.protocol_error.is_none());
+        assert_eq!(fold.text, "Hello, world");
+        assert_eq!(deltas, vec!["Hello, ".to_string(), "world".to_string()]);
+        // The error-body prefix mirrors the head of raw stdout.
+        assert!(String::from_utf8_lossy(&prefix).starts_with("{\"message\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_cancellation_kills_the_stream_child() {
+        use std::time::Instant;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf '%s\\n' '{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"done\":false}'; exec sleep 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let pid = child.id() as i32;
+        let token = AiCancellationToken::new();
+        let canceller_token = token.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            canceller_token.cancel();
+        });
+        let started = Instant::now();
+        let mut deltas: Vec<String> = Vec::new();
+        let error = stream_child_stdout(child, jagent::Provider::Ollama, &token, &mut |d: &str| {
+            deltas.push(d.to_string())
+        })
+        .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(error, AiError::Cancelled);
+        assert_eq!(deltas, vec!["hi".to_string()]);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // SAFETY: signal 0 only probes for existence; no signal is delivered.
+        let probe = unsafe { libc::kill(pid, 0) };
+        assert_eq!(probe, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn stream_curl_config_keeps_stdout_pure_and_unbuffered() {
+        let config = build_curl_stream_config(
+            "https://example.invalid/v1/messages",
+            &[("x-api-key".into(), "k".into())],
+            "{}",
+        )
+        .unwrap();
+        assert!(config.contains("no-buffer\n"));
+        assert!(config.contains(&format!("max-time = {MAX_STREAM_SECONDS}\n")));
+        // The status marker goes to stderr, keeping stdout a pure body.
+        assert!(config.contains("%{stderr}"));
+        let error = build_curl_stream_config(
+            "https://example.invalid",
+            &[("authorization".into(), "Bearer x\r\nX-Evil: y".into())],
+            "{}",
+        )
+        .unwrap_err();
+        assert!(matches!(error, AiError::InvalidConfiguration(_)));
     }
 
     #[test]
