@@ -1618,9 +1618,12 @@ fn parse_single_command(raw: &str) -> Result<String, AiError> {
             .find('\n')
             .ok_or_else(|| AiError::InvalidCommand("unterminated markdown fence".into()))?;
         let language = value[3..first_newline].trim().to_ascii_lowercase();
+        // `jsh`: a model told which shell it is writing for labels the fence with
+        // it, and rejecting that label made the single-command path fail against
+        // the family's own shell while accepting every other one.
         if !matches!(
             language.as_str(),
-            "" | "sh" | "bash" | "shell" | "zsh" | "fish"
+            "" | "sh" | "bash" | "shell" | "zsh" | "fish" | "jsh"
         ) {
             return Err(AiError::InvalidCommand(format!(
                 "unexpected code-fence language '{language}'"
@@ -2237,6 +2240,23 @@ mod tests {
         assert!(parse_single_command("Here you go: git status").is_ok());
         // Prose cannot be identified perfectly, but multiline/fenced protocol
         // violations are rejected; execution is still impossible in this API.
+    }
+
+    /// The family's own shell is a legitimate fence label; a model told it is
+    /// writing for jsh uses it, and rejecting it failed the request outright.
+    #[test]
+    fn a_jsh_fence_is_accepted_like_any_other_shell_fence() {
+        assert_eq!(
+            parse_single_command("```jsh\ngit status\n```").unwrap(),
+            "git status"
+        );
+        assert_eq!(
+            parse_single_command("```JSH\ngit status\n```").unwrap(),
+            "git status"
+        );
+        // Still only shells: a fence claiming another language is a protocol
+        // violation, not something to run.
+        assert!(parse_single_command("```python\nos.remove('/')\n```").is_err());
     }
 
     #[test]
