@@ -27,4 +27,5 @@ pub mod process;
 pub mod pty_input;
 pub mod redact;
 pub mod review_input;
+pub mod snapshot_file;
 pub mod theme;

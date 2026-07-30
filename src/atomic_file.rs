@@ -3,7 +3,7 @@
 //! The temporary file is created next to the destination so the final rename
 //! stays on the same filesystem and remains atomic.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -51,6 +51,19 @@ fn destination_parent(path: &Path) -> io::Result<&Path> {
     }
 }
 
+/// Name of the sibling temporary file used while replacing `destination_name`.
+///
+/// Exposed to the crate because [`crate::snapshot_file`] has to assert that the
+/// name cannot be read back as a session snapshot by the frontends' directory
+/// scans, and a test asserting against a *copy* of this formula would keep
+/// passing after the formula changed.
+pub(crate) fn temp_file_name(destination_name: &OsStr, id: u64) -> OsString {
+    let mut temp_name = OsString::from(".");
+    temp_name.push(destination_name);
+    temp_name.push(format!(".tmp.{}.{id}", std::process::id()));
+    temp_name
+}
+
 fn create_unique_temp(path: &Path, parent: &Path) -> io::Result<(File, PathBuf)> {
     let destination_name = path
         .file_name()
@@ -60,10 +73,7 @@ fn create_unique_temp(path: &Path, parent: &Path) -> io::Result<(File, PathBuf)>
     // counter value. create_new plus retry handles that without clobbering it.
     for _ in 0..128 {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let mut temp_name = OsString::from(".");
-        temp_name.push(destination_name);
-        temp_name.push(format!(".tmp.{}.{}", std::process::id(), id));
-        let temp_path = parent.join(temp_name);
+        let temp_path = parent.join(temp_file_name(destination_name, id));
 
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
