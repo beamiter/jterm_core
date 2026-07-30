@@ -1,9 +1,9 @@
-//! Asynchronous bridge from terminal OSC 133 records to rsh's execution log.
+//! Asynchronous bridge from terminal OSC 133 records to jsh's execution log.
 //!
 //! Terminal parsing runs on the UI thread (and on the bounded background-tab
 //! pump), so it must never wait for a filesystem, an advisory lock, or another
 //! process.  A small bounded channel hands immutable output snapshots to one
-//! writer thread.  rsh owns the rest of the execution lifecycle (`start` and
+//! writer thread.  jsh owns the rest of the execution lifecycle (`start` and
 //! `finish`); jterm contributes the text that was actually rendered by the
 //! terminal as an `output` event with the same execution id.
 
@@ -28,12 +28,12 @@ const MAX_CWD_BYTES: usize = 4 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETAINED_EXECUTIONS: usize = 2_000;
-// rsh compacts after its own event. jterm's correlated output can be the next
+// jsh compacts after its own event. jterm's correlated output can be the next
 // line and legitimately leave the file one bounded event over the threshold.
 const MAX_JOURNAL_READ_BYTES: u64 = MAX_JOURNAL_FILE_BYTES + MAX_EVENT_LINE_BYTES as u64 + 1;
 
 /// One completed command's captured output, as reported by a terminal app.
-/// Only correlation id and output payload matter here; rsh's own events carry
+/// Only correlation id and output payload matter here; jsh's own events carry
 /// the command line, cwd, exit code, and duration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedExecution {
@@ -108,7 +108,7 @@ pub enum HistoryRequestError {
 
 #[derive(Debug, Serialize)]
 struct OutputEvent {
-    rsh_execution_version: u32,
+    jsh_execution_version: u32,
     event: &'static str,
     id: String,
     text: String,
@@ -122,7 +122,7 @@ struct OutputEvent {
 enum PersistedEvent {
     #[serde(rename = "start")]
     Start {
-        rsh_execution_version: u32,
+        jsh_execution_version: u32,
         id: String,
         session_id: Option<String>,
         seq: u64,
@@ -134,7 +134,7 @@ enum PersistedEvent {
     },
     #[serde(rename = "finish")]
     Finish {
-        rsh_execution_version: u32,
+        jsh_execution_version: u32,
         id: String,
         exit_code: i32,
         duration_ms: u64,
@@ -143,7 +143,7 @@ enum PersistedEvent {
     },
     #[serde(rename = "output")]
     Output {
-        rsh_execution_version: u32,
+        jsh_execution_version: u32,
         id: String,
         text: String,
         truncated: bool,
@@ -156,17 +156,17 @@ impl PersistedEvent {
     fn version(&self) -> u32 {
         match self {
             Self::Start {
-                rsh_execution_version,
+                jsh_execution_version,
                 ..
             }
             | Self::Finish {
-                rsh_execution_version,
+                jsh_execution_version,
                 ..
             }
             | Self::Output {
-                rsh_execution_version,
+                jsh_execution_version,
                 ..
-            } => *rsh_execution_version,
+            } => *jsh_execution_version,
         }
     }
 }
@@ -184,14 +184,14 @@ struct HistoryRequest {
 impl OutputEvent {
     fn from_completed(completed: CompletedExecution) -> Option<Self> {
         // Bare FinalTerm markers receive terminal-local ids so the timeline
-        // still works, but there is no matching rsh start/finish lifecycle to
+        // still works, but there is no matching jsh start/finish lifecycle to
         // correlate on disk.
-        if !completed.output_available || !valid_rsh_execution_id(&completed.id) {
+        if !completed.output_available || !valid_jsh_execution_id(&completed.id) {
             return None;
         }
         let retained_bytes = u64::try_from(completed.output.len()).unwrap_or(u64::MAX);
         Some(Self {
-            rsh_execution_version: EXECUTION_JOURNAL_VERSION,
+            jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             event: "output",
             id: completed.id,
             text: completed.output,
@@ -212,13 +212,13 @@ fn writer() -> Option<&'static Sender<JournalMessage>> {
         .get_or_init(|| {
             let (tx, rx) = bounded::<JournalMessage>(WRITER_QUEUE_CAPACITY);
             match std::thread::Builder::new()
-                .name("rsh-execution-journal".to_owned())
+                .name("jsh-execution-journal".to_owned())
                 .spawn(move || {
                     while let Ok(message) = rx.recv() {
                         match message {
                             JournalMessage::Output(event) => {
                                 if let Err(error) = append_event(event) {
-                                    log::warn!("cannot append rsh execution output: {error}");
+                                    log::warn!("cannot append jsh execution output: {error}");
                                 }
                             }
                             JournalMessage::Flush(acknowledge) => {
@@ -229,7 +229,7 @@ fn writer() -> Option<&'static Sender<JournalMessage>> {
                 }) {
                 Ok(_) => Some(tx),
                 Err(error) => {
-                    log::warn!("cannot start rsh execution journal writer: {error}");
+                    log::warn!("cannot start jsh execution journal writer: {error}");
                     None
                 }
             }
@@ -242,7 +242,7 @@ fn reader() -> Option<&'static Sender<HistoryRequest>> {
         .get_or_init(|| {
             let (tx, rx) = bounded::<HistoryRequest>(READER_QUEUE_CAPACITY);
             match std::thread::Builder::new()
-                .name("rsh-execution-history".to_owned())
+                .name("jsh-execution-history".to_owned())
                 .spawn(move || {
                     while let Ok(request) = rx.recv() {
                         let result = read_session_history(&request.session_id);
@@ -260,7 +260,7 @@ fn reader() -> Option<&'static Sender<HistoryRequest>> {
                 }) {
                 Ok(_) => Some(tx),
                 Err(error) => {
-                    log::warn!("cannot start rsh execution history reader: {error}");
+                    log::warn!("cannot start jsh execution history reader: {error}");
                     None
                 }
             }
@@ -294,7 +294,7 @@ pub fn request_history(session_id: String) -> Result<HistoryLoad, HistoryRequest
 /// Queue one completed output without blocking the terminal/UI thread.
 ///
 /// A saturated queue deliberately rejects the newest item. Each command
-/// remains represented by rsh's start/finish events, while memory stays
+/// remains represented by jsh's start/finish events, while memory stays
 /// bounded even if the state directory is on a stalled filesystem.
 pub fn submit(completed: CompletedExecution) -> Result<(), SubmitError> {
     if !enabled() {
@@ -336,7 +336,7 @@ pub fn flush(timeout: std::time::Duration) -> bool {
 }
 
 fn enabled() -> bool {
-    std::env::var("RSH_EXECUTION_JOURNAL")
+    std::env::var("JSH_EXECUTION_JOURNAL")
         .ok()
         .map(|value| {
             !matches!(
@@ -356,14 +356,14 @@ fn unix_time_ms() -> u64 {
 }
 
 fn journal_path() -> io::Result<(PathBuf, bool)> {
-    if let Some(path) = std::env::var_os("RSH_EXECUTION_JOURNAL_PATH")
+    if let Some(path) = std::env::var_os("JSH_EXECUTION_JOURNAL_PATH")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
     {
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "RSH_EXECUTION_JOURNAL_PATH must be absolute",
+                "JSH_EXECUTION_JOURNAL_PATH must be absolute",
             ));
         }
         return Ok((path, true));
@@ -371,7 +371,7 @@ fn journal_path() -> io::Result<(PathBuf, bool)> {
     let state_dir = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no user state directory"))?;
-    Ok((state_dir.join("rsh/executions.jsonl"), false))
+    Ok((state_dir.join("jsh/executions.jsonl"), false))
 }
 
 fn harden_open_options(options: &mut OpenOptions) {
@@ -436,10 +436,10 @@ fn open_journal_for_append(path: &std::path::Path) -> io::Result<File> {
 }
 
 fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>> {
-    if !valid_rsh_session_id(session_id) {
+    if !valid_jsh_session_id(session_id) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid rsh session ID",
+            "invalid jsh session ID",
         ));
     }
     let (path, _) = journal_path()?;
@@ -472,7 +472,7 @@ fn read_session_history_file(
     if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "rsh execution journal exceeds its bounded size",
+            "jsh execution journal exceeds its bounded size",
         ));
     }
 
@@ -500,10 +500,10 @@ fn read_session_history_file(
                 started_at_ms,
                 ..
             } => {
-                if !valid_rsh_execution_id(&id)
+                if !valid_jsh_execution_id(&id)
                     || event_session_id
                         .as_deref()
-                        .is_some_and(|id| !valid_rsh_session_id(id))
+                        .is_some_and(|id| !valid_jsh_session_id(id))
                     || command.len() > MAX_COMMAND_BYTES
                     || cwd.len() > MAX_CWD_BYTES
                 {
@@ -540,7 +540,7 @@ fn read_session_history_file(
                 ended_at_ms,
                 ..
             } => {
-                if !valid_rsh_execution_id(&id) || cwd_after.len() > MAX_CWD_BYTES {
+                if !valid_jsh_execution_id(&id) || cwd_after.len() > MAX_CWD_BYTES {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
@@ -558,7 +558,7 @@ fn read_session_history_file(
                 captured_at_ms,
                 ..
             } => {
-                if !valid_rsh_execution_id(&id) || text.len() > MAX_OUTPUT_BYTES {
+                if !valid_jsh_execution_id(&id) || text.len() > MAX_OUTPUT_BYTES {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
@@ -582,7 +582,7 @@ fn read_session_history_file(
 }
 
 /// Read and, when necessary, discard one JSONL event without allocating more
-/// than rsh's public per-event limit. `false` denotes an oversized event.
+/// than jsh's public per-event limit. `false` denotes an oversized event.
 fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<Option<bool>> {
     line.clear();
     let mut saw_bytes = false;
@@ -645,7 +645,7 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
         if !journal_append_within_bound(current_len, encoded.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::FileTooLarge,
-                "rsh execution journal is awaiting lifecycle compaction",
+                "jsh execution journal is awaiting lifecycle compaction",
             ));
         }
         #[cfg(unix)]
@@ -663,10 +663,10 @@ fn journal_append_within_bound(current_bytes: u64, event_bytes: usize) -> bool {
         <= MAX_JOURNAL_READ_BYTES
 }
 
-/// Match rsh's public execution-id grammar. Generic FinalTerm producers still
+/// Match jsh's public execution-id grammar. Generic FinalTerm producers still
 /// get the in-memory timeline, but their unrelated IDs must not add orphan
-/// output events to rsh's journal.
-fn valid_rsh_execution_id(id: &str) -> bool {
+/// output events to jsh's journal.
+fn valid_jsh_execution_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_EXECUTION_ID_BYTES
         && id
@@ -674,20 +674,20 @@ fn valid_rsh_execution_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-const MAX_RSH_SESSION_ID_BYTES: usize = 128;
+const MAX_JSH_SESSION_ID_BYTES: usize = 128;
 
-/// Shared definition of a well-formed rsh session id (apps re-use this for
+/// Shared definition of a well-formed jsh session id (apps re-use this for
 /// their own session-id handling).
-pub fn is_valid_rsh_session_id(id: &str) -> bool {
+pub fn is_valid_jsh_session_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= MAX_RSH_SESSION_ID_BYTES
+        && id.len() <= MAX_JSH_SESSION_ID_BYTES
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn valid_rsh_session_id(id: &str) -> bool {
-    is_valid_rsh_session_id(id)
+fn valid_jsh_session_id(id: &str) -> bool {
+    is_valid_jsh_session_id(id)
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {
@@ -710,7 +710,7 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
     bounded
 }
 
-/// Serialize within the same one-line limit enforced by rsh's reader. JSON
+/// Serialize within the same one-line limit enforced by jsh's reader. JSON
 /// escaping can expand control-heavy terminal text well beyond its UTF-8 byte
 /// count, so retry with a smaller UTF-8-safe head/tail snapshot when needed.
 fn encode_event(mut event: OutputEvent) -> io::Result<Vec<u8>> {
@@ -724,7 +724,7 @@ fn encode_event(mut event: OutputEvent) -> io::Result<Vec<u8>> {
     if encoded.len() > MAX_EVENT_LINE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "rsh execution output event exceeds the journal line limit",
+            "jsh execution output event exceeds the journal line limit",
         ));
     }
     encoded.push(b'\n');
@@ -831,8 +831,8 @@ mod tests {
     }
 
     #[test]
-    fn only_rsh_compatible_execution_ids_are_persisted() {
-        for id in ["local:1", "rsh:1", "contains space", "雪"] {
+    fn only_jsh_compatible_execution_ids_are_persisted() {
+        for id in ["local:1", "jsh:1", "contains space", "雪"] {
             let completed = CompletedExecution {
                 id: id.to_owned(),
                 output: "output".to_owned(),
@@ -844,7 +844,7 @@ mod tests {
         }
 
         let valid = CompletedExecution {
-            id: "rsh-a_b.c-1".to_owned(),
+            id: "jsh-a_b.c-1".to_owned(),
             output: "output".to_owned(),
             output_available: true,
             truncated: false,
@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn output_event_matches_rsh_envelope() {
+    fn output_event_matches_jsh_envelope() {
         let completed = CompletedExecution {
             id: "exec-1".to_owned(),
             output: "hi".to_owned(),
@@ -863,7 +863,7 @@ mod tests {
             total_bytes: 2,
         };
         let value = serde_json::to_value(OutputEvent::from_completed(completed).unwrap()).unwrap();
-        assert_eq!(value["rsh_execution_version"], 1);
+        assert_eq!(value["jsh_execution_version"], 1);
         assert_eq!(value["event"], "output");
         assert_eq!(value["id"], "exec-1");
         assert_eq!(value["text"], "hi");
@@ -872,11 +872,11 @@ mod tests {
     }
 
     #[test]
-    fn control_heavy_output_stays_within_rshs_jsonl_limit() {
+    fn control_heavy_output_stays_within_jshs_jsonl_limit() {
         let output = "\0".repeat(MAX_OUTPUT_BYTES);
         let total_bytes = output.len();
         let completed = CompletedExecution {
-            id: "rsh-control-heavy".to_owned(),
+            id: "jsh-control-heavy".to_owned(),
             output,
             output_available: true,
             truncated: false,
@@ -898,11 +898,11 @@ mod tests {
         let path = temporary_journal("fold-session");
         let journal = concat!(
             "not json\n",
-            "{\"rsh_execution_version\":99,\"event\":\"start\",\"id\":\"future\",\"session_id\":\"wanted\",\"seq\":0,\"command\":\"future\",\"cwd\":\"/\",\"started_at_ms\":0}\n",
-            "{\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"other-1\",\"session_id\":\"other\",\"seq\":1,\"command\":\"ignore\",\"cwd\":\"/other\",\"started_at_ms\":1}\n",
-            "{\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-1\",\"session_id\":\"wanted\",\"seq\":7,\"command\":\"printf hi\",\"command_truncated\":false,\"cwd\":\"/tmp\",\"started_at_ms\":10}\n",
-            "{\"rsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"hi\",\"truncated\":false,\"total_bytes\":1,\"captured_at_ms\":12}\n",
-            "{\"rsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-1\",\"exit_code\":3,\"duration_ms\":2,\"cwd_after\":\"/tmp/after\",\"ended_at_ms\":12}\n"
+            "{\"jsh_execution_version\":99,\"event\":\"start\",\"id\":\"future\",\"session_id\":\"wanted\",\"seq\":0,\"command\":\"future\",\"cwd\":\"/\",\"started_at_ms\":0}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"other-1\",\"session_id\":\"other\",\"seq\":1,\"command\":\"ignore\",\"cwd\":\"/other\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-1\",\"session_id\":\"wanted\",\"seq\":7,\"command\":\"printf hi\",\"command_truncated\":false,\"cwd\":\"/tmp\",\"started_at_ms\":10}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"hi\",\"truncated\":false,\"total_bytes\":1,\"captured_at_ms\":12}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-1\",\"exit_code\":3,\"duration_ms\":2,\"cwd_after\":\"/tmp/after\",\"ended_at_ms\":12}\n"
         );
         fs::write(&path, journal).unwrap();
 
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn history_reader_discards_an_oversized_line_and_resumes() {
         let path = temporary_journal("oversized-line");
-        let valid = b"{\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"after-large\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n";
+        let valid = b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"after-large\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n";
         let mut journal = vec![b'x'; MAX_EVENT_LINE_BYTES + 2];
         journal.push(b'\n');
         journal.extend_from_slice(valid);
@@ -945,7 +945,7 @@ mod tests {
         for seq in 0..=MAX_RETAINED_EXECUTIONS {
             writeln!(
                 journal,
-                "{{\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"exec-{seq}\",\"session_id\":\"wanted\",\"seq\":{seq},\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":{seq}}}"
+                "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"exec-{seq}\",\"session_id\":\"wanted\",\"seq\":{seq},\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":{seq}}}"
             )
             .unwrap();
         }
@@ -963,12 +963,12 @@ mod tests {
     }
 
     #[test]
-    fn rsh_session_id_validation_matches_the_public_grammar() {
+    fn jsh_session_id_validation_matches_the_public_grammar() {
         for valid in ["123-456", "tab_1", "ABC"] {
-            assert!(valid_rsh_session_id(valid), "{valid}");
+            assert!(valid_jsh_session_id(valid), "{valid}");
         }
         for invalid in ["", "has.dot", "has space", "雪"] {
-            assert!(!valid_rsh_session_id(invalid), "{invalid}");
+            assert!(!valid_jsh_session_id(invalid), "{invalid}");
         }
     }
 

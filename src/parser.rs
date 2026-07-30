@@ -69,9 +69,9 @@ pub enum ParserEvent {
     CommandStart,
     /// OSC 133 ;D with a numeric status — command finished with exit code.
     CommandEnd(i32),
-    /// OSC 7770 — rsh-specific: the remote shell announces its session ID at
+    /// OSC 7770 — jsh-specific: the remote shell announces its session ID at
     /// startup. The UI stores it on the tab's RemoteConn so subsequent
-    /// reconnects pass `--session <id>` and rsh restores cwd/env/aliases.
+    /// reconnects pass `--session <id>` and jsh restores cwd/env/aliases.
     RemoteSessionId(String),
     /// CSI ? 47/1047/1049 h — alt screen entered (vim, less, etc.).
     /// Carries the exact DEC private mode so VTE receives matching semantics.
@@ -750,7 +750,7 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
-    // OSC 7770 ; <session-id> — rsh-specific session announce (see rsh osc.rs:107).
+    // OSC 7770 ; <session-id> — jsh-specific session announce (see jsh osc.rs:107).
     if let Some(rest) = s.strip_prefix("7770;") {
         let id = rest.trim();
         if valid_remote_session_id(id) {

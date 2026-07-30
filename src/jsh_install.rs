@@ -1,16 +1,15 @@
-//! One-command install and update for the companion shell, `rsh`.
+//! One-command install and update for the companion shell, `jsh`.
 //!
-//! Every jterm prefers `rsh` over `bash` when it finds one on `PATH`, so a
+//! Every jterm prefers `jsh` over `bash` when it finds one on `PATH`, so a
 //! machine without it silently runs the second choice. This module closes that
 //! gap without teaching a terminal how to install software: the install logic
-//! lives in the rsh repository, and the crate embeds a copy of that script and
+//! lives in the jsh repository, and the crate embeds a copy of that script and
 //! runs it.
 //!
 //! Three consequences of that split are load-bearing:
 //!   * The script is the only thing that touches the binary, so atomic
-//!     replacement, checksum verification, rollback and the `/usr/bin/rsh`
-//!     (BSD remote shell) collision are handled in one place for all four
-//!     terminals.
+//!     replacement, checksum verification, rollback and the "something else on
+//!     PATH is named jsh" case are handled in one place for all four terminals.
 //!   * The update check reads the installer's own cache, which is shared
 //!     across terminals, so several jterms open at once still make one network
 //!     call per interval.
@@ -26,11 +25,11 @@ use std::process::Stdio;
 
 use serde::Deserialize;
 
-/// Vendored from the rsh repository (`scripts/install-rsh.sh`). Embedding it
-/// is what lets a machine with no `rsh` at all bootstrap one.
-const INSTALLER_SOURCE: &str = include_str!("../scripts/install-rsh.sh");
+/// Vendored from the jsh repository (`scripts/install-jsh.sh`). Embedding it
+/// is what lets a machine with no `jsh` at all bootstrap one.
+const INSTALLER_SOURCE: &str = include_str!("../scripts/install-jsh.sh");
 
-const SCRIPT_NAME: &str = "install-rsh.sh";
+const SCRIPT_NAME: &str = "install-jsh.sh";
 
 /// Seconds a cached update check stays fresh for [`UpdateCheck::Daily`].
 pub const DAILY_MAX_AGE: u64 = 86_400;
@@ -43,13 +42,13 @@ printf '\n'
 if [ "${status}" -eq 0 ]; then
     printf 'Done. Press Enter to close this tab.'
 else
-    printf 'install-rsh.sh exited %s. Press Enter to close this tab.' "${status}"
+    printf 'install-jsh.sh exited %s. Press Enter to close this tab.' "${status}"
 fi
 read -r _
 exit "${status}"
 "#;
 
-/// When to look for a newer rsh. The check never installs anything; it only
+/// When to look for a newer jsh. The check never installs anything; it only
 /// decides whether the offer appears.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UpdateCheck {
@@ -89,18 +88,18 @@ impl UpdateCheck {
     }
 }
 
-/// What `install-rsh.sh --check --json` reports.
+/// What `install-jsh.sh --check --json` reports.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Status {
-    /// Version of the rsh the terminal would manage, when one is installed.
+    /// Version of the jsh the terminal would manage, when one is installed.
     pub installed: Option<String>,
     pub installed_path: Option<String>,
     /// Newest published version, or `None` when the check could not reach it.
     pub latest: Option<String>,
     pub update_available: bool,
-    /// Set when `PATH` resolves `rsh` somewhere else — usually the BSD remote
-    /// shell at /usr/bin/rsh.
+    /// Set when `PATH` resolves `jsh` to a binary that does not identify itself
+    /// as this shell.
     pub shadowed_by: Option<String>,
     pub error: Option<String>,
 }
@@ -126,11 +125,11 @@ impl Prompt {
     pub fn banner_title(&self) -> String {
         match self {
             Prompt::Missing { latest } => format!(
-                "{} prefers rsh as its shell — rsh {latest} is available",
+                "{} prefers jsh as its shell — jsh {latest} is available",
                 crate::identity::get().app_name
             ),
             Prompt::Update { from, to } => {
-                format!("rsh {to} is available — installed: {from}")
+                format!("jsh {to} is available — installed: {from}")
             }
         }
     }
@@ -192,7 +191,7 @@ pub fn script_path() -> io::Result<PathBuf> {
 pub fn check_blocking(max_age: u64) -> Status {
     let script = match script_path() {
         Ok(path) => path,
-        Err(error) => return Status::from_error(format!("cannot write install-rsh.sh: {error}")),
+        Err(error) => return Status::from_error(format!("cannot write install-jsh.sh: {error}")),
     };
 
     let mut command = crate::host::command("sh");
@@ -214,7 +213,7 @@ pub fn check_blocking(max_age: u64) -> Status {
             serde_json::from_str::<Status>(text.trim())
                 .unwrap_or_else(|error| Status::from_error(format!("unreadable check: {error}")))
         }
-        Err(error) => Status::from_error(format!("cannot run install-rsh.sh: {error}")),
+        Err(error) => Status::from_error(format!("cannot run install-jsh.sh: {error}")),
     }
 }
 
@@ -229,7 +228,7 @@ pub fn install_argv() -> io::Result<Vec<String>> {
         "sh".to_string(),
         "-c".to_string(),
         RUN_WRAPPER.to_string(),
-        "jterm-rsh-install".to_string(),
+        "jterm-jsh-install".to_string(),
         script.to_string_lossy().into_owned(),
     ])
 }
@@ -265,11 +264,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_rsh_is_offered_for_install() {
+    fn a_missing_jsh_is_offered_for_install() {
         let status = status_from(
             r#"{"schema":1,"installed":null,"installed_path":null,"latest":"0.3.0",
                 "target":"x86_64-unknown-linux-gnu","update_available":true,
-                "shadowed_by":"/usr/bin/rsh","error":null}"#,
+                "shadowed_by":"/usr/bin/jsh","error":null}"#,
         );
         assert_eq!(
             prompt_for(&status),
@@ -281,9 +280,9 @@ mod tests {
     }
 
     #[test]
-    fn an_outdated_rsh_is_offered_for_update() {
+    fn an_outdated_jsh_is_offered_for_update() {
         let status = status_from(
-            r#"{"installed":"0.2.0","installed_path":"/home/u/.local/bin/rsh",
+            r#"{"installed":"0.2.0","installed_path":"/home/u/.local/bin/jsh",
                 "latest":"0.3.0","update_available":true}"#,
         );
         assert_eq!(
@@ -307,7 +306,7 @@ mod tests {
         // No prompt the user cannot act on, even though nothing is installed.
         let status = status_from(
             r#"{"installed":null,"latest":null,"update_available":false,
-                "error":"cannot reach https://github.com/beamiter/rsh/releases"}"#,
+                "error":"cannot reach https://github.com/beamiter/jsh/releases"}"#,
         );
         assert_eq!(prompt_for(&status), None);
         assert!(status.error.is_some());
@@ -349,14 +348,14 @@ mod tests {
             return;
         }
 
-        let root = std::env::temp_dir().join(format!("jterm-rsh-contract-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("jterm-jsh-contract-{}", std::process::id()));
         let release = root.join("release/latest/download");
         let home = root.join("home");
         std::fs::create_dir_all(&release).expect("release tree");
         std::fs::create_dir_all(&home).expect("home");
         std::fs::write(
             release.join("manifest.json"),
-            r#"{"schema":1,"name":"rsh","version":"9.9.9","tag":"v9.9.9","artifacts":[]}"#,
+            r#"{"schema":1,"name":"jsh","version":"9.9.9","tag":"v9.9.9","artifacts":[]}"#,
         )
         .expect("manifest");
 
@@ -365,12 +364,12 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
 
         // Whatever this machine has on PATH, the check must see the same thing:
-        // an `rsh` that fails identification, exactly like the BSD remote shell.
+        // a `jsh` that fails identification.
         let stub_bin = root.join("bin");
         std::fs::create_dir_all(&stub_bin).expect("stub bin");
-        let stub_rsh = stub_bin.join("rsh");
-        std::fs::write(&stub_rsh, "#!/bin/sh\nexit 1\n").expect("stub rsh");
-        std::fs::set_permissions(&stub_rsh, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let stub_jsh = stub_bin.join("jsh");
+        std::fs::write(&stub_jsh, "#!/bin/sh\nexit 1\n").expect("stub jsh");
+        std::fs::set_permissions(&stub_jsh, std::fs::Permissions::from_mode(0o755)).expect("mode");
         let path = format!(
             "{}:{}",
             stub_bin.display(),
@@ -384,12 +383,12 @@ mod tests {
             .env("XDG_CACHE_HOME", home.join("cache"))
             .env("XDG_STATE_HOME", home.join("state"))
             .env(
-                "RSH_INSTALL_BASE_URL",
+                "JSH_INSTALL_BASE_URL",
                 format!("file://{}", root.join("release").display()),
             )
             .env("PATH", &path)
             .output()
-            .expect("run install-rsh.sh --check");
+            .expect("run install-jsh.sh --check");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let status: Status = serde_json::from_str(stdout.trim())
@@ -401,7 +400,7 @@ mod tests {
         assert_eq!(status.error, None);
         assert_eq!(
             status.shadowed_by.as_deref(),
-            Some(&*stub_rsh.to_string_lossy())
+            Some(&*stub_jsh.to_string_lossy())
         );
         assert_eq!(
             prompt_for(&status),

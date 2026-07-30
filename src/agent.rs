@@ -1,4 +1,4 @@
-//! Review-first agent core, shared with rsh through the `jagent` crate.
+//! Review-first agent core, shared with jsh through the `jagent` crate.
 //!
 //! The pure session state machine, action parser, safety heuristics, and
 //! snapshot serialization live in `jagent` (sans-IO). This module re-exports

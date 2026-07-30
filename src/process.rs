@@ -122,9 +122,9 @@ pub fn shell_quote_argv_for(args: &[String], shell_argv: &[String]) -> Option<St
     }
 }
 
-/// Build the `exec` line that replaces a bootstrap shell with rsh, optionally
+/// Build the `exec` line that replaces a bootstrap shell with jsh, optionally
 /// resuming a saved session. Both fields are quoted as single arguments.
-pub fn build_rsh_exec_command(shell_path: &str, session_id: Option<&str>) -> String {
+pub fn build_jsh_exec_command(shell_path: &str, session_id: Option<&str>) -> String {
     let mut exec_cmd = format!("exec {}", shell_single_quote(shell_path));
     if let Some(sid) = session_id {
         exec_cmd.push_str(" --session ");
@@ -415,7 +415,7 @@ pub fn foreground_uses_external_cwd(pty_fd: i32, shell_pid: i32) -> Option<bool>
 pub fn restorable_command(pty_fd: i32, shell_pid: i32) -> Option<Vec<String>> {
     // Managed remote panes launch ssh/mosh as the PTY child itself rather than
     // underneath an interactive local shell. Preserve that allowlisted argv
-    // too; ordinary bash/zsh/rsh children do not match and continue below.
+    // too; ordinary bash/zsh/jsh children do not match and continue below.
     if let Some(command) =
         read_proc_cmdline(shell_pid).and_then(|args| match_restorable_command(&args))
     {
@@ -1341,18 +1341,18 @@ mod tests {
     }
 
     #[test]
-    fn rsh_exec_command_quotes_shell_and_session() {
+    fn jsh_exec_command_quotes_shell_and_session() {
         assert_eq!(
-            build_rsh_exec_command("/tmp/it's/rsh", None),
-            "exec '/tmp/it'\"'\"'s/rsh'"
+            build_jsh_exec_command("/tmp/it's/jsh", None),
+            "exec '/tmp/it'\"'\"'s/jsh'"
         );
         assert_eq!(
-            build_rsh_exec_command("/usr/bin/rsh", Some("123-456")),
-            "exec '/usr/bin/rsh' --session '123-456'"
+            build_jsh_exec_command("/usr/bin/jsh", Some("123-456")),
+            "exec '/usr/bin/jsh' --session '123-456'"
         );
         assert_eq!(
-            build_rsh_exec_command("/usr/bin/rsh", Some("it's; printf injected")),
-            "exec '/usr/bin/rsh' --session 'it'\"'\"'s; printf injected'"
+            build_jsh_exec_command("/usr/bin/jsh", Some("it's; printf injected")),
+            "exec '/usr/bin/jsh' --session 'it'\"'\"'s; printf injected'"
         );
     }
 

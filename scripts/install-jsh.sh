@@ -1,33 +1,32 @@
 #!/bin/sh
-# vendored from https://github.com/beamiter/rsh -> scripts/install-rsh.sh
+# vendored from https://github.com/beamiter/jsh -> scripts/install-jsh.sh
 # Keep this copy in sync with that file; every jterm embeds it with
-# include_str! so a machine without rsh can still bootstrap one.
-# Install or update rsh for the current user.
+# include_str! so a machine without jsh can still bootstrap one.
+# Install or update jsh for the current user.
 #
-#   curl -fsSL https://github.com/beamiter/rsh/releases/latest/download/install-rsh.sh | sh
+#   curl -fsSL https://github.com/beamiter/jsh/releases/latest/download/install-jsh.sh | sh
 #
-# The script is the single source of truth for "how rsh gets onto a machine":
+# The script is the single source of truth for "how jsh gets onto a machine":
 # jterm1..4 shell out to it instead of each carrying their own installer.
 #
 # Design notes that are easy to get wrong and expensive to rediscover:
-#   * /usr/bin/rsh is the BSD remote shell on Debian-family systems. Every
-#     binary this script touches is identified by its `--version` banner, never
-#     by its name alone.
+#   * Every binary this script touches is identified by its `--version` banner,
+#     never by its name alone: a `jsh` on PATH need not be this shell.
 #   * The binary is replaced by rename(2), so shells that are already running
 #     keep the inode they started with and are never disturbed.
-#   * Nothing here edits shell startup files. If PATH resolves to the wrong rsh
+#   * Nothing here edits shell startup files. If PATH resolves to the wrong jsh
 #     we say so and print the fix; we do not silently rewrite the user's config.
 
 set -eu
 
-REPO="beamiter/rsh"
-BASE_URL="${RSH_INSTALL_BASE_URL:-https://github.com/${REPO}/releases}"
+REPO="beamiter/jsh"
+BASE_URL="${JSH_INSTALL_BASE_URL:-https://github.com/${REPO}/releases}"
 CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
 STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}"
 # Shared by all four terminals on purpose: one update check per machine per
 # interval instead of one per terminal.
-CACHE_FILE="${CACHE_HOME}/rsh/update-check.json"
-ROLLBACK_DIR="${STATE_HOME}/rsh/rollback"
+CACHE_FILE="${CACHE_HOME}/jsh/update-check.json"
+ROLLBACK_DIR="${STATE_HOME}/jsh/rollback"
 # glibc floor of the prebuilt gnu artifacts (built on Ubuntu 22.04).
 GNU_GLIBC_MIN="2.35"
 
@@ -44,7 +43,7 @@ tmp_dir=""
 
 usage() {
     cat <<'USAGE'
-Usage: install-rsh.sh [options]
+Usage: install-jsh.sh [options]
 
 Options:
   --check              Report installed and latest versions, then exit
@@ -59,12 +58,12 @@ Options:
   --dry-run            Print what would happen, change nothing
   -h, --help           Show this help
 
-Default install directory: the directory of the rsh already on PATH when it is
+Default install directory: the directory of the jsh already on PATH when it is
 writable, otherwise ~/.local/bin.
 
 Environment:
-  RSH_INSTALL_BASE_URL  Release base URL (mirrors, local testing)
-  RSH_INSTALL_TARGET    Force a target triple instead of detecting one
+  JSH_INSTALL_BASE_URL  Release base URL (mirrors, local testing)
+  JSH_INSTALL_TARGET    Force a target triple instead of detecting one
   XDG_CACHE_HOME        Update-check cache base (default ~/.cache)
   XDG_STATE_HOME        Rollback copy base (default ~/.local/state)
 USAGE
@@ -79,9 +78,9 @@ say() {
         printf '%s\n' "$*"
     fi
 }
-warn() { printf 'install-rsh: %s\n' "$*" >&2; }
+warn() { printf 'install-jsh: %s\n' "$*" >&2; }
 die() {
-    printf 'install-rsh: %s\n' "$*" >&2
+    printf 'install-jsh: %s\n' "$*" >&2
     exit 1
 }
 have() { command -v "$1" > /dev/null 2>&1; }
@@ -185,8 +184,8 @@ detect_libc() {
 }
 
 detect_target() {
-    if [ -n "${RSH_INSTALL_TARGET:-}" ]; then
-        printf '%s\n' "${RSH_INSTALL_TARGET}"
+    if [ -n "${JSH_INSTALL_TARGET:-}" ]; then
+        printf '%s\n' "${JSH_INSTALL_TARGET}"
         return 0
     fi
     os="$(uname -s)"
@@ -202,18 +201,18 @@ detect_target() {
     return 0
 }
 
-# --- identifying an rsh binary ----------------------------------------------
+# --- identifying a jsh binary -----------------------------------------------
 
-# Prints the version of an rsh binary, or nothing when the file is not rsh.
+# Prints the version of a jsh binary, or nothing when the file is not jsh.
 # This is the same identity check jterm3 performs before adopting a shell.
-rsh_version_of() {
+jsh_version_of() {
     [ -n "$1" ] && [ -x "$1" ] || return 0
     banner="$("$1" --version 2>/dev/null | head -1)" || return 0
     case "${banner}" in
         # Only the first field is the version, so a banner that grows a build
         # suffix later still parses.
-        "rsh "*)
-            rest="${banner#rsh }"
+        "jsh "*)
+            rest="${banner#jsh }"
             printf '%s\n' "${rest%% *}"
             ;;
         *) ;;
@@ -221,9 +220,9 @@ rsh_version_of() {
     return 0
 }
 
-# Absolute path of the rsh that PATH resolves to, whatever it turns out to be.
-path_rsh() {
-    resolved="$(command -v rsh 2>/dev/null)" || return 0
+# Absolute path of the jsh that PATH resolves to, whatever it turns out to be.
+path_jsh() {
+    resolved="$(command -v jsh 2>/dev/null)" || return 0
     case "${resolved}" in
         /*) printf '%s\n' "${resolved}" ;;
         *) ;;
@@ -260,7 +259,7 @@ sha256_of() {
 
 make_tmp() {
     [ -n "${tmp_dir}" ] && return 0
-    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/install-rsh.XXXXXX")" || die "cannot create a temporary directory"
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/install-jsh.XXXXXX")" || die "cannot create a temporary directory"
     return 0
 }
 
@@ -321,10 +320,10 @@ resolve_bin_dir() {
         printf '%s/bin\n' "${prefix}"
         return 0
     fi
-    # Update in place when a genuine rsh is already on PATH, so we do not end up
+    # Update in place when a genuine jsh is already on PATH, so we do not end up
     # with a second copy shadowing the first (the ~/.cargo/bin case).
-    existing="$(path_rsh)"
-    if [ -n "${existing}" ] && [ -n "$(rsh_version_of "${existing}")" ]; then
+    existing="$(path_jsh)"
+    if [ -n "${existing}" ] && [ -n "$(jsh_version_of "${existing}")" ]; then
         existing_dir="$(dirname "${existing}")"
         if writable_dir "${existing_dir}"; then
             printf '%s\n' "${existing_dir}"
@@ -342,10 +341,10 @@ make_tmp
 
 target="$(detect_target)"
 dest_dir="$(resolve_bin_dir)"
-dest="${dest_dir}/rsh"
-installed_version="$(rsh_version_of "${dest}")"
+dest="${dest_dir}/jsh"
+installed_version="$(jsh_version_of "${dest}")"
 
-on_path="$(path_rsh)"
+on_path="$(path_jsh)"
 shadowed_by=""
 if [ -n "${on_path}" ] && [ "${on_path}" != "${dest}" ]; then
     shadowed_by="${on_path}"
@@ -412,23 +411,23 @@ if [ "${channel}" = "release" ] && [ -z "${version}" ]; then
 fi
 
 if [ -n "${installed_version}" ] && [ "${installed_version}" = "${version}" ] && [ "${force}" -eq 0 ]; then
-    say "rsh ${installed_version} is already installed at ${dest}"
+    say "jsh ${installed_version} is already installed at ${dest}"
     say "use --force to reinstall"
     exit 0
 fi
 
 if [ "${dry_run}" -eq 1 ]; then
-    say "would install rsh ${version:-from source} to ${dest} (channel: ${channel}, target: ${target:-n/a})"
+    say "would install jsh ${version:-from source} to ${dest} (channel: ${channel}, target: ${target:-n/a})"
     exit 0
 fi
 
 mkdir -p "${dest_dir}" || die "cannot create ${dest_dir}"
 writable_dir "${dest_dir}" || die "${dest_dir} is not writable"
 make_tmp
-staged="${tmp_dir}/rsh"
+staged="${tmp_dir}/jsh"
 
 if [ "${channel}" = "release" ]; then
-    archive="rsh-${version}-${target}.tar.gz"
+    archive="jsh-${version}-${target}.tar.gz"
     url="${BASE_URL}/download/v${version}/${archive}"
     say "downloading ${archive}"
     fetch "${url}" "${tmp_dir}/${archive}" || die "download failed: ${url}"
@@ -443,29 +442,29 @@ if [ "${channel}" = "release" ]; then
         warn "no published checksum for ${archive}; skipping verification"
     fi
     tar -C "${tmp_dir}" -xzf "${tmp_dir}/${archive}" || die "cannot unpack ${archive}"
-    unpacked="${tmp_dir}/rsh-${version}-${target}/rsh"
-    [ -f "${unpacked}" ] || die "${archive} does not contain rsh-${version}-${target}/rsh"
+    unpacked="${tmp_dir}/jsh-${version}-${target}/jsh"
+    [ -f "${unpacked}" ] || die "${archive} does not contain jsh-${version}-${target}/jsh"
     mv "${unpacked}" "${staged}"
 else
     have cargo || die "channel 'source' needs cargo (https://rustup.rs)"
-    say "building rsh from source; this takes a few minutes"
+    say "building jsh from source; this takes a few minutes"
     cargo_root="${tmp_dir}/cargo-root"
     if [ -n "${version}" ]; then
         cargo install --git "https://github.com/${REPO}" --tag "v${version}" \
-            --locked --root "${cargo_root}" rsh || die "cargo install failed"
+            --locked --root "${cargo_root}" jsh || die "cargo install failed"
     else
         cargo install --git "https://github.com/${REPO}" \
-            --locked --root "${cargo_root}" rsh || die "cargo install failed"
+            --locked --root "${cargo_root}" jsh || die "cargo install failed"
     fi
-    [ -f "${cargo_root}/bin/rsh" ] || die "cargo did not produce a binary"
-    mv "${cargo_root}/bin/rsh" "${staged}"
+    [ -f "${cargo_root}/bin/jsh" ] || die "cargo did not produce a binary"
+    mv "${cargo_root}/bin/jsh" "${staged}"
 fi
 
 chmod 0755 "${staged}"
-staged_version="$(rsh_version_of "${staged}")"
-[ -n "${staged_version}" ] || die "the downloaded binary does not identify itself as rsh"
+staged_version="$(jsh_version_of "${staged}")"
+[ -n "${staged_version}" ] || die "the downloaded binary does not identify itself as jsh"
 if [ -n "${version}" ] && [ "${staged_version}" != "${version}" ]; then
-    die "expected rsh ${version} but the binary reports ${staged_version}"
+    die "expected jsh ${version} but the binary reports ${staged_version}"
 fi
 version="${staged_version}"
 
@@ -473,15 +472,15 @@ version="${staged_version}"
 backup=""
 if [ -n "${installed_version}" ]; then
     if mkdir -p "${ROLLBACK_DIR}" 2> /dev/null; then
-        backup="${ROLLBACK_DIR}/rsh-${installed_version}"
-        rm -f "${ROLLBACK_DIR}"/rsh-* 2> /dev/null || :
+        backup="${ROLLBACK_DIR}/jsh-${installed_version}"
+        rm -f "${ROLLBACK_DIR}"/jsh-* 2> /dev/null || :
         cp "${dest}" "${backup}" 2> /dev/null || backup=""
     fi
 fi
 
 # Land the new binary with rename(2) inside the destination directory: the swap
 # is atomic and running shells keep the inode they were started from.
-incoming="${dest_dir}/.rsh.incoming.$$"
+incoming="${dest_dir}/.jsh.incoming.$$"
 cp "${staged}" "${incoming}" || die "cannot write to ${dest_dir}"
 chmod 0755 "${incoming}"
 mv -f "${incoming}" "${dest}" || {
@@ -489,7 +488,7 @@ mv -f "${incoming}" "${dest}" || {
     die "cannot replace ${dest}"
 }
 
-if [ "$(rsh_version_of "${dest}")" != "${version}" ]; then
+if [ "$(jsh_version_of "${dest}")" != "${version}" ]; then
     if [ -n "${backup}" ] && [ -f "${backup}" ]; then
         cp "${backup}" "${incoming}" && mv -f "${incoming}" "${dest}"
         die "the installed binary failed its self-check; restored ${installed_version}"
@@ -498,11 +497,11 @@ if [ "$(rsh_version_of "${dest}")" != "${version}" ]; then
 fi
 
 if [ -z "${installed_version}" ]; then
-    say "installed rsh ${version} at ${dest}"
+    say "installed jsh ${version} at ${dest}"
 elif [ "${installed_version}" = "${version}" ]; then
-    say "reinstalled rsh ${version} at ${dest}"
+    say "reinstalled jsh ${version} at ${dest}"
 else
-    say "updated rsh ${installed_version} -> ${version} at ${dest}"
+    say "updated jsh ${installed_version} -> ${version} at ${dest}"
 fi
 if [ -n "${backup}" ]; then
     say "previous binary kept at ${backup}"
@@ -511,22 +510,22 @@ cache_put "${version}" "${target}"
 
 # --- post-install PATH report ------------------------------------------------
 
-resolved="$(path_rsh)"
+resolved="$(path_jsh)"
 if [ -z "${resolved}" ]; then
     say ""
     warn "${dest_dir} is not on PATH; add it, for example:"
     say "    export PATH=\"${dest_dir}:\$PATH\""
 elif [ "${resolved}" != "${dest}" ]; then
-    other_version="$(rsh_version_of "${resolved}")"
+    other_version="$(jsh_version_of "${resolved}")"
     say ""
     if [ -z "${other_version}" ]; then
-        # Almost always /usr/bin/rsh, the BSD remote shell.
-        warn "PATH resolves rsh to ${resolved}, which is not this shell"
+        # Some unrelated binary that happens to be named jsh.
+        warn "PATH resolves jsh to ${resolved}, which is not this shell"
     else
-        warn "PATH resolves rsh to ${resolved} (rsh ${other_version}), not the copy just installed"
+        warn "PATH resolves jsh to ${resolved} (jsh ${other_version}), not the copy just installed"
     fi
     say "    put ${dest_dir} earlier on PATH, or rerun with --bin-dir $(dirname "${resolved}")"
 fi
 
 say ""
-say "running shells keep the version they started with; open a new tab to use rsh ${version}"
+say "running shells keep the version they started with; open a new tab to use jsh ${version}"
