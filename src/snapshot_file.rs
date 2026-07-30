@@ -36,6 +36,17 @@
 //!   argv can contain hostnames, remote paths and `docker exec` targets, and
 //!   the cwd of every pane is a map of the user's filesystem. This is not
 //!   configurable.
+//! - **Only a directory this module *created* is chmodded by
+//!   [`write_atomic_private`]; tightening one that already existed is the
+//!   caller's explicit request, through [`ensure_private_directory`].** Two of
+//!   the four apps take the snapshot path from config (jterm2
+//!   `session_history_file`, jterm3 `session_history_path` — which also expands
+//!   `~`), so the parent directory of a destination is not necessarily the
+//!   app's own: it can be `$HOME` or `/tmp`. A `write_atomic_private` that
+//!   tightened whatever parent it was handed would chmod `$HOME` to `0700` as a
+//!   side effect of an autosave, and fail the whole save with `EPERM` on
+//!   `/tmp`. The apps that do own their directory (jterm1
+//!   `~/.config/jterm1`, jterm4 `~/.config/jterm4/windows`) say so once.
 //! - **Nothing here parses.** No `serde_json`, no snapshot types: the four
 //!   apps' snapshot schemas differ (jterm1/jterm4 `SavedSession`, jterm3
 //!   `SessionsSnapshot`, jterm2 its own), and folding a schema in here would
