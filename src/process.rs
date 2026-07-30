@@ -20,6 +20,7 @@
 //!   after the kernel is free to reuse it. The `/proc` probes above are what
 //!   make the session drain possible, which is why both live in one module.
 
+use serde::Deserialize;
 use std::ffi::c_int;
 use std::io;
 use std::path::Path;
@@ -209,6 +210,53 @@ pub fn command_uses_external_cwd(args: &[String]) -> bool {
 /// when local panes use the VTE compatibility backend.
 pub fn command_requires_block_integration(args: &[String]) -> bool {
     matches!(command_basename(args), "ssh" | "mosh")
+}
+
+/// How a snapshot on disk may spell a restorable command. `untagged` so both
+/// shapes are accepted from the same field without a schema version.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum StoredRestorableCommand {
+    Argv(Vec<String>),
+    LegacyString(String),
+}
+
+/// Deserialize a snapshot's restorable command, accepting the legacy joined
+/// string but never replaying it.
+///
+/// The identical duplicate of this lived at jterm1 `src/session.rs` and jterm4
+/// `src/state.rs` (byte-for-byte apart from the log level). Older snapshots
+/// stored the command as `argv.join(" ")`, whose argument boundaries cannot be
+/// recovered: `ssh host 'echo a; rm b'` re-splits into a different command, and
+/// re-quoting a guess would run it locally at restore time without the user
+/// asking. Deserializing to `None` keeps such a snapshot loadable — its tabs,
+/// cwds and layout are still good — while dropping only the command that cannot
+/// be replayed safely.
+///
+/// Use with `#[serde(default, deserialize_with = "...")]` on an
+/// `Option<Vec<String>>` field, so a snapshot predating the field also loads.
+pub fn deserialize_restorable_argv<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Option::<StoredRestorableCommand>::deserialize(deserializer)?;
+    Ok(match stored {
+        // An empty argv is not restorable either: replaying it would exec the
+        // configured shell as if the pane had never run a command.
+        Some(StoredRestorableCommand::Argv(argv)) if !argv.is_empty() => Some(argv),
+        Some(StoredRestorableCommand::LegacyString(joined)) => {
+            // Log the first word only. It is the one boundary the joined form
+            // usually did preserve, so it tells a user which pane lost its
+            // command, without echoing arguments that can hold hostnames, remote
+            // paths or a `docker exec` target into the log.
+            let program = joined.split_whitespace().next().unwrap_or("(empty)");
+            log::warn!(
+                "Ignoring legacy session restore command '{program}' without argv boundaries"
+            );
+            None
+        }
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,6 +1424,53 @@ mod tests {
     fn restored_argv_rejects_pty_control_characters() {
         assert!(shell_quote_argv(&argv(&["ssh", "host\n"])).is_none());
         assert!(shell_quote_argv(&argv(&["ssh", "\x1b]0;x\x07"])).is_none());
+    }
+
+    /// Stand-in for the frontends' snapshot leaf: only the field attribute
+    /// matters, and it is the attribute this test is here to pin.
+    #[derive(Deserialize, Debug, PartialEq, Eq)]
+    struct StoredPane {
+        #[serde(default, deserialize_with = "deserialize_restorable_argv")]
+        cmds: Option<Vec<String>>,
+    }
+
+    fn stored_pane(json: &str) -> StoredPane {
+        serde_json::from_str(json).expect("snapshot leaf must stay loadable")
+    }
+
+    #[test]
+    fn restorable_argv_deserializes_from_the_argv_form() {
+        assert_eq!(
+            stored_pane(r#"{"cmds":["ssh","host","echo a; rm b"]}"#).cmds,
+            Some(argv(&["ssh", "host", "echo a; rm b"]))
+        );
+    }
+
+    #[test]
+    fn legacy_joined_command_loads_but_is_never_replayed() {
+        // The whole point: the snapshot still loads (its tabs, cwds and layout
+        // are good) but the one field whose argument boundaries were destroyed
+        // by `argv.join(" ")` is dropped rather than re-split into a different
+        // command than the user ran.
+        assert_eq!(
+            stored_pane(r#"{"cmds":"ssh host echo a; rm b"}"#).cmds,
+            None
+        );
+    }
+
+    #[test]
+    fn missing_null_and_empty_restorable_commands_are_all_none() {
+        for json in ["{}", r#"{"cmds":null}"#, r#"{"cmds":[]}"#, r#"{"cmds":""}"#] {
+            assert_eq!(stored_pane(json).cmds, None, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_restorable_command_fails_the_whole_field() {
+        // Neither shape: not silently swallowed, because a number or object here
+        // means the snapshot was written by something that is not this family.
+        assert!(serde_json::from_str::<StoredPane>(r#"{"cmds":7}"#).is_err());
+        assert!(serde_json::from_str::<StoredPane>(r#"{"cmds":[1,2]}"#).is_err());
     }
 
     #[test]
