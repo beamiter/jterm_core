@@ -23,6 +23,7 @@ pub mod notify;
 pub mod pane_layout;
 pub mod parser;
 pub mod process;
+pub mod pty_input;
 pub mod redact;
 pub mod review_input;
 pub mod theme;
