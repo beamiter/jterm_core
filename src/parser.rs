@@ -18,6 +18,14 @@ const MAX_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Oversized unterminated payloads are discarded until their real terminator.
 const MAX_DCS_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_CLIPBOARD_BASE64_BYTES: usize = 4 * 1024 * 1024;
+/// Per-field caps for the OSC 133 metadata jsh attaches to its C/D packets.
+/// jsh bounds these on the way out (`MAX_OSC_COMMAND_BYTES` = 16 KiB,
+/// `MAX_OSC_CWD_BYTES` = 4 KiB in jsh/src/osc.rs), but any program can write an
+/// OSC 133 packet, so the reader bounds them too rather than trusting a
+/// cooperative producer.
+const MAX_OSC133_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_OSC133_CWD_BYTES: usize = 4 * 1024;
+const MAX_OSC133_ID_BYTES: usize = 1024;
 
 /// Which color slot an OSC 10/11/12/4 query asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +65,7 @@ pub enum KeyboardProtocolQuery {
 }
 
 /// Events emitted by the stream parser.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParserEvent {
     /// Raw bytes that should be displayed verbatim (ANSI codes stripped of OSC 133/7).
     Bytes(Vec<u8>),
@@ -65,10 +73,19 @@ pub enum ParserEvent {
     PromptStart,
     /// OSC 133 ;B — prompt finished, waiting for user input.
     PromptEnd,
-    /// OSC 133 ;C — user pressed Enter, command is executing.
-    CommandStart,
-    /// OSC 133 ;D with a numeric status — command finished with exit code.
-    CommandEnd(i32),
+    /// OSC 133 ;C — user pressed Enter, command is executing. Carries whatever
+    /// [`CommandMeta`] the shell attached; every field is absent for a shell
+    /// that emits only the bare FinalTerm mark.
+    CommandStart(CommandMeta),
+    /// OSC 133 ;D — command finished.
+    ///
+    /// `exit` is `None` when the shell sent no status or an unparseable one.
+    /// That case used to collapse to `Some(0)`, i.e. a command of unknown
+    /// outcome was reported as having succeeded.
+    CommandEnd {
+        exit: Option<i32>,
+        meta: CommandMeta,
+    },
     /// OSC 7770 — jsh-specific: the remote shell announces its session ID at
     /// startup. The UI stores it on the tab's RemoteConn so subsequent
     /// reconnects pass `--session <id>` and jsh restores cwd/env/aliases.
@@ -721,6 +738,108 @@ fn emit_dcs_passthrough(payload: &[u8], passthrough: &mut Vec<u8>) {
     passthrough.push(b'\\');
 }
 
+/// The metadata a shell attaches to its OSC 133 `C` and `D` packets.
+///
+/// jsh — the family's own shell — carries the command line, the execution id it
+/// keys its execution journal on, the cwd and the measured duration, all
+/// percent-encoded (see `jsh/src/osc.rs`, whose tests pin the exact bytes).
+/// This parser used to split on `;`, read the mark, and throw every parameter
+/// away, so the two frontends that share it reconstructed the command by
+/// scraping it back off the screen and could never correlate their captured
+/// output with a journal record — while [`crate::execution_journal::submit`]
+/// existed for exactly that.
+///
+/// Every field is optional: the same mark is emitted by shells that send no
+/// metadata at all, and a field whose encoding is malformed, oversized or not
+/// UTF-8 is dropped rather than guessed at, so a hostile producer degrades the
+/// metadata instead of the mark.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandMeta {
+    /// The shell's own execution id — the correlation key into its journal.
+    pub id: Option<String>,
+    /// The command line as the shell parsed it, not as the screen rendered it.
+    pub command: Option<String>,
+    /// Working directory the command ran in.
+    pub cwd: Option<String>,
+    /// Wall-clock duration the shell measured, which beats a timer started when
+    /// the frontend happened to notice the mark.
+    pub duration_ms: Option<u64>,
+    /// The shell had a command line but it exceeded the packet budget, so
+    /// [`CommandMeta::command`] is absent for a reason worth telling apart from
+    /// "this shell sends no metadata".
+    pub command_truncated: bool,
+}
+
+impl CommandMeta {
+    /// Parse the `key=value` fields of an OSC 133 packet.
+    ///
+    /// Key aliases follow jterm2's decoder, which is the family's most complete
+    /// and has been reading jsh's packets in production; accepting its spellings
+    /// means the shared parser cannot understand *less* than the frontend that
+    /// already had its own.
+    fn from_fields<'a>(fields: impl Iterator<Item = &'a str>) -> Self {
+        let mut meta = Self::default();
+        for field in fields {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            match key {
+                "id" | "jsh_id" | "execution_id" | "command_id" => {
+                    meta.id = decode_osc133(value, MAX_OSC133_ID_BYTES)
+                        .filter(|id| !id.is_empty() && !id.chars().any(char::is_control));
+                }
+                "cmdline_url" | "command_url" | "command" | "cmdline" => {
+                    meta.command = decode_osc133(value, MAX_OSC133_COMMAND_BYTES);
+                }
+                "cwd_url" | "cwd" => {
+                    meta.cwd = decode_osc133(value, MAX_OSC133_CWD_BYTES);
+                }
+                "duration_ms" | "duration" => {
+                    meta.duration_ms = value.parse().ok();
+                }
+                "cmd_truncated" | "command_truncated" => {
+                    meta.command_truncated = value == "1" || value.eq_ignore_ascii_case("true");
+                }
+                _ => {}
+            }
+        }
+        meta
+    }
+}
+
+/// Strict percent-decode of one OSC 133 metadata field.
+///
+/// Strict on purpose, following jterm2: a truncated escape, an oversized value
+/// or invalid UTF-8 yields `None` rather than a best-effort string, because the
+/// decoded value is used as a filesystem path, a journal key, and text put in
+/// front of the user. Half-decoded input is worse than none.
+fn decode_osc133(value: &str, max_bytes: usize) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len().min(max_bytes));
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = if bytes[i] == b'%' {
+            // Needs two more bytes; `i + 2` must be a valid index.
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let high = (bytes[i + 1] as char).to_digit(16)? as u8;
+            let low = (bytes[i + 2] as char).to_digit(16)? as u8;
+            i += 3;
+            (high << 4) | low
+        } else {
+            let byte = bytes[i];
+            i += 1;
+            byte
+        };
+        if decoded.len() == max_bytes {
+            return None;
+        }
+        decoded.push(byte);
+    }
+    String::from_utf8(decoded).ok()
+}
+
 fn valid_remote_session_id(id: &str) -> bool {
     !id.is_empty() && id.chars().count() <= 1_024 && !id.chars().any(char::is_control)
 }
@@ -737,13 +856,24 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         match fields.next() {
             Some("A") => events.push(ParserEvent::PromptStart),
             Some("B") => events.push(ParserEvent::PromptEnd),
-            Some("C") => events.push(ParserEvent::CommandStart),
+            Some("C") => {
+                events.push(ParserEvent::CommandStart(CommandMeta::from_fields(fields)));
+            }
             Some("D") => {
-                let code = fields
-                    .next()
-                    .and_then(|f| f.parse::<i32>().ok())
-                    .unwrap_or(0);
-                events.push(ParserEvent::CommandEnd(code));
+                // The exit status is positional and comes first, but a shell may
+                // omit it and send only `key=value` metadata, so a field that
+                // carries an `=` is metadata rather than an unparseable status.
+                let mut rest = fields.peekable();
+                let exit = match rest.peek() {
+                    Some(field) if !field.contains('=') => {
+                        rest.next().and_then(|field| field.parse::<i32>().ok())
+                    }
+                    _ => None,
+                };
+                events.push(ParserEvent::CommandEnd {
+                    exit,
+                    meta: CommandMeta::from_fields(rest),
+                });
             }
             _ => {}
         }
@@ -1270,12 +1400,179 @@ mod tests {
             .iter()
             .map(|e| match e {
                 ParserEvent::PromptStart => "A",
-                ParserEvent::CommandStart => "C",
-                ParserEvent::CommandEnd(_) => "D",
+                ParserEvent::CommandStart(_) => "C",
+                ParserEvent::CommandEnd { .. } => "D",
                 _ => "?",
             })
             .collect();
         assert_eq!(kinds, vec!["A", "C", "D"]);
+
+        // The bare FinalTerm form carries no metadata, and that must stay
+        // distinguishable from a shell whose metadata failed to decode.
+        assert_eq!(events[1], ParserEvent::CommandStart(CommandMeta::default()));
+        assert_eq!(
+            events[2],
+            ParserEvent::CommandEnd {
+                exit: Some(0),
+                meta: CommandMeta::default(),
+            }
+        );
+    }
+
+    fn only_event(bytes: &[u8]) -> ParserEvent {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(bytes, &mut events);
+        assert_eq!(events.len(), 1, "{events:?}");
+        events.pop().expect("one event")
+    }
+
+    /// Twin test: the byte literal is jsh's own, copied from the assertion in
+    /// `jsh/src/osc.rs` that pins what `command_output_start_packet` emits. If
+    /// either end changes the packet format, this reddens.
+    #[test]
+    fn osc133_start_decodes_the_packet_jsh_actually_emits() {
+        let event = only_event(b"\x1b]133;C;id=jsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07");
+        assert_eq!(
+            event,
+            ParserEvent::CommandStart(CommandMeta {
+                id: Some("jsh-1".to_string()),
+                command: None,
+                cwd: Some("/tmp".to_string()),
+                duration_ms: None,
+                // The shell had a command line and dropped it for size. Telling
+                // that apart from "sends no metadata" is the whole point.
+                command_truncated: true,
+            })
+        );
+    }
+
+    #[test]
+    fn osc133_end_keeps_the_positional_exit_and_the_metadata() {
+        let event =
+            only_event(b"\x1b]133;D;127;id=jsh-2;duration_ms=42;cwd_url=%2Ftmp%2Fa%3Bb\x07");
+        assert_eq!(
+            event,
+            ParserEvent::CommandEnd {
+                exit: Some(127),
+                meta: CommandMeta {
+                    id: Some("jsh-2".to_string()),
+                    command: None,
+                    // `;` is percent-escaped by jsh precisely so it cannot forge
+                    // a field boundary; it must come back as data.
+                    cwd: Some("/tmp/a;b".to_string()),
+                    duration_ms: Some(42),
+                    command_truncated: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn osc133_start_decodes_a_percent_encoded_command_line() {
+        let event = only_event(
+            b"\x1b]133;C;id=jsh-3;cmdline_url=printf%20%27a%3Bb%2Bc%27%0A%E9%9B%AA;cwd_url=%2Ftmp\x07",
+        );
+        let ParserEvent::CommandStart(meta) = event else {
+            panic!("expected CommandStart");
+        };
+        // The exact command the shell parsed, newline and CJK intact -- no
+        // screen scraping, and no field split on the escaped ';'.
+        assert_eq!(meta.command.as_deref(), Some("printf 'a;b+c'\n雪"));
+        assert_eq!(meta.cwd.as_deref(), Some("/tmp"));
+    }
+
+    /// A missing or unparseable status is `None`, not success. It used to
+    /// `unwrap_or(0)`, so a command of unknown outcome was reported as having
+    /// succeeded -- and an exit-code badge showed a green 0.
+    #[test]
+    fn osc133_end_without_a_status_is_unknown_rather_than_zero() {
+        assert_eq!(
+            only_event(b"\x1b]133;D\x07"),
+            ParserEvent::CommandEnd {
+                exit: None,
+                meta: CommandMeta::default()
+            }
+        );
+        assert_eq!(
+            only_event(b"\x1b]133;D;not-a-number\x07"),
+            ParserEvent::CommandEnd {
+                exit: None,
+                meta: CommandMeta::default()
+            }
+        );
+        // Metadata with no positional status must not be eaten as the status.
+        assert_eq!(
+            only_event(b"\x1b]133;D;id=jsh-4\x07"),
+            ParserEvent::CommandEnd {
+                exit: None,
+                meta: CommandMeta {
+                    id: Some("jsh-4".to_string()),
+                    ..CommandMeta::default()
+                }
+            }
+        );
+        // A signal-terminated command reports 128+n, which must survive.
+        assert_eq!(
+            only_event(b"\x1b]133;D;143\x07"),
+            ParserEvent::CommandEnd {
+                exit: Some(143),
+                meta: CommandMeta::default()
+            }
+        );
+    }
+
+    #[test]
+    fn osc133_drops_a_field_it_cannot_decode_but_keeps_the_mark() {
+        // Truncated escape, oversized value, and invalid UTF-8 each yield None
+        // for that field only: half-decoded text becomes a path and a journal
+        // key, so guessing is worse than admitting ignorance.
+        let ParserEvent::CommandStart(meta) = only_event(b"\x1b]133;C;id=jsh-5;cwd_url=%2\x07")
+        else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.id.as_deref(), Some("jsh-5"));
+        assert_eq!(meta.cwd, None);
+
+        let ParserEvent::CommandStart(meta) = only_event(b"\x1b]133;C;cwd_url=%FF%FE\x07") else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.cwd, None);
+
+        let oversized = format!(
+            "\x1b]133;C;cwd_url={}\x07",
+            "x".repeat(MAX_OSC133_CWD_BYTES + 1)
+        );
+        let ParserEvent::CommandStart(meta) = only_event(oversized.as_bytes()) else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.cwd, None);
+    }
+
+    /// An id becomes a lookup key and is shown to the user, so a control
+    /// character in it is refused outright rather than carried around.
+    #[test]
+    fn osc133_refuses_a_control_bearing_id() {
+        let ParserEvent::CommandStart(meta) =
+            only_event(b"\x1b]133;C;id=jsh%3A7%3B%1B%07;cwd_url=%2Ftmp\x07")
+        else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.id, None);
+        assert_eq!(meta.cwd.as_deref(), Some("/tmp"), "the mark still lands");
+    }
+
+    #[test]
+    fn osc133_accepts_the_key_aliases_jterm2_already_read() {
+        let ParserEvent::CommandStart(meta) =
+            only_event(b"\x1b]133;C;execution_id=x1;command=ls%20-la;cwd=%2Fsrv;duration=7\x07")
+        else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.id.as_deref(), Some("x1"));
+        assert_eq!(meta.command.as_deref(), Some("ls -la"));
+        assert_eq!(meta.cwd.as_deref(), Some("/srv"));
+        assert_eq!(meta.duration_ms, Some(7));
     }
 
     #[test]
