@@ -144,16 +144,60 @@ impl Prompt {
 
 /// Decide whether a check result deserves a prompt. A failed check is never
 /// one: an offline laptop must not grow a bar it cannot act on.
+///
+/// `update_available` is necessary but not sufficient. The flag is computed by
+/// the installer, and the installer that answered may be an older vendored copy
+/// or a cache entry written by one — and until this round it set the flag on
+/// mere string inequality, so a published release *older* than the installed
+/// one (a yanked tag, or a source build that ran ahead of the last tag) arrived
+/// here as an update. Ordering the versions here as well means a downgrade is
+/// never labelled "Update" no matter which installer produced the answer.
 pub fn prompt_for(status: &Status) -> Option<Prompt> {
     let latest = status.latest.clone()?;
     match status.installed.clone() {
         None => Some(Prompt::Missing { latest }),
-        Some(installed) if status.update_available && installed != latest => Some(Prompt::Update {
-            from: installed,
-            to: latest,
-        }),
+        Some(installed) if status.update_available && version_gt(&latest, &installed) => {
+            Some(Prompt::Update {
+                from: installed,
+                to: latest,
+            })
+        }
         Some(_) => None,
     }
+}
+
+/// Is `left` a strictly newer release than `right`?
+///
+/// The twin of `version_gt` in `scripts/install-jsh.sh` and deliberately as
+/// blunt: compare `MAJOR.MINOR.PATCH` numerically, drop any pre-release suffix
+/// rather than ordering it, and read an unparsable field as 0 so a version this
+/// cannot understand sorts as older instead of being offered.
+fn version_gt(left: &str, right: &str) -> bool {
+    for index in 0..3 {
+        let l = version_field(left, index);
+        let r = version_field(right, index);
+        if l != r {
+            return l > r;
+        }
+    }
+    false
+}
+
+/// One dotted field of a version, as a number; 0 when absent or unparsable.
+fn version_field(version: &str, index: usize) -> u64 {
+    version
+        .strip_prefix('v')
+        .unwrap_or(version)
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .split('.')
+        .nth(index)
+        .map(|field| {
+            let digits: String = field.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().unwrap_or(0)
+        })
+        .unwrap_or(0)
 }
 
 /// Materialize the embedded installer under the user's cache directory and
@@ -249,6 +293,23 @@ mod tests {
         assert!(INSTALLER_SOURCE.contains("\"update_available\""));
     }
 
+    /// This copy is vendored by hand from the jsh repository, so nothing forces
+    /// it to be current — and a stale copy is not inert: it is what computes
+    /// `update_available` and what actually installs. Assert on the behaviour
+    /// that was wrong, so re-vendoring an older script fails here instead of
+    /// silently reintroducing a downgrade offer.
+    #[test]
+    fn the_vendored_installer_orders_versions_rather_than_comparing_strings() {
+        assert!(
+            INSTALLER_SOURCE.contains("version_gt()"),
+            "vendored install-jsh.sh predates the version-ordering fix; re-vendor it \
+             from the jsh repository"
+        );
+        assert!(INSTALLER_SOURCE.contains("version_gt \"$1\" \"${installed_version}\""));
+        // And the install path refuses to walk backwards on a bare run.
+        assert!(INSTALLER_SOURCE.contains("is newer than the published"));
+    }
+
     #[test]
     fn update_check_policies_round_trip_and_map_to_cache_ages() {
         for policy in [UpdateCheck::Startup, UpdateCheck::Daily, UpdateCheck::Never] {
@@ -299,6 +360,60 @@ mod tests {
         let status =
             status_from(r#"{"installed":"0.3.0","latest":"0.3.0","update_available":false}"#);
         assert_eq!(prompt_for(&status), None);
+    }
+
+    /// A published release older than the installed one is not an update, even
+    /// when the answering installer insists it is. Reachable from a yanked tag,
+    /// from a build made from source that ran ahead of the last tag, and from a
+    /// cache entry written by a pre-fix installer — which set the flag whenever
+    /// the two version strings merely differed.
+    #[test]
+    fn an_older_published_release_is_never_offered_as_an_update() {
+        let status =
+            status_from(r#"{"installed":"0.4.0","latest":"0.3.9","update_available":true}"#);
+        assert_eq!(prompt_for(&status), None);
+    }
+
+    /// Versions order numerically, not as text: `0.10.0` is newer than `0.9.0`
+    /// though it sorts below it as a string.
+    #[test]
+    fn versions_order_numerically() {
+        assert!(version_gt("0.10.0", "0.9.0"));
+        assert!(!version_gt("0.9.0", "0.10.0"));
+        assert!(version_gt("1.0.0", "0.99.99"));
+        assert!(version_gt("0.3.1", "0.3.0"));
+        assert!(!version_gt("0.3.0", "0.3.0"));
+        assert!(version_gt("v0.4.0", "0.3.0"));
+
+        // A pre-release suffix is dropped rather than ordered: neither side wins,
+        // so nothing is offered. Ordering them needs the full semver rule.
+        assert!(!version_gt("0.3.0-rc1", "0.3.0"));
+        assert!(!version_gt("0.3.0", "0.3.0-rc1"));
+
+        // Unparsable reads as 0, so a version this cannot understand sorts as
+        // older and is never offered over a real one.
+        assert!(!version_gt("garbage", "0.1.0"));
+        assert!(version_gt("0.1.0", "garbage"));
+        assert!(!version_gt("", ""));
+
+        // Missing trailing fields are zero, not an error.
+        assert!(version_gt("0.4", "0.3.9"));
+        assert!(!version_gt("0.3", "0.3.0"));
+    }
+
+    /// The prompt still fires for a genuine newer release whose ordering is only
+    /// visible numerically — the case a lexicographic guard would have blocked.
+    #[test]
+    fn a_numerically_newer_release_is_still_offered() {
+        let status =
+            status_from(r#"{"installed":"0.9.0","latest":"0.10.0","update_available":true}"#);
+        assert_eq!(
+            prompt_for(&status),
+            Some(Prompt::Update {
+                from: "0.9.0".into(),
+                to: "0.10.0".into()
+            })
+        );
     }
 
     #[test]
