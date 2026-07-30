@@ -157,36 +157,87 @@ fn normalize_newlines(text: &str) -> String {
 /// Remove paste-bracket markers, then optionally C0/C1, recording what was
 /// found. Markers go first: stripping ESC first would leave a literal `[201~`
 /// behind, which is harmless but wrong to echo back into an editor model.
+///
+/// Removal checks the **tail of the output** after appending each character,
+/// rather than scanning the input for markers. Scanning the input is what an
+/// obvious implementation does, and it is exploitable: deleting a marker splices
+/// what was in front of it onto what followed, and those halves can spell a live
+/// marker that a forward scan has already walked past. `ESC[ ESC[ ESC[201~ 201~`
+/// is the shortest example — remove the one real match and the leading `ESC[`
+/// joins the trailing `201~`. Checking the output tail catches every marker the
+/// splice creates, in one pass, because a marker can only ever be completed by
+/// the character just appended.
 fn defang(text: &str, strip_controls: bool) -> (String, bool, bool) {
-    let mut out = String::with_capacity(text.len());
+    // Pass 1 — markers. Must run before control stripping: removing the ESC
+    // first would leave a literal `[201~` behind, which is inert but wrong to
+    // echo into an editor model.
+    let mut stripped = String::with_capacity(text.len());
     let mut had_marker = false;
-    let mut had_controls = false;
-
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest = &bytes[i..];
-        if let Some(len) = marker_len(rest) {
-            had_marker = true;
-            i += len;
-            continue;
+    for ch in text.chars() {
+        stripped.push(ch);
+        // A marker ends in `~`, so only that character can complete one; every
+        // other byte skips the check.
+        if ch == '~' {
+            if let Some(len) = marker_len_at_end_str(&stripped) {
+                had_marker = true;
+                stripped.truncate(stripped.len() - len);
+            }
         }
-        // Walk by char so multi-byte scalars are never split.
-        let ch = text[i..].chars().next().expect("index is a char boundary");
+    }
+
+    // Pass 2 — controls. No marker can reappear here: every marker spelling
+    // begins with a control (ESC or 0x9B), so if controls are being stripped
+    // none can survive, and if they are not, this pass changes nothing.
+    let mut had_controls = false;
+    let mut out = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
         let is_control = matches!(ch, '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}')
             || matches!(ch, '\u{80}'..='\u{9f}');
         if is_control {
             had_controls = true;
             if strip_controls {
-                i += ch.len_utf8();
                 continue;
             }
         }
         out.push(ch);
-        i += ch.len_utf8();
     }
 
     (out, had_marker, had_controls)
+}
+
+/// Length of a paste-bracket marker ending at the tail of a byte stream. Both
+/// C1 spellings are in play here: a caller assembling bytes itself can emit a
+/// bare `9B`.
+fn marker_len_at_end(data: &[u8]) -> Option<usize> {
+    [
+        PASTE_START,
+        PASTE_END,
+        C1_PASTE_START,
+        C1_PASTE_END,
+        C1_PASTE_START_UTF8,
+        C1_PASTE_END_UTF8,
+    ]
+    .into_iter()
+    .find(|marker| data.ends_with(marker))
+    .map(<[u8]>::len)
+}
+
+/// Same, for text.
+///
+/// The *raw* C1 spellings are deliberately excluded: in a `str`, `U+009B` is
+/// encoded `C2 9B`, so the 5-byte `9B 32 30 31 7E` form matches the tail of the
+/// 6-byte encoded one. Truncating by 5 would leave a dangling `C2` and panic on
+/// the next `String::truncate`, which is how this was found.
+fn marker_len_at_end_str(text: &str) -> Option<usize> {
+    [
+        PASTE_START,
+        PASTE_END,
+        C1_PASTE_START_UTF8,
+        C1_PASTE_END_UTF8,
+    ]
+    .into_iter()
+    .find(|marker| text.as_bytes().ends_with(marker))
+    .map(<[u8]>::len)
 }
 
 /// Length of a paste-bracket marker at the head of `data`, in either the 7-bit
@@ -376,20 +427,31 @@ impl InputGuard {
             0
         };
 
+        // Same tail-check rule as `defang`, and for the same reason: removing a
+        // marker splices its neighbours together and those halves can spell a
+        // live marker. `out` holds the rewritten prefix once anything changes,
+        // so the tail being checked is always post-splice.
         let mut i = body_start;
         while i < body_end {
-            if let Some(len) = marker_len(&data[i..]) {
-                if !changed {
-                    out.extend_from_slice(&data[..i]);
-                    changed = true;
+            let byte = data[i];
+            i += 1;
+            if changed {
+                out.push(byte);
+                if byte == b'~' {
+                    if let Some(len) = marker_len_at_end(&out) {
+                        out.truncate(out.len() - len);
+                    }
                 }
-                i += len;
                 continue;
             }
-            if changed {
-                out.push(data[i]);
+            if byte == b'~' {
+                if let Some(len) = marker_len_at_end(&data[body_start..i]) {
+                    // First marker in this chunk: copy the clean prefix, drop
+                    // the marker, and switch to the owned path.
+                    out.extend_from_slice(&data[..i - len]);
+                    changed = true;
+                }
             }
-            i += 1;
         }
 
         self.in_frame = if trailing_close { false } else { framed };
@@ -499,6 +561,42 @@ mod tests {
         let paste = encode_paste("a\x1b[200~b\u{9b}201~c", modes, policy);
         assert_eq!(paste.echo_text, "abc");
         assert!(paste.risk.had_embedded_paste_marker);
+    }
+
+    /// Removing a marker splices its neighbours together, and those halves can
+    /// spell a live marker that a forward scan has already walked past. This is
+    /// the shortest payload that exploits it: `ESC[ ESC[ ESC[201~ 201~ 201~`
+    /// leaves a working `ESC[201~` inside the frame under a scan-the-input
+    /// implementation, and it reaches the PTY through command recall, which does
+    /// not strip control bytes.
+    #[test]
+    fn a_spliced_terminator_does_not_reassemble() {
+        let modes = PasteModes { bracketed: true };
+        let policy = PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim);
+        let paste = encode_paste(
+            "echo ok\x1b[\x1b[\x1b[201~201~201~\rrm -rf ~",
+            modes,
+            policy,
+        );
+
+        let interior = &paste.bytes[PASTE_START.len()..paste.bytes.len() - PASTE_END.len()];
+        assert!(
+            !contains(interior, PASTE_END),
+            "reassembled terminator: {:?}",
+            String::from_utf8_lossy(interior)
+        );
+        assert_eq!(paste.echo_text, "echo ok\nrm -rf ~");
+        assert!(paste.risk.had_embedded_paste_marker);
+    }
+
+    /// Same splice, at the byte-level boundary net.
+    #[test]
+    fn guard_does_not_let_a_spliced_terminator_reassemble() {
+        let (modes, policy) = guard_policy();
+        let mut guard = InputGuard::new();
+        let out = guard.filter(b"a\x1b[\x1b[\x1b[201~201~201~b", modes, policy);
+        assert!(!contains(&out, PASTE_END), "{:?}", out);
+        assert_eq!(&*out, b"ab");
     }
 
     #[test]
