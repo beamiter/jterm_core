@@ -111,6 +111,15 @@ fn powershell_quote_argv(args: &[String]) -> Option<String> {
 /// Quote a restorable argv for the configured interactive shell. Unknown shell
 /// grammars are deliberately not guessed: skipping automatic replay is safer
 /// than changing argument boundaries.
+///
+/// `jsh` is on the POSIX list because its single-quote handling was verified
+/// against the exact string [`shell_quote_argv`] emits, not because it is the
+/// family's shell. Adding it any earlier would have been wrong: jsh used to
+/// re-derive glob eligibility from already-expanded text, so quoting did not
+/// suppress pathname expansion and a quoted `*` expanded to the directory
+/// listing — one argument silently becoming many, the precise failure this
+/// function exists to avoid. jsh's `tests/glob_quoting_tests.rs` is the twin of
+/// `jsh_quoting_round_trips` below and pins that guarantee from its side.
 pub fn shell_quote_argv_for(args: &[String], shell_argv: &[String]) -> Option<String> {
     let shell = Path::new(shell_argv.first()?)
         .file_name()?
@@ -118,7 +127,7 @@ pub fn shell_quote_argv_for(args: &[String], shell_argv: &[String]) -> Option<St
         .to_ascii_lowercase();
     match shell.as_str() {
         "pwsh" | "powershell" | "powershell.exe" | "pwsh.exe" => powershell_quote_argv(args),
-        "bash" | "dash" | "fish" | "ksh" | "mksh" | "sh" | "zsh" => shell_quote_argv(args),
+        "bash" | "dash" | "fish" | "jsh" | "ksh" | "mksh" | "sh" | "zsh" => shell_quote_argv(args),
         _ => None,
     }
 }
@@ -1487,6 +1496,32 @@ mod tests {
         assert_eq!(
             shell_quote_argv_for(&args, &argv(&["/opt/exotic-shell"])),
             None
+        );
+    }
+
+    /// The family's own shell has to be on the list, or the terminals silently
+    /// decline to replay a restored command into the shell they ship with.
+    ///
+    /// The expectation here is the exact byte string handed to jsh; jsh's
+    /// `tests/glob_quoting_tests.rs` asserts from the other side that parsing it
+    /// yields the original arguments. Changing the quoting on either side must
+    /// redden both.
+    #[test]
+    fn jsh_quoting_round_trips() {
+        let hostile = argv(&[
+            "printf", "[%s]", "a b", "it's", "*", "$(id)", "~", "a;b", "a?", "x[ab]",
+        ]);
+        assert_eq!(
+            shell_quote_argv_for(&hostile, &argv(&["/usr/local/bin/jsh"])),
+            Some(
+                "'printf' '[%s]' 'a b' 'it'\"'\"'s' '*' '$(id)' '~' 'a;b' 'a?' 'x[ab]'".to_string()
+            )
+        );
+        // Reached through a login argv and through a bare name, as the terminals
+        // spawn it both ways.
+        assert_eq!(
+            shell_quote_argv_for(&argv(&["ssh", "*"]), &argv(&["jsh", "--login"])),
+            Some("'ssh' '*'".to_string())
         );
     }
 
