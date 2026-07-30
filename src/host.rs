@@ -170,10 +170,14 @@ fn wrap_argv_for(
     if let Some(cwd) = cwd.filter(|value| !value.is_empty()) {
         wrapped.push(format!("--directory={cwd}"));
     }
-    wrapped.push("--env=TERM=xterm-256color".to_string());
-    for (key, value) in env_extra {
-        wrapped.push(format!("--env={key}={value}"));
-    }
+    // The host child starts from the host session's environment, so every
+    // variable that identifies *this* terminal has to be spelled out. This used
+    // to be a lone TERM, which is how a Flatpak jterm advertised 256 colours to
+    // tools that would have used 24-bit ones.
+    wrapped.extend(crate::child_env::host_bridge_args(
+        &crate::child_env::ChildEnv::from_identity(),
+        env_extra,
+    ));
     wrapped.extend(argv.iter().cloned());
     wrapped
 }
@@ -277,17 +281,24 @@ mod tests {
     #[test]
     fn flatpak_argv_routes_cwd_and_environment_to_host() {
         let argv = vec!["bash".to_string(), "-l".to_string()];
+        // The environment block is whatever `child_env` reports for the process
+        // identity — TERM alone was the bug, not the contract. Tests never call
+        // `identity::init`, so the neutral "jterm" identity holds here.
         assert_eq!(
             wrap_argv_for(true, &argv, Some("/home/alice/project"), &[("LESS", "R")]),
             vec![
-                "flatpak-spawn",
-                "--host",
-                "--watch-bus",
-                "--directory=/home/alice/project",
-                "--env=TERM=xterm-256color",
-                "--env=LESS=R",
-                "bash",
-                "-l",
+                "flatpak-spawn".to_string(),
+                "--host".to_string(),
+                "--watch-bus".to_string(),
+                "--directory=/home/alice/project".to_string(),
+                "--env=TERM=xterm-256color".to_string(),
+                "--env=COLORTERM=truecolor".to_string(),
+                "--env=TERM_PROGRAM=jterm".to_string(),
+                format!("--env=TERM_PROGRAM_VERSION={}", env!("CARGO_PKG_VERSION")),
+                "--env=VTE_VERSION=7802".to_string(),
+                "--env=LESS=R".to_string(),
+                "bash".to_string(),
+                "-l".to_string(),
             ]
         );
     }

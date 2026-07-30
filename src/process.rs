@@ -1420,6 +1420,7 @@ mod tests {
             "--watch-bus",
             "--directory=/home/x",
             "--env=TERM=xterm-256color",
+            "--env=COLORTERM=truecolor",
             "ssh",
             "host",
         ])));

@@ -9,6 +9,7 @@ pub mod agent;
 pub mod ai;
 pub mod atomic_file;
 pub mod char_width;
+pub mod child_env;
 pub mod command_history;
 pub mod execution_journal;
 pub mod exit_status;
