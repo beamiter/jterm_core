@@ -43,19 +43,32 @@
 //!   the PTY's initial size for the life of the shell. The kernel already tells
 //!   the child its window size through the PTY; nothing here needs to.
 //!
-//! Known gap, deferred to a later round: this module *adds to* the environment
-//! the application happens to be running with. It does not take a pristine
-//! snapshot, so a child still inherits whatever the frontend's toolkit put
-//! there — jterm1 leaks `GTK_PATH`/`GTK_IM_MODULE`/`XMODIFIERS`, jterm4 leaks
-//! `JTERM4_CONFIG`/`JTERM4_MODE`/`JTERM4_SAFE_MODE` into every shell. Scrubbing
-//! those needs a snapshot taken before each app's `main` touches the
-//! environment, i.e. ordering assertions in four `main`s, which is a change of
-//! a different shape than this one.
+//! # Inherited-environment boundary
+//!
+//! Frontends must call [`capture_inherited_environment`] as the first operation
+//! in `main`, before CLI parsing writes `JTERM*` variables, before input-method
+//! setup changes `GTK_PATH`/`GTK_IM_MODULE`/`XMODIFIERS`, and before GTK, GLib,
+//! logging, or any worker thread starts. Direct PTY spawns then use
+//! [`envp_from_captured`]. A VTE spawn must use [`vte_envv_from_captured`] as a
+//! complete environment together with VTE's `VTE_SPAWN_NO_PARENT_ENVV` flag;
+//! the ordinary [`vte_envv`] remains an identity-only compatibility adapter and
+//! cannot remove variables from VTE's live parent environment.
+//!
+//! The default snapshot preserves every launch-time variable, including
+//! `JSH_*`, `JTERM*`, and the user's GTK input-method settings. Those
+//! namespaces contain legitimate shell/provider and nested-terminal
+//! configuration, so a blanket namespace scrub would silently change the
+//! child. An embedding frontend that owns a process-only capability or test
+//! variable can instead name it explicitly with
+//! [`capture_inherited_environment_with_scrub`]. Freezing before frontend
+//! setup still keeps later CLI/toolkit mutations out without guessing which
+//! launch-time configuration belongs to the child.
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::OnceLock;
 
 /// Terminal type every jterm claims. All four repos already sent this.
 pub const TERM: &str = "xterm-256color";
@@ -86,6 +99,48 @@ pub const DEFAULT_LS_COLORS: &str = concat!(
 /// environment block is byte-identical across runs, which is what makes the
 /// spawn path diffable when a shell misbehaves.
 type Environment = BTreeMap<OsString, OsString>;
+
+static CAPTURED_ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+
+/// Numeric value of VTE's `VTE_SPAWN_NO_PARENT_ENVV` flag (available since
+/// VTE 0.60). GTK frontends combine this with their ordinary GLib spawn flags
+/// when passing [`vte_envv_from_captured`], so VTE does not merge the live,
+/// toolkit-mutated process environment back into the frozen block.
+pub const VTE_SPAWN_NO_PARENT_ENVV_BITS: u32 = 1 << 25;
+
+/// Freeze the launch environment exactly as the terminal inherited it.
+///
+/// Call exactly once, as the first operation in an executable's `main`. A
+/// second call returns `AlreadyExists`; treating that as an initialization
+/// error catches ordering mistakes instead of silently accepting a later,
+/// already-mutated snapshot.
+pub fn capture_inherited_environment() -> io::Result<()> {
+    capture_inherited_environment_with_scrub(&[], &[])
+}
+
+/// [`capture_inherited_environment`] with exact names and prefixes owned only
+/// by one embedding application's process.
+///
+/// Prefer exact names. Prefixes are available for genuinely private generated
+/// capability families, but broad prefixes such as `JSH_` or `JTERM4_` also
+/// match legitimate user configuration and must not be used.
+pub fn capture_inherited_environment_with_scrub(
+    extra_names: &[&str],
+    extra_prefixes: &[&str],
+) -> io::Result<()> {
+    validate_scrub_rules(extra_names, extra_prefixes)?;
+    let environment = scrub_environment(std::env::vars_os().collect(), extra_names, extra_prefixes);
+    CAPTURED_ENVIRONMENT.set(environment).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the inherited child environment was already captured",
+        )
+    })
+}
+
+pub fn inherited_environment_is_captured() -> bool {
+    CAPTURED_ENVIRONMENT.get().is_some()
+}
 
 /// Per-app spawn policy. The terminal identity is not configurable; everything
 /// the four repos disagreed about is.
@@ -152,7 +207,25 @@ pub fn overridden_names() -> &'static [&'static str] {
 /// beats both the identity block and the defaults, and a caller that repeats a
 /// name inside `extra` cannot smuggle two values for it into an `execve` block.
 pub fn pairs(options: &ChildEnv<'_>, extra: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
-    policy_vars(&inherited_environment(), options, extra)
+    pairs_for(&inherited_environment(), options, extra)
+}
+
+/// Strict [`pairs`] variant backed only by the early frozen environment.
+/// Returns an initialization error instead of sampling a process environment
+/// that GTK or CLI setup may already have changed.
+pub fn pairs_from_captured(
+    options: &ChildEnv<'_>,
+    extra: &[(&str, &str)],
+) -> io::Result<Vec<(OsString, OsString)>> {
+    Ok(pairs_for(captured_environment()?, options, extra))
+}
+
+fn pairs_for(
+    inherited: &Environment,
+    options: &ChildEnv<'_>,
+    extra: &[(&str, &str)],
+) -> Vec<(OsString, OsString)> {
+    policy_vars(inherited, options, extra)
         .into_iter()
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
         .collect()
@@ -172,6 +245,14 @@ pub fn envp(options: &ChildEnv<'_>, extra: &[(&str, &str)]) -> io::Result<Vec<CS
     envp_for(&inherited_environment(), options, extra)
 }
 
+/// Strict [`envp`] variant backed by [`capture_inherited_environment`].
+pub fn envp_from_captured(
+    options: &ChildEnv<'_>,
+    extra: &[(&str, &str)],
+) -> io::Result<Vec<CString>> {
+    envp_for(captured_environment()?, options, extra)
+}
+
 /// Terminal identity as `KEY=VALUE` strings for libvte's `spawn_async` `envv`.
 ///
 /// Identity only, by design. libvte *adds* `envv` to an environment it also
@@ -184,6 +265,39 @@ pub fn vte_envv(options: &ChildEnv<'_>, extra: &[(&str, &str)]) -> Vec<String> {
     identity_with_extra(options, extra)
         .into_iter()
         .map(|(name, value)| format!("{name}={value}"))
+        .collect()
+}
+
+/// A complete UTF-8 environment block for VTE, built from the early frozen
+/// snapshot rather than VTE's live GTK process environment.
+///
+/// The caller **must** combine this with
+/// [`VTE_SPAWN_NO_PARENT_ENVV_BITS`]. Without that VTE adds the live parent
+/// environment again, reintroducing exactly the frontend-private variables
+/// this block removed. The gtk-rs VTE API accepts `&str`, so a non-UTF-8
+/// inherited name or value is rejected rather than silently changed.
+pub fn vte_envv_from_captured(
+    options: &ChildEnv<'_>,
+    extra: &[(&str, &str)],
+) -> io::Result<Vec<String>> {
+    vte_envv_for(captured_environment()?, options, extra)
+}
+
+fn vte_envv_for(
+    inherited: &Environment,
+    options: &ChildEnv<'_>,
+    extra: &[(&str, &str)],
+) -> io::Result<Vec<String>> {
+    envp_for(inherited, options, extra)?
+        .into_iter()
+        .map(|entry| {
+            String::from_utf8(entry.into_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the captured child environment contains non-UTF-8 data unsupported by VTE",
+                )
+            })
+        })
         .collect()
 }
 
@@ -201,8 +315,64 @@ pub fn host_bridge_args(options: &ChildEnv<'_>, extra: &[(&str, &str)]) -> Vec<S
         .collect()
 }
 
+fn captured_environment() -> io::Result<&'static Environment> {
+    CAPTURED_ENVIRONMENT.get().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "capture_inherited_environment must run before frontend initialization",
+        )
+    })
+}
+
 fn inherited_environment() -> Environment {
-    std::env::vars_os().collect()
+    // Compatibility path for embedders that have not adopted the strict API
+    // yet. Only an explicit early capture can keep later GTK/CLI mutations out;
+    // silently deleting launch-time configuration here would be worse.
+    CAPTURED_ENVIRONMENT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::vars_os().collect())
+}
+
+fn validate_scrub_rules(exact_names: &[&str], prefixes: &[&str]) -> io::Result<()> {
+    if exact_names
+        .iter()
+        .chain(prefixes)
+        .any(|rule| !valid_scrub_rule(rule))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "child-environment scrub names and prefixes must be nonempty variable-name text",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_scrub_rule(rule: &str) -> bool {
+    !rule.is_empty()
+        && !rule.contains(['=', '\0'])
+        && !rule.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(rule)
+}
+
+fn scrub_environment(
+    mut environment: Environment,
+    exact_names: &[&str],
+    extra_prefixes: &[&str],
+) -> Environment {
+    environment.retain(|name, _| {
+        if exact_names
+            .iter()
+            .any(|private| name.as_os_str() == OsStr::new(private))
+        {
+            return false;
+        }
+        let Some(name) = name.to_str() else {
+            return true;
+        };
+        !extra_prefixes.iter().any(|prefix| name.starts_with(prefix))
+    });
+    environment
 }
 
 /// Assign `name`, replacing any earlier assignment and taking its position.
@@ -213,7 +383,10 @@ fn set_var(vars: &mut Vec<(String, String)>, name: &str, value: &str) {
         // *different* variable in the child, or in flatpak-spawn's case get
         // rejected as an unknown option far from the code that built it. Drop
         // it here, where it can still be named in a log line.
-        log::warn!("ignoring child environment variable with invalid name '{name}'");
+        // Do not reflect the invalid name: callers can supply this API from a
+        // config boundary, and control-bearing diagnostic text would become a
+        // second log-injection surface.
+        log::warn!("ignoring child environment variable with an invalid name");
         return;
     }
     vars.retain(|(existing, _)| existing != name);
@@ -241,6 +414,11 @@ fn identity_with_extra(options: &ChildEnv<'_>, extra: &[(&str, &str)]) -> Vec<(S
     for (name, value) in extra {
         set_var(&mut vars, name, value);
     }
+    // These two adapters feed APIs that eventually require C strings but do
+    // not return `Result`. Drop impossible OS environment entries here;
+    // `envp` deliberately keeps them until `CString::new` so its fallible API
+    // continues to report invalid input to the caller.
+    vars.retain(|(name, value)| !name.contains('\0') && !value.contains('\0'));
     vars
 }
 
@@ -659,6 +837,16 @@ mod tests {
     }
 
     #[test]
+    fn infallible_environment_adapters_drop_nul_entries() {
+        assert!(vte_envv(&options(), &[("BAD", "a\0b")])
+            .iter()
+            .all(|entry| !entry.starts_with("BAD=")));
+        assert!(host_bridge_args(&options(), &[("BAD\0NAME", "value")])
+            .iter()
+            .all(|entry| !entry.contains("BAD")));
+    }
+
+    #[test]
     fn host_bridge_args_carry_colorterm_across_the_sandbox_boundary() {
         let args = host_bridge_args(&options(), &[("LESS", "R")]);
         assert!(args.contains(&"--env=COLORTERM=truecolor".to_string()));
@@ -678,5 +866,93 @@ mod tests {
             names(&policy_vars(&env(&[("LESS", "")]), &options, &[])),
             overridden_names()
         );
+    }
+
+    #[test]
+    fn explicit_scrub_preserves_launch_configuration_outside_the_named_capabilities() {
+        let frozen = scrub_environment(
+            env(&[
+                ("PATH", "/usr/bin"),
+                ("GTK_PATH", "/user/gtk"),
+                ("GTK_IM_MODULE", "ibus"),
+                ("XMODIFIERS", "@im=ibus"),
+                ("JTERM1_CONFIG", "/user/config"),
+                ("JTERM4_AI_API_KEY", "user-provider-key"),
+                ("JSH_AI_PROVIDER", "openai"),
+                ("JSH_SESSION_ID", "stale-pane"),
+                ("EMBEDDER_TOKEN", "private"),
+                ("EMBEDDER_DEBUG_LEVEL", "2"),
+            ]),
+            &["EMBEDDER_TOKEN"],
+            &["EMBEDDER_DEBUG_"],
+        );
+
+        for private in ["EMBEDDER_TOKEN", "EMBEDDER_DEBUG_LEVEL"] {
+            assert!(!frozen.contains_key(OsStr::new(private)), "{private}");
+        }
+        for preserved in [
+            "JTERM1_CONFIG",
+            "JTERM4_AI_API_KEY",
+            "JSH_AI_PROVIDER",
+            "JSH_SESSION_ID",
+        ] {
+            assert!(frozen.contains_key(OsStr::new(preserved)), "{preserved}");
+        }
+        assert_eq!(
+            frozen.get(OsStr::new("GTK_PATH")).map(OsString::as_os_str),
+            Some(OsStr::new("/user/gtk"))
+        );
+        assert_eq!(
+            frozen
+                .get(OsStr::new("GTK_IM_MODULE"))
+                .map(OsString::as_os_str),
+            Some(OsStr::new("ibus"))
+        );
+        assert_eq!(
+            frozen
+                .get(OsStr::new("XMODIFIERS"))
+                .map(OsString::as_os_str),
+            Some(OsStr::new("@im=ibus"))
+        );
+    }
+
+    #[test]
+    fn full_vte_block_uses_only_frozen_values_and_current_per_pane_extras() {
+        let frozen = env(&[
+            ("PATH", "/usr/bin"),
+            ("GTK_PATH", "/launch-time/gtk"),
+            ("JTERM4_CONFIG", "/user/jterm4.toml"),
+            ("JSH_AI_PROVIDER", "openai"),
+            ("JSH_SESSION_ID", "stale"),
+        ]);
+        // This represents a process-only value written after the early
+        // snapshot. It is absent from `frozen`, so a complete VTE block cannot
+        // leak it even if the live frontend environment now contains it.
+        let mut live_after_capture = frozen.clone();
+        live_after_capture.insert(OsString::from("JTERM4_SAFE_MODE"), OsString::from("1"));
+        assert!(live_after_capture.contains_key(OsStr::new("JTERM4_SAFE_MODE")));
+
+        let envv =
+            vte_envv_for(&frozen, &options(), &[("JSH_SESSION_ID", "current-pane")]).unwrap();
+
+        assert!(envv.contains(&"PATH=/usr/bin".to_string()));
+        assert!(envv.contains(&"GTK_PATH=/launch-time/gtk".to_string()));
+        assert!(envv.contains(&"JTERM4_CONFIG=/user/jterm4.toml".to_string()));
+        assert!(envv.contains(&"JSH_AI_PROVIDER=openai".to_string()));
+        assert!(envv.contains(&"JSH_SESSION_ID=current-pane".to_string()));
+        assert!(envv.iter().all(|entry| entry != "JSH_SESSION_ID=stale"));
+        assert!(envv
+            .iter()
+            .all(|entry| !entry.starts_with("JTERM4_SAFE_MODE=")));
+        assert_eq!(VTE_SPAWN_NO_PARENT_ENVV_BITS, 33_554_432);
+    }
+
+    #[test]
+    fn scrub_rules_reject_ambiguous_or_control_bearing_names() {
+        for rule in ["", "A=B", "BAD\nNAME", "SAFE\u{202e}NAME"] {
+            assert!(validate_scrub_rules(&[rule], &[]).is_err(), "{rule:?}");
+            assert!(validate_scrub_rules(&[], &[rule]).is_err(), "{rule:?}");
+        }
+        assert!(validate_scrub_rules(&["EMBEDDER_TOKEN"], &["EMBEDDER_"]).is_ok());
     }
 }

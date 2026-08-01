@@ -18,6 +18,8 @@ const MAX_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Oversized unterminated payloads are discarded until their real terminator.
 const MAX_DCS_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_CLIPBOARD_BASE64_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OSC7_URI_BYTES: usize = 16 * 1024;
+const MAX_TITLE_BYTES: usize = 4 * 1024;
 /// Per-field caps for the OSC 133 metadata jsh attaches to its C/D packets.
 /// jsh bounds these on the way out (`MAX_OSC_COMMAND_BYTES` = 16 KiB,
 /// `MAX_OSC_CWD_BYTES` = 4 KiB in jsh/src/osc.rs), but any program can write an
@@ -113,10 +115,11 @@ pub enum ParserEvent {
     /// with a canned "not supported" / level-0 response so the app falls back
     /// gracefully (otherwise neovim, helix, etc. hang waiting on the reply).
     KeyboardProtocolQuery(KeyboardProtocolQuery),
-    /// OSC 9 ; <body> (iTerm2/ConEmu) or OSC 777 ; notify ; <title> ; <body>
+    /// `OSC 9 ; <body>` (iTerm2/ConEmu) or
+    /// `OSC 777 ; notify ; <title> ; <body>`.
     /// (urxvt) — the application requests a desktop notification. Fields are
-    /// bounded to [`MAX_NOTIFICATION_CHARS`] with control characters removed;
-    /// the UI must still rate-limit before showing anything.
+    /// bounded to [`MAX_NOTIFICATION_CHARS`] with control and visual-formatting
+    /// characters replaced; the UI must still rate-limit before showing it.
     Notification { title: Option<String>, body: String },
     /// OSC 10/11/12 with a color value — the app SET a dynamic color (theme
     /// switching tools, vim `background=`). The raw spec is forwarded verbatim
@@ -785,14 +788,23 @@ impl CommandMeta {
             };
             match key {
                 "id" | "jsh_id" | "execution_id" | "command_id" => {
-                    meta.id = decode_osc133(value, MAX_OSC133_ID_BYTES)
-                        .filter(|id| !id.is_empty() && !id.chars().any(char::is_control));
+                    meta.id = decode_osc133(value, MAX_OSC133_ID_BYTES).filter(|id| {
+                        !id.is_empty()
+                            && !id.chars().any(char::is_control)
+                            && !crate::review_input::contains_visual_spoofing(id)
+                    });
                 }
                 "cmdline_url" | "command_url" | "command" | "cmdline" => {
-                    meta.command = decode_osc133(value, MAX_OSC133_COMMAND_BYTES);
+                    meta.command = decode_osc133(value, MAX_OSC133_COMMAND_BYTES).filter(|text| {
+                        !text.chars().any(char::is_control)
+                            && !crate::review_input::contains_visual_spoofing(text)
+                    });
                 }
                 "cwd_url" | "cwd" => {
-                    meta.cwd = decode_osc133(value, MAX_OSC133_CWD_BYTES);
+                    meta.cwd = decode_osc133(value, MAX_OSC133_CWD_BYTES).filter(|text| {
+                        !text.chars().any(char::is_control)
+                            && !crate::review_input::contains_visual_spoofing(text)
+                    });
                 }
                 "duration_ms" | "duration" => {
                     meta.duration_ms = value.parse().ok();
@@ -841,7 +853,7 @@ fn decode_osc133(value: &str, max_bytes: usize) -> Option<String> {
 }
 
 fn valid_remote_session_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().count() <= 1_024 && !id.chars().any(char::is_control)
+    crate::execution_journal::is_valid_jsh_session_id(id)
 }
 
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
@@ -882,7 +894,10 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
 
     // OSC 7770 ; <session-id> — jsh-specific session announce (see jsh osc.rs:107).
     if let Some(rest) = s.strip_prefix("7770;") {
-        let id = rest.trim();
+        // Session IDs are protocol identifiers, not display text. Do not trim
+        // an invalid payload into a different valid identity: jsh's grammar is
+        // already an exact 1-128-byte ASCII token.
+        let id = rest;
         if valid_remote_session_id(id) {
             events.push(ParserEvent::RemoteSessionId(id.to_string()));
         }
@@ -894,12 +909,26 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     // current-directory-uri-notify / window-title-changed signals, which the
     // block_view subscribes to instead of re-parsing here.
     if s.starts_with("7;") {
+        if payload.len() > MAX_OSC7_URI_BYTES || !safe_osc7_text(s) {
+            return;
+        }
         let mut bytes = Vec::with_capacity(payload.len() + 4);
         bytes.push(0x1b);
         bytes.push(b']');
         bytes.extend_from_slice(payload);
         bytes.extend_from_slice(b"\x1b\\");
         events.push(ParserEvent::Bytes(bytes));
+        return;
+    }
+
+    // Title/icon strings become trusted-looking window and tab chrome in the
+    // frontends. Drop an unsafe update instead of letting terminal output
+    // reorder or invisibly alter that UI label.
+    if matches!(s.split_once(';'), Some(("0" | "1" | "2", _)))
+        && (payload.len() > MAX_TITLE_BYTES
+            || s.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoofing(s))
+    {
         return;
     }
 
@@ -1012,12 +1041,54 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     events.push(ParserEvent::Bytes(bytes));
 }
 
+/// Validate both the wire spelling and the value a URI consumer sees after
+/// percent decoding. Checking only the former lets `%0a` or `%E2%80%AE`
+/// reappear as a line break or bidi override in cwd-derived terminal chrome.
+fn safe_osc7_text(value: &str) -> bool {
+    if value.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(value) {
+        return false;
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index.saturating_add(2) >= bytes.len() {
+                return false;
+            }
+            let Some(high) = (bytes[index + 1] as char).to_digit(16) else {
+                return false;
+            };
+            let Some(low) = (bytes[index + 2] as char).to_digit(16) else {
+                return false;
+            };
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).is_ok_and(|decoded| {
+        !decoded.chars().any(char::is_control)
+            && !crate::review_input::contains_visual_spoofing(&decoded)
+    })
+}
+
 /// Bound one OSC 9/777 field: strip control characters (the text reaches
-/// notification daemons verbatim), collapse surrounding whitespace, and cap
-/// the length. Applications, not users, author these strings.
+/// notification daemons verbatim), expose visual formatting as replacement
+/// glyphs, collapse surrounding whitespace, and cap the length. Applications,
+/// not users, author these strings.
 fn bounded_notification_field(raw: &str) -> String {
     raw.chars()
-        .filter(|ch| !ch.is_control())
+        .map(|ch| {
+            if ch.is_control() || crate::review_input::is_visual_spoofing_character(ch) {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
         .take(MAX_NOTIFICATION_CHARS)
         .collect::<String>()
         .trim()
@@ -1135,11 +1206,16 @@ mod tests {
                 if title == "CI" && body == "tests green"
         ));
 
-        // Control characters are stripped and fields are capped, so a hostile
-        // app cannot inject control bytes into the notification daemon.
+        // Control and visual-formatting characters are made visible and fields
+        // are capped, so a hostile app cannot inject invisible structure into
+        // the notification daemon or trusted-looking desktop chrome.
         events.clear();
         let long = "x".repeat(2 * MAX_NOTIFICATION_CHARS);
         parser.feed(b"\x1b]9;evil\ttab\x1b\\", &mut events);
+        parser.feed(
+            "\x1b]9;left\u{202e}right\u{00a0}tail\x07".as_bytes(),
+            &mut events,
+        );
         parser.feed(format!("\x1b]9;{long}\x07").as_bytes(), &mut events);
         let bodies: Vec<&String> = events
             .iter()
@@ -1148,8 +1224,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(bodies[0], "eviltab");
-        assert_eq!(bodies[1].chars().count(), MAX_NOTIFICATION_CHARS);
+        assert_eq!(bodies[0], "evil\u{fffd}tab");
+        assert_eq!(bodies[1], "left\u{fffd}right\u{fffd}tail");
+        assert_eq!(bodies[2].chars().count(), MAX_NOTIFICATION_CHARS);
 
         // Empty notifications and non-notify OSC 777 subcommands emit nothing.
         events.clear();
@@ -1476,9 +1553,10 @@ mod tests {
         let ParserEvent::CommandStart(meta) = event else {
             panic!("expected CommandStart");
         };
-        // The exact command the shell parsed, newline and CJK intact -- no
-        // screen scraping, and no field split on the escaped ';'.
-        assert_eq!(meta.command.as_deref(), Some("printf 'a;b+c'\n雪"));
+        // A multiline command cannot be displayed or replayed as one reviewed
+        // prompt line without changing its semantics, so the unsafe command
+        // field is dropped while independent metadata still survives.
+        assert_eq!(meta.command, None);
         assert_eq!(meta.cwd.as_deref(), Some("/tmp"));
     }
 
@@ -1563,6 +1641,19 @@ mod tests {
     }
 
     #[test]
+    fn osc133_refuses_visual_spoofing_per_field_but_keeps_the_mark() {
+        let ParserEvent::CommandStart(meta) = only_event(
+            b"\x1b]133;C;id=jsh%E2%80%AE7;cmdline_url=echo%C2%A0hidden;cwd_url=%2Ftmp%E2%80%83dir;duration_ms=9\x07",
+        ) else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.id, None);
+        assert_eq!(meta.command, None);
+        assert_eq!(meta.cwd, None);
+        assert_eq!(meta.duration_ms, Some(9), "independent metadata survives");
+    }
+
+    #[test]
     fn osc133_accepts_the_key_aliases_jterm2_already_read() {
         let ParserEvent::CommandStart(meta) =
             only_event(b"\x1b]133;C;execution_id=x1;command=ls%20-la;cwd=%2Fsrv;duration=7\x07")
@@ -1584,6 +1675,36 @@ mod tests {
             collect_bytes(&events),
             b"\x1b]7;file://host/home/me/dir\x1b\\"
         );
+    }
+
+    #[test]
+    fn osc7_and_title_updates_cannot_spoof_frontend_chrome() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(
+            "\x1b]7;file://host/tmp/left\u{202e}right\x07".as_bytes(),
+            &mut events,
+        );
+        p.feed(b"\x1b]7;file://host/tmp/left%0Aright\x07", &mut events);
+        p.feed(
+            b"\x1b]7;file://host/tmp/left%E2%80%AEright\x07",
+            &mut events,
+        );
+        p.feed(b"\x1b]7;file://host/tmp/invalid%FFutf8\x07", &mut events);
+        p.feed(b"\x1b]7;file://host/tmp/incomplete%2\x07", &mut events);
+        p.feed("\x1b]2;build\u{00a0}done\x07".as_bytes(), &mut events);
+        assert!(collect_bytes(&events).is_empty());
+
+        events.clear();
+        p.feed(b"\x1b]2;safe title\x07", &mut events);
+        assert_eq!(collect_bytes(&events), b"\x1b]2;safe title\x07");
+
+        events.clear();
+        let oversized_cwd = format!("\x1b]7;{}\x07", "x".repeat(MAX_OSC7_URI_BYTES + 1));
+        p.feed(oversized_cwd.as_bytes(), &mut events);
+        let oversized_title = format!("\x1b]2;{}\x07", "x".repeat(MAX_TITLE_BYTES + 1));
+        p.feed(oversized_title.as_bytes(), &mut events);
+        assert!(collect_bytes(&events).is_empty());
     }
 
     #[test]
@@ -1627,10 +1748,14 @@ mod tests {
     }
 
     #[test]
-    fn osc_7770_rejects_control_characters_and_oversized_ids() {
+    fn osc_7770_rejects_non_jsh_identifiers() {
         for payload in [
             b"\x1b]7770;line\nbreak\x07".to_vec(),
             b"\x1b]7770;nul\0byte\x07".to_vec(),
+            "\x1b]7770;left\u{202e}right\x07".as_bytes().to_vec(),
+            "\x1b]7770;left\u{00a0}right\x07".as_bytes().to_vec(),
+            b"\x1b]7770; leading-space\x07".to_vec(),
+            b"\x1b]7770;contains.dot\x07".to_vec(),
         ] {
             let mut parser = Parser::new();
             let mut events = Vec::new();
@@ -1641,7 +1766,7 @@ mod tests {
         }
 
         let mut payload = b"\x1b]7770;".to_vec();
-        payload.extend(std::iter::repeat_n(b'x', 1_025));
+        payload.extend(std::iter::repeat_n(b'x', 129));
         payload.push(0x07);
         let mut parser = Parser::new();
         let mut events = Vec::new();

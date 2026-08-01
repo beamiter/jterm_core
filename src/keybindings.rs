@@ -30,6 +30,8 @@
 
 use std::fmt;
 
+const MAX_CHORD_INPUT_BYTES: usize = 256;
+
 /// Modifier set of a chord. Canonical order everywhere in the family is
 /// ctrl, shift, alt, super (`sup` — `super` is a Rust keyword).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -242,6 +244,15 @@ impl std::error::Error for ParseError {}
 ///   lowercase expands to multiple chars (e.g. `'İ'`) is rejected rather
 ///   than stored unmatchable.
 pub fn parse(s: &str) -> Result<Chord, ParseError> {
+    // Config text is persisted and errors are commonly surfaced in logs or a
+    // settings row. Bound it before split/lowercase allocations, and never
+    // echo invisible/control payloads back through `ParseError`.
+    if s.len() > MAX_CHORD_INPUT_BYTES {
+        return Err(ParseError::UnknownKey("<overlong chord>".to_string()));
+    }
+    if s.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(s) {
+        return Err(ParseError::UnknownKey("<unsafe chord>".to_string()));
+    }
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err(ParseError::Empty);
@@ -375,6 +386,12 @@ fn parse_fallback_key(token: &str, lower: &str) -> Result<KeySym, ParseError> {
 /// binding" rather than as a chord: empty, `false`, `none`, `disabled`,
 /// `unbind` (case-insensitive, surrounding whitespace ignored).
 pub fn is_unbind_token(s: &str) -> bool {
+    if s.len() > MAX_CHORD_INPUT_BYTES
+        || s.chars().any(char::is_control)
+        || crate::review_input::contains_visual_spoofing(s)
+    {
+        return false;
+    }
     let t = s.trim();
     t.is_empty()
         || t.eq_ignore_ascii_case("false")
@@ -854,6 +871,23 @@ mod tests {
             parse("ctrl++t"),
             Err(ParseError::UnknownModifier(String::new()))
         );
+    }
+
+    #[test]
+    fn persisted_chords_reject_unbounded_or_invisible_text_without_echoing_it() {
+        assert_eq!(
+            parse("ctrl+\u{202e}"),
+            Err(ParseError::UnknownKey("<unsafe chord>".to_string()))
+        );
+        assert_eq!(
+            parse("ctrl+\u{00a0}t"),
+            Err(ParseError::UnknownKey("<unsafe chord>".to_string()))
+        );
+        assert_eq!(
+            parse(&"x".repeat(MAX_CHORD_INPUT_BYTES + 1)),
+            Err(ParseError::UnknownKey("<overlong chord>".to_string()))
+        );
+        assert!(!is_unbind_token("\u{00a0}none"));
     }
 
     // ---- display form -------------------------------------------------

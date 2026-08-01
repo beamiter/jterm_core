@@ -2,6 +2,34 @@
 //! to Pango markup. Pure string processing — the notebook UI and cell
 //! execution stay in each app.
 
+/// Shared upper bound before parsing duplicates any notebook source text.
+pub const MAX_NOTEBOOK_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// A fence storm cannot make frontends allocate an unbounded widget list.
+pub const MAX_NOTEBOOK_SEGMENTS: usize = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotebookParseError {
+    SourceTooLarge,
+    TooManySegments,
+}
+
+impl std::fmt::Display for NotebookParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceTooLarge => write!(
+                formatter,
+                "notebook exceeds the {MAX_NOTEBOOK_SOURCE_BYTES}-byte parser limit"
+            ),
+            Self::TooManySegments => write!(
+                formatter,
+                "notebook exceeds the {MAX_NOTEBOOK_SEGMENTS}-segment parser limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotebookParseError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
     /// Plain markdown text (may contain inline formatting we render with
@@ -71,6 +99,18 @@ fn push_text(segments: &mut Vec<Segment>, text: String) {
 /// and tilde fences of length three or greater, including CommonMark's three
 /// allowed leading spaces. Unterminated fences remain visible as text.
 pub fn parse_segments(input: &str) -> Vec<Segment> {
+    match try_parse_segments(input) {
+        Ok(segments) => segments,
+        Err(error) => vec![Segment::Text(format!("[Notebook omitted: {error}]\n"))],
+    }
+}
+
+/// Checked form of [`parse_segments`]. Frontends that can surface an open
+/// error should prefer this over the compatibility wrapper.
+pub fn try_parse_segments(input: &str) -> Result<Vec<Segment>, NotebookParseError> {
+    if input.len() > MAX_NOTEBOOK_SOURCE_BYTES {
+        return Err(NotebookParseError::SourceTooLarge);
+    }
     let mut segments = Vec::new();
     let mut text = String::new();
     let mut lines = input.lines();
@@ -83,6 +123,9 @@ pub fn parse_segments(input: &str) -> Vec<Segment> {
         };
 
         push_text(&mut segments, std::mem::take(&mut text));
+        if segments.len() >= MAX_NOTEBOOK_SEGMENTS {
+            return Err(NotebookParseError::TooManySegments);
+        }
         let mut source = String::new();
         let mut closed = false;
         for inner in lines.by_ref() {
@@ -102,6 +145,9 @@ pub fn parse_segments(input: &str) -> Vec<Segment> {
                 lang: info.to_owned(),
                 src: source,
             });
+            if segments.len() > MAX_NOTEBOOK_SEGMENTS {
+                return Err(NotebookParseError::TooManySegments);
+            }
         } else {
             text.push_str(line);
             text.push('\n');
@@ -110,7 +156,10 @@ pub fn parse_segments(input: &str) -> Vec<Segment> {
     }
 
     push_text(&mut segments, text);
-    segments
+    if segments.len() > MAX_NOTEBOOK_SEGMENTS {
+        return Err(NotebookParseError::TooManySegments);
+    }
+    Ok(segments)
 }
 
 /// Render the markdown body of a `Text` segment to a Pango-markup string.
@@ -183,9 +232,20 @@ fn wrap_marker(s: &str, marker: &str, open: &str, close: &str) -> String {
 }
 
 fn escape_pango(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\t' => escaped.push('\t'),
+            ch if ch.is_control() || crate::review_input::is_visual_spoofing_character(ch) => {
+                escaped.push('\u{fffd}');
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -246,8 +306,40 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_oversize_source_before_copying_it() {
+        let oversized = "x".repeat(MAX_NOTEBOOK_SOURCE_BYTES + 1);
+        assert_eq!(
+            try_parse_segments(&oversized),
+            Err(NotebookParseError::SourceTooLarge)
+        );
+        let fallback = parse_segments(&oversized);
+        assert_eq!(fallback.len(), 1);
+        assert!(matches!(&fallback[0], Segment::Text(text) if text.contains("omitted")));
+    }
+
+    #[test]
+    fn parser_rejects_a_fence_storm_instead_of_returning_partial_code() {
+        let source = "```sh\ntrue\n```\n".repeat(MAX_NOTEBOOK_SEGMENTS + 1);
+        assert_eq!(
+            try_parse_segments(&source),
+            Err(NotebookParseError::TooManySegments)
+        );
+        assert!(parse_segments(&source)
+            .iter()
+            .all(|segment| matches!(segment, Segment::Text(_))));
+    }
+
+    #[test]
     fn escape_pango_handles_ampersand_and_angles() {
         assert_eq!(escape_pango("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+    }
+
+    #[test]
+    fn pango_text_makes_controls_and_visual_spoofing_visible() {
+        assert_eq!(
+            escape_pango("safe\u{00a0}\u{2003}\u{202e}\u{200b}\u{00ad}\u{fe0f}\u{e0020}\0\ttext"),
+            "safe��������\ttext"
+        );
     }
 
     #[test]

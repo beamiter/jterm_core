@@ -45,8 +45,10 @@ pub fn cached_char_width(ch: char) -> usize {
     CHAR_WIDTH_CACHE.with(|cache| {
         let mut cache_ref = cache.borrow_mut();
 
-        // 先检查缓存（peek 不会改变 LRU 顺序）
-        if let Some(&w) = cache_ref.peek(&ch) {
+        // A hit must refresh recency. `peek` would turn this nominal LRU into
+        // insertion-order eviction, repeatedly discarding hot glyphs while a
+        // document streams through more than 4096 distinct characters.
+        if let Some(&w) = cache_ref.get(&ch) {
             return w;
         }
 
@@ -110,5 +112,26 @@ mod tests {
         cached_char_width('中');
         let (after_2, _) = get_cache_stats();
         assert_eq!(after_2, after_1); // 缓存大小不变
+    }
+
+    #[test]
+    fn cache_hits_refresh_lru_recency() {
+        clear_width_cache();
+        let glyphs = (0x1000..=0x2000)
+            .map(|value| char::from_u32(value).unwrap())
+            .collect::<Vec<_>>();
+        for glyph in glyphs.iter().take(4096) {
+            cached_char_width(*glyph);
+        }
+
+        // Refresh the oldest entry, then force one eviction. The next-oldest
+        // glyph must leave while the hot glyph survives.
+        cached_char_width(glyphs[0]);
+        cached_char_width(glyphs[4096]);
+        CHAR_WIDTH_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert!(cache.peek(&glyphs[0]).is_some());
+            assert!(cache.peek(&glyphs[1]).is_none());
+        });
     }
 }

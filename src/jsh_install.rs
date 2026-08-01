@@ -18,10 +18,12 @@
 //!     [`prompt_for`], and runs [`install_argv`] in a terminal tab of its own
 //!     making.
 
-use std::io;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -30,13 +32,39 @@ use serde::Deserialize;
 const INSTALLER_SOURCE: &str = include_str!("../scripts/install-jsh.sh");
 
 const SCRIPT_NAME: &str = "install-jsh.sh";
+const MAX_CHECK_OUTPUT_BYTES: u64 = 64 * 1024;
+const CHECK_PROCESS_TIMEOUT: Duration = Duration::from_secs(310);
+const CHECK_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(100);
+const CHECK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_VERSION_LABEL_BYTES: usize = 128;
+const MAX_STATUS_ERROR_CHARS: usize = 512;
+const MAX_STATUS_PATH_CHARS: usize = 4 * 1024;
 
 /// Seconds a cached update check stays fresh for [`UpdateCheck::Daily`].
 pub const DAILY_MAX_AGE: u64 = 86_400;
 
 /// Keeps the tab open after the script finishes. Without it the child exits,
 /// the terminal closes the tab, and the user never sees what happened.
-const RUN_WRAPPER: &str = r#"sh "$1"
+const RUN_WRAPPER: &str = r#"set -f
+safe_path=
+old_ifs=$IFS
+IFS=:
+for directory in ${PATH-}; do
+    case $directory in
+        /*)
+            if [ -z "$safe_path" ]; then
+                safe_path=$directory
+            else
+                safe_path=$safe_path:$directory
+            fi
+            ;;
+    esac
+done
+IFS=$old_ifs
+PATH=${safe_path:-/usr/local/bin:/usr/bin:/bin}
+export PATH
+
+/bin/sh "$1"
 status=$?
 printf '\n'
 if [ "${status}" -eq 0 ]; then
@@ -71,6 +99,12 @@ impl UpdateCheck {
     }
 
     pub fn parse(value: &str) -> UpdateCheck {
+        if value.len() > 32
+            || value.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoofing(value)
+        {
+            return UpdateCheck::Daily;
+        }
         match value.trim().to_ascii_lowercase().as_str() {
             "startup" | "launch" | "always" => UpdateCheck::Startup,
             "never" | "off" | "disabled" => UpdateCheck::Never,
@@ -107,9 +141,25 @@ pub struct Status {
 impl Status {
     fn from_error(message: impl Into<String>) -> Self {
         Self {
-            error: Some(message.into()),
+            error: Some(bounded_visible_text(
+                &message.into(),
+                MAX_STATUS_ERROR_CHARS,
+            )),
             ..Self::default()
         }
+    }
+
+    fn sanitize_untrusted_text(mut self) -> Self {
+        self.installed_path = self
+            .installed_path
+            .map(|value| bounded_visible_text(&value, MAX_STATUS_PATH_CHARS));
+        self.shadowed_by = self
+            .shadowed_by
+            .map(|value| bounded_visible_text(&value, MAX_STATUS_PATH_CHARS));
+        self.error = self
+            .error
+            .map(|value| bounded_visible_text(&value, MAX_STATUS_ERROR_CHARS));
+        self
     }
 }
 
@@ -125,11 +175,16 @@ impl Prompt {
     pub fn banner_title(&self) -> String {
         match self {
             Prompt::Missing { latest } => format!(
-                "{} prefers jsh as its shell — jsh {latest} is available",
-                crate::identity::get().app_name
+                "{} prefers jsh as its shell — jsh {} is available",
+                crate::identity::get().app_name,
+                bounded_visible_text(latest, MAX_VERSION_LABEL_BYTES)
             ),
             Prompt::Update { from, to } => {
-                format!("jsh {to} is available — installed: {from}")
+                format!(
+                    "jsh {} is available — installed: {}",
+                    bounded_visible_text(to, MAX_VERSION_LABEL_BYTES),
+                    bounded_visible_text(from, MAX_VERSION_LABEL_BYTES)
+                )
             }
         }
     }
@@ -154,9 +209,16 @@ impl Prompt {
 /// never labelled "Update" no matter which installer produced the answer.
 pub fn prompt_for(status: &Status) -> Option<Prompt> {
     let latest = status.latest.clone()?;
+    if !valid_version_label(&latest) {
+        return None;
+    }
     match status.installed.clone() {
         None => Some(Prompt::Missing { latest }),
-        Some(installed) if status.update_available && version_gt(&latest, &installed) => {
+        Some(installed)
+            if valid_version_label(&installed)
+                && status.update_available
+                && version_gt(&latest, &installed) =>
+        {
             Some(Prompt::Update {
                 from: installed,
                 to: latest,
@@ -164,6 +226,28 @@ pub fn prompt_for(status: &Status) -> Option<Prompt> {
         }
         Some(_) => None,
     }
+}
+
+fn valid_version_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_VERSION_LABEL_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
+}
+
+fn bounded_visible_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || crate::review_input::is_visual_spoofing_character(ch) {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
+        .take(max_chars)
+        .collect()
 }
 
 /// Is `left` a strictly newer release than `right`?
@@ -211,20 +295,171 @@ pub fn script_path() -> io::Result<PathBuf> {
     let dir = dirs::cache_dir()
         .ok_or_else(|| io::Error::other("no cache directory for this user"))?
         .join("jterm");
-    std::fs::create_dir_all(&dir)?;
+    materialize_script(&dir)
+}
+
+fn open_cached_script(path: &Path) -> io::Result<Option<std::fs::File>> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cached jsh installer is not a private regular file",
+        ));
+    }
+    Ok(Some(file))
+}
+
+fn cached_script_matches(file: std::fs::File) -> io::Result<bool> {
+    let declared = file.metadata()?.len();
+    if declared != INSTALLER_SOURCE.len() as u64 {
+        return Ok(false);
+    }
+    let mut bytes = Vec::with_capacity(INSTALLER_SOURCE.len());
+    file.take(INSTALLER_SOURCE.len() as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes == INSTALLER_SOURCE.as_bytes())
+}
+
+fn materialize_script(dir: &Path) -> io::Result<PathBuf> {
+    crate::snapshot_file::ensure_private_directory(dir)?;
     let path = dir.join(SCRIPT_NAME);
 
-    let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() == Some(INSTALLER_SOURCE) {
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    let current_matches = match open_cached_script(&path) {
+        Ok(Some(file)) => cached_script_matches(file)?,
+        Ok(None) | Err(_) => false,
+    };
+    if current_matches {
+        let file = open_cached_script(&path)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "cached jsh installer disappeared")
+        })?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        file.sync_all()?;
         return Ok(path);
     }
 
-    let staging = dir.join(format!("{SCRIPT_NAME}.{}", std::process::id()));
-    std::fs::write(&staging, INSTALLER_SOURCE)?;
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::rename(&staging, &path)?;
+    crate::atomic_file::write_atomic(&path, INSTALLER_SOURCE.as_bytes())?;
+    let file = open_cached_script(&path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cached jsh installer disappeared after publication",
+        )
+    })?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    file.sync_all()?;
     Ok(path)
+}
+
+fn bounded_command_stdout(
+    command: &mut std::process::Command,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    // The installer may spawn curl/wget. A dedicated group lets timeout and
+    // oversize paths terminate the whole local tree rather than only `sh`.
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_check_process(&mut child);
+        return Err(io::Error::other("jsh installer check stdout was not piped"));
+    };
+    let descriptor = stdout.as_raw_fd();
+    // SAFETY: fcntl only reads/updates flags on the live pipe descriptor.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        terminate_check_process(&mut child);
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024) as usize);
+    let mut buffer = [0_u8; 8 * 1024];
+    let started = Instant::now();
+    let mut status = None;
+    let mut exited_at = None;
+    let mut eof = false;
+    loop {
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
+                Ok(count) => {
+                    if bytes.len().saturating_add(count) > max_bytes as usize {
+                        terminate_check_process(&mut child);
+                        return Err(io::Error::new(
+                            io::ErrorKind::FileTooLarge,
+                            "jsh installer check output is too large",
+                        ));
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    terminate_check_process(&mut child);
+                    return Err(error);
+                }
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    exited_at = Some(Instant::now());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_check_process(&mut child);
+                    return Err(error);
+                }
+            }
+        }
+        if eof && status.is_some() {
+            // A non-zero exit still carries the installer's structured error
+            // body, so callers parse bytes independently of status.
+            return Ok(bytes);
+        }
+        if exited_at.is_some_and(|exited| exited.elapsed() >= CHECK_PIPE_CLOSE_GRACE) {
+            terminate_check_process(&mut child);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "jsh installer exited while a descendant kept stdout open",
+            ));
+        }
+        if started.elapsed() >= CHECK_PROCESS_TIMEOUT {
+            terminate_check_process(&mut child);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "jsh installer check timed out",
+            ));
+        }
+        thread::sleep(CHECK_POLL_INTERVAL);
+    }
+}
+
+fn terminate_check_process(child: &mut Child) {
+    let process_group = child.id() as i32;
+    if process_group > 0 {
+        // SAFETY: bounded_command_stdout places the child in a fresh process
+        // group; a negative target reaches local descendants such as curl.
+        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Ask the installer what is installed and what is published. Blocking: call it
@@ -238,7 +473,10 @@ pub fn check_blocking(max_age: u64) -> Status {
         Err(error) => return Status::from_error(format!("cannot write install-jsh.sh: {error}")),
     };
 
-    let mut command = crate::host::command("sh");
+    let mut command = match crate::host::helper_command("sh") {
+        Ok(command) => command,
+        Err(error) => return Status::from_error(format!("cannot find sh: {error}")),
+    };
     command
         .arg(&script)
         .arg("--check")
@@ -249,12 +487,11 @@ pub fn check_blocking(max_age: u64) -> Status {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    // A non-zero exit still carries a JSON body describing why, so the output
-    // is parsed before the status is judged.
-    match command.output() {
+    match bounded_command_stdout(&mut command, MAX_CHECK_OUTPUT_BYTES) {
         Ok(output) => {
-            let text = String::from_utf8_lossy(&output.stdout);
+            let text = String::from_utf8_lossy(&output);
             serde_json::from_str::<Status>(text.trim())
+                .map(Status::sanitize_untrusted_text)
                 .unwrap_or_else(|error| Status::from_error(format!("unreadable check: {error}")))
         }
         Err(error) => Status::from_error(format!("cannot run install-jsh.sh: {error}")),
@@ -268,13 +505,17 @@ pub fn check_blocking(max_age: u64) -> Status {
 /// which on Flatpak means passing it through [`crate::host::wrap_argv`].
 pub fn install_argv() -> io::Result<Vec<String>> {
     let script = script_path()?;
-    Ok(vec![
-        "sh".to_string(),
+    Ok(install_argv_for(&script))
+}
+
+fn install_argv_for(script: &Path) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
         "-c".to_string(),
         RUN_WRAPPER.to_string(),
         "jterm-jsh-install".to_string(),
         script.to_string_lossy().into_owned(),
-    ])
+    ]
 }
 
 #[cfg(test)]
@@ -291,6 +532,98 @@ mod tests {
         assert!(INSTALLER_SOURCE.contains("--check"));
         assert!(INSTALLER_SOURCE.contains("--max-age"));
         assert!(INSTALLER_SOURCE.contains("\"update_available\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_installer_is_private_bounded_and_replaces_hostile_entries() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "jterm-core-jsh-installer-{}-{id}",
+            std::process::id()
+        ));
+        let path = materialize_script(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"leave me").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        symlink(&victim, &path).unwrap();
+        materialize_script(&dir).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"leave me");
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&victim, &path).unwrap();
+        materialize_script(&dir).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"leave me");
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+
+        std::fs::remove_file(&path).unwrap();
+        let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: encoded is a live NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        materialize_script(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+
+        std::fs::write(&path, vec![b'x'; INSTALLER_SOURCE.len() + 1]).unwrap();
+        materialize_script(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp.")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn installer_check_stdout_is_bounded_before_json_parsing() {
+        let mut exact = std::process::Command::new("sh");
+        exact
+            .args(["-c", "printf test"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        assert_eq!(bounded_command_stdout(&mut exact, 4).unwrap(), b"test");
+
+        let mut oversized = std::process::Command::new("sh");
+        oversized
+            .args(["-c", "printf tests"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        assert_eq!(
+            bounded_command_stdout(&mut oversized, 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::FileTooLarge
+        );
+
+        let mut inherited_pipe = std::process::Command::new("sh");
+        inherited_pipe
+            .args(["-c", "sleep 5 &"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        assert_eq!(
+            bounded_command_stdout(&mut inherited_pipe, 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// This copy is vendored by hand from the jsh repository, so nothing forces
@@ -322,6 +655,7 @@ mod tests {
         assert_eq!(UpdateCheck::Startup.max_age(), Some(0));
         assert_eq!(UpdateCheck::Daily.max_age(), Some(DAILY_MAX_AGE));
         assert_eq!(UpdateCheck::Never.max_age(), None);
+        assert_eq!(UpdateCheck::parse(&"x".repeat(1_000)), UpdateCheck::Daily);
     }
 
     #[test]
@@ -428,6 +762,34 @@ mod tests {
     }
 
     #[test]
+    fn installer_status_text_cannot_inject_log_lines_or_grow_without_bound() {
+        let status = Status {
+            installed_path: Some(format!("/tmp/jsh\nforged{}", "x".repeat(8 * 1024))),
+            shadowed_by: Some("evil\u{202e}txt\rnext".into()),
+            error: Some(format!("offline\nforged{}", "x".repeat(2 * 1024))),
+            ..Status::default()
+        }
+        .sanitize_untrusted_text();
+
+        for value in [
+            status.installed_path.as_deref().unwrap(),
+            status.shadowed_by.as_deref().unwrap(),
+            status.error.as_deref().unwrap(),
+        ] {
+            assert!(!value.chars().any(char::is_control));
+            assert!(!crate::review_input::contains_visual_spoofing(value));
+        }
+        assert_eq!(
+            status.installed_path.unwrap().chars().count(),
+            MAX_STATUS_PATH_CHARS
+        );
+        assert_eq!(
+            status.error.unwrap().chars().count(),
+            MAX_STATUS_ERROR_CHARS
+        );
+    }
+
+    #[test]
     fn unknown_fields_and_missing_fields_are_tolerated() {
         // The installer may grow fields; an older terminal must keep working.
         let status = status_from(r#"{"latest":"9.9.9","future_field":{"a":1}}"#);
@@ -440,9 +802,40 @@ mod tests {
     }
 
     #[test]
+    fn release_labels_cannot_spoof_the_install_banner() {
+        for latest in [
+            "0.3.0\nforged",
+            "0.3.0\u{202e}txt",
+            "0.3.0\u{00a0}hidden",
+            &"x".repeat(MAX_VERSION_LABEL_BYTES + 1),
+        ] {
+            let status = Status {
+                latest: Some(latest.to_string()),
+                update_available: true,
+                ..Status::default()
+            };
+            assert!(prompt_for(&status).is_none(), "{latest:?}");
+        }
+
+        // The enum remains public for frontend state, so its rendering sink
+        // repeats the sanitisation even for a directly constructed value.
+        let title = Prompt::Missing {
+            latest: "0.3.0\u{202e}forged".into(),
+        }
+        .banner_title();
+        assert!(!title.contains('\u{202e}'));
+        assert!(title.contains('\u{fffd}'));
+    }
+
+    #[test]
     fn the_install_tab_waits_for_the_user_before_closing() {
         assert!(RUN_WRAPPER.contains("read -r _"));
         assert!(RUN_WRAPPER.contains("exit \"${status}\""));
+        assert!(RUN_WRAPPER.contains("PATH=${safe_path:-/usr/local/bin:/usr/bin:/bin}"));
+        assert!(RUN_WRAPPER.contains("/bin/sh \"$1\""));
+        let argv = install_argv_for(Path::new("/tmp/install-jsh.sh"));
+        assert_eq!(argv[0], "/bin/sh");
+        assert_eq!(argv.last().map(String::as_str), Some("/tmp/install-jsh.sh"));
     }
 
     /// The riskiest seam is the JSON contract: the installer lives in another

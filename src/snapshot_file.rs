@@ -38,7 +38,7 @@
 //!   configurable.
 //! - **Only a directory this module *created* is chmodded by
 //!   [`write_atomic_private`]; tightening one that already existed is the
-//!   caller's explicit request, through [`ensure_private_directory`].** Two of
+//!   caller's explicit request, through `ensure_private_directory`.** Two of
 //!   the four apps take the snapshot path from config (jterm2
 //!   `session_history_file`, jterm3 `session_history_path` — which also expands
 //!   `~`), so the parent directory of a destination is not necessarily the
@@ -73,14 +73,39 @@ fn open_regular(path: &Path) -> io::Result<File> {
         // for jterm1 and jterm4 that is the GTK main thread, i.e. a window that
         // never draws. O_NONBLOCK lets the open return so the fstat below can
         // reject it, and is a no-op for the regular files this is really for.
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "session snapshot path is not a regular file",
         ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session snapshot must have exactly one hard link",
+            ));
+        }
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session snapshot is not owned by the current user",
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session snapshot is writable by another user or group",
+            ));
+        }
     }
     Ok(file)
 }
@@ -135,9 +160,10 @@ const MAX_QUARANTINE_ATTEMPTS: u32 = 100;
 ///
 /// Call this *before* writing any fresh state, so a snapshot that failed to
 /// parse survives for recovery instead of being overwritten by the next
-/// autosave. The move is a `fs::rename`, which acts on the directory entry: a
-/// symlink at `path` is moved rather than followed, so this cannot be tricked
-/// into renaming the file the link pointed at.
+/// autosave. On Unix a no-clobber hard-link/unlink move closes the existence
+/// check race between concurrent quarantine attempts. `hard_link` acts on the
+/// symlink entry itself rather than its target, so a symlink at `path` is still
+/// retired without touching what it points to.
 pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
     let file_type = fs::symlink_metadata(path)?.file_type();
     if !file_type.is_file() && !file_type.is_symlink() {
@@ -162,14 +188,28 @@ pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
         let mut backup_name = file_name.to_os_string();
         backup_name.push(quarantine_suffix(timestamp, attempt));
         let backup = parent.join(backup_name);
-        // symlink_metadata, not `exists()`: a *dangling* symlink at this name
-        // reports "does not exist", and renaming onto it would retire the
-        // previous quarantine's entry under a name nothing will ever find.
-        if fs::symlink_metadata(&backup).is_ok() {
-            continue;
+        #[cfg(unix)]
+        match fs::hard_link(path, &backup) {
+            Ok(()) => match fs::remove_file(path) {
+                Ok(()) => return Ok(backup),
+                Err(error) => {
+                    let _ = fs::remove_file(&backup);
+                    return Err(error);
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
         }
-        fs::rename(path, &backup)?;
-        return Ok(backup);
+        #[cfg(not(unix))]
+        {
+            // symlink_metadata, not `exists()`: a dangling symlink at this name
+            // reports "does not exist" and must not be overwritten.
+            if fs::symlink_metadata(&backup).is_ok() {
+                continue;
+            }
+            fs::rename(path, &backup)?;
+            return Ok(backup);
+        }
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -195,21 +235,42 @@ fn quarantine_suffix(timestamp_millis: u128, attempt: u32) -> String {
 /// tightened here. Only `dir` is tightened: existing *ancestors* such as
 /// `~/.config` are shared with every other application and are not a terminal
 /// emulator's to chmod.
-fn ensure_private_directory(dir: &Path) -> io::Result<()> {
+pub fn ensure_private_directory(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        // Only chmod when it would change something. An already-private
-        // directory owned by another uid (a shared /tmp fixture, a bind mount)
-        // would fail set_permissions with EPERM for no benefit.
-        let mode = fs::metadata(dir)?.permissions().mode();
+        // Open the directory itself without following a final symlink, then
+        // validate and chmod the descriptor. Path-based metadata/chmod here
+        // would let a substituted parent symlink change an unrelated target's
+        // permissions before the atomic writer even creates its temp file.
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session snapshot parent is not a directory",
+            ));
+        }
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session snapshot parent is not owned by the current user",
+            ));
+        }
+        // Only chmod when it would change something. Ownership was checked
+        // above, so this cannot tighten an unrelated user's directory.
+        let mode = metadata.permissions().mode();
         if mode & 0o077 != 0 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
         }
         Ok(())
     }
@@ -219,12 +280,64 @@ fn ensure_private_directory(dir: &Path) -> io::Result<()> {
     }
 }
 
+fn validate_existing_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session snapshot parent is not a directory",
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        // A foreign owner can replace entries even in a sticky directory.
+        // Root ownership keeps explicitly configured `/tmp/...` snapshots
+        // working while rejecting attacker-owned shared namespaces.
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid && metadata.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session snapshot parent is not owned by the current user or root",
+            ));
+        }
+        if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session snapshot parent is group/world writable without the sticky bit",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if fs::metadata(dir)?.is_dir() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session snapshot parent is not a directory",
+            ))
+        }
+    }
+}
+
 /// Durably replace a snapshot file, creating its directory `0700` if needed.
 ///
 /// The atomic replacement itself is [`crate::atomic_file::write_atomic`], whose
 /// temporary file is already `0600`, so the renamed-into-place snapshot is too.
-/// The private *directory* is the part jterm1 and jterm4 each grew separately
-/// and jterm3 never grew at all.
+/// An existing parent is validated without following a final symlink but is not
+/// chmodded: configured snapshot paths may legitimately live directly under
+/// `$HOME`, `/tmp`, or another directory the application does not own. Call
+/// [`ensure_private_directory`] first when the application owns that directory
+/// and explicitly wants to tighten a legacy installation.
 pub fn write_atomic_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     if path.file_name().is_none() {
         return Err(io::Error::new(
@@ -239,7 +352,13 @@ pub fn write_atomic_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        ensure_private_directory(parent)?;
+        match fs::symlink_metadata(parent) {
+            Ok(_) => validate_existing_directory(parent)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ensure_private_directory(parent)?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     crate::atomic_file::write_atomic(path, contents)
 }
@@ -263,6 +382,11 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Self(path)
         }
 
@@ -277,11 +401,20 @@ mod tests {
         }
     }
 
+    fn write_private_snapshot(path: &Path, contents: impl AsRef<[u8]>) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn reads_a_snapshot_that_fits() {
         let root = TestDir::new("read-ok");
         let path = root.join("tabs.state");
-        fs::write(&path, b"{\"tabs\":[]}").unwrap();
+        write_private_snapshot(&path, b"{\"tabs\":[]}");
 
         assert_eq!(read_bounded(&path, 4096).unwrap(), "{\"tabs\":[]}");
         // The limit is inclusive: a snapshot exactly at the bound is valid.
@@ -292,11 +425,58 @@ mod tests {
     fn rejects_a_snapshot_over_the_limit() {
         let root = TestDir::new("read-big");
         let path = root.join("tabs.state");
-        fs::write(&path, vec![b'x'; 64]).unwrap();
+        write_private_snapshot(&path, vec![b'x'; 64]);
 
         let error = read_bounded(&path, 63).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
         assert!(error.to_string().contains("64 bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_never_follows_a_snapshot_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("read-symlink");
+        let target = root.join("outside.json");
+        let link = root.join("tabs.state");
+        fs::write(&target, b"{\"tabs\":[]}").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(read_bounded(&link, 4096).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"{\"tabs\":[]}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_rejects_a_multiply_linked_snapshot() {
+        let root = TestDir::new("read-hard-link");
+        let target = root.join("outside.json");
+        let link = root.join("tabs.state");
+        fs::write(&target, b"{\"tabs\":[]}").unwrap();
+        fs::hard_link(&target, &link).unwrap();
+
+        assert_eq!(
+            read_bounded(&link, 4096).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"{\"tabs\":[]}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_rejects_a_snapshot_writable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("read-writable");
+        let path = root.join("tabs.state");
+        fs::write(&path, b"{\"tabs\":[]}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).unwrap();
+
+        assert_eq!(
+            read_bounded(&path, 4096).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -306,10 +486,10 @@ mod tests {
         // and the post-read length check can reject content.
         let root = TestDir::new("read-grow");
         let path = root.join("tabs.state");
-        fs::write(&path, b"").unwrap();
+        write_private_snapshot(&path, b"");
         assert_eq!(read_bounded(&path, 0).unwrap(), "");
 
-        fs::write(&path, b"x").unwrap();
+        write_private_snapshot(&path, b"x");
         assert_eq!(
             read_bounded(&path, 0).unwrap_err().kind(),
             io::ErrorKind::FileTooLarge
@@ -320,7 +500,7 @@ mod tests {
     fn rejects_non_utf8_contents_as_invalid_data() {
         let root = TestDir::new("read-utf8");
         let path = root.join("tabs.state");
-        fs::write(&path, [0xffu8, 0xfe]).unwrap();
+        write_private_snapshot(&path, [0xffu8, 0xfe]);
 
         assert_eq!(
             read_bounded(&path, 4096).unwrap_err().kind(),
@@ -386,6 +566,36 @@ mod tests {
         assert_eq!(fs::read(&second).unwrap(), b"second corruption");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_quarantine_has_one_winner_without_clobbering_evidence() {
+        use std::sync::{Arc, Barrier};
+
+        let root = TestDir::new("quarantine-concurrent");
+        let path = root.join("tabs.state");
+        fs::write(&path, b"recover me").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    quarantine_corrupt(&path)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let winners = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().unwrap().ok())
+            .collect::<Vec<_>>();
+
+        assert_eq!(winners.len(), 1);
+        assert!(!path.exists());
+        assert_eq!(fs::read(&winners[0]).unwrap(), b"recover me");
+    }
+
     #[test]
     fn quarantine_refuses_a_directory() {
         let root = TestDir::new("quarantine-dir");
@@ -442,7 +652,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_atomic_private_tightens_a_pre_existing_loose_directory() {
+    fn an_owned_pre_existing_directory_is_tightened_only_when_explicitly_requested() {
         use std::os::unix::fs::PermissionsExt;
 
         // The case `create_dir_all`'s mode argument cannot fix: the snapshot
@@ -455,8 +665,73 @@ mod tests {
 
         write_atomic_private(&directory.join("window-1.state"), b"{}").unwrap();
 
+        let untouched = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        assert_eq!(untouched, 0o755);
+
+        ensure_private_directory(&directory).unwrap();
+
         let mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_private_never_chmods_or_writes_through_a_parent_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TestDir::new("write-parent-symlink");
+        let victim = root.join("victim");
+        let linked_parent = root.join("windows");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&victim, &linked_parent).unwrap();
+
+        assert!(write_atomic_private(&linked_parent.join("window.state"), b"{}").is_err());
+        assert!(!victim.join("window.state").exists());
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_private_does_not_chmod_an_existing_shared_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = std::env::temp_dir();
+        let path = parent.join(format!(
+            "jterm-core-shared-parent-{}-{}.state",
+            std::process::id(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&path);
+        let before = fs::metadata(&parent).unwrap().permissions().mode();
+
+        write_atomic_private(&path, b"{}").unwrap();
+
+        let after = fs::metadata(&parent).unwrap().permissions().mode();
+        assert_eq!(after, before);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_private_rejects_a_nonsticky_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("write-unsafe-parent");
+        let parent = root.join("shared");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let path = parent.join("window.state");
+
+        assert!(write_atomic_private(&path, b"{}").is_err());
+        assert!(!path.exists());
     }
 
     #[test]

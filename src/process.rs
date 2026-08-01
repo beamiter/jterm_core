@@ -20,6 +20,7 @@
 //!   after the kernel is free to reuse it. The `/proc` probes above are what
 //!   make the session drain possible, which is why both live in one module.
 
+#[cfg(test)]
 use serde::Deserialize;
 use std::ffi::c_int;
 use std::io;
@@ -29,6 +30,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+const MAX_PROC_CMDLINE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PROC_ARG_COUNT: usize = 4 * 1024;
+const MAX_PROCESS_LABEL_CHARS: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Shell quoting
@@ -52,20 +57,32 @@ pub fn shell_single_quote(s: &str) -> String {
     quoted
 }
 
-/// Quote a filesystem path for insertion into an interactive command line,
-/// leaving obviously safe paths unquoted so the inserted text stays readable.
-pub fn shell_quote_path(s: &str) -> String {
+/// Checked form of [`shell_quote_path`]. Refuses terminal controls and Unicode
+/// formatting/spacing characters that could make the visible path disagree
+/// with the bytes inserted into the shell editor.
+pub fn try_shell_quote_path(s: &str) -> Option<String> {
+    if s.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(s) {
+        return None;
+    }
     if s.is_empty() {
-        return "''".to_string();
+        return Some("''".to_string());
     }
     let safe = s
         .chars()
         .all(|c| c.is_alphanumeric() || "._-/~".contains(c));
-    if safe {
+    Some(if safe {
         s.to_string()
     } else {
         shell_single_quote(s)
-    }
+    })
+}
+
+/// Quote a filesystem path for insertion into an interactive command line,
+/// leaving obviously safe paths unquoted so the inserted text stays readable.
+/// Unsafe display/control text fails closed to an empty quoted argument; new
+/// callers that can surface an error should use [`try_shell_quote_path`].
+pub fn shell_quote_path(s: &str) -> String {
+    try_shell_quote_path(s).unwrap_or_else(|| "''".to_string())
 }
 
 /// Render one argv as a single POSIX-shell command without changing argument
@@ -77,9 +94,10 @@ pub fn shell_quote_path(s: &str) -> String {
 /// or a newline are interpreted by the line editor before shell parsing.
 pub fn shell_quote_argv(args: &[String]) -> Option<String> {
     if args.is_empty()
-        || args
-            .iter()
-            .any(|argument| argument.chars().any(char::is_control))
+        || args.iter().any(|argument| {
+            argument.chars().any(char::is_control)
+                || crate::review_input::contains_visual_spoofing(argument)
+        })
     {
         return None;
     }
@@ -93,9 +111,10 @@ pub fn shell_quote_argv(args: &[String]) -> Option<String> {
 
 fn powershell_quote_argv(args: &[String]) -> Option<String> {
     if args.is_empty()
-        || args
-            .iter()
-            .any(|argument| argument.chars().any(char::is_control))
+        || args.iter().any(|argument| {
+            argument.chars().any(char::is_control)
+                || crate::review_input::contains_visual_spoofing(argument)
+        })
     {
         return None;
     }
@@ -147,12 +166,45 @@ pub fn build_jsh_exec_command(shell_path: &str, session_id: Option<&str>) -> Str
 // Restorable-command classification
 // ---------------------------------------------------------------------------
 
+/// A restored command is typed into an interactive editor, not passed directly
+/// to `execve`. Keep its structured representation far below OS ARG_MAX and
+/// bound both pathological argument counts and quoting amplification.
+pub const MAX_RESTORABLE_ARG_COUNT: usize = 256;
+pub const MAX_RESTORABLE_ARG_BYTES: usize = 64 * 1024;
+pub const MAX_RESTORABLE_ARGV_BYTES: usize = 256 * 1024;
+
+pub fn restorable_argv_within_limits(args: &[String]) -> bool {
+    if args.is_empty() || args.len() > MAX_RESTORABLE_ARG_COUNT {
+        return false;
+    }
+    let mut total = 0usize;
+    for argument in args {
+        if argument.len() > MAX_RESTORABLE_ARG_BYTES
+            || argument.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoofing(argument)
+        {
+            return false;
+        }
+        let Some(next) = total
+            .checked_add(argument.len())
+            .and_then(|bytes| bytes.checked_add(1))
+        else {
+            return false;
+        };
+        if next > MAX_RESTORABLE_ARGV_BYTES {
+            return false;
+        }
+        total = next;
+    }
+    true
+}
+
 /// Check if an argv matches a known restorable command pattern, returning the
 /// original argument vector for session persistence. Keeping argv structured is
 /// important: joining it here would discard quoting boundaries, so a remote
 /// command argument containing `;` could become a new local command on restore.
 pub fn match_restorable_command(args: &[String]) -> Option<Vec<String>> {
-    if args.is_empty() {
+    if !restorable_argv_within_limits(args) {
         return None;
     }
     let bin = Path::new(&args[0])
@@ -221,15 +273,6 @@ pub fn command_requires_block_integration(args: &[String]) -> bool {
     matches!(command_basename(args), "ssh" | "mosh")
 }
 
-/// How a snapshot on disk may spell a restorable command. `untagged` so both
-/// shapes are accepted from the same field without a schema version.
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum StoredRestorableCommand {
-    Argv(Vec<String>),
-    LegacyString(String),
-}
-
 /// Deserialize a snapshot's restorable command, accepting the legacy joined
 /// string but never replaying it.
 ///
@@ -248,24 +291,136 @@ pub fn deserialize_restorable_argv<'de, D>(deserializer: D) -> Result<Option<Vec
 where
     D: serde::Deserializer<'de>,
 {
-    let stored = Option::<StoredRestorableCommand>::deserialize(deserializer)?;
-    Ok(match stored {
-        // An empty argv is not restorable either: replaying it would exec the
-        // configured shell as if the pane had never run a command.
-        Some(StoredRestorableCommand::Argv(argv)) if !argv.is_empty() => Some(argv),
-        Some(StoredRestorableCommand::LegacyString(joined)) => {
-            // Log the first word only. It is the one boundary the joined form
-            // usually did preserve, so it tells a user which pane lost its
-            // command, without echoing arguments that can hold hostnames, remote
-            // paths or a `docker exec` target into the log.
-            let program = joined.split_whitespace().next().unwrap_or("(empty)");
+    struct BoundedArgument(Option<String>);
+
+    impl<'de> serde::Deserialize<'de> for BoundedArgument {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct ArgumentVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for ArgumentVisitor {
+                type Value = BoundedArgument;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a bounded command argument string")
+                }
+
+                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(BoundedArgument(
+                        (value.len() <= MAX_RESTORABLE_ARG_BYTES
+                            && !value.chars().any(char::is_control)
+                            && !crate::review_input::contains_visual_spoofing(value))
+                        .then(|| value.to_string()),
+                    ))
+                }
+
+                fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(BoundedArgument(
+                        (value.len() <= MAX_RESTORABLE_ARG_BYTES
+                            && !value.chars().any(char::is_control)
+                            && !crate::review_input::contains_visual_spoofing(&value))
+                        .then_some(value),
+                    ))
+                }
+            }
+
+            deserializer.deserialize_string(ArgumentVisitor)
+        }
+    }
+
+    struct StoredCommandVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for StoredCommandVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null, a legacy command string, or a bounded argv array")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_str<E>(self, joined: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            // Log only a bounded, visible spelling of the first word. Legacy
+            // argv boundaries cannot be reconstructed, and the original field
+            // is untrusted snapshot text rather than safe diagnostic output.
+            let raw_program = joined.split_whitespace().next().unwrap_or("(empty)");
+            let program = process_label(raw_program).unwrap_or_else(|| "(empty)".to_string());
             log::warn!(
                 "Ignoring legacy session restore command '{program}' without argv boundaries"
             );
-            None
+            Ok(None)
         }
-        _ => None,
-    })
+
+        fn visit_string<E>(self, joined: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&joined)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let capacity = sequence
+                .size_hint()
+                .unwrap_or(0)
+                .min(MAX_RESTORABLE_ARG_COUNT);
+            let mut argv = Vec::with_capacity(capacity);
+            let mut total = 0usize;
+            let mut count = 0usize;
+            let mut valid = true;
+            while let Some(BoundedArgument(argument)) =
+                sequence.next_element::<BoundedArgument>()?
+            {
+                count = count.saturating_add(1);
+                let Some(argument) = argument else {
+                    valid = false;
+                    continue;
+                };
+                let next_total = total
+                    .checked_add(argument.len())
+                    .and_then(|bytes| bytes.checked_add(1));
+                if count > MAX_RESTORABLE_ARG_COUNT
+                    || next_total.is_none_or(|bytes| bytes > MAX_RESTORABLE_ARGV_BYTES)
+                {
+                    valid = false;
+                    continue;
+                }
+                if valid {
+                    total = next_total.unwrap_or(total);
+                    argv.push(argument);
+                }
+            }
+            Ok(valid.then(|| match_restorable_command(&argv)).flatten())
+        }
+    }
+
+    deserializer.deserialize_any(StoredCommandVisitor)
 }
 
 // ---------------------------------------------------------------------------
@@ -290,32 +445,72 @@ pub fn read_proc_cmdline(pid: i32) -> Option<Vec<String>> {
     if pid <= 0 {
         return None;
     }
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    use std::io::Read;
+
+    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut raw = Vec::new();
+    file.take(MAX_PROC_CMDLINE_BYTES + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() as u64 > MAX_PROC_CMDLINE_BYTES {
+        return None;
+    }
+    parse_proc_cmdline_bytes(&raw)
+}
+
+fn parse_proc_cmdline_bytes(raw: &[u8]) -> Option<Vec<String>> {
     if raw.is_empty() {
         return None;
     }
-    let args: Vec<String> = raw
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).to_string())
-        .collect();
-    if args.is_empty() {
+    // Procfs terminates every argv element with NUL. Remove exactly the final
+    // delimiter, not every empty field: an empty argument is a real boundary
+    // that session restoration must preserve.
+    let body = raw.strip_suffix(&[0]).unwrap_or(raw);
+    let mut args = Vec::new();
+    for bytes in body.split(|byte| *byte == 0) {
+        if args.len() >= MAX_PROC_ARG_COUNT {
+            return None;
+        }
+        args.push(std::str::from_utf8(bytes).ok()?.to_string());
+    }
+    if args.first().is_none_or(String::is_empty) {
         None
     } else {
         Some(args)
     }
 }
 
+fn process_label(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut chars = raw.chars();
+    let mut label = String::new();
+    for ch in chars.by_ref().take(MAX_PROCESS_LABEL_CHARS) {
+        label.push(
+            if ch.is_control() || crate::review_input::is_visual_spoofing_character(ch) {
+                '\u{fffd}'
+            } else {
+                ch
+            },
+        );
+    }
+    if chars.next().is_some() {
+        label.push('…');
+    }
+    Some(label)
+}
+
 /// The kernel task name from `/proc/<pid>/comm`, trimmed. Truncated by the
-/// kernel to `TASK_COMM_LEN`; prefer [`read_proc_cmdline`] when a full argv[0]
+/// kernel to `TASK_COMM_LEN`; prefer [`read_proc_cmdline`] when a full `argv[0]`
 /// is available, and this when only a short display name is needed.
 pub fn process_comm(pid: i32) -> Option<String> {
     if pid <= 0 {
         return None;
     }
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    let comm = comm.trim();
-    (!comm.is_empty()).then(|| comm.to_string())
+    process_label(&comm)
 }
 
 /// The process working directory via `/proc/<pid>/cwd`, when readable.
@@ -504,7 +699,7 @@ pub fn foreground_process_name(pty_fd: i32, shell_pid: i32) -> Option<String> {
             return Path::new(args.first()?)
                 .file_name()
                 .and_then(|name| name.to_str())
-                .map(str::to_string);
+                .and_then(process_label);
         }
     }
     let fg = foreground_pgid(pty_fd, shell_pid)?;
@@ -512,7 +707,7 @@ pub fn foreground_process_name(pty_fd: i32, shell_pid: i32) -> Option<String> {
     Path::new(args.first()?)
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
+        .and_then(process_label)
 }
 
 // ---------------------------------------------------------------------------
@@ -702,7 +897,7 @@ impl ProcessRef {
     /// unrelated group. Returns `InvalidInput` when the process does not lead
     /// its group (including when `/proc` cannot answer).
     pub fn signal_process_group(&self, signal: c_int) -> io::Result<()> {
-        if !process_stat(self.pid).is_some_and(|stat| stat.process_group == self.pid) {
+        if process_stat(self.pid).is_none_or(|stat| stat.process_group != self.pid) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "process does not lead its own process group",
@@ -1395,6 +1590,10 @@ mod tests {
         assert_eq!(shell_quote_path("a b"), "'a b'");
         assert_eq!(shell_quote_path("it's"), "'it'\"'\"'s'");
         assert_eq!(shell_quote_path(""), "''");
+        for unsafe_path in ["line\nbreak", "hidden\u{202e}txt", "not\u{00a0}space"] {
+            assert_eq!(try_shell_quote_path(unsafe_path), None);
+            assert_eq!(shell_quote_path(unsafe_path), "''");
+        }
     }
 
     #[test]
@@ -1419,6 +1618,41 @@ mod tests {
         let restored = match_restorable_command(&args).expect("ssh argv is restorable");
         assert_eq!(restored.len(), 3);
         assert_eq!(restored[2], "printf '%s, %s; still remote' one two");
+    }
+
+    #[test]
+    fn restorable_commands_enforce_count_field_total_and_control_bounds() {
+        let too_many = std::iter::once("ssh".to_string())
+            .chain((0..MAX_RESTORABLE_ARG_COUNT).map(|_| "x".to_string()))
+            .collect::<Vec<_>>();
+        assert!(match_restorable_command(&too_many).is_none());
+
+        let oversized_field = vec!["ssh".to_string(), "x".repeat(MAX_RESTORABLE_ARG_BYTES + 1)];
+        assert!(match_restorable_command(&oversized_field).is_none());
+
+        let chunk = "x".repeat(MAX_RESTORABLE_ARG_BYTES);
+        let oversized_total = vec![
+            "ssh".to_string(),
+            chunk.clone(),
+            chunk.clone(),
+            chunk.clone(),
+            chunk,
+        ];
+        assert!(match_restorable_command(&oversized_total).is_none());
+        assert!(match_restorable_command(&argv(&["ssh", "host\nname"])).is_none());
+        assert!(match_restorable_command(&argv(&["ssh", "host\u{202e}name"])).is_none());
+        assert!(match_restorable_command(&argv(&["ssh", "host\u{00a0}name"])).is_none());
+
+        let boundary_chunk = (MAX_RESTORABLE_ARGV_BYTES - "ssh".len() - 5) / 4;
+        let boundary = vec![
+            "ssh".to_string(),
+            "x".repeat(boundary_chunk),
+            "x".repeat(boundary_chunk),
+            "x".repeat(boundary_chunk),
+            "x".repeat(boundary_chunk),
+        ];
+        assert!(restorable_argv_within_limits(&boundary));
+        assert!(match_restorable_command(&boundary).is_some());
     }
 
     #[test]
@@ -1453,6 +1687,33 @@ mod tests {
             stored_pane(r#"{"cmds":["ssh","host","echo a; rm b"]}"#).cmds,
             Some(argv(&["ssh", "host", "echo a; rm b"]))
         );
+    }
+
+    #[test]
+    fn arbitrary_structured_argv_is_loaded_without_replay() {
+        assert_eq!(
+            stored_pane(r#"{"cmds":["sh","-c","touch /tmp/from-snapshot"]}"#).cmds,
+            None
+        );
+        assert_eq!(stored_pane(r#"{"cmds":["git","status"]}"#).cmds, None);
+    }
+
+    #[test]
+    fn snapshot_argv_is_bounded_while_the_sequence_is_consumed() {
+        let too_many = std::iter::once("ssh".to_string())
+            .chain((0..MAX_RESTORABLE_ARG_COUNT).map(|_| String::new()))
+            .collect::<Vec<_>>();
+        let json = serde_json::json!({ "cmds": too_many }).to_string();
+        assert_eq!(stored_pane(&json).cmds, None);
+
+        let oversized = serde_json::json!({
+            "cmds": ["ssh", "x".repeat(MAX_RESTORABLE_ARG_BYTES + 1)]
+        })
+        .to_string();
+        assert_eq!(stored_pane(&oversized).cmds, None);
+
+        let spoofed = serde_json::json!({ "cmds": ["ssh", "host\u{202e}txt"] }).to_string();
+        assert_eq!(stored_pane(&spoofed).cmds, None);
     }
 
     #[test]
@@ -1626,6 +1887,31 @@ mod tests {
 
         assert!(parse_process_stat("garbage").is_none());
         assert!(parse_process_stat("1 (short) S 1").is_none());
+    }
+
+    #[test]
+    fn proc_cmdline_parser_preserves_boundaries_and_rejects_lossy_data() {
+        assert_eq!(
+            parse_proc_cmdline_bytes(b"ssh\0host\0\0remote arg\0"),
+            Some(argv(&["ssh", "host", "", "remote arg"]))
+        );
+        assert!(parse_proc_cmdline_bytes(b"ssh\0bad\xff\0").is_none());
+        assert!(parse_proc_cmdline_bytes(b"\0").is_none());
+
+        let too_many = vec![0_u8; MAX_PROC_ARG_COUNT + 1];
+        assert!(parse_proc_cmdline_bytes(&too_many).is_none());
+    }
+
+    #[test]
+    fn process_labels_cannot_reformat_terminal_chrome() {
+        let raw = format!("build\nleft\u{202e}right\u{00a0}{}", "x".repeat(200));
+        let label = process_label(&raw).unwrap();
+        assert!(!label.contains('\n'));
+        assert!(!label.contains('\u{202e}'));
+        assert!(!label.contains('\u{00a0}'));
+        assert!(label.contains('\u{fffd}'));
+        assert!(label.ends_with('…'));
+        assert_eq!(label.chars().count(), MAX_PROCESS_LABEL_CHARS + 1);
     }
 
     #[test]

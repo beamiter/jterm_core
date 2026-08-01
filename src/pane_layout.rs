@@ -186,6 +186,7 @@ impl PaneTree {
                         .iter()
                         .position(|c| matches!(c, PaneTree::Leaf(s) if *s == target))
                     {
+                        *ratios = normalized_shares(children.len(), ratios);
                         children.insert(i + 1, PaneTree::Leaf(new));
                         insert_pane_share(ratios, i);
                         return true;
@@ -211,6 +212,7 @@ impl PaneTree {
             .iter()
             .position(|c| matches!(c, PaneTree::Leaf(s) if *s == target))
         {
+            *ratios = normalized_shares(children.len(), ratios);
             children.remove(i);
             remove_pane_share(ratios, i);
             if children.len() == 1 {
@@ -255,10 +257,18 @@ impl PaneDirection {
 /// `snap`, shares close to an even pair split settle exactly there. Returns
 /// whether anything changed.
 pub fn set_divider_share(ratios: &mut [f32], d: usize, first: f32, snap: bool) -> bool {
-    if d + 1 >= ratios.len() {
+    let Some(next) = d.checked_add(1).filter(|next| *next < ratios.len()) else {
+        return false;
+    };
+    let pair = ratios[d] + ratios[next];
+    if !first.is_finite()
+        || !ratios[d].is_finite()
+        || !ratios[next].is_finite()
+        || !pair.is_finite()
+        || pair <= 0.0
+    {
         return false;
     }
-    let pair = ratios[d] + ratios[d + 1];
     let mut first = first;
     if snap && (first - pair / 2.0).abs() < SPLIT_SNAP_EPSILON {
         first = pair / 2.0;
@@ -270,13 +280,16 @@ pub fn set_divider_share(ratios: &mut [f32], d: usize, first: f32, snap: bool) -
         return false;
     }
     ratios[d] = first;
-    ratios[d + 1] = pair - first;
+    ratios[next] = pair - first;
     true
 }
 
 /// Make room for a new pane after `at` by halving `at`'s share; when the halves
 /// would fall below the minimum, every pane is equalized instead.
 pub fn insert_pane_share(ratios: &mut Vec<f32>, at: usize) {
+    if at >= ratios.len() || !ratios[at].is_finite() || ratios[at] <= 0.0 {
+        return;
+    }
     let half = ratios[at] / 2.0;
     ratios[at] = half;
     ratios.insert(at + 1, half);
@@ -309,8 +322,10 @@ pub fn equalize_shares(ratios: &mut [f32]) {
 /// positive; anything else falls back to an even split.
 pub fn normalized_shares(n: usize, ratios: &[f32]) -> Vec<f32> {
     let sum: f32 = ratios.iter().sum();
-    let usable =
-        ratios.len() == n && ratios.iter().all(|x| x.is_finite() && *x > 0.0) && sum > f32::EPSILON;
+    let usable = ratios.len() == n
+        && ratios.iter().all(|x| x.is_finite() && *x > 0.0)
+        && sum.is_finite()
+        && sum > f32::EPSILON;
     if usable {
         ratios.iter().map(|x| *x / sum).collect()
     } else {
@@ -397,6 +412,9 @@ pub fn split_node_rect(
             let Some((&head, tail)) = path.split_first() else {
                 return Some((*axis, rect));
             };
+            if head >= children.len() {
+                return None;
+            }
             let n = children.len().max(1);
             let gaps = divider * n.saturating_sub(1) as f32;
             let even = 1.0 / n as f32;
@@ -500,6 +518,22 @@ mod tests {
         assert_eq!(t.path_to_session(3), Some(vec![1, 1]));
         // Splitting a session that does not exist is a no-op.
         assert!(!t.split_leaf(99, Axis::Vertical, 4));
+
+        // Restored trees may carry malformed ratio arrays. Mutations repair
+        // them instead of indexing the snapshot data blindly.
+        let mut malformed = PaneTree::Split {
+            axis: Axis::Vertical,
+            children: vec![PaneTree::Leaf(0), PaneTree::Leaf(1)],
+            ratios: Vec::new(),
+        };
+        assert!(malformed.split_leaf(1, Axis::Vertical, 2));
+        let PaneTree::Split {
+            children, ratios, ..
+        } = malformed
+        else {
+            panic!("expected split");
+        };
+        assert_eq!(children.len(), ratios.len());
     }
 
     #[test]
@@ -651,6 +685,9 @@ mod tests {
         assert!((three[2] - 0.5).abs() < 1e-6);
         // Out-of-range divider index is rejected.
         assert!(!set_divider_share(&mut three, 2, 0.4, false));
+        assert!(!set_divider_share(&mut three, usize::MAX, 0.4, false));
+        assert!(!set_divider_share(&mut [f32::NAN, 1.0], 0, 0.5, false));
+        assert!(!set_divider_share(&mut [0.5, 0.5], 0, f32::NAN, false));
     }
 
     #[test]
@@ -669,6 +706,10 @@ mod tests {
         insert_pane_share(&mut thin, 1);
         assert_eq!(thin.len(), 3);
         assert!(thin.iter().all(|r| (r - 1.0 / 3.0).abs() < 1e-6));
+
+        let mut invalid = vec![1.0];
+        insert_pane_share(&mut invalid, usize::MAX);
+        assert_eq!(invalid, vec![1.0]);
     }
 
     #[test]
@@ -678,6 +719,7 @@ mod tests {
         assert_eq!(normalized_shares(2, &[1.0]), vec![0.5, 0.5]);
         assert_eq!(normalized_shares(2, &[f32::NAN, 1.0]), vec![0.5, 0.5]);
         assert_eq!(normalized_shares(2, &[-1.0, 2.0]), vec![0.5, 0.5]);
+        assert_eq!(normalized_shares(2, &[f32::MAX, f32::MAX]), vec![0.5, 0.5]);
     }
 
     #[test]

@@ -34,8 +34,10 @@
 //!   a security fix would silently change two apps.
 //! - **Control stripping is a flag, but marker removal is not.** Stripping C0
 //!   and C1 changes observable behaviour (ANSI-coloured text pasted into a
-//!   pager), so it is opt-in per call site: on for clipboard pastes, off for
-//!   command recall. Marker removal has no such tradeoff.
+//!   pager), so it is opt-in per call site. Clipboard paste and command recall
+//!   both enable it; lower-level callers can still opt out when controls are
+//!   part of an intentional program-input protocol. Marker removal has no such
+//!   tradeoff.
 
 use std::borrow::Cow;
 
@@ -97,13 +99,13 @@ impl PastePolicy {
         }
     }
 
-    /// Command recall / block re-run: the text came from this app's own
-    /// history, so leave control bytes alone rather than mangling a command
-    /// that legitimately contains an escape.
+    /// Command recall / block re-run. History can originate in a spoofed
+    /// terminal protocol stream, so it receives the same control-byte
+    /// defanging as clipboard text even though it is not auto-submitted.
     pub fn prompt_insert(unbracketed_multiline: UnbracketedMultiline) -> Self {
         Self {
             unbracketed_multiline,
-            strip_controls: false,
+            strip_controls: true,
             submit: false,
         }
     }
@@ -122,6 +124,13 @@ pub struct PasteRisk {
     pub had_embedded_paste_marker: bool,
     /// C0/C1 bytes were present (removed only when the policy asked).
     pub had_controls: bool,
+    /// Unicode spacing/formatting could make reviewed text display differently
+    /// from the bytes sent to the child. Clipboard callers may confirm it;
+    /// [`encode_prompt_insert`] rejects it outright.
+    pub had_visual_spoofing: bool,
+    /// The normalized body is larger than the review-only command boundary.
+    /// Clipboard transfer can still confirm it; prompt insertion rejects it.
+    pub exceeded_review_limit: bool,
     /// The body was reduced to its first line by [`UnbracketedMultiline`].
     pub truncated_to_first_line: bool,
 }
@@ -262,11 +271,15 @@ fn marker_len(data: &[u8]) -> Option<usize> {
 pub fn classify_paste(text: &str) -> PasteRisk {
     let normalized = normalize_newlines(text);
     let (body, had_marker, had_controls) = defang(&normalized, false);
+    let had_visual_spoofing = crate::review_input::contains_noncontrol_visual_spoofing(&body);
+    let exceeded_review_limit = body.len() > crate::review_input::MAX_REVIEW_INPUT_BYTES;
     PasteRisk {
         lines: body.split('\n').count(),
         bytes: body.len(),
         had_embedded_paste_marker: had_marker,
         had_controls,
+        had_visual_spoofing,
+        exceeded_review_limit,
         truncated_to_first_line: false,
     }
 }
@@ -276,9 +289,14 @@ pub fn classify_paste(text: &str) -> PasteRisk {
 /// Multiline is the common foot-gun: the receiving program may execute on the
 /// first newline whatever the terminal advertised. An embedded marker is a
 /// deliberate injection attempt and always worth surfacing, even though
-/// [`encode_paste`] has already neutralized it.
+/// [`encode_paste`] has already neutralized it. Unicode visual-spoofing text is
+/// likewise never treated as an ordinary one-line paste.
 pub fn should_confirm(risk: &PasteRisk, threshold_bytes: usize) -> bool {
-    risk.lines > 1 || risk.bytes > threshold_bytes || risk.had_embedded_paste_marker
+    risk.lines > 1
+        || risk.bytes > threshold_bytes
+        || risk.had_embedded_paste_marker
+        || risk.had_visual_spoofing
+        || risk.exceeded_review_limit
 }
 
 /// Encode a clipboard payload for the PTY.
@@ -288,12 +306,16 @@ pub fn should_confirm(risk: &PasteRisk, threshold_bytes: usize) -> bool {
 pub fn encode_paste(text: &str, modes: PasteModes, policy: PastePolicy) -> Paste {
     let normalized = normalize_newlines(text);
     let (body, had_marker, had_controls) = defang(&normalized, policy.strip_controls);
+    let had_visual_spoofing = crate::review_input::contains_noncontrol_visual_spoofing(&body);
+    let exceeded_review_limit = body.len() > crate::review_input::MAX_REVIEW_INPUT_BYTES;
 
     let mut risk = PasteRisk {
         lines: body.split('\n').count(),
         bytes: body.len(),
         had_embedded_paste_marker: had_marker,
         had_controls,
+        had_visual_spoofing,
+        exceeded_review_limit,
         truncated_to_first_line: false,
     };
 
@@ -358,6 +380,11 @@ pub fn encode_prompt_insert(
     clear_line_first: bool,
 ) -> Paste {
     let mut paste = encode_paste(command, modes, policy);
+    if paste.risk.had_visual_spoofing || paste.risk.exceeded_review_limit {
+        paste.bytes.clear();
+        paste.echo_text.clear();
+        return paste;
+    }
     if clear_line_first && !paste.bytes.is_empty() {
         paste.bytes.insert(0, KILL_LINE);
     }
@@ -458,7 +485,17 @@ impl InputGuard {
 
         if changed {
             out.extend_from_slice(&data[body_end..]);
-            return Cow::Owned(out);
+            if framed {
+                return Cow::Owned(out);
+            }
+
+            // Marker removal and multiline protection are independent. If the
+            // same unframed write carries both, the hostile marker must not
+            // make the rewritten bytes skip first-line truncation or framing.
+            return Cow::Owned(match self.apply_multiline_policy(&out, modes, policy) {
+                Cow::Borrowed(_) => out,
+                Cow::Owned(rewritten) => rewritten,
+            });
         }
 
         if framed {
@@ -677,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_controls_only_when_the_policy_asks() {
+    fn clipboard_and_prompt_insert_strip_controls() {
         let modes = PasteModes { bracketed: true };
         let stripped = encode_paste(
             "a\x1b[31mb\u{7f}c\td",
@@ -687,13 +724,13 @@ mod tests {
         assert_eq!(stripped.echo_text, "a[31mbc\td", "tab must survive");
         assert!(stripped.risk.had_controls);
 
-        let kept = encode_paste(
+        let prompt = encode_paste(
             "a\x1b[31mb",
             modes,
             PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
         );
-        assert_eq!(kept.echo_text, "a\x1b[31mb");
-        assert!(kept.risk.had_controls);
+        assert_eq!(prompt.echo_text, "a[31mb");
+        assert!(prompt.risk.had_controls);
     }
 
     #[test]
@@ -737,6 +774,39 @@ mod tests {
     }
 
     #[test]
+    fn prompt_insert_rejects_visual_spoofing_while_clipboard_surfaces_it() {
+        let text = "echo\u{00a0}looks-separated";
+        let modes = PasteModes { bracketed: true };
+        let clipboard = encode_paste(
+            text,
+            modes,
+            PastePolicy::clipboard(UnbracketedMultiline::FirstLineOnly),
+        );
+        assert!(clipboard.risk.had_visual_spoofing);
+        assert!(should_confirm(&clipboard.risk, usize::MAX));
+        assert_eq!(clipboard.echo_text, text);
+
+        let prompt = encode_prompt_insert(
+            text,
+            modes,
+            PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly),
+            true,
+        );
+        assert!(prompt.is_empty());
+        assert!(prompt.risk.had_visual_spoofing);
+
+        let oversized = "x".repeat(crate::review_input::MAX_REVIEW_INPUT_BYTES + 1);
+        let prompt = encode_prompt_insert(
+            &oversized,
+            modes,
+            PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly),
+            true,
+        );
+        assert!(prompt.is_empty());
+        assert!(prompt.risk.exceeded_review_limit);
+    }
+
+    #[test]
     fn classify_matches_the_confirmation_policy() {
         let single = classify_paste("echo hi");
         assert_eq!(single.lines, 1);
@@ -744,7 +814,41 @@ mod tests {
 
         let multi = classify_paste("echo hi\n");
         assert_eq!(multi.lines, 2, "a trailing newline is a second line");
+        assert!(
+            !multi.had_visual_spoofing,
+            "structural newlines are covered by multiline risk, not Unicode spoofing"
+        );
         assert!(should_confirm(&multi, 4096));
+
+        let framed = encode_prompt_insert(
+            "printf one\nprintf two",
+            PasteModes { bracketed: true },
+            PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly),
+            true,
+        );
+        assert_eq!(framed.echo_text, "printf one\nprintf two");
+        assert_eq!(
+            framed.bytes,
+            b"\x15\x1b[200~printf one\nprintf two\x1b[201~"
+        );
+
+        let first_line = encode_prompt_insert(
+            "printf one\nprintf two",
+            PasteModes { bracketed: false },
+            PastePolicy::prompt_insert(UnbracketedMultiline::FirstLineOnly),
+            true,
+        );
+        assert_eq!(first_line.echo_text, "printf one");
+        assert_eq!(first_line.bytes, b"\x15printf one");
+
+        let verbatim = encode_prompt_insert(
+            "printf one\nprintf two",
+            PasteModes { bracketed: false },
+            PastePolicy::prompt_insert(UnbracketedMultiline::SendVerbatim),
+            true,
+        );
+        assert_eq!(verbatim.echo_text, "printf one\nprintf two");
+        assert_eq!(verbatim.bytes, b"\x15printf one\nprintf two");
 
         let big = classify_paste(&"x".repeat(5000));
         assert!(should_confirm(&big, 4096));
@@ -818,6 +922,23 @@ mod tests {
         let mut guard = InputGuard::new();
         assert_eq!(&*guard.filter(b"a\x1b[201~b", modes, policy), b"ab");
         assert!(!guard.in_frame());
+    }
+
+    #[test]
+    fn guard_marker_removal_cannot_bypass_multiline_protection() {
+        let (modes, policy) = guard_policy();
+        let mut guard = InputGuard::new();
+        assert_eq!(
+            &*guard.filter(b"one\x1b[201~\ntwo\r", modes, policy),
+            b"\x1b[200~one\ntwo\x1b[201~\r"
+        );
+
+        let modes = PasteModes { bracketed: false };
+        let mut guard = InputGuard::new();
+        assert_eq!(
+            &*guard.filter(b"one\x1b[201~\ntwo\r", modes, policy),
+            b"one"
+        );
     }
 
     #[test]

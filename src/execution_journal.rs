@@ -10,13 +10,14 @@
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EXECUTION_JOURNAL_VERSION: u32 = 1;
 const WRITER_QUEUE_CAPACITY: usize = 64;
@@ -26,11 +27,14 @@ const MAX_EXECUTION_ID_BYTES: usize = 192;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_CWD_BYTES: usize = 4 * 1024;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
 const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RETAINED_EXECUTIONS: usize = 2_000;
 // jsh compacts after its own event. jterm's correlated output can be the next
 // line and legitimately leave the file one bounded event over the threshold.
 const MAX_JOURNAL_READ_BYTES: u64 = MAX_JOURNAL_FILE_BYTES + MAX_EVENT_LINE_BYTES as u64 + 1;
+const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const JOURNAL_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// One completed command's captured output, as reported by a terminal app.
 /// Only correlation id and output payload matter here; jsh's own events carry
@@ -189,13 +193,19 @@ impl OutputEvent {
         if !completed.output_available || !valid_jsh_execution_id(&completed.id) {
             return None;
         }
-        let retained_bytes = u64::try_from(completed.output.len()).unwrap_or(u64::MAX);
+        let observed_bytes = completed.output.len();
+        let retained_bytes = u64::try_from(observed_bytes).unwrap_or(u64::MAX);
+        let (text, truncated) = if observed_bytes > MAX_OUTPUT_BYTES {
+            (bounded_text(&completed.output, MAX_OUTPUT_BYTES), true)
+        } else {
+            (completed.output, completed.truncated)
+        };
         Some(Self {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             event: "output",
             id: completed.id,
-            text: completed.output,
-            truncated: completed.truncated,
+            text,
+            truncated,
             total_bytes: u64::try_from(completed.total_bytes)
                 .unwrap_or(u64::MAX)
                 .max(retained_bytes),
@@ -273,6 +283,14 @@ fn reader() -> Option<&'static Sender<HistoryRequest>> {
 /// machine for both configurations.
 pub fn request_history(session_id: String) -> Result<HistoryLoad, HistoryRequestError> {
     let (reply, receiver) = bounded(1);
+    if !valid_jsh_session_id(&session_id) {
+        let _ = reply.try_send(HistorySnapshot {
+            session_id,
+            records: Vec::new(),
+            error: Some("invalid jsh session ID".to_string()),
+        });
+        return Ok(HistoryLoad { receiver });
+    }
     if !enabled() {
         let _ = reply.try_send(HistorySnapshot {
             session_id,
@@ -366,12 +384,54 @@ fn journal_path() -> io::Result<(PathBuf, bool)> {
                 "JSH_EXECUTION_JOURNAL_PATH must be absolute",
             ));
         }
+        validate_journal_path(&path)?;
         return Ok((path, true));
     }
     let state_dir = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no user state directory"))?;
-    Ok((state_dir.join("jsh/executions.jsonl"), false))
+    let path = state_dir.join("jsh/executions.jsonl");
+    validate_journal_path(&path)?;
+    Ok((path, false))
+}
+
+fn validate_journal_path(path: &Path) -> io::Result<()> {
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution journal path has no file name",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() > MAX_JOURNAL_PATH_BYTES
+            || bytes.iter().any(|byte| matches!(*byte, 0..=0x1f | 0x7f))
+            || path
+                .to_str()
+                .is_some_and(crate::review_input::contains_visual_spoofing)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "execution journal path is too long or contains unsafe display bytes",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let text = path.to_string_lossy();
+        if text.len() > MAX_JOURNAL_PATH_BYTES
+            || text.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoofing(&text)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "execution journal path is too long or contains unsafe display text",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn harden_open_options(options: &mut OpenOptions) {
@@ -379,7 +439,10 @@ fn harden_open_options(options: &mut OpenOptions) {
     {
         options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            // Nonblocking is inert for regular files and prevents a FIFO or
+            // device substituted at a persistence pathname from hanging the
+            // single journal worker before fstat can reject it.
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
 }
 
@@ -401,9 +464,69 @@ fn validate_journal_file(file: &File, description: &str) -> io::Result<()> {
                 format!("{description} must have exactly one hard link"),
             ));
         }
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{description} is not owned by the current user"),
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{description} is writable by another user or group"),
+            ));
+        }
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_journal_directory(dir: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(dir)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "execution journal parent {} is not a directory",
+                dir.display()
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode();
+    // The sticky bit does not constrain the directory owner. Accept a shared
+    // namespace only when it is owned by us or by root (for example `/tmp`).
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid && metadata.uid() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "execution journal parent {} is not owned by the current user or root",
+                dir.display()
+            ),
+        ));
+    }
+    // A sticky shared directory such as /tmp protects entries by owner. Other
+    // group/world-writable parents permit a different uid to replace the lock
+    // or journal pathname between otherwise safe descriptor operations.
+    if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "execution journal parent {} is group/world writable without the sticky bit",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(directory)
 }
 
 fn open_journal_lock(path: &std::path::Path) -> io::Result<File> {
@@ -435,6 +558,103 @@ fn open_journal_for_append(path: &std::path::Path) -> io::Result<File> {
     Ok(file)
 }
 
+#[derive(Clone, Copy)]
+enum JournalLockMode {
+    Shared,
+    Exclusive,
+}
+
+struct JournalFileLock {
+    #[cfg(unix)]
+    directory: File,
+    file: File,
+}
+
+impl JournalFileLock {
+    fn acquire(dir: &Path, lock_path: &Path, mode: JournalLockMode) -> io::Result<Self> {
+        Self::acquire_with_timeout(dir, lock_path, mode, JOURNAL_LOCK_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(
+        dir: &Path,
+        lock_path: &Path,
+        mode: JournalLockMode,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        let started = Instant::now();
+        let wait = |file: &File| -> io::Result<()> {
+            loop {
+                if try_lock(file, mode)? {
+                    return Ok(());
+                }
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {} ms waiting for execution journal lock {}",
+                            timeout.as_millis(),
+                            lock_path.display()
+                        ),
+                    ));
+                }
+                thread::sleep(JOURNAL_LOCK_POLL_INTERVAL.min(timeout - elapsed));
+            }
+        };
+
+        // Stabilize the sidecar pathname before opening it. Every cooperating
+        // reader/writer locks the directory in the same mode, so renaming a
+        // locked sidecar and creating a new inode cannot split the protocol.
+        #[cfg(unix)]
+        let directory = {
+            let directory = open_journal_directory(dir)?;
+            wait(&directory)?;
+            directory
+        };
+        let file = match open_journal_lock(lock_path) {
+            Ok(file) => file,
+            Err(error) => {
+                #[cfg(unix)]
+                let _ = unlock(&directory);
+                return Err(error);
+            }
+        };
+        if let Err(error) = wait(&file) {
+            #[cfg(unix)]
+            let _ = unlock(&directory);
+            return Err(error);
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            directory,
+            file,
+        })
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.directory.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for JournalFileLock {
+    fn drop(&mut self) {
+        if let Err(error) = unlock(&self.file) {
+            log::warn!("failed to release execution journal lock: {error}");
+        }
+        #[cfg(unix)]
+        if let Err(error) = unlock(&self.directory) {
+            log::warn!("failed to release execution journal directory lock: {error}");
+        }
+    }
+}
+
 fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>> {
     if !valid_jsh_session_id(session_id) {
         return Err(io::Error::new(
@@ -443,24 +663,20 @@ fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>>
         ));
     }
     let (path, _) = journal_path()?;
-    if !path.try_exists()? {
-        return Ok(Vec::new());
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     }
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
     let lock_path = dir.join("executions.lock");
-    let lock = open_journal_lock(&lock_path)?;
-    lock_shared(&lock)?;
+    let _lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Shared)?;
 
-    let read_result = match read_session_history_file(&path, session_id) {
+    match read_session_history_file(&path, session_id) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         result => result,
-    };
-    let unlock_result = unlock(&lock);
-    match (read_result, unlock_result) {
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        (Ok(records), Ok(())) => Ok(records),
     }
 }
 
@@ -477,7 +693,13 @@ fn read_session_history_file(
     }
 
     let mut records = HashMap::<String, PersistedExecution>::new();
-    let mut reader = BufReader::new(file);
+    // Keep the working set bounded while folding a journal containing many
+    // tiny start records. The file byte cap alone does not bound HashMap
+    // overhead. This index mirrors the final ordering and lets us evict the
+    // oldest record in logarithmic time.
+    let mut record_order = BTreeMap::<(u64, u64, String), String>::new();
+    let read_limit = MAX_JOURNAL_READ_BYTES.saturating_add(1);
+    let mut reader = BufReader::new(file.take(read_limit));
     let mut line = Vec::new();
     while let Some(within_limit) = read_bounded_line(&mut reader, &mut line)? {
         if !within_limit {
@@ -504,33 +726,44 @@ fn read_session_history_file(
                     || event_session_id
                         .as_deref()
                         .is_some_and(|id| !valid_jsh_session_id(id))
-                    || command.len() > MAX_COMMAND_BYTES
-                    || cwd.len() > MAX_CWD_BYTES
+                    || !valid_command_text(&command)
+                    || !valid_cwd_text(&cwd)
                 {
                     continue;
                 }
                 // A later duplicate start is authoritative, including when it
                 // moves an ID out of the requested session.
-                records.remove(&id);
+                if let Some(previous) = records.remove(&id) {
+                    record_order.remove(&(
+                        previous.started_at_ms,
+                        previous.seq,
+                        previous.id.clone(),
+                    ));
+                }
                 if event_session_id.as_deref() != Some(session_id) {
                     continue;
                 }
-                records.insert(
-                    id.clone(),
-                    PersistedExecution {
-                        id,
-                        seq,
-                        command,
-                        command_truncated,
-                        cwd,
-                        started_at_ms,
-                        exit_code: None,
-                        duration_ms: None,
-                        cwd_after: None,
-                        ended_at_ms: None,
-                        output: None,
-                    },
-                );
+                let record = PersistedExecution {
+                    id: id.clone(),
+                    seq,
+                    command,
+                    command_truncated,
+                    cwd,
+                    started_at_ms,
+                    exit_code: None,
+                    duration_ms: None,
+                    cwd_after: None,
+                    ended_at_ms: None,
+                    output: None,
+                };
+                record_order.insert((started_at_ms, seq, id.clone()), id.clone());
+                records.insert(id, record);
+                while records.len() > MAX_RETAINED_EXECUTIONS {
+                    let Some((_, oldest_id)) = record_order.pop_first() else {
+                        break;
+                    };
+                    records.remove(&oldest_id);
+                }
             }
             PersistedEvent::Finish {
                 id,
@@ -540,7 +773,7 @@ fn read_session_history_file(
                 ended_at_ms,
                 ..
             } => {
-                if !valid_jsh_execution_id(&id) || cwd_after.len() > MAX_CWD_BYTES {
+                if !valid_jsh_execution_id(&id) || !valid_cwd_text(&cwd_after) {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
@@ -571,6 +804,14 @@ fn read_session_history_file(
                 }
             }
         }
+    }
+
+    let bytes_read = read_limit.saturating_sub(reader.get_ref().limit());
+    if bytes_read > MAX_JOURNAL_READ_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "jsh execution journal grew beyond its bounded size while reading",
+        ));
     }
 
     let mut records = records.into_values().collect::<Vec<_>>();
@@ -615,12 +856,37 @@ fn prepare_journal_path() -> io::Result<PathBuf> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
-    let dir_already_existed = dir.exists();
-    fs::create_dir_all(dir)?;
+    let dir_already_existed = match fs::symlink_metadata(dir) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
     #[cfg(unix)]
-    if !custom_path || !dir_already_existed {
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let directory = open_journal_directory(dir)?;
+        if !custom_path || !dir_already_existed {
+            let metadata = directory.metadata()?;
+            // SAFETY: geteuid has no preconditions and only reads process state.
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "execution journal directory {} is not owned by the current user",
+                        dir.display()
+                    ),
+                ));
+            }
+            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
     }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)?;
     Ok(path)
 }
 
@@ -636,10 +902,9 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
     let lock_path = dir.join("executions.lock");
 
-    let lock = open_journal_lock(&lock_path)?;
-    lock_exclusive(&lock)?;
+    let lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Exclusive)?;
 
-    let write_result = (|| {
+    (|| {
         let mut journal = open_journal_for_append(journal_path)?;
         let current_len = journal.metadata()?.len();
         if !journal_append_within_bound(current_len, encoded.len()) {
@@ -651,11 +916,9 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
         #[cfg(unix)]
         journal.set_permissions(fs::Permissions::from_mode(0o600))?;
         journal.write_all(encoded)?;
-        journal.flush()
-    })();
-
-    let unlock_result = unlock(&lock);
-    write_result.and(unlock_result)
+        journal.sync_data()?;
+        lock.sync_directory()
+    })()
 }
 
 fn journal_append_within_bound(current_bytes: u64, event_bytes: usize) -> bool {
@@ -688,6 +951,20 @@ pub fn is_valid_jsh_session_id(id: &str) -> bool {
 
 fn valid_jsh_session_id(id: &str) -> bool {
     is_valid_jsh_session_id(id)
+}
+
+fn valid_command_text(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= MAX_COMMAND_BYTES
+        && !command.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(command)
+}
+
+fn valid_cwd_text(cwd: &str) -> bool {
+    !cwd.is_empty()
+        && cwd.len() <= MAX_CWD_BYTES
+        && !cwd.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(cwd)
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {
@@ -732,39 +1009,32 @@ fn encode_event(mut event: OutputEvent) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn lock_exclusive(file: &std::fs::File) -> io::Result<()> {
+fn try_lock(file: &std::fs::File, mode: JournalLockMode) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
-    // SAFETY: `file` remains open for the entire flock lifetime and flock does
-    // not dereference userspace pointers.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(unix)]
-fn lock_shared(file: &std::fs::File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `file` remains open for the flock lifetime; flock does not
+    let operation = match mode {
+        JournalLockMode::Shared => libc::LOCK_SH,
+        JournalLockMode::Exclusive => libc::LOCK_EX,
+    } | libc::LOCK_NB;
+    // SAFETY: `file` remains open for the flock lifetime and flock does not
     // dereference userspace pointers.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
     if result == 0 {
-        Ok(())
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EAGAIN || code == libc::EWOULDBLOCK)
+    {
+        Ok(false)
     } else {
-        Err(io::Error::last_os_error())
+        Err(error)
     }
 }
 
 #[cfg(not(unix))]
-fn lock_exclusive(_file: &std::fs::File) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn lock_shared(_file: &std::fs::File) -> io::Result<()> {
-    Ok(())
+fn try_lock(_file: &std::fs::File, _mode: JournalLockMode) -> io::Result<bool> {
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -801,6 +1071,8 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
     }
@@ -816,6 +1088,12 @@ mod tests {
             "jterm2-execution-journal-{}-{name}.jsonl",
             std::process::id()
         ))
+    }
+
+    fn write_temporary_journal(path: &Path, contents: impl AsRef<[u8]>) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]
@@ -872,6 +1150,23 @@ mod tests {
     }
 
     #[test]
+    fn oversized_output_is_bounded_before_it_enters_the_writer_queue() {
+        let output = "界".repeat(MAX_OUTPUT_BYTES);
+        let observed = output.len();
+        let event = OutputEvent::from_completed(CompletedExecution {
+            id: "exec-large".to_owned(),
+            output,
+            output_available: true,
+            truncated: false,
+            total_bytes: 0,
+        })
+        .unwrap();
+        assert!(event.text.len() <= MAX_OUTPUT_BYTES);
+        assert!(event.truncated);
+        assert_eq!(event.total_bytes, observed as u64);
+    }
+
+    #[test]
     fn control_heavy_output_stays_within_jshs_jsonl_limit() {
         let output = "\0".repeat(MAX_OUTPUT_BYTES);
         let total_bytes = output.len();
@@ -904,7 +1199,7 @@ mod tests {
             "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"hi\",\"truncated\":false,\"total_bytes\":1,\"captured_at_ms\":12}\n",
             "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-1\",\"exit_code\":3,\"duration_ms\":2,\"cwd_after\":\"/tmp/after\",\"ended_at_ms\":12}\n"
         );
-        fs::write(&path, journal).unwrap();
+        write_temporary_journal(&path, journal);
 
         let records = read_session_history_file(&path, "wanted").unwrap();
         let _ = fs::remove_file(&path);
@@ -923,13 +1218,33 @@ mod tests {
     }
 
     #[test]
+    fn history_reader_drops_unsafe_replay_text_without_losing_safe_records() {
+        let path = temporary_journal("unsafe-display-text");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bad-command\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"echo\\nrun\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bad-cwd\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"true\",\"cwd\":\"/tmp/SPOOFhidden\",\"started_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"safe\",\"session_id\":\"wanted\",\"seq\":3,\"command\":\"printf hi\",\"cwd\":\"/tmp/a b\",\"started_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"safe\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp/SPACEhidden\",\"ended_at_ms\":4}\n"
+        )
+        .replace("SPOOF", "\u{202e}")
+        .replace("SPACE", "\u{00a0}");
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "safe");
+        assert_eq!(records[0].cwd_after, None);
+    }
+
+    #[test]
     fn history_reader_discards_an_oversized_line_and_resumes() {
         let path = temporary_journal("oversized-line");
         let valid = b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"after-large\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n";
         let mut journal = vec![b'x'; MAX_EVENT_LINE_BYTES + 2];
         journal.push(b'\n');
         journal.extend_from_slice(valid);
-        fs::write(&path, journal).unwrap();
+        write_temporary_journal(&path, journal);
 
         let records = read_session_history_file(&path, "wanted").unwrap();
         let _ = fs::remove_file(&path);
@@ -937,7 +1252,6 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "after-large");
     }
-
     #[test]
     fn history_reader_keeps_only_the_latest_bounded_records() {
         let path = temporary_journal("record-limit");
@@ -949,7 +1263,7 @@ mod tests {
             )
             .unwrap();
         }
-        fs::write(&path, journal).unwrap();
+        write_temporary_journal(&path, journal);
 
         let records = read_session_history_file(&path, "wanted").unwrap();
         let _ = fs::remove_file(&path);
@@ -970,6 +1284,29 @@ mod tests {
         for invalid in ["", "has.dot", "has space", "雪"] {
             assert!(!valid_jsh_session_id(invalid), "{invalid}");
         }
+    }
+
+    #[test]
+    fn invalid_history_requests_resolve_without_entering_the_reader_queue() {
+        let session_id = "x".repeat(MAX_EXECUTION_ID_BYTES + 1);
+        let load = request_history(session_id.clone()).unwrap();
+        let snapshot = load
+            .try_snapshot()
+            .unwrap()
+            .expect("invalid requests resolve synchronously");
+
+        assert_eq!(snapshot.session_id, session_id);
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.error.as_deref(), Some("invalid jsh session ID"));
+    }
+
+    #[test]
+    fn journal_paths_are_bounded_and_safe_to_report() {
+        assert!(validate_journal_path(Path::new("executions.jsonl")).is_ok());
+        assert!(validate_journal_path(Path::new("bad\nname.jsonl")).is_err());
+        assert!(validate_journal_path(Path::new("bad\u{202e}name.jsonl")).is_err());
+        let oversized = PathBuf::from("x".repeat(MAX_JOURNAL_PATH_BYTES + 1));
+        assert!(validate_journal_path(&oversized).is_err());
     }
 
     #[test]
@@ -1005,6 +1342,89 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_is_bounded_and_survives_sidecar_replacement() {
+        let root = TestDir::new("lock-replacement");
+        let lock_path = root.0.join("executions.lock");
+        let retired_path = root.0.join("retired.lock");
+        let held =
+            JournalFileLock::acquire(&root.0, &lock_path, JournalLockMode::Exclusive).unwrap();
+        fs::rename(&lock_path, &retired_path).unwrap();
+
+        let started = Instant::now();
+        let error = JournalFileLock::acquire_with_timeout(
+            &root.0,
+            &lock_path,
+            JournalLockMode::Exclusive,
+            Duration::from_millis(25),
+        )
+        .err()
+        .expect("renaming the sidecar must not bypass the directory lock");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        drop(held);
+        let reacquired = JournalFileLock::acquire_with_timeout(
+            &root.0,
+            &lock_path,
+            JournalLockMode::Exclusive,
+            Duration::from_millis(25),
+        )
+        .expect("the protocol remains usable after the original guard exits");
+        drop(reacquired);
+        fs::remove_file(retired_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_descriptors_are_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let root = TestDir::new("lock-cloexec");
+        let lock_path = root.0.join("executions.lock");
+        let held =
+            JournalFileLock::acquire(&root.0, &lock_path, JournalLockMode::Exclusive).unwrap();
+        for file in [&held.directory, &held.file] {
+            // SAFETY: each File owns a live descriptor and F_GETFD only reads
+            // descriptor flags.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = TestDir::new("journal-fifo");
+        let journal_path = root.0.join("executions.jsonl");
+        let encoded = CString::new(journal_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: encoded is a live NUL-terminated path and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        assert!(read_session_history_file(&journal_path, "wanted").is_err());
+        assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonsticky_writable_journal_parent_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("writable-parent");
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o777)).unwrap();
+        let journal_path = root.0.join("executions.jsonl");
+
+        assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
+        assert!(!journal_path.exists());
     }
 
     #[cfg(unix)]
@@ -1048,6 +1468,21 @@ mod tests {
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o640
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_writable_by_other_users_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("shared-write");
+        let journal_path = root.0.join("executions.jsonl");
+        fs::write(&journal_path, "event\n").unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o622)).unwrap();
+
+        assert!(read_session_history_file(&journal_path, "wanted").is_err());
+        assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
+        assert_eq!(fs::read_to_string(journal_path).unwrap(), "event\n");
     }
 
     #[cfg(unix)]

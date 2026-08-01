@@ -13,6 +13,21 @@
 //! that's meant to be unobtrusive.
 
 use std::process::Stdio;
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+const NOTIFICATION_QUEUE_CAPACITY: usize = 16;
+const NOTIFY_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct Notification {
+    urgency: &'static str,
+    timeout_ms: &'static str,
+    title: String,
+    body: String,
+}
+
+static NOTIFICATION_WORKER: OnceLock<Option<SyncSender<Notification>>> = OnceLock::new();
 
 /// Post a desktop notification for a command that just finished. `cmd` is
 /// the displayed command (truncated to keep the toast readable);
@@ -44,58 +59,119 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
 }
 
 /// Post an application-driven desktop notification (OSC 9 / OSC 777). The
-/// shared parser has already bounded the fields and stripped control bytes
-/// (`parser::MAX_NOTIFICATION_CHARS`); callers are expected to rate-limit.
-/// A missing title falls back to the app identity so toasts stay attributable.
+/// shared parser normally bounds and sanitises these fields, and this final
+/// sink repeats that contract for direct callers. Callers are expected to
+/// rate-limit. A missing title falls back to the app identity so toasts stay
+/// attributable.
 pub fn app_notification(title: Option<&str>, body: &str) {
     let title = title
-        .map(str::trim)
+        .map(safe_notification_field)
         .filter(|title| !title.is_empty())
-        .unwrap_or(crate::identity::get().app_name);
-    spawn_notify_send("normal", "5000", title, body);
+        .unwrap_or_else(|| safe_notification_field(crate::identity::get().app_name));
+    let body = safe_notification_field(body);
+    spawn_notify_send("normal", "5000", &title, &body);
 }
 
-/// Spawn notify-send and reap it from a short-lived thread. notify-send exits
-/// as soon as D-Bus accepts the toast, but a dropped Child stays a zombie
-/// until waited on; callers rate-limit launches, so one reaper thread per
-/// notification is bounded and keeps the process table clean.
-fn spawn_notify_send(urgency: &str, timeout_ms: &str, title: &str, body: &str) {
+/// Queue a toast for one bounded worker. A stuck D-Bus bridge can otherwise
+/// leave one process and one reaper thread behind for every notification.
+fn spawn_notify_send(urgency: &'static str, timeout_ms: &'static str, title: &str, body: &str) {
+    let Some(sender) = notification_worker() else {
+        return;
+    };
+    let notification = Notification {
+        urgency,
+        timeout_ms,
+        title: title.to_owned(),
+        body: body.to_owned(),
+    };
+    match sender.try_send(notification) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => log::warn!("desktop notification queue is full"),
+        Err(TrySendError::Disconnected(_)) => {
+            log::warn!("desktop notification worker is unavailable")
+        }
+    }
+}
+
+fn notification_worker() -> Option<&'static SyncSender<Notification>> {
+    NOTIFICATION_WORKER
+        .get_or_init(|| {
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<Notification>(NOTIFICATION_QUEUE_CAPACITY);
+            match std::thread::Builder::new()
+                .name("jterm-notification".to_string())
+                .spawn(move || {
+                    while let Ok(notification) = receiver.recv() {
+                        send_notification(notification);
+                    }
+                }) {
+                Ok(_) => Some(sender),
+                Err(error) => {
+                    log::warn!("failed to start desktop notification worker: {error}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn send_notification(notification: Notification) {
     let identity = crate::identity::get();
     let app_name_arg = format!("--app-name={}", identity.app_name);
     let icon_arg = format!("--icon={}", identity.app_id);
-    let spawned = crate::host::command("notify-send")
+    let Ok(mut command) = crate::host::helper_command("notify-send") else {
+        return;
+    };
+    command
         .args([
             app_name_arg.as_str(),
             icon_arg.as_str(),
             "--urgency",
-            urgency,
+            notification.urgency,
             "--expire-time",
-            timeout_ms,
+            notification.timeout_ms,
             "--",
-            title,
-            body,
+            notification.title.as_str(),
+            notification.body.as_str(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if let Ok(mut child) = spawned {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+        .stderr(Stdio::null());
+    if let Err(error) = crate::host::command_status_with_timeout(command, NOTIFY_SEND_TIMEOUT) {
+        log::warn!("desktop notification subprocess failed: {error}");
     }
 }
 
 fn notification_title(cmd: &str) -> String {
     const MAX_CHARS: usize = 60;
 
-    let first_line = cmd.lines().next().unwrap_or(cmd);
+    let first_line = cmd.split(['\r', '\n']).next().unwrap_or(cmd);
     let mut chars = first_line.chars();
-    let mut title: String = chars.by_ref().take(MAX_CHARS).collect();
+    let mut title = String::new();
+    for ch in chars.by_ref().take(MAX_CHARS) {
+        title.push(visible_notification_character(ch));
+    }
     if chars.next().is_some() {
         title.push('…');
     }
     title
+}
+
+fn safe_notification_field(raw: &str) -> String {
+    raw.chars()
+        .map(visible_notification_character)
+        .take(crate::parser::MAX_NOTIFICATION_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn visible_notification_character(ch: char) -> char {
+    if ch.is_control() || crate::review_input::is_visual_spoofing_character(ch) {
+        '\u{fffd}'
+    } else {
+        ch
+    }
 }
 
 /// Render a millisecond count as a short human string. Used in the
@@ -168,5 +244,18 @@ mod tests {
                 cmd.chars().take(60).collect::<String>()
             );
         }
+    }
+
+    #[test]
+    fn notification_sink_bounds_and_exposes_untrusted_formatting() {
+        assert_eq!(
+            notification_title("echo\tleft\u{202e}right\u{00a0}tail\nignored"),
+            "echo\u{fffd}left\u{fffd}right\u{fffd}tail"
+        );
+        let long = "x".repeat(crate::parser::MAX_NOTIFICATION_CHARS + 1);
+        assert_eq!(
+            safe_notification_field(&long).chars().count(),
+            crate::parser::MAX_NOTIFICATION_CHARS
+        );
     }
 }

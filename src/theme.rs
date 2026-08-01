@@ -4,10 +4,12 @@
 //! trait over [`Theme`].
 
 use serde::{Deserialize, Serialize};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 const MAX_CUSTOM_THEME_NAME_BYTES: usize = 160;
+const MAX_CUSTOM_THEME_FILE_BYTES: u64 = 256 * 1024;
+const MAX_CUSTOM_THEME_FILES: usize = 256;
 
 /// 终端颜色配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -822,8 +824,49 @@ impl Theme {
 
     /// 从文件加载主题
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "theme path is not a regular file",
+            )
+            .into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "theme file must have exactly one hard link",
+                )
+                .into());
+            }
+        }
+        if metadata.len() > MAX_CUSTOM_THEME_FILE_BYTES {
+            return Err(
+                io::Error::new(io::ErrorKind::FileTooLarge, "theme file is too large").into(),
+            );
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_CUSTOM_THEME_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CUSTOM_THEME_FILE_BYTES {
+            return Err(
+                io::Error::new(io::ErrorKind::FileTooLarge, "theme file is too large").into(),
+            );
+        }
+        let content = String::from_utf8(bytes)?;
         let theme: Theme = toml::from_str(&content)?;
+        Self::validate_custom_theme_name(&theme.name).map_err(Self::invalid_theme_name)?;
         Ok(theme)
     }
 
@@ -857,9 +900,10 @@ impl Theme {
                 "theme name is too long (maximum {MAX_CUSTOM_THEME_NAME_BYTES} UTF-8 bytes)"
             )));
         }
-        if name.chars().any(char::is_control) {
+        if name.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(name)
+        {
             return Err(Self::invalid_theme_name(
-                "theme name must not contain control characters",
+                "theme name must not contain controls or invisible formatting characters",
             ));
         }
 
@@ -887,24 +931,42 @@ impl Theme {
     }
 
     fn validate_custom_themes_dir(dir: &Path) -> io::Result<()> {
-        let metadata = std::fs::symlink_metadata(dir)?;
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "custom themes directory must not be a symbolic link",
-            ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(dir)?;
+            let metadata = directory.metadata()?;
+            // SAFETY: geteuid has no preconditions and only reads process state.
+            if !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "custom themes directory must be current-user owned and not group/world writable",
+                ));
+            }
+            Ok(())
         }
-        if !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "custom themes path is not a directory",
-            ));
+        #[cfg(not(unix))]
+        {
+            if std::fs::metadata(dir)?.is_dir() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "custom themes path is not a directory",
+                ))
+            }
         }
-        Ok(())
     }
 
     fn ensure_custom_themes_dir(dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dir)?;
+        crate::snapshot_file::ensure_private_directory(dir)?;
         Self::validate_custom_themes_dir(dir)
     }
 
@@ -916,7 +978,7 @@ impl Theme {
             return Vec::new();
         };
         let mut themes = Vec::new();
-        for entry in entries.flatten() {
+        for entry in entries.flatten().take(MAX_CUSTOM_THEME_FILES) {
             // Do not read through a symlink planted in the themes directory.
             if !entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
                 continue;
@@ -1042,8 +1104,12 @@ impl Theme {
         if matches!(name, "." | "..")
             || name.contains(['/', '\\'])
             || name.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoofing(name)
         {
-            return Err("Name cannot contain path separators or control characters".to_string());
+            return Err(
+                "Name cannot contain path separators, controls, or invisible formatting characters"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -1167,7 +1233,21 @@ mod tests {
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Self(path)
+        }
+    }
+
+    fn create_private_dir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
 
@@ -1218,7 +1298,7 @@ mod tests {
     fn invalid_names_cannot_save_or_delete_outside_themes_directory() {
         let root = TestDirectory::new("invalid-name-operations");
         let themes_dir = root.0.join("themes");
-        std::fs::create_dir_all(&themes_dir).unwrap();
+        create_private_dir(&themes_dir);
         let outside = root.0.join("outside.toml");
         std::fs::write(&outside, "outside stays intact").unwrap();
 
@@ -1239,7 +1319,7 @@ mod tests {
 
         let root = TestDirectory::new("save-symlink");
         let themes_dir = root.0.join("themes");
-        std::fs::create_dir_all(&themes_dir).unwrap();
+        create_private_dir(&themes_dir);
         let outside = root.0.join("outside.toml");
         std::fs::write(&outside, "outside stays intact").unwrap();
         let destination = themes_dir.join("safe.toml");
@@ -1267,7 +1347,7 @@ mod tests {
 
         let root = TestDirectory::new("delete-symlink");
         let themes_dir = root.0.join("themes");
-        std::fs::create_dir_all(&themes_dir).unwrap();
+        create_private_dir(&themes_dir);
         let outside = root.0.join("outside.toml");
         std::fs::write(&outside, "outside stays intact").unwrap();
         let destination = themes_dir.join("safe.toml");
@@ -1304,7 +1384,7 @@ mod tests {
     fn loading_ignores_files_whose_embedded_name_is_unsafe_or_mismatched() {
         let root = TestDirectory::new("load-validation");
         let themes_dir = root.0.join("themes");
-        std::fs::create_dir_all(&themes_dir).unwrap();
+        create_private_dir(&themes_dir);
 
         named_theme("safe")
             .save(&themes_dir.join("safe.toml"))
@@ -1320,6 +1400,38 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "safe");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_theme_io_rejects_oversize_files_and_writable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::new("load-bounds");
+        let themes_dir = root.0.join("themes");
+        create_private_dir(&themes_dir);
+        let oversized = themes_dir.join("oversized.toml");
+        std::fs::write(
+            &oversized,
+            vec![b'x'; MAX_CUSTOM_THEME_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(Theme::from_file(&oversized).is_err());
+        assert!(Theme::load_custom_themes_from(&themes_dir).is_empty());
+
+        std::fs::set_permissions(&themes_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(named_theme("safe")
+            .save_custom_theme_in(&themes_dir)
+            .is_ok());
+        // Save owns this app directory and tightens it before writing.
+        assert_eq!(
+            std::fs::metadata(&themes_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        std::fs::set_permissions(&themes_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Theme::load_custom_themes_from(&themes_dir).is_empty());
+        assert!(Theme::delete_custom_theme_in(&themes_dir, "safe").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1334,7 +1446,18 @@ mod extra_tests {
                 "{valid:?} should be accepted"
             );
         }
-        for invalid in ["", " padded", "padded ", ".", "..", "a/b", "a\\b", "a\nb"] {
+        for invalid in [
+            "",
+            " padded",
+            "padded ",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a\nb",
+            "looks\u{00a0}spaced",
+            "safe\u{202e}txt",
+        ] {
             assert!(
                 Theme::validate_custom_theme_name(invalid).is_err(),
                 "{invalid:?} should be rejected"

@@ -37,9 +37,32 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+const MAX_HOST_PATH_BYTES: usize = 16 * 1024;
+const MAX_HOST_COMMAND_NAME_BYTES: usize = 4 * 1024;
+const HOST_HELPER_LAUNCHER: &str = r#"set -f
+safe_path=
+old_ifs=$IFS
+IFS=:
+for directory in ${PATH-}; do
+    case $directory in
+        /*)
+            if [ -z "$safe_path" ]; then
+                safe_path=$directory
+            else
+                safe_path=$safe_path:$directory
+            fi
+            ;;
+    esac
+done
+IFS=$old_ifs
+PATH=${safe_path:-/usr/local/bin:/usr/bin:/bin}
+export PATH
+exec "$0" "$@"
+"#;
 
 pub fn is_flatpak() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
@@ -93,7 +116,11 @@ fn absolute_executable(candidate: &Path) -> Option<PathBuf> {
 /// separator is rejected outright, since `execvp` would not search `PATH` for it
 /// either.
 pub fn find_executable_in(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
-    if name.is_empty() || name.contains('/') {
+    if name.is_empty()
+        || name.len() > MAX_HOST_COMMAND_NAME_BYTES
+        || name.contains('/')
+        || name.contains('\0')
+    {
         return None;
     }
     std::env::split_paths(path?)
@@ -117,6 +144,9 @@ pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
 /// path — is taken as the path it looks like and only checked for the execute
 /// bit, because it names one specific file the user asked for.
 pub fn resolve_configured_program(token: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    if token.is_empty() || token.len() > MAX_HOST_PATH_BYTES || token.contains('\0') {
+        return None;
+    }
     let candidate = Path::new(token);
     // `file_name()` equals the whole token exactly when the token has no
     // directory part at all. It is None for "", "." and "..", which fall
@@ -143,6 +173,14 @@ pub fn resolve_executable(
     path: Option<&OsStr>,
     child_cwd: Option<&str>,
 ) -> io::Result<PathBuf> {
+    if executable.is_empty()
+        || executable.len() > MAX_HOST_PATH_BYTES
+        || (!executable.contains('/') && executable.len() > MAX_HOST_COMMAND_NAME_BYTES)
+        || executable.contains('\0')
+        || child_cwd.is_some_and(|cwd| cwd.len() > MAX_HOST_PATH_BYTES || cwd.contains('\0'))
+    {
+        return Err(not_executable());
+    }
     let executable_path = Path::new(executable);
     if executable_path.is_absolute() {
         return is_executable_file(executable_path)
@@ -209,6 +247,19 @@ pub fn bridge_available() -> bool {
         || find_executable_in_path("flatpak-spawn").is_some()
 }
 
+/// Resolve the sandbox-side bridge without ever consulting an empty or
+/// relative PATH entry. The absolute fallback deliberately fails closed when
+/// Flatpak support is unavailable instead of executing a project-local file
+/// named `flatpak-spawn`.
+fn flatpak_spawn_program() -> PathBuf {
+    let conventional = PathBuf::from("/usr/bin/flatpak-spawn");
+    if is_executable_file(&conventional) {
+        conventional
+    } else {
+        find_executable_in_path("flatpak-spawn").unwrap_or(conventional)
+    }
+}
+
 #[derive(Default)]
 struct CwdProbeCache {
     entries: HashMap<String, (Instant, bool)>,
@@ -225,6 +276,9 @@ enum ProbeOutcome {
 /// child will run. A Flatpak may not be able to stat an otherwise valid host
 /// directory directly, so ask the host bridge instead.
 pub fn working_directory_available(path: &str) -> bool {
+    if path.is_empty() || path.len() > MAX_HOST_PATH_BYTES || path.contains('\0') {
+        return false;
+    }
     if !is_flatpak() {
         return Path::new(path).is_dir();
     }
@@ -247,7 +301,9 @@ pub fn working_directory_available(path: &str) -> bool {
         }
     }
 
-    let mut check = command("test");
+    let Ok(mut check) = helper_command("test") else {
+        return false;
+    };
     check
         .args(["-d", path])
         .stdin(Stdio::null())
@@ -279,36 +335,64 @@ pub fn working_directory_available(path: &str) -> bool {
 
 /// Wait for a small host probe without ever letting a missing or wedged bridge
 /// freeze the UI main thread indefinitely.
-fn status_with_timeout(mut command: Command, timeout: Duration) -> ProbeOutcome {
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+fn status_with_timeout(command: Command, timeout: Duration) -> ProbeOutcome {
+    match command_status_with_timeout(command, timeout) {
+        Ok(Some(status)) => ProbeOutcome::Finished(status.success()),
+        Ok(None) => ProbeOutcome::TimedOut,
         Err(error) => {
-            log::warn!("failed to start host working-directory probe: {error}");
-            return ProbeOutcome::Finished(false);
+            log::warn!("host subprocess failed: {error}");
+            ProbeOutcome::Finished(false)
         }
-    };
+    }
+}
+
+/// Run a small helper without allowing it or descendants in its process group
+/// to outlive a bounded caller. `None` means the timeout elapsed.
+///
+/// This is crate-visible so other fire-and-forget integrations (currently
+/// desktop notifications) share the same reap contract instead of growing an
+/// unbounded thread per child.
+pub(crate) fn command_status_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> io::Result<Option<ExitStatus>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A group whose id is the child pid gives timeout cleanup a stable,
+        // owned descendant target. This is performed in the child before exec.
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return ProbeOutcome::Finished(status.success()),
+            Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) if started.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Ok(None) => {
-                log::warn!("host working-directory probe timed out");
-                terminate_probe(child);
-                return ProbeOutcome::TimedOut;
+                terminate_child_group(child);
+                return Ok(None);
             }
             Err(error) => {
-                log::warn!("host working-directory probe failed: {error}");
-                terminate_probe(child);
-                return ProbeOutcome::Finished(false);
+                terminate_child_group(child);
+                return Err(error);
             }
         }
     }
 }
 
-fn terminate_probe(mut child: std::process::Child) {
+fn terminate_child_group(mut child: std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(child.id()).unwrap_or(i32::MAX);
+        if pid > 0 {
+            // SAFETY: the command was placed in a fresh process group whose id
+            // is its child pid; a negative id addresses exactly that group.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
     let _ = child.kill();
     let deadline = Instant::now() + Duration::from_millis(50);
     while Instant::now() < deadline {
@@ -318,7 +402,7 @@ fn terminate_probe(mut child: std::process::Child) {
         }
     }
     if let Err(error) = std::thread::Builder::new()
-        .name("jterm-host-probe-reaper".to_string())
+        .name("jterm-host-child-reaper".to_string())
         .spawn(move || {
             let _ = child.wait();
         })
@@ -338,7 +422,7 @@ fn wrap_argv_for(
     }
 
     let mut wrapped = vec![
-        "flatpak-spawn".to_string(),
+        flatpak_spawn_program().to_string_lossy().into_owned(),
         "--host".to_string(),
         "--watch-bus".to_string(),
     ];
@@ -395,7 +479,7 @@ pub fn unwrap_host_argv(args: &[String]) -> &[String] {
 
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     if is_flatpak() {
-        let mut command = Command::new("flatpak-spawn");
+        let mut command = Command::new(flatpak_spawn_program());
         command.args(["--host", "--watch-bus"]);
         command.arg(program);
         command
@@ -406,7 +490,7 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 
 pub fn command_with_cwd(program: impl AsRef<OsStr>, cwd: &Path) -> Command {
     if is_flatpak() {
-        let mut command = Command::new("flatpak-spawn");
+        let mut command = Command::new(flatpak_spawn_program());
         command.args(["--host", "--watch-bus"]);
         command.arg(format!("--directory={}", cwd.display()));
         command.arg(program);
@@ -418,7 +502,87 @@ pub fn command_with_cwd(program: impl AsRef<OsStr>, cwd: &Path) -> Command {
     }
 }
 
+fn trusted_helper_program(flatpak: bool, name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    if name.is_empty()
+        || name.len() > MAX_HOST_COMMAND_NAME_BYTES
+        || name.contains('/')
+        || name.contains('\0')
+        || name.chars().any(char::is_control)
+    {
+        return None;
+    }
+    if flatpak {
+        // An absolute path visible inside the sandbox need not exist on the
+        // host. Keep host-side lookup for Flatpak; native launches can and must
+        // resolve from absolute PATH entries before changing cwd.
+        Some(PathBuf::from(name))
+    } else {
+        find_executable_in(name, path)
+    }
+}
+
+/// Construct a command for an application-owned helper. Unlike [`command`],
+/// native lookup ignores empty and relative PATH entries: opening a project
+/// containing a file named `git`, `curl`, or `notify-send` must never turn a
+/// background integration into repository-controlled code execution.
+pub(crate) fn helper_command(name: &str) -> io::Result<Command> {
+    helper_command_for(
+        is_flatpak(),
+        name,
+        None,
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`helper_command`] with a child working directory.
+pub(crate) fn helper_command_with_cwd(name: &str, cwd: &Path) -> io::Result<Command> {
+    helper_command_for(
+        is_flatpak(),
+        name,
+        Some(cwd),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+fn helper_command_for(
+    flatpak: bool,
+    name: &str,
+    cwd: Option<&Path>,
+    path: Option<&OsStr>,
+) -> io::Result<Command> {
+    let program = trusted_helper_program(flatpak, name, path).ok_or_else(not_executable)?;
+    if !flatpak {
+        return Ok(match cwd {
+            Some(cwd) => command_with_cwd(program, cwd),
+            None => command(program),
+        });
+    }
+
+    // Resolve the helper in the host namespace, but filter empty and relative
+    // PATH entries there before exec. A project-local `curl` or `git` must not
+    // become trusted merely because the Flatpak bridge changed directory to
+    // that project. `/bin/sh` is absolute and is only a small launcher whose
+    // script uses shell builtins before replacing itself with the helper.
+    let mut command = Command::new(flatpak_spawn_program());
+    command.args(["--host", "--watch-bus"]);
+    if let Some(cwd) = cwd {
+        command.arg(format!("--directory={}", cwd.display()));
+    }
+    command
+        .args(["/bin/sh", "-c", HOST_HELPER_LAUNCHER])
+        .arg(program);
+    Ok(command)
+}
+
 pub fn command_available(name: &str) -> bool {
+    if name.is_empty()
+        || name.len() > MAX_HOST_COMMAND_NAME_BYTES
+        || name.contains('/')
+        || name.contains('\0')
+        || name.chars().any(char::is_control)
+    {
+        return false;
+    }
     if !is_flatpak() {
         return find_executable_in_path(name).is_some();
     }
@@ -426,7 +590,10 @@ pub fn command_available(name: &str) -> bool {
         return false;
     }
 
-    command("sh")
+    let Ok(mut probe) = helper_command("sh") else {
+        return false;
+    };
+    probe
         .args([
             "-lc",
             "command -v -- \"$1\" >/dev/null 2>&1",
@@ -435,9 +602,11 @@ pub fn command_available(name: &str) -> bool {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(Stdio::null());
+    matches!(
+        status_with_timeout(probe, Duration::from_millis(500)),
+        ProbeOutcome::Finished(true)
+    )
 }
 
 #[cfg(test)]
@@ -547,6 +716,52 @@ mod tests {
             find_executable_in("prog", Some(std::ffi::OsStr::new(":."))),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_helpers_cannot_be_hijacked_by_the_child_directory() {
+        let root = TestDir::new("trusted-helper");
+        let installed = root.program("curl", true);
+
+        assert_eq!(
+            trusted_helper_program(false, "curl", Some(std::ffi::OsStr::new(":."))),
+            None
+        );
+        assert_eq!(
+            trusted_helper_program(false, "curl", Some(&path_var(&[&root.0]))),
+            Some(installed)
+        );
+        // Host lookup happens in a different namespace, so Flatpak retains a
+        // bare token for the bridge instead of reusing a sandbox path.
+        assert_eq!(
+            trusted_helper_program(true, "curl", Some(std::ffi::OsStr::new(":."))),
+            Some(PathBuf::from("curl"))
+        );
+    }
+
+    #[test]
+    fn flatpak_helpers_filter_the_host_path_before_changing_directory() {
+        let cwd = Path::new("/tmp/untrusted-project");
+        let command =
+            helper_command_for(true, "curl", Some(cwd), Some(std::ffi::OsStr::new(":."))).unwrap();
+        assert!(Path::new(command.get_program()).is_absolute());
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments[0..3],
+            [
+                "--host",
+                "--watch-bus",
+                "--directory=/tmp/untrusted-project"
+            ]
+        );
+        assert_eq!(arguments[3], "/bin/sh");
+        assert_eq!(arguments[4], "-c");
+        assert_eq!(arguments[5], HOST_HELPER_LAUNCHER);
+        assert_eq!(arguments[6], "curl");
     }
 
     #[test]
@@ -677,6 +892,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_status_kills_a_descendant_holding_the_process_alive() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 5 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        assert!(
+            command_status_with_timeout(command, Duration::from_millis(50))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn flatpak_argv_routes_cwd_and_environment_to_host() {
         let argv = vec!["bash".to_string(), "-l".to_string()];
@@ -686,7 +919,7 @@ mod tests {
         assert_eq!(
             wrap_argv_for(true, &argv, Some("/home/alice/project"), &[("LESS", "R")]),
             vec![
-                "flatpak-spawn".to_string(),
+                flatpak_spawn_program().to_string_lossy().into_owned(),
                 "--host".to_string(),
                 "--watch-bus".to_string(),
                 "--directory=/home/alice/project".to_string(),
@@ -699,6 +932,16 @@ mod tests {
                 "bash".to_string(),
                 "-l".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn flatpak_bridge_argv_never_uses_an_implicit_path_lookup() {
+        let wrapped = wrap_argv_for(true, &["sh".to_string()], None, &[]);
+        assert!(Path::new(&wrapped[0]).is_absolute());
+        assert_eq!(
+            Path::new(&wrapped[0]).file_name(),
+            Some(OsStr::new("flatpak-spawn"))
         );
     }
 

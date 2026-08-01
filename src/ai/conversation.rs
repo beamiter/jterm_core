@@ -8,7 +8,7 @@
 
 use super::{BlockContext, Role, Turn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
 const LEGACY_CONVERSATION_SNAPSHOT_VERSION: u32 = 1;
@@ -598,7 +598,11 @@ impl LegacyConversationSnapshot {
 }
 
 fn completed_history(history: &[Turn]) -> (Vec<Turn>, bool) {
-    let mut complete_pairs: Vec<(&Turn, &Turn)> = Vec::new();
+    // Retain only the bounded newest window while scanning. Building an
+    // intermediate Vec of every historical pair would let an otherwise valid
+    // caller amplify a large live transcript before retention is applied.
+    let mut retained = VecDeque::<(Turn, Turn, usize)>::new();
+    let mut retained_bytes = 0usize;
     let mut history_truncated = false;
     for pair in history.chunks(2) {
         if pair.len() != 2 {
@@ -615,31 +619,22 @@ fn completed_history(history: &[Turn]) -> (Vec<Turn>, bool) {
             history_truncated = true;
             continue;
         }
-        complete_pairs.push((user, assistant));
-    }
-
-    let mut retained_reversed: Vec<(Turn, Turn)> = Vec::new();
-    let mut retained_bytes = 0usize;
-    for (user, assistant) in complete_pairs.iter().rev().copied() {
-        if retained_reversed.len() * 2 == MAX_PERSISTED_TURNS {
-            history_truncated = true;
-            break;
-        }
         let pair_bytes = user.text.len().saturating_add(assistant.text.len());
-        if retained_bytes.saturating_add(pair_bytes) > MAX_CHAT_TURN_TEXT_BYTES {
+        retained_bytes = retained_bytes.saturating_add(pair_bytes);
+        retained.push_back((user.clone(), assistant.clone(), pair_bytes));
+        while retained.len().saturating_mul(2) > MAX_PERSISTED_TURNS
+            || retained_bytes > MAX_CHAT_TURN_TEXT_BYTES
+        {
+            let Some((_, _, removed_bytes)) = retained.pop_front() else {
+                break;
+            };
+            retained_bytes = retained_bytes.saturating_sub(removed_bytes);
             history_truncated = true;
-            break;
         }
-        retained_bytes += pair_bytes;
-        retained_reversed.push((user.clone(), assistant.clone()));
-    }
-    if retained_reversed.len() < complete_pairs.len() {
-        history_truncated = true;
     }
 
-    retained_reversed.reverse();
-    let mut turns = Vec::with_capacity(retained_reversed.len() * 2);
-    for (user, assistant) in retained_reversed {
+    let mut turns = Vec::with_capacity(retained.len().saturating_mul(2));
+    for (user, assistant, _) in retained {
         turns.push(user);
         turns.push(assistant);
     }
@@ -647,13 +642,13 @@ fn completed_history(history: &[Turn]) -> (Vec<Turn>, bool) {
 }
 
 fn validate_turns(turns: &[Turn]) -> Result<(), ConversationSnapshotError> {
-    if turns.len() > MAX_PERSISTED_TURNS || !turns.len().is_multiple_of(2) {
+    if turns.len() > MAX_PERSISTED_TURNS || turns.len() % 2 != 0 {
         return Err(ConversationSnapshotError::InvalidTurnSequence);
     }
 
     let mut total_bytes = 0usize;
     for (index, turn) in turns.iter().enumerate() {
-        let expected = if index.is_multiple_of(2) {
+        let expected = if index % 2 == 0 {
             Role::User
         } else {
             Role::Assistant
@@ -689,22 +684,34 @@ fn valid_context(context: &BlockContext) -> bool {
 }
 
 fn normalise_title(title: &str) -> String {
-    let cleaned: String = title
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let source = if collapsed.is_empty() {
-        DEFAULT_CHAT_TITLE
-    } else {
-        collapsed.as_str()
-    };
     let mut bounded = String::new();
-    for ch in source.chars().take(MAX_CHAT_TITLE_CHARS) {
-        if bounded.len().saturating_add(ch.len_utf8()) > MAX_CHAT_TITLE_BYTES {
+    let mut char_count = 0usize;
+    let mut pending_space = false;
+    for ch in title.chars() {
+        if ch.is_whitespace()
+            || ch.is_control()
+            || crate::review_input::is_visual_spoofing_character(ch)
+        {
+            pending_space |= !bounded.is_empty();
+            continue;
+        }
+        let separator_bytes = usize::from(pending_space);
+        if char_count.saturating_add(separator_bytes) >= MAX_CHAT_TITLE_CHARS
+            || bounded
+                .len()
+                .saturating_add(separator_bytes)
+                .saturating_add(ch.len_utf8())
+                > MAX_CHAT_TITLE_BYTES
+        {
             break;
         }
+        if pending_space {
+            bounded.push(' ');
+            char_count += 1;
+            pending_space = false;
+        }
         bounded.push(ch);
+        char_count += 1;
     }
     if bounded.is_empty() {
         DEFAULT_CHAT_TITLE.to_string()
@@ -718,6 +725,7 @@ fn valid_title(title: &str) -> bool {
         && title.len() <= MAX_CHAT_TITLE_BYTES
         && title.chars().count() <= MAX_CHAT_TITLE_CHARS
         && !title.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(title)
 }
 
 fn bounded_draft(draft: &str) -> (String, bool) {
@@ -891,6 +899,27 @@ mod tests {
     }
 
     #[test]
+    fn chat_titles_cannot_hide_or_reorder_list_chrome() {
+        let history = pair(1);
+        let chat = ChatSnapshot::from_completed_history(
+            7,
+            "  left\u{202e}right\u{00a0}tail  ",
+            false,
+            &history,
+            None,
+            "",
+        );
+        assert_eq!(chat.title(), "left right tail");
+
+        let encoded = r#"{"version":2,"active_chat_id":7,"chats":[{"id":7,"title":"leftSPOOFright","turns":[{"role":"user","text":"q"},{"role":"assistant","text":"a"}]}]}"#
+            .replace("SPOOF", "\u{202e}");
+        assert_eq!(
+            ConversationSnapshot::from_json(&encoded),
+            Err(ConversationSnapshotError::InvalidChatTitle)
+        );
+    }
+
+    #[test]
     fn draft_round_trips_and_oversized_unicode_draft_is_safely_bounded() {
         let draft = "准备下一步\n--flag=值";
         let with_draft =
@@ -940,7 +969,7 @@ mod tests {
         let history: Vec<_> = (0usize..8)
             .map(|index| {
                 turn(
-                    if index.is_multiple_of(2) {
+                    if index % 2 == 0 {
                         Role::User
                     } else {
                         Role::Assistant
@@ -976,7 +1005,7 @@ mod tests {
         let history: Vec<_> = (0usize..16)
             .map(|index| {
                 turn(
-                    if index.is_multiple_of(2) {
+                    if index % 2 == 0 {
                         Role::User
                     } else {
                         Role::Assistant
@@ -1010,7 +1039,7 @@ mod tests {
         let history: Vec<_> = (0..(MAX_CHAT_TURN_TEXT_BYTES / MAX_TURN_BYTES))
             .map(|index| {
                 turn(
-                    if index.is_multiple_of(2) {
+                    if index % 2 == 0 {
                         Role::User
                     } else {
                         Role::Assistant

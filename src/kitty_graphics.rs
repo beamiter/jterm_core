@@ -45,6 +45,9 @@ use std::collections::HashMap;
 /// Public because jterm2's APC scanner uses it to build a bounded recovery
 /// prefix when a graphics packet is rejected before it is fully buffered.
 pub const MAX_CONTROL_BYTES: usize = 16 * 1024;
+/// Maximum number of separately keyed chunked uploads retained at once.
+/// A byte-only cap is insufficient because `m=1` permits an empty payload.
+pub const MAX_PENDING_TRANSFERS: usize = 256;
 
 /// Memory ceilings applied to one terminal's graphics traffic.
 ///
@@ -768,6 +771,9 @@ impl Assembler {
                 "continuation chunks may carry only m= and an optional q=",
             ));
         }
+        if command.more && self.pending_transfer_count() >= MAX_PENDING_TRANSFERS {
+            return Err(Error::TooLarge);
+        }
         command.require_direct_transport()?;
 
         let mut entry = Pending {
@@ -875,6 +881,12 @@ impl Assembler {
         if let Some(slot) = self.current.take() {
             self.take_slot(slot);
         }
+    }
+
+    fn pending_transfer_count(&self) -> usize {
+        self.in_flight
+            .len()
+            .saturating_add(usize::from(self.anonymous.is_some()))
     }
 
     fn take_slot(&mut self, slot: Slot) -> Option<Pending> {
@@ -1547,6 +1559,21 @@ mod tests {
         );
         assert_eq!(assembler.pending_bytes(), 8);
         assert_eq!(assembler.in_flight.len(), 2);
+    }
+
+    #[test]
+    fn empty_chunked_uploads_cannot_grow_the_slot_map_without_bound() {
+        let mut assembler = assembler();
+        for id in 1..=MAX_PENDING_TRANSFERS {
+            let command = format!("Gi={id},m=1;");
+            assert_eq!(assembler.feed(command.as_bytes()).unwrap(), Step::NeedMore);
+        }
+        assert_eq!(assembler.pending_bytes(), 0);
+        assert_eq!(assembler.in_flight.len(), MAX_PENDING_TRANSFERS);
+
+        let command = format!("Gi={},m=1;", MAX_PENDING_TRANSFERS + 1);
+        assert_eq!(assembler.feed(command.as_bytes()), Err(Error::TooLarge));
+        assert_eq!(assembler.in_flight.len(), MAX_PENDING_TRANSFERS);
     }
 
     #[test]

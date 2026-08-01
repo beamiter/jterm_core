@@ -19,8 +19,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const COMPACT_EVERY: u64 = 128;
-const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum size of one complete physical JSONL record, including its trailing
+/// newline. Writers, readers, and compaction must all measure the same bytes.
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
+/// Commands are later inserted into an interactive prompt for review, so the
+/// persistence contract must match that boundary exactly.
+const MAX_COMMAND_BYTES: usize = crate::review_input::MAX_REVIEW_INPUT_BYTES;
+/// A cwd is display/context metadata, not a bulk payload. This is generous
+/// compared with platform path limits while bounding JSON and UI allocation.
+const MAX_CWD_BYTES: usize = 16 * 1024;
+const MAX_HISTORY_PATH_BYTES: usize = 16 * 1024;
 /// Interactive history consumers only need a recent working set. Keep their
 /// synchronous read bounded even when the on-disk history has reached its
 /// 32 MiB compaction threshold.
@@ -32,6 +41,71 @@ const WRITER_QUEUE_CAPACITY: usize = 256;
 static APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static HISTORY_WRITER: OnceLock<Result<mpsc::SyncSender<WriterMessage>, String>> = OnceLock::new();
+
+fn validate_history_path(path: &Path) -> io::Result<()> {
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command-history path has no file name",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() > MAX_HISTORY_PATH_BYTES
+            || bytes.iter().any(|byte| matches!(*byte, 0..=0x1f | 0x7f))
+            || path
+                .to_str()
+                .is_some_and(crate::review_input::contains_visual_spoofing)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command-history path is too long or contains unsafe display bytes",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let text = path.to_string_lossy();
+        if text.len() > MAX_HISTORY_PATH_BYTES
+            || text.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoofing(&text)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command-history path is too long or contains unsafe display text",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn next_temp_id() -> u64 {
+    let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    {
+        let mut random = [0_u8; std::mem::size_of::<u64>()];
+        // SAFETY: random is a writable buffer of exactly the supplied length;
+        // nonblocking entropy failure falls through to the collision-safe
+        // monotonic fallback below.
+        let read = unsafe {
+            libc::getrandom(
+                random.as_mut_ptr().cast(),
+                random.len(),
+                libc::GRND_NONBLOCK,
+            )
+        };
+        if read == random.len() as isize {
+            return u64::from_ne_bytes(random) ^ sequence;
+        }
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    timestamp ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ u64::from(std::process::id())
+}
 
 fn sibling_path(path: &Path, suffix: &str) -> io::Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
@@ -51,6 +125,157 @@ fn sibling_path(path: &Path, suffix: &str) -> io::Result<PathBuf> {
 
 fn lock_path_for(path: &Path) -> io::Result<PathBuf> {
     sibling_path(path, ".lock")
+}
+
+fn history_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn harden_open_options(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options
+        .mode(0o600)
+        // O_NONBLOCK is inert for regular files, but prevents a substituted
+        // fifo or device from hanging a UI thread before fstat can reject it.
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+}
+
+#[cfg(not(unix))]
+fn harden_open_options(_options: &mut OpenOptions) {}
+
+fn validate_history_file(file: &File, description: &str) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} is not a regular file"),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        // A second hard link would let an attacker make our append or chmod
+        // affect a file reached under another name. History is private state,
+        // so there is no legitimate reason for it to be multiply linked.
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{description} must have exactly one hard link"),
+            ));
+        }
+
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{description} is not owned by the current user"),
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{description} is writable by another user or group"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    harden_open_options(&mut options);
+    let file = options.open(path)?;
+    validate_history_file(&file, "command-history lock")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_history_directory(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent = history_parent(path);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
+    }
+    let directory = options.open(parent)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "command-history parent {} is not a directory",
+                parent.display()
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode();
+    // A sticky bit protects an entry from unrelated directory users, but not
+    // from the directory owner. Trust only our own namespace or a root-owned
+    // shared namespace such as `/tmp`.
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid && metadata.uid() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "command-history parent {} is not owned by the current user or root",
+                parent.display()
+            ),
+        ));
+    }
+    if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "command-history parent {} is group/world writable without the sticky bit",
+                parent.display()
+            ),
+        ));
+    }
+    Ok(directory)
+}
+
+fn open_history_for_append(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    harden_open_options(&mut options);
+    let file = options.open(path)?;
+    validate_history_file(&file, "command-history file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+fn open_history_for_read(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    harden_open_options(&mut options);
+    let file = options.open(path)?;
+    validate_history_file(&file, "command-history file")?;
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -92,41 +317,73 @@ fn unlock(file: &File) {
 fn unlock(_file: &File) {}
 
 struct HistoryFileLock {
+    #[cfg(unix)]
+    directory: File,
     file: File,
 }
 
 impl HistoryFileLock {
     fn acquire(history_path: &Path, timeout: Duration) -> io::Result<Self> {
         let path = lock_path_for(history_path)?;
-        let mut options = OpenOptions::new();
-        options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-
         let started = Instant::now();
-        loop {
-            match try_lock_exclusive(&file)? {
-                true => return Ok(Self { file }),
-                false if started.elapsed() < timeout => thread::sleep(LOCK_POLL_INTERVAL),
-                false => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        format!(
-                            "timed out waiting for command-history lock {}",
-                            path.display()
-                        ),
-                    ));
+        let wait = |file: &File| -> io::Result<()> {
+            loop {
+                match try_lock_exclusive(file)? {
+                    true => return Ok(()),
+                    false if started.elapsed() < timeout => thread::sleep(LOCK_POLL_INTERVAL),
+                    false => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "timed out waiting for command-history lock {}",
+                                path.display()
+                            ),
+                        ));
+                    }
                 }
             }
+        };
+
+        // The directory lock stabilizes the sidecar pathname from before it is
+        // opened until after its flock is acquired. Without it, a cooperating
+        // process could rename the persistent sidecar while it was locked and
+        // then acquire a fresh inode under the original name.
+        #[cfg(unix)]
+        let directory = {
+            let directory = open_history_directory(history_path)?;
+            wait(&directory)?;
+            directory
+        };
+        // The lock file is deliberately persistent. flock state lives on the
+        // open descriptor, so a stale empty sidecar after a crash is harmless.
+        let file = match open_lock_file(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                #[cfg(unix)]
+                unlock(&directory);
+                return Err(error);
+            }
+        };
+        if let Err(error) = wait(&file) {
+            #[cfg(unix)]
+            unlock(&directory);
+            return Err(error);
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            directory,
+            file,
+        })
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.directory.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
         }
     }
 }
@@ -134,6 +391,8 @@ impl HistoryFileLock {
 impl Drop for HistoryFileLock {
     fn drop(&mut self) {
         unlock(&self.file);
+        #[cfg(unix)]
+        unlock(&self.directory);
     }
 }
 
@@ -147,16 +406,13 @@ fn create_unique_temp_file(target: &Path) -> io::Result<(File, PathBuf)> {
             ),
         )
     })?;
-    let parent = target
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = history_parent(target);
 
     for _ in 0..TEMP_FILE_ATTEMPTS {
-        let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = next_temp_id();
         let mut temp_name = OsString::from(".");
         temp_name.push(file_name);
-        temp_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        temp_name.push(format!(".tmp-{}-{id}", std::process::id()));
         let temp_path = parent.join(temp_name);
 
         let mut options = OpenOptions::new();
@@ -164,7 +420,9 @@ fn create_unique_temp_file(target: &Path) -> io::Result<(File, PathBuf)> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         match options.open(&temp_path) {
             Ok(file) => return Ok((file, temp_path)),
@@ -182,6 +440,17 @@ fn create_unique_temp_file(target: &Path) -> io::Result<(File, PathBuf)> {
     ))
 }
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = history_parent(path);
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CommandHistoryRecord {
     pub command: String,
@@ -190,6 +459,49 @@ pub struct CommandHistoryRecord {
     pub exit_code: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_time_ms: Option<u64>,
+}
+
+fn validate_record_fields(command: &str, cwd: Option<&str>) -> io::Result<()> {
+    crate::review_input::validate(command).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("command is unsafe for review-only history: {error}"),
+        )
+    })?;
+    debug_assert!(command.len() <= MAX_COMMAND_BYTES);
+
+    if let Some(cwd) = cwd {
+        if cwd.len() > MAX_CWD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("command-history cwd exceeds {MAX_CWD_BYTES} bytes"),
+            ));
+        }
+        if cwd.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(cwd) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command-history cwd contains a control or invisible formatting character",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn encode_record(record: &CommandHistoryRecord) -> io::Result<Vec<u8>> {
+    validate_record_fields(&record.command, record.cwd.as_deref())?;
+    let mut encoded = serde_json::to_vec(record).map_err(io::Error::other)?;
+    if encoded
+        .len()
+        .checked_add(1)
+        .is_none_or(|physical_len| physical_len > MAX_RECORD_BYTES)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "command history record exceeds 1 MiB",
+        ));
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
 }
 
 struct AppendRequest {
@@ -203,7 +515,37 @@ struct AppendRequest {
 
 enum WriterMessage {
     Append(AppendRequest),
-    Flush(mpsc::SyncSender<()>),
+    Flush(mpsc::SyncSender<io::Result<()>>),
+}
+
+fn run_history_writer(receiver: mpsc::Receiver<WriterMessage>) {
+    let mut pending_error: Option<(io::ErrorKind, String)> = None;
+    while let Ok(message) = receiver.recv() {
+        match message {
+            WriterMessage::Append(request) => {
+                if let Err(error) = append(
+                    &request.path,
+                    request.max_entries,
+                    &request.command,
+                    request.cwd.as_deref(),
+                    request.exit_code,
+                    request.end_time_ms,
+                ) {
+                    log::warn!("command history: {error}");
+                    // Preserve the first failure in this flush generation: it
+                    // is normally the most useful root cause, while retaining
+                    // only bounded metadata no matter how many writes fail.
+                    pending_error.get_or_insert_with(|| (error.kind(), error.to_string()));
+                }
+            }
+            WriterMessage::Flush(acknowledge) => {
+                let result = pending_error
+                    .take()
+                    .map_or(Ok(()), |(kind, message)| Err(io::Error::new(kind, message)));
+                let _ = acknowledge.send(result);
+            }
+        }
+    }
 }
 
 fn history_writer() -> io::Result<&'static mpsc::SyncSender<WriterMessage>> {
@@ -211,27 +553,7 @@ fn history_writer() -> io::Result<&'static mpsc::SyncSender<WriterMessage>> {
         let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         thread::Builder::new()
             .name("jterm-command-history".to_string())
-            .spawn(move || {
-                while let Ok(message) = receiver.recv() {
-                    match message {
-                        WriterMessage::Append(request) => {
-                            if let Err(error) = append(
-                                &request.path,
-                                request.max_entries,
-                                &request.command,
-                                request.cwd.as_deref(),
-                                request.exit_code,
-                                request.end_time_ms,
-                            ) {
-                                log::warn!("command history: {error}");
-                            }
-                        }
-                        WriterMessage::Flush(acknowledge) => {
-                            let _ = acknowledge.send(());
-                        }
-                    }
-                }
-            })
+            .spawn(move || run_history_writer(receiver))
             .map(|_| sender)
             .map_err(|error| error.to_string())
     });
@@ -253,26 +575,26 @@ pub fn enqueue(
     if command.trim().is_empty() {
         return Ok(());
     }
-    crate::review_input::validate(command).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("command is unsafe for review-only history: {error}"),
-        )
-    })?;
-    if command.len() > MAX_RECORD_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "command history record exceeds 1 MiB",
-        ));
-    }
+    validate_history_path(path)?;
+    validate_record_fields(command, cwd)?;
 
-    let request = AppendRequest {
-        path: path.to_path_buf(),
-        max_entries,
+    let record = CommandHistoryRecord {
         command: command.to_string(),
         cwd: cwd.map(str::to_string),
         exit_code,
         end_time_ms,
+    };
+    // Reject records that can never be persisted before they consume a slot in
+    // the bounded worker queue. `append` repeats this at the filesystem boundary
+    // so direct callers and future request producers get the identical check.
+    encode_record(&record)?;
+    let request = AppendRequest {
+        path: path.to_path_buf(),
+        max_entries,
+        command: record.command,
+        cwd: record.cwd,
+        exit_code: record.exit_code,
+        end_time_ms: record.end_time_ms,
     };
     history_writer()?
         .try_send(WriterMessage::Append(request))
@@ -296,13 +618,13 @@ pub fn flush_pending(timeout: Duration) -> io::Result<()> {
         .as_ref()
         .map_err(|error| io::Error::other(error.clone()))?;
     let (acknowledge, received) = mpsc::sync_channel(0);
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     let mut message = WriterMessage::Flush(acknowledge);
 
     loop {
         match sender.try_send(message) {
             Ok(()) => break,
-            Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
+            Err(mpsc::TrySendError::Full(returned)) if started.elapsed() < timeout => {
                 message = returned;
                 thread::sleep(LOCK_POLL_INTERVAL);
             }
@@ -321,7 +643,7 @@ pub fn flush_pending(timeout: Duration) -> io::Result<()> {
         }
     }
 
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining = timeout.saturating_sub(started.elapsed());
     received
         .recv_timeout(remaining)
         .map_err(|error| match error {
@@ -332,7 +654,7 @@ pub fn flush_pending(timeout: Duration) -> io::Result<()> {
             mpsc::RecvTimeoutError::Disconnected => {
                 io::Error::new(io::ErrorKind::BrokenPipe, "command-history writer stopped")
             }
-        })
+        })?
 }
 
 pub fn append(
@@ -346,58 +668,48 @@ pub fn append(
     if command.trim().is_empty() {
         return Ok(());
     }
-    crate::review_input::validate(command).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("command is unsafe for review-only history: {error}"),
-        )
-    })?;
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-
+    validate_history_path(path)?;
+    validate_record_fields(command, cwd)?;
     let record = CommandHistoryRecord {
         command: command.to_string(),
         cwd: cwd.map(str::to_string),
         exit_code,
         end_time_ms,
     };
-    let mut encoded = serde_json::to_vec(&record).map_err(io::Error::other)?;
-    if encoded.len() > MAX_RECORD_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "command history record exceeds 1 MiB",
-        ));
-    }
     // Keep one physical JSONL record in one write_all call. The flock below is
     // the cross-process consistency boundary; combining the newline also keeps
     // readers safe if a future caller writes without sharing this process.
-    encoded.push(b'\n');
+    let encoded = encode_record(&record)?;
 
-    let _lock = HistoryFileLock::acquire(path, LOCK_TIMEOUT)?;
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir_all(parent)?;
     }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
+
+    let lock = HistoryFileLock::acquire(path, LOCK_TIMEOUT)?;
+    let mut file = open_history_for_append(path)?;
     file.write_all(&encoded)?;
-    file.flush()?;
+    // The writer runs off the UI thread, so make an acknowledged append mean
+    // that both the record and a newly created directory entry reached stable
+    // storage rather than only stdio buffers.
+    file.sync_data()?;
+    lock.sync_directory()?;
 
     let append_number = APPEND_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    let oversized = file.metadata()?.len() > MAX_FILE_BYTES;
+    let oversized = file.metadata()?.len() > MAX_FILE_BYTES as u64;
     drop(file);
-    if oversized || append_number.is_multiple_of(COMPACT_EVERY) {
+    if oversized || append_number % COMPACT_EVERY == 0 {
         compact_locked(path, max_entries.max(1))?;
     }
     Ok(())
@@ -462,7 +774,7 @@ fn read_recent_from<R: Read + Seek>(
         let Ok(record) = serde_json::from_slice::<CommandHistoryRecord>(line) else {
             continue;
         };
-        if crate::review_input::validate(&record.command).is_err()
+        if validate_record_fields(&record.command, record.cwd.as_deref()).is_err()
             || !seen.insert(record.command.clone())
         {
             continue;
@@ -479,13 +791,15 @@ fn read_recent_from<R: Read + Seek>(
 /// retaining newest metadata. Corrupt, oversized, incomplete, and unsafe
 /// review-only records are ignored.
 pub fn read_recent(path: &Path, max_entries: usize) -> io::Result<Vec<CommandHistoryRecord>> {
-    let mut input = File::open(path)?;
+    validate_history_path(path)?;
+    let mut input = open_history_for_read(path)?;
     let file_len = input.metadata()?.len();
     read_recent_from(&mut input, file_len, max_entries)
 }
 
 #[cfg(test)]
 fn compact(path: &Path, max_entries: usize) -> io::Result<()> {
+    validate_history_path(path)?;
     let _lock = HistoryFileLock::acquire(path, LOCK_TIMEOUT)?;
     compact_locked(path, max_entries.max(1))
 }
@@ -513,9 +827,18 @@ fn discard_through_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
 /// scan, temp write, and rename in one critical section prevents a second
 /// jterm1 process from appending to an inode that is about to be replaced.
 fn compact_locked(path: &Path, max_entries: usize) -> io::Result<()> {
-    let input = File::open(path)?;
+    compact_locked_with_budget(path, max_entries, MAX_FILE_BYTES)
+}
+
+fn compact_locked_with_budget(
+    path: &Path,
+    max_entries: usize,
+    max_file_bytes: usize,
+) -> io::Result<()> {
+    let input = open_history_for_read(path)?;
     let mut reader = BufReader::new(input);
     let mut recent = VecDeque::with_capacity(max_entries.min(16_384));
+    let mut recent_bytes = 0usize;
     let mut line = String::new();
     loop {
         line.clear();
@@ -534,13 +857,24 @@ fn compact_locked(path: &Path, max_entries: usize) -> io::Result<()> {
             }
             continue;
         }
-        if serde_json::from_str::<serde_json::Value>(line.trim_end()).is_err() {
+        let Ok(record) = serde_json::from_str::<CommandHistoryRecord>(line.trim_end()) else {
+            continue;
+        };
+        if validate_record_fields(&record.command, record.cwd.as_deref()).is_err() {
             continue;
         }
-        if recent.len() == max_entries {
-            recent.pop_front();
-        }
+        recent_bytes = recent_bytes.saturating_add(line.len());
         recent.push_back(line.clone());
+        // The deque is oldest-to-newest. Evicting from its front preserves the
+        // newest records while keeping their original on-disk order. Enforce
+        // both contracts together so a history with a few very large valid
+        // records cannot remain above MAX_FILE_BYTES after every compaction.
+        while recent.len() > max_entries || recent_bytes > max_file_bytes {
+            let Some(evicted) = recent.pop_front() else {
+                break;
+            };
+            recent_bytes = recent_bytes.saturating_sub(evicted.len());
+        }
     }
 
     let (output, temp_path) = create_unique_temp_file(path)?;
@@ -553,7 +887,8 @@ fn compact_locked(path: &Path, max_entries: usize) -> io::Result<()> {
             writer.flush()?;
             writer.get_ref().sync_all()?;
         }
-        fs::rename(&temp_path, path)
+        fs::rename(&temp_path, path)?;
+        sync_parent_directory(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -570,20 +905,45 @@ mod tests {
     const CHILD_PATH_ENV: &str = "JTERM1_HISTORY_TEST_CHILD_PATH";
     const CHILD_PREFIX_ENV: &str = "JTERM1_HISTORY_TEST_CHILD_PREFIX";
     const CHILD_COUNT_ENV: &str = "JTERM1_HISTORY_TEST_CHILD_COUNT";
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "jterm-command-history-{name}-{}-{}.jsonl",
+        let directory = std::env::temp_dir().join(format!(
+            "jterm-command-history-{name}-{}-{}",
             std::process::id(),
-            APPEND_COUNT.fetch_add(1, Ordering::Relaxed)
-        ))
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        directory.join("history.jsonl")
     }
 
     fn cleanup(path: &Path) {
-        let _ = fs::remove_file(path);
-        if let Ok(lock_path) = lock_path_for(path) {
-            let _ = fs::remove_file(lock_path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    fn write_test_history(path: &Path, contents: impl AsRef<[u8]>) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn history_paths_are_bounded_before_entering_the_writer_queue() {
+        assert!(validate_history_path(Path::new("history.jsonl")).is_ok());
+        assert!(validate_history_path(Path::new("bad\nname.jsonl")).is_err());
+        assert!(validate_history_path(Path::new("bad\u{202e}name.jsonl")).is_err());
+        let oversized = PathBuf::from("x".repeat(MAX_HISTORY_PATH_BYTES + 1));
+        assert!(validate_history_path(&oversized).is_err());
     }
 
     struct CountingCursor {
@@ -626,13 +986,44 @@ mod tests {
     }
 
     #[test]
+    fn field_limits_round_trip_with_headroom_under_the_physical_record_limit() {
+        let record = CommandHistoryRecord {
+            command: "x".repeat(MAX_COMMAND_BYTES),
+            cwd: Some("y".repeat(MAX_CWD_BYTES)),
+            exit_code: 0,
+            end_time_ms: None,
+        };
+        let encoded = encode_record(&record).expect("records at every field limit are valid");
+        assert!(encoded.len() < MAX_RECORD_BYTES);
+        assert_eq!(encoded.last(), Some(&b'\n'));
+
+        let mut input = Cursor::new(encoded.clone());
+        assert_eq!(
+            read_recent_from(&mut input, encoded.len() as u64, 1).unwrap(),
+            vec![record.clone()]
+        );
+
+        let mut oversized_command = record.clone();
+        oversized_command.command.push('x');
+        assert_eq!(
+            encode_record(&oversized_command).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let mut oversized_cwd = record;
+        oversized_cwd.cwd.as_mut().unwrap().push('y');
+        assert_eq!(
+            encode_record(&oversized_cwd).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn read_recent_deduplicates_and_skips_corruption() {
         let path = temp_path("read");
-        fs::write(
+        write_test_history(
             &path,
             "{\"command\":\"one\",\"exit_code\":1}\nnot-json\n{\"command\":\"two\",\"exit_code\":0}\n{\"command\":\"one\",\"exit_code\":0}\n",
-        )
-        .unwrap();
+        );
         let records = read_recent(&path, 2).unwrap();
         assert_eq!(
             records
@@ -688,7 +1079,7 @@ mod tests {
         contents.extend_from_slice(b"\xff\n");
         contents.extend_from_slice(b"{\"command\":\"newer\",\"exit_code\":0}\n");
         contents.extend_from_slice(b"{\"command\":\"still-being-written\"");
-        fs::write(&path, contents).unwrap();
+        write_test_history(&path, contents);
 
         let records = read_recent(&path, 10).unwrap();
         assert_eq!(
@@ -702,16 +1093,25 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_control_characters_never_reach_the_palette() {
+    fn unsafe_command_or_cwd_text_never_reaches_the_palette() {
         let path = temp_path("control");
         let error = append(&path, 100, "echo one\necho two", Some("/tmp"), 0, None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-
-        fs::write(
+        let error = append(
             &path,
-            "{\"command\":\"safe\",\"exit_code\":0}\n{\"command\":\"echo one\\necho two\",\"exit_code\":0}\n{\"command\":\"nul\\u0000byte\",\"exit_code\":0}\n",
+            100,
+            "safe",
+            Some("/tmp/looks-safe\u{202e}txt"),
+            0,
+            None,
         )
-        .unwrap();
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        write_test_history(
+            &path,
+            "{\"command\":\"safe\",\"cwd\":\"/tmp\",\"exit_code\":0}\n{\"command\":\"unsafe cwd\",\"cwd\":\"/tmp/looks-safe\\u202etxt\",\"exit_code\":0}\n{\"command\":\"echo one\\necho two\",\"exit_code\":0}\n{\"command\":\"nul\\u0000byte\",\"exit_code\":0}\n",
+        );
         let records = read_recent(&path, 10).unwrap();
         assert_eq!(
             records
@@ -726,17 +1126,51 @@ mod tests {
     #[test]
     fn compact_keeps_only_recent_valid_records() {
         let path = temp_path("compact");
-        fs::write(
+        write_test_history(
             &path,
-            "{\"command\":\"one\"}\nnot-json\n{\"command\":\"two\"}\n{\"command\":\"three\"}\n",
-        )
-        .unwrap();
+            "{\"command\":\"one\",\"exit_code\":0}\nnot-json\n{\"command\":\"missing-status\"}\n{\"command\":\"echo one\\necho two\",\"exit_code\":0}\n{\"command\":\"two\",\"exit_code\":0}\n{\"command\":\"three\",\"exit_code\":0}\n",
+        );
         compact(&path, 2).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("one"));
         assert!(!text.contains("not-json"));
+        assert!(!text.contains("missing-status"));
+        assert!(!text.contains("echo one"));
         assert!(text.contains("two"));
         assert!(text.contains("three"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn compact_keeps_newest_records_in_original_order_within_byte_budget() {
+        let path = temp_path("compact-byte-budget");
+        let records: Vec<Vec<u8>> = (0..8)
+            .map(|index| {
+                encode_record(&CommandHistoryRecord {
+                    command: format!("record-{index}-{}", "x".repeat(index * 17 + 31)),
+                    cwd: None,
+                    exit_code: index as i32,
+                    end_time_ms: None,
+                })
+                .unwrap()
+            })
+            .collect();
+        let original: Vec<u8> = records.iter().flatten().copied().collect();
+        write_test_history(&path, &original);
+
+        let expected: Vec<u8> = records[5..].iter().flatten().copied().collect();
+        let budget = expected.len();
+        assert!(original.len() > budget);
+
+        compact_locked_with_budget(&path, 100, budget).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), budget as u64);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+
+        // Once compacted, an unchanged valid file is a fixed point: another
+        // compaction neither evicts a newer record nor grows back over budget.
+        let once = fs::read(&path).unwrap();
+        compact_locked_with_budget(&path, 100, budget).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), once);
         cleanup(&path);
     }
 
@@ -744,7 +1178,7 @@ mod tests {
     fn compact_streams_past_oversized_unterminated_record() {
         let path = temp_path("compact-oversized-unterminated");
         let oversized = vec![b'x'; MAX_RECORD_BYTES * 3 + 17];
-        fs::write(&path, oversized).unwrap();
+        write_test_history(&path, oversized);
 
         compact(&path, 10).unwrap();
 
@@ -760,7 +1194,7 @@ mod tests {
         let path = temp_path("lock");
         let lock_path = lock_path_for(&path).unwrap();
         fs::write(&lock_path, b"").unwrap();
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).unwrap();
 
         let held = HistoryFileLock::acquire(&path, LOCK_TIMEOUT).unwrap();
         assert_eq!(
@@ -780,6 +1214,185 @@ mod tests {
         cleanup(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_lock_prevents_sidecar_replacement_bypass() {
+        let path = temp_path("lock-entry-replacement");
+        let lock_path = lock_path_for(&path).unwrap();
+        let retired_path = sibling_path(&path, ".retired-lock").unwrap();
+        let held = HistoryFileLock::acquire(&path, LOCK_TIMEOUT).unwrap();
+        fs::rename(&lock_path, &retired_path).unwrap();
+
+        let error = HistoryFileLock::acquire(&path, Duration::from_millis(30))
+            .err()
+            .expect("renaming the visible sidecar must not bypass its directory lock");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(held);
+        let reacquired = HistoryFileLock::acquire(&path, Duration::from_millis(30))
+            .expect("history locking remains usable after the original guard exits");
+        drop(reacquired);
+        fs::remove_file(retired_path).unwrap();
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_parent_is_created_private_and_rejects_nonsticky_shared_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let id = APPEND_COUNT.fetch_add(1, Ordering::Relaxed);
+        let private_parent = std::env::temp_dir().join(format!(
+            "jterm-command-history-private-parent-{}-{id}",
+            std::process::id()
+        ));
+        let private_path = private_parent.join("history.jsonl");
+        append(&private_path, 100, "private", None, 0, None).unwrap();
+        assert_eq!(
+            fs::metadata(&private_parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(&private_parent).unwrap();
+
+        let id = APPEND_COUNT.fetch_add(1, Ordering::Relaxed);
+        let shared_parent = std::env::temp_dir().join(format!(
+            "jterm-command-history-shared-parent-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&shared_parent).unwrap();
+        fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let shared_path = shared_parent.join("history.jsonl");
+        assert!(append(&shared_path, 100, "blocked", None, 0, None).is_err());
+        assert!(!shared_path.exists());
+        fs::remove_dir_all(shared_parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_symlink_never_chmods_or_locks_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let path = temp_path("lock-symlink");
+        let lock_path = lock_path_for(&path).unwrap();
+        let victim = temp_path("lock-symlink-victim");
+        fs::write(&victim, b"do not touch").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&victim, &lock_path).unwrap();
+
+        assert!(append(&path, 100, "blocked", None, 0, None).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        cleanup(&path);
+        cleanup(&victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_symlink_never_appends_to_or_chmods_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let path = temp_path("history-symlink");
+        let victim = temp_path("history-symlink-victim");
+        fs::write(&victim, b"do not touch").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&victim, &path).unwrap();
+
+        assert!(append(&path, 100, "blocked", None, 0, None).is_err());
+        assert!(read_recent(&path, 10).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        cleanup(&path);
+        cleanup(&victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_hard_link_is_rejected_before_append() {
+        let path = temp_path("history-hard-link");
+        let victim = temp_path("history-hard-link-victim");
+        fs::write(&victim, b"do not touch").unwrap();
+        fs::hard_link(&victim, &path).unwrap();
+
+        assert!(append(&path, 100, "blocked", None, 0, None).is_err());
+        assert!(read_recent(&path, 10).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+
+        cleanup(&path);
+        cleanup(&victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_writable_by_other_users_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("shared-write");
+        fs::write(&path, b"{\"command\":\"do not trust\",\"exit_code\":0}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o622)).unwrap();
+
+        assert!(read_recent(&path, 10).is_err());
+        assert!(append(&path, 100, "blocked", None, 0, None).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"command\":\"do not trust\",\"exit_code\":0}\n"
+        );
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_history_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = temp_path("history-fifo");
+        let path_bytes = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path_bytes is NUL-terminated and points to valid storage for
+        // the duration of the call; the mode has no invalid bit pattern.
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        assert!(read_recent(&path, 10).is_err());
+        assert!(append(&path, 100, "blocked", None, 0, None).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "fifo rejection unexpectedly blocked for {:?}",
+            started.elapsed()
+        );
+
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_descriptors_close_across_exec() {
+        use std::os::fd::AsRawFd;
+
+        let path = temp_path("cloexec");
+        write_test_history(&path, b"{\"command\":\"safe\",\"exit_code\":0}\n");
+        let history = open_history_for_read(&path).unwrap();
+        let directory = open_history_directory(&path).unwrap();
+        let lock = open_lock_file(&lock_path_for(&path).unwrap()).unwrap();
+
+        for file in [&history, &directory, &lock] {
+            // SAFETY: file owns a live descriptor and F_GETFD does not mutate
+            // memory through pointers.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+
+        cleanup(&path);
+    }
+
     #[test]
     fn queued_appends_are_persisted_by_flush() {
         let path = temp_path("queued");
@@ -796,6 +1409,44 @@ mod tests {
             vec!["second", "first"]
         );
         cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_flush_reports_and_then_clears_the_generation_error() {
+        use std::os::unix::fs::symlink;
+
+        let path = temp_path("writer-error");
+        let victim = temp_path("writer-error-victim");
+        fs::write(&victim, b"keep me").unwrap();
+        symlink(&victim, &path).unwrap();
+
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let worker = thread::spawn(move || run_history_writer(receiver));
+        sender
+            .send(WriterMessage::Append(AppendRequest {
+                path: path.clone(),
+                max_entries: 100,
+                command: "blocked".to_string(),
+                cwd: None,
+                exit_code: 0,
+                end_time_ms: None,
+            }))
+            .unwrap();
+
+        let flush = |sender: &mpsc::SyncSender<WriterMessage>| {
+            let (acknowledge, received) = mpsc::sync_channel(0);
+            sender.send(WriterMessage::Flush(acknowledge)).unwrap();
+            received.recv_timeout(Duration::from_secs(1)).unwrap()
+        };
+        assert!(flush(&sender).is_err());
+        assert!(flush(&sender).is_ok(), "the next generation starts clean");
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+
+        drop(sender);
+        worker.join().unwrap();
+        cleanup(&path);
+        cleanup(&victim);
     }
 
     #[test]
