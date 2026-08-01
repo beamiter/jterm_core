@@ -58,7 +58,8 @@ fn next_session_epoch() -> AgentSessionEpoch {
 /// The pinned dependency's live state transitions remain useful, but its
 /// restore routine predates strict validation of proposal identifiers and
 /// statuses. Keeping the inner type private ensures every restore reached
-/// through `jterm_core::agent` first crosses [`validate_snapshot`].
+/// through `jterm_core::agent` first crosses the private `validate_snapshot`
+/// gate.
 #[derive(Debug)]
 pub struct AgentSession {
     inner: jagent::session::AgentSession,
