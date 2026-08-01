@@ -165,11 +165,28 @@ const MAX_QUARANTINE_ATTEMPTS: u32 = 100;
 /// symlink entry itself rather than its target, so a symlink at `path` is still
 /// retired without touching what it points to.
 pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
+    move_aside(path, "corrupt")
+}
+
+/// Atomically take exclusive ownership of `path`, returning the private name
+/// the snapshot now lives at.
+///
+/// This is the one-winner primitive behind a restore: the caller whose move
+/// succeeds is the only one that ever observes the snapshot, so two
+/// simultaneous openers cannot both restore the same session — and neither can
+/// a read that is later followed by a separate delete. The claimed file is left
+/// in place, so a caller that cannot use it keeps the evidence instead of
+/// deleting it; a caller that consumed it removes the claim itself.
+pub fn claim_exclusive(path: &Path) -> io::Result<PathBuf> {
+    move_aside(path, "claimed")
+}
+
+fn move_aside(path: &Path, kind: &str) -> io::Result<PathBuf> {
     let file_type = fs::symlink_metadata(path)?.file_type();
     if !file_type.is_file() && !file_type.is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "refusing to quarantine a non-file session snapshot path",
+            "refusing to move aside a non-file session snapshot path",
         ));
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -186,7 +203,7 @@ pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
 
     for attempt in 0..MAX_QUARANTINE_ATTEMPTS {
         let mut backup_name = file_name.to_os_string();
-        backup_name.push(quarantine_suffix(timestamp, attempt));
+        backup_name.push(move_aside_suffix(kind, timestamp, attempt));
         let backup = parent.join(backup_name);
         #[cfg(unix)]
         match fs::hard_link(path, &backup) {
@@ -213,16 +230,16 @@ pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "could not allocate a unique corrupt-snapshot backup name",
+        "could not allocate a unique moved-aside snapshot name",
     ))
 }
 
-/// Suffix appended to a quarantined snapshot's name. Kept as one function
+/// Suffix appended to a moved-aside snapshot's name. Kept as one function
 /// because both the naming and the test that proves the two consumers cannot
 /// misread it have to agree on it.
-fn quarantine_suffix(timestamp_millis: u128, attempt: u32) -> String {
+fn move_aside_suffix(kind: &str, timestamp_millis: u128, attempt: u32) -> String {
     format!(
-        ".corrupt-{timestamp_millis}-{}-{attempt}",
+        ".{kind}-{timestamp_millis}-{}-{attempt}",
         std::process::id()
     )
 }
@@ -820,17 +837,22 @@ mod tests {
     }
 
     #[test]
-    fn quarantined_names_are_not_snapshots() {
+    fn moved_aside_names_are_not_snapshots() {
         for destination in ["tabs.state", "tabs.7f3a.state", "window-12.active"] {
-            let quarantined = format!("{destination}{}", quarantine_suffix(1_700_000_000_000, 0));
-            assert!(
-                !jterm1_accepts_state_file_name(&quarantined),
-                "jterm1 would restore the quarantined {quarantined}"
-            );
-            assert!(
-                !jterm4_accepts_snapshot_name(&quarantined),
-                "jterm4 would restore the quarantined {quarantined}"
-            );
+            for kind in ["corrupt", "claimed"] {
+                let moved = format!(
+                    "{destination}{}",
+                    move_aside_suffix(kind, 1_700_000_000_000, 0)
+                );
+                assert!(
+                    !jterm1_accepts_state_file_name(&moved),
+                    "jterm1 would restore the moved-aside {moved}"
+                );
+                assert!(
+                    !jterm4_accepts_snapshot_name(&moved),
+                    "jterm4 would restore the moved-aside {moved}"
+                );
+            }
         }
     }
 }

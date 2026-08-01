@@ -7,6 +7,7 @@
 //! the embedded window-state JSON can exceed its hard limit.
 
 use super::{BlockContext, Role, Turn};
+use serde::de::{self, DeserializeSeed, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
@@ -31,8 +32,11 @@ const DEFAULT_CHAT_TITLE: &str = "New chat";
 pub const MAX_CONVERSATION_SNAPSHOT_JSON_BYTES: usize = 8 * 1024 * 1024;
 
 /// A single durable chat row and its complete provider history.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Deliberately not [`Deserialize`]: [`ConversationSnapshot::from_json`] is the
+/// only wire path, and it decodes through budgeted seeds instead of Serde's
+/// ordinary collection deserialization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ChatSnapshot {
     id: u64,
     title: String,
@@ -49,8 +53,9 @@ pub struct ChatSnapshot {
 }
 
 /// The complete AI chat collection associated with one window snapshot.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Deliberately not [`Deserialize`]: see [`ChatSnapshot`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConversationSnapshot {
     version: u32,
     active_chat_id: u64,
@@ -62,12 +67,10 @@ struct SnapshotVersion {
     version: u32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct LegacyConversationSnapshot {
     version: u32,
     turns: Vec<Turn>,
-    #[serde(default)]
     block_context: Option<BlockContext>,
 }
 
@@ -366,16 +369,23 @@ impl ConversationSnapshot {
         Ok(encoded)
     }
 
+    /// Decode a persisted collection under the schema's own budgets.
+    ///
+    /// The encoded envelope is bounded first, then decoding itself stops
+    /// before chat 51 and turn 101, rejects unknown and duplicate fields, and
+    /// charges per-field plus cumulative title, turn, draft, and context
+    /// budgets while constructing. Both schema versions and every public error
+    /// category are preserved; `validate` still owns the semantic invariants.
     pub fn from_json(encoded: &str) -> Result<Self, ConversationSnapshotError> {
         if encoded.len() > MAX_CONVERSATION_SNAPSHOT_JSON_BYTES {
             return Err(ConversationSnapshotError::EncodedTooLarge);
         }
+        // Peek the schema version without retaining any other field.
         let version: SnapshotVersion = serde_json::from_str(encoded)
             .map_err(|error| ConversationSnapshotError::InvalidJson(error.to_string()))?;
         match version.version {
             LEGACY_CONVERSATION_SNAPSHOT_VERSION => {
-                let legacy: LegacyConversationSnapshot = serde_json::from_str(encoded)
-                    .map_err(|error| ConversationSnapshotError::InvalidJson(error.to_string()))?;
+                let legacy = decode_legacy_snapshot(encoded)?;
                 legacy.validate()?;
                 let title = legacy
                     .turns
@@ -393,8 +403,7 @@ impl ConversationSnapshot {
                     .ok_or(ConversationSnapshotError::ConversationTooLarge)
             }
             CONVERSATION_SNAPSHOT_VERSION => {
-                let snapshot: Self = serde_json::from_str(encoded)
-                    .map_err(|error| ConversationSnapshotError::InvalidJson(error.to_string()))?;
+                let snapshot = decode_snapshot(encoded)?;
                 snapshot.validate()?;
                 Ok(snapshot)
             }
@@ -594,6 +603,702 @@ impl LegacyConversationSnapshot {
             return Err(ConversationSnapshotError::BlockContextTooLarge);
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded wire decoding
+// ---------------------------------------------------------------------------
+
+/// Collection-wide allocation budgets, charged while decoding.
+///
+/// `from_json` refuses an oversized encoded envelope first, but an 8 MiB
+/// document can still describe thousands of chats, thousands of turns, or a
+/// handful of near-envelope-sized strings. Ordinary Serde deserialization
+/// would build all of them and only then meet the retention limits, so the
+/// seeds below charge as they decode and stop at the first value that does not
+/// fit. `validate` still owns every *semantic* invariant — identity, ordering,
+/// role alternation, and the active-chat binding.
+struct DecodeState {
+    remaining_turn_text: usize,
+    remaining_context: usize,
+    remaining_draft: usize,
+    /// The schema-specific reason a budget rejected the document, so
+    /// decoding-time enforcement keeps the public error categories.
+    error: Option<ConversationSnapshotError>,
+}
+
+impl DecodeState {
+    fn new() -> Self {
+        Self {
+            remaining_turn_text: MAX_ALL_CHAT_TURN_TEXT_BYTES,
+            remaining_context: MAX_ALL_BLOCK_CONTEXT_BYTES,
+            remaining_draft: MAX_ALL_CHAT_DRAFT_BYTES,
+            error: None,
+        }
+    }
+
+    fn fail<E: de::Error>(&mut self, reason: ConversationSnapshotError) -> E {
+        let message = reason.to_string();
+        self.error.get_or_insert(reason);
+        de::Error::custom(message)
+    }
+
+    fn charge<E: de::Error>(&mut self, budget: TextBudget, bytes: usize) -> Result<(), E> {
+        let (remaining, reason) = match budget {
+            TextBudget::None => return Ok(()),
+            TextBudget::TurnText => (
+                &mut self.remaining_turn_text,
+                ConversationSnapshotError::ConversationTooLarge,
+            ),
+            TextBudget::Draft => (
+                &mut self.remaining_draft,
+                ConversationSnapshotError::ConversationTooLarge,
+            ),
+            TextBudget::Context => (
+                &mut self.remaining_context,
+                ConversationSnapshotError::BlockContextTooLarge,
+            ),
+        };
+        match remaining.checked_sub(bytes) {
+            Some(left) => {
+                *remaining = left;
+                Ok(())
+            }
+            None => Err(self.fail(reason)),
+        }
+    }
+}
+
+/// Which collection-wide budget one string is charged against.
+#[derive(Clone, Copy)]
+enum TextBudget {
+    None,
+    TurnText,
+    Draft,
+    Context,
+}
+
+/// Decode one string, rejecting it before it is owned if it does not fit.
+struct BoundedText<'a> {
+    state: &'a mut DecodeState,
+    limit: usize,
+    too_large: ConversationSnapshotError,
+    budget: TextBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedText<'_> {
+    type Value = String;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BoundedText<'_> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a string of at most {} bytes", self.limit)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.len() > self.limit {
+            return Err(self.state.fail(self.too_large));
+        }
+        self.state.charge(self.budget, value.len())?;
+        Ok(value.to_owned())
+    }
+}
+
+/// `Option<String>` with the same bound, for nullable fields.
+struct BoundedOptionalText<'a> {
+    inner: BoundedText<'a>,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedOptionalText<'_> {
+    type Value = Option<String>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_option(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BoundedOptionalText<'_> {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "null or a string of at most {} bytes",
+            self.inner.limit
+        )
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        self.inner.deserialize(deserializer).map(Some)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum TurnField {
+    Role,
+    Text,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ContextField {
+    Cmd,
+    Output,
+    Cwd,
+    ExitCode,
+    Truncated,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ChatField {
+    Id,
+    Title,
+    Archived,
+    Turns,
+    BlockContext,
+    Draft,
+    HistoryTruncated,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum SnapshotField {
+    Version,
+    ActiveChatId,
+    Chats,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum LegacyField {
+    Version,
+    Turns,
+    BlockContext,
+}
+
+const TURN_FIELDS: &[&str] = &["role", "text"];
+const CONTEXT_FIELDS: &[&str] = &["cmd", "output", "cwd", "exit_code", "truncated"];
+const CHAT_FIELDS: &[&str] = &[
+    "id",
+    "title",
+    "archived",
+    "turns",
+    "block_context",
+    "draft",
+    "history_truncated",
+];
+const SNAPSHOT_FIELDS: &[&str] = &["version", "active_chat_id", "chats"];
+const LEGACY_FIELDS: &[&str] = &["version", "turns", "block_context"];
+
+struct TurnSeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for TurnSeed<'_> {
+    type Value = Turn;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("Turn", TURN_FIELDS, self)
+    }
+}
+
+impl<'de> Visitor<'de> for TurnSeed<'_> {
+    type Value = Turn;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a conversation turn")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let state = self.state;
+        let mut role = None;
+        let mut text = None;
+        while let Some(field) = map.next_key::<TurnField>()? {
+            match field {
+                TurnField::Role => {
+                    if role.is_some() {
+                        return Err(de::Error::duplicate_field("role"));
+                    }
+                    role = Some(map.next_value::<Role>()?);
+                }
+                TurnField::Text => {
+                    if text.is_some() {
+                        return Err(de::Error::duplicate_field("text"));
+                    }
+                    text = Some(map.next_value_seed(BoundedText {
+                        state: &mut *state,
+                        limit: MAX_TURN_BYTES,
+                        too_large: ConversationSnapshotError::TurnTooLarge,
+                        budget: TextBudget::TurnText,
+                    })?);
+                }
+            }
+        }
+        Ok(Turn {
+            role: role.ok_or_else(|| de::Error::missing_field("role"))?,
+            text: text.ok_or_else(|| de::Error::missing_field("text"))?,
+        })
+    }
+}
+
+struct TurnsSeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for TurnsSeed<'_> {
+    type Value = Vec<Turn>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for TurnsSeed<'_> {
+    type Value = Vec<Turn>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "at most {MAX_PERSISTED_TURNS} conversation turns"
+        )
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let state = self.state;
+        let mut turns = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_PERSISTED_TURNS));
+        while turns.len() < MAX_PERSISTED_TURNS {
+            let Some(turn) = seq.next_element_seed(TurnSeed { state: &mut *state })? else {
+                return Ok(turns);
+            };
+            turns.push(turn);
+        }
+        // Prove the array is over-long without building turn 101.
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(state.fail(ConversationSnapshotError::InvalidTurnSequence));
+        }
+        Ok(turns)
+    }
+}
+
+struct BlockContextSeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for BlockContextSeed<'_> {
+    type Value = BlockContext;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("BlockContext", CONTEXT_FIELDS, self)
+    }
+}
+
+impl<'de> Visitor<'de> for BlockContextSeed<'_> {
+    type Value = BlockContext;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a selected block context")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let state = self.state;
+        let mut cmd = None;
+        let mut output = None;
+        let mut cwd = None;
+        let mut exit_code = None;
+        let mut truncated = None;
+        // The per-context limit applies to cmd + output + cwd together.
+        let mut context_bytes = 0usize;
+        while let Some(field) = map.next_key::<ContextField>()? {
+            match field {
+                ContextField::Cmd | ContextField::Output | ContextField::Cwd => {
+                    let text = map.next_value_seed(BoundedOptionalText {
+                        inner: BoundedText {
+                            state: &mut *state,
+                            limit: MAX_BLOCK_CONTEXT_BYTES,
+                            too_large: ConversationSnapshotError::BlockContextTooLarge,
+                            budget: TextBudget::Context,
+                        },
+                    })?;
+                    context_bytes =
+                        context_bytes.saturating_add(text.as_ref().map_or(0, String::len));
+                    if context_bytes > MAX_BLOCK_CONTEXT_BYTES {
+                        return Err(state.fail(ConversationSnapshotError::BlockContextTooLarge));
+                    }
+                    let slot = match field {
+                        ContextField::Cmd => &mut cmd,
+                        ContextField::Output => &mut output,
+                        _ => &mut cwd,
+                    };
+                    if slot.is_some() {
+                        return Err(de::Error::duplicate_field(match field {
+                            ContextField::Cmd => "cmd",
+                            ContextField::Output => "output",
+                            _ => "cwd",
+                        }));
+                    }
+                    *slot = Some(text);
+                }
+                ContextField::ExitCode => {
+                    if exit_code.is_some() {
+                        return Err(de::Error::duplicate_field("exit_code"));
+                    }
+                    exit_code = Some(map.next_value::<i32>()?);
+                }
+                ContextField::Truncated => {
+                    if truncated.is_some() {
+                        return Err(de::Error::duplicate_field("truncated"));
+                    }
+                    truncated = Some(map.next_value::<bool>()?);
+                }
+            }
+        }
+        // `cmd` and `output` are plain strings on the wire; only `cwd` is
+        // nullable, so a null in either required field is a schema violation.
+        let required = |field, value: Option<Option<String>>| {
+            value
+                .ok_or_else(|| de::Error::missing_field(field))?
+                .ok_or_else(|| de::Error::invalid_type(de::Unexpected::Unit, &"a string"))
+        };
+        Ok(BlockContext {
+            cmd: required("cmd", cmd)?,
+            output: required("output", output)?,
+            cwd: cwd.flatten(),
+            exit_code: exit_code.ok_or_else(|| de::Error::missing_field("exit_code"))?,
+            truncated: truncated.unwrap_or_default(),
+        })
+    }
+}
+
+struct OptionalBlockContextSeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for OptionalBlockContextSeed<'_> {
+    type Value = Option<BlockContext>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_option(self)
+    }
+}
+
+impl<'de> Visitor<'de> for OptionalBlockContextSeed<'_> {
+    type Value = Option<BlockContext>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("null or a selected block context")
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        BlockContextSeed { state: self.state }
+            .deserialize(deserializer)
+            .map(Some)
+    }
+}
+
+struct ChatSeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for ChatSeed<'_> {
+    type Value = ChatSnapshot;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("ChatSnapshot", CHAT_FIELDS, self)
+    }
+}
+
+impl<'de> Visitor<'de> for ChatSeed<'_> {
+    type Value = ChatSnapshot;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a chat row")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let state = self.state;
+        let mut id = None;
+        let mut title = None;
+        let mut archived = None;
+        let mut turns = None;
+        let mut block_context = None;
+        let mut draft = None;
+        let mut history_truncated = None;
+        while let Some(field) = map.next_key::<ChatField>()? {
+            match field {
+                ChatField::Id => {
+                    if id.is_some() {
+                        return Err(de::Error::duplicate_field("id"));
+                    }
+                    id = Some(map.next_value::<u64>()?);
+                }
+                ChatField::Title => {
+                    if title.is_some() {
+                        return Err(de::Error::duplicate_field("title"));
+                    }
+                    title = Some(map.next_value_seed(BoundedText {
+                        state: &mut *state,
+                        limit: MAX_CHAT_TITLE_BYTES,
+                        too_large: ConversationSnapshotError::InvalidChatTitle,
+                        budget: TextBudget::None,
+                    })?);
+                }
+                ChatField::Archived => {
+                    if archived.is_some() {
+                        return Err(de::Error::duplicate_field("archived"));
+                    }
+                    archived = Some(map.next_value::<bool>()?);
+                }
+                ChatField::Turns => {
+                    if turns.is_some() {
+                        return Err(de::Error::duplicate_field("turns"));
+                    }
+                    turns = Some(map.next_value_seed(TurnsSeed { state: &mut *state })?);
+                }
+                ChatField::BlockContext => {
+                    if block_context.is_some() {
+                        return Err(de::Error::duplicate_field("block_context"));
+                    }
+                    block_context =
+                        Some(map.next_value_seed(OptionalBlockContextSeed { state: &mut *state })?);
+                }
+                ChatField::Draft => {
+                    if draft.is_some() {
+                        return Err(de::Error::duplicate_field("draft"));
+                    }
+                    draft = Some(map.next_value_seed(BoundedText {
+                        state: &mut *state,
+                        limit: MAX_CHAT_DRAFT_BYTES,
+                        too_large: ConversationSnapshotError::ConversationTooLarge,
+                        budget: TextBudget::Draft,
+                    })?);
+                }
+                ChatField::HistoryTruncated => {
+                    if history_truncated.is_some() {
+                        return Err(de::Error::duplicate_field("history_truncated"));
+                    }
+                    history_truncated = Some(map.next_value::<bool>()?);
+                }
+            }
+        }
+        Ok(ChatSnapshot {
+            id: id.ok_or_else(|| de::Error::missing_field("id"))?,
+            title: title.ok_or_else(|| de::Error::missing_field("title"))?,
+            archived: archived.unwrap_or_default(),
+            turns: turns.unwrap_or_default(),
+            block_context: block_context.flatten(),
+            draft: draft.unwrap_or_default(),
+            history_truncated: history_truncated.unwrap_or_default(),
+        })
+    }
+}
+
+struct ChatsSeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for ChatsSeed<'_> {
+    type Value = Vec<ChatSnapshot>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ChatsSeed<'_> {
+    type Value = Vec<ChatSnapshot>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at most {MAX_PERSISTED_CHATS} chats")
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let state = self.state;
+        let mut chats = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_PERSISTED_CHATS));
+        while chats.len() < MAX_PERSISTED_CHATS {
+            let Some(chat) = seq.next_element_seed(ChatSeed { state: &mut *state })? else {
+                return Ok(chats);
+            };
+            chats.push(chat);
+        }
+        // Prove the array is over-wide without building chat 51.
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(state.fail(ConversationSnapshotError::TooManyChats));
+        }
+        Ok(chats)
+    }
+}
+
+struct SnapshotSeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for SnapshotSeed<'_> {
+    type Value = ConversationSnapshot;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("ConversationSnapshot", SNAPSHOT_FIELDS, self)
+    }
+}
+
+impl<'de> Visitor<'de> for SnapshotSeed<'_> {
+    type Value = ConversationSnapshot;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a conversation snapshot object")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let state = self.state;
+        let mut version = None;
+        let mut active_chat_id = None;
+        let mut chats = None;
+        while let Some(field) = map.next_key::<SnapshotField>()? {
+            match field {
+                SnapshotField::Version => {
+                    if version.is_some() {
+                        return Err(de::Error::duplicate_field("version"));
+                    }
+                    version = Some(map.next_value::<u32>()?);
+                }
+                SnapshotField::ActiveChatId => {
+                    if active_chat_id.is_some() {
+                        return Err(de::Error::duplicate_field("active_chat_id"));
+                    }
+                    active_chat_id = Some(map.next_value::<u64>()?);
+                }
+                SnapshotField::Chats => {
+                    if chats.is_some() {
+                        return Err(de::Error::duplicate_field("chats"));
+                    }
+                    chats = Some(map.next_value_seed(ChatsSeed { state: &mut *state })?);
+                }
+            }
+        }
+        Ok(ConversationSnapshot {
+            version: version.ok_or_else(|| de::Error::missing_field("version"))?,
+            active_chat_id: active_chat_id
+                .ok_or_else(|| de::Error::missing_field("active_chat_id"))?,
+            chats: chats.ok_or_else(|| de::Error::missing_field("chats"))?,
+        })
+    }
+}
+
+struct LegacySeed<'a> {
+    state: &'a mut DecodeState,
+}
+
+impl<'de> DeserializeSeed<'de> for LegacySeed<'_> {
+    type Value = LegacyConversationSnapshot;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("LegacyConversationSnapshot", LEGACY_FIELDS, self)
+    }
+}
+
+impl<'de> Visitor<'de> for LegacySeed<'_> {
+    type Value = LegacyConversationSnapshot;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a version 1 conversation snapshot object")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let state = self.state;
+        let mut version = None;
+        let mut turns = None;
+        let mut block_context = None;
+        while let Some(field) = map.next_key::<LegacyField>()? {
+            match field {
+                LegacyField::Version => {
+                    if version.is_some() {
+                        return Err(de::Error::duplicate_field("version"));
+                    }
+                    version = Some(map.next_value::<u32>()?);
+                }
+                LegacyField::Turns => {
+                    if turns.is_some() {
+                        return Err(de::Error::duplicate_field("turns"));
+                    }
+                    turns = Some(map.next_value_seed(TurnsSeed { state: &mut *state })?);
+                }
+                LegacyField::BlockContext => {
+                    if block_context.is_some() {
+                        return Err(de::Error::duplicate_field("block_context"));
+                    }
+                    block_context =
+                        Some(map.next_value_seed(OptionalBlockContextSeed { state: &mut *state })?);
+                }
+            }
+        }
+        Ok(LegacyConversationSnapshot {
+            version: version.ok_or_else(|| de::Error::missing_field("version"))?,
+            turns: turns.ok_or_else(|| de::Error::missing_field("turns"))?,
+            block_context: block_context.flatten(),
+        })
+    }
+}
+
+fn decode_snapshot(encoded: &str) -> Result<ConversationSnapshot, ConversationSnapshotError> {
+    let mut state = DecodeState::new();
+    let mut deserializer = serde_json::Deserializer::from_str(encoded);
+    let decoded = SnapshotSeed { state: &mut state }.deserialize(&mut deserializer);
+    finish_decode(decoded, &mut deserializer, state)
+}
+
+fn decode_legacy_snapshot(
+    encoded: &str,
+) -> Result<LegacyConversationSnapshot, ConversationSnapshotError> {
+    let mut state = DecodeState::new();
+    let mut deserializer = serde_json::Deserializer::from_str(encoded);
+    let decoded = LegacySeed { state: &mut state }.deserialize(&mut deserializer);
+    finish_decode(decoded, &mut deserializer, state)
+}
+
+fn finish_decode<'de, T, R>(
+    decoded: Result<T, serde_json::Error>,
+    deserializer: &mut serde_json::Deserializer<R>,
+    state: DecodeState,
+) -> Result<T, ConversationSnapshotError>
+where
+    R: serde_json::de::Read<'de>,
+{
+    match decoded {
+        Ok(value) => {
+            deserializer
+                .end()
+                .map_err(|error| ConversationSnapshotError::InvalidJson(error.to_string()))?;
+            Ok(value)
+        }
+        // A budget records the schema-specific reason; anything else is a
+        // genuine JSON or shape failure.
+        Err(error) => Err(state
+            .error
+            .unwrap_or_else(|| ConversationSnapshotError::InvalidJson(error.to_string()))),
     }
 }
 
@@ -878,6 +1583,178 @@ mod tests {
                 Err(ConversationSnapshotError::InvalidJson(_))
             ));
         }
+    }
+
+    /// Wrap `chats` in a v2 document with chat 1 active.
+    fn snapshot_json(chats: &str) -> String {
+        format!(r#"{{"version":2,"active_chat_id":1,"chats":[{chats}]}}"#)
+    }
+
+    fn chat_json(id: u64, turns: &str) -> String {
+        format!(r#"{{"id":{id},"title":"chat {id}","turns":[{turns}]}}"#)
+    }
+
+    fn pair_json(text: &str) -> String {
+        format!(r#"{{"role":"user","text":"{text}"}},{{"role":"assistant","text":"a"}}"#)
+    }
+
+    #[test]
+    fn decoding_stops_before_building_the_51st_chat_or_101st_turn() {
+        let widest = (1..=MAX_PERSISTED_CHATS as u64)
+            .map(|id| chat_json(id, &pair_json("q")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let decoded = ConversationSnapshot::from_json(&snapshot_json(&widest)).unwrap();
+        assert_eq!(decoded.chats().len(), MAX_PERSISTED_CHATS);
+
+        // Thousands of tiny chats still fit the encoded envelope; the seed
+        // refuses the 51st before constructing it.
+        let over_wide = (1..=MAX_PERSISTED_CHATS as u64 * 20)
+            .map(|id| chat_json(id, ""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = snapshot_json(&over_wide);
+        assert!(json.len() < MAX_CONVERSATION_SNAPSHOT_JSON_BYTES);
+        assert_eq!(
+            ConversationSnapshot::from_json(&json),
+            Err(ConversationSnapshotError::TooManyChats)
+        );
+
+        let longest = (0..MAX_PERSISTED_TURNS / 2)
+            .map(|index| pair_json(&format!("q{index}")))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(ConversationSnapshot::from_json(&snapshot_json(&chat_json(1, &longest))).is_ok());
+
+        let over_long = (0..MAX_PERSISTED_TURNS)
+            .map(|index| pair_json(&format!("q{index}")))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            ConversationSnapshot::from_json(&snapshot_json(&chat_json(1, &over_long))),
+            Err(ConversationSnapshotError::InvalidTurnSequence)
+        );
+    }
+
+    #[test]
+    fn decoding_charges_per_field_budgets_with_their_own_error_categories() {
+        let oversized_turn = "q".repeat(MAX_TURN_BYTES + 1);
+        assert_eq!(
+            ConversationSnapshot::from_json(&snapshot_json(&chat_json(
+                1,
+                &pair_json(&oversized_turn)
+            ))),
+            Err(ConversationSnapshotError::TurnTooLarge)
+        );
+
+        let oversized_title = "t".repeat(MAX_CHAT_TITLE_BYTES + 1);
+        let chat = format!(
+            r#"{{"id":1,"title":"{oversized_title}","turns":[{}]}}"#,
+            pair_json("q")
+        );
+        assert_eq!(
+            ConversationSnapshot::from_json(&snapshot_json(&chat)),
+            Err(ConversationSnapshotError::InvalidChatTitle)
+        );
+
+        let oversized_draft = "d".repeat(MAX_CHAT_DRAFT_BYTES + 1);
+        let chat = format!(
+            r#"{{"id":1,"title":"one","turns":[{}],"draft":"{oversized_draft}"}}"#,
+            pair_json("q")
+        );
+        assert_eq!(
+            ConversationSnapshot::from_json(&snapshot_json(&chat)),
+            Err(ConversationSnapshotError::ConversationTooLarge)
+        );
+
+        let oversized_output = "o".repeat(MAX_BLOCK_CONTEXT_BYTES + 1);
+        let chat = format!(
+            r#"{{"id":1,"title":"one","turns":[{}],"block_context":{{"cmd":"echo","output":"{oversized_output}","cwd":null,"exit_code":0}}}}"#,
+            pair_json("q")
+        );
+        assert_eq!(
+            ConversationSnapshot::from_json(&snapshot_json(&chat)),
+            Err(ConversationSnapshotError::BlockContextTooLarge)
+        );
+
+        // cmd + output + cwd share one per-context limit.
+        let half = "o".repeat(MAX_BLOCK_CONTEXT_BYTES / 2 + 1);
+        let chat = format!(
+            r#"{{"id":1,"title":"one","turns":[{}],"block_context":{{"cmd":"{half}","output":"{half}","cwd":null,"exit_code":0}}}}"#,
+            pair_json("q")
+        );
+        assert_eq!(
+            ConversationSnapshot::from_json(&snapshot_json(&chat)),
+            Err(ConversationSnapshotError::BlockContextTooLarge)
+        );
+    }
+
+    #[test]
+    fn decoding_charges_cumulative_budgets_across_chats() {
+        let turn = "q".repeat(MAX_TURN_BYTES);
+        let turns_per_chat = 4usize;
+        let chats_needed = MAX_ALL_CHAT_TURN_TEXT_BYTES / (MAX_TURN_BYTES * turns_per_chat) + 1;
+        let chats = (1..=chats_needed as u64)
+            .map(|id| {
+                let turns = (0..turns_per_chat / 2)
+                    .map(|_| {
+                        format!(
+                            r#"{{"role":"user","text":"{turn}"}},{{"role":"assistant","text":"{turn}"}}"#
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                chat_json(id, &turns)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = snapshot_json(&chats);
+        assert!(json.len() < MAX_CONVERSATION_SNAPSHOT_JSON_BYTES);
+        assert_eq!(
+            ConversationSnapshot::from_json(&json),
+            Err(ConversationSnapshotError::ConversationTooLarge)
+        );
+
+        let output = "o".repeat(MAX_BLOCK_CONTEXT_BYTES);
+        let chats = (1..=(MAX_ALL_BLOCK_CONTEXT_BYTES / MAX_BLOCK_CONTEXT_BYTES + 1) as u64)
+            .map(|id| {
+                format!(
+                    r#"{{"id":{id},"title":"chat {id}","turns":[{}],"block_context":{{"cmd":"","output":"{output}","cwd":null,"exit_code":0}}}}"#,
+                    pair_json("q")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            ConversationSnapshot::from_json(&snapshot_json(&chats)),
+            Err(ConversationSnapshotError::BlockContextTooLarge)
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_duplicate_fields_and_trailing_content() {
+        let valid = snapshot_json(&chat_json(1, &pair_json("q")));
+        assert!(ConversationSnapshot::from_json(&valid).is_ok());
+
+        for duplicated in [
+            valid.replace(
+                r#""active_chat_id":1"#,
+                r#""active_chat_id":1,"active_chat_id":2"#,
+            ),
+            valid.replace(r#""title":"chat 1""#, r#""title":"chat 1","title":"other""#),
+            valid.replace(r#""role":"user""#, r#""role":"user","role":"assistant""#),
+        ] {
+            assert!(matches!(
+                ConversationSnapshot::from_json(&duplicated),
+                Err(ConversationSnapshotError::InvalidJson(message))
+                    if message.contains("duplicate field")
+            ));
+        }
+
+        assert!(matches!(
+            ConversationSnapshot::from_json(&format!("{valid}{valid}")),
+            Err(ConversationSnapshotError::InvalidJson(_))
+        ));
     }
 
     #[test]

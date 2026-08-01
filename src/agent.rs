@@ -425,6 +425,57 @@ pub fn remove_snapshot_file(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Outcome of [`claim_session_file`].
+#[derive(Debug)]
+pub enum SessionClaim {
+    /// Nothing to restore: no snapshot existed, or another opener claimed it.
+    Vacant,
+    /// This caller won the claim and the session was restored. The persisted
+    /// snapshot has been consumed.
+    Restored(AgentSession),
+    /// This caller won the claim, but the evidence could not become a session.
+    /// It has been moved aside at `path` rather than deleted, so a corrupt or
+    /// hostile snapshot stays available for inspection.
+    Quarantined {
+        path: std::path::PathBuf,
+        error: AgentSnapshotError,
+    },
+}
+
+/// Atomically claim a persisted snapshot and consume it into a live session.
+///
+/// Restoring as a `read_snapshot_file` followed by a separate
+/// `remove_snapshot_file` is racy in two ways: two windows opening at once can
+/// both read the same snapshot and both resume it, and a crash between the two
+/// calls either loses the session or replays it. This primitive closes both:
+/// the snapshot is moved to a private name first, so exactly one caller ever
+/// observes it, and the claim is only deleted once a session exists.
+pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
+    let Ok(claimed) = crate::snapshot_file::claim_exclusive(path) else {
+        // Missing file, lost race, or an unusable path: in every case this
+        // caller has nothing to resume and must not fall back to reading the
+        // original name.
+        return SessionClaim::Vacant;
+    };
+    let restored =
+        crate::snapshot_file::read_bounded(&claimed, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
+            .map_err(|error| {
+                AgentSnapshotError::Decode(format!("read {}: {error}", claimed.display()))
+            })
+            .and_then(|encoded| AgentSessionSnapshot::from_json(&encoded))
+            .and_then(AgentSession::restore);
+    match restored {
+        Ok(session) => {
+            let _ = std::fs::remove_file(&claimed);
+            SessionClaim::Restored(session)
+        }
+        Err(error) => SessionClaim::Quarantined {
+            path: claimed,
+            error,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +549,63 @@ mod tests {
         assert!(read_snapshot_file(&path).is_none());
         // Removing a missing file is fine.
         remove_snapshot_file(&path);
+    }
+
+    #[test]
+    fn claiming_a_session_has_exactly_one_winner() {
+        let dir = TestDir::new("claim");
+        let path = dir.0.join("agent_session.json");
+        write_snapshot_file(&path, &pending_snapshot()).unwrap();
+
+        let SessionClaim::Restored(session) = claim_session_file(&path) else {
+            panic!("the first claim must restore the session");
+        };
+        assert!(matches!(
+            session.state(),
+            AgentState::AwaitingApproval { .. }
+        ));
+        // The snapshot is consumed, so a second opener finds nothing — and no
+        // leftover claim file can be restored later.
+        assert!(!path.exists());
+        assert!(matches!(claim_session_file(&path), SessionClaim::Vacant));
+        assert!(std::fs::read_dir(&dir.0).unwrap().next().is_none());
+
+        // Claiming a path that never existed is vacant, not an error.
+        assert!(matches!(
+            claim_session_file(&dir.0.join("missing.json")),
+            SessionClaim::Vacant
+        ));
+    }
+
+    #[test]
+    fn an_unusable_claim_is_quarantined_rather_than_deleted() {
+        let dir = TestDir::new("quarantine");
+        let path = dir.0.join("agent_session.json");
+
+        for evidence in ["not json", r#"{"version":99}"#] {
+            std::fs::write(&path, evidence).unwrap();
+            let SessionClaim::Quarantined {
+                path: quarantined, ..
+            } = claim_session_file(&path)
+            else {
+                panic!("invalid evidence must be quarantined");
+            };
+            assert!(!path.exists(), "the original name is claimed");
+            assert_eq!(std::fs::read_to_string(&quarantined).unwrap(), evidence);
+            // A quarantined file is never restored by a later opener.
+            assert!(matches!(claim_session_file(&path), SessionClaim::Vacant));
+            std::fs::remove_file(&quarantined).unwrap();
+        }
+
+        // A snapshot that decodes but cannot become a session is evidence too.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&pending_snapshot().to_json().unwrap()).unwrap();
+        value["turns_used"] = serde_json::json!(u32::MAX);
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(matches!(
+            claim_session_file(&path),
+            SessionClaim::Quarantined { .. }
+        ));
     }
 
     #[test]
