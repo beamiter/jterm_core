@@ -46,22 +46,7 @@ pub const DAILY_MAX_AGE: u64 = 86_400;
 /// Keeps the tab open after the script finishes. Without it the child exits,
 /// the terminal closes the tab, and the user never sees what happened.
 const RUN_WRAPPER: &str = r#"set -f
-safe_path=
-old_ifs=$IFS
-IFS=:
-for directory in ${PATH-}; do
-    case $directory in
-        /*)
-            if [ -z "$safe_path" ]; then
-                safe_path=$directory
-            else
-                safe_path=$safe_path:$directory
-            fi
-            ;;
-    esac
-done
-IFS=$old_ifs
-PATH=${safe_path:-/usr/local/bin:/usr/bin:/bin}
+PATH=/usr/bin:/bin
 export PATH
 
 /bin/sh "$1"
@@ -831,7 +816,7 @@ mod tests {
     fn the_install_tab_waits_for_the_user_before_closing() {
         assert!(RUN_WRAPPER.contains("read -r _"));
         assert!(RUN_WRAPPER.contains("exit \"${status}\""));
-        assert!(RUN_WRAPPER.contains("PATH=${safe_path:-/usr/local/bin:/usr/bin:/bin}"));
+        assert!(RUN_WRAPPER.contains("PATH=/usr/bin:/bin"));
         assert!(RUN_WRAPPER.contains("/bin/sh \"$1\""));
         let argv = install_argv_for(Path::new("/tmp/install-jsh.sh"));
         assert_eq!(argv[0], "/bin/sh");

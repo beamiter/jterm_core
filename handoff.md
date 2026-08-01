@@ -34,8 +34,6 @@ needs a release-grade trust pass:
 - Require and validate a published SHA-256 instead of continuing when it is absent.
 - Validate version, target, and base URL before constructing paths or URLs.
 - Reject unsafe archive members and links; extract only the expected binary.
-- Resolve automatic helper programs from trusted, non-writable directories rather
-  than inheriting arbitrary absolute `PATH` entries.
 - Make installer cache creation private, symlink-safe, and atomically replaceable.
 
 Keep explicit source builds separate from the automatic release-install path.

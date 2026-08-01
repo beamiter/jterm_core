@@ -43,23 +43,9 @@ use std::time::{Duration, Instant};
 
 const MAX_HOST_PATH_BYTES: usize = 16 * 1024;
 const MAX_HOST_COMMAND_NAME_BYTES: usize = 4 * 1024;
+const TRUSTED_HELPER_PATH: &str = "/usr/bin:/bin";
 const HOST_HELPER_LAUNCHER: &str = r#"set -f
-safe_path=
-old_ifs=$IFS
-IFS=:
-for directory in ${PATH-}; do
-    case $directory in
-        /*)
-            if [ -z "$safe_path" ]; then
-                safe_path=$directory
-            else
-                safe_path=$safe_path:$directory
-            fi
-            ;;
-    esac
-done
-IFS=$old_ifs
-PATH=${safe_path:-/usr/local/bin:/usr/bin:/bin}
+PATH=/usr/bin:/bin
 export PATH
 exec "$0" "$@"
 "#;
@@ -517,8 +503,53 @@ fn trusted_helper_program(flatpak: bool, name: &str, path: Option<&OsStr>) -> Op
         // resolve from absolute PATH entries before changing cwd.
         Some(PathBuf::from(name))
     } else {
-        find_executable_in(name, path)
+        std::env::split_paths(path?).find_map(|directory| {
+            if !directory.is_absolute() {
+                return None;
+            }
+            trusted_system_executable(&directory.join(name))
+        })
     }
+}
+
+/// Resolve an automatic helper to its canonical, non-user-writable target.
+///
+/// Returning the canonical path is important: validating a symlink in a
+/// writable PATH directory and then executing the symlink would leave a race
+/// between validation and `execve`. Every namespace component of the resolved
+/// target must also be non-writable by this process's user and by group/other.
+#[cfg(unix)]
+fn trusted_system_executable(candidate: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn writable_by_current_user(metadata: &std::fs::Metadata) -> bool {
+        let mode = metadata.permissions().mode();
+        mode & 0o022 != 0 || (metadata.uid() == unsafe { libc::geteuid() } && mode & 0o200 != 0)
+    }
+
+    let canonical = std::fs::canonicalize(candidate).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
+        || writable_by_current_user(&metadata)
+    {
+        return None;
+    }
+    for parent in canonical.ancestors().skip(1) {
+        let metadata = std::fs::metadata(parent).ok()?;
+        if !metadata.is_dir() || writable_by_current_user(&metadata) {
+            return None;
+        }
+    }
+    Some(canonical)
+}
+
+#[cfg(not(unix))]
+fn trusted_system_executable(candidate: &Path) -> Option<PathBuf> {
+    // Automatic helper integrations are Unix-only today. Keep other targets
+    // fail-closed until they have an equivalent ownership policy.
+    let _ = candidate;
+    None
 }
 
 /// Construct a command for an application-owned helper. Unlike [`command`],
@@ -552,10 +583,12 @@ fn helper_command_for(
 ) -> io::Result<Command> {
     let program = trusted_helper_program(flatpak, name, path).ok_or_else(not_executable)?;
     if !flatpak {
-        return Ok(match cwd {
+        let mut command = match cwd {
             Some(cwd) => command_with_cwd(program, cwd),
             None => command(program),
-        });
+        };
+        command.env("PATH", TRUSTED_HELPER_PATH);
+        return Ok(command);
     }
 
     // Resolve the helper in the host namespace, but filter empty and relative
@@ -571,6 +604,7 @@ fn helper_command_for(
     command
         .args(["/bin/sh", "-c", HOST_HELPER_LAUNCHER])
         .arg(program);
+    command.env("PATH", TRUSTED_HELPER_PATH);
     Ok(command)
 }
 
@@ -722,7 +756,7 @@ mod tests {
     #[test]
     fn implicit_helpers_cannot_be_hijacked_by_the_child_directory() {
         let root = TestDir::new("trusted-helper");
-        let installed = root.program("curl", true);
+        root.program("curl", true);
 
         assert_eq!(
             trusted_helper_program(false, "curl", Some(std::ffi::OsStr::new(":."))),
@@ -730,7 +764,8 @@ mod tests {
         );
         assert_eq!(
             trusted_helper_program(false, "curl", Some(&path_var(&[&root.0]))),
-            Some(installed)
+            None,
+            "an executable in a user-writable absolute PATH directory is still untrusted"
         );
         // Host lookup happens in a different namespace, so Flatpak retains a
         // bare token for the bridge instead of reusing a sandbox path.
@@ -738,6 +773,32 @@ mod tests {
             trusted_helper_program(true, "curl", Some(std::ffi::OsStr::new(":."))),
             Some(PathBuf::from("curl"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_automatic_helpers_are_canonical_and_use_a_fixed_child_path() {
+        let Some(program) =
+            trusted_helper_program(false, "sh", Some(std::ffi::OsStr::new("/usr/bin:/bin")))
+        else {
+            // Non-standard development hosts may not have a system-owned sh.
+            return;
+        };
+        assert!(program.is_absolute());
+        assert_eq!(std::fs::canonicalize(&program).unwrap(), program);
+
+        let command = helper_command_for(
+            false,
+            "sh",
+            None,
+            Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+        )
+        .unwrap();
+        let child_path = command
+            .get_envs()
+            .find_map(|(name, value)| (name == "PATH").then_some(value))
+            .flatten();
+        assert_eq!(child_path, Some(std::ffi::OsStr::new(TRUSTED_HELPER_PATH)));
     }
 
     #[test]
