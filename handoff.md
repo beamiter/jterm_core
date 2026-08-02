@@ -11,6 +11,22 @@ installer.
 
 ## Completed since the previous handoff
 
+- `src/jsh_remote.rs` turns a remote-host description into argv that runs the
+  newly vendored `scripts/jsh-remote.sh`, which places a verified static jsh on
+  a destination that has none for the life of a session and removes it after.
+  `Deploy` is `Off`/`Persist`/`Incognito`; `parse` returns `None` for anything it
+  does not recognise so a caller rejects a typo instead of downgrading
+  `incognito` — the modes differ in whether the destination's `$HOME` is written
+  to. `publish_launcher` and `launch_argv_with_script` are separate from
+  `launch_argv` so an app can assert argument order without publishing, and can
+  fall back to plain ssh when only publication fails. jterm1 and jterm4 both
+  consume it through a new `deploy` key on `[[remote_hosts]]`.
+- `src/vendored_script.rs` holds the "publish an embedded script so it can be
+  executed" logic that `jsh_install` used to own privately: private directory,
+  `O_NOFOLLOW`, regular-file/owner/link checks, byte-comparison before reuse, and
+  atomic publication. `jsh_install` now delegates to it, so the installer and the
+  remote launcher cannot drift apart on any of those properties.
+
 - `src/ai/conversation.rs` decodes both schema versions through
   `DeserializeSeed`/`Visitor` implementations that stop before chat 51 and turn
   101, reject unknown and duplicate fields, and charge per-field plus cumulative

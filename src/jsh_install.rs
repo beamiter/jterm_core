@@ -19,7 +19,7 @@
 //!     making.
 
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::thread;
@@ -28,10 +28,13 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 /// Vendored from the jsh repository (`scripts/install-jsh.sh`). Embedding it
-/// is what lets a machine with no `jsh` at all bootstrap one.
-const INSTALLER_SOURCE: &str = include_str!("../scripts/install-jsh.sh");
-
-const SCRIPT_NAME: &str = "install-jsh.sh";
+/// is what lets a machine with no `jsh` at all bootstrap one. Publishing it on
+/// disk — privately, atomically, and only when the bytes changed — is
+/// [`crate::vendored_script`]'s job, shared with the remote launcher.
+const INSTALLER: crate::vendored_script::VendoredScript = crate::vendored_script::VendoredScript {
+    name: "install-jsh.sh",
+    source: include_str!("../scripts/install-jsh.sh"),
+};
 const MAX_CHECK_OUTPUT_BYTES: u64 = 64 * 1024;
 const CHECK_PROCESS_TIMEOUT: Duration = Duration::from_secs(310);
 const CHECK_PIPE_CLOSE_GRACE: Duration = Duration::from_millis(100);
@@ -277,72 +280,7 @@ fn version_field(version: &str, index: usize) -> u64 {
 /// directory in the user's home. The manifests carry `--filesystem=host`, so
 /// the host-side `sh` that [`crate::host::command`] spawns sees the same path.
 pub fn script_path() -> io::Result<PathBuf> {
-    let dir = dirs::cache_dir()
-        .ok_or_else(|| io::Error::other("no cache directory for this user"))?
-        .join("jterm");
-    materialize_script(&dir)
-}
-
-fn open_cached_script(path: &Path) -> io::Result<Option<std::fs::File>> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let metadata = file.metadata()?;
-    // SAFETY: geteuid has no preconditions and only reads process state.
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "cached jsh installer is not a private regular file",
-        ));
-    }
-    Ok(Some(file))
-}
-
-fn cached_script_matches(file: std::fs::File) -> io::Result<bool> {
-    let declared = file.metadata()?.len();
-    if declared != INSTALLER_SOURCE.len() as u64 {
-        return Ok(false);
-    }
-    let mut bytes = Vec::with_capacity(INSTALLER_SOURCE.len());
-    file.take(INSTALLER_SOURCE.len() as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes == INSTALLER_SOURCE.as_bytes())
-}
-
-fn materialize_script(dir: &Path) -> io::Result<PathBuf> {
-    crate::snapshot_file::ensure_private_directory(dir)?;
-    let path = dir.join(SCRIPT_NAME);
-
-    let current_matches = match open_cached_script(&path) {
-        Ok(Some(file)) => cached_script_matches(file)?,
-        Ok(None) | Err(_) => false,
-    };
-    if current_matches {
-        let file = open_cached_script(&path)?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "cached jsh installer disappeared")
-        })?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-        file.sync_all()?;
-        return Ok(path);
-    }
-
-    crate::atomic_file::write_atomic(&path, INSTALLER_SOURCE.as_bytes())?;
-    let file = open_cached_script(&path)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "cached jsh installer disappeared after publication",
-        )
-    })?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o700))?;
-    file.sync_all()?;
-    Ok(path)
+    INSTALLER.path()
 }
 
 fn bounded_command_stdout(
@@ -506,6 +444,9 @@ fn install_argv_for(script: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests inspect modes and ownership now; publication itself moved
+    // to `crate::vendored_script`.
+    use std::os::unix::fs::PermissionsExt;
 
     fn status_from(json: &str) -> Status {
         serde_json::from_str(json).expect("valid check output")
@@ -513,10 +454,10 @@ mod tests {
 
     #[test]
     fn vendored_installer_still_looks_like_the_script_we_call() {
-        assert!(INSTALLER_SOURCE.starts_with("#!/bin/sh"));
-        assert!(INSTALLER_SOURCE.contains("--check"));
-        assert!(INSTALLER_SOURCE.contains("--max-age"));
-        assert!(INSTALLER_SOURCE.contains("\"update_available\""));
+        assert!(INSTALLER.source.starts_with("#!/bin/sh"));
+        assert!(INSTALLER.source.contains("--check"));
+        assert!(INSTALLER.source.contains("--max-age"));
+        assert!(INSTALLER.source.contains("\"update_available\""));
     }
 
     #[cfg(unix)]
@@ -532,8 +473,8 @@ mod tests {
             "jterm-core-jsh-installer-{}-{id}",
             std::process::id()
         ));
-        let path = materialize_script(&dir).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+        let path = INSTALLER.materialize(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER.source.as_bytes());
         assert_eq!(
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
@@ -547,26 +488,26 @@ mod tests {
         std::fs::write(&victim, b"leave me").unwrap();
         std::fs::remove_file(&path).unwrap();
         symlink(&victim, &path).unwrap();
-        materialize_script(&dir).unwrap();
+        INSTALLER.materialize(&dir).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"leave me");
-        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER.source.as_bytes());
 
         std::fs::remove_file(&path).unwrap();
         std::fs::hard_link(&victim, &path).unwrap();
-        materialize_script(&dir).unwrap();
+        INSTALLER.materialize(&dir).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"leave me");
-        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER.source.as_bytes());
 
         std::fs::remove_file(&path).unwrap();
         let encoded = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: encoded is a live NUL-terminated path and the mode is valid.
         assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
-        materialize_script(&dir).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+        INSTALLER.materialize(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER.source.as_bytes());
 
-        std::fs::write(&path, vec![b'x'; INSTALLER_SOURCE.len() + 1]).unwrap();
-        materialize_script(&dir).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER_SOURCE.as_bytes());
+        std::fs::write(&path, vec![b'x'; INSTALLER.source.len() + 1]).unwrap();
+        INSTALLER.materialize(&dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INSTALLER.source.as_bytes());
         assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
@@ -619,13 +560,15 @@ mod tests {
     #[test]
     fn the_vendored_installer_orders_versions_rather_than_comparing_strings() {
         assert!(
-            INSTALLER_SOURCE.contains("version_gt()"),
+            INSTALLER.source.contains("version_gt()"),
             "vendored install-jsh.sh predates the version-ordering fix; re-vendor it \
              from the jsh repository"
         );
-        assert!(INSTALLER_SOURCE.contains("version_gt \"$1\" \"${installed_version}\""));
+        assert!(INSTALLER
+            .source
+            .contains("version_gt \"$1\" \"${installed_version}\""));
         // And the install path refuses to walk backwards on a bare run.
-        assert!(INSTALLER_SOURCE.contains("is newer than the published"));
+        assert!(INSTALLER.source.contains("is newer than the published"));
     }
 
     #[test]
@@ -852,8 +795,8 @@ mod tests {
         )
         .expect("manifest");
 
-        let script = root.join(SCRIPT_NAME);
-        std::fs::write(&script, INSTALLER_SOURCE).expect("script");
+        let script = root.join(INSTALLER.name);
+        std::fs::write(&script, INSTALLER.source).expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
 
         // Whatever this machine has on PATH, the check must see the same thing:
