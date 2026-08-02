@@ -168,6 +168,229 @@ pub fn launch_argv_with_script(script: &Path, target: &RemoteTarget<'_>) -> Vec<
     argv
 }
 
+/// A remote destination the way a serde-configured app declares one.
+///
+/// jterm2 and jterm3 keep their whole configuration in one serde struct, so
+/// their `[[remote_hosts]]` entries deserialize into this shared type and the
+/// argv both apps hand a new tab comes from here — one grammar, one builder,
+/// tested once. jterm1 and jterm4 predate it with hand-rolled TOML pipelines
+/// of the same shape; the *semantics* stay aligned through [`RemoteTarget`],
+/// which every app ultimately goes through.
+///
+/// Unknown `deploy` spellings and unusable fields are rejected by
+/// [`RemoteHostConfig::validate`], not at deserialization: one bad host entry
+/// should cost that host, not silently revert the application's entire
+/// configuration to defaults.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteHostConfig {
+    /// Display name in a picker; the host when empty.
+    #[serde(default)]
+    pub name: String,
+    /// The ssh destination host, or the running container's name.
+    pub host: String,
+    /// The ssh login, or the `docker exec -u` user inside the container.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Reach `host` with `docker exec` instead of ssh.
+    #[serde(default)]
+    pub docker: bool,
+    /// Shell to run when nothing is deployed (default `jsh`).
+    #[serde(default = "default_remote_shell")]
+    pub remote_shell: String,
+    /// Stable session id forwarded for resume-on-reconnect.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// Extra ssh arguments, inserted verbatim. Meaningless for a container.
+    #[serde(default)]
+    pub ssh_args: Vec<String>,
+    /// `off` (default), `persist`, or `incognito` — see [`Deploy`].
+    #[serde(default)]
+    pub deploy: String,
+    /// A jsh built locally for `deploy` to push instead of lending the local
+    /// one or fetching a release. Absolute path.
+    #[serde(default)]
+    pub deploy_artifact: Option<String>,
+}
+
+fn default_remote_shell() -> String {
+    "jsh".to_string()
+}
+
+impl RemoteHostConfig {
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.host
+        } else {
+            &self.name
+        }
+    }
+
+    fn parsed_deploy(&self) -> Option<Deploy> {
+        if self.deploy.is_empty() {
+            Some(Deploy::Off)
+        } else {
+            Deploy::parse(&self.deploy)
+        }
+    }
+
+    /// Why this entry cannot be used, or `Ok` when it can.
+    ///
+    /// Everything here ends up in an argv, so the grammar is the family's
+    /// usual one: no whitespace or control characters where a token must stay
+    /// one token, no leading `-` where a value must not read as a flag, and a
+    /// `deploy` spelling this build does not understand rejects the host
+    /// rather than quietly downgrading `incognito` to something that writes
+    /// to a shared account.
+    pub fn validate(&self) -> Result<(), String> {
+        fn plain_token(value: &str, what: &str) -> Result<(), String> {
+            if value.is_empty() {
+                return Err(format!("{what} must not be empty"));
+            }
+            if value.len() > 512 {
+                return Err(format!("{what} is too long"));
+            }
+            if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!(
+                    "{what} must not contain whitespace or control characters"
+                ));
+            }
+            Ok(())
+        }
+        plain_token(&self.host, "host")?;
+        if self.host.starts_with('-') {
+            return Err("host must not begin with '-'".to_string());
+        }
+        if !self.name.is_empty() && self.name.chars().any(char::is_control) {
+            return Err("name must not contain control characters".to_string());
+        }
+        if let Some(user) = &self.user {
+            plain_token(user, "user")?;
+            if user.contains('@') {
+                return Err("user must not contain '@'".to_string());
+            }
+        }
+        plain_token(&self.remote_shell, "remote_shell")?;
+        if let Some(session) = &self.session {
+            if !crate::execution_journal::is_valid_jsh_session_id(session) {
+                return Err("session must be 1-128 ASCII letters, digits, '_' or '-'".to_string());
+            }
+        }
+        if self.ssh_args.len() > 64 {
+            return Err("ssh_args must not contain more than 64 entries".to_string());
+        }
+        for arg in &self.ssh_args {
+            if arg.is_empty() || arg.len() > 512 || arg.chars().any(char::is_control) {
+                return Err("ssh_args entries must be short, non-empty, and printable".to_string());
+            }
+        }
+        if self.parsed_deploy().is_none() {
+            return Err(format!(
+                "deploy '{}' is not understood (expected off, persist, or incognito)",
+                self.deploy.escape_debug()
+            ));
+        }
+        if let Some(artifact) = &self.deploy_artifact {
+            if !Path::new(artifact).is_absolute() {
+                return Err("deploy_artifact must be an absolute path".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// The `[user@]host` ssh destination, or the bare container name —
+    /// `docker exec` would read `user@container` as a container nobody has.
+    fn destination(&self) -> String {
+        match (&self.user, self.docker) {
+            (Some(user), false) => format!("{user}@{}", self.host),
+            _ => self.host.clone(),
+        }
+    }
+
+    fn valid_session(&self) -> Option<&str> {
+        self.session
+            .as_deref()
+            .filter(|id| crate::execution_journal::is_valid_jsh_session_id(id))
+    }
+
+    /// argv for a tab that deploys jsh onto the destination. Errs only when
+    /// the launcher script cannot be published; callers degrade to
+    /// [`Self::plain_argv`] and say so, exactly as jterm1/4 do.
+    pub fn deployed_argv(&self) -> io::Result<Vec<String>> {
+        Ok(self.deployed_argv_with_script(&publish_launcher()?))
+    }
+
+    /// The argv half of [`Self::deployed_argv`], for a launcher already on
+    /// disk — the same split [`launch_argv_with_script`] exists for, and for
+    /// the same reason: order can be asserted without publishing anything.
+    pub fn deployed_argv_with_script(&self, script: &Path) -> Vec<String> {
+        let deploy = self.parsed_deploy().unwrap_or(Deploy::Off);
+        let ssh_args: &[String] = if self.docker { &[] } else { &self.ssh_args };
+        launch_argv_with_script(
+            script,
+            &RemoteTarget {
+                destination: &self.destination(),
+                docker: self.docker,
+                docker_user: if self.docker {
+                    self.user.as_deref()
+                } else {
+                    None
+                },
+                artifact: self.deploy_artifact.as_deref().map(Path::new),
+                session: self.session.as_deref(),
+                ssh_args,
+                deploy,
+            },
+        )
+    }
+
+    /// argv for a tab that deploys nothing: plain ssh, or a plain
+    /// `docker exec`, running `remote_shell` as found on the destination.
+    pub fn plain_argv(&self) -> Vec<String> {
+        if self.docker {
+            let mut argv = vec!["docker".to_string(), "exec".to_string(), "-it".to_string()];
+            if let Some(user) = &self.user {
+                argv.push("-u".to_string());
+                argv.push(user.clone());
+            }
+            argv.push(self.host.clone());
+            argv.push(self.remote_shell.clone());
+            if let Some(session) = self.valid_session() {
+                argv.push("--session".to_string());
+                argv.push(session.to_string());
+            }
+            argv
+        } else {
+            // ssh joins its trailing words and hands them to the remote login
+            // shell; the session id is validated to a token that survives
+            // that reparse unquoted.
+            let mut remote_command = self.remote_shell.clone();
+            if let Some(session) = self.valid_session() {
+                remote_command.push_str(" --session ");
+                remote_command.push_str(session);
+            }
+            let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+            argv.extend(self.ssh_args.iter().cloned());
+            argv.push("--".to_string());
+            argv.push(self.destination());
+            argv.push(remote_command);
+            argv
+        }
+    }
+
+    /// The argv a tab should run: deployment when configured, with the plain
+    /// connection as the fallback the caller is told about.
+    pub fn tab_argv(&self) -> (Vec<String>, Option<io::Error>) {
+        if self.parsed_deploy().unwrap_or(Deploy::Off).is_enabled() {
+            match self.deployed_argv() {
+                Ok(argv) => (argv, None),
+                Err(error) => (self.plain_argv(), Some(error)),
+            }
+        } else {
+            (self.plain_argv(), None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{launch_argv_with_script, Deploy, RemoteTarget};
@@ -334,5 +557,125 @@ mod tests {
             let argv = launch_argv_with_script(Path::new("/c/jsh-remote.sh"), &t);
             assert!(!argv.iter().any(|a| a == "--artifact"), "{argv:?}");
         }
+    }
+
+    fn toml_host(text: &str) -> super::RemoteHostConfig {
+        toml::from_str(text).expect("deserialize host")
+    }
+
+    #[test]
+    fn a_minimal_serde_entry_is_a_plain_ssh_host() {
+        let host = toml_host(r#"host = "build-box""#);
+        assert!(host.validate().is_ok());
+        assert_eq!(host.display_name(), "build-box");
+        let (argv, degraded) = host.tab_argv();
+        assert!(degraded.is_none());
+        assert_eq!(argv, ["ssh", "-t", "--", "build-box", "jsh"]);
+    }
+
+    #[test]
+    fn a_serde_container_entry_builds_the_docker_exec() {
+        let host = toml_host(
+            r#"
+host = "myubuntu"
+docker = true
+user = "devuser"
+session = "cloud-1"
+"#,
+        );
+        assert!(host.validate().is_ok());
+        let (argv, _) = host.tab_argv();
+        assert_eq!(
+            argv,
+            [
+                "docker",
+                "exec",
+                "-it",
+                "-u",
+                "devuser",
+                "myubuntu",
+                "jsh",
+                "--session",
+                "cloud-1"
+            ]
+        );
+        // user@container would be read as a container name nobody has.
+        assert!(!argv.iter().any(|a| a.contains('@')), "{argv:?}");
+    }
+
+    #[test]
+    fn a_deploying_serde_entry_routes_through_the_launcher() {
+        let host = toml_host(
+            r#"
+host = "myubuntu"
+docker = true
+deploy = "incognito"
+"#,
+        );
+        assert!(host.validate().is_ok());
+        let argv = host.deployed_argv_with_script(Path::new("/c/jsh-remote.sh"));
+        assert_eq!(argv[0], "/bin/sh");
+        assert_eq!(argv[1], "/c/jsh-remote.sh");
+        assert!(argv.contains(&"--incognito".to_string()), "{argv:?}");
+        let docker = argv.iter().position(|a| a == "--docker").expect("--docker");
+        assert_eq!(argv[docker + 1], "myubuntu");
+    }
+
+    #[test]
+    fn entries_that_cannot_become_one_argv_token_are_refused() {
+        for (text, why) in [
+            (r#"host = """#, "empty host"),
+            (r#"host = "has space""#, "whitespace in host"),
+            (r#"host = "-oProxyCommand=x""#, "host reading as a flag"),
+            ("host = \"h\"\nuser = \"a@b\"", "user with @"),
+            ("host = \"h\"\nsession = \"a b\"", "unsafe session id"),
+            (
+                "host = \"h\"\ndeploy = \"incognitoo\"",
+                "unknown deploy spelling",
+            ),
+            (
+                "host = \"h\"\ndeploy = \"persist\"\ndeploy_artifact = \"target/jsh\"",
+                "relative artifact",
+            ),
+        ] {
+            let host = toml_host(text);
+            assert!(host.validate().is_err(), "accepted {why}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_ssh_session_id_travels_validated_and_container_args_drop_ssh_flags() {
+        let host = toml_host(
+            r#"
+host = "box"
+user = "yj"
+session = "dev-main"
+ssh_args = ["-p", "2222"]
+"#,
+        );
+        let (argv, _) = host.tab_argv();
+        assert_eq!(
+            argv,
+            [
+                "ssh",
+                "-t",
+                "-p",
+                "2222",
+                "--",
+                "yj@box",
+                "jsh --session dev-main"
+            ]
+        );
+
+        let container = toml_host(
+            r#"
+host = "box"
+docker = true
+deploy = "persist"
+ssh_args = ["-p", "2222"]
+"#,
+        );
+        let argv = container.deployed_argv_with_script(Path::new("/c/jsh-remote.sh"));
+        assert!(!argv.iter().any(|a| a == "-p"), "{argv:?}");
     }
 }
