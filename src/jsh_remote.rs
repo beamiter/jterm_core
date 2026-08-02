@@ -80,6 +80,17 @@ pub struct RemoteTarget<'a> {
     pub destination: &'a str,
     /// Connect to a running container with `docker exec` instead of ssh.
     pub docker: bool,
+    /// The user to become inside the container. Meaningless without `docker`,
+    /// and ignored there, because an ssh destination carries its user in
+    /// `destination` instead.
+    pub docker_user: Option<&'a str>,
+    /// A jsh built here to push, instead of fetching a published release.
+    /// The only way to deploy on a machine with no release to fetch — an
+    /// unreleased build, or no network at all. Dropped unless it is an
+    /// absolute path: a relative one would resolve against whatever directory
+    /// the tab happens to start in, and a leading `-` would be read as an
+    /// option by the launcher.
+    pub artifact: Option<&'a Path>,
     /// Stable session id forwarded to the remote jsh for resume-on-reconnect.
     /// Callers are expected to have validated it; an invalid id is dropped.
     pub session: Option<&'a str>,
@@ -133,9 +144,18 @@ pub fn launch_argv_with_script(script: &Path, target: &RemoteTarget<'_>) -> Vec<
         argv.push(session.to_string());
     }
 
+    if let Some(artifact) = target.artifact.filter(|path| path.is_absolute()) {
+        argv.push("--artifact".to_string());
+        argv.push(artifact.display().to_string());
+    }
+
     if target.docker {
         argv.push("--docker".to_string());
         argv.push(target.destination.to_string());
+        if let Some(user) = target.docker_user {
+            argv.push("--docker-user".to_string());
+            argv.push(user.to_string());
+        }
     } else {
         // Everything after `--` goes to ssh. The destination comes first so it
         // is never mistaken for one of those pass-through arguments.
@@ -157,6 +177,8 @@ mod tests {
         RemoteTarget {
             destination,
             docker: false,
+            docker_user: None,
+            artifact: None,
             session: None,
             ssh_args,
             deploy: Deploy::Persist,
@@ -256,5 +278,61 @@ mod tests {
             source.contains("--incognito") && source.contains("--persist"),
             "vendored jsh-remote.sh predates the two-mode interface; re-vendor it"
         );
+    }
+
+    #[test]
+    fn a_container_user_travels_as_its_own_option() {
+        let mut t = target("my-service", &[]);
+        t.docker = true;
+        t.docker_user = Some("devuser");
+        let argv = launch_argv_with_script(Path::new("/c/jsh-remote.sh"), &t);
+        // Never `user@container`: `docker exec` would read that as the name of
+        // a container nobody has.
+        assert!(!argv.iter().any(|a| a.contains('@')), "{argv:?}");
+        let user = argv
+            .iter()
+            .position(|a| a == "--docker-user")
+            .expect("--docker-user");
+        assert_eq!(argv[user + 1], "devuser");
+    }
+
+    #[test]
+    fn a_container_user_means_nothing_over_ssh() {
+        let mut t = target("yj@host", &[]);
+        t.docker_user = Some("devuser");
+        let argv = launch_argv_with_script(Path::new("/c/jsh-remote.sh"), &t);
+        assert!(!argv.iter().any(|a| a == "--docker-user"), "{argv:?}");
+    }
+
+    #[test]
+    fn a_local_artifact_is_deployed_instead_of_a_release() {
+        let mut t = target("host", &[]);
+        t.artifact = Some(Path::new("/home/yj/jsh/target/release/jsh"));
+        let argv = launch_argv_with_script(Path::new("/c/jsh-remote.sh"), &t);
+        assert_eq!(
+            argv,
+            vec![
+                "/bin/sh",
+                "/c/jsh-remote.sh",
+                "--persist",
+                "--artifact",
+                "/home/yj/jsh/target/release/jsh",
+                "host"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_artifact_that_is_not_an_absolute_path_is_dropped() {
+        // A relative path would resolve against whatever directory the tab
+        // started in, and `-foo` would be read as an option. Neither is worth
+        // guessing about: without it the launcher fetches a release, which is
+        // the behaviour of every host that never named one.
+        for candidate in ["target/release/jsh", "-artifact"] {
+            let mut t = target("host", &[]);
+            t.artifact = Some(Path::new(candidate));
+            let argv = launch_argv_with_script(Path::new("/c/jsh-remote.sh"), &t);
+            assert!(!argv.iter().any(|a| a == "--artifact"), "{argv:?}");
+        }
     }
 }
