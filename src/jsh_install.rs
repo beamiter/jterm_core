@@ -48,7 +48,16 @@ pub const DAILY_MAX_AGE: u64 = 86_400;
 
 /// Keeps the tab open after the script finishes. Without it the child exits,
 /// the terminal closes the tab, and the user never sees what happened.
+///
+/// The tab inherits the user's environment, but the tools the script executes
+/// must not resolve from user-writable directories, so PATH is clamped to the
+/// system ones. The pre-clamp PATH is what the user's own shells resolve `jsh`
+/// from — usually `~/.cargo/bin` — so it is kept, for lookup only, in
+/// `JSH_LOOKUP_PATH`: without it the installer cannot see an existing jsh
+/// outside the default destination and would plant a second copy beside it.
 const RUN_WRAPPER: &str = r#"set -f
+JSH_LOOKUP_PATH=${PATH-}
+export JSH_LOOKUP_PATH
 PATH=/usr/bin:/bin
 export PATH
 
@@ -409,6 +418,17 @@ pub fn check_blocking(max_age: u64) -> Status {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // The helper runs with PATH clamped to system directories, which also
+    // starved the script's jsh detection: the jsh the user runs usually lives
+    // in `~/.cargo/bin`, so every check reported "nothing installed" and the
+    // install banner never went away. Hand this process's own PATH over for
+    // lookup only — the script executes nothing resolved through it except
+    // jsh itself, which this process already executes as the session shell.
+    // (Under Flatpak the host-side launcher captures the host PATH instead;
+    // an env var set here stops at flatpak-spawn.)
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("JSH_LOOKUP_PATH", path);
+    }
 
     match bounded_command_stdout(&mut command, MAX_CHECK_OUTPUT_BYTES) {
         Ok(output) => {
@@ -569,6 +589,19 @@ mod tests {
             .contains("version_gt \"$1\" \"${installed_version}\""));
         // And the install path refuses to walk backwards on a bare run.
         assert!(INSTALLER.source.contains("is newer than the published"));
+    }
+
+    /// Same seam as the version-ordering canary. The check runs with PATH
+    /// clamped to system directories, so the script must honour the
+    /// `JSH_LOOKUP_PATH` override or a jsh living in `~/.cargo/bin` reports as
+    /// "nothing installed" and the install banner never goes away.
+    #[test]
+    fn the_vendored_installer_honours_the_lookup_path_override() {
+        assert!(
+            INSTALLER.source.contains("JSH_LOOKUP_PATH"),
+            "vendored install-jsh.sh predates the lookup-path override; re-vendor it \
+             from the jsh repository"
+        );
     }
 
     #[test]
@@ -761,6 +794,12 @@ mod tests {
         assert!(RUN_WRAPPER.contains("exit \"${status}\""));
         assert!(RUN_WRAPPER.contains("PATH=/usr/bin:/bin"));
         assert!(RUN_WRAPPER.contains("/bin/sh \"$1\""));
+        // The user's PATH is captured for jsh lookup before the clamp takes it
+        // away; the other order captures the clamp.
+        let capture = RUN_WRAPPER
+            .find("JSH_LOOKUP_PATH=${PATH-}")
+            .expect("wrapper keeps the pre-clamp PATH for jsh lookup");
+        assert!(capture < RUN_WRAPPER.find("PATH=/usr/bin:/bin").unwrap());
         let argv = install_argv_for(Path::new("/tmp/install-jsh.sh"));
         assert_eq!(argv[0], "/bin/sh");
         assert_eq!(argv.last().map(String::as_str), Some("/tmp/install-jsh.sh"));
@@ -844,5 +883,83 @@ mod tests {
                 latest: "9.9.9".into()
             })
         );
+    }
+
+    /// The regression that motivated `JSH_LOOKUP_PATH`, end to end: PATH
+    /// clamped to system directories the way [`crate::host`] clamps it for
+    /// helpers, a genuine jsh outside them (`~/.cargo/bin` is the common
+    /// home), and the user's real PATH passed for lookup only. The check must
+    /// find the installed shell in place and offer nothing when it is
+    /// current — before the override, this exact setup reported "nothing
+    /// installed" and raised the install banner on every launch.
+    #[test]
+    fn a_clamped_check_still_finds_the_users_jsh_through_the_lookup_path() {
+        use std::process::Command;
+
+        let downloader_present = Command::new("sh")
+            .arg("-c")
+            .arg("command -v curl >/dev/null || command -v wget >/dev/null")
+            .status()
+            .is_ok_and(|status| status.success());
+        if !downloader_present {
+            eprintln!("skipped: neither curl nor wget is available");
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("jterm-jsh-lookup-{}", std::process::id()));
+        let release = root.join("release/latest/download");
+        let home = root.join("home");
+        let cargo_bin = home.join(".cargo/bin");
+        std::fs::create_dir_all(&release).expect("release tree");
+        std::fs::create_dir_all(&cargo_bin).expect("cargo bin");
+        std::fs::write(
+            release.join("manifest.json"),
+            r#"{"schema":1,"name":"jsh","version":"9.9.9","tag":"v9.9.9","artifacts":[]}"#,
+        )
+        .expect("manifest");
+
+        let script = root.join(INSTALLER.name);
+        std::fs::write(&script, INSTALLER.source).expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
+
+        let jsh = cargo_bin.join("jsh");
+        std::fs::write(
+            &jsh,
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo 'jsh 9.9.9 (fake)'\nexit 0\n",
+        )
+        .expect("stub jsh");
+        std::fs::set_permissions(&jsh, std::fs::Permissions::from_mode(0o755)).expect("mode");
+
+        let output = Command::new("sh")
+            .arg(&script)
+            .args(["--check", "--json", "--max-age", "0"])
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env(
+                "JSH_INSTALL_BASE_URL",
+                format!("file://{}", root.join("release").display()),
+            )
+            .env("PATH", "/usr/bin:/bin")
+            .env(
+                "JSH_LOOKUP_PATH",
+                format!("{}:/usr/bin:/bin", cargo_bin.display()),
+            )
+            .output()
+            .expect("run install-jsh.sh --check");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let status: Status = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|error| panic!("unparseable check output {stdout:?}: {error}"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(status.installed.as_deref(), Some("9.9.9"));
+        assert_eq!(
+            status.installed_path.as_deref(),
+            Some(&*jsh.to_string_lossy())
+        );
+        assert!(!status.update_available);
+        assert_eq!(status.shadowed_by, None);
+        assert_eq!(prompt_for(&status), None);
     }
 }

@@ -44,7 +44,12 @@ use std::time::{Duration, Instant};
 const MAX_HOST_PATH_BYTES: usize = 16 * 1024;
 const MAX_HOST_COMMAND_NAME_BYTES: usize = 4 * 1024;
 const TRUSTED_HELPER_PATH: &str = "/usr/bin:/bin";
+// The pre-clamp PATH is preserved for lookup only: the jsh install check
+// resolves the user's own jsh through it (`~/.cargo/bin` is the common home)
+// while every tool it executes still comes from the clamped PATH.
 const HOST_HELPER_LAUNCHER: &str = r#"set -f
+JSH_LOOKUP_PATH=${PATH-}
+export JSH_LOOKUP_PATH
 PATH=/usr/bin:/bin
 export PATH
 exec "$0" "$@"
