@@ -176,8 +176,9 @@ fn visible_notification_character(ch: char) -> char {
 
 /// Render a millisecond count as a short human string. Used in the
 /// notification body so "exit 0 after 12m 4s" reads naturally instead of
-/// "exit 0 after 724000ms".
-fn humanize_duration(ms: u64) -> String {
+/// "exit 0 after 724000ms", and by the bottom bar so the same duration
+/// reads identically in both places.
+pub fn humanize_duration(ms: u64) -> String {
     let secs = ms / 1000;
     if secs < 60 {
         format!("{secs}s")

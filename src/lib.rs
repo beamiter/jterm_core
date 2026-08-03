@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod ai;
 pub mod atomic_file;
+pub mod bottom_bar;
 pub mod char_width;
 pub mod child_env;
 pub mod command_history;
