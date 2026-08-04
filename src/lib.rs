@@ -11,6 +11,7 @@ pub mod atomic_file;
 pub mod bottom_bar;
 pub mod char_width;
 pub mod child_env;
+pub mod click_cursor;
 pub mod command_history;
 pub mod execution_journal;
 pub mod exit_status;
