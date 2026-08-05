@@ -19,7 +19,7 @@ installer.
   `incognito` — the modes differ in whether the destination's `$HOME` is written
   to. `publish_launcher` and `launch_argv_with_script` are separate from
   `launch_argv` so an app can assert argument order without publishing, and can
-  fall back to plain ssh when only publication fails. jterm1 and jterm4 both
+  fall back to plain ssh when only publication fails. anvil and forge both
   consume it through a new `deploy` key on `[[remote_hosts]]`.
 - `src/vendored_script.rs` holds the "publish an embedded script so it can be
   executed" logic that `jsh_install` used to own privately: private directory,
@@ -52,7 +52,7 @@ installer.
 ### Adopt the claim primitive in the apps
 
 `claim_session_file` exists, but `read_snapshot_file` + `remove_snapshot_file`
-remain public and are what jterm1..4 still call. Migrate each app (their handoffs
+remain public and are what all four terminals still call. Migrate each app (their handoffs
 track this) and then decide whether the racy pair should be deprecated or
 removed, so a future caller cannot reintroduce the two-step restore.
 

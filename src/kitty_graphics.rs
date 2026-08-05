@@ -21,28 +21,28 @@
 //!
 //! # Deliberate divergences from the four pre-hoist implementations
 //!
-//! * `f=` defaults to **RGBA** (`f=32`), the protocol default and jterm2's
-//!   behaviour. jterm1/jterm3/jterm4 defaulted to PNG, so a command that omits
+//! * `f=` defaults to **RGBA** (`f=32`), the protocol default and ember's
+//!   behaviour. anvil/frost/forge defaulted to PNG, so a command that omits
 //!   `f=` now means "raw RGBA, `s=`/`v=` required" for them too. Pinned by the
 //!   `format_defaults_to_rgba_not_png` test.
 //! * Only `t=d` (direct/inline) transmission is supported. `t=f`, `t=t` and
 //!   `t=s` parse into [`Transport`] but are rejected with
-//!   [`Error::NotSupported`] before any buffering. jterm3 validated nothing
+//!   [`Error::NotSupported`] before any buffering. frost validated nothing
 //!   here.
-//! * Only `f=100`, `f=32` and `f=24` are accepted. jterm3's non-standard
+//! * Only `f=100`, `f=32` and `f=24` are accepted. frost's non-standard
 //!   `png`/`jpeg`/`jpg`/`webp`/`rgb`/`rgba` aliases are gone.
-//! * Raw payload length must match `s*v*channels` **exactly** (jterm2's rule),
-//!   not "at least" (jterm1/jterm4 accepted trailing slack).
-//! * Continuation chunks may carry only `m=` and an optional `q=` (jterm2's
+//! * Raw payload length must match `s*v*channels` **exactly** (ember's rule),
+//!   not "at least" (anvil/forge accepted trailing slack).
+//! * Continuation chunks may carry only `m=` and an optional `q=` (ember's
 //!   spec-correct rule), but in-flight transfers are keyed per image id with a
-//!   separate anonymous slot (jterm1/jterm4's shape), so an upload for `i=1`
+//!   separate anonymous slot (anvil/forge's shape), so an upload for `i=1`
 //!   survives an unrelated single-shot transfer for `i=2`.
 
 use std::collections::HashMap;
 
 /// Hard ceiling on the control-data section (everything before the first `;`).
 ///
-/// Public because jterm2's APC scanner uses it to build a bounded recovery
+/// Public because ember's APC scanner uses it to build a bounded recovery
 /// prefix when a graphics packet is rejected before it is fully buffered.
 pub const MAX_CONTROL_BYTES: usize = 16 * 1024;
 /// Maximum number of separately keyed chunked uploads retained at once.
@@ -70,7 +70,7 @@ pub struct Caps {
 
 impl Caps {
     /// Budget for terminals that attach images to finished command blocks
-    /// (jterm1, jterm4). One block's images share the decoded budget.
+    /// (anvil, forge). One block's images share the decoded budget.
     pub const BLOCK: Self = Self {
         max_encoded_bytes: 16 * 1024 * 1024,
         max_decoded_bytes: 16 * 1024 * 1024,
@@ -79,8 +79,8 @@ impl Caps {
         max_pending_bytes: 16 * 1024 * 1024,
     };
 
-    /// Budget for terminals that keep a live screen image store (jterm2,
-    /// jterm3), where a single image may legitimately cover a large window.
+    /// Budget for terminals that keep a live screen image store (ember,
+    /// frost), where a single image may legitimately cover a large window.
     pub const SCREEN: Self = Self {
         max_encoded_bytes: 64 * 1024 * 1024,
         max_decoded_bytes: 64 * 1024 * 1024,
@@ -645,7 +645,7 @@ pub enum Step<'a> {
     Other {
         /// The parsed command.
         command: Command<'a>,
-        /// An in-flight transfer was aborted to make room for it. jterm2 turns
+        /// An in-flight transfer was aborted to make room for it. ember turns
         /// this into "chunked transfer interrupted by another action" for every
         /// action but `a=d`.
         interrupted: bool,
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn format_defaults_to_rgba_not_png() {
-        // Decision pinned: jterm1/jterm3/jterm4 used to default to PNG here.
+        // Decision pinned: anvil/frost/forge used to default to PNG here.
         let command = parse("Gi=5,s=1,v=1;AQIDBA==").unwrap();
         assert_eq!(command.format, Format::Rgba8);
 
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn oversized_control_data_is_rejected_before_the_pairs_are_read() {
-        // jterm2's regression: 16 KiB of junk with no '=' must not be parsed.
+        // ember's regression: 16 KiB of junk with no '=' must not be parsed.
         let payload = format!("Gi=49,{}", "x".repeat(MAX_CONTROL_BYTES));
         assert_eq!(parse(&payload), Err(Error::TooLarge));
     }
@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(Format::from_control("100").unwrap(), Format::Png);
         assert_eq!(Format::from_control("32").unwrap(), Format::Rgba8);
         assert_eq!(Format::from_control("24").unwrap(), Format::Rgb8);
-        // jterm3's non-standard aliases do not survive the hoist.
+        // frost's non-standard aliases do not survive the hoist.
         for alias in ["png", "jpeg", "jpg", "webp", "rgb", "rgba", "0", ""] {
             assert_eq!(
                 Format::from_control(alias),
@@ -1494,7 +1494,7 @@ mod tests {
     fn the_decoded_cap_holds_at_the_boundary_and_one_past_it() {
         assert_eq!(decode_base64(b"AQID", 3).unwrap(), [1, 2, 3]);
         assert_eq!(decode_base64(b"AQID", 2), Err(Error::TooLarge));
-        // Nothing is allocated first: jterm2's zero-budget regression.
+        // Nothing is allocated first: ember's zero-budget regression.
         assert_eq!(decode_base64(b"AAAA", 0), Err(Error::TooLarge));
         assert_eq!(decode_base64(b"", 0).unwrap(), Vec::<u8>::new());
     }

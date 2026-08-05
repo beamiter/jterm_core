@@ -9,7 +9,7 @@
 const MAX_OSC_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// Per-field cap for app-driven desktop notifications (OSC 9 / OSC 777),
-/// matching the jterm3 in-engine limit so the family behaves identically.
+/// matching the frost in-engine limit so the family behaves identically.
 pub const MAX_NOTIFICATION_CHARS: usize = 256;
 /// Kitty graphics uses APC. Keep a practical encoded-image ceiling while
 /// preventing one unterminated sequence from retaining arbitrary PTY output.
@@ -776,7 +776,7 @@ pub struct CommandMeta {
 impl CommandMeta {
     /// Parse the `key=value` fields of an OSC 133 packet.
     ///
-    /// Key aliases follow jterm2's decoder, which is the family's most complete
+    /// Key aliases follow ember's decoder, which is the family's most complete
     /// and has been reading jsh's packets in production; accepting its spellings
     /// means the shared parser cannot understand *less* than the frontend that
     /// already had its own.
@@ -821,7 +821,7 @@ impl CommandMeta {
 
 /// Strict percent-decode of one OSC 133 metadata field.
 ///
-/// Strict on purpose, following jterm2: a truncated escape, an oversized value
+/// Strict on purpose, following ember: a truncated escape, an oversized value
 /// or invalid UTF-8 yields `None` rather than a best-effort string, because the
 /// decoded value is used as a filesystem path, a journal key, and text put in
 /// front of the user. Half-decoded input is worse than none.
@@ -1654,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn osc133_accepts_the_key_aliases_jterm2_already_read() {
+    fn osc133_accepts_the_key_aliases_ember_already_read() {
         let ParserEvent::CommandStart(meta) =
             only_event(b"\x1b]133;C;execution_id=x1;command=ls%20-la;cwd=%2Fsrv;duration=7\x07")
         else {

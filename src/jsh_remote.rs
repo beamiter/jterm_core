@@ -170,10 +170,10 @@ pub fn launch_argv_with_script(script: &Path, target: &RemoteTarget<'_>) -> Vec<
 
 /// A remote destination the way a serde-configured app declares one.
 ///
-/// jterm2 and jterm3 keep their whole configuration in one serde struct, so
+/// ember and frost keep their whole configuration in one serde struct, so
 /// their `[[remote_hosts]]` entries deserialize into this shared type and the
 /// argv both apps hand a new tab comes from here — one grammar, one builder,
-/// tested once. jterm1 and jterm4 predate it with hand-rolled TOML pipelines
+/// tested once. anvil and forge predate it with hand-rolled TOML pipelines
 /// of the same shape; the *semantics* stay aligned through [`RemoteTarget`],
 /// which every app ultimately goes through.
 ///
@@ -314,7 +314,7 @@ impl RemoteHostConfig {
 
     /// argv for a tab that deploys jsh onto the destination. Errs only when
     /// the launcher script cannot be published; callers degrade to
-    /// [`Self::plain_argv`] and say so, exactly as jterm1/4 do.
+    /// [`Self::plain_argv`] and say so, exactly as anvil/forge do.
     pub fn deployed_argv(&self) -> io::Result<Vec<String>> {
         Ok(self.deployed_argv_with_script(&publish_launcher()?))
     }

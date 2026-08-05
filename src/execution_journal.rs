@@ -1067,7 +1067,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "jterm2-execution-journal-{}-{label}-{id}",
+                "ember-execution-journal-{}-{label}-{id}",
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();
@@ -1085,7 +1085,7 @@ mod tests {
 
     fn temporary_journal(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "jterm2-execution-journal-{}-{name}.jsonl",
+            "ember-execution-journal-{}-{name}.jsonl",
             std::process::id()
         ))
     }

@@ -6,9 +6,9 @@
 //! optional helper commands are routed through `flatpak-spawn --host`; native
 //! builds keep their existing direct-exec behavior.
 //!
-//! The lookup half is seeded from jterm1 `src/pty.rs::resolve_executable` (the
+//! The lookup half is seeded from anvil `src/pty.rs::resolve_executable` (the
 //! family's strongest implementation: `execvp` semantics resolved eagerly so
-//! the forked child only has to call `execve`) and jterm2
+//! the forked child only has to call `execve`) and ember
 //! `src/pty.rs::choose_shell_with_path` (the bare-name rule for a *configured*
 //! shell, and the injectable `PATH` that launchers like wofi make necessary).
 //! It exists because [`find_executable_in_path`] — the one shared lookup — used
@@ -127,7 +127,7 @@ pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
 /// Resolve a user-configured program token (a `shell = ` setting, an override
 /// environment variable) to something safe to exec.
 ///
-/// A bare name is a `PATH` lookup and **never** an implicit `./name`. jterm2
+/// A bare name is a `PATH` lookup and **never** an implicit `./name`. ember
 /// documents why at `src/pty.rs::choose_shell_with_path`: a terminal opens in
 /// whatever directory the user is browsing, so a project checkout containing an
 /// executable called `bash` would otherwise hijack `shell = "bash"` for anyone
@@ -151,7 +151,7 @@ pub fn resolve_configured_program(token: &str, path: Option<&OsStr>) -> Option<P
 /// Resolve `executable` the way `execvp` would, but eagerly and with the execute
 /// bit checked, so the caller can hand `execve` an absolute path.
 ///
-/// Hoisted from jterm1 `src/pty.rs`. Doing this before `fork` is what keeps the
+/// Hoisted from anvil `src/pty.rs`. Doing this before `fork` is what keeps the
 /// child's post-fork code down to `execve`: a lookup between `fork` and `exec`
 /// would have to allocate and read directories in a process where only
 /// async-signal-safe calls are legal. Failures are reported to the pane that

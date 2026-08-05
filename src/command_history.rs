@@ -825,7 +825,7 @@ fn discard_through_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
 
 /// Compact while the caller owns the history sidecar lock. Keeping append,
 /// scan, temp write, and rename in one critical section prevents a second
-/// jterm1 process from appending to an inode that is about to be replaced.
+/// anvil process from appending to an inode that is about to be replaced.
 fn compact_locked(path: &Path, max_entries: usize) -> io::Result<()> {
     compact_locked_with_budget(path, max_entries, MAX_FILE_BYTES)
 }
@@ -902,9 +902,9 @@ mod tests {
     use std::io::Cursor;
     use std::process::{Command, Stdio};
 
-    const CHILD_PATH_ENV: &str = "JTERM1_HISTORY_TEST_CHILD_PATH";
-    const CHILD_PREFIX_ENV: &str = "JTERM1_HISTORY_TEST_CHILD_PREFIX";
-    const CHILD_COUNT_ENV: &str = "JTERM1_HISTORY_TEST_CHILD_COUNT";
+    const CHILD_PATH_ENV: &str = "ANVIL_HISTORY_TEST_CHILD_PATH";
+    const CHILD_PREFIX_ENV: &str = "ANVIL_HISTORY_TEST_CHILD_PREFIX";
+    const CHILD_COUNT_ENV: &str = "ANVIL_HISTORY_TEST_CHILD_COUNT";
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn temp_path(name: &str) -> std::path::PathBuf {

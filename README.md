@@ -1,7 +1,7 @@
 # jterm_core
 
-`jterm_core` is the UI-independent foundation shared by jterm1, jterm2,
-jterm3, and jterm4. It contains terminal protocol, process, persistence,
+`jterm_core` is the UI-independent foundation shared by anvil, ember,
+frost, and forge. It contains terminal protocol, process, persistence,
 AI/Agent, and policy code that must behave identically across GTK, egui, and
 iced frontends.
 

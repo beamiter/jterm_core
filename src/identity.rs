@@ -8,9 +8,9 @@
 use std::sync::OnceLock;
 
 pub struct AppIdentity {
-    /// Short binary name, e.g. "jterm4". Used as the notification app-name.
+    /// Short binary name, e.g. "forge". Used as the notification app-name.
     pub app_name: &'static str,
-    /// Reverse-DNS application id, e.g. "io.github.beamiter.jterm4". Used as
+    /// Reverse-DNS application id, e.g. "io.github.beamiter.forge". Used as
     /// the desktop icon name.
     pub app_id: &'static str,
     /// The app's own `env!("CARGO_PKG_VERSION")`. Reported to child shells as

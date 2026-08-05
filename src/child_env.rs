@@ -1,18 +1,18 @@
 //! What the family tells a shell about the terminal it is running in.
 //!
 //! Seeded from the four repos' spawn paths: the variable set and the
-//! `overridden`/`has_less` shape come from jterm3 (`src/pty.rs`, the fullest
-//! builder in the family) and jterm2 (`src/pty.rs`, which added the locale
+//! `overridden`/`has_less` shape come from frost (`src/pty.rs`, the fullest
+//! builder in the family) and ember (`src/pty.rs`, which added the locale
 //! normalization); the `BTreeMap`-over-`vars_os` merge and the NUL rejection
-//! come from jterm1 (`src/pty.rs`) and jterm4 (`src/pty.rs::child_environment`);
-//! the two libvte `envv` call sites are jterm1 `src/terminal/vte.rs` and jterm4
+//! come from anvil (`src/pty.rs`) and forge (`src/pty.rs::child_environment`);
+//! the two libvte `envv` call sites are anvil `src/terminal/vte.rs` and forge
 //! `src/terminal.rs`; the Flatpak `--env=` form is [`crate::host::wrap_argv`],
 //! which already owned an incomplete copy of this policy (`TERM` and nothing
 //! else).
 //!
-//! The bug that motivated the module: jterm1 and jterm4 insert **only** `TERM`,
+//! The bug that motivated the module: anvil and forge insert **only** `TERM`,
 //! and both default to *block* mode, where libvte never spawns the child —
-//! jterm1 hands libvte a foreign PTY master, jterm4 uses libvte display-only —
+//! anvil hands libvte a foreign PTY master, forge uses libvte display-only —
 //! so the `TERM`/`COLORTERM`/`VTE_VERSION` libvte would otherwise inject never
 //! reach the shell. In the family's two GTK terminals, in their default mode,
 //! `bat`, `delta` and `lazygit` therefore fell back to 256 colours.
@@ -24,13 +24,13 @@
 //!   forgot `COLORTERM`. Truecolor is not a capability any of the four
 //!   frontends can fail to provide, so it is not a flag.
 //! - **`VTE_VERSION` is emulated, not reported.** [`EMULATED_VTE_VERSION`] is
-//!   the value jterm2/jterm3 already hardcode. Distro `vte.sh` gates its OSC 7
+//!   the value ember/frost already hardcode. Distro `vte.sh` gates its OSC 7
 //!   emitter on this variable, and that emitter is how a block-mode pane learns
 //!   the child's cwd, so the number has to be high enough to pass the gate
 //!   whatever libvte the machine has (or has not) installed.
 //! - **`LESS`, `LS_COLORS`/`CLICOLOR` and locale normalization are flags, not
-//!   defaults.** jterm1/jterm4 chose `LESS=R` with a written rationale (keep the
-//!   pager interactive and on the alternate screen); jterm2/jterm3 chose
+//!   defaults.** anvil/forge chose `LESS=R` with a written rationale (keep the
+//!   pager interactive and on the alternate screen); ember/frost chose
 //!   `LESS=FR`. That is a product disagreement, and unifying it under cover of
 //!   a colour fix would silently change two apps' pagers. `less_default` names
 //!   the value so both survive.
@@ -73,21 +73,21 @@ use std::sync::OnceLock;
 /// Terminal type every jterm claims. All four repos already sent this.
 pub const TERM: &str = "xterm-256color";
 
-/// 24-bit colour advertisement. The variable jterm1/jterm4 were missing.
+/// 24-bit colour advertisement. The variable anvil/forge were missing.
 pub const COLORTERM: &str = "truecolor";
 
 /// The `VTE_VERSION` the family reports regardless of the libvte it links (or,
-/// for jterm2/jterm3, does not link). Matches the constant jterm2 and jterm3
+/// for ember/frost, does not link). Matches the constant ember and frost
 /// already hardcode, so a distro `vte.sh` still installs its OSC 7 cwd emitter.
 pub const EMULATED_VTE_VERSION: &str = "7802";
 
 /// Locale used when [`ChildEnv::normalize_locale`] has to repair a non-UTF-8
-/// environment. `C.UTF-8` is the choice jterm2 made: available without any
+/// environment. `C.UTF-8` is the choice ember made: available without any
 /// locale being generated, and unambiguously UTF-8.
 pub const UTF8_LOCALE: &str = "C.UTF-8";
 
 /// `LS_COLORS` used when [`ChildEnv::color_defaults`] is on. Vendored from
-/// jterm3, which is the only repo that ever set it.
+/// frost, which is the only repo that ever set it.
 pub const DEFAULT_LS_COLORS: &str = concat!(
     "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:",
     "do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:",
@@ -122,7 +122,7 @@ pub fn capture_inherited_environment() -> io::Result<()> {
 /// by one embedding application's process.
 ///
 /// Prefer exact names. Prefixes are available for genuinely private generated
-/// capability families, but broad prefixes such as `JSH_` or `JTERM4_` also
+/// capability families, but broad prefixes such as `JSH_` or `FORGE_` also
 /// match legitimate user configuration and must not be used.
 pub fn capture_inherited_environment_with_scrub(
     extra_names: &[&str],
@@ -152,14 +152,14 @@ pub struct ChildEnv<'a> {
     /// Value for `VTE_VERSION`, normally [`EMULATED_VTE_VERSION`]. `None` still
     /// *removes* an inherited `VTE_VERSION`; see [`overridden_names`].
     pub vte_version: Option<&'a str>,
-    /// Value for `LESS` when the parent has none: `"R"` for jterm1/jterm4,
-    /// `"FR"` for jterm2/jterm3, `None` to leave the pager alone entirely.
+    /// Value for `LESS` when the parent has none: `"R"` for anvil/forge,
+    /// `"FR"` for ember/frost, `None` to leave the pager alone entirely.
     pub less_default: Option<&'a str>,
-    /// Set `LS_COLORS` and `CLICOLOR` when the parent has neither. Only jterm3
+    /// Set `LS_COLORS` and `CLICOLOR` when the parent has neither. Only frost
     /// does this today.
     pub color_defaults: bool,
-    /// Replace a non-UTF-8 locale with [`UTF8_LOCALE`]. Only jterm2 does this
-    /// today. A terminal that draws UTF-8 either way (jterm1, jterm3, jterm4)
+    /// Replace a non-UTF-8 locale with [`UTF8_LOCALE`]. Only ember does this
+    /// today. A terminal that draws UTF-8 either way (anvil, frost, forge)
     /// should leave it off rather than overriding a deliberate `LANG`.
     pub normalize_locale: bool,
 }
@@ -477,7 +477,7 @@ fn non_empty<'a>(inherited: &'a Environment, name: &str) -> Option<&'a OsStr> {
 /// precedence: `LC_ALL`, then `LC_CTYPE`, then `LANG`, each only when set to a
 /// non-empty value.
 ///
-/// jterm2 used `.any()` over the three names instead, which reports UTF-8 as
+/// ember used `.any()` over the three names instead, which reports UTF-8 as
 /// long as *some* locale variable mentions it. `LC_ALL=C` together with
 /// `LANG=en_US.UTF-8` — a common shape on a machine that pins the C locale for
 /// tooling — therefore skipped normalization and forwarded `LC_ALL=C` verbatim,
@@ -668,35 +668,35 @@ mod tests {
             None
         );
 
-        let jterm1 = ChildEnv {
+        let anvil = ChildEnv {
             less_default: Some("R"),
             ..options()
         };
-        let jterm3 = ChildEnv {
+        let frost = ChildEnv {
             less_default: Some("FR"),
             color_defaults: true,
             ..options()
         };
         assert_eq!(
-            value(&policy_vars(&env(&[]), &jterm1, &[]), "LESS"),
+            value(&policy_vars(&env(&[]), &anvil, &[]), "LESS"),
             Some("R")
         );
         assert_eq!(
-            value(&policy_vars(&env(&[]), &jterm3, &[]), "LESS"),
+            value(&policy_vars(&env(&[]), &frost, &[]), "LESS"),
             Some("FR")
         );
         assert_eq!(
-            value(&policy_vars(&env(&[]), &jterm3, &[]), "LS_COLORS"),
+            value(&policy_vars(&env(&[]), &frost, &[]), "LS_COLORS"),
             Some(DEFAULT_LS_COLORS)
         );
         assert_eq!(
-            value(&policy_vars(&env(&[]), &jterm3, &[]), "CLICOLOR"),
+            value(&policy_vars(&env(&[]), &frost, &[]), "CLICOLOR"),
             Some("1")
         );
 
         // An explicit empty LESS is still the user's choice, not an absence.
         let configured = env(&[("LESS", ""), ("LS_COLORS", "di=0"), ("CLICOLOR", "0")]);
-        let vars = policy_vars(&configured, &jterm3, &[]);
+        let vars = policy_vars(&configured, &frost, &[]);
         assert_eq!(value(&vars, "LESS"), None);
         assert_eq!(value(&vars, "LS_COLORS"), None);
         assert_eq!(value(&vars, "CLICOLOR"), None);
@@ -713,8 +713,8 @@ mod tests {
             value(&vars, "LANG").map(str::to_string)
         };
 
-        // The jterm2 bug: LC_ALL=C outranks a UTF-8 LANG, so this must
-        // normalize. jterm2's `.any()` saw the UTF-8 LANG and forwarded
+        // The ember bug: LC_ALL=C outranks a UTF-8 LANG, so this must
+        // normalize. ember's `.any()` saw the UTF-8 LANG and forwarded
         // LC_ALL=C untouched.
         assert_eq!(
             normalized(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")]),
@@ -876,8 +876,8 @@ mod tests {
                 ("GTK_PATH", "/user/gtk"),
                 ("GTK_IM_MODULE", "ibus"),
                 ("XMODIFIERS", "@im=ibus"),
-                ("JTERM1_CONFIG", "/user/config"),
-                ("JTERM4_AI_API_KEY", "user-provider-key"),
+                ("ANVIL_CONFIG", "/user/config"),
+                ("FORGE_AI_API_KEY", "user-provider-key"),
                 ("JSH_AI_PROVIDER", "openai"),
                 ("JSH_SESSION_ID", "stale-pane"),
                 ("EMBEDDER_TOKEN", "private"),
@@ -891,8 +891,8 @@ mod tests {
             assert!(!frozen.contains_key(OsStr::new(private)), "{private}");
         }
         for preserved in [
-            "JTERM1_CONFIG",
-            "JTERM4_AI_API_KEY",
+            "ANVIL_CONFIG",
+            "FORGE_AI_API_KEY",
             "JSH_AI_PROVIDER",
             "JSH_SESSION_ID",
         ] {
@@ -921,7 +921,7 @@ mod tests {
         let frozen = env(&[
             ("PATH", "/usr/bin"),
             ("GTK_PATH", "/launch-time/gtk"),
-            ("JTERM4_CONFIG", "/user/jterm4.toml"),
+            ("FORGE_CONFIG", "/user/forge.toml"),
             ("JSH_AI_PROVIDER", "openai"),
             ("JSH_SESSION_ID", "stale"),
         ]);
@@ -929,21 +929,21 @@ mod tests {
         // snapshot. It is absent from `frozen`, so a complete VTE block cannot
         // leak it even if the live frontend environment now contains it.
         let mut live_after_capture = frozen.clone();
-        live_after_capture.insert(OsString::from("JTERM4_SAFE_MODE"), OsString::from("1"));
-        assert!(live_after_capture.contains_key(OsStr::new("JTERM4_SAFE_MODE")));
+        live_after_capture.insert(OsString::from("FORGE_SAFE_MODE"), OsString::from("1"));
+        assert!(live_after_capture.contains_key(OsStr::new("FORGE_SAFE_MODE")));
 
         let envv =
             vte_envv_for(&frozen, &options(), &[("JSH_SESSION_ID", "current-pane")]).unwrap();
 
         assert!(envv.contains(&"PATH=/usr/bin".to_string()));
         assert!(envv.contains(&"GTK_PATH=/launch-time/gtk".to_string()));
-        assert!(envv.contains(&"JTERM4_CONFIG=/user/jterm4.toml".to_string()));
+        assert!(envv.contains(&"FORGE_CONFIG=/user/forge.toml".to_string()));
         assert!(envv.contains(&"JSH_AI_PROVIDER=openai".to_string()));
         assert!(envv.contains(&"JSH_SESSION_ID=current-pane".to_string()));
         assert!(envv.iter().all(|entry| entry != "JSH_SESSION_ID=stale"));
         assert!(envv
             .iter()
-            .all(|entry| !entry.starts_with("JTERM4_SAFE_MODE=")));
+            .all(|entry| !entry.starts_with("FORGE_SAFE_MODE=")));
         assert_eq!(VTE_SPAWN_NO_PARENT_ENVV_BITS, 33_554_432);
     }
 

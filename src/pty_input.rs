@@ -1,8 +1,8 @@
 //! Hardening for everything the frontends write *to* a shell PTY.
 //!
 //! Every jterm grew its own paste encoder, and they disagreed on every axis.
-//! Only jterm2 removed an embedded `ESC[201~` from the payload before framing
-//! it; jterm1, jterm3 and jterm4 pasted the clipboard verbatim, so a hostile
+//! Only ember removed an embedded `ESC[201~` from the payload before framing
+//! it; anvil, frost and forge pasted the clipboard verbatim, so a hostile
 //! clipboard could close the bracketed-paste frame early and have the rest of
 //! its bytes arrive as *keystrokes*:
 //!
@@ -20,16 +20,16 @@
 //! Family decisions frozen here (do not relitigate per-app):
 //!
 //! - **This module does not own DECSET 2004.** [`PasteModes`] is a parameter.
-//!   jterm2/jterm3 read the mode from their own VT emulators, jterm1/jterm4
+//!   ember/frost read the mode from their own VT emulators, anvil/forge
 //!   from a raw byte scan plus a `ParserEvent::DecsetMode` cell, and
 //!   [`crate::parser`] carries a fourth (currently unused) copy. A fifth owner
 //!   living here would make this module a net regression.
 //! - **The submit CR goes *outside* the frame.** Readline deliberately does not
 //!   execute newlines contained in a bracketed paste, so a submit appended
-//!   inside the frame is swallowed. jterm2 already had this right.
-//! - **[`UnbracketedMultiline`] stays a per-app knob.** jterm1/jterm4 truncate
+//!   inside the frame is swallowed. ember already had this right.
+//! - **[`UnbracketedMultiline`] stays a per-app knob.** anvil/forge truncate
 //!   a multiline paste to its first line when the shell has not advertised
-//!   2004; jterm2 confirms and then sends everything; jterm3 sends everything.
+//!   2004; ember confirms and then sends everything; frost sends everything.
 //!   That is a product disagreement, not a bug, and unifying it under cover of
 //!   a security fix would silently change two apps.
 //! - **Control stripping is a flag, but marker removal is not.** Stripping C0
@@ -72,9 +72,9 @@ pub struct PasteModes {
 /// bracketed paste, so every embedded newline would execute a line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnbracketedMultiline {
-    /// Keep only the first logical line (jterm1, jterm4).
+    /// Keep only the first logical line (anvil, forge).
     FirstLineOnly,
-    /// Send every line and let the child execute them (jterm2, jterm3).
+    /// Send every line and let the child execute them (ember, frost).
     SendVerbatim,
 }
 
@@ -302,7 +302,7 @@ pub fn should_confirm(risk: &PasteRisk, threshold_bytes: usize) -> bool {
 /// Encode a clipboard payload for the PTY.
 ///
 /// Pure: a caller may re-run it with the same arguments and get the same bytes,
-/// which is what jterm2's all-or-nothing backpressure retry depends on.
+/// which is what ember's all-or-nothing backpressure retry depends on.
 pub fn encode_paste(text: &str, modes: PasteModes, policy: PastePolicy) -> Paste {
     let normalized = normalize_newlines(text);
     let (body, had_marker, had_controls) = defang(&normalized, policy.strip_controls);
@@ -369,7 +369,7 @@ pub fn encode_paste(text: &str, modes: PasteModes, policy: PastePolicy) -> Paste
 /// Encode a command this app is putting on the child's prompt — history recall,
 /// block re-run, an agent's suggestion.
 ///
-/// `clear_line_first` should be `true` unconditionally. jterm4 learned why:
+/// `clear_line_first` should be `true` unconditionally. forge learned why:
 /// gating the `Ctrl+U` on a "the shell's line buffer is in sync" flag appends
 /// the recalled command to whatever the user had already typed, because typed
 /// text is not represented by that flag.
@@ -393,7 +393,7 @@ pub fn encode_prompt_insert(
 
 /// The PTY-boundary net for writes that did **not** come from [`encode_paste`].
 ///
-/// jterm1 and jterm4 funnel every PTY write through one choke point, which is
+/// anvil and forge funnel every PTY write through one choke point, which is
 /// the only thing covering their ad-hoc writers (a history palette that emits
 /// raw command bytes, a queued startup command formatted with a trailing CR).
 /// This replaces the `sanitize_input_chunk` both repos grew independently, with
@@ -701,7 +701,7 @@ mod tests {
         assert_eq!(bracketed.echo_text, "one\ntwo");
     }
 
-    /// jterm1's second bypass: an unnormalized clipboard ending in a bare CR
+    /// anvil's second bypass: an unnormalized clipboard ending in a bare CR
     /// used to hit the boundary's explicit-submission fast path and defeat the
     /// truncation the module doc promised.
     #[test]
@@ -886,7 +886,7 @@ mod tests {
         ));
     }
 
-    /// jterm1 wrote its frame as three separate `write_bytes` calls, so the
+    /// anvil wrote its frame as three separate `write_bytes` calls, so the
     /// body arrived while a frame was already open and the old boundary waved
     /// it through untouched.
     #[test]

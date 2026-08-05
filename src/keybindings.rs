@@ -1,8 +1,8 @@
 //! Toolkit-neutral keyboard-chord core for the jterm family.
 //!
-//! jterm1..4 each grew their own chord handling (GTK `parse_key_combo` /
-//! `key_combo_to_string` in jterm1/4, string-level `normalize_binding` in
-//! jterm2, `KeyBinding::canonical` in jterm3). This module is the shared
+//! The four terminals each grew their own chord handling (GTK `parse_key_combo` /
+//! `key_combo_to_string` in anvil/forge, string-level `normalize_binding` in
+//! ember, `KeyBinding::canonical` in frost). This module is the shared
 //! replacement: the *union* of the four grammars in, one canonical form
 //! out, with zero toolkit types so GTK, egui and iced frontends can all
 //! link it.
@@ -10,13 +10,13 @@
 //! Family decisions frozen here (do not relitigate per-app):
 //!
 //! - **Canonical modifier order is `ctrl+shift+alt+super`** — the display
-//!   order jterm1/4 already print and the storage order jterm2/3 already
+//!   order anvil/forge already print and the storage order ember/frost already
 //!   persist. [`Chord::display`] renders `Ctrl+Shift+Alt+Super+<Key>`;
 //!   [`Chord::canonical`] renders the all-lowercase storage form.
 //! - **Numpad digits fold onto the main row**: chords only ever store
 //!   `Char('0'..='9')`. Frontends normalize keypad keysyms (`KP_1`, ...)
 //!   to plain digits before lookup so `ctrl+1` covers both keyboards.
-//! - **Backslash stores as the word `backslash`** (jterm3's fold): both
+//! - **Backslash stores as the word `backslash`** (frost's fold): both
 //!   `ctrl+\` and `ctrl+backslash` parse to the same chord and
 //!   [`Chord::canonical`] always emits `ctrl+backslash`, so TOML/JSON
 //!   configs never need escaping. [`Chord::display`] shows the literal
@@ -65,7 +65,7 @@ pub enum NamedKey {
 
 impl NamedKey {
     /// Human-facing spelling used by [`Chord::display`]. `Return` shows
-    /// as "Enter" — the family UI convention (jterm2's prettify, jterm1/4
+    /// as "Enter" — the family UI convention (ember's prettify, anvil/forge
     /// display).
     fn display_name(self) -> &'static str {
         match self {
@@ -88,7 +88,7 @@ impl NamedKey {
     }
 
     /// Lowercase storage spelling used by [`Chord::canonical`]. Note the
-    /// storage form keeps `return` (jterm2/3 store `ctrl+shift+return`)
+    /// storage form keeps `return` (ember/frost store `ctrl+shift+return`)
     /// even though the display form says "Enter"; both parse.
     fn canonical_name(self) -> &'static str {
         match self {
@@ -232,9 +232,9 @@ impl std::error::Error for ParseError {}
 ///   case-insensitive throughout.
 /// - Modifier aliases: `ctrl`/`control`, `shift`, `alt`/`option`,
 ///   `super`/`cmd`/`command`/`win`/`meta`. A duplicated modifier (even
-///   via an alias) is an error — jterm2's strictness, kept because it
+///   via an alias) is an error — ember's strictness, kept because it
 ///   catches typo'd chords in config files.
-/// - `+` is also the separator, so a literal plus key uses the jterm1/4
+/// - `+` is also the separator, so a literal plus key uses the anvil/forge
 ///   special cases: an input ending in `++` with at least three parts
 ///   (`ctrl+shift++`), or a trailing empty part with at least two parts
 ///   (`ctrl++`), means "key is `+`". `plus` also always works.
@@ -262,7 +262,7 @@ pub fn parse(s: &str) -> Result<Chord, ParseError> {
     // The last part is the key, but a literal '+' key needs special cases:
     // a bare "+" splits into two empty parts, and "ctrl++"/"ctrl+shift++"
     // carry two trailing empties. A single trailing '+' with no key (e.g.
-    // "ctrl+") is a malformed chord, not a plus key — the historical jterm1/4
+    // "ctrl+") is a malformed chord, not a plus key — the historical anvil/forge
     // branch silently dropped the modifier there.
     let (mod_parts, key_token) = if trimmed == "+" {
         (&parts[..0], "+")
@@ -339,7 +339,7 @@ fn parse_key_token(token: &str) -> Result<KeySym, ParseError> {
         "down" | "arrowdown" => KeySym::Named(Down),
         "left" | "arrowleft" => KeySym::Named(Left),
         "right" | "arrowright" => KeySym::Named(Right),
-        // X11-style symbol names (jterm1/4 accept these via GTK's
+        // X11-style symbol names (anvil/forge accept these via GTK's
         // Key::from_name; kept so existing configs keep parsing) plus
         // the literal characters themselves.
         "plus" | "+" => KeySym::Char('+'),
@@ -403,7 +403,7 @@ pub fn is_unbind_token(s: &str) -> bool {
 /// Actions every jterm binds by default. Names are app-neutral: the
 /// split variants are *geometric* (side-by-side vs stacked) because the
 /// repos disagree on the words — `ctrl+shift+e` is "SplitHorizontal" in
-/// jterm4 but "TerminalSplitVertical" in jterm2/3, yet it is the same
+/// forge but "TerminalSplitVertical" in ember/frost, yet it is the same
 /// gesture (new pane beside the current one). `ctrl+shift+d` stacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CommonAction {
@@ -455,12 +455,12 @@ pub enum CommonAction {
 ///
 /// Deliberately EXCLUDED (do not add without a cross-repo decision):
 ///
-/// - `ctrl+shift+a` — hard family conflict: SelectAllBlocks in jterm1/4
-///   vs AgentToggle in jterm2/3. No neutral meaning exists.
+/// - `ctrl+shift+a` — hard family conflict: SelectAllBlocks in anvil/forge
+///   vs AgentToggle in ember/frost. No neutral meaning exists.
 /// - Vim-letter pane fallbacks (`ctrl+alt+h/j/k/l` and the shift+resize
-///   forms) — jterm4-local workaround for desktops that grab
+///   forms) — forge-local workaround for desktops that grab
 ///   Ctrl+Alt+arrows (GNOME workspace switching); not a family contract.
-/// - `ctrl++` / `ctrl+shift++` font-size aliases — jterm2-local extras
+/// - `ctrl++` / `ctrl+shift++` font-size aliases — ember-local extras
 ///   on top of the canonical `ctrl+=`.
 /// - History palette, tab switcher and help chords — not yet bound
 ///   universally; they join the table once all four repos agree.

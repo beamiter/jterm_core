@@ -1,5 +1,5 @@
 //! UI-independent process inspection and shell quoting shared by the jterm
-//! family. Seeded from jterm1's hardened `process.rs`, the only copy whose
+//! family. Seeded from anvil's hardened `process.rs`, the only copy whose
 //! tests pin the edge cases the other terminals' local copies got wrong.
 //!
 //! Four concerns live here because they feed each other:
@@ -276,7 +276,7 @@ pub fn command_requires_block_integration(args: &[String]) -> bool {
 /// Deserialize a snapshot's restorable command, accepting the legacy joined
 /// string but never replaying it.
 ///
-/// The identical duplicate of this lived at jterm1 `src/session.rs` and jterm4
+/// The identical duplicate of this lived at anvil `src/session.rs` and forge
 /// `src/state.rs` (byte-for-byte apart from the log level). Older snapshots
 /// stored the command as `argv.join(" ")`, whose argument boundaries cannot be
 /// recovered: `ssh host 'echo a; rm b'` re-splits into a different command, and
@@ -2064,7 +2064,7 @@ mod lifecycle_tests {
         }
     }
 
-    // -- hoisted from jterm1 ------------------------------------------------
+    // -- hoisted from anvil ------------------------------------------------
 
     #[test]
     fn session_drain_requires_quiet_after_a_late_fork_appears() {
@@ -2165,7 +2165,7 @@ mod lifecycle_tests {
         assert!(drain.drain_session);
         assert!(!group.drain_session);
         assert!(EscalationPolicy::default().drain_session);
-        // jterm1's timings, which both presets inherit.
+        // anvil's timings, which both presets inherit.
         assert_eq!(drain.hangup_signal, libc::SIGHUP);
         assert_eq!(drain.term_signal, libc::SIGTERM);
         assert_eq!(drain.kill_signal, libc::SIGKILL);

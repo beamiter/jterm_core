@@ -1,13 +1,13 @@
 //! Reading, retiring and replacing the family's on-disk session snapshots.
 //!
 //! Seeded from the three persistence layers that already disagreed about this:
-//! the bounded read is the missing half of jterm1 `src/session.rs` (a plain
-//! `fs::read_to_string` on a file chosen by directory scan) and jterm3
+//! the bounded read is the missing half of anvil `src/session.rs` (a plain
+//! `fs::read_to_string` on a file chosen by directory scan) and frost
 //! `src/session_persistence.rs::load` (the same); [`quarantine_corrupt`] is
-//! lifted from jterm2 `src/session_persistence.rs::quarantine_corrupt_snapshot`,
+//! lifted from ember `src/session_persistence.rs::quarantine_corrupt_snapshot`,
 //! the only repo that had the idea; [`write_atomic_private`] is the union of
-//! jterm1 `src/session.rs::atomic_write` + `ensure_private_directory`, jterm4
-//! `src/state.rs::atomic_write_private_file`, and jterm3's `save` (which was
+//! anvil `src/session.rs::atomic_write` + `ensure_private_directory`, forge
+//! `src/state.rs::atomic_write_private_file`, and frost's `save` (which was
 //! `fs::write` + `rename`, so a crash between them could publish a truncated
 //! snapshot). The durable-replacement mechanics themselves are not re-done here
 //! — [`crate::atomic_file::write_atomic`] already had them right.
@@ -30,7 +30,7 @@
 //!   generous — the number stays per-app because only the app knows how many
 //!   panes and how much scrollback metadata it persists.
 //! - **Quarantine happens *before* the fresh write, never after the failed
-//!   parse.** Ordering is the whole point: jterm1 and jterm3 both retain a
+//!   parse.** Ordering is the whole point: anvil and frost both retain a
 //!   corrupt file and then save over it on the next autosave tick.
 //! - **A snapshot directory is `0700` and a snapshot file is `0600`.** Restored
 //!   argv can contain hostnames, remote paths and `docker exec` targets, and
@@ -39,17 +39,17 @@
 //! - **Only a directory this module *created* is chmodded by
 //!   [`write_atomic_private`]; tightening one that already existed is the
 //!   caller's explicit request, through `ensure_private_directory`.** Two of
-//!   the four apps take the snapshot path from config (jterm2
-//!   `session_history_file`, jterm3 `session_history_path` — which also expands
+//!   the four apps take the snapshot path from config (ember
+//!   `session_history_file`, frost `session_history_path` — which also expands
 //!   `~`), so the parent directory of a destination is not necessarily the
 //!   app's own: it can be `$HOME` or `/tmp`. A `write_atomic_private` that
 //!   tightened whatever parent it was handed would chmod `$HOME` to `0700` as a
 //!   side effect of an autosave, and fail the whole save with `EPERM` on
-//!   `/tmp`. The apps that do own their directory (jterm1
-//!   `~/.config/jterm1`, jterm4 `~/.config/jterm4/windows`) say so once.
+//!   `/tmp`. The apps that do own their directory (anvil
+//!   `~/.config/anvil`, forge `~/.config/forge/windows`) say so once.
 //! - **Nothing here parses.** No `serde_json`, no snapshot types: the four
-//!   apps' snapshot schemas differ (jterm1/jterm4 `SavedSession`, jterm3
-//!   `SessionsSnapshot`, jterm2 its own), and folding a schema in here would
+//!   apps' snapshot schemas differ (anvil/forge `SavedSession`, frost
+//!   `SessionsSnapshot`, ember its own), and folding a schema in here would
 //!   make this module a versioning problem instead of an I/O one.
 
 use std::fs::{self, File, OpenOptions};
@@ -70,7 +70,7 @@ fn open_regular(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         // A snapshot path replaced by a fifo would otherwise block `open` until
         // some writer appears, hanging whichever thread the restore runs on —
-        // for jterm1 and jterm4 that is the GTK main thread, i.e. a window that
+        // for anvil and forge that is the GTK main thread, i.e. a window that
         // never draws. O_NONBLOCK lets the open return so the fstat below can
         // reject it, and is a no-op for the regular files this is really for.
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC);
@@ -152,7 +152,7 @@ fn oversize_error(path: &Path, actual: u64, max_bytes: u64) -> io::Error {
 }
 
 /// Highest number of same-millisecond quarantine attempts before giving up.
-/// Matches jterm2's bound; a caller retrying a hundred times inside one
+/// Matches ember's bound; a caller retrying a hundred times inside one
 /// millisecond is looping, not making progress.
 const MAX_QUARANTINE_ATTEMPTS: u32 = 100;
 
@@ -780,11 +780,11 @@ mod tests {
     // already been told was corrupt.
     // -----------------------------------------------------------------------
 
-    /// Shape of jterm1 `src/session.rs::parse_state_file_name`, which accepts
+    /// Shape of anvil `src/session.rs::parse_state_file_name`, which accepts
     /// `tabs.state`, `tabs.<identity>.state` and either of those followed by
     /// `.claim.<identity>`. Reproduced structurally, not verbatim: only the
     /// prefix/suffix anchoring matters for this assertion.
-    fn jterm1_accepts_state_file_name(name: &str) -> bool {
+    fn anvil_accepts_state_file_name(name: &str) -> bool {
         fn unclaimed(name: &str) -> bool {
             name == "tabs.state"
                 || name
@@ -798,9 +798,9 @@ mod tests {
         }
     }
 
-    /// Shape of jterm4 `src/state.rs::snapshots_with_extension`, which keeps a
+    /// Shape of forge `src/state.rs::snapshots_with_extension`, which keeps a
     /// regular file whose *final* extension is exactly `state` or `active`.
-    fn jterm4_accepts_snapshot_name(name: &str) -> bool {
+    fn forge_accepts_snapshot_name(name: &str) -> bool {
         Path::new(name)
             .extension()
             .and_then(|value| value.to_str())
@@ -811,11 +811,11 @@ mod tests {
     fn consumers_accept_the_real_snapshot_names() {
         // Guard the guard: a predicate that rejected everything would make the
         // assertions below vacuous.
-        assert!(jterm1_accepts_state_file_name("tabs.state"));
-        assert!(jterm1_accepts_state_file_name("tabs.7f3a.state"));
-        assert!(jterm1_accepts_state_file_name("tabs.7f3a.state.claim.9b1c"));
-        assert!(jterm4_accepts_snapshot_name("window-12.state"));
-        assert!(jterm4_accepts_snapshot_name("window-12.active"));
+        assert!(anvil_accepts_state_file_name("tabs.state"));
+        assert!(anvil_accepts_state_file_name("tabs.7f3a.state"));
+        assert!(anvil_accepts_state_file_name("tabs.7f3a.state.claim.9b1c"));
+        assert!(forge_accepts_snapshot_name("window-12.state"));
+        assert!(forge_accepts_snapshot_name("window-12.active"));
     }
 
     #[test]
@@ -826,12 +826,12 @@ mod tests {
                     .into_string()
                     .expect("temp names are ASCII for ASCII destinations");
             assert!(
-                !jterm1_accepts_state_file_name(&temp),
-                "jterm1 would restore the temporary {temp}"
+                !anvil_accepts_state_file_name(&temp),
+                "anvil would restore the temporary {temp}"
             );
             assert!(
-                !jterm4_accepts_snapshot_name(&temp),
-                "jterm4 would restore the temporary {temp}"
+                !forge_accepts_snapshot_name(&temp),
+                "forge would restore the temporary {temp}"
             );
         }
     }
@@ -845,12 +845,12 @@ mod tests {
                     move_aside_suffix(kind, 1_700_000_000_000, 0)
                 );
                 assert!(
-                    !jterm1_accepts_state_file_name(&moved),
-                    "jterm1 would restore the moved-aside {moved}"
+                    !anvil_accepts_state_file_name(&moved),
+                    "anvil would restore the moved-aside {moved}"
                 );
                 assert!(
-                    !jterm4_accepts_snapshot_name(&moved),
-                    "jterm4 would restore the moved-aside {moved}"
+                    !forge_accepts_snapshot_name(&moved),
+                    "forge would restore the moved-aside {moved}"
                 );
             }
         }

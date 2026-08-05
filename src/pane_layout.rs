@@ -1,6 +1,6 @@
 //! Framework-neutral tmux-style split-pane layout tree.
 //!
-//! Extracted from jterm3. The tree, ratio math, and pixel-geometry helpers are
+//! Extracted from frost. The tree, ratio math, and pixel-geometry helpers are
 //! pure data: rendering, hit-testing, and persistence stay in each app. The
 //! divider thickness is passed into the geometry functions so apps with
 //! different chrome share the same subdivision math.
