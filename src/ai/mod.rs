@@ -2224,23 +2224,34 @@ mod tests {
     #[test]
     fn redaction_applies_to_history_and_system_before_sending() {
         let secret = "ghp_1234567890abcdefghijABCDEFGHIJ123456";
+        let url_password = "postgres://alice:s3cr3t@db.internal/app";
+        let bearer = "opaque-session-token_123456789";
         let mut redacting = client(Provider::OpenAiCompatible);
         redacting.redact_secrets = true;
         let turns = vec![Turn {
             role: Role::User,
-            text: format!("please use {secret} to push"),
+            text: format!("please use {secret} to push; Authorization: Bearer {bearer}"),
         }];
         let request = redacting
-            .build_request(Some(&format!("system with {secret}")), &turns)
+            .build_request(
+                Some(&format!("system with {secret} and {url_password}")),
+                &turns,
+            )
             .unwrap();
         assert!(!request.body.contains(secret));
+        assert!(!request.body.contains("s3cr3t"));
+        assert!(!request.body.contains(bearer));
         assert!(request.body.contains("[REDACTED:github-token]"));
+        assert!(request.body.contains("[REDACTED:url-password]"));
+        assert!(request.body.contains("[REDACTED:bearer-token]"));
 
         // Off by default: the raw text passes through untouched.
         let mut plain = client(Provider::OpenAiCompatible);
         plain.redact_secrets = false;
-        let request = plain.build_request(None, &turns).unwrap();
+        let request = plain.build_request(Some(url_password), &turns).unwrap();
         assert!(request.body.contains(secret));
+        assert!(request.body.contains("s3cr3t"));
+        assert!(request.body.contains(bearer));
     }
 
     #[test]
