@@ -1,6 +1,6 @@
 [package]
 name = "jterm_core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.86"
 description = "Shared UI-independent core for the jterm family of terminal emulators"
@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Pin the policy engine so a branch move cannot silently change the contract.
-jagent = { git = "https://github.com/beamiter/jagent.git", rev = "e94469b3b0b706100cfda91ea80281dbbfe6fe6b" }
+jagent = { git = "https://github.com/beamiter/jagent.git", rev = "f3b9b9a95d494619b0e623bd96afa70311f9ca26" }
 crossbeam-channel = "0.5"
 libc = "0.2.189"
 log = "0.4"

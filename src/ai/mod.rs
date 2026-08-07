@@ -4,11 +4,14 @@
 //! keeps the GTK thread free (callers run these blocking functions on a worker)
 //! and avoids adding a second TLS stack. Every API here only returns text; no
 //! function in this module executes or submits a generated command.
+//! Non-streaming success bodies remain raw bytes until jagent applies its
+//! canonical one-MiB envelope gate; provider error JSON is inspected only
+//! inside the much smaller diagnostic-text budget.
 
 use jagent::provider::{
-    bound_history_with, build_chat_request, build_chat_request_streaming, parse_chat_response_full,
-    ChatConfig, HttpRequest, ProviderError, MAX_REQUEST_HISTORY_BYTES, MAX_REQUEST_HISTORY_TURNS,
-    MAX_REQUEST_TURN_BYTES,
+    bound_history_with, build_chat_request, build_chat_request_streaming,
+    parse_chat_response_full_bytes, ChatConfig, HttpRequest, ProviderError,
+    MAX_REQUEST_HISTORY_BYTES, MAX_REQUEST_HISTORY_TURNS, MAX_REQUEST_TURN_BYTES,
 };
 use jagent::stream::{StreamEvent, StreamParser};
 use serde::{Deserialize, Serialize};
@@ -46,7 +49,7 @@ const MAX_CURL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_SECONDS: u32 = 300;
 /// Bounded head of raw stdout kept for API error bodies (non-2xx responses
 /// are plain JSON, not stream frames).
-const STREAM_ERROR_PREFIX_BYTES: usize = 8 * 1024;
+const STREAM_ERROR_PREFIX_BYTES: usize = MAX_ERROR_BODY_BYTES;
 const MAX_CURL_STDERR_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_AI_REQUESTS: usize = 4;
 const CURL_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -549,8 +552,8 @@ impl AiClient {
         }
         let _permit = acquire_request_permit(cancellation)?;
         let request = self.build_request(system, history)?;
-        let response = curl_json_post(&request.url, &request.headers, &request.body, cancellation)?;
-        self.parse_response(response)
+        let response = curl_body_post(&request.url, &request.headers, &request.body, cancellation)?;
+        self.parse_response(&response)
     }
 
     /// Send a transcript with incremental delivery: `on_delta` receives each
@@ -665,8 +668,8 @@ impl AiClient {
         }
     }
 
-    fn parse_response(&self, response: Value) -> Result<String, AiError> {
-        let parsed = parse_chat_response_full(self.provider.to_jagent(), &response)?;
+    fn parse_response(&self, response: &[u8]) -> Result<String, AiError> {
+        let parsed = parse_chat_response_full_bytes(self.provider.to_jagent(), response)?;
         let mut text = parsed.text;
         if parsed.reached_token_limit {
             text.push_str(
@@ -1348,12 +1351,12 @@ fn write_curl_config(
     Ok(())
 }
 
-fn curl_json_post(
+fn curl_body_post(
     url: &str,
     headers: &[(String, String)],
     body: &str,
     cancellation: &AiCancellationToken,
-) -> Result<Value, AiError> {
+) -> Result<Vec<u8>, AiError> {
     if cancellation.is_cancelled() {
         return Err(AiError::Cancelled);
     }
@@ -1368,22 +1371,31 @@ fn curl_json_post(
             trim_for_log(&stderr, MAX_ERROR_BODY_BYTES)
         )));
     }
-    let stdout = String::from_utf8(output.stdout).map_err(|error| {
-        AiError::Transport(format!(
-            "curl stdout is not valid UTF-8 at byte {}",
-            error.utf8_error().valid_up_to()
-        ))
-    })?;
-    let (body, status) =
-        split_curl_w(&stdout).ok_or_else(|| AiError::Transport("malformed curl output".into()))?;
+    decode_curl_body(output.stdout)
+}
+
+/// Separate curl's appended status from its body without decoding or copying
+/// the response into a `serde_json::Value`. Successful bytes stay raw until
+/// jagent applies its canonical envelope limit; error JSON is inspected only
+/// through [`api_error_message`]'s much smaller diagnostic prefix.
+fn decode_curl_body(mut stdout: Vec<u8>) -> Result<Vec<u8>, AiError> {
+    let marker = CURL_STATUS_MARKER.as_bytes();
+    let index = stdout
+        .windows(marker.len())
+        .rposition(|candidate| candidate == marker)
+        .ok_or_else(|| AiError::Transport("malformed curl output".into()))?;
+    let status = std::str::from_utf8(&stdout[index + marker.len()..])
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .ok_or_else(|| AiError::Transport("malformed curl output".into()))?;
+    stdout.truncate(index);
     if !(200..300).contains(&status) {
         return Err(AiError::Api {
             status,
-            message: api_error_message(body, status),
+            message: api_error_message(&stdout, status),
         });
     }
-    serde_json::from_str(body)
-        .map_err(|error| AiError::Transport(format!("decode response: {error}")))
+    Ok(stdout)
 }
 
 /// Result of folding one response's stream events.
@@ -1588,10 +1600,9 @@ fn curl_stream_post(
         .map(|(_, status)| status)
         .ok_or_else(|| AiError::Transport("malformed curl status output".into()))?;
     if !(200..300).contains(&http_status) {
-        let body_prefix = String::from_utf8_lossy(&error_prefix);
         return Err(AiError::Api {
             status: http_status,
-            message: api_error_message(&body_prefix, http_status),
+            message: api_error_message(&error_prefix, http_status),
         });
     }
     if let Some(message) = fold.protocol_error {
@@ -1704,8 +1715,12 @@ fn build_curl_stdin_config(
     Ok(config)
 }
 
-fn api_error_message(body: &str, status: u16) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
+fn api_error_message(body: &[u8], status: u16) -> String {
+    // Never build a `Value` from the transport's full (up to 8 MiB) error
+    // body. A useful provider error fits in the same diagnostic budget used
+    // for the fallback; an over-wide document is shown as a bounded prefix.
+    let body = &body[..body.len().min(MAX_ERROR_BODY_BYTES)];
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
         if let Some(message) = value
             .pointer("/error/message")
             .and_then(Value::as_str)
@@ -1715,6 +1730,7 @@ fn api_error_message(body: &str, status: u16) -> String {
             return trim_for_log(message, MAX_ERROR_BODY_BYTES);
         }
     }
+    let body = String::from_utf8_lossy(body);
     if body.trim().is_empty() {
         format!("HTTP {status}")
     } else {
@@ -2507,41 +2523,100 @@ mod tests {
 
     #[test]
     fn parses_all_provider_response_shapes() {
+        let parse = |provider, response: Value| {
+            let encoded = serde_json::to_vec(&response).unwrap();
+            client(provider).parse_response(&encoded)
+        };
         assert_eq!(
-            client(Provider::Anthropic)
-                .parse_response(json!({"content":[{"type":"text","text":"ok"}]}))
-                .unwrap(),
+            parse(
+                Provider::Anthropic,
+                json!({"content":[{"type":"text","text":"ok"}]})
+            )
+            .unwrap(),
             "ok"
         );
         assert_eq!(
-            client(Provider::OpenAiCompatible)
-                .parse_response(json!({"choices":[{"message":{"content":"ok"}}]}))
-                .unwrap(),
+            parse(
+                Provider::OpenAiCompatible,
+                json!({"choices":[{"message":{"content":"ok"}}]})
+            )
+            .unwrap(),
             "ok"
         );
-        assert!(client(Provider::OpenAiCompatible)
-            .parse_response(json!({
+        assert!(parse(
+            Provider::OpenAiCompatible,
+            json!({
                 "choices":[{
                     "message":{"content":"partial"},
                     "finish_reason":"length"
                 }]
-            }))
-            .unwrap()
-            .contains("configured output limit"));
+            })
+        )
+        .unwrap()
+        .contains("configured output limit"));
         assert_eq!(
-            client(Provider::Ollama)
-                .parse_response(json!({"message":{"content":"ok"}}))
-                .unwrap(),
+            parse(Provider::Ollama, json!({"message":{"content":"ok"}})).unwrap(),
             "ok"
         );
         assert!(matches!(
-            client(Provider::Ollama).parse_response(
+            parse(
+                Provider::Ollama,
                 json!({"message":{"content":"x".repeat(jagent::provider::MAX_MODEL_TEXT_BYTES + 1)}})
             ),
             Err(AiError::ResponseTooLarge {
                 limit: jagent::provider::MAX_MODEL_TEXT_BYTES
             })
         ));
+    }
+
+    #[test]
+    fn nonstreaming_response_gate_accepts_exact_limit_and_rejects_the_next_byte() {
+        let collect_success = |body: &[u8]| {
+            let mut output = body.to_vec();
+            output.extend_from_slice(format!("{CURL_STATUS_MARKER}200").as_bytes());
+            decode_curl_body(output).unwrap()
+        };
+
+        let mut body = serde_json::to_vec(&json!({"message": {"content": "ok"}})).unwrap();
+        body.resize(jagent::provider::MAX_RESPONSE_JSON_BYTES, b' ');
+        let response = collect_success(&body);
+        assert_eq!(
+            client(Provider::Ollama).parse_response(&response).unwrap(),
+            "ok"
+        );
+
+        body.push(b' ');
+        let response = collect_success(&body);
+        assert!(matches!(
+            client(Provider::Ollama).parse_response(&response),
+            Err(AiError::ResponseTooLarge {
+                limit: jagent::provider::MAX_RESPONSE_JSON_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn large_http_error_body_is_only_parsed_within_the_diagnostic_budget() {
+        assert_eq!(
+            api_error_message(br#"{"error":{"message":"rate limited"}}"#, 429),
+            "rate limited"
+        );
+
+        let oversized_message = "x".repeat(jagent::provider::MAX_RESPONSE_JSON_BYTES + 1);
+        let mut output = format!(r#"{{"error":{{"message":"{oversized_message}"}}}}"#).into_bytes();
+        output.extend_from_slice(format!("{CURL_STATUS_MARKER}429").as_bytes());
+
+        let error = decode_curl_body(output).unwrap_err();
+        let AiError::Api { status, message } = error else {
+            panic!("expected an HTTP API error");
+        };
+        assert_eq!(status, 429);
+        assert!(message.len() <= MAX_ERROR_BODY_BYTES);
+        // The capped prefix is incomplete JSON and therefore remains visible
+        // evidence. Parsing the full body would instead extract only the huge
+        // nested message, which is precisely the allocation path prohibited.
+        assert!(message.starts_with(r#"{"error":{"message":"#));
+        assert!(!message.ends_with("}}"));
     }
 
     #[test]

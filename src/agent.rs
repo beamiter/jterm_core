@@ -12,7 +12,6 @@ pub use jagent::session::{
     ApprovedCommand, CancellationToken, ModelOutcome, ParseError, ParsedAction, ProposalId,
     ProposalStatus, SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -55,11 +54,10 @@ fn next_session_epoch() -> AgentSessionEpoch {
 
 /// Hardened compatibility wrapper around the exact-pinned jagent session.
 ///
-/// The pinned dependency's live state transitions remain useful, but its
-/// restore routine predates strict validation of proposal identifiers and
-/// statuses. Keeping the inner type private ensures every restore reached
-/// through `jterm_core::agent` first crosses the private `validate_snapshot`
-/// gate.
+/// jagent validates its own snapshot invariants; this wrapper preserves the
+/// family contract independently and adds a process-local task epoch. Keeping
+/// the inner type private ensures every restore reached through
+/// `jterm_core::agent` first audits jagent's bounded, immutable snapshot view.
 #[derive(Debug)]
 pub struct AgentSession {
     inner: jagent::session::AgentSession,
@@ -227,28 +225,17 @@ impl AgentSession {
     }
 }
 
-#[derive(Deserialize)]
-struct SnapshotInspection {
-    transcript: Vec<Turn>,
-    state: AgentState,
-    next_proposal_id: u64,
-}
-
 fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapshotError> {
-    // AgentSessionSnapshot's fields are deliberately private upstream. Its
-    // own bounded serializer gives this compatibility layer an exact,
-    // canonical view without exposing or duplicating a second public snapshot
-    // format.
-    let encoded = snapshot.to_json()?;
-    let inspection: SnapshotInspection = serde_json::from_str(&encoded)
-        .map_err(|error| AgentSnapshotError::Decode(error.to_string()))?;
-
-    if inspection.transcript.len() > MAX_STORED_TRANSCRIPT_ENTRIES {
+    // jagent decoded this immutable view through allocation-aware seeds. Audit
+    // it directly: re-serializing into an ordinary `Vec<Turn>` decoder would
+    // create a second, weaker wire path around that boundary.
+    let transcript = snapshot.transcript();
+    if transcript.len() > MAX_STORED_TRANSCRIPT_ENTRIES {
         return Err(AgentSnapshotError::Invalid(
             "transcript exceeds its entry limit",
         ));
     }
-    let transcript_bytes = serde_json::to_vec(&inspection.transcript)
+    let transcript_bytes = serde_json::to_vec(transcript)
         .map_err(|error| AgentSnapshotError::Encode(error.to_string()))?
         .len();
     if transcript_bytes > MAX_STORED_TRANSCRIPT_BYTES {
@@ -261,7 +248,7 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
     let mut proposal_statuses = HashMap::new();
     let mut pending_proposal = None;
     let mut observed_proposals = HashSet::new();
-    for turn in &inspection.transcript {
+    for turn in transcript {
         match turn {
             Turn::User(message) | Turn::AssistantSay(message) => {
                 validate_snapshot_text(message, MAX_MESSAGE_BYTES, true)?;
@@ -313,16 +300,16 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
         }
     }
 
-    if inspection.next_proposal_id == 0
-        || inspection.next_proposal_id == u64::MAX
-        || inspection.next_proposal_id <= highest_proposal_id
+    if snapshot.next_proposal_id() == 0
+        || snapshot.next_proposal_id() == u64::MAX
+        || snapshot.next_proposal_id() <= highest_proposal_id
     {
         return Err(AgentSnapshotError::Invalid(
             "next proposal id is stale or exhausted",
         ));
     }
 
-    match inspection.state {
+    match snapshot.state() {
         AgentState::AwaitingApproval { proposal_id }
             if pending_proposal == Some(proposal_id)
                 && proposal_statuses.get(&proposal_id.get()) == Some(&ProposalStatus::Pending) =>

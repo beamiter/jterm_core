@@ -9,6 +9,10 @@ The crate deliberately has no GUI-toolkit dependency. Frontends own widgets,
 rendering, and event-loop integration; this crate owns byte-level protocols,
 bounds, validation, and operating-system primitives.
 
+Version 0.2 adopts jagent 0.6's explicit wire boundary. Agent snapshots are
+audited directly through their bounded decoded view, and non-streaming provider
+responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
+
 ## Shared surfaces
 
 - OSC/CSI/DCS/APC parsing, Kitty graphics framing, character widths, themes,
@@ -54,7 +58,9 @@ bounds, validation, and operating-system primitives.
    closed; clipboard paste reports the risk for explicit confirmation.
 10. AI curl and jsh update-check pipes are drained nonblocking with byte/time
     caps and process-group cleanup. Slow consumers apply kernel backpressure;
-    a descendant retaining stdout cannot pin a reader thread.
+    a descendant retaining stdout cannot pin a reader thread. Successful
+    non-streaming AI bodies are decoded only after jagent's 1 MiB gate, while
+    non-2xx JSON is parsed only within the 2 KiB diagnostic budget.
 11. A completed block is successful only when a frontend-resolved, non-blank
     command has an explicitly reported exit code of zero. An absent resolved
     command is background output, and a missing exit code remains unknown;

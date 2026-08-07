@@ -7,7 +7,8 @@ process-group lifecycle control, private atomic persistence, environment capture
 history retention, command review, and terminal helper primitives for all jterms.
 It now also decodes persisted conversations under their own budgets, offers an
 atomic claim/consume primitive for Agent snapshots, and vendors a fail-closed jsh
-installer.
+installer. Version 0.2 adopts jagent 0.6's serialize-only transcript boundary and
+keeps non-streaming provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
@@ -49,6 +50,16 @@ installer.
   private name before it is read, so two simultaneous openers cannot both resume
   it and a restore is no longer a racy read-then-remove. Evidence that cannot
   become a session is quarantined at the claim path rather than deleted.
+- `src/agent.rs::validate_snapshot` now audits jagent's bounded immutable
+  snapshot accessors directly. The former `to_json` plus ordinary
+  `SnapshotInspection { transcript: Vec<Turn>, .. }` decode is gone, while all
+  family-level proposal, observation, command, counter, and active-state checks
+  remain unchanged.
+- Non-streaming AI success bodies remain raw bytes through curl collection and
+  enter `parse_chat_response_full_bytes`, which applies jagent's 1 MiB ceiling
+  before constructing a JSON value. Non-2xx bodies may still be collected as
+  bounded evidence, but only their first 2 KiB can enter the diagnostic JSON
+  parser; streamed responses retain their frame and cumulative limits.
 - `scripts/install-jsh.sh` is resynced from the hardened canonical jsh copy: a
   published SHA-256 is mandatory and format-checked, downloads are byte-bounded
   and HTTPS-only across redirects, version/target/base-URL grammars are validated
@@ -58,17 +69,6 @@ installer.
 
 ## Remaining boundaries
 
-### Adopt the completed-block contract in the apps
-
-The pure `block_contract` API now exists, but anvil, ember, forge, and frost
-still classify completed blocks locally. First migrate their completed-state
-classifiers plus failed-only and exact-exit filters; renderer wrappers remain
-app-owned (especially Ember's Prompt/Running states). Resolve command metadata
-and screen fallback before calling core, and classify raw `Option<i32>` before
-any legacy sentinel conversion such as Forge's `-1`, which would otherwise look
-like a real failure. Keep serialized records app-owned: the shared enum has no
-serde contract and must not become a persistence schema.
-
 ### Consolidate the app-local claim implementations
 
 All four terminals claim Agent snapshots before production restore, but ember,
@@ -77,14 +77,6 @@ anvil calls `claim_session_file` directly. Migrate the remaining apps to the
 shared primitive, keep their post-decode semantic audits app-owned, then decide
 whether the public read/remove pair should be deprecated so a future restore
 cannot reintroduce a two-step race.
-
-### Make Agent snapshot decoding one-shot end to end
-
-`validate_snapshot` still re-encodes the snapshot and decodes a second
-`SnapshotInspection` view to audit it. The pinned jagent already decodes
-snapshots through bounded seeds, so this layer should audit the decoded value
-directly instead of paying for — and trusting — a second serialization round
-trip.
 
 ### Add a signed release manifest to the installer
 
@@ -97,9 +89,9 @@ release-side signing decision, so it is deliberately not approximated here.
 
 ```text
 cargo fmt --all -- --check
-cargo test --locked --all-targets --all-features --no-fail-fast
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo doc --locked --all-features --no-deps
+cargo test --all-targets --all-features --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+cargo doc --all-features --no-deps
 ```
 
 `process::lifecycle_tests::final_drain_kills_a_background_member_of_the_child_session`
