@@ -12,7 +12,8 @@ bounds, validation, and operating-system primitives.
 ## Shared surfaces
 
 - OSC/CSI/DCS/APC parsing, Kitty graphics framing, character widths, themes,
-  and the family keybinding grammar.
+  the family keybinding grammar, and the four-way completed-block outcome
+  contract (background, success, failure, or unknown status).
 - PTY input guarding, review-only command insertion, child environments,
   process-group lifecycle management, and restorable-command quoting.
 - Private atomic snapshots, command history, jsh execution journals, pane
@@ -54,6 +55,12 @@ bounds, validation, and operating-system primitives.
 10. AI curl and jsh update-check pipes are drained nonblocking with byte/time
     caps and process-group cleanup. Slow consumers apply kernel backpressure;
     a descendant retaining stdout cannot pin a reader thread.
+11. A completed block is successful only when a frontend-resolved, non-blank
+    command has an explicitly reported exit code of zero. An absent resolved
+    command is background output, and a missing exit code remains unknown;
+    neither is rewritten into a synthetic success or failure. Resolution must
+    apply protocol/screen fallback before classification, while command review
+    and display sanitization remain separate boundaries.
 
 ## Development
 

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-01
+Updated: 2026-08-08
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -10,6 +10,15 @@ atomic claim/consume primitive for Agent snapshots, and vendors a fail-closed js
 installer.
 
 ## Completed since the previous handoff
+
+- `src/block_contract.rs` establishes the renderer- and serialization-free
+  completed-block outcome shared by all four terminals. `classify_completed`
+  gives an absent/blank frontend-resolved command precedence as `Background`,
+  distinguishes an explicitly reported zero (`Success`) from non-zero
+  (`Failed`) and from no reported status (`Unknown`), and preserves the exact
+  observed status through `reported_exit_code`. Hostile command text and a
+  property-style status matrix pin the boundary without importing frontend or
+  persistence types.
 
 - `src/jsh_remote.rs` turns a remote-host description into argv that runs the
   newly vendored `scripts/jsh-remote.sh`, which places a verified static jsh on
@@ -49,20 +58,33 @@ installer.
 
 ## Remaining boundaries
 
-### Adopt the claim primitive in the apps
+### Adopt the completed-block contract in the apps
 
-`claim_session_file` exists, but `read_snapshot_file` + `remove_snapshot_file`
-remain public and are what all four terminals still call. Migrate each app (their handoffs
-track this) and then decide whether the racy pair should be deprecated or
-removed, so a future caller cannot reintroduce the two-step restore.
+The pure `block_contract` API now exists, but anvil, ember, forge, and frost
+still classify completed blocks locally. First migrate their completed-state
+classifiers plus failed-only and exact-exit filters; renderer wrappers remain
+app-owned (especially Ember's Prompt/Running states). Resolve command metadata
+and screen fallback before calling core, and classify raw `Option<i32>` before
+any legacy sentinel conversion such as Forge's `-1`, which would otherwise look
+like a real failure. Keep serialized records app-owned: the shared enum has no
+serde contract and must not become a persistence schema.
+
+### Consolidate the app-local claim implementations
+
+All four terminals claim Agent snapshots before production restore, but ember,
+forge, and frost still carry separate descriptor-safe implementations while
+anvil calls `claim_session_file` directly. Migrate the remaining apps to the
+shared primitive, keep their post-decode semantic audits app-owned, then decide
+whether the public read/remove pair should be deprecated so a future restore
+cannot reintroduce a two-step race.
 
 ### Make Agent snapshot decoding one-shot end to end
 
 `validate_snapshot` still re-encodes the snapshot and decodes a second
-`SnapshotInspection` view to audit it. The upstream jagent now decodes snapshots
-through bounded seeds, so once the pinned revision is advanced this layer should
-audit the decoded value directly instead of paying for — and trusting — a second
-serialization round trip.
+`SnapshotInspection` view to audit it. The pinned jagent already decodes
+snapshots through bounded seeds, so this layer should audit the decoded value
+directly instead of paying for — and trusting — a second serialization round
+trip.
 
 ### Add a signed release manifest to the installer
 
