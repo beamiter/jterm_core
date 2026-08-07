@@ -7,8 +7,9 @@ process-group lifecycle control, private atomic persistence, environment capture
 history retention, command review, and terminal helper primitives for all jterms.
 It now also decodes persisted conversations under their own budgets, offers an
 atomic claim/consume primitive for Agent snapshots, and vendors a fail-closed jsh
-installer. Version 0.2 adopts jagent 0.6's serialize-only transcript boundary and
-keeps non-streaming provider responses byte-oriented until their canonical gate.
+installer. Version 0.2 adopts jagent 0.6's serialize-only transcript boundary,
+closes the same owning-string bypass for core AI turns, and keeps non-streaming
+provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
@@ -67,6 +68,12 @@ keeps non-streaming provider responses byte-oriented until their canonical gate.
   primitive fail closed. Evidence that cannot become a session is quarantined
   at the claim path rather than deleted, while ordinary corrupt-snapshot
   quarantine retains its portable evidence-preserving fallback.
+- `src/agent.rs::try_claim_session_file` now distinguishes absence or a lost
+  claim race (`Ok(Vacant)`) from every other acquisition failure (`io::Error`).
+  It never falls back to reading the public name, while successful claims whose
+  evidence cannot restore remain `Ok(Quarantined)`. The historical
+  `claim_session_file` delegates to it and preserves best-effort compatibility
+  by logging and collapsing typed errors to `Vacant`.
 - `src/agent.rs::validate_snapshot` now audits jagent's bounded immutable
   snapshot accessors directly. The former `to_json` plus ordinary
   `SnapshotInspection { transcript: Vec<Turn>, .. }` decode is gone, while all
@@ -77,6 +84,15 @@ keeps non-streaming provider responses byte-oriented until their canonical gate.
   before constructing a JSON value. Non-2xx bodies may still be collected as
   bounded evidence, but only their first 2 KiB can enter the diagnostic JSON
   parser; streamed responses retain their frame and cumulative limits.
+- Blocking and streaming AI requests now consume jagent's `*_with_report`
+  builders. Core retains its pre-allocation history window and carries that
+  exact omission count into a complete system notice; any further omission by
+  jagent is treated as an invariant violation and fails closed. Raw and
+  redacted system instructions have a strict 64 KiB ceiling, and adding the
+  optional separator plus complete notice uses checked arithmetic and rejects
+  overflow instead of sampling safety instructions. Core's public `ai::Turn`
+  is serialize-only, so persisted conversations can decode only through the
+  bounded `ConversationSnapshot::from_json` path.
 - `scripts/install-jsh.sh` is resynced from the hardened canonical jsh copy: a
   published SHA-256 is mandatory and format-checked, downloads are byte-bounded
   and HTTPS-only across redirects, version/target/base-URL grammars are validated
@@ -86,20 +102,18 @@ keeps non-streaming provider responses byte-oriented until their canonical gate.
 
 ## Remaining boundaries
 
-### Consolidate the app-local claim implementations
+### Finish Forge's stronger claim validation boundary
 
-All four terminals claim Agent snapshots before production restore, but ember,
-forge, and frost still carry separate implementations while anvil calls
-`claim_session_file` directly. Forge's dirfd/inode-bound transaction still
-enforces policy beyond core's path-based primitive. A consumer of core
-`Restored` must use that session directly, not run a second app restore/audit
-after core has already consumed the claim. Apps with policy that core does not
-cover must keep their local transactional claim (including Forge for now) until
-core exposes a pre-retire validation boundary. Then decide whether the public
-read/remove pair should be deprecated and whether claim I/O failures need a
-typed public outcome instead of the current logged `Vacant`, so a future
-restore cannot reintroduce a two-step race, lose evidence after late validation,
-or hide an unavailable platform primitive.
+Anvil, ember, and frost now consume core's `SessionClaim::Restored` directly;
+they do not run a second app restore/audit after core has consumed the claim.
+Typed claim-acquisition failures are also complete in core through
+`try_claim_session_file`. Forge alone retains a local dirfd/inode-bound
+transaction because it enforces policy beyond core's path-based primitive. It
+should keep that stronger transaction until core exposes a pre-retire
+validation hook that can preserve Forge's late validation without losing
+evidence. After that migration, decide whether to deprecate the public
+best-effort read/remove pair and legacy claim wrapper so a new integration
+cannot accidentally reintroduce a two-step restore race.
 
 ### Add a signed release manifest to the installer
 
@@ -113,8 +127,9 @@ release-side signing decision, so it is deliberately not approximated here.
 ```text
 cargo fmt --all -- --check
 cargo test --all-targets --all-features --no-fail-fast
+cargo test --doc
 cargo clippy --all-targets --all-features -- -D warnings
-cargo doc --all-features --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 ```
 
 `process::lifecycle_tests::final_drain_kills_a_background_member_of_the_child_session`

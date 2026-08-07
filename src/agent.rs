@@ -412,12 +412,14 @@ pub fn remove_snapshot_file(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Outcome of [`claim_session_file`].
+/// Outcome of [`try_claim_session_file`] and [`claim_session_file`].
 #[derive(Debug)]
 pub enum SessionClaim {
-    /// Nothing to restore: no snapshot existed, another opener claimed it, or
-    /// the platform could not safely claim the path. Non-missing claim errors
-    /// are logged before this outcome is returned.
+    /// Nothing to restore: no snapshot existed or another opener claimed it.
+    ///
+    /// The compatibility [`claim_session_file`] wrapper also returns this
+    /// outcome after logging a non-missing claim error. Call
+    /// [`try_claim_session_file`] when the distinction matters.
     Vacant,
     /// This caller won the claim and the session was restored. The persisted
     /// snapshot has been consumed.
@@ -439,21 +441,28 @@ pub enum SessionClaim {
 /// calls either loses the session or replays it. This primitive closes both:
 /// the snapshot is moved to a private name first, so exactly one caller ever
 /// observes it, and the claim is only deleted once a session exists.
-pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
-    let claimed = match crate::snapshot_file::claim_exclusive(path) {
+///
+/// A missing public name, including losing a race to another opener, returns
+/// [`SessionClaim::Vacant`]. Any other failure to acquire the claim is returned
+/// unchanged as an [`std::io::Error`]; the function never falls back to a
+/// separate read. Once the claim succeeds, invalid evidence returns
+/// [`SessionClaim::Quarantined`] so its private claim path is not lost.
+pub fn try_claim_session_file(path: &std::path::Path) -> std::io::Result<SessionClaim> {
+    try_claim_session_file_with(path, crate::snapshot_file::claim_exclusive)
+}
+
+fn try_claim_session_file_with(
+    path: &std::path::Path,
+    claim: impl FnOnce(&std::path::Path) -> std::io::Result<std::path::PathBuf>,
+) -> std::io::Result<SessionClaim> {
+    let claimed = match claim(path) {
         Ok(claimed) => claimed,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Missing file or a lost race: do not fall back to reading the
             // public name after another opener may have retired it.
-            return SessionClaim::Vacant;
+            return Ok(SessionClaim::Vacant);
         }
-        Err(error) => {
-            log::warn!(
-                "agent: could not atomically claim saved session {}: {error}",
-                path.display()
-            );
-            return SessionClaim::Vacant;
-        }
+        Err(error) => return Err(error),
     };
     let restored =
         crate::snapshot_file::read_bounded(&claimed, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
@@ -462,7 +471,7 @@ pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
             })
             .and_then(|encoded| AgentSessionSnapshot::from_json(&encoded))
             .and_then(AgentSession::restore);
-    match restored {
+    Ok(match restored {
         Ok(session) => {
             let _ = std::fs::remove_file(&claimed);
             SessionClaim::Restored(session)
@@ -471,7 +480,33 @@ pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
             path: claimed,
             error,
         },
+    })
+}
+
+fn collapse_claim_result(
+    path: &std::path::Path,
+    result: std::io::Result<SessionClaim>,
+) -> SessionClaim {
+    match result {
+        Ok(claim) => claim,
+        Err(error) => {
+            log::warn!(
+                "agent: could not atomically claim saved session {}: {error}",
+                path.display()
+            );
+            SessionClaim::Vacant
+        }
     }
+}
+
+/// Compatibility wrapper around [`try_claim_session_file`].
+///
+/// Non-missing claim failures are logged and collapsed to
+/// [`SessionClaim::Vacant`], preserving the historical best-effort behavior.
+/// New integrations should use the typed entry point when an unavailable safe
+/// claim primitive or an I/O policy failure must be visible.
+pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
+    collapse_claim_result(path, try_claim_session_file(path))
 }
 
 #[cfg(test)]
@@ -511,6 +546,86 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn typed_claim_errors_distinguish_missing_from_hard_failures_without_fallback() {
+        let dir = TestDir::new("claim-injected-errors");
+        let path = dir.0.join("agent_session.json");
+        std::fs::write(&path, b"public evidence stays put").unwrap();
+
+        for (kind, vacant) in [
+            (std::io::ErrorKind::NotFound, true),
+            (std::io::ErrorKind::Unsupported, false),
+            (std::io::ErrorKind::PermissionDenied, false),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let result = try_claim_session_file_with(&path, |_| {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::new(kind, "injected claim failure"))
+            });
+            assert_eq!(calls.get(), 1, "claim backend must run exactly once");
+            if vacant {
+                assert!(matches!(result.unwrap(), SessionClaim::Vacant));
+            } else {
+                assert_eq!(result.unwrap_err().kind(), kind);
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"public evidence stays put",
+                "a claim error must not fall back to reading or retiring the public name"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_claim_collapses_a_typed_error_to_vacant() {
+        let dir = TestDir::new("claim-legacy-collapse");
+        let path = dir.0.join("agent_session.json");
+        std::fs::write(&path, b"public evidence stays put").unwrap();
+        let result = try_claim_session_file_with(&path, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "injected unavailable primitive",
+            ))
+        });
+
+        assert!(matches!(
+            collapse_claim_result(&path, result),
+            SessionClaim::Vacant
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"public evidence stays put");
+    }
+
+    #[test]
+    fn injected_claim_restores_valid_evidence_and_quarantines_invalid_evidence() {
+        let dir = TestDir::new("claim-injected-evidence");
+        let public = dir.0.join("agent_session.json");
+        let valid_claim = dir.0.join("agent_session.valid-claim.json");
+        write_snapshot_file(&valid_claim, &pending_snapshot()).unwrap();
+
+        let SessionClaim::Restored(session) = try_claim_session_file_with(&public, |path| {
+            assert_eq!(path, public);
+            Ok(valid_claim.clone())
+        })
+        .unwrap() else {
+            panic!("valid claimed evidence must restore");
+        };
+        assert!(matches!(
+            session.state(),
+            AgentState::AwaitingApproval { .. }
+        ));
+        assert!(!valid_claim.exists(), "restored evidence must be consumed");
+
+        let invalid_claim = dir.0.join("agent_session.invalid-claim.json");
+        crate::snapshot_file::write_atomic_private(&invalid_claim, b"not json").unwrap();
+        let SessionClaim::Quarantined { path, .. } =
+            try_claim_session_file_with(&public, |_| Ok(invalid_claim.clone())).unwrap()
+        else {
+            panic!("invalid claimed evidence must be quarantined");
+        };
+        assert_eq!(path, invalid_claim);
+        assert_eq!(std::fs::read(&path).unwrap(), b"not json");
     }
 
     #[test]
@@ -556,7 +671,7 @@ mod tests {
         let path = dir.0.join("agent_session.json");
         write_snapshot_file(&path, &pending_snapshot()).unwrap();
 
-        let SessionClaim::Restored(session) = claim_session_file(&path) else {
+        let SessionClaim::Restored(session) = try_claim_session_file(&path).unwrap() else {
             panic!("the first claim must restore the session");
         };
         assert!(matches!(
@@ -566,12 +681,15 @@ mod tests {
         // The snapshot is consumed, so a second opener finds nothing — and no
         // leftover claim file can be restored later.
         assert!(!path.exists());
-        assert!(matches!(claim_session_file(&path), SessionClaim::Vacant));
+        assert!(matches!(
+            try_claim_session_file(&path).unwrap(),
+            SessionClaim::Vacant
+        ));
         assert!(std::fs::read_dir(&dir.0).unwrap().next().is_none());
 
         // Claiming a path that never existed is vacant, not an error.
         assert!(matches!(
-            claim_session_file(&dir.0.join("missing.json")),
+            try_claim_session_file(&dir.0.join("missing.json")).unwrap(),
             SessionClaim::Vacant
         ));
     }
@@ -591,7 +709,7 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    match claim_session_file(&path) {
+                    match try_claim_session_file(&path).unwrap() {
                         SessionClaim::Restored(session) => {
                             assert!(matches!(
                                 session.state(),
@@ -629,6 +747,10 @@ mod tests {
         let path = dir.0.join("agent_session.json");
         std::fs::create_dir(&path).unwrap();
 
+        assert_eq!(
+            try_claim_session_file(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
         assert!(matches!(claim_session_file(&path), SessionClaim::Vacant));
         assert!(path.is_dir());
         assert!(std::fs::read_dir(&path).unwrap().next().is_none());
@@ -647,7 +769,7 @@ mod tests {
 
         let SessionClaim::Quarantined {
             path: quarantined, ..
-        } = claim_session_file(&path)
+        } = try_claim_session_file(&path).unwrap()
         else {
             panic!("the claimed symlink must remain invalid evidence");
         };
@@ -677,17 +799,18 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker_path = path.clone();
         let worker = std::thread::spawn(move || {
-            sender
-                .send(matches!(
-                    claim_session_file(&worker_path),
-                    SessionClaim::Vacant
-                ))
-                .unwrap();
+            let typed_kind = try_claim_session_file(&worker_path)
+                .expect_err("a FIFO must be rejected as a claim source")
+                .kind();
+            let legacy_vacant = matches!(claim_session_file(&worker_path), SessionClaim::Vacant);
+            sender.send((typed_kind, legacy_vacant)).unwrap();
         });
 
-        assert!(receiver
+        let (typed_kind, legacy_vacant) = receiver
             .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("claiming a FIFO must not wait for a writer"));
+            .expect("claiming a FIFO must not wait for a writer");
+        assert_eq!(typed_kind, std::io::ErrorKind::InvalidInput);
+        assert!(legacy_vacant);
         worker.join().unwrap();
         assert!(std::fs::symlink_metadata(&path)
             .unwrap()
@@ -705,14 +828,17 @@ mod tests {
             std::fs::write(&path, evidence).unwrap();
             let SessionClaim::Quarantined {
                 path: quarantined, ..
-            } = claim_session_file(&path)
+            } = try_claim_session_file(&path).unwrap()
             else {
                 panic!("invalid evidence must be quarantined");
             };
             assert!(!path.exists(), "the original name is claimed");
             assert_eq!(std::fs::read_to_string(&quarantined).unwrap(), evidence);
             // A quarantined file is never restored by a later opener.
-            assert!(matches!(claim_session_file(&path), SessionClaim::Vacant));
+            assert!(matches!(
+                try_claim_session_file(&path).unwrap(),
+                SessionClaim::Vacant
+            ));
             std::fs::remove_file(&quarantined).unwrap();
         }
 

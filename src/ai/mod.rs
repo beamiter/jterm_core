@@ -9,9 +9,10 @@
 //! inside the much smaller diagnostic-text budget.
 
 use jagent::provider::{
-    bound_history_with, build_chat_request, build_chat_request_streaming,
-    parse_chat_response_full_bytes, ChatConfig, HttpRequest, ProviderError,
-    MAX_REQUEST_HISTORY_BYTES, MAX_REQUEST_HISTORY_TURNS, MAX_REQUEST_TURN_BYTES,
+    bound_history_with, build_chat_request_streaming_with_report, build_chat_request_with_report,
+    parse_chat_response_full_bytes, BuiltRequest, ChatConfig, HttpRequest, ProviderError,
+    MAX_REQUEST_HISTORY_BYTES, MAX_REQUEST_HISTORY_TURNS, MAX_REQUEST_SYSTEM_BYTES,
+    MAX_REQUEST_TURN_BYTES,
 };
 use jagent::stream::{StreamEvent, StreamParser};
 use serde::{Deserialize, Serialize};
@@ -177,8 +178,16 @@ impl Role {
 }
 
 /// One turn in a provider-neutral conversation transcript.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Transcript restoration must use [`ConversationSnapshot::from_json`],
+/// which applies allocation-aware field and cumulative budgets. `Turn` stays
+/// serialize-only so an owning-string decode cannot bypass that boundary.
+///
+/// ```compile_fail
+/// fn require_decode<T: serde::de::DeserializeOwned>() {}
+/// require_decode::<jterm_core::ai::Turn>();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Turn {
     pub role: Role,
     pub text: String,
@@ -592,6 +601,16 @@ impl AiClient {
         }
     }
 
+    fn prepare_system(&self, system: Option<&str>) -> Result<Option<String>, AiError> {
+        let Some(raw) = system else {
+            return Ok(None);
+        };
+        ensure_system_budget(raw, "raw")?;
+        let prepared = self.prepare_text(raw);
+        ensure_system_budget(&prepared, "prepared")?;
+        Ok(Some(prepared))
+    }
+
     /// Assemble the provider POST through `jagent::provider`: redact, bound
     /// the history, note omissions in the system text, and build the wire
     /// request. Split from the transport so tests cover it without a network.
@@ -609,14 +628,15 @@ impl AiClient {
         history: &[Turn],
         streaming: bool,
     ) -> Result<HttpRequest, AiError> {
-        // Bound caller-owned strings before redaction/cloning. `jagent` also
-        // enforces its canonical request budget, but handing it a cloned
-        // multi-gigabyte transcript would already have lost the memory bound.
-        let mut system = system.map(|text| {
-            let raw = sample_output(text, MAX_REQUEST_TURN_BYTES);
-            let prepared = self.prepare_text(&raw);
-            sample_output(&prepared, MAX_REQUEST_TURN_BYTES)
-        });
+        // Reject an oversized system instruction before cloning or redaction.
+        // Unlike history evidence, a safety-bearing system prompt must never
+        // be sampled into a different instruction.
+        let mut system = self.prepare_system(system)?;
+
+        // Bound caller-owned history strings before redaction/cloning.
+        // `jagent` also enforces its canonical request budget, but handing it a
+        // cloned multi-gigabyte transcript would already have lost the memory
+        // bound.
         let mut retained_reversed = Vec::new();
         let mut retained_bytes = 0usize;
         for turn in history.iter().rev().take(MAX_REQUEST_HISTORY_TURNS) {
@@ -638,20 +658,7 @@ impl AiClient {
         let (bounded, jagent_omitted) =
             bound_history_with(&retained_reversed, |text| self.prepare_text(text));
         let omitted_turns = pre_omitted.saturating_add(jagent_omitted);
-        if omitted_turns > 0 {
-            let note = format!(
-                "{omitted_turns} older conversation turn(s) were omitted by \
-                 {}'s request safety budget. Do not assume access to them.",
-                crate::identity::get().app_name
-            );
-            match system.as_mut() {
-                Some(system) => {
-                    system.push_str("\n\n");
-                    system.push_str(&note);
-                }
-                None => system = Some(note),
-            }
-        }
+        append_omission_notice(&mut system, omitted_turns)?;
         let config = ChatConfig {
             provider: self.provider.to_jagent(),
             api_key: self.api_key.clone(),
@@ -660,12 +667,13 @@ impl AiClient {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
         };
-        if streaming {
-            build_chat_request_streaming(&config, system.as_deref(), &bounded)
-                .map_err(AiError::from)
+        let built = if streaming {
+            build_chat_request_streaming_with_report(&config, system.as_deref(), &bounded)
         } else {
-            build_chat_request(&config, system.as_deref(), &bounded).map_err(AiError::from)
+            build_chat_request_with_report(&config, system.as_deref(), &bounded)
         }
+        .map_err(AiError::from)?;
+        accept_prebounded_request(built)
     }
 
     fn parse_response(&self, response: &[u8]) -> Result<String, AiError> {
@@ -679,6 +687,63 @@ impl AiClient {
         }
         Ok(text)
     }
+}
+
+fn ensure_system_budget(system: &str, stage: &str) -> Result<(), AiError> {
+    if system.len() > MAX_REQUEST_SYSTEM_BYTES {
+        return Err(AiError::InvalidConfiguration(format!(
+            "{stage} system prompt exceeds the {MAX_REQUEST_SYSTEM_BYTES}-byte request limit"
+        )));
+    }
+    Ok(())
+}
+
+fn append_omission_notice(
+    system: &mut Option<String>,
+    omitted_turns: usize,
+) -> Result<(), AiError> {
+    if omitted_turns == 0 {
+        return Ok(());
+    }
+    let note = format!(
+        "{omitted_turns} older conversation turn(s) were omitted by {}'s request safety budget. \
+         Do not assume access to them.",
+        crate::identity::get().app_name
+    );
+    let separator = if system.is_some() { "\n\n" } else { "" };
+    let final_len = system
+        .as_ref()
+        .map_or(0, String::len)
+        .checked_add(separator.len())
+        .and_then(|len| len.checked_add(note.len()))
+        .ok_or_else(|| {
+            AiError::InvalidConfiguration(
+                "system prompt and omission notice length overflowed".into(),
+            )
+        })?;
+    if final_len > MAX_REQUEST_SYSTEM_BYTES {
+        return Err(AiError::InvalidConfiguration(format!(
+            "system prompt and omission notice exceed the {MAX_REQUEST_SYSTEM_BYTES}-byte request limit"
+        )));
+    }
+    match system {
+        Some(system) => {
+            system.push_str(separator);
+            system.push_str(&note);
+        }
+        None => *system = Some(note),
+    }
+    Ok(())
+}
+
+fn accept_prebounded_request(built: BuiltRequest) -> Result<HttpRequest, AiError> {
+    if built.omitted_history_turns > 0 {
+        return Err(AiError::InvalidConfiguration(format!(
+            "request builder unexpectedly omitted {} turn(s) from already-bounded history",
+            built.omitted_history_turns
+        )));
+    }
+    Ok(built.request)
 }
 
 fn validate_client_values(model: &str, base_url: &str, max_tokens: u32) -> Result<(), AiError> {
@@ -2255,6 +2320,123 @@ mod tests {
         assert_eq!(ollama["options"]["num_predict"], 512);
     }
 
+    fn openai_system_text(request: &HttpRequest) -> String {
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        body["messages"][0]["content"]
+            .as_str()
+            .expect("the first OpenAI-compatible message is the system prompt")
+            .to_string()
+    }
+
+    fn one_omitted_turn_history() -> Vec<Turn> {
+        (0..=MAX_REQUEST_HISTORY_TURNS)
+            .map(|index| Turn {
+                role: Role::User,
+                text: format!("turn {index}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn system_prompt_limit_is_exact_and_shared_by_blocking_and_streaming_builds() {
+        let client = client(Provider::OpenAiCompatible);
+        let exact = "s".repeat(MAX_REQUEST_SYSTEM_BYTES);
+        for streaming in [false, true] {
+            let request = client
+                .build_request_with(Some(&exact), &[], streaming)
+                .unwrap();
+            assert_eq!(openai_system_text(&request), exact);
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                streaming.then_some(true)
+            );
+        }
+
+        let oversized = "s".repeat(MAX_REQUEST_SYSTEM_BYTES + 1);
+        for streaming in [false, true] {
+            assert!(matches!(
+                client.build_request_with(Some(&oversized), &[], streaming),
+                Err(AiError::InvalidConfiguration(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn omission_notice_is_complete_or_the_request_fails_closed() {
+        let client = client(Provider::OpenAiCompatible);
+        let history = one_omitted_turn_history();
+        let note = "1 older conversation turn(s) were omitted by jterm's request safety budget. \
+                    Do not assume access to them.";
+        let base_len = MAX_REQUEST_SYSTEM_BYTES
+            .checked_sub("\n\n".len())
+            .and_then(|len| len.checked_sub(note.len()))
+            .unwrap();
+        let at_limit = "s".repeat(base_len);
+        let over_limit = "s".repeat(base_len + 1);
+        let exact_without_room = "s".repeat(MAX_REQUEST_SYSTEM_BYTES);
+
+        for streaming in [false, true] {
+            let request = client
+                .build_request_with(Some(&at_limit), &history, streaming)
+                .unwrap();
+            let system = openai_system_text(&request);
+            assert_eq!(system, format!("{at_limit}\n\n{note}"));
+            assert_eq!(system.len(), MAX_REQUEST_SYSTEM_BYTES);
+
+            for system in [&over_limit, &exact_without_room] {
+                let error = client
+                    .build_request_with(Some(system), &history, streaming)
+                    .unwrap_err();
+                assert!(matches!(error, AiError::InvalidConfiguration(_)));
+                assert!(error.to_string().contains("omission notice"));
+            }
+
+            let request = client
+                .build_request_with(None, &history, streaming)
+                .unwrap();
+            assert_eq!(openai_system_text(&request), note);
+        }
+    }
+
+    #[test]
+    fn redaction_may_not_expand_a_system_prompt_past_the_limit() {
+        let mut client = client(Provider::OpenAiCompatible);
+        client.redact_secrets = true;
+        let system = "AKIAIOSFODNN7EXAMPLE ".repeat(3_000);
+        assert!(system.len() <= MAX_REQUEST_SYSTEM_BYTES);
+        assert!(crate::redact::redact_secrets(&system).len() > MAX_REQUEST_SYSTEM_BYTES);
+
+        assert!(matches!(
+            client.build_request(Some(&system), &[]),
+            Err(AiError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn a_nonzero_builder_report_is_rejected_after_prebounding() {
+        let request = HttpRequest {
+            url: "https://example.invalid/v1/chat/completions".into(),
+            headers: vec![],
+            body: "{}".into(),
+        };
+        assert_eq!(
+            accept_prebounded_request(BuiltRequest {
+                request: request.clone(),
+                omitted_history_turns: 0,
+            })
+            .unwrap(),
+            request
+        );
+        let error = accept_prebounded_request(BuiltRequest {
+            request,
+            omitted_history_turns: 1,
+        })
+        .unwrap_err();
+        assert!(matches!(error, AiError::InvalidConfiguration(_)));
+        assert!(error.to_string().contains("already-bounded history"));
+    }
+
     #[test]
     fn live_request_history_keeps_recent_complete_bounded_context() {
         let client = client(Provider::OpenAiCompatible);
@@ -2278,12 +2460,15 @@ mod tests {
         let body: Value = serde_json::from_str(&request.body).unwrap();
         let messages = body["messages"].as_array().unwrap();
         // Leading system message plus a bounded window of history.
-        assert!(messages.len() <= jagent::provider::MAX_REQUEST_HISTORY_TURNS + 1);
+        assert_eq!(messages.len(), 40);
         assert_eq!(messages[0]["role"], "system");
         // The omission note lands in the system text with the app identity.
         let system = messages[0]["content"].as_str().unwrap();
-        assert!(system.contains("omitted"));
-        assert!(system.contains("request safety budget"));
+        assert_eq!(
+            system,
+            "system\n\n22 older conversation turn(s) were omitted by jterm's request safety \
+             budget. Do not assume access to them."
+        );
         // The retained window starts with a user turn and the oversized final
         // turn was elided, not dropped.
         assert_eq!(messages[1]["role"], "user");

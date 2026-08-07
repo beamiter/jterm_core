@@ -9,8 +9,9 @@ The crate deliberately has no GUI-toolkit dependency. Frontends own widgets,
 rendering, and event-loop integration; this crate owns byte-level protocols,
 bounds, validation, and operating-system primitives.
 
-Version 0.2 adopts jagent 0.6's explicit wire boundary. Agent snapshots are
-audited directly through their bounded decoded view, and non-streaming provider
+Version 0.2 adopts jagent 0.6's explicit wire boundary. Agent and conversation
+snapshots restore only through allocation-aware bounded decoders; their
+owning-string transcript values remain serialize-only. Non-streaming provider
 responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
 
 ## Shared surfaces
@@ -23,7 +24,9 @@ responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
 - Private atomic snapshots, command history, jsh execution journals, pane
   layouts, Git metadata, notifications, and host/Flatpak command routing.
 - Provider-neutral AI requests, bounded conversations, secret redaction, and
-  the review-first `jagent` session surface.
+  the review-first `jagent` session surface. Request construction reports any
+  omitted history, while system instructions are rejected rather than sampled
+  when they or the complete omission notice exceed jagent's 64 KiB limit.
 
 ## Security and reliability invariants
 
@@ -36,7 +39,9 @@ responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
    claims use one atomic no-replace rename: a process crash leaves either the
    public snapshot or one `.claimed-*` evidence file, never a transient extra
    hard link. Other platforms fail closed when they cannot provide that
-   primitive.
+   primitive. `try_claim_session_file` exposes every non-missing claim failure
+   as `io::Error`; the legacy best-effort wrapper logs and collapses it to a
+   vacant outcome without falling back to a separate read.
 3. Restored argv boundaries are preserved. Legacy joined command strings may
    be read for migration but are never replayed.
 4. Model output is only a proposal. Every command requires explicit user
@@ -83,6 +88,7 @@ responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+cargo test --doc
 cargo doc --no-deps
 ```
 
