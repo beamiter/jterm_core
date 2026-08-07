@@ -200,7 +200,7 @@ fn last_command_segment(snapshot: &Snapshot) -> Option<Segment> {
 }
 
 /// Render a cwd the way every jterm's bar shows it: home collapsed to `~`,
-/// and when the result is still longer than [`MAX_CWD_CHARS`], the head
+/// and when the result is still longer than `MAX_CWD_CHARS`, the head
 /// elided down to the last two components (`…/parent/leaf`). Deliberately
 /// not fish-style single-letter abbreviation: a bar is read at a glance, and
 /// `…/jterm_core/src` answers "where am I" better than `~/p/j/src`.
