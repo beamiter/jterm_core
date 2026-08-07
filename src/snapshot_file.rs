@@ -151,10 +151,10 @@ fn oversize_error(path: &Path, actual: u64, max_bytes: u64) -> io::Error {
     )
 }
 
-/// Highest number of same-millisecond quarantine attempts before giving up.
+/// Highest number of same-millisecond move-aside attempts before giving up.
 /// Matches ember's bound; a caller retrying a hundred times inside one
 /// millisecond is looping, not making progress.
-const MAX_QUARANTINE_ATTEMPTS: u32 = 100;
+const MAX_MOVE_ASIDE_ATTEMPTS: u32 = 100;
 
 /// Move a malformed snapshot aside, returning the path it now lives at.
 ///
@@ -165,23 +165,128 @@ const MAX_QUARANTINE_ATTEMPTS: u32 = 100;
 /// symlink entry itself rather than its target, so a symlink at `path` is still
 /// retired without touching what it points to.
 pub fn quarantine_corrupt(path: &Path) -> io::Result<PathBuf> {
-    move_aside(path, "corrupt")
+    move_aside_legacy(path, "corrupt")
 }
 
 /// Atomically take exclusive ownership of `path`, returning the private name
 /// the snapshot now lives at.
 ///
-/// This is the one-winner primitive behind a restore: the caller whose move
-/// succeeds is the only one that ever observes the snapshot, so two
-/// simultaneous openers cannot both restore the same session — and neither can
-/// a read that is later followed by a separate delete. The claimed file is left
-/// in place, so a caller that cannot use it keeps the evidence instead of
-/// deleting it; a caller that consumed it removes the claim itself.
+/// This is the one-winner primitive behind a restore: on supported platforms a
+/// single no-clobber rename retires the public name and creates the claim, so a
+/// process crash cannot leave a transient second hard link that makes a valid
+/// snapshot fail the reader's single-link check. A pre-existing claim name is
+/// never overwritten. Platforms without an atomic exclusive-rename primitive
+/// return [`io::ErrorKind::Unsupported`] instead of falling back to a racy
+/// check-then-rename or hard-link/unlink sequence.
+///
+/// The claimed file is left in place, so a caller that cannot use it keeps the
+/// evidence instead of deleting it; a caller that consumed it removes the
+/// claim itself.
 pub fn claim_exclusive(path: &Path) -> io::Result<PathBuf> {
-    move_aside(path, "claimed")
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    claim_exclusive_with(path, timestamp, atomic_rename_noreplace)
 }
 
-fn move_aside(path: &Path, kind: &str) -> io::Result<PathBuf> {
+fn claim_exclusive_with(
+    path: &Path,
+    timestamp_millis: u128,
+    mut rename_noreplace: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    validate_move_aside_source(path)?;
+    for attempt in 0..MAX_MOVE_ASIDE_ATTEMPTS {
+        let claimed = moved_aside_path(path, "claimed", timestamp_millis, attempt)?;
+        match rename_noreplace(path, &claimed) {
+            Ok(()) => return Ok(claimed),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique moved-aside snapshot name",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn path_cstring(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("session snapshot path contains NUL: {}", path.display()),
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn atomic_rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let from = path_cstring(from)?;
+    let to = path_cstring(to)?;
+    // SAFETY: both C strings remain live for the syscall, which retains no
+    // pointers. `renameat2` returns only after the single namespace operation
+    // either committed or failed.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("atomic no-replace rename is unavailable: {error}"),
+        ));
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let from = path_cstring(from)?;
+    let to = path_cstring(to)?;
+    // SAFETY: both C strings remain live for the call and `renamex_np` retains
+    // no pointers. RENAME_EXCL makes an existing destination an error.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("atomic no-replace rename is unavailable: {error}"),
+        ));
+    }
+    Err(error)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn atomic_rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this platform has no supported atomic no-replace rename for Agent snapshots",
+    ))
+}
+
+fn validate_move_aside_source(path: &Path) -> io::Result<()> {
     let file_type = fs::symlink_metadata(path)?.file_type();
     if !file_type.is_file() && !file_type.is_symlink() {
         return Err(io::Error::new(
@@ -189,6 +294,15 @@ fn move_aside(path: &Path, kind: &str) -> io::Result<PathBuf> {
             "refusing to move aside a non-file session snapshot path",
         ));
     }
+    Ok(())
+}
+
+fn moved_aside_path(
+    path: &Path,
+    kind: &str,
+    timestamp_millis: u128,
+    attempt: u32,
+) -> io::Result<PathBuf> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -196,15 +310,25 @@ fn move_aside(path: &Path, kind: &str) -> io::Result<PathBuf> {
             "session snapshot path has no file name",
         )
     })?;
+    let mut backup_name = file_name.to_os_string();
+    backup_name.push(move_aside_suffix(kind, timestamp_millis, attempt));
+    Ok(parent.join(backup_name))
+}
+
+/// Portable evidence-preserving fallback for ordinary corrupt snapshots.
+///
+/// Agent claims deliberately do not use this two-syscall sequence: a crash or
+/// a simultaneous contender can temporarily leave more than one hard link,
+/// which conflicts with the strict reader that immediately follows a claim.
+fn move_aside_legacy(path: &Path, kind: &str) -> io::Result<PathBuf> {
+    validate_move_aside_source(path)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
 
-    for attempt in 0..MAX_QUARANTINE_ATTEMPTS {
-        let mut backup_name = file_name.to_os_string();
-        backup_name.push(move_aside_suffix(kind, timestamp, attempt));
-        let backup = parent.join(backup_name);
+    for attempt in 0..MAX_MOVE_ASIDE_ATTEMPTS {
+        let backup = moved_aside_path(path, kind, timestamp, attempt)?;
         #[cfg(unix)]
         match fs::hard_link(path, &backup) {
             Ok(()) => match fs::remove_file(path) {
@@ -581,6 +705,140 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(fs::read(&first).unwrap(), b"first corruption");
         assert_eq!(fs::read(&second).unwrap(), b"second corruption");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn exclusive_claim_never_clobbers_a_preplanted_target_and_keeps_one_link() {
+        use std::os::unix::fs::MetadataExt;
+
+        const TIMESTAMP_MILLIS: u128 = 1_700_000_000_000;
+        let root = TestDir::new("claim-no-clobber");
+        let path = root.join("agent.json");
+        write_private_snapshot(&path, b"snapshot");
+
+        let preplanted = moved_aside_path(&path, "claimed", TIMESTAMP_MILLIS, 0).unwrap();
+        write_private_snapshot(&preplanted, b"do not overwrite");
+
+        let claimed =
+            claim_exclusive_with(&path, TIMESTAMP_MILLIS, atomic_rename_noreplace).unwrap();
+
+        assert_eq!(
+            claimed,
+            moved_aside_path(&path, "claimed", TIMESTAMP_MILLIS, 1).unwrap()
+        );
+        assert_eq!(fs::read(&preplanted).unwrap(), b"do not overwrite");
+        assert_eq!(fs::read(&claimed).unwrap(), b"snapshot");
+        assert!(!path.exists());
+        assert_eq!(fs::metadata(&claimed).unwrap().nlink(), 1);
+    }
+
+    #[test]
+    fn exclusive_claim_does_not_fallback_after_an_atomic_backend_failure() {
+        const TIMESTAMP_MILLIS: u128 = 1_700_000_000_000;
+
+        for (label, error_kind) in [
+            ("unsupported", io::ErrorKind::Unsupported),
+            ("denied", io::ErrorKind::PermissionDenied),
+        ] {
+            let root = TestDir::new(label);
+            let path = root.join("agent.json");
+            write_private_snapshot(&path, b"snapshot");
+            let calls = std::cell::Cell::new(0);
+
+            let error = claim_exclusive_with(&path, TIMESTAMP_MILLIS, |_, _| {
+                calls.set(calls.get() + 1);
+                Err(io::Error::new(error_kind, "injected atomic rename failure"))
+            })
+            .unwrap_err();
+
+            assert_eq!(error.kind(), error_kind);
+            assert_eq!(calls.get(), 1, "a hard failure must not be retried");
+            assert_eq!(fs::read(&path).unwrap(), b"snapshot");
+            assert!(
+                !moved_aside_path(&path, "claimed", TIMESTAMP_MILLIS, 0)
+                    .unwrap()
+                    .exists(),
+                "a fallback must not create a claim"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(fs::metadata(&path).unwrap().nlink(), 1);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn interruption_after_the_atomic_move_leaves_one_single_link_claim() {
+        use std::os::unix::fs::MetadataExt;
+
+        const TIMESTAMP_MILLIS: u128 = 1_700_000_000_000;
+        let root = TestDir::new("claim-interrupted");
+        let path = root.join("agent.json");
+        write_private_snapshot(&path, b"snapshot");
+        let claimed = moved_aside_path(&path, "claimed", TIMESTAMP_MILLIS, 0).unwrap();
+
+        let interrupted = std::panic::catch_unwind(|| {
+            let _ = claim_exclusive_with(&path, TIMESTAMP_MILLIS, |from, to| {
+                atomic_rename_noreplace(from, to)?;
+                panic!("injected interruption after atomic rename")
+            });
+        });
+
+        assert!(interrupted.is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&claimed).unwrap(), b"snapshot");
+        assert_eq!(fs::metadata(&claimed).unwrap().nlink(), 1);
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn completed_atomic_move_is_already_exclusive_before_the_winner_returns() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Barrier};
+
+        const TIMESTAMP_MILLIS: u128 = 1_700_000_000_000;
+        let root = TestDir::new("claim-atomic-boundary");
+        let path = root.join("agent.json");
+        write_private_snapshot(&path, b"snapshot");
+        let claimed = moved_aside_path(&path, "claimed", TIMESTAMP_MILLIS, 0).unwrap();
+        let (renamed_sender, renamed_receiver) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new(Barrier::new(2));
+
+        let winner_path = path.clone();
+        let winner_release = Arc::clone(&release);
+        let winner = std::thread::spawn(move || {
+            claim_exclusive_with(&winner_path, TIMESTAMP_MILLIS, |from, to| {
+                atomic_rename_noreplace(from, to)?;
+                renamed_sender.send(()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "test observer disappeared")
+                })?;
+                winner_release.wait();
+                Ok(())
+            })
+        });
+
+        // The winner has completed the namespace syscall but is deliberately
+        // paused before returning from the backend closure.
+        renamed_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the real atomic rename must complete promptly");
+        assert!(!path.exists());
+        assert_eq!(fs::read(&claimed).unwrap(), b"snapshot");
+        assert_eq!(fs::metadata(&claimed).unwrap().nlink(), 1);
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+
+        let loser_error = claim_exclusive_with(&path, TIMESTAMP_MILLIS, |_, _| {
+            panic!("a contender must not reach its backend after the public name is retired")
+        })
+        .unwrap_err();
+        assert_eq!(loser_error.kind(), io::ErrorKind::NotFound);
+
+        release.wait();
+        assert_eq!(winner.join().unwrap().unwrap(), claimed);
     }
 
     #[cfg(unix)]

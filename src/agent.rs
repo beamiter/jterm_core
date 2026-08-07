@@ -415,7 +415,9 @@ pub fn remove_snapshot_file(path: &std::path::Path) {
 /// Outcome of [`claim_session_file`].
 #[derive(Debug)]
 pub enum SessionClaim {
-    /// Nothing to restore: no snapshot existed, or another opener claimed it.
+    /// Nothing to restore: no snapshot existed, another opener claimed it, or
+    /// the platform could not safely claim the path. Non-missing claim errors
+    /// are logged before this outcome is returned.
     Vacant,
     /// This caller won the claim and the session was restored. The persisted
     /// snapshot has been consumed.
@@ -438,11 +440,20 @@ pub enum SessionClaim {
 /// the snapshot is moved to a private name first, so exactly one caller ever
 /// observes it, and the claim is only deleted once a session exists.
 pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
-    let Ok(claimed) = crate::snapshot_file::claim_exclusive(path) else {
-        // Missing file, lost race, or an unusable path: in every case this
-        // caller has nothing to resume and must not fall back to reading the
-        // original name.
-        return SessionClaim::Vacant;
+    let claimed = match crate::snapshot_file::claim_exclusive(path) {
+        Ok(claimed) => claimed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Missing file or a lost race: do not fall back to reading the
+            // public name after another opener may have retired it.
+            return SessionClaim::Vacant;
+        }
+        Err(error) => {
+            log::warn!(
+                "agent: could not atomically claim saved session {}: {error}",
+                path.display()
+            );
+            return SessionClaim::Vacant;
+        }
     };
     let restored =
         crate::snapshot_file::read_bounded(&claimed, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
@@ -538,6 +549,7 @@ mod tests {
         remove_snapshot_file(&path);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn claiming_a_session_has_exactly_one_winner() {
         let dir = TestDir::new("claim");
@@ -564,6 +576,126 @@ mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn simultaneous_session_claims_have_exactly_one_restored_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = TestDir::new("claim-concurrent");
+        let path = dir.0.join("agent_session.json");
+        write_snapshot_file(&path, &pending_snapshot()).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    match claim_session_file(&path) {
+                        SessionClaim::Restored(session) => {
+                            assert!(matches!(
+                                session.state(),
+                                AgentState::AwaitingApproval { .. }
+                            ));
+                            true
+                        }
+                        SessionClaim::Vacant => false,
+                        SessionClaim::Quarantined { path, error } => {
+                            panic!(
+                                "a valid concurrent claim was quarantined at {}: {error}",
+                                path.display()
+                            )
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let restored = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|restored| *restored)
+            .count();
+
+        assert_eq!(restored, 1);
+        assert!(!path.exists());
+        assert!(std::fs::read_dir(&dir.0).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_non_file_claim_failure_never_reads_or_removes_the_object() {
+        let dir = TestDir::new("claim-directory");
+        let path = dir.0.join("agent_session.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(matches!(claim_session_file(&path), SessionClaim::Vacant));
+        assert!(path.is_dir());
+        assert!(std::fs::read_dir(&path).unwrap().next().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_symlink_claim_is_quarantined_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new("claim-symlink");
+        let path = dir.0.join("agent_session.json");
+        let target = dir.0.join("outside.json");
+        std::fs::write(&target, b"outside stays intact").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let SessionClaim::Quarantined {
+            path: quarantined, ..
+        } = claim_session_file(&path)
+        else {
+            panic!("the claimed symlink must remain invalid evidence");
+        };
+
+        assert!(!path.exists());
+        assert!(std::fs::symlink_metadata(&quarantined)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside stays intact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_claim_returns_vacant_without_blocking_or_removing_it() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = TestDir::new("claim-fifo");
+        let path = dir.0.join("agent_session.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `name` is a NUL-terminated path that remains live for the call.
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        if made != 0 {
+            return;
+        }
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(matches!(
+                    claim_session_file(&worker_path),
+                    SessionClaim::Vacant
+                ))
+                .unwrap();
+        });
+
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("claiming a FIFO must not wait for a writer"));
+        worker.join().unwrap();
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn an_unusable_claim_is_quarantined_rather_than_deleted() {
         let dir = TestDir::new("quarantine");

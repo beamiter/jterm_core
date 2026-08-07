@@ -59,10 +59,14 @@ keeps non-streaming provider responses byte-oriented until their canonical gate.
   preserved — a budget records its own reason instead of surfacing as
   `InvalidJson`.
 - `src/agent.rs` gained `claim_session_file`, a one-winner claim/consume
-  primitive built on `snapshot_file::claim_exclusive`. The snapshot is moved to a
-  private name before it is read, so two simultaneous openers cannot both resume
-  it and a restore is no longer a racy read-then-remove. Evidence that cannot
-  become a session is quarantined at the claim path rather than deleted.
+  primitive built on `snapshot_file::claim_exclusive`. Linux/Android use one
+  raw `renameat2(RENAME_NOREPLACE)` syscall and macOS uses
+  `renamex_np(RENAME_EXCL)`, preserving the existing `.claimed-*` name without
+  the transient link-count and process-crash window of hard-link/unlink. A
+  pre-existing target is never overwritten; platforms without an equivalent
+  primitive fail closed. Evidence that cannot become a session is quarantined
+  at the claim path rather than deleted, while ordinary corrupt-snapshot
+  quarantine retains its portable evidence-preserving fallback.
 - `src/agent.rs::validate_snapshot` now audits jagent's bounded immutable
   snapshot accessors directly. The former `to_json` plus ordinary
   `SnapshotInspection { transcript: Vec<Turn>, .. }` decode is gone, while all
@@ -85,11 +89,17 @@ keeps non-streaming provider responses byte-oriented until their canonical gate.
 ### Consolidate the app-local claim implementations
 
 All four terminals claim Agent snapshots before production restore, but ember,
-forge, and frost still carry separate descriptor-safe implementations while
-anvil calls `claim_session_file` directly. Migrate the remaining apps to the
-shared primitive, keep their post-decode semantic audits app-owned, then decide
-whether the public read/remove pair should be deprecated so a future restore
-cannot reintroduce a two-step race.
+forge, and frost still carry separate implementations while anvil calls
+`claim_session_file` directly. Forge's dirfd/inode-bound transaction still
+enforces policy beyond core's path-based primitive. A consumer of core
+`Restored` must use that session directly, not run a second app restore/audit
+after core has already consumed the claim. Apps with policy that core does not
+cover must keep their local transactional claim (including Forge for now) until
+core exposes a pre-retire validation boundary. Then decide whether the public
+read/remove pair should be deprecated and whether claim I/O failures need a
+typed public outcome instead of the current logged `Vacant`, so a future
+restore cannot reintroduce a two-step race, lose evidence after late validation,
+or hide an unavailable platform primitive.
 
 ### Add a signed release manifest to the installer
 

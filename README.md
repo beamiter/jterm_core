@@ -32,7 +32,11 @@ responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
    atomic durable replacement, and bounded reads. Lock-using stores add
    time-bounded cross-process locks whose namespace cannot be split by
    replacing a sidecar path. FIFOs, devices, unsafe writable parents, and
-   symlink targets fail closed.
+   symlink targets fail closed. On Linux, Android, and macOS, Agent restore
+   claims use one atomic no-replace rename: a process crash leaves either the
+   public snapshot or one `.claimed-*` evidence file, never a transient extra
+   hard link. Other platforms fail closed when they cannot provide that
+   primitive.
 3. Restored argv boundaries are preserved. Legacy joined command strings may
    be read for migration but are never replayed.
 4. Model output is only a proposal. Every command requires explicit user
