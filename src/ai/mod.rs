@@ -1487,15 +1487,12 @@ fn stream_child_stdout(
             }
         }
         if !stderr_eof {
-            match drain_nonblocking(
+            stderr_eof = drain_nonblocking(
                 &mut stderr,
                 &mut stderr_bytes,
                 MAX_CURL_STDERR_BYTES,
                 CapturedStream::Stderr,
-            ) {
-                Ok(eof) => stderr_eof = eof,
-                Err(error) => return Err(error),
-            }
+            )?;
         }
         if status.is_none() {
             match child.root_has_exited() {
