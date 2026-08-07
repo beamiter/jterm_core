@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{ChildStdout, Stdio};
 #[cfg(not(unix))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -282,14 +282,10 @@ fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
 /// Run one bounded Git process. A helper drains stdout so a very dirty worktree
 /// cannot fill the pipe and deadlock before the child exits.
 fn run_git_status(cwd: &Path) -> Option<String> {
+    let deadline = Instant::now() + GIT_STATUS_TIMEOUT;
     let mut command = crate::host::helper_command_with_cwd("git", cwd).ok()?;
     harden_git_environment(&mut command);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = command
+    command
         .args([
             // A repository-local core.fsmonitor path is executable code. Use
             // a known inert hook on every supported Unix, including Git
@@ -310,19 +306,18 @@ fn run_git_status(cwd: &Path) -> Option<String> {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    let mut child = crate::supervised::SupervisedChild::spawn(&mut command).ok()?;
 
-    let stdout = child.stdout.take()?;
+    let stdout = child.take_stdout()?;
 
     #[cfg(unix)]
     {
-        collect_git_status_output(child, stdout)
+        collect_git_status_output(child, stdout, deadline)
     }
     #[cfg(not(unix))]
     {
-        collect_git_status_output_portable(child, stdout)
+        collect_git_status_output_portable(child, stdout, deadline)
     }
 }
 
@@ -337,7 +332,11 @@ fn harden_git_environment(command: &mut std::process::Command) {
 }
 
 #[cfg(unix)]
-fn collect_git_status_output(mut child: Child, mut stdout: ChildStdout) -> Option<String> {
+fn collect_git_status_output(
+    mut child: crate::supervised::SupervisedChild,
+    mut stdout: ChildStdout,
+    deadline: Instant,
+) -> Option<String> {
     use std::os::fd::AsRawFd;
 
     // Keep stdout in the same bounded polling loop as the child. A Git hook or
@@ -349,67 +348,70 @@ fn collect_git_status_output(mut child: Child, mut stdout: ChildStdout) -> Optio
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
     {
-        terminate_child(&mut child);
         return None;
     }
 
-    let started = Instant::now();
-    let mut status = None;
+    let mut root_exited = false;
     let mut eof = false;
     let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 16 * 1024];
 
     loop {
-        loop {
-            match stdout.read(&mut buffer) {
-                Ok(0) => {
-                    eof = true;
-                    break;
-                }
-                Ok(read) => {
-                    if bytes.len().saturating_add(read) > MAX_GIT_STATUS_OUTPUT_BYTES as usize {
-                        terminate_child(&mut child);
-                        return None;
-                    }
-                    bytes.extend_from_slice(&buffer[..read]);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    terminate_child(&mut child);
-                    return None;
-                }
-            }
+        if !eof {
+            eof = drain_git_stdout(&mut stdout, &mut bytes)?;
         }
 
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit)) => status = Some(exit),
-                Ok(None) => {}
-                Err(_) => {
-                    terminate_child(&mut child);
-                    return None;
+        if !root_exited {
+            let exited = child.root_has_exited().ok()?;
+            if exited {
+                // The root can exit between the read above returning
+                // WouldBlock and waitid observing it. Drain once more while
+                // its zombie still reserves the group: only a different
+                // process can keep the pipe open after this point.
+                if !eof {
+                    eof = drain_git_stdout(&mut stdout, &mut bytes)?;
                 }
+                root_exited = true;
             }
         }
-        if eof {
-            if let Some(status) = status {
-                return status
-                    .success()
-                    .then(|| String::from_utf8(bytes).ok())
-                    .flatten();
-            }
+        if eof && root_exited {
+            let status = child.reap_after_group_kill().ok()?;
+            return status
+                .success()
+                .then(|| String::from_utf8(bytes).ok())
+                .flatten();
         }
-        if started.elapsed() >= GIT_STATUS_TIMEOUT {
-            terminate_child(&mut child);
+        if Instant::now() >= deadline {
             return None;
         }
         thread::sleep(GIT_WAIT_POLL);
     }
 }
 
+#[cfg(unix)]
+fn drain_git_stdout(stdout: &mut ChildStdout, bytes: &mut Vec<u8>) -> Option<bool> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => return Some(true),
+            Ok(read) => {
+                if bytes.len().saturating_add(read) > MAX_GIT_STATUS_OUTPUT_BYTES as usize {
+                    return None;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Some(false),
+            Err(_) => return None,
+        }
+    }
+}
+
 #[cfg(not(unix))]
-fn collect_git_status_output_portable(mut child: Child, stdout: ChildStdout) -> Option<String> {
+fn collect_git_status_output_portable(
+    mut child: crate::supervised::SupervisedChild,
+    stdout: ChildStdout,
+    deadline: Instant,
+) -> Option<String> {
     // Portable std does not expose a nonblocking pipe descriptor or a process
     // group kill. Permit at most one reader that has not reached EOF: if a
     // detached descendant inherits stdout, later probes fail closed instead
@@ -418,7 +420,6 @@ fn collect_git_status_output_portable(mut child: Child, stdout: ChildStdout) -> 
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        terminate_child(&mut child);
         return None;
     }
     let (output_tx, output_rx) = mpsc::sync_channel(1);
@@ -430,22 +431,18 @@ fn collect_git_status_output_portable(mut child: Child, stdout: ChildStdout) -> 
         });
     if reader.is_err() {
         PORTABLE_READER_ACTIVE.store(false, Ordering::Release);
-        terminate_child(&mut child);
         return None;
     }
 
-    let started = Instant::now();
     let mut status = None;
     let mut output = None;
     loop {
         match output_rx.try_recv() {
             Ok(Some(captured)) => output = Some(captured),
             Ok(None) => {
-                terminate_child(&mut child);
                 return None;
             }
             Err(mpsc::TryRecvError::Disconnected) if output.is_none() => {
-                terminate_child(&mut child);
                 return None;
             }
             Err(mpsc::TryRecvError::Disconnected) => {}
@@ -453,20 +450,15 @@ fn collect_git_status_output_portable(mut child: Child, stdout: ChildStdout) -> 
         }
 
         if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit)) => status = Some(exit),
-                Ok(None) => {}
-                Err(_) => {
-                    terminate_child(&mut child);
-                    return None;
-                }
+            let exited = child.root_has_exited().ok()?;
+            if exited {
+                status = Some(child.reap_after_group_kill().ok()?);
             }
         }
         if let (Some(status), Some(output)) = (status.as_ref(), output.as_ref()) {
             return status.success().then(|| output.clone());
         }
-        if started.elapsed() >= GIT_STATUS_TIMEOUT {
-            terminate_child(&mut child);
+        if Instant::now() >= deadline {
             // Deliberately do not join: a detached descendant may still own
             // the pipe. The active guard keeps that leak bounded to one.
             return None;
@@ -486,21 +478,6 @@ fn read_bounded_status_output(reader: impl Read) -> Option<String> {
         return None;
     }
     String::from_utf8(bytes).ok()
-}
-
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let process_group = child.id() as i32;
-        if process_group > 0 {
-            // SAFETY: run_git_status places this child in a fresh process
-            // group whose id is the child pid. A negative target reaches any
-            // descendant that inherited stdout and kept the pipe open.
-            let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Format a RepoMeta into the compact status-strip text.
@@ -724,21 +701,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_collector_does_not_wait_for_background_pipe_holder() {
-        use std::os::unix::process::CommandExt;
-
         let mut command = std::process::Command::new("sh");
         command
             .args(["-c", "sleep 5 &"])
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = command.spawn().unwrap();
-        let stdout = child.stdout.take().unwrap();
+        let mut child = crate::supervised::SupervisedChild::spawn(&mut command).unwrap();
+        let pid = child.id() as i32;
+        let stdout = child.take_stdout().unwrap();
         let started = Instant::now();
 
-        assert!(collect_git_status_output(child, stdout).is_none());
+        assert!(
+            collect_git_status_output(child, stdout, Instant::now() + GIT_STATUS_TIMEOUT).is_none()
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
+        let mut status = 0;
+        // SAFETY: status is writable and the collector owned this exact child.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]

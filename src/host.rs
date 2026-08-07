@@ -347,58 +347,17 @@ pub(crate) fn command_status_with_timeout(
     mut command: Command,
     timeout: Duration,
 ) -> io::Result<Option<ExitStatus>> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // A group whose id is the child pid gives timeout cleanup a stable,
-        // owned descendant target. This is performed in the child before exec.
-        command.process_group(0);
-    }
-    let mut child = command.spawn()?;
-    let started = Instant::now();
+    let deadline = Instant::now() + timeout;
+    let mut child = crate::supervised::SupervisedChild::spawn(&mut command)?;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(Some(status)),
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Ok(None) => {
-                terminate_child_group(child);
-                return Ok(None);
-            }
-            Err(error) => {
-                terminate_child_group(child);
-                return Err(error);
-            }
+        if child.root_has_exited()? {
+            return child.reap_after_group_kill().map(Some);
         }
-    }
-}
-
-fn terminate_child_group(mut child: std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pid = i32::try_from(child.id()).unwrap_or(i32::MAX);
-        if pid > 0 {
-            // SAFETY: the command was placed in a fresh process group whose id
-            // is its child pid; a negative id addresses exactly that group.
-            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if Instant::now() >= deadline {
+            child.reap_after_group_kill()?;
+            return Ok(None);
         }
-    }
-    let _ = child.kill();
-    let deadline = Instant::now() + Duration::from_millis(50);
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-        }
-    }
-    if let Err(error) = std::thread::Builder::new()
-        .name("jterm-host-child-reaper".to_string())
-        .spawn(move || {
-            let _ = child.wait();
-        })
-    {
-        log::warn!("failed to start host-probe reaper: {error}");
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -961,9 +920,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_status_kills_a_descendant_holding_the_process_alive() {
+        let root = TestDir::new("bounded-status-reap");
+        let pid_file = root.0.join("root.pid");
         let mut command = Command::new("sh");
         command
-            .args(["-c", "sleep 5 & wait"])
+            .args([
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("printf '%s' \"$$\" > \"$1\"; sleep 5 & wait"),
+                std::ffi::OsStr::new("jterm-host-test"),
+                pid_file.as_os_str(),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -974,6 +940,20 @@ mod tests {
                 .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let mut status = 0;
+        // SAFETY: status is writable and the bounded runner owned this child.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]

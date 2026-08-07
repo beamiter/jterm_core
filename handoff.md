@@ -12,6 +12,19 @@ keeps non-streaming provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/supervised.rs` now owns every short-lived core helper used by host
+  probes, Git metadata, the jsh update check, and blocking or streaming AI
+  transport. On Unix it keeps the root waitable with `waitid(..., WNOWAIT)`,
+  clears the fresh process group before consuming the root status, and
+  synchronously reaps on success, timeout, cancellation, output overflow, and
+  early-return paths. The first group signal permanently disarms the guard, so
+  an `ECHILD` or a second cleanup cannot target a recycled PGID; host, Git, jsh,
+  and AI each carry one absolute deadline across spawn and collection.
+  Auto-reaping `SIGCHLD` dispositions are rejected; a benign custom handler is
+  allowed, but no external waiter may consume a supervised child's status.
+  After a logical deadline the final synchronous kernel wait can still exceed
+  wall time for a task stuck in uninterruptible sleep.
+
 - `src/block_contract.rs` establishes the renderer- and serialization-free
   completed-block outcome shared by all four terminals. `classify_completed`
   gives an absent/blank frontend-resolved command precedence as `Background`,

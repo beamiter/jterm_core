@@ -47,11 +47,16 @@ responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
    a save cannot redirect the commit. Shared writable parents require sticky
    semantics and temporary names include OS entropy.
 8. Git metadata subprocess output, queues, cache entries, waiters, branch
-   labels, and lifetime are bounded; process-group cleanup handles descendants
-   that retain stdout, and repository-configured hooks/FSMonitor programs are
-   disabled. Notebook splitting rejects oversized input and fence storms, and
-   Pango rendering exposes control/invisible/bidirectional formatting instead
-   of displaying a reordered review surface.
+   labels, and lifetime are bounded. Short-lived helpers are supervised under
+   one absolute deadline; on Unix their root remains waitable until the fresh
+   process group is cleared and is then synchronously reaped, including when a
+   descendant retains a pipe. This ownership requires a waitable `SIGCHLD`
+   disposition and no external waiter for that exact child; the final kernel
+   wait after a logical deadline may exceed wall time for uninterruptible I/O.
+   Repository-configured hooks/FSMonitor programs are disabled. Notebook
+   splitting rejects oversized input and fence storms, and Pango rendering
+   exposes control/invisible/bidirectional formatting instead of displaying a
+   reordered review surface.
 9. Review-only text uses one shared visual-spoof predicate (non-ASCII spacing,
    bidi, zero-width, and default-ignorable formatting). Prompt insertion,
    restored argv, history metadata, shell-quoted paths, and theme names fail

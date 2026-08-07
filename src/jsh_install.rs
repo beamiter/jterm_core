@@ -21,7 +21,7 @@
 use std::io::{self, Read};
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -296,31 +296,33 @@ fn bounded_command_stdout(
     command: &mut std::process::Command,
     max_bytes: u64,
 ) -> io::Result<Vec<u8>> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-
-    // The installer may spawn curl/wget. A dedicated group lets timeout and
-    // oversize paths terminate the whole local tree rather than only `sh`.
-    command.process_group(0);
-    let mut child = command.spawn()?;
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_check_process(&mut child);
+    let deadline = Instant::now() + CHECK_PROCESS_TIMEOUT;
+    let mut child = crate::supervised::SupervisedChild::spawn(command)?;
+    let Some(stdout) = child.take_stdout() else {
         return Err(io::Error::other("jsh installer check stdout was not piped"));
     };
+    collect_bounded_command_stdout(child, stdout, max_bytes, deadline)
+}
+
+fn collect_bounded_command_stdout(
+    mut child: crate::supervised::SupervisedChild,
+    mut stdout: std::process::ChildStdout,
+    max_bytes: u64,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+
     let descriptor = stdout.as_raw_fd();
     // SAFETY: fcntl only reads/updates flags on the live pipe descriptor.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
     {
-        terminate_check_process(&mut child);
         return Err(io::Error::last_os_error());
     }
 
     let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024) as usize);
     let mut buffer = [0_u8; 8 * 1024];
-    let started = Instant::now();
-    let mut status = None;
-    let mut exited_at = None;
+    let mut root_exited_at = None;
     let mut eof = false;
     loop {
         loop {
@@ -331,7 +333,6 @@ fn bounded_command_stdout(
                 }
                 Ok(count) => {
                     if bytes.len().saturating_add(count) > max_bytes as usize {
-                        terminate_check_process(&mut child);
                         return Err(io::Error::new(
                             io::ErrorKind::FileTooLarge,
                             "jsh installer check output is too large",
@@ -341,39 +342,52 @@ fn bounded_command_stdout(
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => {
-                    terminate_check_process(&mut child);
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit)) => {
-                    status = Some(exit);
-                    exited_at = Some(Instant::now());
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    terminate_check_process(&mut child);
-                    return Err(error);
+        if root_exited_at.is_none() && child.root_has_exited()? {
+            // Close the race where the root exits after the read above
+            // returned WouldBlock. With the root now known dead, another
+            // nonblocking drain distinguishes ordinary EOF from an
+            // inherited writer before the group is cleared and reaped.
+            if !eof {
+                loop {
+                    match stdout.read(&mut buffer) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(count) => {
+                            if bytes.len().saturating_add(count) > max_bytes as usize {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::FileTooLarge,
+                                    "jsh installer check output is too large",
+                                ));
+                            }
+                            bytes.extend_from_slice(&buffer[..count]);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
+                    }
                 }
             }
+            root_exited_at = Some(Instant::now());
         }
-        if eof && status.is_some() {
+        if eof && root_exited_at.is_some() {
+            child.reap_after_group_kill()?;
             // A non-zero exit still carries the installer's structured error
             // body, so callers parse bytes independently of status.
             return Ok(bytes);
         }
-        if exited_at.is_some_and(|exited| exited.elapsed() >= CHECK_PIPE_CLOSE_GRACE) {
-            terminate_check_process(&mut child);
+        if root_exited_at.is_some_and(|exited| exited.elapsed() >= CHECK_PIPE_CLOSE_GRACE) {
+            child.reap_after_group_kill()?;
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "jsh installer exited while a descendant kept stdout open",
             ));
         }
-        if started.elapsed() >= CHECK_PROCESS_TIMEOUT {
-            terminate_check_process(&mut child);
+        if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "jsh installer check timed out",
@@ -381,17 +395,6 @@ fn bounded_command_stdout(
         }
         thread::sleep(CHECK_POLL_INTERVAL);
     }
-}
-
-fn terminate_check_process(child: &mut Child) {
-    let process_group = child.id() as i32;
-    if process_group > 0 {
-        // SAFETY: bounded_command_stdout places the child in a fresh process
-        // group; a negative target reaches local descendants such as curl.
-        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Ask the installer what is installed and what is published. Blocking: call it
@@ -538,37 +541,54 @@ mod tests {
 
     #[test]
     fn installer_check_stdout_is_bounded_before_json_parsing() {
-        let mut exact = std::process::Command::new("sh");
-        exact
-            .args(["-c", "printf test"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        assert_eq!(bounded_command_stdout(&mut exact, 4).unwrap(), b"test");
+        fn run(script: &str, max_bytes: u64) -> (io::Result<Vec<u8>>, i32) {
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", script])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let mut child = crate::supervised::SupervisedChild::spawn(&mut command).unwrap();
+            let pid = child.id() as i32;
+            let stdout = child.take_stdout().unwrap();
+            (
+                collect_bounded_command_stdout(
+                    child,
+                    stdout,
+                    max_bytes,
+                    Instant::now() + CHECK_PROCESS_TIMEOUT,
+                ),
+                pid,
+            )
+        }
 
-        let mut oversized = std::process::Command::new("sh");
-        oversized
-            .args(["-c", "printf tests"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        assert_eq!(
-            bounded_command_stdout(&mut oversized, 4)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::FileTooLarge
-        );
+        fn assert_reaped(pid: i32) {
+            let mut status = 0;
+            // SAFETY: status is writable and the collector owned this child.
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
 
-        let mut inherited_pipe = std::process::Command::new("sh");
-        inherited_pipe
-            .args(["-c", "sleep 5 &"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        let (exact, exact_pid) = run("printf test", 4);
+        assert_eq!(exact.unwrap(), b"test");
+        assert_reaped(exact_pid);
+
+        let (oversized, oversized_pid) = run("printf tests", 4);
+        assert_eq!(oversized.unwrap_err().kind(), io::ErrorKind::FileTooLarge);
+        assert_reaped(oversized_pid);
+
         let started = Instant::now();
+        let (inherited_pipe, inherited_pid) = run("sleep 5 &", 4);
         assert_eq!(
-            bounded_command_stdout(&mut inherited_pipe, 4)
-                .unwrap_err()
-                .kind(),
+            inherited_pipe.unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
+        assert_reaped(inherited_pid);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
