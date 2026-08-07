@@ -1997,7 +1997,14 @@ mod lifecycle_tests {
             use std::os::unix::process::CommandExt;
 
             let mut command = Command::new("sh");
-            command.args(["-c", "sleep 30 & wait"]);
+            // Keep the leader alive independently of the background member.
+            // With `sleep 30 & wait`, killing the member can wake `wait` and
+            // let the shell exit before the direct SIGKILL reaches it, making
+            // the test observe a normal/137 exit even though the session was
+            // drained correctly. `exec` leaves one stable leader and one
+            // background member, so both halves of the invariant are
+            // deterministic.
+            command.args(["-c", "sleep 30 & exec sleep 30"]);
             // SAFETY: setsid is async-signal-safe and the closure performs no
             // allocation or other work after Command forks.
             unsafe {
