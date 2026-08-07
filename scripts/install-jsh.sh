@@ -1,7 +1,7 @@
 #!/bin/sh
 # vendored from https://github.com/beamiter/jsh -> scripts/install-jsh.sh
-# Keep this copy in sync with that file; every jterm embeds it with
-# include_str! so a machine without jsh can still bootstrap one.
+# Keep this copy in sync with upstream commit fd605616b56bd73265a3a6141c814938aa2859f9;
+# every jterm embeds it with include_str! so a machine without jsh can bootstrap one.
 # Install or update jsh for the current user.
 #
 #   curl -fsSL https://github.com/beamiter/jsh/releases/latest/download/install-jsh.sh | sh
@@ -823,8 +823,9 @@ if [ "${channel}" = "release" ]; then
     tar -C "${tmp_dir}" -xzf "${tmp_dir}/${archive}" "${member}" \
         || die "cannot unpack ${member} from ${archive}"
     unpacked="${tmp_dir}/${member}"
-    [ -f "${unpacked}" ] && [ ! -L "${unpacked}" ] \
-        || die "${archive} does not contain a regular ${member}"
+    if [ ! -f "${unpacked}" ] || [ -L "${unpacked}" ]; then
+        die "${archive} does not contain a regular ${member}"
+    fi
     [ "$(file_size "${unpacked}")" -le "${MAX_ARCHIVE_BYTES}" ] \
         || die "${member} exceeds its ${MAX_ARCHIVE_BYTES}-byte limit"
     mv "${unpacked}" "${staged}"
@@ -1010,12 +1011,14 @@ mv -f "${incoming}" "${dest}" || {
 if [ "$(jsh_version_of "${dest}")" != "${version}" ]; then
     if [ -n "${backup}" ] && [ -f "${backup}" ]; then
         if restoring="$(mktemp "${dest_dir}/.jsh.rollback.XXXXXX" 2> /dev/null)"; then
-            cat < "${backup}" > "${restoring}" \
+            if cat < "${backup}" > "${restoring}" \
                 && chmod 0755 "${restoring}" \
-                && mv -f "${restoring}" "${dest}" \
-                || rm -f "${restoring}"
+                && mv -f "${restoring}" "${dest}"; then
+                die "the installed binary failed its self-check; restored ${installed_version}"
+            fi
+            rm -f "${restoring}" 2> /dev/null || :
         fi
-        die "the installed binary failed its self-check; restored ${installed_version}"
+        die "the installed binary failed its self-check; rollback failed; previous binary kept at ${backup}"
     fi
     die "the installed binary failed its self-check at ${dest}"
 fi

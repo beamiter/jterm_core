@@ -1,7 +1,7 @@
 #!/bin/sh
 # vendored from https://github.com/beamiter/jsh -> scripts/jsh-remote.sh
-# Keep this copy in sync with that file; every jterm embeds it with
-# include_str! so a remote host can get a jsh without one being installed.
+# Keep this copy in sync with upstream commit fd605616b56bd73265a3a6141c814938aa2859f9;
+# every jterm embeds it with include_str! so a remote host can get jsh without one installed.
 # Run jsh on a machine that does not have jsh installed.
 #
 #   jsh-remote.sh build-box
@@ -44,6 +44,11 @@
 #     replaces the shell that would have carried the trap. The local side tears
 #     down when the transport returns, and any sandbox orphaned by a crash is
 #     swept by the next connection.
+
+# The large single-quoted strings below are programs for the destination shell.
+# Local expansion would cross the trust boundary and run them with the wrong
+# environment, so each payload carries a narrow SC2016 annotation where it is
+# constructed.
 
 set -eu
 
@@ -133,7 +138,11 @@ USAGE
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'jsh-remote: %s\n' "$*" >&2; }
-note() { [ "${verbose}" -eq 1 ] && printf 'jsh-remote: %s\n' "$*" >&2 || :; }
+note() {
+    if [ "${verbose}" -eq 1 ]; then
+        printf 'jsh-remote: %s\n' "$*" >&2 || :
+    fi
+}
 die() {
     printf 'jsh-remote: %s\n' "$*" >&2
     exit 1
@@ -381,6 +390,7 @@ remote_exec() {
 
 # --- teardown ----------------------------------------------------------------
 
+# shellcheck disable=SC2016 # Expanded by the destination shell.
 CLEANUP_SCRIPT='
 set -u
 d="$1"
@@ -448,6 +458,7 @@ trap 'cleanup; exit 130' HUP INT TERM
 # there. Pure POSIX sh with no external tools beyond uname/id, so a busybox-only
 # image answers it too.
 
+# shellcheck disable=SC2016 # Expanded by the destination shell.
 PROBE_SCRIPT='
 set -u
 want_mode="$1"
@@ -741,6 +752,7 @@ if [ "${dry_run}" -eq 1 ]; then
     exit 0
 fi
 
+# shellcheck disable=SC2016 # Expanded by the destination shell.
 PREPARE_SCRIPT='
 set -u
 execdir="$1"
@@ -824,6 +836,7 @@ printf "cached=0\n"
 # Shell integration for a bash that has never heard of jsh. Read once by
 # --rcfile and deleted with the sandbox; nothing is installed, and the
 # destination's own ~/.bashrc still runs first so aliases and prompt survive.
+# shellcheck disable=SC2016 # Expanded by the destination shell.
 INTEGRATION_RC='# jsh remote shell integration (temporary; removed on exit)
 case $- in *i*) ;; *) return 0 ;; esac
 if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
@@ -889,6 +902,7 @@ start_integration_session() {
 
     note "starting ${remote_bash} with shell integration on ${destination}"
     set +e
+    # shellcheck disable=SC2016 # Expanded by the destination shell.
     remote_exec 'printf "%s\n" "$$" > "$1/pid" 2>/dev/null || :
 JSH_REMOTE_SANDBOX="$1"
 export JSH_REMOTE_SANDBOX
@@ -971,6 +985,7 @@ esac
 
 # --- step 7: push ------------------------------------------------------------
 
+# shellcheck disable=SC2016 # Expanded by the destination shell.
 VERIFY_SCRIPT='
 set -u
 incoming="$1"
@@ -1045,6 +1060,7 @@ fi
 
 # --- step 9: the session -----------------------------------------------------
 
+# shellcheck disable=SC2016 # Expanded by the destination shell.
 SESSION_SCRIPT='
 set -u
 sandbox="$1"
