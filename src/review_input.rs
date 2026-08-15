@@ -73,8 +73,62 @@ pub fn contains_noncontrol_visual_spoofing(text: &str) -> bool {
         .any(|ch| !ch.is_control() && is_visual_spoofing_character(ch))
 }
 
+/// Render untrusted text for one display line without letting controls, bidi
+/// marks, or default-ignorable characters alter the surrounding UI. The
+/// returned value is always valid UTF-8 and never exceeds `max_bytes`.
+pub fn safe_inline_display(text: &str, max_bytes: usize) -> String {
+    safe_display(text, max_bytes, false)
+}
+
+/// Display a command or document fragment while preserving only structural
+/// newline/tab controls. All other terminal and visual formatting controls are
+/// made explicit as replacement glyphs.
+pub fn safe_multiline_display(text: &str, max_bytes: usize) -> String {
+    safe_display(text, max_bytes, true)
+}
+
+fn safe_display(text: &str, max_bytes: usize, multiline: bool) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let mut output = String::with_capacity(text.len().min(max_bytes));
+    let mut truncated = false;
+    for ch in text.chars() {
+        let rendered = if multiline && matches!(ch, '\n' | '\t') {
+            ch
+        } else if ch.is_control() || is_visual_spoofing_character(ch) {
+            '\u{fffd}'
+        } else {
+            ch
+        };
+        if output.len().saturating_add(rendered.len_utf8()) > max_bytes {
+            truncated = true;
+            break;
+        }
+        output.push(rendered);
+    }
+    if truncated && max_bytes >= '…'.len_utf8() {
+        while output.len().saturating_add('…'.len_utf8()) > max_bytes {
+            if output.pop().is_none() {
+                break;
+            }
+        }
+        output.push('…');
+    }
+    output
+}
+
 /// Whether one Unicode scalar is unsafe in text whose displayed spelling is a
 /// security boundary. Prefer [`contains_visual_spoofing`] for whole strings.
+///
+/// Two ranges are kept wider than Unicode's current default-ignorable
+/// assignments: the unassigned specials `FFF0..=FFF8` and the entire
+/// supplementary tag plane `E0000..=E0FFF` (rather than the enumerated tag
+/// characters). A future format assignment inside a reserved range must fail
+/// closed without waiting for a release, while the assigned interlinear
+/// annotation anchors (`FFF9..=FFFB`) and Egyptian layout controls
+/// (`U+13430` onward) stay allowed because Unicode does not classify them as
+/// default-ignorable.
 pub fn is_visual_spoofing_character(ch: char) -> bool {
     (ch.is_whitespace() && ch != ' ')
         || matches!(
@@ -97,11 +151,10 @@ pub fn is_visual_spoofing_character(ch: char) -> bool {
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
             | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fff8}'
             | '\u{1bca0}'..='\u{1bca3}'
             | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0001}'
-            | '\u{e0020}'..='\u{e007f}'
-            | '\u{e0100}'..='\u{e01ef}'
+            | '\u{e0000}'..='\u{e0fff}'
         )
 }
 
@@ -151,10 +204,36 @@ mod tests {
             "echo safe\u{2066}hidden",
             "echo emoji\u{fe0f}",
             "echo tag\u{e0020}hidden",
+            "echo reserved\u{fff0}mark",
+            "echo tag\u{e0080}mark",
             "echo safe\u{feff}hidden",
         ] {
             assert_eq!(validate(unsafe_text), Err(ReviewInputError::VisualSpoof));
         }
+    }
+
+    /// Reserved ranges fail closed so a future format assignment needs no
+    /// release lag, while assigned layout and annotation controls Unicode
+    /// keeps outside Default_Ignorable_Code_Point stay allowed.
+    #[test]
+    fn reserved_ranges_fail_closed_while_assigned_layout_controls_stay_allowed() {
+        assert!(!is_visual_spoofing_character('\u{fff9}'));
+        assert!(!is_visual_spoofing_character('\u{13430}'));
+    }
+
+    #[test]
+    fn display_text_is_bounded_and_makes_terminal_metadata_unambiguous() {
+        assert_eq!(
+            safe_inline_display("safe\n\u{202e}\u{fe0f}name", 64),
+            "safe\u{fffd}\u{fffd}\u{fffd}name"
+        );
+        assert_eq!(
+            safe_multiline_display("safe\n\t\u{202e}\u{fff0}\u{e01f0}name", 64),
+            "safe\n\t\u{fffd}\u{fffd}\u{fffd}name"
+        );
+        assert_eq!(safe_inline_display("abcdefgh", 6), "abc…");
+        assert!(safe_inline_display(&"界".repeat(100), 32).len() <= 32);
+        assert!(safe_inline_display("abc", 0).is_empty());
     }
 
     #[test]

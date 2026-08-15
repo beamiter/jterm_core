@@ -291,7 +291,7 @@ pub fn request_history(session_id: String) -> Result<HistoryLoad, HistoryRequest
         });
         return Ok(HistoryLoad { receiver });
     }
-    if !enabled() {
+    if !output_capture_enabled() {
         let _ = reply.try_send(HistorySnapshot {
             session_id,
             records: Vec::new(),
@@ -315,7 +315,7 @@ pub fn request_history(session_id: String) -> Result<HistoryLoad, HistoryRequest
 /// remains represented by jsh's start/finish events, while memory stays
 /// bounded even if the state directory is on a stalled filesystem.
 pub fn submit(completed: CompletedExecution) -> Result<(), SubmitError> {
-    if !enabled() {
+    if !output_capture_enabled() {
         return Ok(());
     }
     let Some(event) = OutputEvent::from_completed(completed) else {
@@ -334,7 +334,7 @@ pub fn submit(completed: CompletedExecution) -> Result<(), SubmitError> {
 /// Used during orderly application shutdown; normal terminal frames never
 /// block on the journal.
 pub fn flush(timeout: std::time::Duration) -> bool {
-    if !enabled() {
+    if !output_capture_enabled() {
         return true;
     }
     let Some(Some(writer)) = WRITER.get() else {
@@ -353,7 +353,13 @@ pub fn flush(timeout: std::time::Duration) -> bool {
         .is_ok()
 }
 
-fn enabled() -> bool {
+/// Whether a terminal output producer has a journal consumer to serve.
+///
+/// Callers which hold output lazily use this capability before constructing a
+/// snapshot. `submit` repeats the check at the queue boundary because the
+/// environment can change between the two calls (and because direct callers
+/// must remain safe on their own).
+pub fn output_capture_enabled() -> bool {
     std::env::var("JSH_EXECUTION_JOURNAL")
         .ok()
         .map(|value| {

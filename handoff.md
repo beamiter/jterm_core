@@ -13,6 +13,26 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- Three forge-only additions are upstreamed so forge can delete its diverged
+  local copies. `review_input::is_visual_spoofing_character` now keeps the
+  unassigned specials `FFF0..=FFF8` and the entire supplementary tag plane
+  `E0000..=E0FFF` whole instead of the enumerated tags, so future format
+  assignments fail closed without a release lag (interlinear annotation
+  anchors and Egyptian layout controls stay allowed). The same module gains
+  the public display sanitizers `safe_inline_display` and
+  `safe_multiline_display`, which replace controls and spoofing characters
+  with U+FFFD (the multiline form preserves `\n`/`\t`) and truncate to
+  `max_bytes` on a char boundary with a `…` marker. `pty_input` gains
+  `AdmittedInput` and `admitted_input`, the single-pass editor-semantics
+  classifier for sanitized outgoing chunks: framing markers only set/clear the
+  frame state and are omitted from `editor_bytes`, CR/LF outside a frame
+  submits the line (a CRLF/LFCR pair consumed silently), and bytes after a
+  real submission (except 0x03/0x04) mark `input_after_submission`;
+  `taints_editor` keeps the prompt fail-closed on framing-only writes.
+  `execution_journal`'s private `enabled()` is promoted to the public
+  `output_capture_enabled`, with `submit`, `flush`, and history loading
+  calling it directly.
+
 - `src/notify.rs` now sends through the `src/helper.rs` boundary instead of
   the older `host::helper_command` plus `host::command_status_with_timeout`
   route, retiring the second, differently-hardened notification path.
