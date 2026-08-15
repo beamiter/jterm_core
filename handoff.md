@@ -13,6 +13,13 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/link.rs` sinks the family's single opener policy: `is_openable_url`
+  admits only an absolute HTTP(S) URL (case-insensitive scheme) with a
+  non-empty, userinfo-free authority, at most `MAX_OPENABLE_URL_BYTES` (2 KiB),
+  and no whitespace, control, backslash, or visually ambiguous characters.
+  frost's `link::is_openable_url` and ember's
+  `terminal::is_supported_hyperlink_uri` were equivalent copies; both now
+  delegate here, and the spoof check rides on `review_input`.
 - `src/helper.rs` sinks the trusted-helper boundary ember and frost carried as
   near-identical local copies: `TrustedHelper` resolves a named helper from
   fixed absolute system candidates through `trusted_system_executable`
