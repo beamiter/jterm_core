@@ -13,6 +13,13 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/command_history.rs` gains `prepare_path`, the pre-flight frost carried
+  locally as `prepare_command_history_path` while the old pin opened history
+  unsafely: the immediate parent must be owned by this user and never
+  group/other writable (stricter than the append path's sticky-namespace
+  allowance), a missing parent is created 0700 for writers only, and existing
+  history/lock entries are descriptor-checked under `O_NOFOLLOW`/`O_NONBLOCK`
+  with writers tightening a lax mode to 0600 and readers rejecting it.
 - `src/link.rs` sinks the family's single opener policy: `is_openable_url`
   admits only an absolute HTTP(S) URL (case-insensitive scheme) with a
   non-empty, userinfo-free authority, at most `MAX_OPENABLE_URL_BYTES` (2 KiB),

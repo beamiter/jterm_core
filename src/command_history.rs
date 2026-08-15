@@ -278,6 +278,168 @@ fn open_history_for_read(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Validate the configured command-history path before the first read or
+/// write of a session.
+///
+/// The immediate parent must be a directory owned by this user and not
+/// writable by group or other — stricter than the append path's own check,
+/// which also admits a root-owned sticky shared namespace, because a
+/// configured history location is application state, not a spool. A missing
+/// parent is created private (0700) for a writer and left alone for a
+/// reader. Existing history and lock entries are descriptor-checked without
+/// following links or blocking on FIFOs; a writer tightens a lax mode to
+/// 0600 while a reader rejects it.
+pub fn prepare_path(path: &Path, for_write: bool) -> io::Result<()> {
+    validate_history_path(path)?;
+    let parent = history_parent(path);
+    match fs::symlink_metadata(parent) {
+        Ok(_) => drop(open_owned_history_parent(parent)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && for_write => {
+            create_private_history_parent(parent)?;
+            drop(open_owned_history_parent(parent)?);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    prepare_optional_entry(path, for_write)?;
+    prepare_optional_entry(&lock_path_for(path)?, for_write)
+}
+
+#[cfg(unix)]
+fn open_owned_history_parent(parent: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let directory = options.open(parent)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "command-history parent {} is not a directory",
+                parent.display()
+            ),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "command-history parent {} is not owned by the current user",
+                parent.display()
+            ),
+        ));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "command-history parent {} must not be group- or world-writable",
+                parent.display()
+            ),
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_owned_history_parent(parent: &Path) -> io::Result<File> {
+    if fs::metadata(parent)?.is_dir() {
+        fs::File::open(parent)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "command-history parent {} is not a directory",
+                parent.display()
+            ),
+        ))
+    }
+}
+
+fn create_private_history_parent(parent: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let directory = options.open(parent)?;
+        let metadata = directory.metadata()?;
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "command-history parent {} is not a private directory we own",
+                    parent.display()
+                ),
+            ));
+        }
+        use std::os::unix::fs::PermissionsExt;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(parent)
+    }
+}
+
+fn prepare_optional_entry(path: &Path, for_write: bool) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(for_write);
+    harden_open_options(&mut options);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular history file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be owned by the current user and have exactly one hard link",
+                    path.display()
+                ),
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            if for_write {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} must not be group- or world-writable", path.display()),
+                ));
+            }
+        } else if for_write && mode & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     // SAFETY: `file` owns a live descriptor for this call. flock retains no
@@ -1519,6 +1681,117 @@ mod tests {
             assert!(commands.insert(record.command));
         }
         assert_eq!(commands.len(), WORKERS * RECORDS_PER_WORKER);
+        cleanup(&path);
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "jterm-command-history-{name}-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        directory
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_creates_a_private_parent_and_tightens_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("preflight-create");
+        let parent = root.join("state");
+        let path = parent.join("history.jsonl");
+
+        prepare_path(&path, true).unwrap();
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let lock = lock_path_for(&path).unwrap();
+        fs::write(&path, b"history\n").unwrap();
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(prepare_path(&path, false).is_err());
+
+        prepare_path(&path, true).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_links_and_fifos_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = temp_root("preflight-unsafe");
+        let victim = root.join("victim.jsonl");
+        fs::write(&victim, b"victim\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let symlink_path = root.join("symlink.jsonl");
+        symlink(&victim, &symlink_path).unwrap();
+        assert!(prepare_path(&symlink_path, false).is_err());
+        assert!(prepare_path(&symlink_path, true).is_err());
+
+        let hard_link_path = root.join("hard-link.jsonl");
+        fs::hard_link(&victim, &hard_link_path).unwrap();
+        assert!(prepare_path(&hard_link_path, false).is_err());
+        assert!(prepare_path(&hard_link_path, true).is_err());
+
+        let fifo_path = root.join("fifo.jsonl");
+        let encoded = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: encoded is a live NUL-terminated pathname for this call.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(prepare_path(&fifo_path, false).is_err());
+        assert!(prepare_path(&fifo_path, true).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let safe_history = root.join("safe.jsonl");
+        let unsafe_lock = lock_path_for(&safe_history).unwrap();
+        symlink(&victim, &unsafe_lock).unwrap();
+        assert!(prepare_path(&safe_history, true).is_err());
+        assert!(!safe_history.exists());
+        assert_eq!(fs::read(&victim).unwrap(), b"victim\n");
+        cleanup(&safe_history);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_a_writable_parent_without_chmodding_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("preflight-writable-parent");
+        let parent = root.join("shared");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let path = parent.join("history.jsonl");
+
+        assert!(prepare_path(&path, false).is_err());
+        assert!(prepare_path(&path, true).is_err());
+        assert!(!path.exists());
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
         cleanup(&path);
     }
 }
