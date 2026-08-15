@@ -13,6 +13,18 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/helper.rs` sinks the trusted-helper boundary ember and frost carried as
+  near-identical local copies: `TrustedHelper` resolves a named helper from
+  fixed absolute system candidates through `trusted_system_executable`
+  (canonical target, every ancestor root- or self-owned, never group/other
+  writable, a non-root user's own writable component refused), and `run`
+  executes it with the child PATH clamped to `/usr/bin:/bin`.
+  `bounded_command_output` captures stdout and stderr concurrently under
+  independent byte caps and one absolute deadline on top of
+  `supervised::SupervisedChild`, so the WNOWAIT exit observation, whole-group
+  SIGKILL, and synchronous reap share the one audited implementation. The
+  family's `fc_list`, `fc_match`, and `notify_send` entry points carry the
+  previously duplicated caps and deadlines.
 - `src/supervised.rs` is now public API: `SupervisedChild` is the opaque
   helper-process runner the frontends migrate onto (forge's trusted-helper,
   Git-metadata, jsh-installer, and command-correction runners, plus anvil's

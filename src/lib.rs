@@ -17,6 +17,7 @@ pub mod command_history;
 pub mod execution_journal;
 pub mod exit_status;
 pub mod git_meta;
+pub mod helper;
 pub mod host;
 pub mod identity;
 pub mod jsh_install;
