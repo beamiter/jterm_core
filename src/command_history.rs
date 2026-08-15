@@ -1263,10 +1263,32 @@ mod tests {
         contents.extend_from_slice(b"\n{\"command\":\"newer\",\"exit_code\":0}\n");
         write_test_history(&path, &contents);
         let recent = read_recent_with_status(&path, 10).unwrap();
-        assert_eq!(recent.records.len(), 1);
+        assert_eq!(
+            recent
+                .records
+                .iter()
+                .map(|record| record.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer"]
+        );
         assert!(
             recent.tail_truncated,
             "a file larger than the tail window must report skipped older bytes"
+        );
+        cleanup(&path);
+
+        // Boundary: a file exactly the tail-window size is read in full, so
+        // nothing was skipped and the flag stays clear.
+        let path = temp_path("read-status-boundary");
+        let suffix = b"\n{\"command\":\"newer\",\"exit_code\":0}\n";
+        let mut contents = vec![b'x'; READ_RECENT_TAIL_BYTES as usize - suffix.len()];
+        contents.extend_from_slice(suffix);
+        write_test_history(&path, &contents);
+        let recent = read_recent_with_status(&path, 10).unwrap();
+        assert_eq!(recent.records.len(), 1);
+        assert!(
+            !recent.tail_truncated,
+            "a file exactly at the tail-window size skips nothing"
         );
         cleanup(&path);
     }
