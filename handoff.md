@@ -13,6 +13,24 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/parser.rs` is unified with forge's stricter terminal parser, retiring
+  core's lenient control-string recovery. APC, DCS, PM/SOS, and every
+  oversized discard state now terminate on ST only (BEL stays payload or a
+  discarded byte), while OSC and OscDiscard keep accepting BEL per xterm
+  convention. An ESC followed by a non-ST byte inside any control string
+  aborts the partial string without emitting its payload — an aborted OSC 133
+  can no longer forge prompt marks — and the ESC + final byte is reinterpreted
+  as a fresh sequence through one shared `reprocess_escape_final!` path. RIS
+  (`ESC c`, including when it aborts a control string) and a strict all-digit
+  `CSI 3 J` (never `?3J`, `3;0J`, `3:0J`, or `3 J`) are pre-feed coalescing
+  barriers: pending bytes flush, the `HardReset`/`EraseScrollback` event
+  fires, and the raw sequence follows as its own immediate `Bytes` event;
+  RIS also resets the parser's private-mode snooping (bracketed paste, mouse
+  mode/encoding, focus events). OSC 7771 surfaces
+  `ParserEvent::AgentIntegrationReady` only for an exact 32-hex-digit token
+  and never passes through to VTE. SOS (`ESC X`) joins PM (`ESC ^`) in the
+  discard-until-ST `Ignore` state.
+
 - Three forge-only additions are upstreamed so forge can delete its diverged
   local copies. `review_input::is_visual_spoofing_character` now keeps the
   unassigned specials `FFF0..=FFF8` and the entire supplementary tag plane

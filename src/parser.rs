@@ -92,6 +92,9 @@ pub enum ParserEvent {
     /// startup. The UI stores it on the tab's RemoteConn so subsequent
     /// reconnects pass `--session <id>` and jsh restores cwd/env/aliases.
     RemoteSessionId(String),
+    /// OSC 7771 — the bundled local shell integration consumed its private
+    /// one-shot token fd and is ready to correlate Agent executions.
+    AgentIntegrationReady(String),
     /// CSI ? 47/1047/1049 h — alt screen entered (vim, less, etc.).
     /// Carries the exact DEC private mode so VTE receives matching semantics.
     AltScreenEnter(u32),
@@ -131,6 +134,13 @@ pub enum ParserEvent {
     /// OSC 110/111/112 — the app reset a dynamic color back to the default.
     /// Bytes also pass through; the caller drops its tracked dynamic value.
     ColorReset(ColorKind),
+    /// `CSI 3 J` / `CSI 03 J` — xterm erase-scrollback. Emitted immediately
+    /// before the complete sequence is passed through as [`Self::Bytes`], so
+    /// callers can invalidate row authority using the pre-feed ring mapping.
+    EraseScrollback,
+    /// RIS (`ESC c`) — hard terminal reset. Like [`Self::EraseScrollback`],
+    /// this is a byte-coalescing barrier emitted before the raw sequence.
+    HardReset,
 }
 
 /// Longest accepted OSC 10/11/12 color spec. X11 names and rgb: forms are
@@ -153,11 +163,12 @@ enum State {
     OscDiscard,
     /// Saw ESC while discarding an oversized OSC; '\' completes ST.
     OscDiscardEsc,
-    /// Inside APC (ESC _): collecting bytes for Kitty graphics etc.
+    /// Inside APC (ESC _): collecting bytes for Kitty graphics etc. APC is a
+    /// control string and is terminated only by ST, never by BEL.
     Apc { buf: Vec<u8> },
     /// Saw ESC while in APC — next byte should be '\' for ST
     ApcEsc { payload: Vec<u8> },
-    /// APC exceeded its hard payload limit. Ignore bytes until BEL or ST.
+    /// APC exceeded its hard payload limit. Ignore bytes until ST.
     ApcDiscard,
     /// Saw ESC while discarding an oversized APC; '\' completes ST.
     ApcDiscardEsc,
@@ -167,13 +178,13 @@ enum State {
     Dcs { buf: Vec<u8> },
     /// Saw ESC while in DCS — next byte should be '\' for ST.
     DcsEsc { payload: Vec<u8> },
-    /// DCS exceeded its hard payload limit. Ignore bytes until BEL or ST.
+    /// DCS exceeded its hard payload limit. Ignore bytes until ST.
     DcsDiscard,
     /// Saw ESC while discarding an oversized DCS; '\' completes ST.
     DcsDiscardEsc,
-    /// Inside PM (ESC ^) — consume until ST and discard.
+    /// Inside PM (ESC ^) or SOS (ESC X) — consume until ST and discard.
     Ignore,
-    /// Saw ESC while in PM — consume the ST final byte too.
+    /// Saw ESC while in PM/SOS — consume the ST final byte too.
     IgnoreEsc,
 }
 
@@ -247,6 +258,20 @@ fn alt_screen_mode(params: &[u8]) -> Option<u32> {
         b"?1049" => Some(1049),
         _ => None,
     }
+}
+
+/// True only for the ordinary (non-private, no-intermediate) ED parameter
+/// whose numeric value is 3. Extra parameter fields are deliberately rejected:
+/// the lifecycle side effect must not fire for a malformed/lookalike CSI that
+/// VTE may interpret differently.
+fn is_erase_scrollback(params: &[u8]) -> bool {
+    !params.is_empty()
+        && params.iter().all(u8::is_ascii_digit)
+        && params.iter().fold(0_u32, |value, digit| {
+            value
+                .saturating_mul(10)
+                .saturating_add(u32::from(*digit - b'0'))
+        }) == 3
 }
 
 fn is_mouse_reporting_mode(params: &[u8]) -> bool {
@@ -400,6 +425,45 @@ impl Parser {
             };
         }
 
+        macro_rules! hard_reset {
+            () => {{
+                flush!();
+                self.bracketed_paste = false;
+                self.mouse_mode = MouseMode::None;
+                self.mouse_encoding = MouseEncoding::Default;
+                self.focus_events = false;
+                events.push(ParserEvent::HardReset);
+                // RIS itself is an immediate feed boundary. Keeping it in a
+                // dedicated Bytes event prevents a later query/DECSET in the
+                // same PTY read from being coalesced across the reset hook.
+                events.push(ParserEvent::Bytes(b"\x1bc".to_vec()));
+                self.state = State::Ground;
+            }};
+        }
+
+        /// Abort an incomplete control string at its non-ST ESC sequence and
+        /// reinterpret the escape introducer plus final byte from scratch.
+        /// Keeping this in one local helper avoids subtly different recovery
+        /// rules between OSC, APC, DCS, and their oversized discard states.
+        macro_rules! reprocess_escape_final {
+            ($byte:expr) => {{
+                match $byte {
+                    0x1b => self.state = State::Esc,
+                    b'[' => self.state = State::Csi { buf: Vec::new() },
+                    b']' => self.state = State::Osc { buf: Vec::new() },
+                    b'_' => self.state = State::Apc { buf: Vec::new() },
+                    b'P' => self.state = State::Dcs { buf: Vec::new() },
+                    b'^' | b'X' => self.state = State::Ignore,
+                    b'c' => hard_reset!(),
+                    byte => {
+                        self.passthrough.push(0x1b);
+                        self.passthrough.push(byte);
+                        self.state = State::Ground;
+                    }
+                }
+            }};
+        }
+
         // Ground-state fast-path: bulk-copy runs of bytes until the next ESC.
         // The previous per-byte loop dominated cost on heavy text streams; ESC
         // is the only byte that exits Ground, so memchr lets us hop directly
@@ -446,8 +510,14 @@ impl Parser {
                     b'P' => {
                         self.state = State::Dcs { buf: Vec::new() };
                     }
-                    b'^' => {
+                    // PM (`ESC ^`) and SOS (`ESC X`) are control strings whose
+                    // payload is ignored through ST. Treat both alike here;
+                    // their ESC + non-ST recovery is handled below.
+                    b'^' | b'X' => {
                         self.state = State::Ignore;
+                    }
+                    b'c' => {
+                        hard_reset!();
                     }
                     _ => {
                         self.passthrough.push(0x1b);
@@ -473,6 +543,18 @@ impl Parser {
                                 });
                             }
                         }
+                        let erase_scrollback = b == b'J' && is_erase_scrollback(&params);
+                        if erase_scrollback {
+                            flush!();
+                            events.push(ParserEvent::EraseScrollback);
+                            // Like RIS, ED3 must reach VTE before any suffix
+                            // event from this same feed is dispatched.
+                            let mut sequence = Vec::with_capacity(params.len() + 3);
+                            sequence.extend_from_slice(b"\x1b[");
+                            sequence.extend_from_slice(&params);
+                            sequence.push(b);
+                            events.push(ParserEvent::Bytes(sequence));
+                        }
                         if let (b'h', Some(mode)) = (b, alt_mode) {
                             // Recognized alt-screen enter: drop the sequence bytes
                             // (never passed through) and emit the exact DEC mode.
@@ -491,7 +573,7 @@ impl Parser {
                             && is_focus_reporting_mode(&params)
                         {
                             // Drop: keep VTE out of focus reporting mode.
-                        } else {
+                        } else if !erase_scrollback {
                             // Detect terminal-capability handshakes whose response
                             // the active VTE would write back through its own PTY
                             // (which is not connected). The caller synthesizes a
@@ -593,12 +675,18 @@ impl Parser {
                 },
 
                 State::OscEsc { payload } => {
-                    let payload = std::mem::take(payload);
-                    self.state = State::Ground;
-                    flush!();
-                    handle_osc(&payload, events);
-                    if b != b'\\' {
-                        self.passthrough.push(b);
+                    if b == b'\\' {
+                        let payload = std::mem::take(payload);
+                        self.state = State::Ground;
+                        flush!();
+                        handle_osc(&payload, events);
+                    } else {
+                        // ESC followed by a non-ST byte aborts the incomplete
+                        // OSC. Do not accept its payload (especially OSC 133),
+                        // and reinterpret this ESC + byte as a fresh escape
+                        // sequence. The byte is processed inline so RIS and
+                        // suffix semantic events keep exact stream order.
+                        reprocess_escape_final!(b);
                     }
                 }
 
@@ -609,20 +697,14 @@ impl Parser {
                 },
 
                 State::OscDiscardEsc => {
-                    self.state = match b {
-                        b'\\' | 0x07 => State::Ground,
-                        0x1b => State::OscDiscardEsc,
-                        _ => State::OscDiscard,
-                    };
+                    if b == b'\\' {
+                        self.state = State::Ground;
+                    } else {
+                        reprocess_escape_final!(b);
+                    }
                 }
 
                 State::Apc { buf } => match b {
-                    0x07 => {
-                        let payload = std::mem::take(buf);
-                        self.state = State::Ground;
-                        flush!();
-                        events.push(ParserEvent::ApcSequence(payload));
-                    }
                     0x1b => {
                         let payload = std::mem::take(buf);
                         self.state = State::ApcEsc { payload };
@@ -638,38 +720,31 @@ impl Parser {
                 },
 
                 State::ApcEsc { payload } => {
-                    let payload = std::mem::take(payload);
-                    self.state = State::Ground;
                     if b == b'\\' {
+                        let payload = std::mem::take(payload);
+                        self.state = State::Ground;
                         flush!();
                         events.push(ParserEvent::ApcSequence(payload));
                     } else {
-                        flush!();
-                        events.push(ParserEvent::ApcSequence(payload));
-                        self.passthrough.push(b);
+                        reprocess_escape_final!(b);
                     }
                 }
 
-                State::ApcDiscard => match b {
-                    0x07 => self.state = State::Ground,
-                    0x1b => self.state = State::ApcDiscardEsc,
-                    _ => {}
-                },
+                State::ApcDiscard => {
+                    if b == 0x1b {
+                        self.state = State::ApcDiscardEsc;
+                    }
+                }
 
                 State::ApcDiscardEsc => {
-                    self.state = match b {
-                        b'\\' | 0x07 => State::Ground,
-                        0x1b => State::ApcDiscardEsc,
-                        _ => State::ApcDiscard,
-                    };
+                    if b == b'\\' {
+                        self.state = State::Ground;
+                    } else {
+                        reprocess_escape_final!(b);
+                    }
                 }
 
                 State::Dcs { buf } => match b {
-                    0x07 => {
-                        let payload = std::mem::take(buf);
-                        self.state = State::Ground;
-                        emit_dcs_passthrough(&payload, &mut self.passthrough);
-                    }
                     0x1b => {
                         let payload = std::mem::take(buf);
                         self.state = State::DcsEsc { payload };
@@ -685,41 +760,40 @@ impl Parser {
                 },
 
                 State::DcsEsc { payload } => {
-                    let payload = std::mem::take(payload);
-                    self.state = State::Ground;
-                    emit_dcs_passthrough(&payload, &mut self.passthrough);
                     if b == b'\\' {
-                        // Consumed the ST terminator.
+                        let payload = std::mem::take(payload);
+                        self.state = State::Ground;
+                        emit_dcs_passthrough(&payload, &mut self.passthrough);
                     } else {
-                        self.passthrough.push(b);
+                        reprocess_escape_final!(b);
                     }
                 }
 
-                State::DcsDiscard => match b {
-                    0x07 => self.state = State::Ground,
-                    0x1b => self.state = State::DcsDiscardEsc,
-                    _ => {}
-                },
+                State::DcsDiscard => {
+                    if b == 0x1b {
+                        self.state = State::DcsDiscardEsc;
+                    }
+                }
 
                 State::DcsDiscardEsc => {
-                    self.state = match b {
-                        b'\\' | 0x07 => State::Ground,
-                        0x1b => State::DcsDiscardEsc,
-                        _ => State::DcsDiscard,
-                    };
+                    if b == b'\\' {
+                        self.state = State::Ground;
+                    } else {
+                        reprocess_escape_final!(b);
+                    }
                 }
 
                 State::Ignore => {
-                    if b == 0x07 {
-                        self.state = State::Ground;
-                    } else if b == 0x1b {
+                    if b == 0x1b {
                         self.state = State::IgnoreEsc;
                     }
                 }
 
                 State::IgnoreEsc => {
-                    if b != 0x1b {
+                    if b == b'\\' {
                         self.state = State::Ground;
+                    } else {
+                        reprocess_escape_final!(b);
                     }
                 }
             }
@@ -900,6 +974,16 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         let id = rest;
         if valid_remote_session_id(id) {
             events.push(ParserEvent::RemoteSessionId(id.to_string()));
+        }
+        return;
+    }
+
+    // OSC 7771 ; <32-hex-token> — local Forge shell integration readiness.
+    // The token came from a one-shot inherited fd rather than argv/env. Keep
+    // this packet out of VTE and let the pane compare it with its private copy.
+    if let Some(token) = s.strip_prefix("7771;") {
+        if token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            events.push(ParserEvent::AgentIntegrationReady(token.to_string()));
         }
         return;
     }
@@ -1165,6 +1249,238 @@ mod tests {
     }
 
     #[test]
+    fn ed3_and_ris_are_pre_feed_coalescing_barriers() {
+        for (sequence, semantic) in [
+            (b"\x1b[3J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\x1b[03J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\x1bc".as_slice(), ParserEvent::HardReset),
+        ] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            let mut input = b"before".to_vec();
+            input.extend_from_slice(sequence);
+            input.extend_from_slice(b"after");
+            parser.feed(&input, &mut events);
+            assert_eq!(events[0], ParserEvent::Bytes(b"before".to_vec()));
+            assert_eq!(events[1], semantic);
+            assert_eq!(events[2], ParserEvent::Bytes(sequence.to_vec()));
+            assert_eq!(events[3], ParserEvent::Bytes(b"after".to_vec()));
+            assert_eq!(collect_bytes(&events), input);
+        }
+    }
+
+    #[test]
+    fn reset_boundaries_survive_every_byte_split_and_ignore_lookalikes() {
+        for sequence in [b"\x1b[3J".as_slice(), b"\x1b[03J", b"\x1bc"] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            for byte in sequence {
+                parser.feed(std::slice::from_ref(byte), &mut events);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        ParserEvent::EraseScrollback | ParserEvent::HardReset
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(collect_bytes(&events), sequence);
+        }
+
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        // Exercise unrelated ED lookalikes and the discarded PM/SOS strings
+        // one byte at a time. PM/SOS only end at ST, so BEL stays inert. ESC c
+        // is intentionally covered by the abort-and-reprocess tests below.
+        for byte in b"\x1b[2J\x1b[?3J\x1b[3;0J\x1b[3:0J\x1b[3 J\x1b[3K\x1b]0;inside [3J\x07\x1b^inside \x07 still inside\x1b\\\x1bXinside \x07 still inside\x1b\\"
+        {
+            parser.feed(std::slice::from_ref(byte), &mut events);
+        }
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::EraseScrollback | ParserEvent::HardReset)));
+    }
+
+    #[test]
+    fn reset_raw_bytes_are_an_immediate_barrier_before_suffix_semantics() {
+        for (reset, semantic) in [
+            (b"\x1bc".as_slice(), ParserEvent::HardReset),
+            (b"\x1b[3J".as_slice(), ParserEvent::EraseScrollback),
+        ] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            let mut input = b"prefix".to_vec();
+            input.extend_from_slice(reset);
+            input.extend_from_slice(b"\x1b[c\x1b[?2004htext");
+            parser.feed(&input, &mut events);
+
+            assert_eq!(events[0], ParserEvent::Bytes(b"prefix".to_vec()));
+            assert_eq!(events[1], semantic);
+            assert_eq!(events[2], ParserEvent::Bytes(reset.to_vec()));
+            assert_eq!(
+                events[3],
+                ParserEvent::KeyboardProtocolQuery(KeyboardProtocolQuery::PrimaryDeviceAttributes)
+            );
+            assert_eq!(
+                events[4],
+                ParserEvent::DecsetMode {
+                    mode: 2004,
+                    set: true
+                }
+            );
+            assert_eq!(
+                collect_bytes(&events),
+                [b"prefix".as_slice(), reset, b"\x1b[c\x1b[?2004htext"].concat()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_control_strings_abort_and_reprocess_escape_sequence() {
+        for prefix in [
+            b"\x1b]133;A".as_slice(),
+            b"\x1b_Ga=T;AAAA".as_slice(),
+            b"\x1bPqpayload".as_slice(),
+            b"\x1b^private-message".as_slice(),
+            b"\x1bXsos-payload".as_slice(),
+        ] {
+            for split in 0..=prefix.len() + 2 {
+                let mut parser = Parser::new();
+                let mut events = Vec::new();
+                let mut input = prefix.to_vec();
+                input.extend_from_slice(b"\x1bc\x1b[c");
+
+                let split = split.min(input.len());
+                parser.feed(&input[..split], &mut events);
+                for byte in &input[split..] {
+                    parser.feed(std::slice::from_ref(byte), &mut events);
+                }
+
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, ParserEvent::HardReset))
+                        .count(),
+                    1,
+                    "prefix={prefix:?}, split={split}, events={events:?}"
+                );
+                assert!(events.iter().all(|event| !matches!(
+                    event,
+                    ParserEvent::PromptStart | ParserEvent::ApcSequence(_)
+                )));
+                let reset = events
+                    .iter()
+                    .position(|event| matches!(event, ParserEvent::HardReset))
+                    .unwrap();
+                assert_eq!(events[reset + 1], ParserEvent::Bytes(b"\x1bc".to_vec()));
+                assert!(matches!(
+                    events[reset + 2],
+                    ParserEvent::KeyboardProtocolQuery(
+                        KeyboardProtocolQuery::PrimaryDeviceAttributes
+                    )
+                ));
+                assert_eq!(collect_bytes(&events), b"\x1bc\x1b[c");
+            }
+        }
+    }
+
+    #[test]
+    fn doubled_escape_in_control_string_keeps_second_escape_as_ris_introducer() {
+        for prefix in [
+            b"\x1b]133;A".as_slice(),
+            b"\x1b_Ga=T;AAAA".as_slice(),
+            b"\x1bPqpayload".as_slice(),
+            b"\x1b^private".as_slice(),
+        ] {
+            let input = [prefix, b"\x1b\x1bc\x1b[c".as_slice()].concat();
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            for byte in &input {
+                parser.feed(std::slice::from_ref(byte), &mut events);
+            }
+
+            assert!(events.iter().all(|event| !matches!(
+                event,
+                ParserEvent::PromptStart | ParserEvent::ApcSequence(_)
+            )));
+            let reset = events
+                .iter()
+                .position(|event| matches!(event, ParserEvent::HardReset))
+                .unwrap();
+            assert_eq!(events[reset + 1], ParserEvent::Bytes(b"\x1bc".to_vec()));
+            assert!(matches!(
+                events[reset + 2],
+                ParserEvent::KeyboardProtocolQuery(KeyboardProtocolQuery::PrimaryDeviceAttributes)
+            ));
+            assert_eq!(collect_bytes(&events), b"\x1bc\x1b[c");
+        }
+    }
+
+    #[test]
+    fn pm_sos_non_st_escape_aborts_before_a_real_ris() {
+        for prefix in [b"\x1b^private".as_slice(), b"\x1bXsos".as_slice()] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            let input = [prefix, b"\x1bq".as_slice(), b"suffix\x1bc".as_slice()].concat();
+            for byte in &input {
+                parser.feed(std::slice::from_ref(byte), &mut events);
+            }
+
+            assert_eq!(events.first(), Some(&ParserEvent::Bytes(b"\x1bq".to_vec())));
+            assert_eq!(
+                events
+                    .iter()
+                    .position(|event| matches!(event, ParserEvent::HardReset)),
+                Some(events.len() - 2)
+            );
+            assert_eq!(events.last(), Some(&ParserEvent::Bytes(b"\x1bc".to_vec())));
+            assert_eq!(collect_bytes(&events), b"\x1bqsuffix\x1bc");
+        }
+    }
+
+    #[test]
+    fn bel_terminates_only_osc_not_apc_or_dcs() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b]133;A\x07", &mut events);
+        assert!(matches!(&events[..], [ParserEvent::PromptStart]));
+
+        events.clear();
+        parser.feed(b"\x1b_Ga=T;A\x07B", &mut events);
+        assert!(events.is_empty());
+        parser.feed(b"\x1b\\", &mut events);
+        assert_eq!(events, [ParserEvent::ApcSequence(b"Ga=T;A\x07B".to_vec())]);
+
+        events.clear();
+        parser.feed(b"\x1bPqA\x07B", &mut events);
+        assert!(events.is_empty());
+        parser.feed(b"\x1b\\", &mut events);
+        assert_eq!(collect_bytes(&events), b"\x1bPqA\x07B\x1b\\");
+    }
+
+    #[test]
+    fn ris_resets_parser_private_mode_snooping() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b[?2004;1003;1006;1004h", &mut events);
+        assert!(parser.bracketed_paste());
+        assert_eq!(parser.mouse_mode(), MouseMode::AnyEvent);
+        assert_eq!(parser.mouse_encoding(), MouseEncoding::Sgr);
+        assert!(parser.focus_events());
+
+        events.clear();
+        parser.feed(b"\x1bc", &mut events);
+        assert!(!parser.bracketed_paste());
+        assert_eq!(parser.mouse_mode(), MouseMode::None);
+        assert_eq!(parser.mouse_encoding(), MouseEncoding::Default);
+        assert!(!parser.focus_events());
+        assert_eq!(events[0], ParserEvent::HardReset);
+    }
+
+    #[test]
     fn oversized_osc_is_discarded_and_recovers_from_split_st() {
         let mut parser = Parser::new();
         let mut events = Vec::new();
@@ -1180,12 +1496,13 @@ mod tests {
 
         parser.feed(b"\x1b", &mut events);
         assert!(matches!(parser.state, State::OscDiscardEsc));
-        parser.feed(b"Xstill-hidden\x1b", &mut events);
-        assert!(matches!(parser.state, State::OscDiscardEsc));
-        parser.feed(b"\\visible", &mut events);
+        // A non-ST escape aborts the oversized string and is reinterpreted as
+        // a new ESC sequence. `ESC X` starts SOS, so use a harmless escape
+        // final here before checking ordinary text becomes visible again.
+        parser.feed(b"qvisible", &mut events);
 
         assert!(matches!(parser.state, State::Ground));
-        assert_eq!(collect_bytes(&events), b"visible");
+        assert_eq!(collect_bytes(&events), b"\x1bqvisible");
     }
 
     #[test]
@@ -1296,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_apc_is_discarded_and_recovers_at_bel() {
+    fn oversized_apc_is_discarded_and_recovers_at_st() {
         let mut parser = Parser::new();
         let mut events = Vec::new();
         parser.feed(b"\x1b_Ga=T;", &mut events);
@@ -1309,7 +1626,9 @@ mod tests {
         assert!(events.is_empty());
         assert!(matches!(parser.state, State::ApcDiscard));
 
-        parser.feed(b"\x07visible", &mut events);
+        parser.feed(b"\x07still-hidden", &mut events);
+        assert!(matches!(parser.state, State::ApcDiscard));
+        parser.feed(b"\x1b\\visible", &mut events);
         assert!(matches!(parser.state, State::Ground));
         assert_eq!(collect_bytes(&events), b"visible");
         assert!(events
@@ -1494,6 +1813,26 @@ mod tests {
                 meta: CommandMeta::default(),
             }
         );
+    }
+
+    #[test]
+    fn private_agent_integration_ready_marker_is_strict_and_hidden() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            only_event(format!("\x1b]7771;{token}\x07").as_bytes()),
+            ParserEvent::AgentIntegrationReady(token.to_string())
+        );
+
+        for invalid in [
+            "short",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            parser.feed(format!("\x1b]7771;{invalid}\x07").as_bytes(), &mut events);
+            assert!(events.is_empty(), "accepted invalid token {invalid:?}");
+        }
     }
 
     fn only_event(bytes: &[u8]) -> ParserEvent {
