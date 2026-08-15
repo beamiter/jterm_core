@@ -949,14 +949,34 @@ fn read_recent_from<R: Read + Seek>(
     Ok(records)
 }
 
+/// Recent history plus whether the bounded tail window skipped older bytes.
+pub struct RecentHistory {
+    pub records: Vec<CommandHistoryRecord>,
+    /// True when older bytes existed outside the synchronous 4 MiB tail
+    /// window. Consumers must not describe a short result as the complete
+    /// history then.
+    pub tail_truncated: bool,
+}
+
+/// Read newest-first from a bounded tail window, deduplicating commands while
+/// retaining newest metadata and reporting whether older bytes were skipped.
+/// Corrupt, oversized, incomplete, and unsafe review-only records are ignored.
+pub fn read_recent_with_status(path: &Path, max_entries: usize) -> io::Result<RecentHistory> {
+    validate_history_path(path)?;
+    let mut input = open_history_for_read(path)?;
+    let file_len = input.metadata()?.len();
+    let records = read_recent_from(&mut input, file_len, max_entries)?;
+    Ok(RecentHistory {
+        records,
+        tail_truncated: file_len > READ_RECENT_TAIL_BYTES,
+    })
+}
+
 /// Read newest-first from a bounded tail window, deduplicating commands while
 /// retaining newest metadata. Corrupt, oversized, incomplete, and unsafe
 /// review-only records are ignored.
 pub fn read_recent(path: &Path, max_entries: usize) -> io::Result<Vec<CommandHistoryRecord>> {
-    validate_history_path(path)?;
-    let mut input = open_history_for_read(path)?;
-    let file_len = input.metadata()?.len();
-    read_recent_from(&mut input, file_len, max_entries)
+    read_recent_with_status(path, max_entries).map(|recent| recent.records)
 }
 
 #[cfg(test)]
@@ -1224,6 +1244,31 @@ mod tests {
             input.bytes_read,
             READ_RECENT_TAIL_BYTES
         );
+    }
+
+    #[test]
+    fn read_recent_with_status_reports_a_skipped_older_prefix() {
+        let path = temp_path("read-status");
+        write_test_history(
+            &path,
+            "{\"command\":\"one\",\"exit_code\":0}\n{\"command\":\"two\",\"exit_code\":1}\n",
+        );
+        let recent = read_recent_with_status(&path, 10).unwrap();
+        assert_eq!(recent.records.len(), 2);
+        assert!(!recent.tail_truncated);
+        cleanup(&path);
+
+        let path = temp_path("read-status-big");
+        let mut contents = vec![b'x'; READ_RECENT_TAIL_BYTES as usize + 64 * 1024];
+        contents.extend_from_slice(b"\n{\"command\":\"newer\",\"exit_code\":0}\n");
+        write_test_history(&path, &contents);
+        let recent = read_recent_with_status(&path, 10).unwrap();
+        assert_eq!(recent.records.len(), 1);
+        assert!(
+            recent.tail_truncated,
+            "a file larger than the tail window must report skipped older bytes"
+        );
+        cleanup(&path);
     }
 
     #[test]

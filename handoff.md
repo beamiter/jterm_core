@@ -13,6 +13,12 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/command_history.rs` gains `read_recent_with_status`, upstreamed from
+  forge's local copy: the same bounded newest-first tail read plus a
+  `tail_truncated` flag for the case where older bytes fell outside the 4 MiB
+  window, so consumers never describe a short result as the complete history.
+  `read_recent` is now a compatibility wrapper over it.
+
 - `src/bounded_json.rs` holds the two schema-independent pieces of the
   RawValue bounded-decoder pattern ember and frost both carry in their
   session persistence: `TextBudget` (one cumulative checked-sub text budget
