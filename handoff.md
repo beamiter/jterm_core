@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-15
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -12,6 +12,24 @@ closes the same owning-string bypass for core AI turns, and keeps non-streaming
 provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
+
+- `src/supervised.rs` is now public API: `SupervisedChild` is the opaque
+  helper-process runner the frontends migrate onto (forge's trusted-helper,
+  Git-metadata, jsh-installer, and command-correction runners, plus anvil's
+  command-correction runner). The struct keeps its `Child` private — callers
+  take standard streams, observe the root with `root_has_exited`, and finish
+  with `reap_after_group_kill`; `spawn` rejects auto-reaping SIGCHLD
+  dispositions with `Unsupported`. Test-only helpers stay crate-private.
+- `src/snapshot_file.rs` gains `read_bounded_private`, the 0600-or-nothing
+  reader anvil and forge previously carried as local copies for organism
+  memory: on Unix it rejects any group/other permission bits (any owner-only
+  mode is accepted) on the same open descriptor that is read, then shares the
+  bounded-read body with `read_bounded` through `read_bounded_file`.
+- `src/atomic_file.rs::temp_file_name` is public so frontends can assert their
+  snapshot-directory scans never read back an in-flight temp name without
+  copying the formula.
+
+## Previously completed
 
 - `src/supervised.rs` now owns every short-lived core helper used by host
   probes, Git metadata, the jsh update check, and blocking or streaming AI

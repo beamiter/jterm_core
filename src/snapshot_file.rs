@@ -119,6 +119,43 @@ fn open_regular(path: &Path) -> io::Result<File> {
 /// declared.
 pub fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
     let file = open_regular(path)?;
+    read_bounded_file(path, file, max_bytes)
+}
+
+/// Read a bounded snapshot whose contents include private local metadata.
+///
+/// [`read_bounded`] rejects files writable by other users, which is enough for
+/// integrity. Some snapshots (for example the apps' organism memory) also
+/// contain absolute repository paths, so on Unix their loaders require the
+/// stronger confidentiality invariant: no group/other permission bits at all
+/// (any owner-only mode is accepted, not just `0600`). The check is made on
+/// the same descriptor that is read, avoiding a path-based check/open race.
+/// Platforms without Unix permission bits apply only the [`read_bounded`]
+/// integrity checks.
+pub fn read_bounded_private(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let file = open_regular(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = file.metadata()?;
+        // open_regular already checked ownership and link count; retain the
+        // explicit owner assertion here so this stronger contract stays true
+        // if the shared helper's policy ever changes.
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private snapshot grants access to group or other users",
+            ));
+        }
+    }
+    read_bounded_file(path, file, max_bytes)
+}
+
+fn read_bounded_file(path: &Path, file: File, max_bytes: u64) -> io::Result<String> {
     let declared_len = file.metadata()?.len();
     if declared_len > max_bytes {
         return Err(oversize_error(path, declared_len, max_bytes));
@@ -618,6 +655,35 @@ mod tests {
             read_bounded(&path, 4096).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_read_rejects_any_group_or_other_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("read-private");
+        let path = root.join("memory.state");
+        fs::write(&path, b"{\"days\":[]}").unwrap();
+
+        // Group-read and other-read each fail on their own: the mask is the
+        // full 0o077, not just the group half of it.
+        for mode in [0o640, 0o604] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                read_bounded_private(&path, 4096).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            // The weaker integrity-only reader still accepts the same file.
+            assert_eq!(read_bounded(&path, 4096).unwrap(), "{\"days\":[]}");
+        }
+
+        // Stricter-than-0600 owner-only modes are accepted: the invariant is
+        // "no group/other access", not one exact mode.
+        for mode in [0o600, 0o400] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(read_bounded_private(&path, 4096).unwrap(), "{\"days\":[]}");
+        }
     }
 
     #[test]

@@ -122,11 +122,12 @@ fn destination_parent(path: &Path) -> io::Result<&Path> {
 
 /// Name of the sibling temporary file used while replacing `destination_name`.
 ///
-/// Exposed to the crate because [`crate::snapshot_file`] has to assert that the
-/// name cannot be read back as a session snapshot by the frontends' directory
-/// scans, and a test asserting against a *copy* of this formula would keep
-/// passing after the formula changed.
-pub(crate) fn temp_file_name(destination_name: &OsStr, id: u64) -> OsString {
+/// Public because frontends' snapshot-directory scans have to assert that the
+/// name cannot be read back as a session snapshot, and a test asserting against
+/// a *copy* of this formula would keep passing after the formula changed.
+/// `id` is the caller-chosen attempt counter that keeps same-process retries
+/// distinct; the process id is embedded by this function itself.
+pub fn temp_file_name(destination_name: &OsStr, id: u64) -> OsString {
     let mut temp_name = OsString::from(".");
     temp_name.push(destination_name);
     temp_name.push(format!(".tmp.{}.{id}", std::process::id()));

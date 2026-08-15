@@ -22,11 +22,11 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 
 /// An owned helper child whose process group is cleared before reap on Unix.
 ///
-/// This is intentionally crate-private and does not expose the underlying
-/// [`Child`]: callers may take its standard streams, observe the root without
-/// reaping it, and finish the owned cleanup, but cannot accidentally poll its
-/// status destructively and release the PID early.
-pub(crate) struct SupervisedChild {
+/// The underlying [`Child`] is deliberately opaque: callers may take its
+/// standard streams, observe the root without reaping it, and finish the
+/// owned cleanup, but cannot accidentally poll its status destructively and
+/// release the PID early.
+pub struct SupervisedChild {
     child: Option<Child>,
     #[cfg(unix)]
     process_group: i32,
@@ -80,7 +80,11 @@ fn require_waitable_sigchld() -> io::Result<()> {
 
 impl SupervisedChild {
     /// Spawn `command`; on Unix, make it leader of a fresh process group.
-    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+    ///
+    /// Fails with [`io::ErrorKind::Unsupported`] without spawning when the
+    /// process-wide SIGCHLD disposition would auto-reap the child (`SIG_IGN`
+    /// or `SA_NOCLDWAIT`): the supervision contract needs a waitable child.
+    pub fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -110,15 +114,15 @@ impl SupervisedChild {
             .id()
     }
 
-    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.as_mut()?.stdin.take()
     }
 
-    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.as_mut()?.stdout.take()
     }
 
-    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
         self.child.as_mut()?.stderr.take()
     }
 
@@ -128,7 +132,7 @@ impl SupervisedChild {
     /// must promptly call [`Self::reap_after_group_kill`], which signals the
     /// still-unrecycled group before consuming that status.
     #[cfg(unix)]
-    pub(crate) fn root_has_exited(&mut self) -> io::Result<bool> {
+    pub fn root_has_exited(&mut self) -> io::Result<bool> {
         if self.child.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -171,7 +175,7 @@ impl SupervisedChild {
     }
 
     #[cfg(not(unix))]
-    pub(crate) fn root_has_exited(&mut self) -> io::Result<bool> {
+    pub fn root_has_exited(&mut self) -> io::Result<bool> {
         if self.cached_status.is_some() {
             return Ok(true);
         }
@@ -196,7 +200,7 @@ impl SupervisedChild {
     /// When called after [`Self::root_has_exited`] returned true, the SIGKILL
     /// cannot change the root's already-recorded status.  It only clears any
     /// descendants that inherited the group.
-    pub(crate) fn reap_after_group_kill(&mut self) -> io::Result<ExitStatus> {
+    pub fn reap_after_group_kill(&mut self) -> io::Result<ExitStatus> {
         self.reap_after_group_kill_with(|_| {})
     }
 
