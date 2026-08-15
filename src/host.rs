@@ -340,9 +340,8 @@ fn status_with_timeout(command: Command, timeout: Duration) -> ProbeOutcome {
 /// Run a small helper without allowing it or descendants in its process group
 /// to outlive a bounded caller. `None` means the timeout elapsed.
 ///
-/// This is crate-visible so other fire-and-forget integrations (currently
-/// desktop notifications) share the same reap contract instead of growing an
-/// unbounded thread per child.
+/// The host probes above share this contract so a missing or wedged Flatpak
+/// bridge can never leave an unbounded thread per child.
 pub(crate) fn command_status_with_timeout(
     mut command: Command,
     timeout: Duration,

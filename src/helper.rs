@@ -137,9 +137,29 @@ pub fn fc_match(args: &[&str]) -> io::Result<Output> {
 
 /// Run `notify-send` with the family's notification bounds.
 pub fn notify_send(title: &str, body: &str) -> io::Result<Output> {
+    notify_send_with(&[], title, body)
+}
+
+/// [`notify_send`] with caller-supplied options ahead of the positional
+/// title and body.
+pub fn notify_send_with(options: &[&str], title: &str, body: &str) -> io::Result<Output> {
+    notify_send_through(&NOTIFY_SEND, options, title, body)
+}
+
+fn notify_send_through(
+    helper: &TrustedHelper,
+    options: &[&str],
+    title: &str,
+    body: &str,
+) -> io::Result<Output> {
     // `--` keeps notification text beginning with `-` out of option parsing.
-    NOTIFY_SEND.run(
-        ["--", title, body],
+    let args = options
+        .iter()
+        .copied()
+        .chain(["--", title, body])
+        .collect::<Vec<_>>();
+    helper.run(
+        args,
         NOTIFICATION_OUTPUT_LIMIT,
         NOTIFICATION_OUTPUT_LIMIT,
         NOTIFICATION_HELPER_TIMEOUT,
@@ -546,6 +566,18 @@ mod tests {
             !survivor_file.exists(),
             "a process in the helper group survived timeout cleanup"
         );
+    }
+
+    #[test]
+    fn notify_send_never_executes_an_untrusted_candidate() {
+        let missing = TrustedHelper::new(
+            "jterm-core-no-such-notify-send",
+            &["/nonexistent/jterm-core-no-such-notify-send"],
+        );
+        let error = notify_send_through(&missing, &["--urgency", "critical"], "title", "body")
+            .expect_err("an unresolved notify-send must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("jterm-core-no-such-notify-send"));
     }
 
     #[test]

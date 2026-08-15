@@ -13,6 +13,18 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/notify.rs` now sends through the `src/helper.rs` boundary instead of
+  the older `host::helper_command` plus `host::command_status_with_timeout`
+  route, retiring the second, differently-hardened notification path.
+  `helper::notify_send` keeps its `(title, body)` shape for ember and frost;
+  the new `helper::notify_send_with` carries caller-supplied options
+  (`--app-name`, `--icon`, `--urgency`, `--expire-time`) ahead of the `--`
+  guard, so core's own toasts get the same fixed-candidate trusted
+  resolution, process-group ownership, concurrent byte-capped drains, one
+  deadline, and synchronous reap. Queueing, truncation, and sanitisation in
+  `notify.rs` are unchanged, and `host::command_status_with_timeout` stays
+  for the Flatpak cwd/availability probes that still use it.
+
 - `src/command_history.rs` gains `read_recent_with_status`, upstreamed from
   forge's local copy: the same bounded newest-first tail read plus a
   `tail_truncated` flag for the case where older bytes fell outside the 4 MiB

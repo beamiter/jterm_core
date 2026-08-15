@@ -8,17 +8,19 @@
 //! fork+exec per long-running command — negligible compared to whatever
 //! the command itself just spent doing.
 //!
+//! Execution goes through [`crate::helper`]'s trusted boundary: the binary
+//! is resolved from fixed absolute system candidates and run under the
+//! family's output caps and deadline, so this module only owns queueing and
+//! field sanitisation.
+//!
 //! Errors are intentionally swallowed: if notify-send is missing or
 //! D-Bus is broken, the user shouldn't see a stack trace from a feature
 //! that's meant to be unobtrusive.
 
-use std::process::Stdio;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::OnceLock;
-use std::time::Duration;
 
 const NOTIFICATION_QUEUE_CAPACITY: usize = 16;
-const NOTIFY_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct Notification {
     urgency: &'static str,
@@ -119,25 +121,18 @@ fn send_notification(notification: Notification) {
     let identity = crate::identity::get();
     let app_name_arg = format!("--app-name={}", identity.app_name);
     let icon_arg = format!("--icon={}", identity.app_id);
-    let Ok(mut command) = crate::host::helper_command("notify-send") else {
-        return;
-    };
-    command
-        .args([
+    if let Err(error) = crate::helper::notify_send_with(
+        &[
             app_name_arg.as_str(),
             icon_arg.as_str(),
             "--urgency",
             notification.urgency,
             "--expire-time",
             notification.timeout_ms,
-            "--",
-            notification.title.as_str(),
-            notification.body.as_str(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Err(error) = crate::host::command_status_with_timeout(command, NOTIFY_SEND_TIMEOUT) {
+        ],
+        &notification.title,
+        &notification.body,
+    ) {
         log::warn!("desktop notification subprocess failed: {error}");
     }
 }
