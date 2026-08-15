@@ -13,6 +13,14 @@ provider responses byte-oriented until their canonical gate.
 
 ## Completed since the previous handoff
 
+- `src/bounded_json.rs` holds the two schema-independent pieces of the
+  RawValue bounded-decoder pattern ember and frost both carry in their
+  session persistence: `TextBudget` (one cumulative checked-sub text budget
+  per snapshot decode) and `DeferredRawField` (a borrowed `&RawValue` map
+  field with duplicate tracking, so nested payloads are never cloned per
+  ancestor and an explicit `null` still counts as present). The apps' repair
+  counters and field enums stay app-side; they are the schema. Enabling
+  serde_json's `raw_value` feature was the only manifest change.
 - `src/command_history.rs` gains `prepare_path`, the pre-flight frost carried
   locally as `prepare_command_history_path` while the old pin opened history
   unsafely: the immediate parent must be owned by this user and never

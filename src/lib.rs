@@ -10,6 +10,7 @@ pub mod ai;
 pub mod atomic_file;
 pub mod block_contract;
 pub mod bottom_bar;
+pub mod bounded_json;
 pub mod char_width;
 pub mod child_env;
 pub mod click_cursor;
