@@ -118,6 +118,32 @@ provider responses byte-oriented until their canonical gate.
 - `src/atomic_file.rs::temp_file_name` is public so frontends can assert their
   snapshot-directory scans never read back an in-flight temp name without
   copying the formula.
+- `src/agent.rs` restore validation regains forge's stricter snapshot audit,
+  ported from forge's removed `audit_agent_snapshot` that core's earlier
+  adoption dropped. The pre-restore audit now requires the pending proposal to
+  be the transcript's final turn (a "hidden" or "covered" pending can no
+  longer split the reviewed card from the authorizable action), checks
+  `turns_used` against the retained transcript's model-action and
+  protocol-error counts (an exact range while untruncated, a lower bound once
+  truncated), matches every state against the final turn's shape and budget
+  exactly as the live transitions produce it (`Completed` only on a final
+  assistant message, `Ready` never on a bare observation), and requires every
+  approved proposal's fate to be recorded: an observation, the
+  `AwaitingObservation` state, or — the one adaptation from forge's rule,
+  which never restored an in-flight execution at all — the explicit
+  unknown-result note jagent's restore normalization appends immediately after
+  the proposal. The claim read moved from `read_bounded` to
+  `read_bounded_private`, so a claimed snapshot with any group/other
+  permission bits (e.g. 0640) is quarantined as tampering instead of restored.
+  Forge's removed adversarial tests (hidden, covered, unobserved-approved,
+  wrong-state, wrong-counter) are ported into core's suite, alongside a test
+  that snapshots from every reachable live state/final-turn combination — the
+  shapes anvil's jagent-produced sessions actually persist — still restore.
+  `src/parser.rs` pins three reviewed gaps: a u32-saturating ED3 parameter
+  (`CSI 42949672963 J`) is never erase-scrollback, an OSC aborted by
+  `ESC BEL` drops its payload (no forged OSC 133 mark) and passes the raw
+  bytes through, and the oversized APC/DCS discard states abort and reprocess
+  a non-ST escape exactly like the OSC discard state.
 
 ## Previously completed
 

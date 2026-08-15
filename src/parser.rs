@@ -1506,6 +1506,71 @@ mod tests {
     }
 
     #[test]
+    fn ed3_parameter_past_u32_saturates_away_from_erase_scrollback() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        // 42949672963 > u32::MAX: the accumulator must saturate, never wrap
+        // back onto the value 3 and fire the scrollback side effect for a
+        // parameter the active VTE will not read as ED3 either.
+        parser.feed(b"\x1b[42949672963J", &mut events);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::EraseScrollback)));
+        assert_eq!(collect_bytes(&events), b"\x1b[42949672963J");
+    }
+
+    #[test]
+    fn osc_aborted_by_esc_bel_drops_the_payload_and_passes_both_bytes_through() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        // ESC BEL is not ST: the incomplete OSC must be aborted without any
+        // handle_osc effect (no OSC 133 mark), and the raw ESC BEL bytes are
+        // reinterpreted as an ordinary escape sequence for the terminal.
+        parser.feed(b"\x1b]133;A\x1b\x07after", &mut events);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::PromptStart)));
+        assert!(matches!(parser.state, State::Ground));
+        assert_eq!(collect_bytes(&events), b"\x1b\x07after");
+    }
+
+    #[test]
+    fn oversized_apc_and_dcs_abort_and_reprocess_a_non_st_escape() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b_Ga=T;", &mut events);
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..=(MAX_APC_PAYLOAD_BYTES / chunk.len()) {
+            parser.feed(&chunk, &mut events);
+        }
+        assert!(matches!(parser.state, State::ApcDiscard));
+        parser.feed(b"\x1b", &mut events);
+        assert!(matches!(parser.state, State::ApcDiscardEsc));
+        // A non-ST escape aborts the oversized string and is reinterpreted as
+        // a new ESC sequence; ordinary text becomes visible again.
+        parser.feed(b"qvisible", &mut events);
+        assert!(matches!(parser.state, State::Ground));
+        assert_eq!(collect_bytes(&events), b"\x1bqvisible");
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::ApcSequence(_))));
+
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1bPq", &mut events);
+        let chunk = vec![b'x'; 8 * 1024];
+        for _ in 0..=(MAX_DCS_PAYLOAD_BYTES / chunk.len()) {
+            parser.feed(&chunk, &mut events);
+        }
+        assert!(matches!(parser.state, State::DcsDiscard));
+        parser.feed(b"\x1b", &mut events);
+        assert!(matches!(parser.state, State::DcsDiscardEsc));
+        parser.feed(b"qvisible", &mut events);
+        assert!(matches!(parser.state, State::Ground));
+        assert_eq!(collect_bytes(&events), b"\x1bqvisible");
+    }
+
+    #[test]
     fn osc_9_and_777_become_bounded_notification_events() {
         let mut parser = Parser::new();
         let mut events = Vec::new();

@@ -245,13 +245,19 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
     }
 
     let mut highest_proposal_id = 0_u64;
-    let mut proposal_statuses = HashMap::new();
+    let mut proposal_statuses: HashMap<u64, (ProposalStatus, usize)> = HashMap::new();
     let mut pending_proposal = None;
     let mut observed_proposals = HashSet::new();
-    for turn in transcript {
+    let mut model_actions = 0_u32;
+    let mut protocol_errors = 0_u32;
+    for (index, turn) in transcript.iter().enumerate() {
         match turn {
-            Turn::User(message) | Turn::AssistantSay(message) => {
+            Turn::User(message) => {
                 validate_snapshot_text(message, MAX_MESSAGE_BYTES, true)?;
+            }
+            Turn::AssistantSay(message) => {
+                validate_snapshot_text(message, MAX_MESSAGE_BYTES, true)?;
+                model_actions = model_actions.saturating_add(1);
             }
             Turn::AssistantThought(thought) => {
                 validate_snapshot_text(thought, MAX_THOUGHT_BYTES, true)?;
@@ -261,6 +267,7 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
                 command,
                 status,
             } => {
+                model_actions = model_actions.saturating_add(1);
                 let id_value = id.get();
                 if id_value == 0 || id_value <= highest_proposal_id {
                     return Err(AgentSnapshotError::Invalid(
@@ -269,8 +276,10 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
                 }
                 validate_snapshot_command(command)?;
                 highest_proposal_id = id_value;
-                proposal_statuses.insert(id_value, *status);
-                if *status == ProposalStatus::Pending && pending_proposal.replace(*id).is_some() {
+                proposal_statuses.insert(id_value, (*status, index));
+                if *status == ProposalStatus::Pending
+                    && pending_proposal.replace((*id, index)).is_some()
+                {
                     return Err(AgentSnapshotError::Invalid(
                         "snapshot contains multiple pending proposals",
                     ));
@@ -286,7 +295,10 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
                         "observation violates its safety bounds",
                     ));
                 }
-                if proposal_statuses.get(&proposal_id.get()) != Some(&ProposalStatus::Approved)
+                if proposal_statuses
+                    .get(&proposal_id.get())
+                    .map(|(status, _)| status)
+                    != Some(&ProposalStatus::Approved)
                     || !observed_proposals.insert(proposal_id.get())
                 {
                     return Err(AgentSnapshotError::Invalid(
@@ -296,6 +308,7 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
             }
             Turn::ProtocolError(message) => {
                 validate_snapshot_text(message, MAX_MESSAGE_BYTES, false)?;
+                protocol_errors = protocol_errors.saturating_add(1);
             }
         }
     }
@@ -309,31 +322,148 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
         ));
     }
 
+    // Every retained proposal/say consumed one model turn. A ProtocolError may
+    // be either a parse failure (one turn) or a transport failure (no turn),
+    // which gives an exact range while the transcript is untruncated.
+    let turns_used = snapshot.turns_used();
+    if turns_used < model_actions
+        || (!snapshot.transcript_truncated()
+            && turns_used > model_actions.saturating_add(protocol_errors))
+    {
+        return Err(AgentSnapshotError::Invalid(
+            "turn counter is inconsistent with the transcript",
+        ));
+    }
+
+    // An empty transcript is rejected by jagent's own restore below; every
+    // remaining check reasons about the final turn, so there is nothing more
+    // to audit on one here.
+    let Some(final_index) = transcript.len().checked_sub(1) else {
+        return Ok(());
+    };
+    let final_turn = &transcript[final_index];
+
+    // The state must bind to the transcript's final turn: an approval card
+    // (or an in-flight execution) anywhere else would split the reviewed UI
+    // identity from the session's authorizable action.
     match snapshot.state() {
         AgentState::AwaitingApproval { proposal_id }
-            if pending_proposal == Some(proposal_id)
-                && proposal_statuses.get(&proposal_id.get()) == Some(&ProposalStatus::Pending) =>
-        {
-            Ok(())
+            if pending_proposal == Some((proposal_id, final_index)) => {}
+        AgentState::AwaitingApproval { .. } => {
+            return Err(AgentSnapshotError::Invalid(
+                "approval state does not identify the final pending proposal",
+            ));
         }
-        AgentState::AwaitingApproval { .. } => Err(AgentSnapshotError::Invalid(
-            "approval state does not identify the sole pending proposal",
-        )),
         AgentState::AwaitingObservation { proposal_id }
             if pending_proposal.is_none()
-                && proposal_statuses.get(&proposal_id.get()) == Some(&ProposalStatus::Approved)
-                && !observed_proposals.contains(&proposal_id.get()) =>
-        {
-            Ok(())
+                && proposal_statuses.get(&proposal_id.get())
+                    == Some(&(ProposalStatus::Approved, final_index))
+                && !observed_proposals.contains(&proposal_id.get()) => {}
+        AgentState::AwaitingObservation { .. } => {
+            return Err(AgentSnapshotError::Invalid(
+                "observation state does not identify the final unobserved approved proposal",
+            ));
         }
-        AgentState::AwaitingObservation { .. } => Err(AgentSnapshotError::Invalid(
-            "observation state does not identify one unobserved approved proposal",
-        )),
-        _ if pending_proposal.is_some() => Err(AgentSnapshotError::Invalid(
-            "pending proposal exists outside approval state",
-        )),
-        _ => Ok(()),
+        _ if pending_proposal.is_some() => {
+            return Err(AgentSnapshotError::Invalid(
+                "pending proposal exists outside approval state",
+            ));
+        }
+        _ => {}
     }
+
+    // Terminal and waiting states must match the final turn's shape exactly
+    // the way the live transitions produce it.
+    let final_state_is_valid = match snapshot.state() {
+        AgentState::Ready => {
+            turns_used < snapshot.max_turns()
+                && matches!(
+                    final_turn,
+                    Turn::AssistantSay(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::ManualReview,
+                            ..
+                        }
+                )
+        }
+        AgentState::AwaitingModel => {
+            turns_used < snapshot.max_turns()
+                && matches!(
+                    final_turn,
+                    Turn::User(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::Observation { .. }
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::Rejected,
+                            ..
+                        }
+                )
+        }
+        // Both in-flight states were pinned to the final turn above.
+        AgentState::AwaitingApproval { .. } | AgentState::AwaitingObservation { .. } => true,
+        AgentState::Completed => matches!(final_turn, Turn::AssistantSay(_)),
+        AgentState::TurnLimitReached => {
+            turns_used == snapshot.max_turns()
+                && matches!(
+                    final_turn,
+                    Turn::AssistantSay(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::Observation { .. }
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::Rejected | ProposalStatus::ManualReview,
+                            ..
+                        }
+                )
+        }
+        AgentState::Cancelled => false,
+    };
+    if !final_state_is_valid {
+        return Err(AgentSnapshotError::Invalid(
+            "session state does not match the final transcript turn or budget",
+        ));
+    }
+
+    // An approved proposal's fate must be recorded: either its observation is
+    // in the transcript, or it is the one in-flight execution the
+    // AwaitingObservation state names, or — the shape jagent's
+    // AwaitingObservation restore normalization produces — its unknown result
+    // is documented by the note that normalization appended immediately after
+    // it. Anything else silently erases the command's outcome.
+    for (proposal_id, (status, index)) in &proposal_statuses {
+        if *status != ProposalStatus::Approved {
+            continue;
+        }
+        let is_current_unobserved = matches!(
+            snapshot.state(),
+            AgentState::AwaitingObservation {
+                proposal_id: current
+            } if current.get() == *proposal_id
+        );
+        if observed_proposals.contains(proposal_id) {
+            // The state arm above already proved the AwaitingObservation
+            // proposal is unobserved, so an observed proposal can never be the
+            // in-flight one.
+            if is_current_unobserved {
+                return Err(AgentSnapshotError::Invalid(
+                    "approved proposal observation lifecycle is inconsistent",
+                ));
+            }
+            continue;
+        }
+        if !is_current_unobserved {
+            let documented = Turn::ProtocolError(format!(
+                "the application exited before proposal #{proposal_id}'s output was \
+                 observed; its result is unknown"
+            ));
+            if transcript.get(index + 1) != Some(&documented) {
+                return Err(AgentSnapshotError::Invalid(
+                    "approved proposal observation lifecycle is inconsistent",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_snapshot_text(
@@ -464,8 +594,10 @@ fn try_claim_session_file_with(
         }
         Err(error) => return Err(error),
     };
+    // Transcripts can contain private data, so a claimed snapshot with any
+    // group/other permission bits is treated as tampering, not merely read.
     let restored =
-        crate::snapshot_file::read_bounded(&claimed, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
+        crate::snapshot_file::read_bounded_private(&claimed, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64)
             .map_err(|error| {
                 AgentSnapshotError::Decode(format!("read {}: {error}", claimed.display()))
             })
@@ -1062,6 +1194,330 @@ mod tests {
             AgentSession::restore(pending_but_awaiting_observation),
             Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation state")
         ));
+    }
+
+    /// A two-proposal pending snapshot: transcript [User, Proposed#1(Rejected),
+    /// Proposed#2(Pending)], state AwaitingApproval{#2}.
+    fn rejected_then_pending_snapshot_json() -> serde_json::Value {
+        let mut session = AgentSession::new(6);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id: first, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf first"}"#)
+            .unwrap()
+        else {
+            panic!("expected first proposal")
+        };
+        session.reject(first).unwrap();
+        let ModelOutcome::Proposal { .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf second"}"#)
+            .unwrap()
+        else {
+            panic!("expected second proposal")
+        };
+        serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap()
+    }
+
+    fn decode_snapshot_json(value: &serde_json::Value) -> AgentSessionSnapshot {
+        AgentSessionSnapshot::from_json(&serde_json::to_string(value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn restore_rejects_a_pending_proposal_that_is_not_the_final_turn() {
+        let base = rejected_then_pending_snapshot_json();
+        assert!(AgentSession::restore(decode_snapshot_json(&base)).is_ok());
+
+        // Hidden: the sole pending status sits on an older proposal behind a
+        // newer final one. An approval card bound to it would authorize a
+        // command the user never saw as current.
+        let mut hidden = base.clone();
+        let mut seen = 0;
+        for turn in hidden["transcript"].as_array_mut().unwrap() {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["status"] =
+                    serde_json::json!(if seen == 0 { "Pending" } else { "Rejected" });
+                seen += 1;
+            }
+        }
+        hidden["state"] = serde_json::json!({"AwaitingApproval": {"proposal_id": 1}});
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&hidden)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("approval state")
+        ));
+
+        // Covered: the pending proposal is buried under a later turn, so the
+        // visible final turn and the authorizable action disagree.
+        let mut covered = base;
+        covered["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"ProtocolError": "cover pending proposal"}));
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&covered)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("approval state")
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_an_unobserved_approved_proposal_outside_observation_state() {
+        // The state machine only reaches Ready with a final AssistantSay,
+        // ProtocolError, or manual-review proposal, so burying an unobserved
+        // approved proposal under a say keeps every other check satisfied and
+        // isolates the lifecycle rule: without AwaitingObservation (whose
+        // restore normalization records an explicit unknown-result note) the
+        // command's fate would be silently erased.
+        let mut buried = rejected_then_pending_snapshot_json();
+        let mut seen = 0;
+        for turn in buried["transcript"].as_array_mut().unwrap() {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["status"] =
+                    serde_json::json!(if seen == 0 { "Approved" } else { "Rejected" });
+                seen += 1;
+            }
+        }
+        buried["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"AssistantSay": "all done"}));
+        buried["state"] = serde_json::json!("Ready");
+        buried["turns_used"] = serde_json::json!(3);
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&buried)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+        ));
+
+        // The same shape as the final turn in Ready fails the state/final-turn
+        // match before the lifecycle rule is even reached.
+        let mut final_unobserved = rejected_then_pending_snapshot_json();
+        for turn in final_unobserved["transcript"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .rev()
+        {
+            if let Some(proposal) = turn.get_mut("AssistantProposed") {
+                proposal["status"] = serde_json::json!("Approved");
+                break;
+            }
+        }
+        final_unobserved["state"] = serde_json::json!("Ready");
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&final_unobserved)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("final transcript turn")
+        ));
+    }
+
+    /// A snapshot whose approved proposal was observed: transcript [User,
+    /// Proposed#1(Approved), Observation], state AwaitingModel.
+    fn observed_snapshot_json() -> serde_json::Value {
+        let mut session = AgentSession::new(6);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf safe"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = session.approve(id).unwrap();
+        session.observe(id, 0, "safe output").unwrap();
+        serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn restore_rejects_a_terminal_state_that_contradicts_the_final_turn_or_counter() {
+        let observed = observed_snapshot_json();
+        assert!(AgentSession::restore(decode_snapshot_json(&observed)).is_ok());
+
+        // Completed must close on an assistant message, not on an observation
+        // whose follow-up model turn never ran.
+        let mut wrong_state = observed.clone();
+        wrong_state["state"] = serde_json::json!("Completed");
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&wrong_state)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("final transcript turn")
+        ));
+
+        // The turn counter must be consistent with the retained transcript.
+        let mut wrong_counter = observed;
+        wrong_counter["turns_used"] = serde_json::json!(0);
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&wrong_counter)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("turn counter")
+        ));
+    }
+
+    #[test]
+    fn restore_accepts_every_legitimate_live_snapshot_shape() {
+        // AwaitingModel on a fresh user turn.
+        let mut awaiting_user = AgentSession::new(10);
+        awaiting_user.submit_user("inspect").unwrap();
+        assert!(AgentSession::restore(awaiting_user.snapshot().unwrap()).is_ok());
+
+        // AwaitingApproval on the final pending proposal.
+        assert!(AgentSession::restore(pending_snapshot()).is_ok());
+
+        // AwaitingObservation on the final approved proposal: restore
+        // normalizes it to Ready plus an explicit unknown-result note, and the
+        // normalized session itself snapshots into a restorable shape.
+        let mut in_flight = AgentSession::new(10);
+        in_flight.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = in_flight
+            .accept_model_reply(r#"{"action":"run","command":"printf safe"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = in_flight.approve(id).unwrap();
+        let snapshot = in_flight.snapshot().unwrap();
+        assert!(matches!(
+            snapshot.state(),
+            AgentState::AwaitingObservation { .. }
+        ));
+        let restored = AgentSession::restore(snapshot).unwrap();
+        assert_eq!(restored.state(), AgentState::Ready);
+        assert!(matches!(
+            restored.transcript().last(),
+            Some(Turn::ProtocolError(note)) if note.contains("result is unknown")
+        ));
+        assert!(AgentSession::restore(restored.snapshot().unwrap()).is_ok());
+
+        // AwaitingModel on a rejection, an observation, Ready on a say, a
+        // protocol error, and a manual review, and Completed on a done.
+        let mut session = AgentSession::new(10);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf first"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        session.reject(id).unwrap();
+        assert!(matches!(session.state(), AgentState::AwaitingModel));
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf second"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = session.approve(id).unwrap();
+        session.observe(id, 0, "output").unwrap();
+        assert!(matches!(session.state(), AgentState::AwaitingModel));
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+
+        session
+            .accept_model_reply(r#"{"action":"say","message":"noted"}"#)
+            .unwrap();
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+
+        session.submit_user("again").unwrap();
+        assert!(session.accept_model_reply("not json").is_err());
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+
+        session.retry_model().unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf third"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        session.edit_for_manual_review(id, "printf third").unwrap();
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+
+        session.submit_user("finish").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"done","message":"done"}"#)
+            .unwrap();
+        assert_eq!(session.state(), AgentState::Completed);
+        assert!(AgentSession::restore(session.snapshot().unwrap()).is_ok());
+
+        // TurnLimitReached on each final-turn shape the limit can produce.
+        let mut limited = AgentSession::new(1);
+        limited.submit_user("once").unwrap();
+        limited
+            .accept_model_reply(r#"{"action":"say","message":"only turn"}"#)
+            .unwrap();
+        assert_eq!(limited.state(), AgentState::TurnLimitReached);
+        assert!(AgentSession::restore(limited.snapshot().unwrap()).is_ok());
+
+        let mut limited_reject = AgentSession::new(1);
+        limited_reject.submit_user("once").unwrap();
+        let ModelOutcome::Proposal { id, .. } = limited_reject
+            .accept_model_reply(r#"{"action":"run","command":"printf once"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        limited_reject.reject(id).unwrap();
+        assert_eq!(limited_reject.state(), AgentState::TurnLimitReached);
+        assert!(AgentSession::restore(limited_reject.snapshot().unwrap()).is_ok());
+
+        let mut limited_observe = AgentSession::new(1);
+        limited_observe.submit_user("once").unwrap();
+        let ModelOutcome::Proposal { id, .. } = limited_observe
+            .accept_model_reply(r#"{"action":"run","command":"printf once"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = limited_observe.approve(id).unwrap();
+        limited_observe.observe(id, 0, "output").unwrap();
+        assert_eq!(limited_observe.state(), AgentState::TurnLimitReached);
+        assert!(AgentSession::restore(limited_observe.snapshot().unwrap()).is_ok());
+
+        let mut limited_error = AgentSession::new(1);
+        limited_error.submit_user("once").unwrap();
+        assert!(limited_error.accept_model_reply("not json").is_err());
+        assert_eq!(limited_error.state(), AgentState::TurnLimitReached);
+        assert!(AgentSession::restore(limited_error.snapshot().unwrap()).is_ok());
+
+        let mut limited_review = AgentSession::new(1);
+        limited_review.submit_user("once").unwrap();
+        let ModelOutcome::Proposal { id, .. } = limited_review
+            .accept_model_reply(r#"{"action":"run","command":"printf once"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        limited_review
+            .edit_for_manual_review(id, "printf once")
+            .unwrap();
+        assert_eq!(limited_review.state(), AgentState::TurnLimitReached);
+        assert!(AgentSession::restore(limited_review.snapshot().unwrap()).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn a_group_readable_claimed_snapshot_is_quarantined_as_tampering() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("claim-loose-permissions");
+        let path = dir.0.join("agent_session.json");
+        write_snapshot_file(&path, &pending_snapshot()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let SessionClaim::Quarantined {
+            path: quarantined,
+            error,
+        } = try_claim_session_file(&path).unwrap()
+        else {
+            panic!("loose permissions on claimed evidence must quarantine it");
+        };
+        assert!(matches!(error, AgentSnapshotError::Decode(_)));
+        assert!(!path.exists(), "the original name is claimed");
+        // The evidence survives for inspection and is never restored.
+        assert!(
+            AgentSessionSnapshot::from_json(&std::fs::read_to_string(&quarantined).unwrap())
+                .is_ok()
+        );
+        assert!(matches!(
+            try_claim_session_file(&path).unwrap(),
+            SessionClaim::Vacant
+        ));
+        std::fs::remove_file(&quarantined).unwrap();
     }
 
     #[test]
