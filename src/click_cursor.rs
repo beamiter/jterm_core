@@ -99,10 +99,11 @@ pub fn click_may_move_cursor(guards: &Guards) -> bool {
 /// The stretch of cells the line editor currently owns.
 ///
 /// `start` is where the shell's input begins (the cell just past the prompt);
-/// `end` is one past its last character. A click outside is clamped to the
-/// nearer edge rather than refused, so clicking the prompt itself means "go to
-/// the beginning" and clicking the empty space after the command means "go to
-/// the end" — both of which are what a user expects from an editor.
+/// `end` is one past its last character. Horizontal overshoot on either
+/// boundary row is clamped to the nearer edge, so clicking the prompt means
+/// "go to the beginning" and clicking the empty space after the command means
+/// "go to the end". Rows outside the logical line are history or terminal
+/// furniture and are refused by [`target_cell`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputSpan {
     pub start: Cell,
@@ -119,10 +120,13 @@ pub const MAX_STEPS: i64 = 4096;
 /// Decide which cell a click should move the cursor to, or `None` when the
 /// click should be left alone.
 ///
-/// With a known `span` the click is clamped into it. Without one — a frontend
-/// that cannot tell where the input begins and ends — only same-row clicks are
-/// honoured, because a cross-row move would have to guess how many characters
-/// separate rows it knows nothing about.
+/// With a known `span`, clicks on one of its rows are clamped horizontally at
+/// the first and last row. Rows outside the span are refused: they belong to
+/// history or other terminal furniture, and interacting with them must not
+/// disturb the live editor. Without a span — a frontend that cannot tell where
+/// the input begins and ends — only same-row clicks are honoured, because a
+/// cross-row move would have to guess how many characters separate rows it
+/// knows nothing about.
 pub fn target_cell(
     cursor: Cell,
     click: Cell,
@@ -140,6 +144,9 @@ pub fn target_cell(
             } else {
                 (span.end, span.start)
             };
+            if click.row < lo.row || click.row > hi.row {
+                return None;
+            }
             let clicked = click.index(columns);
             if clicked < lo.index(columns) {
                 lo
@@ -354,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn a_span_clamps_instead_of_refusing() {
+    fn a_span_clamps_on_its_boundary_rows() {
         let span = InputSpan {
             start: Cell::new(10, 2),
             end: Cell::new(11, 7),
@@ -372,14 +379,30 @@ mod tests {
             target_cell(cursor, Cell::new(11, 60), COLS, Some(span)),
             Some(span.end)
         );
-        assert_eq!(
-            target_cell(cursor, Cell::new(40, 0), COLS, Some(span)),
-            Some(span.end)
-        );
         // Inside, the click is taken as-is, across a soft wrap.
         assert_eq!(
             target_cell(cursor, Cell::new(11, 3), COLS, Some(span)),
             Some(Cell::new(11, 3))
+        );
+    }
+
+    #[test]
+    fn rows_outside_the_input_span_preserve_the_cursor() {
+        let span = InputSpan {
+            start: Cell::new(10, 2),
+            end: Cell::new(11, 7),
+        };
+        let cursor = span.end;
+
+        assert_eq!(
+            target_cell(cursor, Cell::new(9, 40), COLS, Some(span)),
+            None,
+            "a click in a historical block must not become Home"
+        );
+        assert_eq!(
+            target_cell(cursor, Cell::new(12, 0), COLS, Some(span)),
+            None,
+            "terminal furniture below the editor must not become End"
         );
     }
 
