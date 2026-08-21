@@ -17,6 +17,13 @@ through allocation-aware bounded decoders; their owning-string transcript
 values remain serialize-only. Non-streaming provider responses remain raw
 bytes until jagent checks its 1 MiB envelope ceiling.
 
+`jterm_core::agent` also exposes jagent's versioned capability contract:
+`AgentCapabilities`, `AgentDelivery`, `CapabilityError`, `agent_capabilities`,
+the provider alias `AgentProvider`, and the
+`AGENT_CAPABILITIES_*`/`MAX_AGENT_CAPABILITIES_WIRE_BYTES` constants. Frontends
+can therefore parse and negotiate a bounded peer token without depending on
+jagent through a second public path or transporting credentials.
+
 ## Shared surfaces
 
 - OSC/CSI/DCS/APC parsing, Kitty graphics framing, character widths, themes,

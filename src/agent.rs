@@ -9,7 +9,11 @@
 pub use jagent::agent::{
     prepare_agent_request, AgentRequestReport, AgentRequestSpec, PreparedAgentRequest,
 };
-pub use jagent::provider::{Message as AgentMessage, Role as AgentRole};
+pub use jagent::capabilities::{
+    agent_capabilities, AgentCapabilities, AgentDelivery, CapabilityError,
+    AGENT_CAPABILITIES_V1_WIRE, AGENT_CAPABILITIES_VERSION, MAX_AGENT_CAPABILITIES_WIRE_BYTES,
+};
+pub use jagent::provider::{Message as AgentMessage, Provider as AgentProvider, Role as AgentRole};
 pub use jagent::response::{AgentResponse, AgentStream};
 pub use jagent::safety::is_dangerous;
 pub use jagent::session::{
@@ -1816,5 +1820,30 @@ mod tests {
             panic!("expected proposal")
         };
         assert_eq!(command, "pwd");
+    }
+
+    #[test]
+    fn capability_negotiation_is_available_through_the_core_facade() {
+        assert_eq!(AGENT_CAPABILITIES_VERSION, 1);
+        assert!(AGENT_CAPABILITIES_V1_WIRE.len() <= MAX_AGENT_CAPABILITIES_WIRE_BYTES);
+
+        let peer = AgentCapabilities::from_wire("jagent-agent/1;protocols=text;delivery=complete")
+            .unwrap();
+        assert!(peer.supports(AgentProtocol::Text, AgentDelivery::Complete));
+        assert!(!peer.supports(AgentProtocol::NativeTools, AgentDelivery::Complete));
+        assert_eq!(
+            AgentCapabilities::from_wire("not-a-capability-token"),
+            Err(CapabilityError::Malformed)
+        );
+
+        let local = agent_capabilities(AgentProvider::OpenAiCompatible);
+        assert_eq!(
+            local.negotiate_with(
+                peer,
+                &[AgentProtocol::NativeTools, AgentProtocol::Text],
+                AgentDelivery::Complete,
+            ),
+            Some(AgentProtocol::Text)
+        );
     }
 }

@@ -22,6 +22,12 @@ canonical gate.
   the ordinary chat builder. Snapshot auditing accepts the exact 0.6 and 0.7
   proposal-bound unknown-execution notes so a dependency upgrade does not make
   a legitimate in-flight restore unreadable.
+- The jagent pin advances to `d52002e`, and `jterm_core::agent` now re-exports
+  `AgentCapabilities`, `AgentDelivery`, `CapabilityError`,
+  `agent_capabilities`, the `AgentProvider` alias, and the version/wire-size
+  constants. A facade-level negotiation test pins strict token parsing and
+  provider/peer intersection so terminal consumers do not need a second direct
+  jagent API surface.
 - `block_contract` keeps outcome and lifecycle evidence orthogonal through
   `CompletionProvenance`, `BlockLifecycleHealth`, and `assess_lifecycle`.
   Exhaustive tests pin shell-confirmed, journal-recovered, boundary-inferred,
