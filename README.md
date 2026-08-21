@@ -31,7 +31,10 @@ jagent through a second public path or transporting credentials.
   contract (background, success, failure, or unknown status). Completion
   provenance is tracked separately as shell-reported, journal-recovered,
   boundary-inferred, or unknown, with one renderer-neutral lifecycle-health
-  mapping shared by every frontend. Strict ordinary-numeric `CSI 2 J` and
+  mapping shared by every frontend. Both lifecycle enums expose stable,
+  dependency-free `schema_name()` spellings so a frontend can re-export them
+  without changing its existing diagnostic or JSON call surface. Strict
+  ordinary-numeric `CSI 2 J` and
   `CSI 3 J` sequences surface pre-feed `EraseDisplay`/`EraseScrollback`
   barriers before their original bytes, so renderers can invalidate row
   authority without rescanning arbitrary output.

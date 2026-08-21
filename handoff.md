@@ -31,7 +31,9 @@ canonical gate.
 - `block_contract` keeps outcome and lifecycle evidence orthogonal through
   `CompletionProvenance`, `BlockLifecycleHealth`, and `assess_lifecycle`.
   Exhaustive tests pin shell-confirmed, journal-recovered, boundary-inferred,
-  missing-start, and incomplete cases without inventing exit codes.
+  missing-start, and incomplete cases without inventing exit codes. Both enums
+  carry dependency-free `schema_name()` methods so frontends can re-export the
+  shared types without breaking their established public call surface.
 
 - `src/parser.rs` is unified with forge's stricter terminal parser, retiring
   core's lenient control-string recovery. APC, DCS, PM/SOS, and every

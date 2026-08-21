@@ -36,6 +36,24 @@ pub enum CompletionProvenance {
     Unknown,
 }
 
+impl CompletionProvenance {
+    /// Stable family-wide spelling used by exports and diagnostics.
+    ///
+    /// This is deliberately an inherent, dependency-free method: frontends
+    /// can re-export the shared type without breaking their existing
+    /// `.schema_name()` call sites, while retaining ownership of serde and
+    /// persistence policy.
+    #[must_use]
+    pub const fn schema_name(self) -> &'static str {
+        match self {
+            Self::ShellReported => "shell_reported",
+            Self::JournalRecovered => "journal_recovered",
+            Self::BoundaryInferred => "boundary_inferred",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Renderer-neutral health of a command block's observed lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlockLifecycleHealth {
@@ -48,6 +66,19 @@ pub enum BlockLifecycleHealth {
     Degraded,
     /// No completion evidence is available; the block remains incomplete.
     Incomplete,
+}
+
+impl BlockLifecycleHealth {
+    /// Stable family-wide spelling used by exports and diagnostics.
+    #[must_use]
+    pub const fn schema_name(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Recovered => "recovered",
+            Self::Degraded => "degraded",
+            Self::Incomplete => "incomplete",
+        }
+    }
 }
 
 /// Assess lifecycle health independently of command outcome.
@@ -176,6 +207,15 @@ mod tests {
                 "start_seen={start_seen}, provenance={provenance:?}"
             );
         }
+
+        assert_eq!(ShellReported.schema_name(), "shell_reported");
+        assert_eq!(JournalRecovered.schema_name(), "journal_recovered");
+        assert_eq!(BoundaryInferred.schema_name(), "boundary_inferred");
+        assert_eq!(Unknown.schema_name(), "unknown");
+        assert_eq!(Healthy.schema_name(), "healthy");
+        assert_eq!(Recovered.schema_name(), "recovered");
+        assert_eq!(Degraded.schema_name(), "degraded");
+        assert_eq!(Incomplete.schema_name(), "incomplete");
     }
 
     #[test]
