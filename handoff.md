@@ -1,17 +1,31 @@
 # Engineering handoff
 
-Updated: 2026-08-15
+Updated: 2026-08-21
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
 history retention, command review, and terminal helper primitives for all jterms.
 It now also decodes persisted conversations under their own budgets, offers an
 atomic claim/consume primitive for Agent snapshots, and vendors a fail-closed jsh
-installer. Version 0.2 adopts jagent 0.6's serialize-only transcript boundary,
-closes the same owning-string bypass for core AI turns, and keeps non-streaming
-provider responses byte-oriented until their canonical gate.
+installer. Version 0.2 now pins jagent 0.7 and exposes its protocol-bound
+request/response path, while preserving the serialize-only transcript boundary
+and keeping non-streaming provider responses byte-oriented until their
+canonical gate.
 
 ## Completed since the previous handoff
+
+- `agent` now re-exports jagent 0.7's `AgentRequestSpec`,
+  `PreparedAgentRequest`, `AgentResponse`/`AgentStream`, and `AgentProtocol`;
+  its hardened session wrapper accepts the bound response directly and exposes
+  rejection feedback plus execution-failure observation. `AiClient` prepares a
+  protocol-matched Agent request without routing review-first traffic through
+  the ordinary chat builder. Snapshot auditing accepts the exact 0.6 and 0.7
+  proposal-bound unknown-execution notes so a dependency upgrade does not make
+  a legitimate in-flight restore unreadable.
+- `block_contract` keeps outcome and lifecycle evidence orthogonal through
+  `CompletionProvenance`, `BlockLifecycleHealth`, and `assess_lifecycle`.
+  Exhaustive tests pin shell-confirmed, journal-recovered, boundary-inferred,
+  missing-start, and incomplete cases without inventing exit codes.
 
 - `src/parser.rs` is unified with forge's stricter terminal parser, retiring
   core's lenient control-string recovery. APC, DCS, PM/SOS, and every
@@ -30,6 +44,15 @@ provider responses byte-oriented until their canonical gate.
   `ParserEvent::AgentIntegrationReady` only for an exact 32-hex-digit token
   and never passes through to VTE. SOS (`ESC X`) joins PM (`ESC ^`) in the
   discard-until-ST `Ignore` state.
+
+- `ParserEvent::EraseDisplay` extends the same pre-feed barrier contract to
+  ordinary all-digit `CSI 2 J` (including zero-padded `CSI 02 J`). The parser
+  flushes earlier bytes, emits the semantic event, then emits the exact ED2
+  sequence as its own `Bytes` event before any suffix semantics. Private,
+  compound, colon, intermediate, overflow, wrong-final, and control-string
+  lookalikes remain ordinary payload/pass-through and never gain the event.
+  Frontends pinned to an older core revision keep their local compatibility
+  detection until this API is published and their dependency pins can move.
 
 - Three forge-only additions are upstreamed so forge can delete its diverged
   local copies. `review_input::is_visual_spoofing_character` now keeps the

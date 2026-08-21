@@ -536,6 +536,34 @@ impl AiClient {
         format!("{} · {}", self.provider.display_name(), self.model)
     }
 
+    /// Prepare one review-first Agent request through jagent's protocol-aware
+    /// 0.7 boundary.
+    ///
+    /// Unlike the ordinary chat helpers below, this binds the built-in Agent
+    /// system prompt, text/native-tools schema, streaming mode, redaction
+    /// policy, response decoder, and non-sensitive preparation report into one
+    /// value. The caller transports [`jagent::PreparedAgentRequest::request`]
+    /// and must parse the response through that same prepared value.
+    pub fn prepare_agent_request(
+        &self,
+        history: &[crate::agent::AgentMessage],
+        protocol: crate::agent::AgentProtocol,
+        streaming: bool,
+    ) -> Result<crate::agent::PreparedAgentRequest, AiError> {
+        let config = ChatConfig {
+            provider: self.provider.to_jagent(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+        };
+        let spec = jagent::AgentRequestSpec::new(history, protocol)
+            .streaming(streaming)
+            .redact_secrets(self.redact_secrets);
+        jagent::prepare_agent_request(&config, spec).map_err(AiError::from)
+    }
+
     /// Send an existing multi-turn transcript. This function blocks and must
     /// be invoked off the GTK main thread.
     pub fn send_turns_blocking(
@@ -2282,6 +2310,32 @@ mod tests {
             );
             assert_eq!(provider, Provider::from_jagent(provider.to_jagent()));
         }
+    }
+
+    #[test]
+    fn agent_client_preparation_binds_protocol_redaction_and_decoder() {
+        let mut client = client(Provider::OpenAiCompatible);
+        client.redact_secrets = true;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ";
+        let history = [jagent::Message {
+            role: jagent::Role::User,
+            text: format!("inspect token={secret}"),
+        }];
+        let prepared = client
+            .prepare_agent_request(&history, jagent::AgentProtocol::NativeTools, false)
+            .unwrap();
+
+        assert_eq!(prepared.protocol(), jagent::AgentProtocol::NativeTools);
+        assert!(prepared.report.redaction_enabled);
+        assert_eq!(prepared.report.history.changed_history_turns, 1);
+        assert!(!prepared.request.body.contains(secret));
+        assert!(prepared.request.body.contains("\"tools\""));
+        let response = prepared
+            .parse_response(
+                br#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"run","arguments":"{\"command\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+        assert_eq!(response.protocol(), jagent::AgentProtocol::NativeTools);
     }
 
     #[test]

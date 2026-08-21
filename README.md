@@ -9,16 +9,25 @@ The crate deliberately has no GUI-toolkit dependency. Frontends own widgets,
 rendering, and event-loop integration; this crate owns byte-level protocols,
 bounds, validation, and operating-system primitives.
 
-Version 0.2 adopts jagent 0.6's explicit wire boundary. Agent and conversation
-snapshots restore only through allocation-aware bounded decoders; their
-owning-string transcript values remain serialize-only. Non-streaming provider
-responses remain raw bytes until jagent checks its 1 MiB envelope ceiling.
+Version 0.2 adopts jagent 0.7's protocol-aware request boundary. Agent system
+prompt, Text/NativeTools schema, delivery mode, redaction report, response
+decoder, and session ingestion can travel as one bound path, while historical
+entry points remain compatible. Agent and conversation snapshots restore only
+through allocation-aware bounded decoders; their owning-string transcript
+values remain serialize-only. Non-streaming provider responses remain raw
+bytes until jagent checks its 1 MiB envelope ceiling.
 
 ## Shared surfaces
 
 - OSC/CSI/DCS/APC parsing, Kitty graphics framing, character widths, themes,
   the family keybinding grammar, and the four-way completed-block outcome
-  contract (background, success, failure, or unknown status).
+  contract (background, success, failure, or unknown status). Completion
+  provenance is tracked separately as shell-reported, journal-recovered,
+  boundary-inferred, or unknown, with one renderer-neutral lifecycle-health
+  mapping shared by every frontend. Strict ordinary-numeric `CSI 2 J` and
+  `CSI 3 J` sequences surface pre-feed `EraseDisplay`/`EraseScrollback`
+  barriers before their original bytes, so renderers can invalidate row
+  authority without rescanning arbitrary output.
 - PTY input guarding, review-only command insertion, child environments,
   process-group lifecycle management, and restorable-command quoting.
 - Private atomic snapshots, command history, jsh execution journals, pane

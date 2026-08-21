@@ -237,12 +237,7 @@ pub fn encode_key(key: KittyKey, mods: Modifiers, flags: u8) -> Option<Vec<u8>> 
 /// choosing a candidate. At the commit, a key the IME consumed never arrives,
 /// and composed text never matches a legacy form, so both stay untouched —
 /// only the bytes VTE emitted *for that key* are replaced.
-pub fn rewrite_commit(
-    key: KittyKey,
-    mods: Modifiers,
-    legacy: &[u8],
-    flags: u8,
-) -> Option<Vec<u8>> {
+pub fn rewrite_commit(key: KittyKey, mods: Modifiers, legacy: &[u8], flags: u8) -> Option<Vec<u8>> {
     let encoded = encode_key(key, mods, flags)?;
     legacy_form_matches(key, legacy).then_some(encoded)
 }
@@ -339,7 +334,11 @@ mod tests {
         stacks.leave_alt_screen();
         assert_eq!(stacks.flags(), 1, "back to the main stack, still pushed");
         stacks.enter_alt_screen();
-        assert_eq!(stacks.flags(), 0, "a crashed full-screen app left nothing behind");
+        assert_eq!(
+            stacks.flags(),
+            0,
+            "a crashed full-screen app left nothing behind"
+        );
         stacks.reset();
         assert_eq!(stacks, KittyKeyboardStacks::new());
     }
@@ -360,9 +359,16 @@ mod tests {
 
     #[test]
     fn nothing_is_encoded_without_the_disambiguate_flag() {
-        assert_eq!(encode_key(KittyKey::Escape, mods(false, false, false), 0), None);
         assert_eq!(
-            encode_key(KittyKey::Enter, mods(true, false, false), REPORT_EVENT_TYPES),
+            encode_key(KittyKey::Escape, mods(false, false, false), 0),
+            None
+        );
+        assert_eq!(
+            encode_key(
+                KittyKey::Enter,
+                mods(true, false, false),
+                REPORT_EVENT_TYPES
+            ),
             None
         );
     }
@@ -373,7 +379,10 @@ mod tests {
             encode_key(KittyKey::Enter, mods(true, false, false), 1).as_deref(),
             Some(&b"\x1b[13;2u"[..])
         );
-        assert_eq!(encode_key(KittyKey::Enter, mods(false, false, false), 1), None);
+        assert_eq!(
+            encode_key(KittyKey::Enter, mods(false, false, false), 1),
+            None
+        );
         assert_eq!(
             encode_key(KittyKey::Enter, mods(false, false, true), 1).as_deref(),
             Some(&b"\x1b[13;5u"[..])
@@ -382,12 +391,18 @@ mod tests {
             encode_key(KittyKey::Tab, mods(true, false, false), 1).as_deref(),
             Some(&b"\x1b[9;2u"[..])
         );
-        assert_eq!(encode_key(KittyKey::Tab, mods(false, false, false), 1), None);
+        assert_eq!(
+            encode_key(KittyKey::Tab, mods(false, false, false), 1),
+            None
+        );
         assert_eq!(
             encode_key(KittyKey::Backspace, mods(false, true, false), 1).as_deref(),
             Some(&b"\x1b[127;3u"[..])
         );
-        assert_eq!(encode_key(KittyKey::Backspace, mods(false, false, false), 1), None);
+        assert_eq!(
+            encode_key(KittyKey::Backspace, mods(false, false, false), 1),
+            None
+        );
     }
 
     #[test]
@@ -405,8 +420,14 @@ mod tests {
     #[test]
     fn text_keys_stay_text_until_ctrl_alt_or_super_is_held() {
         // Shift alone produces text; the VTE sends it.
-        assert_eq!(encode_key(KittyKey::Unicode('a'), mods(true, false, false), 1), None);
-        assert_eq!(encode_key(KittyKey::Space, mods(true, false, false), 1), None);
+        assert_eq!(
+            encode_key(KittyKey::Unicode('a'), mods(true, false, false), 1),
+            None
+        );
+        assert_eq!(
+            encode_key(KittyKey::Space, mods(true, false, false), 1),
+            None
+        );
         // Ctrl+c: no longer the raw 0x03 byte.
         assert_eq!(
             encode_key(KittyKey::Unicode('c'), mods(false, false, true), 1).as_deref(),
@@ -438,7 +459,10 @@ mod tests {
 
     #[test]
     fn functional_keys_keep_their_legacy_encoding() {
-        assert_eq!(encode_key(KittyKey::Functional, mods(true, true, true), 1), None);
+        assert_eq!(
+            encode_key(KittyKey::Functional, mods(true, true, true), 1),
+            None
+        );
     }
 
     #[test]
@@ -451,7 +475,12 @@ mod tests {
         // The IME used Enter to choose a candidate and committed text instead:
         // untouched.
         assert_eq!(
-            rewrite_commit(KittyKey::Enter, mods(true, false, false), "中".as_bytes(), 1),
+            rewrite_commit(
+                KittyKey::Enter,
+                mods(true, false, false),
+                "中".as_bytes(),
+                1
+            ),
             None
         );
         // Plain Esc.
@@ -461,18 +490,21 @@ mod tests {
         );
         // Ctrl+c is 0x03 in legacy; Alt+x is ESC x; Alt+Shift+a is ESC A.
         assert_eq!(
-            rewrite_commit(KittyKey::Unicode('c'), mods(false, false, true), b"\x03", 1)
-                .as_deref(),
+            rewrite_commit(KittyKey::Unicode('c'), mods(false, false, true), b"\x03", 1).as_deref(),
             Some(&b"\x1b[99;5u"[..])
         );
         assert_eq!(
-            rewrite_commit(KittyKey::Unicode('x'), mods(false, true, false), b"\x1bx", 1)
-                .as_deref(),
+            rewrite_commit(
+                KittyKey::Unicode('x'),
+                mods(false, true, false),
+                b"\x1bx",
+                1
+            )
+            .as_deref(),
             Some(&b"\x1b[120;3u"[..])
         );
         assert_eq!(
-            rewrite_commit(KittyKey::Unicode('a'), mods(true, true, false), b"\x1bA", 1)
-                .as_deref(),
+            rewrite_commit(KittyKey::Unicode('a'), mods(true, true, false), b"\x1bA", 1).as_deref(),
             Some(&b"\x1b[97;4u"[..])
         );
         // Shift+Tab arrives as back-tab.
@@ -487,7 +519,12 @@ mod tests {
         );
         // A commit that is not this key's legacy form is left alone.
         assert_eq!(
-            rewrite_commit(KittyKey::Unicode('c'), mods(false, false, true), b"hello", 1),
+            rewrite_commit(
+                KittyKey::Unicode('c'),
+                mods(false, false, true),
+                b"hello",
+                1
+            ),
             None
         );
         // And nothing happens without the flag.

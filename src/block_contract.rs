@@ -9,6 +9,66 @@
 //! The distinction between [`CompletedBlockOutcome::Success`] and
 //! [`CompletedBlockOutcome::Unknown`] is intentional. A bare `OSC 133;D` says
 //! that a command ended, but it does not say that the command exited zero.
+//!
+//! Completion *outcome* and completion *provenance* are deliberately
+//! orthogonal. A recovered journal record can carry a real non-zero exit code,
+//! while a shell-reported end mark can omit one. Frontends should classify the
+//! outcome with [`classify_completed`] and report lifecycle confidence with
+//! [`assess_lifecycle`] instead of deriving either value from the other.
+
+/// Evidence that caused a frontend to close one command block.
+///
+/// The variants are ordered conceptually, not by trust: a journal record is a
+/// durable recovery source, while an OSC end mark is the live shell source.
+/// Neither [`BoundaryInferred`](Self::BoundaryInferred) nor
+/// [`Unknown`](Self::Unknown) is permission to invent an exit status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CompletionProvenance {
+    /// The shell emitted the expected OSC 133 `D` end mark.
+    ShellReported,
+    /// A matching finished execution was recovered from jsh's journal.
+    JournalRecovered,
+    /// A later prompt, command start, PTY close, or similar boundary forced
+    /// the frontend to close a block whose end mark was missing.
+    BoundaryInferred,
+    /// There is no usable evidence explaining how or whether the command
+    /// completed.
+    Unknown,
+}
+
+/// Renderer-neutral health of a command block's observed lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlockLifecycleHealth {
+    /// Start and end marks were both observed through the live shell protocol.
+    Healthy,
+    /// Durable journal evidence repaired a missing or interrupted live
+    /// lifecycle.
+    Recovered,
+    /// The block was closed, but its live protocol lifecycle was incomplete.
+    Degraded,
+    /// No completion evidence is available; the block remains incomplete.
+    Incomplete,
+}
+
+/// Assess lifecycle health independently of command outcome.
+///
+/// `start_mark_seen` means the matching OSC 133 `C` was observed before the
+/// block. A shell end without its start and every boundary-inferred close are
+/// degraded. Journal recovery is reported distinctly even when the start mark
+/// survived, so a UI can explain that the live end event had to be repaired.
+#[must_use]
+pub const fn assess_lifecycle(
+    start_mark_seen: bool,
+    provenance: CompletionProvenance,
+) -> BlockLifecycleHealth {
+    match (start_mark_seen, provenance) {
+        (true, CompletionProvenance::ShellReported) => BlockLifecycleHealth::Healthy,
+        (_, CompletionProvenance::JournalRecovered) => BlockLifecycleHealth::Recovered,
+        (_, CompletionProvenance::BoundaryInferred)
+        | (false, CompletionProvenance::ShellReported) => BlockLifecycleHealth::Degraded,
+        (_, CompletionProvenance::Unknown) => BlockLifecycleHealth::Incomplete,
+    }
+}
 
 /// The semantic outcome of one completed command block.
 ///
@@ -88,7 +148,53 @@ pub fn classify_completed(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_completed, CompletedBlockOutcome};
+    use super::{
+        assess_lifecycle, classify_completed, BlockLifecycleHealth, CompletedBlockOutcome,
+        CompletionProvenance,
+    };
+
+    #[test]
+    fn lifecycle_health_exhaustively_maps_start_and_completion_evidence() {
+        use BlockLifecycleHealth::{Degraded, Healthy, Incomplete, Recovered};
+        use CompletionProvenance::{BoundaryInferred, JournalRecovered, ShellReported, Unknown};
+
+        let cases = [
+            (true, ShellReported, Healthy),
+            (false, ShellReported, Degraded),
+            (true, JournalRecovered, Recovered),
+            (false, JournalRecovered, Recovered),
+            (true, BoundaryInferred, Degraded),
+            (false, BoundaryInferred, Degraded),
+            (true, Unknown, Incomplete),
+            (false, Unknown, Incomplete),
+        ];
+
+        for (start_seen, provenance, expected) in cases {
+            assert_eq!(
+                assess_lifecycle(start_seen, provenance),
+                expected,
+                "start_seen={start_seen}, provenance={provenance:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_never_changes_the_four_way_outcome() {
+        use CompletionProvenance::{BoundaryInferred, JournalRecovered, ShellReported, Unknown};
+
+        let provenances = [ShellReported, JournalRecovered, BoundaryInferred, Unknown];
+        for provenance in provenances {
+            let _health = assess_lifecycle(true, provenance);
+            assert_eq!(
+                classify_completed(Some("false"), None),
+                CompletedBlockOutcome::Unknown
+            );
+            assert_eq!(
+                classify_completed(Some("false"), Some(7)),
+                CompletedBlockOutcome::Failed(7)
+            );
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct GoldenCase {

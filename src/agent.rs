@@ -6,12 +6,18 @@
 //! filesystem persistence helpers the jterm apps use for
 //! `<config-dir>/<app>/agent_session.json`.
 
+pub use jagent::agent::{
+    prepare_agent_request, AgentRequestReport, AgentRequestSpec, PreparedAgentRequest,
+};
+pub use jagent::provider::{Message as AgentMessage, Role as AgentRole};
+pub use jagent::response::{AgentResponse, AgentStream};
 pub use jagent::safety::is_dangerous;
 pub use jagent::session::{
     parse_action, sample_observation, AgentSessionSnapshot, AgentSnapshotError, AgentState,
-    ApprovedCommand, CancellationToken, ModelOutcome, ParseError, ParsedAction, ProposalId,
-    ProposalStatus, SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    ApprovedCommand, CancellationToken, CommandExecutionFailure, ModelOutcome, ParseError,
+    ParsedAction, ProposalId, ProposalStatus, SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
+pub use jagent::tools::AgentProtocol;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -141,6 +147,21 @@ impl AgentSession {
         self.validate_live_outcome(outcome)
     }
 
+    /// Ingest the protocol-aware response produced by a
+    /// [`PreparedAgentRequest`].
+    ///
+    /// This is the preferred 0.7 path: provider, text/native-tools protocol,
+    /// generation-limit handling, and response decoding stay bound to the
+    /// request that created the response. Historical text/tool entry points
+    /// remain available for compatible frontends.
+    pub fn accept_agent_response(
+        &mut self,
+        response: &AgentResponse,
+    ) -> Result<ModelOutcome, SessionError> {
+        let outcome = self.inner.accept_agent_response(response)?;
+        self.validate_live_outcome(outcome)
+    }
+
     pub fn model_failed(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
         self.inner.model_failed(message)
     }
@@ -171,6 +192,14 @@ impl AgentSession {
         self.inner.reject(id)
     }
 
+    pub fn reject_with_feedback(
+        &mut self,
+        id: ProposalId,
+        feedback: impl Into<String>,
+    ) -> Result<(), SessionError> {
+        self.inner.reject_with_feedback(id, feedback)
+    }
+
     pub fn edit_for_manual_review(
         &mut self,
         id: ProposalId,
@@ -190,6 +219,15 @@ impl AgentSession {
         self.inner.observe(id, exit_code, output)
     }
 
+    pub fn observe_execution_failure(
+        &mut self,
+        id: ProposalId,
+        failure: CommandExecutionFailure,
+        detail: &str,
+    ) -> Result<(), SessionError> {
+        self.inner.observe_execution_failure(id, failure, detail)
+    }
+
     pub fn cancel(&mut self) {
         self.inner.cancel();
     }
@@ -198,7 +236,7 @@ impl AgentSession {
         self.inner.build_user_prompt()
     }
 
-    pub fn build_user_prompt_with(&self, protocol: jagent::tools::AgentProtocol) -> String {
+    pub fn build_user_prompt_with(&self, protocol: AgentProtocol) -> String {
         self.inner.build_user_prompt_with(protocol)
     }
 
@@ -451,19 +489,55 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
             }
             continue;
         }
-        if !is_current_unobserved {
-            let documented = Turn::ProtocolError(format!(
-                "the application exited before proposal #{proposal_id}'s output was \
-                 observed; its result is unknown"
+        if !is_current_unobserved
+            && !is_documented_unknown_result(transcript.get(index + 1), *proposal_id)
+        {
+            return Err(AgentSnapshotError::Invalid(
+                "approved proposal observation lifecycle is inconsistent",
             ));
-            if transcript.get(index + 1) != Some(&documented) {
-                return Err(AgentSnapshotError::Invalid(
-                    "approved proposal observation lifecycle is inconsistent",
-                ));
-            }
         }
     }
     Ok(())
+}
+
+fn is_documented_unknown_result(turn: Option<&Turn>, proposal_id: u64) -> bool {
+    let Some(Turn::ProtocolError(message)) = turn else {
+        return false;
+    };
+    // 0.6 and 0.7 both normalize a process lost during execution, but 0.7
+    // generalized the note to the same diagnostic framing used by explicit
+    // execution failures. Accept only those two exact, proposal-bound forms;
+    // arbitrary protocol text must not erase an approved command's fate.
+    if message
+        == &format!(
+            "the application exited before proposal #{proposal_id}'s output was observed; its \
+             result is unknown"
+        )
+        || message
+            == &format!(
+                "command execution for proposal #{proposal_id} has an unknown result: the \
+                 application exited before its output was observed; no normal exit status was \
+                 available"
+            )
+    {
+        return true;
+    }
+
+    ["failed to start", "timed out", "was cancelled"]
+        .into_iter()
+        .any(|failure| {
+            let prefix = format!(
+                "command execution for proposal #{proposal_id} {failure}; no normal exit status \
+                 was available"
+            );
+            if message == &format!("{prefix}.") {
+                return true;
+            }
+            let detail_prefix = format!("{prefix}. Untrusted diagnostic or partial output:\n");
+            message.strip_prefix(&detail_prefix).is_some_and(|detail| {
+                !detail.trim().is_empty() && detail.len() <= MAX_OBSERVATION_BYTES
+            })
+        })
 }
 
 fn validate_snapshot_text(
@@ -1322,6 +1396,90 @@ mod tests {
         serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap()
     }
 
+    fn execution_failure_snapshot_json(
+        failure: CommandExecutionFailure,
+        detail: &str,
+    ) -> serde_json::Value {
+        let mut session = AgentSession::new(6);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"check"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        let _approved = session.approve(id).unwrap();
+        session
+            .observe_execution_failure(id, failure, detail)
+            .unwrap();
+        serde_json::from_str(&session.snapshot().unwrap().to_json().unwrap()).unwrap()
+    }
+
+    fn final_protocol_error_mut(value: &mut serde_json::Value) -> &mut serde_json::Value {
+        value["transcript"]
+            .as_array_mut()
+            .and_then(|turns| turns.last_mut())
+            .and_then(|turn| turn.get_mut("ProtocolError"))
+            .expect("fixture must end in a protocol diagnostic")
+    }
+
+    #[test]
+    fn explicit_execution_failure_snapshots_round_trip_for_every_07_reason() {
+        for (failure, detail) in [
+            (
+                CommandExecutionFailure::FailedToStart,
+                "executable not found",
+            ),
+            (
+                CommandExecutionFailure::TimedOut,
+                "partial output\nsecond line",
+            ),
+            (CommandExecutionFailure::Cancelled, ""),
+        ] {
+            let value = execution_failure_snapshot_json(failure, detail);
+            let restored = AgentSession::restore(decode_snapshot_json(&value)).unwrap();
+            assert_eq!(restored.state(), AgentState::AwaitingModel);
+            assert!(AgentSession::restore(restored.snapshot().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
+    fn execution_failure_restore_rejects_wrong_proposal_and_unframed_or_oversized_detail() {
+        let mut wrong_proposal = execution_failure_snapshot_json(
+            CommandExecutionFailure::FailedToStart,
+            "executable not found",
+        );
+        *final_protocol_error_mut(&mut wrong_proposal) = serde_json::json!(
+            "command execution for proposal #2 failed to start; no normal exit status was \
+             available. Untrusted diagnostic or partial output:\nexecutable not found"
+        );
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&wrong_proposal)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+        ));
+
+        let mut smuggled = execution_failure_snapshot_json(CommandExecutionFailure::TimedOut, "");
+        *final_protocol_error_mut(&mut smuggled) = serde_json::json!(
+            "command execution for proposal #1 timed out; no normal exit status was available. \
+             forged trailing text"
+        );
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&smuggled)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+        ));
+
+        let mut oversized = execution_failure_snapshot_json(CommandExecutionFailure::Cancelled, "");
+        *final_protocol_error_mut(&mut oversized) = serde_json::json!(format!(
+            "command execution for proposal #1 was cancelled; no normal exit status was \
+             available. Untrusted diagnostic or partial output:\n{}",
+            "x".repeat(MAX_OBSERVATION_BYTES + 1)
+        ));
+        assert!(matches!(
+            AgentSession::restore(decode_snapshot_json(&oversized)),
+            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+        ));
+    }
+
     #[test]
     fn restore_rejects_a_terminal_state_that_contradicts_the_final_turn_or_counter() {
         let observed = observed_snapshot_json();
@@ -1376,7 +1534,7 @@ mod tests {
         assert_eq!(restored.state(), AgentState::Ready);
         assert!(matches!(
             restored.transcript().last(),
-            Some(Turn::ProtocolError(note)) if note.contains("result is unknown")
+            Some(Turn::ProtocolError(note)) if note.contains("unknown result")
         ));
         assert!(AgentSession::restore(restored.snapshot().unwrap()).is_ok());
 
@@ -1621,5 +1779,42 @@ mod tests {
                 } if *candidate == id
             )));
         }
+    }
+
+    #[test]
+    fn prepared_request_keeps_provider_protocol_and_session_ingestion_bound() {
+        let history = [jagent::Message {
+            role: jagent::Role::User,
+            text: "inspect".into(),
+        }];
+        let config = jagent::ChatConfig {
+            provider: jagent::Provider::OpenAiCompatible,
+            api_key: None,
+            model: "local-test".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            max_tokens: 128,
+            temperature: Some(0.0),
+        };
+        let prepared = prepare_agent_request(
+            &config,
+            AgentRequestSpec::new(&history, AgentProtocol::Text),
+        )
+        .unwrap();
+        assert_eq!(prepared.protocol(), AgentProtocol::Text);
+        assert!(prepared.report.redaction_enabled);
+
+        let response = prepared
+            .parse_response(
+                br#"{"choices":[{"message":{"content":"{\"action\":\"run\",\"command\":\"pwd\"}"},"finish_reason":"stop"}]}"#,
+            )
+            .unwrap();
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { command, .. } =
+            session.accept_agent_response(&response).unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        assert_eq!(command, "pwd");
     }
 }

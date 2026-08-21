@@ -136,6 +136,12 @@ pub enum ParserEvent {
     /// OSC 110/111/112 — the app reset a dynamic color back to the default.
     /// Bytes also pass through; the caller drops its tracked dynamic value.
     ColorReset(ColorKind),
+    /// `CSI 2 J` / `CSI 02 J` — erase the complete display using an ordinary,
+    /// all-digit ED parameter. Emitted immediately before the complete sequence
+    /// is passed through as [`Self::Bytes`], so callers can invalidate visible
+    /// row authority using the pre-feed mapping. Private, compound, colon and
+    /// intermediate forms are deliberately not promoted to this semantic event.
+    EraseDisplay,
     /// `CSI 3 J` / `CSI 03 J` — xterm erase-scrollback. Emitted immediately
     /// before the complete sequence is passed through as [`Self::Bytes`], so
     /// callers can invalidate row authority using the pre-feed ring mapping.
@@ -267,18 +273,27 @@ fn alt_screen_mode(params: &[u8]) -> Option<u32> {
     }
 }
 
-/// True only for the ordinary (non-private, no-intermediate) ED parameter
-/// whose numeric value is 3. Extra parameter fields are deliberately rejected:
-/// the lifecycle side effect must not fire for a malformed/lookalike CSI that
-/// VTE may interpret differently.
-fn is_erase_scrollback(params: &[u8]) -> bool {
+/// True only for an ordinary (non-private, no-intermediate) CSI parameter with
+/// exactly the requested numeric value. Extra parameter fields are deliberately
+/// rejected: a semantic side effect must not fire for a malformed/lookalike CSI
+/// that VTE may interpret differently. Saturation prevents a hostile oversized
+/// parameter from wrapping back onto a recognized value.
+fn is_ordinary_numeric_param(params: &[u8], expected: u32) -> bool {
     !params.is_empty()
         && params.iter().all(u8::is_ascii_digit)
         && params.iter().fold(0_u32, |value, digit| {
             value
                 .saturating_mul(10)
                 .saturating_add(u32::from(*digit - b'0'))
-        }) == 3
+        }) == expected
+}
+
+fn is_erase_display(params: &[u8]) -> bool {
+    is_ordinary_numeric_param(params, 2)
+}
+
+fn is_erase_scrollback(params: &[u8]) -> bool {
+    is_ordinary_numeric_param(params, 3)
 }
 
 fn is_mouse_reporting_mode(params: &[u8]) -> bool {
@@ -561,11 +576,17 @@ impl Parser {
                                 });
                             }
                         }
+                        let erase_display = b == b'J' && is_erase_display(&params);
                         let erase_scrollback = b == b'J' && is_erase_scrollback(&params);
-                        if erase_scrollback {
+                        let erase_barrier = erase_display || erase_scrollback;
+                        if erase_barrier {
                             flush!();
-                            events.push(ParserEvent::EraseScrollback);
-                            // Like RIS, ED3 must reach VTE before any suffix
+                            events.push(if erase_display {
+                                ParserEvent::EraseDisplay
+                            } else {
+                                ParserEvent::EraseScrollback
+                            });
+                            // Like RIS, ED2/ED3 must reach VTE before any suffix
                             // event from this same feed is dispatched.
                             let mut sequence = Vec::with_capacity(params.len() + 3);
                             sequence.extend_from_slice(b"\x1b[");
@@ -591,7 +612,7 @@ impl Parser {
                             && is_focus_reporting_mode(&params)
                         {
                             // Drop: keep VTE out of focus reporting mode.
-                        } else if !erase_scrollback {
+                        } else if !erase_barrier {
                             // Detect terminal-capability handshakes whose response
                             // the active VTE would write back through its own PTY
                             // (which is not connected). The caller synthesizes a
@@ -613,14 +634,14 @@ impl Parser {
                                     ));
                                 }
                                 (b'u', p) if p.first() == Some(&b'>') => {
-                                    events.push(ParserEvent::KittyKeyboard(
-                                        KittyKeyboardOp::Push(csi_u8_param(&p[1..])),
-                                    ));
+                                    events.push(ParserEvent::KittyKeyboard(KittyKeyboardOp::Push(
+                                        csi_u8_param(&p[1..]),
+                                    )));
                                 }
                                 (b'u', p) if p.first() == Some(&b'<') => {
-                                    events.push(ParserEvent::KittyKeyboard(
-                                        KittyKeyboardOp::Pop(csi_u8_param(&p[1..])),
-                                    ));
+                                    events.push(ParserEvent::KittyKeyboard(KittyKeyboardOp::Pop(
+                                        csi_u8_param(&p[1..]),
+                                    )));
                                 }
                                 (b'u', p) if p.first() == Some(&b'=') => {
                                     let mut fields = p[1..].split(|&c| c == b';');
@@ -630,9 +651,10 @@ impl Parser {
                                         .map(csi_u8_param)
                                         .filter(|mode| *mode != 0)
                                         .unwrap_or(1);
-                                    events.push(ParserEvent::KittyKeyboard(
-                                        KittyKeyboardOp::Set { flags, mode },
-                                    ));
+                                    events.push(ParserEvent::KittyKeyboard(KittyKeyboardOp::Set {
+                                        flags,
+                                        mode,
+                                    }));
                                 }
                                 (b'm', b"?4") => {
                                     events.push(ParserEvent::KeyboardProtocolQuery(
@@ -1289,8 +1311,10 @@ mod tests {
     }
 
     #[test]
-    fn ed3_and_ris_are_pre_feed_coalescing_barriers() {
+    fn ed2_ed3_and_ris_are_pre_feed_coalescing_barriers() {
         for (sequence, semantic) in [
+            (b"\x1b[2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x1b[02J".as_slice(), ParserEvent::EraseDisplay),
             (b"\x1b[3J".as_slice(), ParserEvent::EraseScrollback),
             (b"\x1b[03J".as_slice(), ParserEvent::EraseScrollback),
             (b"\x1bc".as_slice(), ParserEvent::HardReset),
@@ -1310,44 +1334,52 @@ mod tests {
     }
 
     #[test]
-    fn reset_boundaries_survive_every_byte_split_and_ignore_lookalikes() {
-        for sequence in [b"\x1b[3J".as_slice(), b"\x1b[03J", b"\x1bc"] {
-            let mut parser = Parser::new();
-            let mut events = Vec::new();
-            for byte in sequence {
-                parser.feed(std::slice::from_ref(byte), &mut events);
+    fn reset_boundaries_survive_every_byte_split() {
+        for (sequence, semantic) in [
+            (b"\x1b[2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x1b[02J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x1b[3J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\x1b[03J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\x1bc".as_slice(), ParserEvent::HardReset),
+        ] {
+            for split in 0..=sequence.len() {
+                let mut parser = Parser::new();
+                let mut events = Vec::new();
+                parser.feed(&sequence[..split], &mut events);
+                parser.feed(&sequence[split..], &mut events);
+                assert_eq!(
+                    events.iter().filter(|event| **event == semantic).count(),
+                    1,
+                    "sequence={sequence:?}, split={split}, events={events:?}"
+                );
+                assert_eq!(collect_bytes(&events), sequence);
             }
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(
-                        event,
-                        ParserEvent::EraseScrollback | ParserEvent::HardReset
-                    ))
-                    .count(),
-                1
-            );
-            assert_eq!(collect_bytes(&events), sequence);
         }
+    }
 
+    #[test]
+    fn erase_events_reject_nonordinary_and_control_string_lookalikes() {
         let mut parser = Parser::new();
         let mut events = Vec::new();
-        // Exercise unrelated ED lookalikes and the discarded PM/SOS strings
-        // one byte at a time. PM/SOS only end at ST, so BEL stays inert. ESC c
-        // is intentionally covered by the abort-and-reprocess tests below.
-        for byte in b"\x1b[2J\x1b[?3J\x1b[3;0J\x1b[3:0J\x1b[3 J\x1b[3K\x1b]0;inside [3J\x07\x1b^inside \x07 still inside\x1b\\\x1bXinside \x07 still inside\x1b\\"
+        // Every form here either has a non-ordinary parameter grammar, a
+        // different final, or merely spells "[2J" as inert control-string
+        // payload. Feed one byte at a time so no chunk boundary can promote a
+        // lookalike into a semantic event.
+        for byte in b"\x1b[J\x1b[?2J\x1b[>2J\x1b[2;0J\x1b[2:0J\x1b[2 J\x1b[2K\x1b[42949672962J\x1b[?3J\x1b[3;0J\x1b[3:0J\x1b[3 J\x1b[3K\x1b]0;inside [2J and [3J\x07\x1b_Ga=T;inside [2J and [3J\x1b\\\x1bPqinside [2J and [3J\x1b\\\x1b^inside [2J and [3J\x1b\\\x1bXinside [2J and [3J\x1b\\"
         {
             parser.feed(std::slice::from_ref(byte), &mut events);
         }
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, ParserEvent::EraseScrollback | ParserEvent::HardReset)));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            ParserEvent::EraseDisplay | ParserEvent::EraseScrollback
+        )));
     }
 
     #[test]
     fn reset_raw_bytes_are_an_immediate_barrier_before_suffix_semantics() {
         for (reset, semantic) in [
             (b"\x1bc".as_slice(), ParserEvent::HardReset),
+            (b"\x1b[2J".as_slice(), ParserEvent::EraseDisplay),
             (b"\x1b[3J".as_slice(), ParserEvent::EraseScrollback),
         ] {
             let mut parser = Parser::new();
@@ -1546,17 +1578,22 @@ mod tests {
     }
 
     #[test]
-    fn ed3_parameter_past_u32_saturates_away_from_erase_scrollback() {
-        let mut parser = Parser::new();
-        let mut events = Vec::new();
-        // 42949672963 > u32::MAX: the accumulator must saturate, never wrap
-        // back onto the value 3 and fire the scrollback side effect for a
-        // parameter the active VTE will not read as ED3 either.
-        parser.feed(b"\x1b[42949672963J", &mut events);
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, ParserEvent::EraseScrollback)));
-        assert_eq!(collect_bytes(&events), b"\x1b[42949672963J");
+    fn erase_parameter_past_u32_saturates_away_from_semantic_events() {
+        for (sequence, semantic) in [
+            (b"\x1b[42949672962J".as_slice(), ParserEvent::EraseDisplay),
+            (
+                b"\x1b[42949672963J".as_slice(),
+                ParserEvent::EraseScrollback,
+            ),
+        ] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            // The accumulator must saturate, never wrap onto a recognized
+            // value and fire a side effect VTE would not interpret as ED2/ED3.
+            parser.feed(sequence, &mut events);
+            assert!(events.iter().all(|event| *event != semantic));
+            assert_eq!(collect_bytes(&events), sequence);
+        }
     }
 
     #[test]
@@ -1927,7 +1964,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ops, vec![KittyKeyboardOp::Push(255), KittyKeyboardOp::Pop(255)]);
+        assert_eq!(
+            ops,
+            vec![KittyKeyboardOp::Push(255), KittyKeyboardOp::Pop(255)]
+        );
     }
 
     #[test]
