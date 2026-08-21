@@ -23,6 +23,11 @@ the provider alias `AgentProvider`, and the
 `AGENT_CAPABILITIES_*`/`MAX_AGENT_CAPABILITIES_WIRE_BYTES` constants. Frontends
 can therefore parse and negotiate a bounded peer token without depending on
 jagent through a second public path or transporting credentials.
+The facade also re-exports jagent's `CommandExecutionOutcome`, peer-aware v2
+capability helpers, and `AgentSession::observe_execution`, so a frontend can
+report a real exit separately from failed start, timeout, or cancellation
+without inventing an exit code. Compatibility-first discovery still emits v1;
+v2 is selected only for a peer that has already advertised v2 support.
 
 ## Shared surfaces
 

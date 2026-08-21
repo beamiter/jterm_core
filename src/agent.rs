@@ -10,16 +10,18 @@ pub use jagent::agent::{
     prepare_agent_request, AgentRequestReport, AgentRequestSpec, PreparedAgentRequest,
 };
 pub use jagent::capabilities::{
-    agent_capabilities, AgentCapabilities, AgentDelivery, CapabilityError,
-    AGENT_CAPABILITIES_V1_WIRE, AGENT_CAPABILITIES_VERSION, MAX_AGENT_CAPABILITIES_WIRE_BYTES,
+    agent_capabilities, agent_capabilities_for_peer, agent_capabilities_v2, AgentCapabilities,
+    AgentDelivery, CapabilityError, AGENT_CAPABILITIES_V1_WIRE, AGENT_CAPABILITIES_V2_WIRE,
+    AGENT_CAPABILITIES_VERSION, MAX_AGENT_CAPABILITIES_WIRE_BYTES,
 };
 pub use jagent::provider::{Message as AgentMessage, Provider as AgentProvider, Role as AgentRole};
 pub use jagent::response::{AgentResponse, AgentStream};
 pub use jagent::safety::is_dangerous;
 pub use jagent::session::{
     parse_action, sample_observation, AgentSessionSnapshot, AgentSnapshotError, AgentState,
-    ApprovedCommand, CancellationToken, CommandExecutionFailure, ModelOutcome, ParseError,
-    ParsedAction, ProposalId, ProposalStatus, SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    ApprovedCommand, CancellationToken, CommandExecutionFailure, CommandExecutionOutcome,
+    ModelOutcome, ParseError, ParsedAction, ProposalId, ProposalStatus, SessionError, Turn,
+    MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
 pub use jagent::tools::AgentProtocol;
 use std::collections::{HashMap, HashSet};
@@ -221,6 +223,16 @@ impl AgentSession {
         output: &str,
     ) -> Result<(), SessionError> {
         self.inner.observe(id, exit_code, output)
+    }
+
+    /// Ingest the executor's typed result without synthesizing a status for
+    /// start, timeout, or cancellation failures.
+    pub fn observe_execution(
+        &mut self,
+        id: ProposalId,
+        outcome: CommandExecutionOutcome,
+    ) -> Result<(), SessionError> {
+        self.inner.observe_execution(id, outcome)
     }
 
     pub fn observe_execution_failure(
@@ -1824,8 +1836,9 @@ mod tests {
 
     #[test]
     fn capability_negotiation_is_available_through_the_core_facade() {
-        assert_eq!(AGENT_CAPABILITIES_VERSION, 1);
+        assert_eq!(AGENT_CAPABILITIES_VERSION, 2);
         assert!(AGENT_CAPABILITIES_V1_WIRE.len() <= MAX_AGENT_CAPABILITIES_WIRE_BYTES);
+        assert!(AGENT_CAPABILITIES_V2_WIRE.len() <= MAX_AGENT_CAPABILITIES_WIRE_BYTES);
 
         let peer = AgentCapabilities::from_wire("jagent-agent/1;protocols=text;delivery=complete")
             .unwrap();
@@ -1837,6 +1850,7 @@ mod tests {
         );
 
         let local = agent_capabilities(AgentProvider::OpenAiCompatible);
+        assert_eq!(local.version(), 1);
         assert_eq!(
             local.negotiate_with(
                 peer,
@@ -1845,5 +1859,51 @@ mod tests {
             ),
             Some(AgentProtocol::Text)
         );
+
+        let v2_peer = AgentCapabilities::from_wire(AGENT_CAPABILITIES_V2_WIRE).unwrap();
+        assert_eq!(
+            agent_capabilities_v2(AgentProvider::OpenAiCompatible).version(),
+            2
+        );
+        assert_eq!(
+            agent_capabilities_for_peer(AgentProvider::OpenAiCompatible, v2_peer).version(),
+            2
+        );
+    }
+
+    #[test]
+    fn typed_execution_outcomes_cross_the_hardened_facade_and_restore() {
+        for outcome in [
+            CommandExecutionOutcome::exited(17, "real output"),
+            CommandExecutionOutcome::failed(
+                CommandExecutionFailure::FailedToStart,
+                "spawn boundary refused the child",
+            ),
+        ] {
+            let expected_exit = outcome.exit_code();
+            let expected_failure = outcome.failure();
+            let mut session = AgentSession::new(4);
+            session.submit_user("inspect").unwrap();
+            let ModelOutcome::Proposal { id, .. } = session
+                .accept_model_reply(r#"{"action":"run","command":"check"}"#)
+                .unwrap()
+            else {
+                panic!("expected proposal")
+            };
+            let _approved = session.approve(id).unwrap();
+            session.observe_execution(id, outcome).unwrap();
+
+            match (expected_exit, expected_failure, session.transcript().last()) {
+                (Some(17), None, Some(Turn::Observation { exit_code: 17, .. })) => {}
+                (
+                    None,
+                    Some(CommandExecutionFailure::FailedToStart),
+                    Some(Turn::ProtocolError(message)),
+                ) if message.contains("no normal exit status") => {}
+                unexpected => panic!("unexpected execution transcript: {unexpected:?}"),
+            }
+            let snapshot = session.snapshot().unwrap();
+            assert!(AgentSession::restore(snapshot).is_ok());
+        }
     }
 }
