@@ -42,6 +42,8 @@ pub enum ColorKind {
     Palette(u8),
 }
 
+pub use crate::kitty_keyboard::KittyKeyboardOp;
+
 /// Which terminal-capability handshake an app sent. The active VTE in block view
 /// has no real PTY return path, so we synthesize a sensible "not supported"
 /// reply ourselves to keep neovim/helix from blocking on a missing response.
@@ -141,6 +143,11 @@ pub enum ParserEvent {
     /// RIS (`ESC c`) — hard terminal reset. Like [`Self::EraseScrollback`],
     /// this is a byte-coalescing barrier emitted before the raw sequence.
     HardReset,
+    /// Kitty keyboard protocol flag-stack operation — `CSI > flags u` (push),
+    /// `CSI < n u` (pop), `CSI = flags ; mode u` (set). The bytes still pass
+    /// through; the caller owns the stacks (see [`crate::kitty_keyboard`])
+    /// and must answer the matching `CSI ? u` query from them.
+    KittyKeyboard(KittyKeyboardOp),
 }
 
 /// Longest accepted OSC 10/11/12 color spec. X11 names and rgb: forms are
@@ -291,6 +298,17 @@ fn is_mouse_reporting_mode(params: &[u8]) -> bool {
 
 fn is_focus_reporting_mode(params: &[u8]) -> bool {
     matches!(params, b"?1004")
+}
+
+/// A small decimal CSI parameter. Non-digits end the number; an absent one is
+/// zero, and the value saturates so a hostile width cannot wrap.
+fn csi_u8_param(digits: &[u8]) -> u8 {
+    digits
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .fold(0_u8, |value, digit| {
+            value.saturating_mul(10).saturating_add(digit - b'0')
+        })
 }
 
 impl Default for Parser {
@@ -592,6 +610,28 @@ impl Parser {
                                 (b'u', b"?") => {
                                     events.push(ParserEvent::KeyboardProtocolQuery(
                                         KeyboardProtocolQuery::KittyQuery,
+                                    ));
+                                }
+                                (b'u', p) if p.first() == Some(&b'>') => {
+                                    events.push(ParserEvent::KittyKeyboard(
+                                        KittyKeyboardOp::Push(csi_u8_param(&p[1..])),
+                                    ));
+                                }
+                                (b'u', p) if p.first() == Some(&b'<') => {
+                                    events.push(ParserEvent::KittyKeyboard(
+                                        KittyKeyboardOp::Pop(csi_u8_param(&p[1..])),
+                                    ));
+                                }
+                                (b'u', p) if p.first() == Some(&b'=') => {
+                                    let mut fields = p[1..].split(|&c| c == b';');
+                                    let flags = csi_u8_param(fields.next().unwrap_or(b""));
+                                    let mode = fields
+                                        .next()
+                                        .map(csi_u8_param)
+                                        .filter(|mode| *mode != 0)
+                                        .unwrap_or(1);
+                                    events.push(ParserEvent::KittyKeyboard(
+                                        KittyKeyboardOp::Set { flags, mode },
                                     ));
                                 }
                                 (b'm', b"?4") => {
@@ -1828,6 +1868,66 @@ mod tests {
                 KeyboardProtocolQuery::SecondaryDeviceAttributes,
             ]
         );
+    }
+
+    #[test]
+    fn kitty_keyboard_stack_operations_emit_events_and_pass_through() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        // codex/kimi push 7 and query; a pop, a bare pop, and the three set modes.
+        p.feed(
+            b"\x1b[>7u\x1b[?u\x1b[<2u\x1b[<u\x1b[=1;2u\x1b[=5;3u\x1b[=3u\x1b[>u",
+            &mut events,
+        );
+        let ops: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::KittyKeyboard(op) => Some(*op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                KittyKeyboardOp::Push(7),
+                KittyKeyboardOp::Pop(2),
+                KittyKeyboardOp::Pop(0),
+                KittyKeyboardOp::Set { flags: 1, mode: 2 },
+                KittyKeyboardOp::Set { flags: 5, mode: 3 },
+                KittyKeyboardOp::Set { flags: 3, mode: 1 },
+                KittyKeyboardOp::Push(0),
+            ]
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ParserEvent::KeyboardProtocolQuery(KeyboardProtocolQuery::KittyQuery)
+        )));
+        // Every sequence still reaches the surface verbatim.
+        let passed: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::Bytes(b) => Some(b.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(passed.windows(5).any(|w| w == b"\x1b[>7u"));
+        assert!(passed.windows(7).any(|w| w == b"\x1b[=1;2u"));
+    }
+
+    #[test]
+    fn kitty_keyboard_parameters_saturate_instead_of_wrapping() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[>99999999999999999999u\x1b[<300u", &mut events);
+        let ops: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::KittyKeyboard(op) => Some(*op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ops, vec![KittyKeyboardOp::Push(255), KittyKeyboardOp::Pop(255)]);
     }
 
     #[test]

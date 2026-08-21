@@ -25,6 +25,7 @@ pub mod jsh_install;
 pub mod jsh_remote;
 pub mod keybindings;
 pub mod kitty_graphics;
+pub mod kitty_keyboard;
 pub mod link;
 pub mod notebook_text;
 pub mod notify;
