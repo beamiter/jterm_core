@@ -55,12 +55,15 @@ canonical gate.
 
 - `ParserEvent::EraseDisplay` extends the same pre-feed barrier contract to
   ordinary all-digit `CSI 2 J` (including zero-padded `CSI 02 J`). The parser
-  flushes earlier bytes, emits the semantic event, then emits the exact ED2
-  sequence as its own `Bytes` event before any suffix semantics. Private,
-  compound, colon, intermediate, overflow, wrong-final, and control-string
-  lookalikes remain ordinary payload/pass-through and never gain the event.
-  Frontends pinned to an older core revision keep their local compatibility
-  detection until this API is published and their dependency pins can move.
+  now preserves and recognizes `ESC [`, raw C1 `9B`, and UTF-8 U+009B
+  (`C2 9B`) introducers for both ED2 and ED3. It flushes earlier bytes, emits
+  the semantic event, then emits the exact control bytes before any suffix
+  semantics. A three-byte Ground suffix window distinguishes C1 from `9B`
+  continuation bytes inside ordinary two-, three-, and four-byte UTF-8 text
+  without abandoning the bulk-copy fast path. Private, compound, colon,
+  intermediate, overflow, wrong-final, and control-string lookalikes remain
+  ordinary payload/pass-through and never gain the event; exhaustive split
+  tests pin raw bytes and event ordering across every introducer form.
 
 - Three forge-only additions are upstreamed so forge can delete its diverged
   local copies. `review_input::is_visual_spoofing_character` now keeps the

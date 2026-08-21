@@ -34,10 +34,12 @@ jagent through a second public path or transporting credentials.
   mapping shared by every frontend. Both lifecycle enums expose stable,
   dependency-free `schema_name()` spellings so a frontend can re-export them
   without changing its existing diagnostic or JSON call surface. Strict
-  ordinary-numeric `CSI 2 J` and
-  `CSI 3 J` sequences surface pre-feed `EraseDisplay`/`EraseScrollback`
-  barriers before their original bytes, so renderers can invalidate row
-  authority without rescanning arbitrary output.
+  ordinary-numeric `CSI 2 J` and `CSI 3 J` sequences surface pre-feed
+  `EraseDisplay`/`EraseScrollback` barriers before their original bytes, for
+  `ESC [`, raw C1 `9B`, and UTF-8 U+009B (`C2 9B`) introducers. A bounded
+  Ground-state UTF-8 suffix classifier prevents an unrelated continuation
+  byte `9B` inside normal Unicode text from becoming a control event, so
+  renderers can invalidate row authority without rescanning arbitrary output.
 - PTY input guarding, review-only command insertion, child environments,
   process-group lifecycle management, and restorable-command quoting.
 - Private atomic snapshots, command history, jsh execution journals, pane

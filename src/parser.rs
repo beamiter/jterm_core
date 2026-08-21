@@ -137,14 +137,15 @@ pub enum ParserEvent {
     /// Bytes also pass through; the caller drops its tracked dynamic value.
     ColorReset(ColorKind),
     /// `CSI 2 J` / `CSI 02 J` — erase the complete display using an ordinary,
-    /// all-digit ED parameter. Emitted immediately before the complete sequence
-    /// is passed through as [`Self::Bytes`], so callers can invalidate visible
-    /// row authority using the pre-feed mapping. Private, compound, colon and
-    /// intermediate forms are deliberately not promoted to this semantic event.
+    /// all-digit ED parameter. Both `ESC [` and C1 (`9B` or UTF-8 `C2 9B`)
+    /// introducers are recognized. Emitted immediately before the complete,
+    /// byte-exact sequence is passed through as [`Self::Bytes`], so callers can
+    /// invalidate visible row authority using the pre-feed mapping. Private,
+    /// compound, colon and intermediate forms are deliberately not promoted.
     EraseDisplay,
-    /// `CSI 3 J` / `CSI 03 J` — xterm erase-scrollback. Emitted immediately
-    /// before the complete sequence is passed through as [`Self::Bytes`], so
-    /// callers can invalidate row authority using the pre-feed ring mapping.
+    /// `CSI 3 J` / `CSI 03 J` — xterm erase-scrollback. Supports the same
+    /// byte-preserving 7-bit and C1 introducers as [`Self::EraseDisplay`] and is
+    /// emitted immediately before the complete sequence is passed through.
     EraseScrollback,
     /// RIS (`ESC c`) — hard terminal reset. Like [`Self::EraseScrollback`],
     /// this is a byte-coalescing barrier emitted before the raw sequence.
@@ -160,14 +161,139 @@ pub enum ParserEvent {
 /// short; anything longer is malformed and only passes through.
 pub const MAX_COLOR_SPEC_CHARS: usize = 128;
 
+#[derive(Clone, Copy)]
+enum CsiIntroducer {
+    /// The 7-bit representation, `ESC [`.
+    EscBracket,
+    /// The legacy single-byte C1 representation, `0x9b`.
+    C1,
+    /// UTF-8 encoded U+009B, `0xc2 0x9b`.
+    Utf8C1,
+}
+
+impl CsiIntroducer {
+    fn len(self) -> usize {
+        match self {
+            Self::EscBracket | Self::Utf8C1 => 2,
+            Self::C1 => 1,
+        }
+    }
+
+    fn append_to(self, bytes: &mut Vec<u8>) {
+        match self {
+            Self::EscBracket => bytes.extend_from_slice(b"\x1b["),
+            Self::C1 => bytes.push(0x9b),
+            Self::Utf8C1 => bytes.extend_from_slice(b"\xc2\x9b"),
+        }
+    }
+}
+
+/// The last few display bytes seen in Ground. Keeping only a suffix is enough
+/// to decide whether a following `0x9b` is a UTF-8 continuation, without
+/// turning the Ground bulk-copy path back into a per-byte decoder.
+#[derive(Default)]
+struct GroundUtf8Tail {
+    bytes: [u8; 3],
+    len: usize,
+}
+
+impl GroundUtf8Tail {
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        let capacity = self.bytes.len();
+        if bytes.len() >= capacity {
+            self.bytes.copy_from_slice(&bytes[bytes.len() - capacity..]);
+            self.len = capacity;
+            return;
+        }
+
+        for &byte in bytes {
+            if self.len < self.bytes.len() {
+                self.bytes[self.len] = byte;
+                self.len += 1;
+            } else {
+                self.bytes.copy_within(1.., 0);
+                self.bytes[self.bytes.len() - 1] = byte;
+            }
+        }
+    }
+
+    fn previous(&self, distance: usize) -> Option<u8> {
+        (distance != 0 && distance <= self.len).then(|| self.bytes[self.len - distance])
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum C1GroundRole {
+    /// UTF-8 U+009B is itself the CSI control.
+    Utf8Csi,
+    /// `0x9b` belongs to some other valid UTF-8 scalar.
+    Utf8Continuation,
+    /// A standalone 8-bit CSI introducer.
+    Csi,
+}
+
+fn valid_first_continuation(lead: u8, continuation: u8) -> bool {
+    match lead {
+        0xe0 => (0xa0..=0xbf).contains(&continuation),
+        0xed => (0x80..=0x9f).contains(&continuation),
+        0xf0 => (0x90..=0xbf).contains(&continuation),
+        0xf4 => (0x80..=0x8f).contains(&continuation),
+        0xe1..=0xec | 0xee..=0xef | 0xf1..=0xf3 => (0x80..=0xbf).contains(&continuation),
+        _ => false,
+    }
+}
+
+fn classify_ground_c1(tail: &GroundUtf8Tail) -> C1GroundRole {
+    let Some(previous) = tail.previous(1) else {
+        return C1GroundRole::Csi;
+    };
+
+    if previous == 0xc2 {
+        return C1GroundRole::Utf8Csi;
+    }
+    if (0xc3..=0xdf).contains(&previous) || valid_first_continuation(previous, 0x9b) {
+        return C1GroundRole::Utf8Continuation;
+    }
+
+    if (0x80..=0xbf).contains(&previous) {
+        if let Some(lead) = tail.previous(2) {
+            if (0xe0..=0xef).contains(&lead) && valid_first_continuation(lead, previous) {
+                return C1GroundRole::Utf8Continuation;
+            }
+            if (0xf0..=0xf4).contains(&lead) && valid_first_continuation(lead, previous) {
+                return C1GroundRole::Utf8Continuation;
+            }
+        }
+
+        if let (Some(first_continuation), Some(lead)) = (tail.previous(2), tail.previous(3)) {
+            if (0x80..=0xbf).contains(&first_continuation)
+                && (0xf0..=0xf4).contains(&lead)
+                && valid_first_continuation(lead, first_continuation)
+            {
+                return C1GroundRole::Utf8Continuation;
+            }
+        }
+    }
+
+    C1GroundRole::Csi
+}
+
 #[derive(Default)]
 enum State {
     #[default]
     Ground,
     /// Saw ESC, waiting for next byte
     Esc,
-    /// Inside CSI (ESC [): collecting parameter/intermediary bytes
-    Csi { buf: Vec<u8> },
+    /// Inside CSI: collecting parameter/intermediary bytes while retaining its
+    /// exact 7-bit, 8-bit, or UTF-8 C1 introducer for pass-through.
+    Csi {
+        introducer: CsiIntroducer,
+        buf: Vec<u8>,
+    },
     /// Inside OSC (ESC ]): collecting bytes until ST (BEL or ESC \)
     Osc { buf: Vec<u8> },
     /// Just saw ESC while in OSC — next byte should be '\' for ST
@@ -236,6 +362,7 @@ pub enum MouseEncoding {
 pub struct Parser {
     state: State,
     passthrough: Vec<u8>,
+    ground_utf8_tail: GroundUtf8Tail,
     config: ParserConfig,
     /// `?2004` — shell asked for paste content to be bracketed with `\e[200~`
     /// / `\e[201~`. The caller wraps its own `Paste` write when this is on.
@@ -341,6 +468,7 @@ impl Parser {
         Parser {
             state: State::default(),
             passthrough: Vec::with_capacity(4096),
+            ground_utf8_tail: GroundUtf8Tail::default(),
             config,
             bracketed_paste: false,
             mouse_mode: MouseMode::None,
@@ -461,6 +589,7 @@ impl Parser {
         macro_rules! hard_reset {
             () => {{
                 flush!();
+                self.ground_utf8_tail.clear();
                 self.bracketed_paste = false;
                 self.mouse_mode = MouseMode::None;
                 self.mouse_encoding = MouseEncoding::Default;
@@ -482,7 +611,12 @@ impl Parser {
             ($byte:expr) => {{
                 match $byte {
                     0x1b => self.state = State::Esc,
-                    b'[' => self.state = State::Csi { buf: Vec::new() },
+                    b'[' => {
+                        self.state = State::Csi {
+                            introducer: CsiIntroducer::EscBracket,
+                            buf: Vec::new(),
+                        }
+                    }
                     b']' => self.state = State::Osc { buf: Vec::new() },
                     b'_' => self.state = State::Apc { buf: Vec::new() },
                     b'P' => self.state = State::Dcs { buf: Vec::new() },
@@ -497,25 +631,66 @@ impl Parser {
             }};
         }
 
-        // Ground-state fast-path: bulk-copy runs of bytes until the next ESC.
-        // The previous per-byte loop dominated cost on heavy text streams; ESC
-        // is the only byte that exits Ground, so memchr lets us hop directly
-        // to the next state transition.
+        // Ground-state fast-path: bulk-copy runs until ESC or an 8-bit CSI
+        // candidate. The short suffix window crosses feed boundaries, but no
+        // byte is withheld: Parser has no EOF signal, so even a trailing UTF-8
+        // lead must remain immediate pass-through.
         let mut i = 0usize;
         let len = data.len();
         while i < len {
             if matches!(self.state, State::Ground) {
-                match memchr::memchr(0x1b, &data[i..]) {
+                match memchr::memchr2(0x1b, 0x9b, &data[i..]) {
                     Some(off) => {
                         if off > 0 {
-                            self.passthrough.extend_from_slice(&data[i..i + off]);
+                            let plain = &data[i..i + off];
+                            self.passthrough.extend_from_slice(plain);
+                            self.ground_utf8_tail.extend(plain);
                         }
-                        i += off + 1;
-                        self.state = State::Esc;
+                        i += off;
+                        if data[i] == 0x1b {
+                            i += 1;
+                            self.ground_utf8_tail.clear();
+                            self.state = State::Esc;
+                        } else {
+                            i += 1;
+                            match classify_ground_c1(&self.ground_utf8_tail) {
+                                C1GroundRole::Utf8Csi => {
+                                    // When C2 is in this feed, retain both bytes
+                                    // in Csi so the sequence passes through as
+                                    // one run. Across a feed boundary C2 has
+                                    // already passed through (and cannot affect
+                                    // VTE until 9B arrives), so retain only 9B.
+                                    let introducer = if self.passthrough.last() == Some(&0xc2) {
+                                        self.passthrough.pop();
+                                        CsiIntroducer::Utf8C1
+                                    } else {
+                                        CsiIntroducer::C1
+                                    };
+                                    self.ground_utf8_tail.clear();
+                                    self.state = State::Csi {
+                                        introducer,
+                                        buf: Vec::new(),
+                                    };
+                                }
+                                C1GroundRole::Utf8Continuation => {
+                                    self.passthrough.push(0x9b);
+                                    self.ground_utf8_tail.extend(&[0x9b]);
+                                }
+                                C1GroundRole::Csi => {
+                                    self.ground_utf8_tail.clear();
+                                    self.state = State::Csi {
+                                        introducer: CsiIntroducer::C1,
+                                        buf: Vec::new(),
+                                    };
+                                }
+                            }
+                        }
                         continue;
                     }
                     None => {
-                        self.passthrough.extend_from_slice(&data[i..]);
+                        let plain = &data[i..];
+                        self.passthrough.extend_from_slice(plain);
+                        self.ground_utf8_tail.extend(plain);
                         break;
                     }
                 }
@@ -532,7 +707,10 @@ impl Parser {
                         // read boundary falling mid-sequence cannot split it across
                         // two Bytes events — downstream scanners (interactive-mode
                         // detection) rely on seeing each CSI whole.
-                        self.state = State::Csi { buf: Vec::new() };
+                        self.state = State::Csi {
+                            introducer: CsiIntroducer::EscBracket,
+                            buf: Vec::new(),
+                        };
                     }
                     b']' => {
                         self.state = State::Osc { buf: Vec::new() };
@@ -559,9 +737,10 @@ impl Parser {
                     }
                 },
 
-                State::Csi { buf } => {
+                State::Csi { introducer, buf } => {
                     if (0x40..=0x7e).contains(&b) {
                         // Final byte of CSI sequence
+                        let introducer = *introducer;
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
                         let alt_mode = alt_screen_mode(&params);
@@ -588,8 +767,9 @@ impl Parser {
                             });
                             // Like RIS, ED2/ED3 must reach VTE before any suffix
                             // event from this same feed is dispatched.
-                            let mut sequence = Vec::with_capacity(params.len() + 3);
-                            sequence.extend_from_slice(b"\x1b[");
+                            let mut sequence =
+                                Vec::with_capacity(params.len() + introducer.len() + 1);
+                            introducer.append_to(&mut sequence);
                             sequence.extend_from_slice(&params);
                             sequence.push(b);
                             events.push(ParserEvent::Bytes(sequence));
@@ -694,8 +874,7 @@ impl Parser {
                                 _ => {}
                             }
                             // Pass the complete sequence through as one contiguous run.
-                            self.passthrough.push(0x1b);
-                            self.passthrough.push(b'[');
+                            introducer.append_to(&mut self.passthrough);
                             self.passthrough.extend_from_slice(&params);
                             self.passthrough.push(b);
                         }
@@ -704,10 +883,10 @@ impl Parser {
                         // Guard against an unterminated CSI growing without bound
                         // (malformed stream). Dump what we have and recover.
                         if buf.len() > 4096 {
+                            let introducer = *introducer;
                             let params = std::mem::take(buf);
                             self.state = State::Ground;
-                            self.passthrough.push(0x1b);
-                            self.passthrough.push(b'[');
+                            introducer.append_to(&mut self.passthrough);
                             self.passthrough.extend_from_slice(&params);
                         }
                     }
@@ -1354,6 +1533,260 @@ mod tests {
                 );
                 assert_eq!(collect_bytes(&events), sequence);
             }
+        }
+    }
+
+    #[test]
+    fn c1_ed2_ed3_are_byte_exact_pre_feed_barriers() {
+        for (sequence, semantic) in [
+            (b"\x9b2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x9b02J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x9b3J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\x9b03J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\xc2\x9b2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\xc2\x9b02J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\xc2\x9b3J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\xc2\x9b03J".as_slice(), ParserEvent::EraseScrollback),
+        ] {
+            let input = [b"before".as_slice(), sequence, b"after".as_slice()].concat();
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            parser.feed(&input, &mut events);
+
+            assert_eq!(
+                events,
+                [
+                    ParserEvent::Bytes(b"before".to_vec()),
+                    semantic,
+                    ParserEvent::Bytes(sequence.to_vec()),
+                    ParserEvent::Bytes(b"after".to_vec()),
+                ],
+                "sequence={sequence:?}"
+            );
+            assert_eq!(collect_bytes(&events), input);
+        }
+    }
+
+    #[test]
+    fn c1_reset_boundaries_survive_every_byte_split() {
+        for (sequence, semantic) in [
+            (b"\x9b2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x9b02J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x9b3J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\x9b03J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\xc2\x9b2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\xc2\x9b02J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\xc2\x9b3J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\xc2\x9b03J".as_slice(), ParserEvent::EraseScrollback),
+        ] {
+            for split in 0..=sequence.len() {
+                let mut parser = Parser::new();
+                let mut events = Vec::new();
+                parser.feed(&sequence[..split], &mut events);
+                parser.feed(&sequence[split..], &mut events);
+
+                assert_eq!(
+                    events.iter().filter(|event| **event == semantic).count(),
+                    1,
+                    "sequence={sequence:?}, split={split}, events={events:?}"
+                );
+                assert_eq!(collect_bytes(&events), sequence);
+
+                let barrier = events.iter().position(|event| *event == semantic).unwrap();
+                let bytes_before_barrier = collect_bytes(&events[..barrier]);
+                assert!(
+                    bytes_before_barrier.is_empty() || bytes_before_barrier == b"\xc2",
+                    "sequence={sequence:?}, split={split}, events={events:?}"
+                );
+                assert_eq!(
+                    collect_bytes(&events[barrier + 1..]),
+                    &sequence[bytes_before_barrier.len()..],
+                    "sequence={sequence:?}, split={split}, events={events:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_c1_csi_is_passed_through_whole_across_every_split() {
+        for sequence in [b"\x9b31m".as_slice(), b"\xc2\x9b31m".as_slice()] {
+            for split in 0..=sequence.len() {
+                let mut parser = Parser::new();
+                let mut events = Vec::new();
+                parser.feed(&sequence[..split], &mut events);
+                parser.feed(&sequence[split..], &mut events);
+
+                assert_eq!(collect_bytes(&events), sequence);
+                assert!(events
+                    .iter()
+                    .all(|event| matches!(event, ParserEvent::Bytes(_))));
+                if sequence[0] == 0x9b || split != 1 {
+                    assert_eq!(
+                        events,
+                        [ParserEvent::Bytes(sequence.to_vec())],
+                        "sequence={sequence:?}, split={split}"
+                    );
+                } else {
+                    assert_eq!(
+                        events,
+                        [
+                            ParserEvent::Bytes(b"\xc2".to_vec()),
+                            ParserEvent::Bytes(b"\x9b31m".to_vec()),
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_utf8_c1_lead_is_immediate_passthrough() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"tail\xc2", &mut events);
+
+        assert_eq!(events, [ParserEvent::Bytes(b"tail\xc2".to_vec())]);
+
+        // The suffix window may remember C2 for classification, but it must
+        // neither duplicate nor withhold that byte when later text arrives.
+        parser.feed(b"x", &mut events);
+        assert_eq!(collect_bytes(&events), b"tail\xc2x");
+    }
+
+    #[test]
+    fn escape_boundaries_clear_the_ground_utf8_tail_before_c1() {
+        for boundary in [b"\x1bq".as_slice(), b"\x1bc".as_slice()] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            parser.feed(b"\xd8", &mut events);
+
+            let suffix = [boundary, b"\x9b2J".as_slice()].concat();
+            parser.feed(&suffix, &mut events);
+
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, ParserEvent::EraseDisplay))
+                    .count(),
+                1,
+                "boundary={boundary:?}, events={events:?}"
+            );
+            assert_eq!(
+                collect_bytes(&events),
+                [b"\xd8".as_slice(), suffix.as_slice()].concat()
+            );
+        }
+    }
+
+    #[test]
+    fn c1_erase_events_reject_nonordinary_lookalikes() {
+        for introducer in [b"\x9b".as_slice(), b"\xc2\x9b".as_slice()] {
+            for body in [
+                b"J".as_slice(),
+                b"?2J".as_slice(),
+                b">2J".as_slice(),
+                b"2;0J".as_slice(),
+                b"2:0J".as_slice(),
+                b"2 J".as_slice(),
+                b"2K".as_slice(),
+                b"42949672962J".as_slice(),
+                b"?3J".as_slice(),
+                b"3;0J".as_slice(),
+                b"3:0J".as_slice(),
+                b"3 J".as_slice(),
+                b"3K".as_slice(),
+                b"42949672963J".as_slice(),
+            ] {
+                let sequence = [introducer, body].concat();
+                for split in 0..=sequence.len() {
+                    let mut parser = Parser::new();
+                    let mut events = Vec::new();
+                    parser.feed(&sequence[..split], &mut events);
+                    parser.feed(&sequence[split..], &mut events);
+
+                    assert!(events.iter().all(|event| !matches!(
+                        event,
+                        ParserEvent::EraseDisplay | ParserEvent::EraseScrollback
+                    )));
+                    assert_eq!(
+                        collect_bytes(&events),
+                        sequence,
+                        "sequence={sequence:?}, split={split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_continuation_9b_in_normal_unicode_is_not_c1() {
+        // Cover every continuation position in valid two-, three-, and
+        // four-byte UTF-8. The following ASCII deliberately looks like an
+        // ED2/ED3 body; none of these 9B bytes is a control introducer.
+        for scalar in [
+            b"\xd8\x9b".as_slice(),
+            b"\xe1\x9b\x80".as_slice(),
+            b"\xe2\x82\x9b".as_slice(),
+            b"\xf0\x9b\x80\x80".as_slice(),
+            b"\xf0\x90\x9b\x80".as_slice(),
+            b"\xf0\x90\x80\x9b".as_slice(),
+        ] {
+            assert!(std::str::from_utf8(scalar).is_ok());
+            for body in [b"2J".as_slice(), b"3J".as_slice()] {
+                let input = [b"prefix".as_slice(), scalar, body].concat();
+                for split in 0..=input.len() {
+                    let mut parser = Parser::new();
+                    let mut events = Vec::new();
+                    parser.feed(&input[..split], &mut events);
+                    parser.feed(&input[split..], &mut events);
+
+                    assert!(events.iter().all(|event| !matches!(
+                        event,
+                        ParserEvent::EraseDisplay | ParserEvent::EraseScrollback
+                    )));
+                    assert_eq!(
+                        collect_bytes(&events),
+                        input,
+                        "scalar={scalar:?}, body={body:?}, split={split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c1_reset_raw_bytes_precede_suffix_semantics() {
+        for (reset, semantic) in [
+            (b"\x9b2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\x9b3J".as_slice(), ParserEvent::EraseScrollback),
+            (b"\xc2\x9b2J".as_slice(), ParserEvent::EraseDisplay),
+            (b"\xc2\x9b3J".as_slice(), ParserEvent::EraseScrollback),
+        ] {
+            let input = [
+                b"prefix".as_slice(),
+                reset,
+                b"\x1b[c\x1b[?2004htext".as_slice(),
+            ]
+            .concat();
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            parser.feed(&input, &mut events);
+
+            assert_eq!(events[0], ParserEvent::Bytes(b"prefix".to_vec()));
+            assert_eq!(events[1], semantic);
+            assert_eq!(events[2], ParserEvent::Bytes(reset.to_vec()));
+            assert_eq!(
+                events[3],
+                ParserEvent::KeyboardProtocolQuery(KeyboardProtocolQuery::PrimaryDeviceAttributes)
+            );
+            assert_eq!(
+                events[4],
+                ParserEvent::DecsetMode {
+                    mode: 2004,
+                    set: true
+                }
+            );
+            assert_eq!(collect_bytes(&events), input);
         }
     }
 
