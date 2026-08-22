@@ -1040,13 +1040,11 @@ mod tests {
     fn write_atomic_private_does_not_chmod_an_existing_shared_parent() {
         use std::os::unix::fs::PermissionsExt;
 
-        let parent = std::env::temp_dir();
-        let path = parent.join(format!(
-            "jterm-core-shared-parent-{}-{}.state",
-            std::process::id(),
-            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_file(&path);
+        let root = TestDir::new("write-shared-parent");
+        let parent = root.join("shared");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o1777)).unwrap();
+        let path = parent.join("window.state");
         let before = fs::metadata(&parent).unwrap().permissions().mode();
 
         write_atomic_private(&path, b"{}").unwrap();

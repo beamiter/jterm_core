@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-21
+Updated: 2026-08-22
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -11,6 +11,61 @@ installer. Version 0.2 now pins jagent 0.7 and exposes its protocol-bound
 request/response path, while preserving the serialize-only transcript boundary
 and keeping non-streaming provider responses byte-oriented until their
 canonical gate.
+
+## 2026-08-22 ten-round AI configuration hardening
+
+1. `AiClient::new` validates exact model bytes instead of trimming them.
+2. Base URLs are likewise validated exactly; only endpoint trailing slashes
+   are normalized after validation.
+3. Both ordinary-chat and Agent request boundaries revalidate every mutable
+   public client field, including token and temperature limits.
+4. `AiClient` Debug reports lengths/presence and never raw model, URL, or key.
+5. Environment model/base values default only when absent; the legacy
+   `send_blocking` base-URL path also preserves explicit empty/padded values.
+6. Explicit malformed `AI_MAX_TOKENS` values are errors instead of defaults.
+7. Explicit malformed, non-finite, or out-of-range `AI_TEMPERATURE` values are errors.
+8. Credential-path overrides and configured paths preserve exact non-empty
+   text; surrounding spaces are rejected rather than retargeting file I/O,
+   while `~/` expansion requires a safe absolute UTF-8 `HOME` and rechecks the
+   final expanded byte ceiling.
+9. `AiSettings` Debug does not echo provider/model/URL/path contents.
+10. `display_name` remains one-line and byte-bounded after public-field mutation.
+
+## 2026-08-22 twenty-round AI origin and authority hardening
+
+1. AI base URLs now require an exact lower-case transport scheme instead of
+   accepting a look-alike or normalizing caller-controlled text.
+2. One authority splitter validates the complete host/port shape before any
+   provider endpoint is appended.
+3. Bracketed IPv6 authorities are accepted only when the literal parses and
+   the closing bracket is followed by either nothing or one valid port.
+4. Port text must be canonical decimal digits that fit in `u16`.
+5. Port zero is refused at both AI-origin and clickable-link boundaries.
+6. DNS hosts are ASCII labels with the conservative letter/digit/hyphen
+   grammar and 63-byte per-label limit.
+7. Ordinary IPv4 hosts must parse canonically rather than relying on a URL
+   handler's legacy-number interpretation.
+8. IPv6 literals are parsed as addresses rather than accepted as colon-shaped
+   text.
+9. Percent-encoded hosts fail closed before transport or opener resolution.
+10. Unicode host text must be supplied as explicit ASCII punycode.
+11. Empty, leading/trailing-hyphen, and trailing-dot DNS labels are rejected.
+12. Hex, one-part, and shortened legacy IPv4 aliases remain rejected.
+13. Cleartext AI transport is limited to loopback hosts; remote origins need
+    HTTPS.
+14. The complete `127.0.0.0/8` block is recognized as loopback, rather than a
+    single hard-coded address.
+15. Canonical IPv6 `::1` is recognized as loopback.
+16. `localhost` recognition is ASCII-case-insensitive while the scheme remains
+    exact.
+17. A valid base path is preserved verbatim (apart from the established final
+    slash normalization) for provider endpoint construction.
+18. Construction and both mutable-client request boundaries call the same
+    configuration validator, so post-construction mutation cannot bypass it.
+19. Invalid-origin errors describe only the contract and never echo the URL,
+    hostname, credential, query, or path supplied by the caller.
+20. Table-driven regressions cover HTTPS DNS/IP origins, every supported local
+    provider shape, malformed authorities, ambiguous hosts, and opener parity.
 
 ## Completed since the previous handoff
 
@@ -33,6 +88,11 @@ canonical gate.
   provides `CommandExecutionOutcome`. The core facade re-exports that upstream
   type and delegates typed observation directly, so failure paths no longer
   need a synthetic exit code or a duplicate compatibility enum.
+- AI credentials now have one exact-value policy at environment/client,
+  settings-write, credential-file-read, ordinary-chat, and Agent-request
+  boundaries: non-empty visible ASCII with no whitespace. Credential files may
+  normalize one final LF or CRLF only; stored and transported key bytes remain
+  exact, and rejection errors never include credential material.
 - `block_contract` keeps outcome and lifecycle evidence orthogonal through
   `CompletionProvenance`, `BlockLifecycleHealth`, and `assess_lifecycle`.
   Exhaustive tests pin shell-confirmed, journal-recovered, boundary-inferred,
@@ -127,6 +187,10 @@ canonical gate.
   admits only an absolute HTTP(S) URL (case-insensitive scheme) with a
   non-empty, userinfo-free authority, at most `MAX_OPENABLE_URL_BYTES` (2 KiB),
   and no whitespace, control, backslash, or visually ambiguous characters.
+  Authority parsing now also requires a valid bracketed IPv6/numeric-port
+  shape plus a conservative ASCII DNS or valid IP host; encoded, Unicode,
+  empty-label, numeric-alias, invalid-port, and parser-dependent spellings fail
+  closed before a desktop opener sees them.
   frost's `link::is_openable_url` and ember's
   `terminal::is_supported_hyperlink_uri` were equivalent copies; both now
   delegate here, and the spoof check rides on `review_input`.

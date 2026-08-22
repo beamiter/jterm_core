@@ -17,6 +17,7 @@ use jagent::provider::{
 use jagent::stream::{StreamEvent, StreamParser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ const MAX_BLOCK_CWD_BYTES: usize = 4 * 1024;
 const MAX_AGENT_ENV_VALUE_BYTES: usize = 4 * 1024;
 const MAX_CONTEXT_LINES_PER_SIDE: usize = 1024;
 const MAX_SESSION_CONTEXT_BYTES: usize = 64 * 1024;
+const MAX_AI_DISPLAY_MODEL_BYTES: usize = 128;
 const MAX_CURL_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 /// Streaming responses take as long as generation does; allow well beyond the
 /// non-streaming 75s but still bound a wedged connection.
@@ -136,7 +138,7 @@ impl Provider {
             Self::OpenAiCompatible => "OPENAI_API_KEY",
             Self::Ollama => "OLLAMA_API_KEY",
         };
-        nonempty_env(&app_env_name("AI_API_KEY")).or_else(|| nonempty_env(provider_key))
+        exact_api_key_env(&app_env_name("AI_API_KEY")).or_else(|| exact_api_key_env(provider_key))
     }
 }
 
@@ -381,7 +383,7 @@ impl From<ProviderError> for AiError {
 
 /// Provider-neutral AI settings as persisted by an application's config.
 /// Carries only a credential-file path, never key material.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AiSettings {
     pub enabled: bool,
     pub provider: String,
@@ -392,6 +394,22 @@ pub struct AiSettings {
     /// Optional sampling temperature; `None` keeps the provider default.
     pub temperature: Option<f32>,
     pub redact_secrets: bool,
+}
+
+impl std::fmt::Debug for AiSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AiSettings")
+            .field("enabled", &self.enabled)
+            .field("provider_bytes", &self.provider.len())
+            .field("api_key_file_configured", &self.api_key_file.is_some())
+            .field("model_bytes", &self.model.len())
+            .field("base_url_bytes", &self.base_url.len())
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("redact_secrets", &self.redact_secrets)
+            .finish()
+    }
 }
 
 /// Fully resolved settings for one provider. API key contents are never part
@@ -413,8 +431,8 @@ impl std::fmt::Debug for AiClient {
             .debug_struct("AiClient")
             .field("provider", &self.provider)
             .field("api_key_configured", &self.api_key.is_some())
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
+            .field("model_bytes", &self.model.len())
+            .field("base_url_bytes", &self.base_url.len())
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .field("redact_secrets", &self.redact_secrets)
@@ -432,42 +450,22 @@ impl AiClient {
         temperature: Option<f32>,
         redact_secrets: bool,
     ) -> Result<Self, AiError> {
-        let model: String = model.into();
-        let model = model.trim().to_string();
-        let base_url: String = base_url.into();
-        let base_url = base_url.trim().to_string();
-        validate_client_values(&model, &base_url, max_tokens)?;
-        if let Some(temperature) = temperature {
-            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-                return Err(AiError::InvalidConfiguration(
-                    "temperature must be a finite value in 0.0..=2.0".into(),
-                ));
-            }
-        }
-        let api_key = api_key
-            .map(|key| {
-                let key = key.trim();
-                if key.len() > MAX_API_KEY_BYTES || key.chars().any(char::is_control) {
-                    return Err(AiError::InvalidConfiguration(format!(
-                        "API key must be at most {MAX_API_KEY_BYTES} bytes and contain no control characters"
-                    )));
-                }
-                Ok((!key.is_empty()).then(|| key.to_string()))
-            })
-            .transpose()?
-            .flatten();
-        if provider == Provider::Anthropic && api_key.is_none() {
-            return Err(AiError::MissingProviderApiKey { provider });
-        }
-        Ok(Self {
+        let model = model.into();
+        let base_url = base_url.into();
+        let mut client = Self {
             provider,
             api_key,
             model,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             max_tokens,
             temperature,
             redact_secrets,
-        })
+        };
+        client.validate_configuration()?;
+        // A trailing slash is endpoint punctuation rather than user data;
+        // normalize it only after validating the exact supplied value.
+        client.base_url = client.base_url.trim_end_matches('/').to_string();
+        Ok(client)
     }
 
     /// Build a client from app-owned AI settings. Each app converts its own
@@ -499,28 +497,40 @@ impl AiClient {
     /// Environment-only construction for non-GTK callers. Explicit provider
     /// wins, followed by detected Anthropic/OpenAI credentials, then Ollama.
     pub fn from_env() -> Result<Self, AiError> {
-        let provider = match nonempty_env(&app_env_name("AI_PROVIDER")) {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, AiError> {
+        let app_provider = app_env_name("AI_PROVIDER");
+        let provider = match trimmed_nonempty(get(&app_provider)) {
             Some(value) => Provider::from_str(&value)?,
-            None if nonempty_env("ANTHROPIC_API_KEY").is_some() => Provider::Anthropic,
-            None if nonempty_env("OPENAI_API_KEY").is_some() => Provider::OpenAiCompatible,
+            None if exact_nonempty(get("ANTHROPIC_API_KEY")).is_some() => Provider::Anthropic,
+            None if exact_nonempty(get("OPENAI_API_KEY")).is_some() => Provider::OpenAiCompatible,
             None => Provider::Ollama,
         };
-        let model = nonempty_env(&app_env_name("AI_MODEL"))
-            .unwrap_or_else(|| provider.default_model().to_string());
-        let base_url = nonempty_env(&app_env_name("AI_BASE_URL"))
+        let model =
+            get(&app_env_name("AI_MODEL")).unwrap_or_else(|| provider.default_model().to_string());
+        let base_url = get(&app_env_name("AI_BASE_URL"))
             .unwrap_or_else(|| provider.default_base_url().to_string());
-        let max_tokens = nonempty_env(&app_env_name("AI_MAX_TOKENS"))
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1024);
-        let temperature = nonempty_env(&app_env_name("AI_TEMPERATURE"))
-            .and_then(|value| value.parse::<f32>().ok());
-        let api_key = match provider.provider_api_key() {
-            Some(key) => Some(key),
-            None => nonempty_env(&app_env_name("AI_API_KEY_FILE"))
-                .as_deref()
-                .map(read_api_key_file)
-                .transpose()?,
+        let max_tokens =
+            parse_optional_env_value(get(&app_env_name("AI_MAX_TOKENS")), "AI_MAX_TOKENS")?
+                .unwrap_or(1024);
+        let temperature =
+            parse_optional_env_value(get(&app_env_name("AI_TEMPERATURE")), "AI_TEMPERATURE")?;
+        let app_key = app_env_name("AI_API_KEY");
+        let provider_key = match provider {
+            Provider::Anthropic => "ANTHROPIC_API_KEY",
+            Provider::OpenAiCompatible => "OPENAI_API_KEY",
+            Provider::Ollama => "OLLAMA_API_KEY",
         };
+        let api_key =
+            match exact_nonempty(get(&app_key)).or_else(|| exact_nonempty(get(provider_key))) {
+                Some(key) => Some(key),
+                None => exact_nonempty(get(&app_env_name("AI_API_KEY_FILE")))
+                    .as_deref()
+                    .map(read_api_key_file)
+                    .transpose()?,
+            };
         Self::new(
             provider,
             api_key,
@@ -533,7 +543,27 @@ impl AiClient {
     }
 
     pub fn display_name(&self) -> String {
-        format!("{} · {}", self.provider.display_name(), self.model)
+        let model =
+            crate::review_input::safe_inline_display(&self.model, MAX_AI_DISPLAY_MODEL_BYTES);
+        format!("{} · {model}", self.provider.display_name())
+    }
+
+    fn validate_configuration(&self) -> Result<(), AiError> {
+        validate_client_values(self.provider, &self.model, &self.base_url, self.max_tokens)?;
+        if self.temperature.is_some_and(|temperature| {
+            !temperature.is_finite() || !(0.0..=2.0).contains(&temperature)
+        }) {
+            return Err(AiError::InvalidConfiguration(
+                "temperature must be a finite value in 0.0..=2.0".into(),
+            ));
+        }
+        validate_client_api_key(self.api_key.as_deref())?;
+        if self.provider == Provider::Anthropic && self.api_key.is_none() {
+            return Err(AiError::MissingProviderApiKey {
+                provider: self.provider,
+            });
+        }
+        Ok(())
     }
 
     /// Prepare one review-first Agent request through jagent's protocol-aware
@@ -550,6 +580,7 @@ impl AiClient {
         protocol: crate::agent::AgentProtocol,
         streaming: bool,
     ) -> Result<crate::agent::PreparedAgentRequest, AiError> {
+        self.validate_configuration()?;
         let config = ChatConfig {
             provider: self.provider.to_jagent(),
             api_key: self.api_key.clone(),
@@ -656,6 +687,11 @@ impl AiClient {
         history: &[Turn],
         streaming: bool,
     ) -> Result<HttpRequest, AiError> {
+        // `AiClient` has public fields for compatibility, so revalidate at
+        // the last in-process boundary as well as at construction time. A
+        // caller that mutates a client cannot smuggle a normalized credential
+        // into jagent/curl.
+        self.validate_configuration()?;
         // Reject an oversized system instruction before cloning or redaction.
         // Unlike history evidence, a safety-bearing system prompt must never
         // be sampled into a different instruction.
@@ -774,8 +810,14 @@ fn accept_prebounded_request(built: BuiltRequest) -> Result<HttpRequest, AiError
     Ok(built.request)
 }
 
-fn validate_client_values(model: &str, base_url: &str, max_tokens: u32) -> Result<(), AiError> {
+fn validate_client_values(
+    provider: Provider,
+    model: &str,
+    base_url: &str,
+    max_tokens: u32,
+) -> Result<(), AiError> {
     if model.trim().is_empty()
+        || model.trim() != model
         || model.len() > MAX_MODEL_NAME_BYTES
         || model.chars().any(char::is_control)
         || crate::review_input::contains_visual_spoofing(model)
@@ -784,18 +826,36 @@ fn validate_client_values(model: &str, base_url: &str, max_tokens: u32) -> Resul
             "model must be non-empty, visible text no longer than {MAX_MODEL_NAME_BYTES} bytes"
         )));
     }
-    let base_url = base_url.trim();
-    let authority = base_url
-        .strip_prefix("http://")
-        .or_else(|| base_url.strip_prefix("https://"))
-        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(""));
+    if base_url.trim() != base_url {
+        return Err(AiError::InvalidConfiguration(
+            "base URL must not contain surrounding whitespace".into(),
+        ));
+    }
+    let parsed = base_url.split_once("://");
+    let authority = parsed.map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""));
+    let host = authority.and_then(crate::link::authority_host);
+    let valid_scheme = match parsed {
+        Some(("https", _)) => true,
+        // Loopback HTTP is deliberately provider-neutral: local
+        // OpenAI-compatible endpoints are a supported deployment shape too.
+        Some(("http", _)) => {
+            host.is_some_and(crate::link::is_loopback_url_host)
+                && matches!(
+                    provider,
+                    Provider::Anthropic | Provider::OpenAiCompatible | Provider::Ollama
+                )
+        }
+        _ => false,
+    };
     if base_url.len() > MAX_BASE_URL_BYTES
+        || !valid_scheme
         || authority.is_none_or(str::is_empty)
         // Credentials embedded in a URL would be persisted with ordinary
         // settings and exposed by `AiClient`'s otherwise credential-safe
         // Debug implementation. Queries and fragments are also not base-URL
         // components: jagent appends a provider endpoint after this string.
         || authority.is_some_and(|value| value.contains('@'))
+        || host.is_none_or(|host| !crate::link::is_valid_url_host(host))
         || base_url.contains(['?', '#', '\\'])
         || base_url.chars().any(char::is_whitespace)
         || base_url.chars().any(char::is_control)
@@ -803,7 +863,7 @@ fn validate_client_values(model: &str, base_url: &str, max_tokens: u32) -> Resul
     {
         return Err(AiError::InvalidConfiguration(
             format!(
-                "base URL must be an absolute http(s) URL no longer than {MAX_BASE_URL_BYTES} bytes without credentials, a query, fragment, backslash, or whitespace"
+                "base URL must use HTTPS, or HTTP for a loopback host, and be no longer than {MAX_BASE_URL_BYTES} bytes with a canonical host and without credentials, a query, fragment, backslash, or whitespace"
             ),
         ));
     }
@@ -815,11 +875,51 @@ fn validate_client_values(model: &str, base_url: &str, max_tokens: u32) -> Resul
     Ok(())
 }
 
-fn nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
+fn trimmed_nonempty(value: Option<String>) -> Option<String> {
+    value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn exact_nonempty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn parse_optional_env_value<T: FromStr>(
+    value: Option<String>,
+    setting: &str,
+) -> Result<Option<T>, AiError> {
+    value
+        .map(|value| {
+            value.parse().map_err(|_| {
+                AiError::InvalidConfiguration(format!(
+                    "{setting} must contain a valid numeric value"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Credential environment values are not user-facing labels: preserve their
+/// exact bytes so [`AiClient::new`] can reject whitespace rather than silently
+/// turning one configured secret into another.
+fn exact_api_key_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn api_key_is_exact_visible_ascii(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_API_KEY_BYTES
+        && key.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+}
+
+fn validate_client_api_key(api_key: Option<&str>) -> Result<(), AiError> {
+    if api_key.is_some_and(|key| !api_key_is_exact_visible_ascii(key)) {
+        return Err(AiError::InvalidConfiguration(format!(
+            "API key must be non-empty visible ASCII without whitespace and at most {MAX_API_KEY_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Family-wide default provider-key file for this process identity:
@@ -840,12 +940,12 @@ pub fn default_api_key_path() -> String {
 pub fn api_key_file_env_override() -> Option<String> {
     std::env::var(app_env_name("AI_API_KEY_FILE"))
         .ok()
-        .map(|value| value.trim_matches(' ').to_string())
         .filter(|value| !value.is_empty())
 }
 
 /// Effective key-file path: environment override first, then the configured
-/// value; blank strings on either side never mask "not configured".
+/// value. Empty strings never mask "not configured"; whitespace-only values
+/// are preserved so the path validator can reject them without retargeting.
 pub fn resolve_api_key_file(configured: Option<&str>) -> Option<String> {
     resolve_api_key_file_from(api_key_file_env_override(), configured)
 }
@@ -854,18 +954,23 @@ fn resolve_api_key_file_from(
     env_override: Option<String>,
     configured: Option<&str>,
 ) -> Option<String> {
-    env_override
-        .map(|value| value.trim_matches(' ').to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            configured
-                .map(|value| value.trim_matches(' ').to_string())
-                .filter(|value| !value.is_empty())
-        })
+    env_override.filter(|value| !value.is_empty()).or_else(|| {
+        configured
+            .map(str::to_string)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn expand_api_key_path(raw: &str) -> Result<PathBuf, AiError> {
+    let home = std::env::var_os("HOME");
+    expand_api_key_path_from(raw, home.as_deref())
+}
+
+/// Pure expansion seam: validation tests inject hostile HOME values without
+/// mutating the process environment shared by Rust's parallel test runner.
+fn expand_api_key_path_from(raw: &str, home: Option<&OsStr>) -> Result<PathBuf, AiError> {
     if raw.len() > MAX_API_KEY_PATH_BYTES
+        || raw.trim_matches(' ') != raw
         || raw.chars().any(char::is_control)
         || crate::review_input::contains_visual_spoofing(raw)
     {
@@ -873,17 +978,36 @@ fn expand_api_key_path(raw: &str) -> Result<PathBuf, AiError> {
             "path must be visible text no longer than {MAX_API_KEY_PATH_BYTES} bytes"
         )));
     }
-    let raw = raw.trim_matches(' ');
     if raw.is_empty() {
         return Err(AiError::CredentialFile("path is empty".into()));
     }
     if raw == "~" || raw.starts_with("~/") {
-        let home = std::env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AiError::CredentialFile("HOME is unavailable for ~/ path".into()))?;
+        let invalid_home = || {
+            AiError::CredentialFile(
+                "HOME must be a non-empty, safe absolute UTF-8 path for ~/ credential paths".into(),
+            )
+        };
+        let home = home.and_then(OsStr::to_str).ok_or_else(invalid_home)?;
+        if home.is_empty()
+            || !Path::new(home).is_absolute()
+            || home.chars().any(char::is_control)
+            || crate::review_input::contains_visual_spoofing(home)
+        {
+            return Err(invalid_home());
+        }
         let mut path = PathBuf::from(home);
         if let Some(rest) = raw.strip_prefix("~/") {
+            if Path::new(rest).is_absolute() {
+                return Err(AiError::CredentialFile(
+                    "~/ credential paths must remain relative to HOME".into(),
+                ));
+            }
             path.push(rest);
+        }
+        if path.as_os_str().as_encoded_bytes().len() > MAX_API_KEY_PATH_BYTES {
+            return Err(AiError::CredentialFile(format!(
+                "expanded credential path exceeds {MAX_API_KEY_PATH_BYTES} bytes"
+            )));
         }
         return Ok(path);
     }
@@ -944,18 +1068,9 @@ fn validate_api_key_file_metadata(path: &Path, metadata: &fs::Metadata) -> Resul
 /// durable atomic replacement. The caller persists only `raw_path`.
 pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> Result<(), AiError> {
     let path = expand_api_key_path(raw_path)?;
-    let key = raw_key.trim();
-    if key.is_empty() {
-        return Err(AiError::CredentialFile("key must not be empty".into()));
-    }
-    if key.chars().any(char::is_control) {
-        return Err(AiError::CredentialFile(
-            "key must be a single line without control characters".into(),
-        ));
-    }
-    if key.len() as u64 + 1 > MAX_API_KEY_FILE_BYTES {
+    if !api_key_is_exact_visible_ascii(raw_key) {
         return Err(AiError::CredentialFile(format!(
-            "key exceeds {} bytes",
+            "key must be non-empty visible ASCII without whitespace and at most {} bytes",
             MAX_API_KEY_FILE_BYTES - 1
         )));
     }
@@ -1018,8 +1133,8 @@ pub fn write_api_key_file(raw_path: &str, raw_key: &str) -> Result<(), AiError> 
         }
     }
 
-    let mut contents = Vec::with_capacity(key.len() + 1);
-    contents.extend_from_slice(key.as_bytes());
+    let mut contents = Vec::with_capacity(raw_key.len() + 1);
+    contents.extend_from_slice(raw_key.as_bytes());
     contents.push(b'\n');
     // Publish relative to one validated directory descriptor. Besides using a
     // random O_EXCL staging name, `atomic_file` keeps that descriptor open for
@@ -1109,16 +1224,17 @@ fn read_api_key_file(raw_path: &str) -> Result<String, AiError> {
             MAX_API_KEY_FILE_BYTES
         )));
     }
-    let key = contents.trim();
-    if key.is_empty() {
+    // Files written by `write_api_key_file` end with one LF. Also accept one
+    // conventional CRLF from an externally provisioned secret file, but do
+    // not apply generic `trim()`: spaces or a second line would silently turn
+    // configured credential bytes into a different value.
+    let key = contents
+        .strip_suffix('\n')
+        .map(|value| value.strip_suffix('\r').unwrap_or(value))
+        .unwrap_or(&contents);
+    if !api_key_is_exact_visible_ascii(key) {
         return Err(AiError::CredentialFile(format!(
-            "{} is empty",
-            path.display()
-        )));
-    }
-    if key.chars().any(char::is_control) {
-        return Err(AiError::CredentialFile(format!(
-            "{} contains control characters",
+            "{} must contain one non-empty visible-ASCII key without whitespace, optionally followed by one line ending",
             path.display()
         )));
     }
@@ -1860,19 +1976,34 @@ pub fn send_blocking(
     system: Option<&str>,
     history: &[Turn],
 ) -> Result<String, AiError> {
-    let api_key = nonempty_env("ANTHROPIC_API_KEY").ok_or(AiError::MissingApiKey)?;
-    let base_url = nonempty_env(&app_env_name("AI_BASE_URL"))
-        .unwrap_or_else(|| Provider::Anthropic.default_base_url().to_string());
-    let client = AiClient::new(
+    let client = compatibility_anthropic_client(
+        model,
+        max_tokens,
+        exact_api_key_env("ANTHROPIC_API_KEY"),
+        // Preserve explicit empty or padded values so `AiClient::new` rejects
+        // them; this compatibility entry point must not silently select a
+        // different endpoint than the ordinary `from_env` path.
+        std::env::var(app_env_name("AI_BASE_URL")).ok(),
+    )?;
+    client.send_turns_blocking(system, history)
+}
+
+fn compatibility_anthropic_client(
+    model: &str,
+    max_tokens: u32,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> Result<AiClient, AiError> {
+    let api_key = api_key.ok_or(AiError::MissingApiKey)?;
+    AiClient::new(
         Provider::Anthropic,
         Some(api_key),
         model,
-        base_url,
+        base_url.unwrap_or_else(|| Provider::Anthropic.default_base_url().to_string()),
         max_tokens,
         None,
         false,
-    )?;
-    client.send_turns_blocking(system, history)
+    )
 }
 
 /// Natural language to one reviewable shell command. The returned command is
@@ -2129,6 +2260,53 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    struct UniquePrivateTestDirectory {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl UniquePrivateTestDirectory {
+        fn new(label: &str) -> Self {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+            for _ in 0..128 {
+                let nonce = API_KEY_FILE_NONCE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "jterm-core-{label}-{}-{nonce:016x}",
+                    std::process::id()
+                ));
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(&path) {
+                    Ok(()) => {
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                            .expect("set private test-directory permissions");
+                        let metadata = fs::metadata(&path).expect("inspect private test directory");
+                        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+                        // SAFETY: geteuid has no preconditions and only returns process state.
+                        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                        return Self { path };
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create private test directory: {error}"),
+                }
+            }
+            panic!("could not allocate a unique private test directory");
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UniquePrivateTestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[cfg(unix)]
     fn spawn_supervised(command: &mut std::process::Command) -> crate::supervised::SupervisedChild {
         crate::supervised::SupervisedChild::spawn(command).expect("spawn supervised test child")
     }
@@ -2218,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn api_key_file_resolution_prefers_env_and_ignores_blanks() {
+    fn api_key_file_resolution_preserves_exact_nonempty_paths() {
         assert_eq!(
             resolve_api_key_file_from(Some("/run/secret".into()), Some("/cfg/ai.key")),
             Some("/run/secret".to_string())
@@ -2229,10 +2407,64 @@ mod tests {
         );
         assert_eq!(
             resolve_api_key_file_from(Some("   ".into()), Some(" /cfg/ai.key ")),
+            Some("   ".to_string())
+        );
+        assert_eq!(
+            resolve_api_key_file_from(None, Some(" /cfg/ai.key ")),
+            Some(" /cfg/ai.key ".to_string())
+        );
+        assert_eq!(
+            resolve_api_key_file_from(Some(String::new()), Some("/cfg/ai.key")),
             Some("/cfg/ai.key".to_string())
         );
-        assert_eq!(resolve_api_key_file_from(None, Some("   ")), None);
+        assert!(expand_api_key_path(" /cfg/ai.key ").is_err());
         assert_eq!(resolve_api_key_file_from(None, None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tilde_credential_paths_require_a_safe_bounded_absolute_utf8_home() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = OsStr::new("/tmp/safe home");
+        assert_eq!(
+            expand_api_key_path_from("~/credentials/key", Some(home)).unwrap(),
+            PathBuf::from("/tmp/safe home/credentials/key")
+        );
+        assert!(expand_api_key_path_from("~//etc/key", Some(home)).is_err());
+
+        let overlong = format!(
+            "/tmp/overlong-secret-home/{}",
+            "x".repeat(MAX_API_KEY_PATH_BYTES)
+        );
+        let invalid_homes = [
+            OsString::from("relative-secret-home"),
+            OsString::from("/tmp/control-secret-home\nrest"),
+            OsString::from("/tmp/spoof-secret-home\u{202e}"),
+            OsString::from(overlong),
+            OsString::from_vec(b"/tmp/nonutf-secret-home-\xff".to_vec()),
+        ];
+        for invalid_home in &invalid_homes {
+            let error = expand_api_key_path_from("~/key", Some(invalid_home))
+                .expect_err("unsafe HOME was accepted")
+                .to_string();
+            assert!(
+                !error.contains("secret-home"),
+                "HOME leaked through {error}"
+            );
+        }
+        assert!(expand_api_key_path_from("~/key", None).is_err());
+        assert!(expand_api_key_path_from("~/key", Some(OsStr::new(""))).is_err());
+
+        let maximum_home = format!("/{}", "h".repeat(MAX_API_KEY_PATH_BYTES - 1));
+        assert_eq!(maximum_home.len(), MAX_API_KEY_PATH_BYTES);
+        assert!(expand_api_key_path_from("~", Some(OsStr::new(&maximum_home))).is_ok());
+        let error = expand_api_key_path_from("~/x", Some(OsStr::new(&maximum_home)))
+            .expect_err("expanded path exceeded its byte ceiling")
+            .to_string();
+        assert!(error.contains("expanded credential path"));
+        assert!(!error.contains(&maximum_home));
     }
 
     #[test]
@@ -2249,14 +2481,14 @@ mod tests {
         std::env::set_var(var, " /run/probe.key ");
         assert_eq!(
             api_key_file_env_override(),
-            Some("/run/probe.key".to_string())
+            Some(" /run/probe.key ".to_string())
         );
         assert_eq!(
             resolve_api_key_file(Some("/cfg/ai.key")),
-            Some("/run/probe.key".to_string())
+            Some(" /run/probe.key ".to_string())
         );
         std::env::set_var(var, "   ");
-        assert_eq!(api_key_file_env_override(), None);
+        assert_eq!(api_key_file_env_override(), Some("   ".to_string()));
         std::env::remove_var(var);
     }
 
@@ -3243,23 +3475,31 @@ mod tests {
         for key in [
             format!("{}x", "k".repeat(MAX_API_KEY_BYTES)),
             "bad\nkey".into(),
+            " leading-secret".into(),
+            "trailing-secret ".into(),
+            "internal secret".into(),
+            "internal\tsecret".into(),
+            "clé-secret".into(),
         ] {
-            assert!(matches!(
-                AiClient::new(
-                    Provider::OpenAiCompatible,
-                    Some(key),
-                    "model",
-                    "https://example.com/v1",
-                    512,
-                    None,
-                    true
-                ),
-                Err(AiError::InvalidConfiguration(_))
-            ));
+            let error = AiClient::new(
+                Provider::OpenAiCompatible,
+                Some(key.clone()),
+                "model",
+                "https://example.com/v1",
+                512,
+                None,
+                true,
+            )
+            .unwrap_err();
+            assert!(matches!(error, AiError::InvalidConfiguration(_)));
+            assert!(
+                !error.to_string().contains(&key),
+                "invalid credential leaked through its error"
+            );
         }
         let client = AiClient::new(
             Provider::OpenAiCompatible,
-            Some("  valid-key  ".into()),
+            Some("valid-key".into()),
             "model",
             "https://example.com/v1",
             512,
@@ -3270,6 +3510,37 @@ mod tests {
         assert_eq!(client.api_key.as_deref(), Some("valid-key"));
         assert_eq!(client.model, "model");
         assert_eq!(client.base_url, "https://example.com/v1");
+
+        for model in ["", " ", " model", "model "] {
+            assert!(AiClient::new(
+                Provider::Ollama,
+                None,
+                model,
+                "http://localhost:11434",
+                512,
+                None,
+                true,
+            )
+            .is_err());
+        }
+        for base_url in [" http://localhost:11434", "http://localhost:11434 "] {
+            assert!(
+                AiClient::new(Provider::Ollama, None, "model", base_url, 512, None, true,).is_err()
+            );
+        }
+
+        assert!(matches!(
+            AiClient::new(
+                Provider::OpenAiCompatible,
+                Some(String::new()),
+                "model",
+                "https://example.com/v1",
+                512,
+                None,
+                true
+            ),
+            Err(AiError::InvalidConfiguration(_))
+        ));
 
         for (model, url) in [
             (
@@ -3294,9 +3565,123 @@ mod tests {
     }
 
     #[test]
+    fn ai_base_url_validation_uses_one_canonical_authority_policy() {
+        for (provider, api_key) in [
+            (Provider::Ollama, None),
+            (Provider::OpenAiCompatible, Some("openai-key".to_string())),
+            (Provider::Anthropic, Some("anthropic-key".to_string())),
+        ] {
+            for base_url in [
+                "https://api-1.example/v1",
+                "https://127.0.0.1:8443/v1",
+                "https://[2001:db8::1]:8443/v1",
+                "http://localhost:11434/api",
+                "http://LOCALHOST:11434/api",
+                "http://127.0.0.2:11434/api",
+                "http://[::1]:11434/api",
+            ] {
+                assert!(
+                    AiClient::new(
+                        provider,
+                        api_key.clone(),
+                        "model",
+                        base_url,
+                        512,
+                        None,
+                        true,
+                    )
+                    .is_ok(),
+                    "{provider:?} should accept {base_url:?}"
+                );
+            }
+
+            for base_url in [
+                "HTTP://localhost:11434",
+                "https://example.com:0/v1",
+                "https://example.com:/v1",
+                "https://example.com:65536/v1",
+                "https://example.com:443:444/v1",
+                "https://[::1/v1",
+                "https://[::1]suffix/v1",
+                "https://::1/v1",
+                "https://%65xample.com/v1",
+                "https://example..com/v1",
+                "https://example.com./v1",
+                "https://2130706433/v1",
+                "https://127.1/v1",
+                "https://例子.example/v1",
+                "http://example.com/v1",
+            ] {
+                let error = AiClient::new(
+                    provider,
+                    api_key.clone(),
+                    "model",
+                    base_url,
+                    512,
+                    None,
+                    true,
+                )
+                .unwrap_err();
+                assert!(matches!(error, AiError::InvalidConfiguration(_)));
+                assert!(!error.to_string().contains(base_url));
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_anthropic_client_preserves_exact_transport_values() {
+        let secret = " raw-anthropic-secret ";
+        let error = compatibility_anthropic_client(
+            "claude-test",
+            512,
+            Some(secret.into()),
+            Some("https://api.anthropic.com".into()),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AiError::InvalidConfiguration(_)));
+        assert!(!error.to_string().contains(secret));
+
+        let exact = "sk-ant-exact_+/=~";
+        let client = compatibility_anthropic_client(
+            "claude-test",
+            512,
+            Some(exact.into()),
+            Some("https://api.anthropic.com".into()),
+        )
+        .unwrap();
+        assert_eq!(client.api_key.as_deref(), Some(exact));
+
+        assert!(matches!(
+            compatibility_anthropic_client(
+                "claude-test",
+                512,
+                None,
+                Some("https://api.anthropic.com".into())
+            ),
+            Err(AiError::MissingApiKey)
+        ));
+
+        for base_url in [
+            "",
+            " https://api.anthropic.com",
+            "https://api.anthropic.com ",
+        ] {
+            assert!(matches!(
+                compatibility_anthropic_client(
+                    "claude-test",
+                    512,
+                    Some("exact-key".into()),
+                    Some(base_url.into()),
+                ),
+                Err(AiError::InvalidConfiguration(_))
+            ));
+        }
+    }
+
+    #[test]
     fn client_debug_never_exposes_api_key_material() {
         let secret = "sk-super-secret-debug-probe";
-        let client = AiClient::new(
+        let mut client = AiClient::new(
             Provider::OpenAiCompatible,
             Some(secret.into()),
             "model",
@@ -3306,11 +3691,138 @@ mod tests {
             true,
         )
         .unwrap();
+        client.model = format!("model-{secret}");
+        client.base_url = format!("https://user:{secret}@example.test");
 
         let debug = format!("{client:?}");
         assert!(!debug.contains(secret));
         assert!(debug.contains("api_key_configured: true"));
         assert!(debug.contains("OpenAiCompatible"));
+
+        let settings = AiSettings {
+            enabled: true,
+            provider: format!("provider-{secret}"),
+            api_key_file: Some(format!("/tmp/{secret}")),
+            model: format!("model-{secret}"),
+            base_url: format!("https://{secret}.example"),
+            max_tokens: 512,
+            temperature: None,
+            redact_secrets: true,
+        };
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("api_key_file_configured: true"));
+    }
+
+    #[test]
+    fn mutated_api_key_is_revalidated_before_chat_or_agent_transport() {
+        let secret = "mutated secret must-not-leak";
+        let mut client = client(Provider::OpenAiCompatible);
+        client.api_key = Some(secret.into());
+
+        for error in [
+            client.build_request(None, &[]).unwrap_err(),
+            client
+                .prepare_agent_request(&[], jagent::AgentProtocol::Text, false)
+                .unwrap_err(),
+        ] {
+            let rendered = error.to_string();
+            assert!(rendered.contains("visible ASCII"));
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn every_mutable_client_field_is_revalidated_at_both_request_boundaries() {
+        let assert_rejected = |client: &AiClient| {
+            assert!(client.build_request(None, &[]).is_err());
+            assert!(client
+                .prepare_agent_request(&[], jagent::AgentProtocol::Text, false)
+                .is_err());
+        };
+
+        let mut fixture = client(Provider::OpenAiCompatible);
+        fixture.model = " model".into();
+        assert_rejected(&fixture);
+
+        let mut fixture = client(Provider::OpenAiCompatible);
+        fixture.base_url = "https://example.com/v1 ".into();
+        assert_rejected(&fixture);
+
+        let mut fixture = client(Provider::OpenAiCompatible);
+        fixture.max_tokens = 1;
+        assert_rejected(&fixture);
+
+        let mut fixture = client(Provider::OpenAiCompatible);
+        fixture.temperature = Some(f32::NAN);
+        assert_rejected(&fixture);
+
+        let mut fixture = client(Provider::Anthropic);
+        fixture.api_key = None;
+        assert_rejected(&fixture);
+    }
+
+    #[test]
+    fn env_lookup_preserves_exact_transport_values_and_rejects_bad_numbers() {
+        use std::collections::HashMap;
+
+        let build = |pairs: &[(&str, &str)]| {
+            let values: HashMap<String, String> = pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
+            AiClient::from_lookup(|name| values.get(name).cloned())
+        };
+        let provider_name = app_env_name("AI_PROVIDER");
+        let model_name = app_env_name("AI_MODEL");
+        let base_name = app_env_name("AI_BASE_URL");
+        let max_name = app_env_name("AI_MAX_TOKENS");
+        let temperature_name = app_env_name("AI_TEMPERATURE");
+
+        for (name, value) in [
+            (model_name.as_str(), ""),
+            (model_name.as_str(), " model "),
+            (base_name.as_str(), ""),
+            (base_name.as_str(), " http://localhost:11434 "),
+        ] {
+            assert!(build(&[(provider_name.as_str(), "ollama"), (name, value)]).is_err());
+        }
+        for (name, value) in [
+            (max_name.as_str(), ""),
+            (max_name.as_str(), "512x"),
+            (temperature_name.as_str(), ""),
+            (temperature_name.as_str(), "NaN"),
+            (temperature_name.as_str(), "0.5x"),
+        ] {
+            assert!(build(&[(provider_name.as_str(), "ollama"), (name, value)]).is_err());
+        }
+
+        let exact = build(&[
+            (provider_name.as_str(), "ollama"),
+            (model_name.as_str(), "model"),
+            (base_name.as_str(), "http://localhost:11434/"),
+            (max_name.as_str(), "512"),
+            (temperature_name.as_str(), "0.5"),
+        ])
+        .unwrap();
+        assert_eq!(exact.model, "model");
+        assert_eq!(exact.base_url, "http://localhost:11434");
+        assert_eq!(exact.max_tokens, 512);
+        assert_eq!(exact.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn display_name_is_single_line_and_bounded_after_public_mutation() {
+        let mut client = client(Provider::Ollama);
+        client.model = format!("secret\n\u{202e}{}", "x".repeat(1024));
+        let display = client.display_name();
+        assert!(!display.contains('\n'));
+        assert!(!display.contains('\u{202e}'));
+        assert!(
+            display.len()
+                <= Provider::Ollama.display_name().len() + " · ".len() + MAX_AI_DISPLAY_MODEL_BYTES
+        );
+        assert!(display.ends_with('…'));
     }
 
     #[test]
@@ -3361,26 +3873,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn api_key_file_requires_private_permissions_and_trims_one_line() {
+    fn api_key_file_normalizes_one_line_ending_but_no_other_whitespace() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = std::env::temp_dir().join(format!(
-            "jterm-core-ai-key-test-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
-        ));
+        let directory = UniquePrivateTestDirectory::new("ai-key-normalization");
+        let path = directory.path().join("ai.key");
         fs::write(&path, "sk-test-secret\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            read_api_key_file(path.to_str().unwrap()).unwrap(),
-            "sk-test-secret"
-        );
+        for contents in ["sk-test-secret", "sk-test-secret\n", "sk-test-secret\r\n"] {
+            fs::write(&path, contents).unwrap();
+            assert_eq!(
+                read_api_key_file(path.to_str().unwrap()).unwrap(),
+                "sk-test-secret"
+            );
+        }
+        for contents in [
+            " sk-test-secret\n",
+            "sk-test-secret \n",
+            "sk test secret\n",
+            "sk-test-secret\n\n",
+            "clé-test-secret\n",
+        ] {
+            fs::write(&path, contents).unwrap();
+            let error = read_api_key_file(path.to_str().unwrap()).unwrap_err();
+            assert!(matches!(error, AiError::CredentialFile(_)));
+            assert!(!error
+                .to_string()
+                .contains(contents.trim_end_matches(['\r', '\n'])));
+        }
 
+        fs::write(&path, "sk-test-secret\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let error = read_api_key_file(path.to_str().unwrap()).unwrap_err();
         assert!(matches!(error, AiError::CredentialFile(_)));
         assert!(error.to_string().contains("chmod 600"));
-        fs::remove_file(path).unwrap();
     }
 
     #[cfg(unix)]
@@ -3413,9 +3939,19 @@ mod tests {
             .to_string_lossy()
             .contains(".next.")));
 
-        let error = write_api_key_file(path_text, "first\nsecond").unwrap_err();
-        assert!(matches!(error, AiError::CredentialFile(_)));
-        assert_eq!(read_api_key_file(path_text).unwrap(), "sk-settings-secret");
+        for invalid in [
+            "first\nsecond",
+            " leading-secret",
+            "trailing-secret ",
+            "internal secret",
+            "internal\tsecret",
+            "clé-settings-secret",
+        ] {
+            let error = write_api_key_file(path_text, invalid).unwrap_err();
+            assert!(matches!(error, AiError::CredentialFile(_)));
+            assert!(!error.to_string().contains(invalid));
+            assert_eq!(read_api_key_file(path_text).unwrap(), "sk-settings-secret");
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
