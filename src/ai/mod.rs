@@ -620,7 +620,7 @@ impl AiClient {
         }
         let _permit = acquire_request_permit(cancellation)?;
         let request = self.build_request(system, history)?;
-        let response = curl_body_post(&request.url, &request.headers, &request.body, cancellation)?;
+        let response = curl_body_post(&request, cancellation)?;
         self.parse_response(&response)
     }
 
@@ -642,14 +642,7 @@ impl AiClient {
         }
         let _permit = acquire_request_permit(cancellation)?;
         let request = self.build_request_with(system, history, true)?;
-        curl_stream_post(
-            &request.url,
-            &request.headers,
-            &request.body,
-            self.provider.to_jagent(),
-            cancellation,
-            on_delta,
-        )
+        curl_stream_post(&request, self.provider.to_jagent(), cancellation, on_delta)
     }
 
     fn prepare_text(&self, text: &str) -> String {
@@ -807,6 +800,7 @@ fn accept_prebounded_request(built: BuiltRequest) -> Result<HttpRequest, AiError
             built.omitted_history_turns
         )));
     }
+    built.request.validate_transport()?;
     Ok(built.request)
 }
 
@@ -1535,16 +1529,20 @@ fn write_curl_config(
 }
 
 fn curl_body_post(
-    url: &str,
-    headers: &[(String, String)],
-    body: &str,
+    request: &HttpRequest,
     cancellation: &AiCancellationToken,
 ) -> Result<Vec<u8>, AiError> {
     if cancellation.is_cancelled() {
         return Err(AiError::Cancelled);
     }
+    let bypass_environment_proxy = request_must_bypass_proxy(request)?;
     let deadline = Instant::now() + CURL_PROCESS_TIMEOUT;
-    let config = build_curl_stdin_config(url, headers, body)?;
+    let config = build_curl_stdin_config(
+        &request.url,
+        &request.headers,
+        &request.body,
+        bypass_environment_proxy,
+    )?;
     let child = spawn_curl(&config, cancellation, deadline)?;
     let output = wait_with_bounded_output(child, cancellation, deadline)?;
     if !output.status.success() {
@@ -1740,9 +1738,7 @@ fn stream_child_stdout(
 }
 
 fn curl_stream_post(
-    url: &str,
-    headers: &[(String, String)],
-    body: &str,
+    request: &HttpRequest,
     provider: jagent::Provider,
     cancellation: &AiCancellationToken,
     on_delta: &mut dyn FnMut(&str),
@@ -1750,8 +1746,14 @@ fn curl_stream_post(
     if cancellation.is_cancelled() {
         return Err(AiError::Cancelled);
     }
+    let bypass_environment_proxy = request_must_bypass_proxy(request)?;
     let deadline = Instant::now() + CURL_PROCESS_TIMEOUT;
-    let config = build_curl_stream_config(url, headers, body)?;
+    let config = build_curl_stream_config(
+        &request.url,
+        &request.headers,
+        &request.body,
+        bypass_environment_proxy,
+    )?;
     let child = spawn_curl(&config, cancellation, deadline)?;
     let (fold, error_prefix, status, stderr) =
         stream_child_stdout(child, provider, cancellation, deadline, on_delta)?;
@@ -1807,10 +1809,17 @@ fn build_curl_stream_config(
     url: &str,
     headers: &[(String, String)],
     body: &str,
+    bypass_environment_proxy: bool,
 ) -> Result<String, AiError> {
     let mut config = format!(
         "silent\nshow-error\nno-buffer\nconnect-timeout = 10\nmax-time = {MAX_STREAM_SECONDS}\nmax-filesize = {MAX_CURL_STDOUT_BYTES}\nrequest = \"POST\"\n"
     );
+    if bypass_environment_proxy {
+        // A validated plain-HTTP request can only name a loopback origin.
+        // curl otherwise honors *_PROXY and could tunnel the provider
+        // credential to a non-loopback peer after URL validation succeeded.
+        config.push_str("noproxy = \"*\"\n");
+    }
     config.push_str("url = ");
     config.push_str(&curl_config_quote(url));
     config.push('\n');
@@ -1861,10 +1870,14 @@ fn build_curl_stdin_config(
     url: &str,
     headers: &[(String, String)],
     body: &str,
+    bypass_environment_proxy: bool,
 ) -> Result<String, AiError> {
     let mut config = format!(
         "silent\nshow-error\nconnect-timeout = 10\nmax-time = 75\nmax-filesize = {MAX_CURL_STDOUT_BYTES}\nrequest = \"POST\"\n"
     );
+    if bypass_environment_proxy {
+        config.push_str("noproxy = \"*\"\n");
+    }
     config.push_str("url = ");
     config.push_str(&curl_config_quote(url));
     config.push('\n');
@@ -1887,6 +1900,14 @@ fn build_curl_stdin_config(
     )));
     config.push('\n');
     Ok(config)
+}
+
+/// Validate the public mutable request at the literal curl boundary and bind
+/// its only clear-text exception to a direct connection. HTTPS and every
+/// non-loopback request retain the user's normal proxy configuration.
+fn request_must_bypass_proxy(request: &HttpRequest) -> Result<bool, AiError> {
+    request.validate_transport()?;
+    Ok(request.url.starts_with("http://"))
 }
 
 fn api_error_message(body: &[u8], status: u16) -> String {
@@ -2504,6 +2525,66 @@ mod tests {
         }
     }
 
+    fn read_http_head(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound capture read");
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while bytes.len() < 64 * 1024 && !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(_) => break,
+            }
+        }
+        bytes
+    }
+
+    fn capture_http_connection(
+        listener: std::net::TcpListener,
+        done: Arc<AtomicBool>,
+        act_as_proxy: bool,
+    ) -> Option<Vec<u8>> {
+        listener
+            .set_nonblocking(true)
+            .expect("make capture listener nonblocking");
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut captured = read_http_head(&mut stream);
+                    if act_as_proxy && captured.starts_with(b"CONNECT ") {
+                        stream
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .expect("answer proxy CONNECT");
+                        captured.extend_from_slice(&read_http_head(&mut stream));
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                    );
+                    let _ = stream.flush();
+                    return Some(captured);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if done.load(Ordering::Acquire) {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("capture listener failed: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn cancellation_token_is_shared_and_idempotent() {
         let token = AiCancellationToken::new();
@@ -2703,7 +2784,7 @@ mod tests {
     fn a_nonzero_builder_report_is_rejected_after_prebounding() {
         let request = HttpRequest {
             url: "https://example.invalid/v1/chat/completions".into(),
-            headers: vec![],
+            headers: vec![("content-type".into(), "application/json".into())],
             body: "{}".into(),
         };
         assert_eq!(
@@ -2802,6 +2883,7 @@ mod tests {
             "https://example.invalid/v1/messages",
             &[("x-api-key".into(), secret.into())],
             r#"{"prompt":"say \"hello\""}"#,
+            false,
         )
         .unwrap();
         assert!(config.contains(secret));
@@ -2815,6 +2897,92 @@ mod tests {
         assert_eq!(argv.first(), Some(&"--disable"));
         assert!(!argv.join(" ").contains(secret));
         assert!(!argv.join(" ").contains("example.invalid"));
+    }
+
+    #[test]
+    fn validated_loopback_http_curl_bypasses_environment_proxy() {
+        let target =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind direct loopback provider");
+        let target_address = target.local_addr().expect("direct provider address");
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake proxy");
+        let proxy_address = proxy.local_addr().expect("fake proxy address");
+        let done = Arc::new(AtomicBool::new(false));
+        let target_thread = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || capture_http_connection(target, done, false))
+        };
+        let proxy_thread = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || capture_http_connection(proxy, done, true))
+        };
+
+        let secret = "Bearer direct-loopback-sentinel";
+        let request = HttpRequest {
+            url: format!("http://{target_address}/v1/chat/completions"),
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("authorization".into(), secret.into()),
+            ],
+            body: "{}".into(),
+        };
+        let bypass_environment_proxy = request_must_bypass_proxy(&request).unwrap();
+        assert!(bypass_environment_proxy);
+        let config = build_curl_stdin_config(
+            &request.url,
+            &request.headers,
+            &request.body,
+            bypass_environment_proxy,
+        )
+        .unwrap();
+        assert!(config.contains("noproxy = \"*\"\n"));
+
+        let proxy_url = format!("http://{proxy_address}");
+        let mut child = std::process::Command::new("curl")
+            .args(["--disable", "--config", "-"])
+            .env("ALL_PROXY", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("https_proxy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn curl proxy probe");
+        child
+            .stdin
+            .take()
+            .expect("curl config stdin")
+            .write_all(config.as_bytes())
+            .expect("write curl config");
+        let output = child.wait_with_output().expect("await curl proxy probe");
+        done.store(true, Ordering::Release);
+        let direct = target_thread.join().expect("direct provider thread");
+        let proxied = proxy_thread.join().expect("fake proxy thread");
+
+        assert!(
+            output.status.success(),
+            "curl stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let direct = String::from_utf8_lossy(
+            direct
+                .as_deref()
+                .expect("curl did not reach the direct loopback provider"),
+        );
+        assert!(direct.contains(secret), "direct request={direct:?}");
+        assert!(
+            proxied.is_none(),
+            "loopback credentials reached the environment proxy: {:?}",
+            String::from_utf8_lossy(proxied.as_deref().unwrap_or_default())
+        );
+
+        let mut https = request;
+        https.url = "https://example.invalid/v1/chat/completions".into();
+        assert!(!request_must_bypass_proxy(&https).unwrap());
     }
 
     #[test]
@@ -3126,16 +3294,26 @@ mod tests {
             "https://example.invalid/v1/messages",
             &[("x-api-key".into(), "k".into())],
             "{}",
+            false,
         )
         .unwrap();
         assert!(config.contains("no-buffer\n"));
         assert!(config.contains(&format!("max-time = {MAX_STREAM_SECONDS}\n")));
         // The status marker goes to stderr, keeping stdout a pure body.
         assert!(config.contains("%{stderr}"));
+        let direct = build_curl_stream_config(
+            "http://127.0.0.1:11434/api/chat",
+            &[("content-type".into(), "application/json".into())],
+            "{}",
+            true,
+        )
+        .unwrap();
+        assert!(direct.contains("noproxy = \"*\"\n"));
         let error = build_curl_stream_config(
             "https://example.invalid",
             &[("authorization".into(), "Bearer x\r\nX-Evil: y".into())],
             "{}",
+            false,
         )
         .unwrap_err();
         assert!(matches!(error, AiError::InvalidConfiguration(_)));
@@ -3147,6 +3325,7 @@ mod tests {
             "https://example.invalid/v1/messages",
             &[("authorization".into(), "Bearer good\r\nX-Evil: yes".into())],
             "{}",
+            false,
         )
         .unwrap_err();
         assert!(matches!(error, AiError::InvalidConfiguration(_)));

@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-22
+Updated: 2026-08-24
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -69,6 +69,21 @@ canonical gate.
 
 ## Completed since the previous handoff
 
+- The jagent pin advances to `fcb9768`. Ordinary blocking/streaming AI
+  requests now re-run jagent's complete URL/header/unique-top-level-JSON/body
+  postcondition immediately before curl, while builders retain the same
+  compatibility surface. Validated clear-text loopback requests additionally
+  emit curl's explicit no-proxy policy, so inherited proxy settings cannot
+  redirect local provider credentials off-host; HTTPS keeps the user's proxy
+  configuration. jagent also turns a second post-preparation history omission
+  into a release-mode error, so the exact dependency consumed here now carries
+  the same upstream guard in optimized builds.
+- OSC 133 command metadata now preserves jsh's percent-encoded structural
+  newline/tab bytes instead of discarding a valid multiline command. Repeated
+  aliases for id/command/cwd/duration fail closed rather than using last-wins
+  correlation. Execution-journal readers accept the pre-rename
+  `rsh_execution_version` alias just as jsh does, and the v1 schema ceilings
+  are public constants with jsh-shaped lifecycle fixtures pinning both ends.
 - `agent` now re-exports jagent 0.7's `AgentRequestSpec`,
   `PreparedAgentRequest`, `AgentResponse`/`AgentStream`, and `AgentProtocol`;
   its hardened session wrapper accepts the bound response directly and exposes
@@ -77,7 +92,7 @@ canonical gate.
   the ordinary chat builder. Snapshot auditing accepts the exact 0.6 and 0.7
   proposal-bound unknown-execution notes so a dependency upgrade does not make
   a legitimate in-flight restore unreadable.
-- The jagent pin advances to `6aa3136`, and `jterm_core::agent` now re-exports
+- The earlier jagent pin advanced to `6aa3136`, and `jterm_core::agent` now re-exports
   `AgentCapabilities`, `AgentDelivery`, `CapabilityError`,
   `agent_capabilities`, the `AgentProvider` alias, and the version/wire-size
   constants. A facade-level negotiation test pins strict token parsing and

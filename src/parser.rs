@@ -25,9 +25,15 @@ const MAX_TITLE_BYTES: usize = 4 * 1024;
 /// `MAX_OSC_CWD_BYTES` = 4 KiB in jsh/src/osc.rs), but any program can write an
 /// OSC 133 packet, so the reader bounds them too rather than trusting a
 /// cooperative producer.
-const MAX_OSC133_COMMAND_BYTES: usize = 16 * 1024;
-const MAX_OSC133_CWD_BYTES: usize = 4 * 1024;
-const MAX_OSC133_ID_BYTES: usize = 1024;
+/// Maximum decoded command bytes accepted from OSC 133 metadata. This matches
+/// jsh's emitter; oversized commands use `cmd_truncated=1` instead.
+pub const MAX_OSC133_COMMAND_BYTES: usize = 16 * 1024;
+/// Maximum decoded cwd bytes accepted from OSC 133 metadata.
+pub const MAX_OSC133_CWD_BYTES: usize = 4 * 1024;
+/// Maximum decoded execution-id bytes accepted from OSC 133 metadata. Shells
+/// other than jsh may use longer opaque correlation ids; journal persistence
+/// independently applies jsh's narrower 192-byte grammar.
+pub const MAX_OSC133_ID_BYTES: usize = 1024;
 
 /// Which color slot an OSC 10/11/12/4 query asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1097,12 +1103,24 @@ impl CommandMeta {
     /// already had its own.
     fn from_fields<'a>(fields: impl Iterator<Item = &'a str>) -> Self {
         let mut meta = Self::default();
+        // Aliases name the same semantic slot. Reject a repeated slot instead
+        // of applying last-wins semantics to a journal correlation id,
+        // command, cwd, or duration supplied by untrusted PTY output.
+        let mut seen_id = false;
+        let mut seen_command = false;
+        let mut seen_cwd = false;
+        let mut seen_duration = false;
+        let mut seen_command_truncated = false;
         for field in fields {
             let Some((key, value)) = field.split_once('=') else {
                 continue;
             };
             match key {
                 "id" | "jsh_id" | "execution_id" | "command_id" => {
+                    if std::mem::replace(&mut seen_id, true) {
+                        meta.id = None;
+                        continue;
+                    }
                     meta.id = decode_osc133(value, MAX_OSC133_ID_BYTES).filter(|id| {
                         !id.is_empty()
                             && !id.chars().any(char::is_control)
@@ -1110,21 +1128,41 @@ impl CommandMeta {
                     });
                 }
                 "cmdline_url" | "command_url" | "command" | "cmdline" => {
+                    if std::mem::replace(&mut seen_command, true) {
+                        meta.command = None;
+                        continue;
+                    }
                     meta.command = decode_osc133(value, MAX_OSC133_COMMAND_BYTES).filter(|text| {
-                        !text.chars().any(char::is_control)
-                            && !crate::review_input::contains_visual_spoofing(text)
+                        !text
+                            .chars()
+                            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+                            && !crate::review_input::contains_noncontrol_visual_spoofing(text)
                     });
                 }
                 "cwd_url" | "cwd" => {
+                    if std::mem::replace(&mut seen_cwd, true) {
+                        meta.cwd = None;
+                        continue;
+                    }
                     meta.cwd = decode_osc133(value, MAX_OSC133_CWD_BYTES).filter(|text| {
                         !text.chars().any(char::is_control)
                             && !crate::review_input::contains_visual_spoofing(text)
                     });
                 }
                 "duration_ms" | "duration" => {
+                    if std::mem::replace(&mut seen_duration, true) {
+                        meta.duration_ms = None;
+                        continue;
+                    }
                     meta.duration_ms = value.parse().ok();
                 }
                 "cmd_truncated" | "command_truncated" => {
+                    if std::mem::replace(&mut seen_command_truncated, true) {
+                        // Ambiguous disclosure must not turn a known truncated
+                        // command back into an apparently complete one.
+                        meta.command_truncated = true;
+                        continue;
+                    }
                     meta.command_truncated = value == "1" || value.eq_ignore_ascii_case("true");
                 }
                 _ => {}
@@ -2530,11 +2568,35 @@ mod tests {
         let ParserEvent::CommandStart(meta) = event else {
             panic!("expected CommandStart");
         };
-        // A multiline command cannot be displayed or replayed as one reviewed
-        // prompt line without changing its semantics, so the unsafe command
-        // field is dropped while independent metadata still survives.
-        assert_eq!(meta.command, None);
+        // This is the exact packet shape jsh emits for a multiline command.
+        // Newline is structural shell syntax, not terminal framing (it was
+        // percent-encoded on the wire), so the block/journal path must retain
+        // it. Display and replay remain separate sanitized/reviewed surfaces.
+        assert_eq!(meta.command.as_deref(), Some("printf 'a;b+c'\n雪"));
         assert_eq!(meta.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn osc133_repeated_aliases_invalidate_the_semantic_slot() {
+        let ParserEvent::CommandStart(meta) = only_event(
+            b"\x1b]133;C;id=first;execution_id=second;cmdline_url=true;command=false;cwd_url=%2Fa;cwd=%2Fb\x07",
+        ) else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.id, None, "a correlation id must never be last-wins");
+        assert_eq!(meta.command, None, "a command must never be last-wins");
+        assert_eq!(meta.cwd, None, "a cwd must never be last-wins");
+
+        let ParserEvent::CommandEnd { meta, .. } = only_event(
+            b"\x1b]133;D;0;duration_ms=1;duration=2;cmd_truncated=0;command_truncated=0\x07",
+        ) else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(meta.duration_ms, None);
+        assert!(
+            meta.command_truncated,
+            "ambiguous truncation disclosure must fail toward the safe fallback"
+        );
     }
 
     /// A missing or unparseable status is `None`, not success. It used to

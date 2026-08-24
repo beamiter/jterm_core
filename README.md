@@ -48,11 +48,17 @@ v2 is selected only for a peer that has already advertised v2 support.
 - PTY input guarding, review-only command insertion, child environments,
   process-group lifecycle management, and restorable-command quoting.
 - Private atomic snapshots, command history, jsh execution journals, pane
-  layouts, Git metadata, notifications, and host/Flatpak command routing.
+  layouts, Git metadata, notifications, and host/Flatpak command routing. The
+  journal v1 version and byte/record ceilings are public, and its reader keeps
+  jsh's JSON-escaped multiline commands plus the pre-rename version alias so
+  migrated shell history and live OSC metadata resolve identically.
 - Provider-neutral AI requests, bounded conversations, secret redaction, and
   the review-first `jagent` session surface. Request construction reports any
   omitted history, while system instructions are rejected rather than sampled
   when they or the complete omission notice exceed jagent's 64 KiB limit.
+  Validated loopback HTTP requests force curl to bypass environment proxies,
+  keeping their clear-text credential hop local while preserving normal proxy
+  behavior for HTTPS.
 
 ## Security and reliability invariants
 

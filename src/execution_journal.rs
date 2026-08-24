@@ -19,17 +19,25 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const EXECUTION_JOURNAL_VERSION: u32 = 1;
+/// Current jsh execution-journal JSONL schema version.
+pub const EXECUTION_JOURNAL_VERSION: u32 = 1;
 const WRITER_QUEUE_CAPACITY: usize = 64;
 const READER_QUEUE_CAPACITY: usize = 2;
-const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
-const MAX_EXECUTION_ID_BYTES: usize = 192;
-const MAX_COMMAND_BYTES: usize = 64 * 1024;
-const MAX_CWD_BYTES: usize = 4 * 1024;
-const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Maximum encoded bytes in one journal JSONL event, excluding its newline.
+pub const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
+/// Maximum bytes in the shell/frontend correlation identifier.
+pub const MAX_EXECUTION_ID_BYTES: usize = 192;
+/// Maximum retained UTF-8 bytes in one command.
+pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
+/// Maximum retained UTF-8 bytes in one working directory.
+pub const MAX_CWD_BYTES: usize = 4 * 1024;
+/// Maximum retained UTF-8 bytes in one terminal-output snapshot.
+pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
-const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_RETAINED_EXECUTIONS: usize = 2_000;
+/// Size at which jsh compacts its append-only journal.
+pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum folded execution records retained by either reader.
+pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
 // jsh compacts after its own event. jterm's correlated output can be the next
 // line and legitimately leave the file one bounded event over the threshold.
 const MAX_JOURNAL_READ_BYTES: u64 = MAX_JOURNAL_FILE_BYTES + MAX_EVENT_LINE_BYTES as u64 + 1;
@@ -126,6 +134,7 @@ struct OutputEvent {
 enum PersistedEvent {
     #[serde(rename = "start")]
     Start {
+        #[serde(alias = "rsh_execution_version")]
         jsh_execution_version: u32,
         id: String,
         session_id: Option<String>,
@@ -138,6 +147,7 @@ enum PersistedEvent {
     },
     #[serde(rename = "finish")]
     Finish {
+        #[serde(alias = "rsh_execution_version")]
         jsh_execution_version: u32,
         id: String,
         exit_code: i32,
@@ -147,6 +157,7 @@ enum PersistedEvent {
     },
     #[serde(rename = "output")]
     Output {
+        #[serde(alias = "rsh_execution_version")]
         jsh_execution_version: u32,
         id: String,
         text: String,
@@ -943,7 +954,9 @@ fn valid_jsh_execution_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-const MAX_JSH_SESSION_ID_BYTES: usize = 128;
+/// Maximum bytes in the jsh session identifier announced over OSC 7770 and
+/// stored on a journal start event.
+pub const MAX_JSH_SESSION_ID_BYTES: usize = 128;
 
 /// Shared definition of a well-formed jsh session id (apps re-use this for
 /// their own session-id handling).
@@ -962,8 +975,13 @@ fn valid_jsh_session_id(id: &str) -> bool {
 fn valid_command_text(command: &str) -> bool {
     !command.is_empty()
         && command.len() <= MAX_COMMAND_BYTES
-        && !command.chars().any(char::is_control)
-        && !crate::review_input::contains_visual_spoofing(command)
+        // jsh commands are structurally multiline. Preserve newline and tab,
+        // which its JSONL serializer safely escapes, while still refusing
+        // terminal controls and non-control display ambiguity on replay.
+        && !command
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+        && !crate::review_input::contains_noncontrol_visual_spoofing(command)
 }
 
 fn valid_cwd_text(cwd: &str) -> bool {
@@ -1224,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn history_reader_drops_unsafe_replay_text_without_losing_safe_records() {
+    fn history_reader_preserves_structural_multiline_but_drops_ambiguous_replay_text() {
         let path = temporary_journal("unsafe-display-text");
         let journal = concat!(
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bad-command\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"echo\\nrun\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
@@ -1238,9 +1256,49 @@ mod tests {
 
         let records = read_session_history_file(&path, "wanted").unwrap();
         let _ = fs::remove_file(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, "bad-command");
+        assert_eq!(records[0].command, "echo\nrun");
+        assert_eq!(records[1].id, "safe");
+        assert_eq!(records[1].cwd_after, None);
+    }
+
+    /// Twin fixture for jsh's serializer. It covers the complete lifecycle,
+    /// the pre-rename version alias jsh migrates in place, and a structural
+    /// multiline command that older core readers incorrectly discarded.
+    #[test]
+    fn history_reader_accepts_jsh_v1_and_legacy_lifecycle_fixtures() {
+        let path = temporary_journal("jsh-golden-lifecycle");
+        let journal = concat!(
+            "{\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"legacy-1\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"printf one\\nprintf two\",\"command_truncated\":false,\"cwd\":\"/tmp\",\"started_at_ms\":10}\n",
+            "{\"rsh_execution_version\":1,\"event\":\"finish\",\"id\":\"legacy-1\",\"exit_code\":7,\"duration_ms\":3,\"cwd_after\":\"/tmp\",\"ended_at_ms\":13}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"legacy-1\",\"text\":\"one\\ntwo\",\"truncated\":false,\"total_bytes\":7,\"captured_at_ms\":14}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].id, "safe");
-        assert_eq!(records[0].cwd_after, None);
+        let record = &records[0];
+        assert_eq!(record.command, "printf one\nprintf two");
+        assert_eq!(record.exit_code, Some(7));
+        assert_eq!(
+            record.output.as_ref().map(|output| output.text.as_str()),
+            Some("one\ntwo")
+        );
+    }
+
+    #[test]
+    fn public_journal_contract_values_match_jsh_v1() {
+        assert_eq!(EXECUTION_JOURNAL_VERSION, 1);
+        assert_eq!(MAX_EVENT_LINE_BYTES, 1024 * 1024);
+        assert_eq!(MAX_EXECUTION_ID_BYTES, 192);
+        assert_eq!(MAX_COMMAND_BYTES, 64 * 1024);
+        assert_eq!(MAX_CWD_BYTES, 4 * 1024);
+        assert_eq!(MAX_OUTPUT_BYTES, 256 * 1024);
+        assert_eq!(MAX_JOURNAL_FILE_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_RETAINED_EXECUTIONS, 2_000);
+        assert_eq!(MAX_JSH_SESSION_ID_BYTES, 128);
     }
 
     #[test]
