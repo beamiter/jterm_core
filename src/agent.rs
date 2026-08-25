@@ -621,6 +621,7 @@ pub fn write_snapshot_file(
 /// Best-effort bounded read of a snapshot file. Any failure (missing file,
 /// oversize, parse error) yields None — a broken snapshot must never block
 /// opening a fresh session.
+#[deprecated(note = "use try_claim_session_file for an atomic, typed, durability-owning restore")]
 pub fn read_snapshot_file(path: &std::path::Path) -> Option<AgentSessionSnapshot> {
     let encoded =
         crate::snapshot_file::read_bounded(path, MAX_AGENT_SNAPSHOT_JSON_BYTES as u64).ok()?;
@@ -628,6 +629,9 @@ pub fn read_snapshot_file(path: &std::path::Path) -> Option<AgentSessionSnapshot
 }
 
 /// Remove a persisted snapshot; missing files are fine.
+#[deprecated(
+    note = "use try_claim_session_file for restore/consume, or an application-owned durable deletion transaction for explicit discard"
+)]
 pub fn remove_snapshot_file(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
 }
@@ -758,6 +762,7 @@ fn collapse_claim_result(
 /// [`SessionClaim::Vacant`], preserving the historical best-effort behavior.
 /// New integrations should use the typed entry point when an unavailable safe
 /// claim primitive or an I/O policy failure must be visible.
+#[deprecated(note = "use try_claim_session_file so non-missing claim failures remain typed")]
 pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
     collapse_claim_result(path, try_claim_session_file(path))
 }
@@ -765,6 +770,24 @@ pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compatibility regressions deliberately exercise these deprecated
+    // wrappers through three narrowly allowed adapters. Production code and
+    // every non-compatibility test keep deprecation warnings visible.
+    #[allow(deprecated)]
+    fn legacy_read_snapshot_file(path: &std::path::Path) -> Option<AgentSessionSnapshot> {
+        read_snapshot_file(path)
+    }
+
+    #[allow(deprecated)]
+    fn legacy_remove_snapshot_file(path: &std::path::Path) {
+        remove_snapshot_file(path);
+    }
+
+    #[allow(deprecated)]
+    fn legacy_claim_session_file(path: &std::path::Path) -> SessionClaim {
+        claim_session_file(path)
+    }
 
     fn pending_snapshot() -> AgentSessionSnapshot {
         let mut session = AgentSession::new(10);
@@ -974,19 +997,19 @@ mod tests {
             assert_eq!(parent_mode, 0o700);
         }
 
-        let restored = read_snapshot_file(&path).expect("snapshot reads back");
+        let restored = legacy_read_snapshot_file(&path).expect("snapshot reads back");
         let restored = AgentSession::restore(restored).unwrap();
         let expected = AgentSession::restore(snapshot).unwrap();
         assert_eq!(restored.transcript(), expected.transcript());
 
         // Corrupt files read as None instead of failing the caller.
         std::fs::write(&path, "not json").unwrap();
-        assert!(read_snapshot_file(&path).is_none());
+        assert!(legacy_read_snapshot_file(&path).is_none());
 
-        remove_snapshot_file(&path);
-        assert!(read_snapshot_file(&path).is_none());
+        legacy_remove_snapshot_file(&path);
+        assert!(legacy_read_snapshot_file(&path).is_none());
         // Removing a missing file is fine.
-        remove_snapshot_file(&path);
+        legacy_remove_snapshot_file(&path);
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -1076,7 +1099,10 @@ mod tests {
             try_claim_session_file(&path).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
-        assert!(matches!(claim_session_file(&path), SessionClaim::Vacant));
+        assert!(matches!(
+            legacy_claim_session_file(&path),
+            SessionClaim::Vacant
+        ));
         assert!(path.is_dir());
         assert!(std::fs::read_dir(&path).unwrap().next().is_none());
     }
@@ -1127,7 +1153,10 @@ mod tests {
             let typed_kind = try_claim_session_file(&worker_path)
                 .expect_err("a FIFO must be rejected as a claim source")
                 .kind();
-            let legacy_vacant = matches!(claim_session_file(&worker_path), SessionClaim::Vacant);
+            let legacy_vacant = matches!(
+                legacy_claim_session_file(&worker_path),
+                SessionClaim::Vacant
+            );
             sender.send((typed_kind, legacy_vacant)).unwrap();
         });
 
@@ -1173,7 +1202,7 @@ mod tests {
         value["turns_used"] = serde_json::json!(u32::MAX);
         std::fs::write(&path, value.to_string()).unwrap();
         assert!(matches!(
-            claim_session_file(&path),
+            legacy_claim_session_file(&path),
             SessionClaim::Quarantined { .. }
         ));
     }
@@ -1184,10 +1213,10 @@ mod tests {
         let path = dir.0.join("agent_session.json");
 
         std::fs::write(&path, vec![b'x'; MAX_AGENT_SNAPSHOT_JSON_BYTES + 1]).unwrap();
-        assert!(read_snapshot_file(&path).is_none());
+        assert!(legacy_read_snapshot_file(&path).is_none());
 
         std::fs::write(&path, "not json").unwrap();
-        assert!(read_snapshot_file(&path).is_none());
+        assert!(legacy_read_snapshot_file(&path).is_none());
     }
 
     #[cfg(unix)]
@@ -1215,7 +1244,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert!(read_snapshot_file(&path).is_some());
+        assert!(legacy_read_snapshot_file(&path).is_some());
     }
 
     #[cfg(unix)]
@@ -1236,7 +1265,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_file());
-        assert!(read_snapshot_file(&path).is_some());
+        assert!(legacy_read_snapshot_file(&path).is_some());
     }
 
     #[cfg(unix)]
@@ -1253,7 +1282,7 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        assert!(read_snapshot_file(&path).is_some());
+        assert!(legacy_read_snapshot_file(&path).is_some());
     }
 
     #[cfg(unix)]
@@ -1273,7 +1302,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let reader_path = path.clone();
         let reader = std::thread::spawn(move || {
-            let _ = sender.send(read_snapshot_file(&reader_path));
+            let _ = sender.send(legacy_read_snapshot_file(&reader_path));
         });
         let result = receiver
             .recv_timeout(std::time::Duration::from_secs(1))

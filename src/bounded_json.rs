@@ -6,11 +6,19 @@
 //! runs. The jterm frontends therefore decode through `DeserializeSeed`
 //! visitors that borrow every nested payload as a [`RawValue`] slice and only
 //! descend under an explicit budget. This module holds the two
-//! schema-independent pieces of that pattern: the cumulative text budget and
-//! the deferred borrowed map field.
+//! schema-independent pieces of that pattern: the cumulative text budget, the
+//! deferred borrowed map field, and a recursive duplicate-member preflight for
+//! trust boundaries that still decode into ordinary Serde types.
 
 use serde::de::{Error as DeError, IgnoredAny, MapAccess};
 use serde_json::value::RawValue;
+
+/// Validate one complete JSON value and reject duplicate object members at
+/// every depth without retaining a decoded [`serde_json::Value`] tree. This is
+/// re-exported from jagent so Agent wire decoding and the family's credential,
+/// IPC, and persistence boundaries cannot drift onto different uniqueness
+/// semantics.
+pub use jagent::validate_no_duplicate_members;
 
 /// A cumulative byte budget charged as decoded text fields are retained.
 ///
@@ -91,6 +99,40 @@ mod tests {
     use super::*;
     use serde::de::Visitor;
     use serde::Deserializer as _;
+
+    #[test]
+    fn duplicate_member_preflight_is_recursive_and_does_not_echo_names() {
+        for valid in [
+            br#"null"#.as_slice(),
+            br#"[true,7,"text",{"nested":[1,2,3]}]"#.as_slice(),
+            br#"{"credential":{"token":"one"},"id":1}"#.as_slice(),
+        ] {
+            validate_no_duplicate_members(valid).unwrap();
+        }
+
+        for invalid in [
+            br#"{"token":"first","token":"second"}"#.as_slice(),
+            br#"{"credential":{"token":"first","token":"second"}}"#.as_slice(),
+            br#"{"name":"first","\u006eame":"second"}"#.as_slice(),
+        ] {
+            let error = validate_no_duplicate_members(invalid)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("duplicate JSON object member"), "{error}");
+            assert!(!error.contains("token"), "{error}");
+            assert!(!error.contains("name"), "{error}");
+        }
+    }
+
+    #[test]
+    fn duplicate_member_preflight_requires_one_complete_json_value() {
+        for invalid in [
+            br#"{"ok":true} trailing"#.as_slice(),
+            br#"{"ok":true"#.as_slice(),
+        ] {
+            assert!(validate_no_duplicate_members(invalid).is_err());
+        }
+    }
 
     #[test]
     fn text_budget_charges_cumulatively_and_fails_closed() {

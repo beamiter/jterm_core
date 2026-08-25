@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25
+Updated: 2026-08-25 (strict JSON preflight and snapshot API deprecation)
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -69,6 +69,23 @@ canonical gate.
 
 ## Completed since the previous handoff
 
+- `bounded_json::validate_no_duplicate_members(&[u8])` is the shared recursive
+  preflight for bounded credential, IPC, and persistence JSON. It validates one
+  complete value, compares object names after escape decoding at every depth,
+  never echoes a hostile name, and retains no `Value` tree; callers keep their
+  schema-specific raw-byte cap and typed decode. Core re-exports jagent's
+  implementation, keeping Agent wire and app-local JSON on one semantic source
+  instead of maintaining a second visitor. This gives ember/frost one
+  contract for Codex `auth.json` and app-server JSON-RPC lines instead of local
+  first-value/last-value behavior.
+- The legacy Agent snapshot `read_snapshot_file` / `remove_snapshot_file` pair
+  and error-collapsing `claim_session_file` wrapper are deprecated, not removed,
+  for 0.2 source compatibility. Every terminal production path now uses
+  `try_claim_session_file`; Forge keeps narrow deprecated re-exports only so
+  existing callers remain source-compatible and still receive the upstream
+  migration warning. Three narrow core test adapters explicitly allow the
+  warnings while production code and every non-compatibility regression keep
+  them visible. Removal belongs to a later breaking release, not the 0.2 line.
 - Agent snapshot claims now make their exactly-once boundary durable inside
   core: the parent directory is descriptor-validated and synced immediately
   after the public name is atomically retired, before decoding can expose a
@@ -81,7 +98,13 @@ canonical gate.
   the crash-replay gap for ember and frost, which correctly consumed the typed
   claim but did not add an app-local directory sync, and makes the contract
   independent of anvil/forge's redundant outer namespace sync.
-- The jagent pin advances to `2570e5e`. Ordinary blocking/streaming AI
+- The jagent pin advances from `2570e5e` to exact revision `a144fb0`. The new
+  public duplicate-member preflight above is the single semantic source for
+  Agent and application JSON, and outbound request validation now rejects
+  nested ambiguity in messages, tools, and provider options. Its development
+  graph also forces serde_json's map-backed arbitrary-precision number path,
+  keeping root-object validation stable under downstream feature unification.
+  Ordinary blocking/streaming AI
   requests now re-run jagent's complete URL/header/unique-top-level-JSON/body
   postcondition immediately before curl, while builders retain the same
   compatibility surface. Validated clear-text loopback requests additionally
@@ -199,14 +222,14 @@ canonical gate.
   window, so consumers never describe a short result as the complete history.
   `read_recent` is now a compatibility wrapper over it.
 
-- `src/bounded_json.rs` holds the two schema-independent pieces of the
+- `src/bounded_json.rs` holds the schema-independent pieces of the
   RawValue bounded-decoder pattern ember and frost both carry in their
   session persistence: `TextBudget` (one cumulative checked-sub text budget
   per snapshot decode) and `DeferredRawField` (a borrowed `&RawValue` map
   field with duplicate tracking, so nested payloads are never cloned per
-  ancestor and an explicit `null` still counts as present). The apps' repair
-  counters and field enums stay app-side; they are the schema. Enabling
-  serde_json's `raw_value` feature was the only manifest change.
+  ancestor and an explicit `null` still counts as present), plus the recursive
+  duplicate-member preflight described above. The apps' repair counters and
+  field enums stay app-side; they are the schema.
 - `src/command_history.rs` gains `prepare_path`, the pre-flight frost carried
   locally as `prepare_command_history_path` while the old pin opened history
   unsafely: the immediate parent must be owned by this user and never
@@ -369,20 +392,6 @@ canonical gate.
   the update-check cache is private, symlink-safe, and atomically replaced.
 
 ## Remaining boundaries
-
-### Retire the legacy Agent snapshot compatibility surface
-
-All four terminal consumers use `try_claim_session_file`; Forge moved to the
-shared claim transaction in its `964a35f` integration round. The public
-best-effort `read_snapshot_file` / `remove_snapshot_file` pair and the
-error-collapsing `claim_session_file` wrapper remain only for 0.2 source
-compatibility. Deprecate them in the next API release so a new integration
-cannot accidentally reintroduce a two-step restore race or hide a durability
-failure. The downstream migration rule for anvil and forge is to remove their
-post-`Restored` `sync_config_parent` calls in the same commit that advances from
-the published `0f47569` pin to this core-owned claim-sync contract: those calls
-are the old pin's only durability barrier, but become a redundant failure point
-once this revision is consumed.
 
 ### Add a signed release manifest to the installer
 

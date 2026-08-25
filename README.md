@@ -52,6 +52,10 @@ v2 is selected only for a peer that has already advertised v2 support.
   journal v1 version and byte/record ceilings are public, and its reader keeps
   jsh's JSON-escaped multiline commands plus the pre-rename version alias so
   migrated shell history and live OSC metadata resolve identically.
+  `bounded_json::validate_no_duplicate_members` re-exports jagent's wire
+  preflight and gives bounded credential, IPC, and persistence decoders one
+  allocation-light recursive preflight, so escaped or plain duplicate object
+  names cannot acquire parser-dependent meanings before typed deserialization.
 - Provider-neutral AI requests, bounded conversations, secret redaction, and
   the review-first `jagent` session surface. Request construction reports any
   omitted history, while system instructions are rejected rather than sampled
@@ -73,7 +77,8 @@ v2 is selected only for a peer that has already advertised v2 support.
    hard link. Other platforms fail closed when they cannot provide that
    primitive. `try_claim_session_file` exposes every non-missing claim failure
    as `io::Error`; the legacy best-effort wrapper logs and collapses it to a
-   vacant outcome without falling back to a separate read. Agent claims sync
+   vacant outcome without falling back to a separate read, and is deprecated
+   together with the racy legacy read/remove pair. Agent claims sync
    the parent after retiring the public name before a live session is exposed,
    then unlink and sync the consumed private claim. A failed retirement barrier
    exposes no session and preserves the evidence; a failed post-unlink cleanup
