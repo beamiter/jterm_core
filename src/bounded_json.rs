@@ -17,7 +17,9 @@ use serde_json::value::RawValue;
 /// every depth without retaining a decoded [`serde_json::Value`] tree. This is
 /// re-exported from jagent so Agent wire decoding and the family's credential,
 /// IPC, and persistence boundaries cannot drift onto different uniqueness
-/// semantics.
+/// semantics. Callers must enforce their raw-input byte ceiling before this
+/// preflight because it allocates decoded member names for each open object,
+/// then perform their schema-specific typed decode only after it succeeds.
 pub use jagent::validate_no_duplicate_members;
 
 /// A cumulative byte budget charged as decoded text fields are retained.
@@ -132,6 +134,27 @@ mod tests {
         ] {
             assert!(validate_no_duplicate_members(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn duplicate_member_preflight_blocks_raw_value_feature_reparse() {
+        let input =
+            br#"{"$serde_json::private::RawValue":"{\"token\":\"safe\",\"token\":\"different\"}"}"#;
+
+        // Core enables serde_json/raw_value for DeferredRawField. Pin the
+        // feature-unified native behavior that would otherwise reparse the
+        // string and silently retain the last duplicate.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(input).unwrap(),
+            serde_json::json!({"token": "different"})
+        );
+
+        let error = validate_no_duplicate_members(input)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved JSON object member"), "{error}");
+        assert!(!error.contains("RawValue"), "{error}");
+        assert!(!error.contains("token"), "{error}");
     }
 
     #[test]

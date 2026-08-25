@@ -56,6 +56,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   preflight and gives bounded credential, IPC, and persistence decoders one
   allocation-light recursive preflight, so escaped or plain duplicate object
   names cannot acquire parser-dependent meanings before typed deserialization.
+  Callers enforce their raw byte ceiling first; the preflight also rejects
+  serde_json's private RawValue escape key before a feature-unified `Value`
+  decoder can reinterpret its string as unchecked JSON.
 - Provider-neutral AI requests, bounded conversations, secret redaction, and
   the review-first `jagent` session surface. Request construction reports any
   omitted history, while system instructions are rejected rather than sampled

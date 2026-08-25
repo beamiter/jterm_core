@@ -73,11 +73,13 @@ canonical gate.
   preflight for bounded credential, IPC, and persistence JSON. It validates one
   complete value, compares object names after escape decoding at every depth,
   never echoes a hostile name, and retains no `Value` tree; callers keep their
-  schema-specific raw-byte cap and typed decode. Core re-exports jagent's
-  implementation, keeping Agent wire and app-local JSON on one semantic source
-  instead of maintaining a second visitor. This gives ember/frost one
-  contract for Codex `auth.json` and app-server JSON-RPC lines instead of local
-  first-value/last-value behavior.
+  schema-specific raw-byte cap before the name-allocating preflight and typed
+  decode. Core re-exports jagent's implementation, keeping Agent wire and
+  app-local JSON on one semantic source instead of maintaining a second
+  visitor. This gives ember/frost one contract for Codex `auth.json` and
+  app-server JSON-RPC lines instead of local first-value/last-value behavior.
+  The contract also rejects serde_json's private RawValue sentinel before a
+  feature-unified `Value` decoder can reparse its string as unchecked JSON.
 - The legacy Agent snapshot `read_snapshot_file` / `remove_snapshot_file` pair
   and error-collapsing `claim_session_file` wrapper are deprecated, not removed,
   for 0.2 source compatibility. Every terminal production path now uses
@@ -98,12 +100,13 @@ canonical gate.
   the crash-replay gap for ember and frost, which correctly consumed the typed
   claim but did not add an app-local directory sync, and makes the contract
   independent of anvil/forge's redundant outer namespace sync.
-- The jagent pin advances from `2570e5e` to exact revision `a144fb0`. The new
-  public duplicate-member preflight above is the single semantic source for
-  Agent and application JSON, and outbound request validation now rejects
-  nested ambiguity in messages, tools, and provider options. Its development
-  graph also forces serde_json's map-backed arbitrary-precision number path,
-  keeping root-object validation stable under downstream feature unification.
+- The jagent pin advances from `2570e5e` to exact revision `a462ec8`. Its
+  public duplicate-member preflight above is the single semantic
+  source for Agent and application JSON, and outbound request validation now
+  rejects nested ambiguity in messages, tools, and provider options. Its
+  development graph also forces serde_json's map-backed arbitrary-precision
+  number and RawValue paths, keeping root-object and private-sentinel handling
+  stable under downstream feature unification.
   Ordinary blocking/streaming AI
   requests now re-run jagent's complete URL/header/unique-top-level-JSON/body
   postcondition immediately before curl, while builders retain the same

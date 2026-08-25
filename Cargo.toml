@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # Pin the policy engine so a branch move cannot silently change the contract.
-jagent = { git = "https://github.com/beamiter/jagent.git", rev = "a144fb0a88007f7d0d6637f13f4c3eb72ecef752" }
+jagent = { git = "https://github.com/beamiter/jagent.git", rev = "a462ec81f3a4c6ad85a455780ced232172f127ea" }
 crossbeam-channel = "0.5"
 libc = "0.2.189"
 log = "0.4"
