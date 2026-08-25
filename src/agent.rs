@@ -660,7 +660,10 @@ pub enum SessionClaim {
 /// both read the same snapshot and both resume it, and a crash between the two
 /// calls either loses the session or replays it. This primitive closes both:
 /// the snapshot is moved to a private name first, so exactly one caller ever
-/// observes it, and the claim is only deleted once a session exists.
+/// observes it, the retired public name is durably synced before any session
+/// is exposed, and the claim is only deleted once a session exists. Its cleanup
+/// sync is attempted before return; failure can leave only an ignored private
+/// orphan after a crash, never replay the durably retired public snapshot.
 ///
 /// A missing public name, including losing a race to another opener, returns
 /// [`SessionClaim::Vacant`]. Any other failure to acquire the claim is returned
@@ -675,6 +678,14 @@ fn try_claim_session_file_with(
     path: &std::path::Path,
     claim: impl FnOnce(&std::path::Path) -> std::io::Result<std::path::PathBuf>,
 ) -> std::io::Result<SessionClaim> {
+    try_claim_session_file_with_sync(path, claim, crate::snapshot_file::sync_parent_directory)
+}
+
+fn try_claim_session_file_with_sync(
+    path: &std::path::Path,
+    claim: impl FnOnce(&std::path::Path) -> std::io::Result<std::path::PathBuf>,
+    mut sync_parent: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<SessionClaim> {
     let claimed = match claim(path) {
         Ok(claimed) => claimed,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -684,6 +695,10 @@ fn try_claim_session_file_with(
         }
         Err(error) => return Err(error),
     };
+    // Persist retirement of the public name before decoding can expose a live
+    // session. Without this barrier a power loss may roll the rename back and
+    // let a later process replay the same approval snapshot.
+    sync_parent(&claimed)?;
     // Transcripts can contain private data, so a claimed snapshot with any
     // group/other permission bits is treated as tampering, not merely read.
     let restored =
@@ -695,7 +710,23 @@ fn try_claim_session_file_with(
             .and_then(AgentSession::restore);
     Ok(match restored {
         Ok(session) => {
-            let _ = std::fs::remove_file(&claimed);
+            // Do not report a consumed session while its private claim could
+            // still survive this process. A failure is surfaced through the
+            // typed I/O result and the evidence remains at its claim path.
+            std::fs::remove_file(&claimed)?;
+            // The first barrier already made retirement of the public name
+            // durable, so a later process can never replay this session. If
+            // syncing the cleanup fails, the worst crash outcome is an orphan
+            // under the private `.claimed-*` name, which loaders deliberately
+            // ignore. Keep the live session available and surface that
+            // maintenance issue through the log instead of losing both it and
+            // the now-unlinked evidence.
+            if let Err(error) = sync_parent(&claimed) {
+                log::warn!(
+                    "agent: consumed snapshot cleanup for {} was not durable: {error}",
+                    claimed.display()
+                );
+            }
             SessionClaim::Restored(session)
         }
         Err(error) => SessionClaim::Quarantined {
@@ -848,6 +879,78 @@ mod tests {
         };
         assert_eq!(path, invalid_claim);
         assert_eq!(std::fs::read(&path).unwrap(), b"not json");
+    }
+
+    #[test]
+    fn a_valid_claim_is_synced_before_decode_and_after_consumption() {
+        let dir = TestDir::new("claim-durable-order");
+        let public = dir.0.join("agent_session.json");
+        let claimed = dir.0.join("agent_session.claimed.json");
+        write_snapshot_file(&claimed, &pending_snapshot()).unwrap();
+        let namespace_states = std::cell::RefCell::new(Vec::new());
+
+        let result = try_claim_session_file_with_sync(
+            &public,
+            |_| Ok(claimed.clone()),
+            |path| {
+                assert_eq!(path, claimed);
+                namespace_states.borrow_mut().push(path.exists());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result, SessionClaim::Restored(_)));
+        assert_eq!(
+            namespace_states.borrow().as_slice(),
+            [true, false],
+            "the retired public name must sync while the claim exists, then the consumed claim must sync after unlink"
+        );
+    }
+
+    #[test]
+    fn a_failed_claim_durability_barrier_exposes_no_session_and_keeps_evidence() {
+        let dir = TestDir::new("claim-sync-failure");
+        let public = dir.0.join("agent_session.json");
+        let claimed = dir.0.join("agent_session.claimed.json");
+        write_snapshot_file(&claimed, &pending_snapshot()).unwrap();
+
+        let error = try_claim_session_file_with_sync(
+            &public,
+            |_| Ok(claimed.clone()),
+            |_| Err(std::io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(claimed.exists(), "unsynced evidence must not be consumed");
+    }
+
+    #[test]
+    fn a_failed_post_unlink_sync_keeps_the_nonreplayable_live_session() {
+        let dir = TestDir::new("claim-cleanup-sync-failure");
+        let public = dir.0.join("agent_session.json");
+        let claimed = dir.0.join("agent_session.claimed.json");
+        write_snapshot_file(&claimed, &pending_snapshot()).unwrap();
+        let sync_calls = std::cell::Cell::new(0);
+
+        let result = try_claim_session_file_with_sync(
+            &public,
+            |_| Ok(claimed.clone()),
+            |_| {
+                sync_calls.set(sync_calls.get() + 1);
+                if sync_calls.get() == 1 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("injected cleanup sync failure"))
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result, SessionClaim::Restored(_)));
+        assert_eq!(sync_calls.get(), 2);
+        assert!(!claimed.exists());
     }
 
     #[test]

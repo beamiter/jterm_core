@@ -458,41 +458,46 @@ pub fn ensure_private_directory(dir: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn open_existing_directory(dir: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session snapshot parent is not a directory",
+        ));
+    }
+    let mode = metadata.permissions().mode();
+    // A foreign owner can replace entries even in a sticky directory. Root
+    // ownership keeps explicitly configured `/tmp/...` snapshots working
+    // while rejecting attacker-owned shared namespaces.
+    // SAFETY: geteuid has no preconditions and only reads process state.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid && metadata.uid() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session snapshot parent is not owned by the current user or root",
+        ));
+    }
+    if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session snapshot parent is group/world writable without the sticky bit",
+        ));
+    }
+    Ok(directory)
+}
+
 fn validate_existing_directory(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(dir)?;
-        let metadata = directory.metadata()?;
-        if !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session snapshot parent is not a directory",
-            ));
-        }
-        let mode = metadata.permissions().mode();
-        // A foreign owner can replace entries even in a sticky directory.
-        // Root ownership keeps explicitly configured `/tmp/...` snapshots
-        // working while rejecting attacker-owned shared namespaces.
-        // SAFETY: geteuid has no preconditions and only reads process state.
-        let effective_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != effective_uid && metadata.uid() != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "session snapshot parent is not owned by the current user or root",
-            ));
-        }
-        if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "session snapshot parent is group/world writable without the sticky bit",
-            ));
-        }
-        Ok(())
+        open_existing_directory(dir).map(drop)
     }
     #[cfg(not(unix))]
     {
@@ -504,6 +509,30 @@ fn validate_existing_directory(dir: &Path) -> io::Result<()> {
                 "session snapshot parent is not a directory",
             ))
         }
+    }
+}
+
+/// Persist namespace changes beside `path` through the same validated parent
+/// directory policy used by private snapshot writes.
+///
+/// Agent claims call this after retiring the public name and again after
+/// consuming the private claim. Keeping the directory descriptor alive across
+/// `sync_all` prevents a final-component symlink swap from redirecting the
+/// durability barrier. Non-Unix platforms do not expose the atomic claim
+/// primitive and therefore need no directory sync here.
+pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        open_existing_directory(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 

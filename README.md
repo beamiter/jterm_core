@@ -73,7 +73,11 @@ v2 is selected only for a peer that has already advertised v2 support.
    hard link. Other platforms fail closed when they cannot provide that
    primitive. `try_claim_session_file` exposes every non-missing claim failure
    as `io::Error`; the legacy best-effort wrapper logs and collapses it to a
-   vacant outcome without falling back to a separate read.
+   vacant outcome without falling back to a separate read. Agent claims sync
+   the parent after retiring the public name before a live session is exposed,
+   then unlink and sync the consumed private claim. A failed retirement barrier
+   exposes no session and preserves the evidence; a failed post-unlink cleanup
+   sync is logged but the already non-replayable live session remains usable.
 3. Restored argv boundaries are preserved. Legacy joined command strings may
    be read for migration but are never replayed.
 4. Model output is only a proposal. Every command requires explicit user

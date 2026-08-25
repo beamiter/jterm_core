@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-24
+Updated: 2026-08-25
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -69,7 +69,19 @@ canonical gate.
 
 ## Completed since the previous handoff
 
-- The jagent pin advances to `fcb9768`. Ordinary blocking/streaming AI
+- Agent snapshot claims now make their exactly-once boundary durable inside
+  core: the parent directory is descriptor-validated and synced immediately
+  after the public name is atomically retired, before decoding can expose a
+  live session, then synced again after the private claim is removed. A sync or
+  unlink failure before consumption returns through the typed I/O result
+  instead of reporting a consumed session; evidence that still has a name
+  remains intact. A post-unlink sync failure is logged while the live session
+  remains usable: the first barrier already made the public retirement durable,
+  so a crash can at worst resurrect an ignored `.claimed-*` orphan. This closes
+  the crash-replay gap for ember and frost, which correctly consumed the typed
+  claim but did not add an app-local directory sync, and makes the contract
+  independent of anvil/forge's redundant outer namespace sync.
+- The jagent pin advances to `2570e5e`. Ordinary blocking/streaming AI
   requests now re-run jagent's complete URL/header/unique-top-level-JSON/body
   postcondition immediately before curl, while builders retain the same
   compatibility surface. Validated clear-text loopback requests additionally
@@ -77,7 +89,11 @@ canonical gate.
   redirect local provider credentials off-host; HTTPS keeps the user's proxy
   configuration. jagent also turns a second post-preparation history omission
   into a release-mode error, so the exact dependency consumed here now carries
-  the same upstream guard in optimized builds.
+  the same upstream guard in optimized builds. Complete responses, streaming
+  frames, JSON-in-text actions, and native-tool arguments additionally reject
+  duplicate JSON object members recursively, so provider/model bytes cannot
+  select different completion states or commands through first-value/last-value
+  decoder differences.
 - OSC 133 command metadata now preserves jsh's percent-encoded structural
   newline/tab bytes instead of discarding a valid multiline command. Repeated
   aliases for id/command/cwd/duration fail closed rather than using last-wins
@@ -354,18 +370,19 @@ canonical gate.
 
 ## Remaining boundaries
 
-### Finish Forge's stronger claim validation boundary
+### Retire the legacy Agent snapshot compatibility surface
 
-Anvil, ember, and frost now consume core's `SessionClaim::Restored` directly;
-they do not run a second app restore/audit after core has consumed the claim.
-Typed claim-acquisition failures are also complete in core through
-`try_claim_session_file`. Forge alone retains a local dirfd/inode-bound
-transaction because it enforces policy beyond core's path-based primitive. It
-should keep that stronger transaction until core exposes a pre-retire
-validation hook that can preserve Forge's late validation without losing
-evidence. After that migration, decide whether to deprecate the public
-best-effort read/remove pair and legacy claim wrapper so a new integration
-cannot accidentally reintroduce a two-step restore race.
+All four terminal consumers use `try_claim_session_file`; Forge moved to the
+shared claim transaction in its `964a35f` integration round. The public
+best-effort `read_snapshot_file` / `remove_snapshot_file` pair and the
+error-collapsing `claim_session_file` wrapper remain only for 0.2 source
+compatibility. Deprecate them in the next API release so a new integration
+cannot accidentally reintroduce a two-step restore race or hide a durability
+failure. The downstream migration rule for anvil and forge is to remove their
+post-`Restored` `sync_config_parent` calls in the same commit that advances from
+the published `0f47569` pin to this core-owned claim-sync contract: those calls
+are the old pin's only durability barrier, but become a redundant failure point
+once this revision is consumed.
 
 ### Add a signed release manifest to the installer
 
