@@ -405,6 +405,15 @@ pub enum ObservedSshTarget {
 
 const UNSAFE_SSH_OPTION: &str =
     "this SSH command uses an option that cannot be safely reused for Files";
+const UNSAFE_OBSERVED_CONTROL_PATH: &str =
+    "SSH ControlPath reused by Files must be an absolute path or start with ~/";
+
+fn valid_observed_control_path(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        || path
+            .strip_prefix("~/")
+            .is_some_and(|relative| !relative.is_empty())
+}
 
 fn safe_o_option(option: &str) -> bool {
     let key = option
@@ -614,7 +623,9 @@ fn observed_jsh_remote_target(argv: &[String]) -> ObservedSshTarget {
 /// Only an interactive login with no remote command is accepted. Connection
 /// options needed by a second non-interactive probe are retained; TTY,
 /// forwarding, logging, and presentation flags are deliberately dropped.
-/// Options that can execute a local command or load code are rejected.
+/// Options that can execute a local command or load code are rejected. An
+/// observed ControlPath must be absolute or use `~/` so replay cannot silently
+/// resolve the socket against the file sidecar's different working directory.
 pub fn observed_ssh_target(argv: &[String]) -> ObservedSshTarget {
     if is_jsh_remote_launcher_argv(argv) {
         return observed_jsh_remote_target(argv);
@@ -673,6 +684,13 @@ fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
                     None
                 };
 
+                if flag == 'S'
+                    && operand
+                        .as_deref()
+                        .is_none_or(|path| !valid_observed_control_path(path))
+                {
+                    return ObservedSshTarget::Unsupported(UNSAFE_OBSERVED_CONTROL_PATH);
+                }
                 if takes_operand && operand.as_deref().is_none_or(str::is_empty) {
                     return ObservedSshTarget::Unsupported("this SSH option has no value");
                 }
@@ -712,6 +730,14 @@ fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
                         let option = operand.as_deref().expect("operand option");
                         if !safe_o_option(option) {
                             return ObservedSshTarget::Unsupported(UNSAFE_SSH_OPTION);
+                        }
+                        let (key, value) = option
+                            .split_once('=')
+                            .map_or((option, None), |(key, value)| (key, Some(value)));
+                        if key.eq_ignore_ascii_case("controlpath")
+                            && value.is_none_or(|path| !valid_observed_control_path(path))
+                        {
+                            return ObservedSshTarget::Unsupported(UNSAFE_OBSERVED_CONTROL_PATH);
                         }
                         ssh_args.push("-o".to_string());
                         ssh_args.push(option.to_string());
@@ -1011,6 +1037,96 @@ mod tests {
                 "StrictHostKeyChecking=no"
             ]
         );
+    }
+
+    #[test]
+    fn observed_ssh_accepts_only_stable_control_path_operands() {
+        const REASON: &str =
+            "SSH ControlPath reused by Files must be an absolute path or start with ~/";
+
+        for (args, expected) in [
+            (
+                &["ssh", "-S", "/tmp/cm-%C", "host"] as &[&str],
+                &["-S", "/tmp/cm-%C"] as &[&str],
+            ),
+            (&["ssh", "-S~/.ssh/cm-%C", "host"], &["-S", "~/.ssh/cm-%C"]),
+            (
+                &["ssh", "-o", "ControlPath=/tmp/cm-%C", "host"],
+                &["-o", "ControlPath=/tmp/cm-%C"],
+            ),
+            (
+                &["ssh", "-ocontrolpath=~/.ssh/cm-%C", "host"],
+                &["-o", "controlpath=~/.ssh/cm-%C"],
+            ),
+        ] {
+            let ObservedSshTarget::Target(target) = ssh(args) else {
+                panic!("expected an observed SSH target for {args:?}");
+            };
+            assert_eq!(target.ssh_args, expected, "argv: {args:?}");
+        }
+
+        for args in [
+            &["ssh", "-S"] as &[&str],
+            &["ssh", "-S", "", "host"] as &[&str],
+            &["ssh", "-S", "cm-%C", "host"],
+            &["ssh", "-S./cm-%C", "host"],
+            &["ssh", "-S../cm-%C", "host"],
+            &["ssh", "-S~alice/.ssh/cm-%C", "host"],
+            &["ssh", "-S~/", "host"],
+            &["ssh", "-o", "ControlPath", "host"],
+            &["ssh", "-o", "ControlPath=", "host"],
+            &["ssh", "-oControlPath=", "host"],
+            &["ssh", "-oControlPath=cm-%C", "host"],
+            &["ssh", "-o", "controlpath=./cm-%C", "host"],
+            &["ssh", "-oControlPath=../cm-%C", "host"],
+            &["ssh", "-o", "ControlPath=~alice/.ssh/cm-%C", "host"],
+        ] {
+            assert_eq!(
+                ssh(args),
+                ObservedSshTarget::Unsupported(REASON),
+                "argv: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_jsh_launcher_applies_the_control_path_gate_to_pass_through_args() {
+        const REASON: &str =
+            "SSH ControlPath reused by Files must be an absolute path or start with ~/";
+
+        let prefix = [
+            "/bin/sh",
+            "/home/alice/.cache/jsh/jsh-remote.sh",
+            "--persist",
+            "--local-jsh",
+            "/home/alice/.local/bin/jsh",
+            "dev@box.example",
+            "--",
+        ];
+
+        let mut accepted = prefix.to_vec();
+        accepted.extend(["-oControlPath=~/.ssh/cm-%C", "-S", "/tmp/cm-override-%C"]);
+        let ObservedSshTarget::Target(target) = ssh(&accepted) else {
+            panic!("expected absolute and SSH-home ControlPaths to pass through");
+        };
+        assert_eq!(
+            target.ssh_args,
+            [
+                "-o",
+                "ControlPath=~/.ssh/cm-%C",
+                "-S",
+                "/tmp/cm-override-%C"
+            ]
+        );
+
+        for rejected_args in [
+            ["-S", "relative/cm-%C"].as_slice(),
+            ["-oControlPath=~alice/.ssh/cm-%C"].as_slice(),
+        ] {
+            let mut rejected = prefix.to_vec();
+            rejected.extend_from_slice(rejected_args);
+            assert_eq!(ssh(&rejected), ObservedSshTarget::Unsupported(REASON));
+        }
     }
 
     #[test]
