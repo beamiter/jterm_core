@@ -709,6 +709,274 @@ pub fn restorable_command_via_stat(shell_pid: i32) -> Option<Vec<String>> {
     restorable_command_from_foreground(shell_pid, foreground)
 }
 
+/// One SSH command observed at a real local process boundary.
+///
+/// `argv` is retained for cheap foreground-change deduplication. `target` is
+/// already classified so a trusted jsh deployment launcher can carry the
+/// same result as a direct `ssh`, including an actionable `Unsupported`
+/// reason when hidden launcher inputs make exact reuse impossible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedSshCommand {
+    pub argv: Vec<String>,
+    pub target: crate::jsh_remote::ObservedSshTarget,
+    /// A jsh-remote master socket that a Files execution profile may overlay
+    /// after it has resolved stable saved/transient target identity.
+    pub reusable_control_path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum JshLauncherAuthority {
+    Untrusted,
+    HiddenSshArgs,
+    Trusted { control_path: Option<String> },
+}
+
+fn has_control_path_argument(args: &[String]) -> bool {
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "-S" || (argument.starts_with("-S") && argument.len() > 2) {
+            return true;
+        }
+        if argument == "-o" {
+            if args.get(index + 1).is_some_and(|option| {
+                option
+                    .split_once('=')
+                    .map_or(option.as_str(), |(key, _)| key)
+                    .eq_ignore_ascii_case("controlpath")
+            }) {
+                return true;
+            }
+            index += 1;
+        } else if let Some(option) = argument.strip_prefix("-o") {
+            if option
+                .split_once('=')
+                .map_or(option, |(key, _)| key)
+                .eq_ignore_ascii_case("controlpath")
+            {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn apply_jsh_launcher_authority(
+    argv: Vec<String>,
+    target: crate::jsh_remote::ObservedSshTarget,
+    authority: JshLauncherAuthority,
+) -> Option<ObservedSshCommand> {
+    use crate::jsh_remote::ObservedSshTarget;
+
+    match authority {
+        JshLauncherAuthority::Untrusted => None,
+        JshLauncherAuthority::HiddenSshArgs => Some(ObservedSshCommand {
+            argv,
+            target: match target {
+                ObservedSshTarget::Target(_) => ObservedSshTarget::Unsupported(
+                    "JSH_REMOTE_SSH_ARGS hides connection options; use a saved Remote Files profile",
+                ),
+                other => other,
+            },
+            reusable_control_path: None,
+        }),
+        JshLauncherAuthority::Trusted { control_path } => {
+            let reusable_control_path = match (&target, control_path) {
+                (ObservedSshTarget::Target(profile), Some(path))
+                    if !has_control_path_argument(&profile.ssh_args) =>
+                {
+                    Some(path)
+                }
+                _ => None,
+            };
+            Some(ObservedSshCommand {
+                argv,
+                target,
+                reusable_control_path,
+            })
+        }
+    }
+}
+
+fn observed_ssh_command_from_foreground<ReadArgv, ReadParent, CheckLauncher>(
+    shell_pid: i32,
+    foreground_pid: Option<i32>,
+    mut read_argv: ReadArgv,
+    mut read_parent: ReadParent,
+    mut check_launcher: CheckLauncher,
+) -> Option<ObservedSshCommand>
+where
+    ReadArgv: FnMut(i32) -> Option<Vec<String>>,
+    ReadParent: FnMut(i32) -> Option<i32>,
+    CheckLauncher: FnMut(i32, i32, &[String]) -> JshLauncherAuthority,
+{
+    use crate::jsh_remote::{observed_ssh_target, ObservedSshTarget};
+
+    // A managed plain-SSH pane may make ssh the PTY child itself. Deployment
+    // launchers need a jsh parent and are therefore handled only in the
+    // foreground ancestry below.
+    if let Some(argv) = read_argv(shell_pid) {
+        let target = observed_ssh_target(&argv);
+        if !matches!(target, ObservedSshTarget::NotSsh)
+            && !crate::jsh_remote::is_jsh_remote_launcher_argv(&argv)
+        {
+            return Some(ObservedSshCommand {
+                argv,
+                target,
+                reusable_control_path: None,
+            });
+        }
+    }
+
+    let mut pid = foreground_pid?;
+    for _ in 0..16 {
+        if pid == shell_pid || pid <= 1 {
+            return None;
+        }
+        let argv = read_argv(pid)?;
+        let target = observed_ssh_target(&argv);
+        if !matches!(target, ObservedSshTarget::NotSsh) {
+            if crate::jsh_remote::is_jsh_remote_launcher_argv(&argv) {
+                let authority = check_launcher(pid, shell_pid, &argv);
+                return apply_jsh_launcher_authority(argv, target, authority);
+            }
+            return Some(ObservedSshCommand {
+                argv,
+                target,
+                reusable_control_path: None,
+            });
+        }
+        pid = read_parent(pid)?;
+    }
+    None
+}
+
+const MAX_PROC_ENVIRON_BYTES: u64 = 2 * 1024 * 1024;
+
+fn read_proc_environ(pid: i32) -> Option<Vec<u8>> {
+    if pid <= 0 {
+        return None;
+    }
+    use std::io::Read;
+
+    let file = std::fs::File::open(format!("/proc/{pid}/environ")).ok()?;
+    let mut raw = Vec::new();
+    file.take(MAX_PROC_ENVIRON_BYTES + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    (raw.len() as u64 <= MAX_PROC_ENVIRON_BYTES).then_some(raw)
+}
+
+fn environment_value<'a>(environment: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    environment.split(|byte| *byte == 0).find_map(|entry| {
+        let equals = entry.iter().position(|byte| *byte == b'=')?;
+        let (key, value) = entry.split_at(equals);
+        let value = value.get(1..)?;
+        (key == name).then_some(value)
+    })
+}
+
+fn private_owned_regular_file(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_file()
+        && metadata.nlink() == 1
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o022 == 0
+}
+
+fn jsh_launcher_authority(
+    launcher_pid: i32,
+    shell_pid: i32,
+    argv: &[String],
+) -> JshLauncherAuthority {
+    if !crate::jsh_remote::is_jsh_ssh_upgrade_launcher_argv(argv)
+        || read_ppid(launcher_pid) != Some(shell_pid)
+        || std::fs::read_link(format!("/proc/{shell_pid}/exe"))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_owned()))
+            .and_then(|name| name.to_str().map(str::to_owned))
+            .as_deref()
+            != Some("jsh")
+    {
+        return JshLauncherAuthority::Untrusted;
+    }
+
+    let Some(environment) = read_proc_environ(launcher_pid) else {
+        return JshLauncherAuthority::Untrusted;
+    };
+    let value = |name: &[u8]| {
+        environment_value(&environment, name)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .filter(|value| !value.is_empty())
+    };
+    let cache_home = value(b"XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            value(b"HOME")
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".cache"))
+        });
+    let Some(script) = argv.get(1).map(Path::new) else {
+        return JshLauncherAuthority::Untrusted;
+    };
+    if !private_owned_regular_file(script) {
+        return JshLauncherAuthority::Untrusted;
+    }
+
+    if environment_value(&environment, b"JSH_REMOTE_SSH_ARGS")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return JshLauncherAuthority::HiddenSshArgs;
+    }
+
+    let control_base = value(b"XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| cache_home.map(|cache| cache.join("anvil")));
+    let control_path = control_base.and_then(|base| {
+        let path = base.join("cm-%C");
+        let path = path.to_str()?;
+        (path.len() <= 512
+            && !path
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+            && !crate::review_input::contains_visual_spoofing(path))
+        .then(|| path.to_string())
+    });
+    JshLauncherAuthority::Trusted { control_path }
+}
+
+/// Observe a direct foreground SSH command or a provenance-checked jsh remote
+/// launcher through a PTY master fd.
+pub fn observed_ssh_command(pty_fd: i32, shell_pid: i32) -> Option<ObservedSshCommand> {
+    observed_ssh_command_from_foreground(
+        shell_pid,
+        foreground_pgid(pty_fd, shell_pid),
+        read_proc_cmdline,
+        read_ppid,
+        jsh_launcher_authority,
+    )
+}
+
+/// [`observed_ssh_command`] for frontends that own only the shell pid.
+pub fn observed_ssh_command_via_stat(shell_pid: i32) -> Option<ObservedSshCommand> {
+    let foreground = foreground_pgid_via_stat(shell_pid).filter(|pid| *pid != shell_pid);
+    observed_ssh_command_from_foreground(
+        shell_pid,
+        foreground,
+        read_proc_cmdline,
+        read_ppid,
+        jsh_launcher_authority,
+    )
+}
+
 /// Name of the foreground process on a PTY (e.g. "ssh", "vim"), or None if the
 /// shell itself is in the foreground. Used for close-confirmation prompts.
 pub fn foreground_process_name(pty_fd: i32, shell_pid: i32) -> Option<String> {
@@ -1636,6 +1904,164 @@ mod tests {
         let restored = match_restorable_command(&args).expect("ssh argv is restorable");
         assert_eq!(restored.len(), 3);
         assert_eq!(restored[2], "printf '%s, %s; still remote' one two");
+    }
+
+    #[test]
+    fn jsh_remote_launchers_are_observed_but_never_added_to_session_restore() {
+        use crate::jsh_remote::ObservedSshTarget;
+
+        let launcher = argv(&[
+            "/bin/sh",
+            "/home/alice/.cache/jsh/jsh-remote.sh",
+            "--persist",
+            "--local-jsh",
+            "/home/alice/bin/jsh",
+            "root@box.example",
+            "--",
+            "-p",
+            "22",
+        ]);
+        assert!(match_restorable_command(&launcher).is_none());
+
+        let command = observed_ssh_command_from_foreground(
+            100,
+            Some(200),
+            |pid| match pid {
+                100 => Some(argv(&["jsh"])),
+                200 => Some(launcher.clone()),
+                _ => None,
+            },
+            |pid| (pid == 200).then_some(100),
+            |pid, shell, _| {
+                assert_eq!((pid, shell), (200, 100));
+                JshLauncherAuthority::Trusted {
+                    control_path: Some("/run/user/1000/cm-%C".to_string()),
+                }
+            },
+        )
+        .expect("trusted launcher");
+        assert_eq!(command.argv, launcher);
+        assert_eq!(
+            command.reusable_control_path.as_deref(),
+            Some("/run/user/1000/cm-%C")
+        );
+        let ObservedSshTarget::Target(target) = command.target else {
+            panic!("expected SSH target");
+        };
+        assert_eq!(target.host, "box.example");
+        assert_eq!(target.user.as_deref(), Some("root"));
+        assert_eq!(target.ssh_args, ["-p", "22"]);
+    }
+
+    #[test]
+    fn observed_jsh_launcher_fails_closed_on_provenance_and_hidden_flags() {
+        use crate::jsh_remote::ObservedSshTarget;
+
+        let launcher = argv(&[
+            "/bin/sh",
+            "/home/alice/.cache/jsh/jsh-remote.sh",
+            "--persist",
+            "--local-jsh",
+            "/home/alice/bin/jsh",
+            "box.example",
+        ]);
+        let read = |pid| match pid {
+            100 => Some(argv(&["jsh"])),
+            200 => Some(launcher.clone()),
+            _ => None,
+        };
+        assert!(observed_ssh_command_from_foreground(
+            100,
+            Some(200),
+            read,
+            |pid| (pid == 200).then_some(100),
+            |_, _, _| JshLauncherAuthority::Untrusted,
+        )
+        .is_none());
+
+        let hidden = observed_ssh_command_from_foreground(
+            100,
+            Some(200),
+            read,
+            |pid| (pid == 200).then_some(100),
+            |_, _, _| JshLauncherAuthority::HiddenSshArgs,
+        )
+        .expect("trusted process with hidden input gets a diagnostic");
+        assert!(matches!(hidden.target, ObservedSshTarget::Unsupported(_)));
+    }
+
+    #[test]
+    fn direct_observed_ssh_does_not_need_launcher_authority() {
+        use crate::jsh_remote::ObservedSshTarget;
+
+        let command = observed_ssh_command_from_foreground(
+            100,
+            Some(200),
+            |pid| match pid {
+                100 => Some(argv(&["jsh"])),
+                200 => Some(argv(&["ssh", "dev@box", "-p", "2200"])),
+                _ => None,
+            },
+            |pid| (pid == 200).then_some(100),
+            |_, _, _| panic!("direct ssh must not ask for launcher authority"),
+        )
+        .expect("direct ssh");
+        let ObservedSshTarget::Target(target) = command.target else {
+            panic!("expected SSH target");
+        };
+        assert_eq!(target.user.as_deref(), Some("dev"));
+        assert_eq!(target.ssh_args, ["-p", "2200"]);
+        assert!(command.reusable_control_path.is_none());
+    }
+
+    #[test]
+    fn launcher_environment_lookup_and_control_path_detection_are_exact() {
+        let environment = b"HOME=/home/a\0JSH_REMOTE_SSH_ARGS=\0XDG_RUNTIME_DIR=/run/u\0";
+        assert_eq!(
+            environment_value(environment, b"HOME"),
+            Some(&b"/home/a"[..])
+        );
+        assert_eq!(
+            environment_value(environment, b"JSH_REMOTE_SSH_ARGS"),
+            Some(&b""[..])
+        );
+        assert_eq!(environment_value(environment, b"NOT_HOME"), None);
+        assert!(has_control_path_argument(&argv(&[
+            "-p",
+            "22",
+            "-o",
+            "ControlPath=/tmp/cm-%C"
+        ])));
+        assert!(has_control_path_argument(&argv(&["-S/tmp/cm-%C"])));
+        assert!(!has_control_path_argument(&argv(&[
+            "-o",
+            "ControlMaster=auto"
+        ])));
+    }
+
+    #[test]
+    fn launcher_script_authority_rejects_links_and_writable_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!(
+            "jterm-core-launcher-authority-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("scratch directory");
+        let script = dir.join("jsh-remote.sh");
+        std::fs::write(&script, "exit 0\n").expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("private mode");
+        assert!(private_owned_regular_file(&script));
+
+        let link = dir.join("linked-jsh-remote.sh");
+        symlink(&script, &link).expect("symlink");
+        assert!(!private_owned_regular_file(&link));
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o722))
+            .expect("writable mode");
+        assert!(!private_owned_regular_file(&script));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

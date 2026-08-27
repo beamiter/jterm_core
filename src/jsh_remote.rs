@@ -487,19 +487,142 @@ fn observed_name(user: Option<&str>, host: &str) -> String {
     }
 }
 
+/// Whether this is the structured launcher argv emitted by jsh and the four
+/// terminal frontends for a deployed remote session.
+///
+/// The path itself may live below either jsh's or jterm's private cache, so the
+/// stable authority is the real foreground process boundary plus the exact
+/// `/bin/sh …/jsh-remote.sh` shape. The parser below still validates every
+/// launcher field and every SSH argument before a Files sidecar can reuse it.
+pub(crate) fn is_jsh_remote_launcher_argv(argv: &[String]) -> bool {
+    argv.first().is_some_and(|command| command == "/bin/sh")
+        && argv.get(1).is_some_and(|script| {
+            let script = Path::new(script);
+            script.is_absolute()
+                && script
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == "jsh-remote.sh")
+        })
+}
+
+/// The narrower launcher form emitted by jsh's `ssh …` command upgrade.
+/// Process inspection requires this fixed prefix before treating a script
+/// process as equivalent to the SSH command the user entered.
+pub(crate) fn is_jsh_ssh_upgrade_launcher_argv(argv: &[String]) -> bool {
+    is_jsh_remote_launcher_argv(argv)
+        && argv.get(2).is_some_and(|mode| mode == "--persist")
+        && argv.get(3).is_some_and(|option| option == "--local-jsh")
+        && argv
+            .get(4)
+            .is_some_and(|artifact| Path::new(artifact).is_absolute())
+        && argv
+            .get(5)
+            .is_some_and(|destination| !destination.is_empty() && !destination.starts_with('-'))
+        && (argv.len() == 6
+            || (argv.get(6).is_some_and(|separator| separator == "--") && argv.len() > 7))
+}
+
+fn observed_jsh_remote_target(argv: &[String]) -> ObservedSshTarget {
+    if !crate::process::restorable_argv_within_limits(argv) {
+        return ObservedSshTarget::Unsupported("this jsh remote launcher is too large or unsafe");
+    }
+
+    let mut destination: Option<String> = None;
+    let mut ssh_args = Vec::new();
+    let mut mode_seen = false;
+    let mut index = 2usize;
+    while index < argv.len() {
+        let argument = &argv[index];
+        if argument == "--" {
+            if destination.is_none() {
+                return ObservedSshTarget::Unsupported(
+                    "this jsh remote launcher has no SSH destination",
+                );
+            }
+            ssh_args.extend(argv[index + 1..].iter().cloned());
+            break;
+        }
+
+        match argument.as_str() {
+            "--persist" | "--incognito" => {
+                if mode_seen {
+                    return ObservedSshTarget::Unsupported(
+                        "this jsh remote launcher has conflicting modes",
+                    );
+                }
+                mode_seen = true;
+            }
+            // These fields control jsh deployment, not the connection Files
+            // needs. Consume their structured operands without replaying them.
+            "--session" | "--artifact" | "--local-jsh" => {
+                index += 1;
+                if argv.get(index).is_none_or(String::is_empty) {
+                    return ObservedSshTarget::Unsupported(
+                        "this jsh remote launcher option has no value",
+                    );
+                }
+            }
+            // A container launcher is real, but it is not an SSH target. The
+            // four frontends already handle configured Docker locations.
+            "--docker" => return ObservedSshTarget::NotSsh,
+            option if option.starts_with('-') => {
+                return ObservedSshTarget::Unsupported(
+                    "this jsh remote launcher uses an unsupported option",
+                );
+            }
+            _ if destination.is_none() => destination = Some(argument.clone()),
+            _ => {
+                return ObservedSshTarget::Unsupported(
+                    "this jsh remote launcher has more than one destination",
+                );
+            }
+        }
+        index += 1;
+    }
+
+    if !mode_seen {
+        return ObservedSshTarget::Unsupported(
+            "this jsh remote launcher has no explicit deployment mode",
+        );
+    }
+    let Some(destination) = destination else {
+        return ObservedSshTarget::Unsupported("this jsh remote launcher has no SSH destination");
+    };
+
+    let mut ssh = Vec::with_capacity(2 + ssh_args.len());
+    ssh.push("ssh".to_string());
+    ssh.extend(ssh_args);
+    // jsh-remote invokes `ssh ${ssh_extra} -- destination`, even when the
+    // original command placed options after its destination. Preserve that
+    // effective ordering for first-wins options such as `-l`.
+    ssh.push(destination);
+    observed_plain_ssh_target(&ssh)
+}
+
 /// Derive a transient file-tree profile from the argv of a *real* foreground
 /// process.
 ///
 /// Callers must obtain `argv` from an OS process boundary such as
-/// `/proc/<pid>/cmdline` (the [`crate::process::restorable_command`] helpers do
-/// this). Terminal output and OSC 133 command strings are untrusted text and
-/// must not be passed here as proof that the user launched SSH.
+/// `/proc/<pid>/cmdline`. Frontends should use
+/// [`crate::process::observed_ssh_command`] (or its `via_stat` counterpart),
+/// which additionally proves the provenance of jsh's deployment launcher;
+/// generic session-restoration discovery intentionally does not replay that
+/// launcher. Terminal output and OSC 133 command strings are untrusted text
+/// and must not be passed here as proof that the user launched SSH.
 ///
 /// Only an interactive login with no remote command is accepted. Connection
 /// options needed by a second non-interactive probe are retained; TTY,
 /// forwarding, logging, and presentation flags are deliberately dropped.
 /// Options that can execute a local command or load code are rejected.
 pub fn observed_ssh_target(argv: &[String]) -> ObservedSshTarget {
+    if is_jsh_remote_launcher_argv(argv) {
+        return observed_jsh_remote_target(argv);
+    }
+    observed_plain_ssh_target(argv)
+}
+
+fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
     if argv
         .first()
         .and_then(|command| Path::new(command).file_name())
@@ -699,6 +822,148 @@ mod tests {
         assert_eq!(target.user.as_deref(), Some("root"));
         assert_eq!(target.ssh_args, ["-p", "22"]);
         assert_eq!(target.deploy, "off");
+    }
+
+    #[test]
+    fn observed_ssh_accepts_the_real_jsh_upgrade_launcher_shape() {
+        let argv = [
+            "/bin/sh",
+            "/home/alice/.cache/jsh/jsh-remote.sh",
+            "--persist",
+            "--local-jsh",
+            "/home/alice/.local/bin/jsh",
+            "root@dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc.example.com",
+            "--",
+            "-p",
+            "22",
+        ];
+        assert!(super::is_jsh_ssh_upgrade_launcher_argv(
+            &argv
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        ));
+        let ObservedSshTarget::Target(target) = ssh(&argv) else {
+            panic!("expected the jsh launcher to retain its SSH target");
+        };
+        assert_eq!(
+            target.host,
+            "dsw-notebook-dsw-l8rnh0wm7vs81o7z6j-22.vpc.example.com"
+        );
+        assert_eq!(target.user.as_deref(), Some("root"));
+        assert_eq!(target.ssh_args, ["-p", "22"]);
+    }
+
+    #[test]
+    fn observed_jsh_launcher_preserves_the_effective_ssh_option_order() {
+        let ObservedSshTarget::Target(target) = ssh(&[
+            "/bin/sh",
+            "/home/alice/.cache/jsh/jsh-remote.sh",
+            "--persist",
+            "--local-jsh",
+            "/home/alice/.local/bin/jsh",
+            "bob@box.example",
+            "--",
+            "-l",
+            "alice",
+        ]) else {
+            panic!("expected the jsh launcher to retain its SSH target");
+        };
+        assert_eq!(target.user.as_deref(), Some("alice"));
+        assert_eq!(target.host, "box.example");
+    }
+
+    #[test]
+    fn observed_ssh_accepts_the_terminal_launcher_without_deployment_fields() {
+        let argv = [
+            "/bin/sh",
+            "/home/alice/.cache/jterm/jsh-remote.sh",
+            "--incognito",
+            "--session",
+            "work_7",
+            "--artifact",
+            "/opt/jsh",
+            "dev@box.example",
+            "--",
+            "-J",
+            "jump.example",
+            "-p2200",
+        ];
+        assert!(!super::is_jsh_ssh_upgrade_launcher_argv(
+            &argv
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        ));
+        let ObservedSshTarget::Target(target) = ssh(&argv) else {
+            panic!("expected the terminal launcher to retain its SSH target");
+        };
+        assert_eq!(target.host, "box.example");
+        assert_eq!(target.user.as_deref(), Some("dev"));
+        assert_eq!(target.ssh_args, ["-J", "jump.example", "-p", "2200"]);
+        assert_eq!(target.deploy, "off");
+        assert!(target.session.is_none());
+        assert!(target.deploy_artifact.is_none());
+    }
+
+    #[test]
+    fn observed_jsh_launcher_rejects_ambiguous_or_side_effecting_shapes() {
+        for args in [
+            &[
+                "/bin/sh",
+                "/cache/jsh-remote.sh",
+                "--persist",
+                "host",
+                "--",
+                "-o",
+                "ProxyCommand=sh -c evil",
+            ] as &[&str],
+            &[
+                "/bin/sh",
+                "/cache/jsh-remote.sh",
+                "--persist",
+                "host",
+                "second-host",
+            ],
+            &[
+                "/bin/sh",
+                "/cache/jsh-remote.sh",
+                "--persist",
+                "--incognito",
+                "host",
+            ],
+            &[
+                "/bin/sh",
+                "/cache/jsh-remote.sh",
+                "--local-jsh",
+                "/opt/jsh",
+                "host",
+            ],
+            &[
+                "/bin/sh",
+                "/cache/jsh-remote.sh",
+                "--persist",
+                "--dry-run",
+                "host",
+            ],
+        ] {
+            assert!(matches!(ssh(args), ObservedSshTarget::Unsupported(_)));
+        }
+
+        assert!(matches!(
+            ssh(&[
+                "/bin/sh",
+                "/cache/jsh-remote.sh",
+                "--persist",
+                "--docker",
+                "container"
+            ]),
+            ObservedSshTarget::NotSsh
+        ));
+        assert!(matches!(
+            ssh(&["/bin/sh", "/cache/not-jsh-remote.sh", "--persist", "host"]),
+            ObservedSshTarget::NotSsh
+        ));
     }
 
     #[test]
