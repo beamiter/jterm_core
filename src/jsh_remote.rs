@@ -391,9 +391,279 @@ impl RemoteHostConfig {
     }
 }
 
+/// Result of inspecting one real process argv for an interactive SSH target.
+///
+/// The distinction lets a frontend silently ignore other foreground commands
+/// while showing one bounded, actionable notice for an SSH invocation whose
+/// connection semantics cannot safely be replayed by a file-tree sidecar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservedSshTarget {
+    NotSsh,
+    Unsupported(&'static str),
+    Target(RemoteHostConfig),
+}
+
+const UNSAFE_SSH_OPTION: &str =
+    "this SSH command uses an option that cannot be safely reused for Files";
+
+fn safe_o_option(option: &str) -> bool {
+    let key = option
+        .split_once('=')
+        .map_or(option, |(key, _)| key)
+        .to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "addressfamily"
+            | "batchmode"
+            | "bindaddress"
+            | "bindinterface"
+            | "canonicalizehostname"
+            | "certificatefile"
+            | "checkhostip"
+            | "ciphers"
+            | "connectionattempts"
+            | "connecttimeout"
+            | "controlmaster"
+            | "controlpath"
+            | "controlpersist"
+            | "fingerprinthash"
+            | "globalknownhostsfile"
+            | "hostbasedauthentication"
+            | "hostkeyalgorithms"
+            | "hostname"
+            | "identityagent"
+            | "identityfile"
+            | "identitiesonly"
+            | "ipqos"
+            | "kbdinteractiveauthentication"
+            | "kexalgorithms"
+            | "loglevel"
+            | "macs"
+            | "numberofpasswordprompts"
+            | "passwordauthentication"
+            | "port"
+            | "preferredauthentications"
+            | "proxyjump"
+            | "pubkeyacceptedalgorithms"
+            | "pubkeyauthentication"
+            | "rekeylimit"
+            | "requiredrsasize"
+            | "sendenv"
+            | "serveralivecountmax"
+            | "serveraliveinterval"
+            | "stricthostkeychecking"
+            | "tcpkeepalive"
+            | "updatehostkeys"
+            | "user"
+            | "userknownhostsfile"
+    )
+}
+
+fn valid_observed_port(port: &str) -> bool {
+    port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
+fn parse_observed_destination(destination: &str) -> Option<(Option<String>, String)> {
+    if destination.is_empty() || destination.starts_with('-') || destination.len() > 512 {
+        return None;
+    }
+    let (user, host) = match destination.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() && !user.contains('@') => {
+            (Some(user.to_string()), host.to_string())
+        }
+        Some(_) => return None,
+        None => (None, destination.to_string()),
+    };
+    if host.starts_with('-') || host.is_empty() || host.len() > 512 {
+        return None;
+    }
+    Some((user, host))
+}
+
+fn observed_name(user: Option<&str>, host: &str) -> String {
+    match user {
+        Some(user) => format!("{user}@{host}"),
+        None => host.to_string(),
+    }
+}
+
+/// Derive a transient file-tree profile from the argv of a *real* foreground
+/// process.
+///
+/// Callers must obtain `argv` from an OS process boundary such as
+/// `/proc/<pid>/cmdline` (the [`crate::process::restorable_command`] helpers do
+/// this). Terminal output and OSC 133 command strings are untrusted text and
+/// must not be passed here as proof that the user launched SSH.
+///
+/// Only an interactive login with no remote command is accepted. Connection
+/// options needed by a second non-interactive probe are retained; TTY,
+/// forwarding, logging, and presentation flags are deliberately dropped.
+/// Options that can execute a local command or load code are rejected.
+pub fn observed_ssh_target(argv: &[String]) -> ObservedSshTarget {
+    if argv
+        .first()
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|command| command.to_str())
+        != Some("ssh")
+    {
+        return ObservedSshTarget::NotSsh;
+    }
+    if !crate::process::restorable_argv_within_limits(argv) {
+        return ObservedSshTarget::Unsupported("this SSH command is too large or unsafe");
+    }
+
+    let mut destination: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut ssh_args = Vec::new();
+    let mut end_options = false;
+    let mut index = 1usize;
+    let mut port_seen = false;
+    let mut address_family_seen = false;
+
+    while index < argv.len() {
+        let argument = &argv[index];
+        if !end_options && argument == "--" {
+            end_options = true;
+            index += 1;
+            continue;
+        }
+
+        if !end_options && argument.starts_with('-') && argument != "-" {
+            if argument.starts_with("--") {
+                return ObservedSshTarget::Unsupported(
+                    "long SSH options cannot be safely reused for Files",
+                );
+            }
+            let bytes = argument.as_bytes();
+            let mut offset = 1usize;
+            while offset < bytes.len() {
+                let flag = bytes[offset] as char;
+                let takes_operand = "BbcDEeFIiJLlmOoPpQRSWw".contains(flag);
+                let operand = if takes_operand {
+                    if offset + 1 < bytes.len() {
+                        Some(argument[offset + 1..].to_string())
+                    } else {
+                        index += 1;
+                        argv.get(index).cloned()
+                    }
+                } else {
+                    None
+                };
+
+                if takes_operand && operand.as_deref().is_none_or(str::is_empty) {
+                    return ObservedSshTarget::Unsupported("this SSH option has no value");
+                }
+
+                match flag {
+                    '4' | '6' => {
+                        if !address_family_seen {
+                            ssh_args.push(format!("-{flag}"));
+                            address_family_seen = true;
+                        }
+                    }
+                    // These affect reachability or authentication and are safe
+                    // to preserve as structured argv.
+                    'B' | 'b' | 'c' | 'i' | 'J' | 'm' | 'P' | 'S' => {
+                        ssh_args.push(format!("-{flag}"));
+                        ssh_args.push(operand.as_ref().expect("operand option").clone());
+                    }
+                    'l' => {
+                        if user.is_none() {
+                            user = operand;
+                        }
+                    }
+                    'p' => {
+                        let port = operand.as_deref().expect("operand option");
+                        if !valid_observed_port(port) {
+                            return ObservedSshTarget::Unsupported(
+                                "the SSH port must be between 1 and 65535",
+                            );
+                        }
+                        if !port_seen {
+                            ssh_args.push("-p".to_string());
+                            ssh_args.push(port.to_string());
+                            port_seen = true;
+                        }
+                    }
+                    'o' => {
+                        let option = operand.as_deref().expect("operand option");
+                        if !safe_o_option(option) {
+                            return ObservedSshTarget::Unsupported(UNSAFE_SSH_OPTION);
+                        }
+                        ssh_args.push("-o".to_string());
+                        ssh_args.push(option.to_string());
+                    }
+                    // These modes are not an interactive remote shell.
+                    'G' | 'N' | 'O' | 'Q' | 'V' | 'W' | 's' | 'w' => {
+                        return ObservedSshTarget::Unsupported(
+                            "this SSH invocation is not an interactive login",
+                        );
+                    }
+                    // Loading a provider library or executing configured local
+                    // helpers must never happen merely because Files follows a
+                    // terminal command.
+                    'F' | 'I' => return ObservedSshTarget::Unsupported(UNSAFE_SSH_OPTION),
+                    // Forwarding, TTY, agent, X11, compression, verbosity and
+                    // escape/log options do not belong on a filesystem probe.
+                    'A' | 'a' | 'C' | 'D' | 'E' | 'e' | 'f' | 'g' | 'K' | 'k' | 'L' | 'M' | 'n'
+                    | 'q' | 'R' | 'T' | 't' | 'v' | 'X' | 'x' | 'Y' | 'y' => {}
+                    _ => {
+                        return ObservedSshTarget::Unsupported(
+                            "this SSH command uses an unknown option",
+                        )
+                    }
+                }
+
+                if takes_operand {
+                    break;
+                }
+                offset += 1;
+            }
+            index += 1;
+            continue;
+        }
+
+        if destination.is_some() {
+            return ObservedSshTarget::Unsupported(
+                "SSH remote commands are not automatically reused for Files",
+            );
+        }
+        let Some((destination_user, host)) = parse_observed_destination(argument) else {
+            return ObservedSshTarget::Unsupported("the SSH destination is invalid");
+        };
+        if user.is_none() {
+            user = destination_user;
+        }
+        destination = Some(host);
+        index += 1;
+    }
+
+    let Some(host) = destination else {
+        return ObservedSshTarget::Unsupported("this SSH command has no destination");
+    };
+    let target = RemoteHostConfig {
+        name: observed_name(user.as_deref(), &host),
+        host,
+        user,
+        docker: false,
+        remote_shell: default_remote_shell(),
+        session: None,
+        ssh_args,
+        deploy: Deploy::Off.as_str().to_string(),
+        deploy_artifact: None,
+    };
+    if target.validate().is_err() {
+        ObservedSshTarget::Unsupported("the SSH destination is invalid")
+    } else {
+        ObservedSshTarget::Target(target)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{launch_argv_with_script, Deploy, RemoteTarget};
+    use super::{
+        launch_argv_with_script, observed_ssh_target, Deploy, ObservedSshTarget, RemoteTarget,
+    };
     use std::path::Path;
 
     fn target<'a>(destination: &'a str, ssh_args: &'a [String]) -> RemoteTarget<'a> {
@@ -406,6 +676,104 @@ mod tests {
             ssh_args,
             deploy: Deploy::Persist,
         }
+    }
+
+    fn ssh(args: &[&str]) -> ObservedSshTarget {
+        observed_ssh_target(
+            &args
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn observed_ssh_accepts_destination_then_port_without_reparsing_text() {
+        let ObservedSshTarget::Target(target) =
+            ssh(&["/usr/bin/ssh", "root@dsw-notebook.example.com", "-p", "22"])
+        else {
+            panic!("expected an observed SSH target");
+        };
+        assert_eq!(target.name, "root@dsw-notebook.example.com");
+        assert_eq!(target.host, "dsw-notebook.example.com");
+        assert_eq!(target.user.as_deref(), Some("root"));
+        assert_eq!(target.ssh_args, ["-p", "22"]);
+        assert_eq!(target.deploy, "off");
+    }
+
+    #[test]
+    fn observed_ssh_respects_first_user_and_port_like_openssh() {
+        let ObservedSshTarget::Target(target) = ssh(&[
+            "ssh",
+            "-l",
+            "alice",
+            "bob@example.com",
+            "-lcarol",
+            "-p2200",
+            "-p",
+            "22",
+        ]) else {
+            panic!("expected an observed SSH target");
+        };
+        assert_eq!(target.user.as_deref(), Some("alice"));
+        assert_eq!(target.ssh_args, ["-p", "2200"]);
+    }
+
+    #[test]
+    fn observed_ssh_keeps_connection_options_and_drops_ui_and_forwarding_flags() {
+        let ObservedSshTarget::Target(target) = ssh(&[
+            "ssh",
+            "-vvCt",
+            "-i",
+            "/tmp/key with spaces",
+            "-Jjump@example.com",
+            "-L",
+            "8080:localhost:80",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "example.com",
+        ]) else {
+            panic!("expected an observed SSH target");
+        };
+        assert_eq!(
+            target.ssh_args,
+            [
+                "-i",
+                "/tmp/key with spaces",
+                "-J",
+                "jump@example.com",
+                "-o",
+                "StrictHostKeyChecking=no"
+            ]
+        );
+    }
+
+    #[test]
+    fn observed_ssh_rejects_commands_and_side_effecting_options() {
+        for args in [
+            &["ssh", "host", "uname"] as &[&str],
+            &["ssh", "-o", "ProxyCommand=sh -c evil", "host"],
+            &["ssh", "-oLocalCommand=touch /tmp/side-effect", "host"],
+            &["ssh", "-I", "/tmp/provider.so", "host"],
+            &["ssh", "-F", "/tmp/config", "host"],
+            &["ssh", "-W", "target:22", "jump"],
+            &["ssh", "-N", "host"],
+        ] {
+            assert!(matches!(ssh(args), ObservedSshTarget::Unsupported(_)));
+        }
+    }
+
+    #[test]
+    fn observed_ssh_handles_option_separator_and_non_ssh_commands() {
+        assert!(matches!(
+            ssh(&["ssh", "--", "-host"]),
+            ObservedSshTarget::Unsupported(_)
+        ));
+        assert!(matches!(ssh(&["mosh", "host"]), ObservedSshTarget::NotSsh));
+        assert!(matches!(
+            ssh(&["ssh", "--", "host", "-p", "22"]),
+            ObservedSshTarget::Unsupported(_)
+        ));
     }
 
     #[test]

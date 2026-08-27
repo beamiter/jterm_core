@@ -662,9 +662,10 @@ pub fn foreground_uses_external_cwd(pty_fd: i32, shell_pid: i32) -> Option<bool>
     classify_foreground_external_cwd(shell_pid, foreground_pid, read_proc_cmdline, read_ppid)
 }
 
-/// Detect a restorable interactive command (ssh/nix develop/docker exec/…) by
-/// walking from the PTY's foreground process up to the shell.
-pub fn restorable_command(pty_fd: i32, shell_pid: i32) -> Option<Vec<String>> {
+fn restorable_command_from_foreground(
+    shell_pid: i32,
+    foreground_pid: Option<i32>,
+) -> Option<Vec<String>> {
     // Managed remote panes launch ssh/mosh as the PTY child itself rather than
     // underneath an interactive local shell. Preserve that allowlisted argv
     // too; ordinary bash/zsh/jsh children do not match and continue below.
@@ -674,7 +675,7 @@ pub fn restorable_command(pty_fd: i32, shell_pid: i32) -> Option<Vec<String>> {
         return Some(command);
     }
 
-    let mut pid = foreground_pgid(pty_fd, shell_pid)?;
+    let mut pid = foreground_pid?;
     let mut visited = 0;
     while pid != shell_pid && pid > 1 && visited < 16 {
         if let Some(args) = read_proc_cmdline(pid) {
@@ -689,6 +690,23 @@ pub fn restorable_command(pty_fd: i32, shell_pid: i32) -> Option<Vec<String>> {
         visited += 1;
     }
     None
+}
+
+/// Detect a restorable interactive command (ssh/nix develop/docker exec/…) by
+/// walking from the PTY's foreground process up to the shell.
+pub fn restorable_command(pty_fd: i32, shell_pid: i32) -> Option<Vec<String>> {
+    restorable_command_from_foreground(shell_pid, foreground_pgid(pty_fd, shell_pid))
+}
+
+/// Detect a restorable foreground command using only `/proc/<shell>/stat`.
+///
+/// This is the counterpart to [`restorable_command`] for frontends whose UI
+/// owns the shell pid but not the PTY master fd. The command still comes from
+/// NUL-delimited `/proc/<pid>/cmdline`; terminal output and OSC command text
+/// are never treated as process argv.
+pub fn restorable_command_via_stat(shell_pid: i32) -> Option<Vec<String>> {
+    let foreground = foreground_pgid_via_stat(shell_pid).filter(|pid| *pid != shell_pid);
+    restorable_command_from_foreground(shell_pid, foreground)
 }
 
 /// Name of the foreground process on a PTY (e.g. "ssh", "vim"), or None if the
@@ -1923,6 +1941,7 @@ mod tests {
         assert!(process_comm(0).is_none());
         assert!(process_cwd(0).is_none());
         assert!(foreground_pgid_via_stat(0).is_none());
+        assert!(restorable_command_via_stat(0).is_none());
     }
 
     #[test]
