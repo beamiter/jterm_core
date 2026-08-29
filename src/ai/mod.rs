@@ -81,8 +81,14 @@ fn api_key_env_names() -> [String; 4] {
     ]
 }
 
+mod chat_store;
 mod conversation;
 
+pub use chat_store::{
+    bounded_live_message, ArchiveOutcome, BusyChatPolicy, ChatStatus, ChatStore, ChatStoreError,
+    ChatSummary, DeleteOutcome, RequestStart, RequestToken, DEFAULT_CHAT_TITLE,
+    MAX_LIVE_ASSISTANT_MESSAGE_BYTES, MAX_LIVE_MESSAGE_BYTES,
+};
 pub use conversation::{
     ChatSnapshot, ConversationSnapshot, ConversationSnapshotError,
     MAX_CONVERSATION_SNAPSHOT_JSON_BYTES, MAX_PERSISTED_CHATS,

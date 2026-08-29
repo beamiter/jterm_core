@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25 (strict JSON preflight and snapshot API deprecation)
+Updated: 2026-08-29 (shared multi-chat AI store)
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -10,7 +10,8 @@ atomic claim/consume primitive for Agent snapshots, and vendors a fail-closed js
 installer. Version 0.2 now pins jagent 0.7 and exposes its protocol-bound
 request/response path, while preserving the serialize-only transcript boundary
 and keeping non-streaming provider responses byte-oriented until their
-canonical gate.
+canonical gate. It now also owns the family's multi-chat AI store, which the
+four terminals had each been carrying a private copy of.
 
 ## 2026-08-22 ten-round AI configuration hardening
 
@@ -68,6 +69,58 @@ canonical gate.
     provider shape, malformed authorities, ambiguous hosts, and opener parity.
 
 ## Completed since the previous handoff
+
+- **`ai::chat_store` — the family's multi-chat AI store, unified (2026-08-29)**:
+  all four terminals had grown a private copy of the same state machine over
+  `ai::ConversationSnapshot` — anvil `src/dialogs/ai_chat_store.rs` (786),
+  forge `src/ui/ai_chat_store.rs` (1536), ember `src/ai_chat_store.rs` (903)
+  and frost `src/ai_chat_store.rs` (791), 4,016 lines holding zero toolkit
+  code. `jterm_core::ai::chat_store` is their union and the apps keep a shim.
+
+  The copies had diverged in both directions, so neither lineage was correct
+  on its own. From forge: a library-wide 8 MiB live-history budget with real
+  compaction, persistence that compacts *before* serialising and syncs
+  truncation markers back into the live chats, typed `ArchiveOutcome`/
+  `DeleteOutcome`, and draft merges that report what they dropped. From anvil (and its ember and
+  frost ports): in-store streaming (`push_delta`/`active_partial`), library
+  query filtering, and the prefix rule that makes draft recovery idempotent.
+
+  The library-wide budget is the one that mattered. anvil, ember and frost
+  bounded each chat at 100 turns and each reply at 256 KiB but nothing bounded
+  the 50-chat library, and their `snapshot()` compacted nothing before calling
+  `ConversationSnapshot::from_chats` — so a long-lived library could reach a
+  size persistence refuses, and then `Err(SnapshotInvalid)` was the only
+  outcome. `snapshot_for_persistence` takes `&mut self` for exactly this
+  reason.
+
+  One guard is new here rather than inherited: archiving the last writable chat
+  in a full library was broken in *both* lineages, differently. anvil/ember/frost
+  set `archived = true` and then returned `Err(LimitReached)` from the failed
+  replacement allocation, and every caller swallowed it. forge set `archived =
+  true` and then took `else if !self.at_capacity()`, returning `Ok` with every
+  chat archived and no writable chat left at all. The union checks the
+  replacement *before* mutating, so a refused archive leaves nothing behind. Note the two budgets are deliberately unequal: live state is capped
+  at 8 MiB while persistence caps turn text at 4 MiB, so `from_chats` still
+  compacts on the way out and reports it through the returned flag.
+
+  Archive/delete of a chat with a request in flight is the one place the apps
+  genuinely disagreed — anvil/ember/frost refuse, forge proceeds because its
+  panel cancels first — so it is a construction-time `BusyChatPolicy` rather
+  than a silent default. Retry recovery split the same way and kept both
+  behaviours: `recover_retry_payload` refuses a busy chat, and
+  `recover_retry_payload_detaching` is anvil's shutdown path, which detaches
+  the in-flight request on a clone so the live composer keeps its own draft.
+
+  Previews now pass through `review_input::safe_inline_display`, closing a
+  spoofing hole three of the four copies had: a bidi override in an assistant
+  reply reached the chat-library row unsanitised.
+
+  47 tests, merged from forge's 27, ember's 12 and anvil's 6 with the overlap
+  removed and new coverage for the union behaviours — streaming ownership and
+  UTF-8-boundary partials, merge idempotence, the busy-policy split, the
+  at-capacity archive refusal, and the compaction/marker round trip. Suite:
+  613 -> 660.
+
 
 - `bounded_json::validate_no_duplicate_members(&[u8])` is the shared recursive
   preflight for bounded credential, IPC, and persistence JSON. It validates one
