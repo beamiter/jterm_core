@@ -1,10 +1,10 @@
-//! The searchable overlay ember and frost put in front of a loaded library.
+//! The searchable overlay ember, frost and forge put in front of a loaded
+//! library.
 //!
-//! anvil folds workflows into its tiered command palette instead, and forge
-//! builds a `ListBox` of every workflow with no cap at all; neither of those
-//! is this. What is shared is the state machine ember and frost each wrote by
-//! hand: a query, a highlight, a filtered view, and the invariant that binds
-//! them.
+//! anvil folds workflows into its tiered command palette instead, as does
+//! forge's unified command palette; neither of those surfaces uses this
+//! workflow-only state machine. What is shared here is a query, a highlight,
+//! a filtered view, and the invariant that binds them.
 //!
 //! # The invariant
 //!
@@ -13,9 +13,9 @@
 //! both; the highlight resets to the first row on every query change, because
 //! a query that shrinks the result list would otherwise leave the highlight
 //! selecting a workflow the user can no longer see. frost had that reset
-//! written out at three separate call sites in `main.rs` and forge, which
-//! draws every row, has no such invariant to maintain — which is exactly why
-//! its palette can build 1,024 GTK rows on the main thread.
+//! written out at three separate call sites in `main.rs`; forge's standalone
+//! palette instead built as many as 1,024 GTK rows on the main thread. Both
+//! now share the same bounded state and drawn-row invariant.
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -31,12 +31,11 @@ pub const MAX_PICKER_QUERY_BYTES: usize = MAX_WORKFLOW_FIELD_BYTES;
 ///
 /// Deliberately has no `Default`. The result cap is the one limit on this
 /// surface that legitimately differs — 15 for a workflow-only overlay whose
-/// keyboard navigation must match the drawn list, 200 for a palette that
-/// interleaves workflows with actions and history — and forge's uncapped
-/// `ListBox` is how "no cap" stops looking like a decision. Whether the
-/// command template itself is searchable differs too: forge alone searched it,
-/// so `lsof` found its kill-port workflow and nothing else in the family found
-/// it that way.
+/// keyboard navigation must match the drawn list, and a caller-chosen larger
+/// value for a palette that interleaves workflows with actions and history.
+/// Whether the command template itself is searchable differs too: forge alone
+/// searches it, so `lsof` finds its kill-port workflow and nothing else in the
+/// family finds it that way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PickerPolicy {
     max_results: usize,
@@ -76,6 +75,14 @@ pub struct WorkflowPicker {
     policy: PickerPolicy,
     matcher: SkimMatcherV2,
     query: String,
+    /// Indices into `entries`, in exactly the order callers draw them.
+    ///
+    /// Fuzzy matching is proportional to the whole loaded library (and, when
+    /// command search is enabled, to every command template). Keeping that
+    /// work at the query-change boundary prevents a single frame from doing
+    /// it again for drawing, keyboard navigation, mouse resolution and
+    /// activation.
+    filtered_indices: Vec<usize>,
     selected: usize,
 }
 
@@ -87,13 +94,16 @@ impl WorkflowPicker {
     /// [`LoadOrder`](super::LoadOrder) the caller chose. Order is the loader's
     /// decision, stated once.
     pub fn new(entries: Vec<Workflow>, policy: PickerPolicy) -> Self {
-        Self {
+        let mut picker = Self {
             entries,
             policy,
             matcher: SkimMatcherV2::default(),
             query: String::new(),
+            filtered_indices: Vec::new(),
             selected: 0,
-        }
+        };
+        picker.rebuild_filtered();
+        picker
     }
 
     pub fn policy(&self) -> PickerPolicy {
@@ -136,8 +146,17 @@ impl WorkflowPicker {
             }
             query.truncate(end);
         }
+        // Widget toolkits can report the same value more than once (forge's
+        // SearchEntry does this after the normalization write-back). Preserve
+        // `set_query`'s existing highlight-reset contract, but do not rescan
+        // the whole library when the effective query did not change.
+        if query == self.query {
+            self.selected = 0;
+            return;
+        }
         self.query = query;
         self.selected = 0;
+        self.rebuild_filtered();
     }
 
     /// Append typed text, dropping control characters. Returns whether the
@@ -160,9 +179,13 @@ impl WorkflowPicker {
         if self.query.is_empty() {
             return false;
         }
-        let mut query = std::mem::take(&mut self.query);
-        query.pop();
-        self.set_query(query);
+        // Mutate directly rather than `take` + `set_query`: the latter makes
+        // the temporarily empty stored query compare equal when deleting the
+        // final character, incorrectly skipping the cache rebuild and
+        // highlight reset.
+        self.query.pop();
+        self.selected = 0;
+        self.rebuild_filtered();
         true
     }
 
@@ -170,24 +193,37 @@ impl WorkflowPicker {
     /// library's own order; otherwise entries rank by fuzzy score, with equal
     /// scores keeping library order (the sort is stable).
     pub fn filtered(&self) -> Vec<&Workflow> {
+        self.filtered_indices
+            .iter()
+            .map(|index| &self.entries[*index])
+            .collect()
+    }
+
+    /// Recompute the drawn-order index once, when the query changes.
+    fn rebuild_filtered(&mut self) {
         if self.query.is_empty() {
-            return self.entries.iter().take(self.policy.max_results).collect();
+            self.filtered_indices = (0..self.entries.len())
+                .take(self.policy.max_results)
+                .collect();
+            return;
         }
-        let mut scored: Vec<(i64, &Workflow)> = self
+        let mut scored: Vec<(i64, usize)> = self
             .entries
             .iter()
-            .filter_map(|workflow| {
+            .enumerate()
+            .filter_map(|(index, workflow)| {
                 self.matcher
                     .fuzzy_match(&self.haystack(workflow), &self.query)
-                    .map(|score| (score, workflow))
+                    .map(|score| (score, index))
             })
             .collect();
+        // Stable sorting retains library order for equal fuzzy scores.
         scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-        scored
+        self.filtered_indices = scored
             .into_iter()
             .take(self.policy.max_results)
-            .map(|(_, workflow)| workflow)
-            .collect()
+            .map(|(_, index)| index)
+            .collect();
     }
 
     /// Name, description and tags — plus the command template when the policy
@@ -212,7 +248,7 @@ impl WorkflowPicker {
 
     /// Move the highlight down, wrapping within the drawn rows.
     pub fn select_next(&mut self) {
-        let len = self.filtered().len();
+        let len = self.filtered_indices.len();
         self.selected = if len == 0 {
             0
         } else {
@@ -222,7 +258,7 @@ impl WorkflowPicker {
 
     /// Move the highlight up, wrapping within the drawn rows.
     pub fn select_prev(&mut self) {
-        let len = self.filtered().len();
+        let len = self.filtered_indices.len();
         self.selected = match len {
             0 => 0,
             _ if self.selected == 0 => len - 1,
@@ -234,7 +270,7 @@ impl WorkflowPicker {
     /// indices are ignored rather than clamped, so a click on a row that has
     /// just been filtered away does not silently select a different workflow.
     pub fn select(&mut self, index: usize) -> bool {
-        if index < self.filtered().len() {
+        if index < self.filtered_indices.len() {
             self.selected = index;
             return true;
         }
@@ -243,12 +279,16 @@ impl WorkflowPicker {
 
     /// The highlighted workflow, if the filtered list is non-empty.
     pub fn selected_workflow(&self) -> Option<&Workflow> {
-        self.filtered().get(self.selected).copied()
+        self.filtered_indices
+            .get(self.selected)
+            .map(|index| &self.entries[*index])
     }
 
     /// The workflow at a position in the drawn list — mouse-click dispatch.
     pub fn workflow_at_filtered(&self, index: usize) -> Option<&Workflow> {
-        self.filtered().get(index).copied()
+        self.filtered_indices
+            .get(index)
+            .map(|index| &self.entries[*index])
     }
 }
 
@@ -371,6 +411,59 @@ mod tests {
         assert_eq!(picker.selected(), 0);
         assert!(picker.query().is_empty());
         assert!(!picker.backspace(), "an empty query has nothing to delete");
+    }
+
+    #[test]
+    fn an_unchanged_normalized_query_resets_without_rebuilding() {
+        // forge writes a normalized query back into SearchEntry, which emits
+        // its change signal a second time. Keep the public setter's established
+        // highlight reset, but reuse the already computed result index.
+        let mut picker = WorkflowPicker::new(
+            vec![described("alpha", "", &[]), described("beta", "", &[])],
+            OVERLAY,
+        );
+        picker.select_next();
+        assert_eq!(picker.selected(), 1);
+        let cached = picker.filtered_indices.clone();
+
+        picker.set_query("\n\t");
+        assert!(picker.query().is_empty());
+        assert_eq!(picker.selected(), 0);
+        assert_eq!(picker.filtered_indices, cached);
+        assert_eq!(
+            picker
+                .selected_workflow()
+                .map(|workflow| workflow.name.as_str()),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn all_read_paths_share_the_cached_filtered_order() {
+        let entries = (0..1_024)
+            .map(|index| described(&format!("workflow-{index:04}"), "deploy service", &[]))
+            .collect();
+        let mut picker = WorkflowPicker::new(entries, OVERLAY);
+        picker.set_query("deploy");
+
+        let cached = picker.filtered_indices.clone();
+        assert_eq!(cached.len(), OVERLAY.max_results());
+        assert_eq!(picker.filtered().len(), cached.len());
+        assert_eq!(
+            picker
+                .selected_workflow()
+                .map(|workflow| workflow.name.as_str()),
+            Some("workflow-0000")
+        );
+        assert_eq!(
+            picker
+                .workflow_at_filtered(14)
+                .map(|workflow| workflow.name.as_str()),
+            Some("workflow-0014")
+        );
+        picker.select_next();
+        picker.select_prev();
+        assert_eq!(picker.filtered_indices, cached);
     }
 
     #[test]

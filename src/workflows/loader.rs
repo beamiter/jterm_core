@@ -92,12 +92,15 @@ fn workflow_extension(path: &Path) -> Option<String> {
 
 /// The workflow files in one directory, bounded and sorted.
 ///
-/// [`MAX_DIRECTORY_ENTRIES`] applies *before* the extension filter and
-/// [`MAX_WORKFLOW_FILES_PER_DIRECTORY`] after it, so a directory stuffed with
-/// non-workflow files cannot push the real ones out of the budget while a
-/// directory stuffed with `.toml` files still cannot make the loader parse
-/// more than the cap. The sort makes two runs over the same directory produce
-/// the same palette order — muscle memory is a feature.
+/// [`MAX_DIRECTORY_ENTRIES`] applies *before* the extension filter: this is the
+/// total enumeration/DoS budget, so entries beyond it are deliberately not
+/// inspected and enough non-workflow files can consume that budget. Within
+/// the bounded set that was inspected, paths are sorted *before*
+/// [`MAX_WORKFLOW_FILES_PER_DIRECTORY`] is applied. Thus a directory with too
+/// many matching files admits the first names deterministically instead of a
+/// filesystem-order-dependent subset, while still parsing no more than the
+/// cap. Stable palette order is muscle memory; unbounded enumeration is not
+/// the price paid for it.
 ///
 /// Exported for the same reason as [`is_workflow_file`]: anvil's diagnostics
 /// report walks these directories with `fs::read_dir` and *no* caps at all,
@@ -115,14 +118,20 @@ pub fn workflow_files_in(dir: &Path) -> Vec<PathBuf> {
             return Vec::new();
         }
     };
+    // Sort the bounded raw-entry set before applying the workflow-file cap.
+    // `read_dir` order is explicitly unspecified; taking 512 matching files
+    // first made the admitted library depend on filesystem enumeration order
+    // whenever a directory held more than the per-directory workflow cap.
     let mut paths: Vec<PathBuf> = entries
         .take(MAX_DIRECTORY_ENTRIES)
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| is_workflow_file(path))
-        .take(MAX_WORKFLOW_FILES_PER_DIRECTORY)
         .collect();
     paths.sort();
     paths
+        .into_iter()
+        .filter(|path| is_workflow_file(path))
+        .take(MAX_WORKFLOW_FILES_PER_DIRECTORY)
+        .collect()
 }
 
 /// Load every workflow file under `dirs`, skipping what does not parse.
@@ -823,6 +832,29 @@ default = "api"
         assert_eq!(
             load_all(&[dir.path().to_path_buf()], LoadOrder::Precedence).len(),
             MAX_WORKFLOW_FILES_PER_DIRECTORY
+        );
+    }
+
+    #[test]
+    fn the_per_directory_cap_keeps_the_first_sorted_workflow_files() {
+        // Creation/read_dir order is not the library order. In particular,
+        // taking the cap before sorting made the admitted 512 files vary by
+        // filesystem when more candidates existed. Create in reverse to keep
+        // that implementation mistake visible on filesystems that enumerate
+        // close to insertion order.
+        let dir = TestDir::new("sorted-per-directory-cap");
+        for index in (0..MAX_WORKFLOW_FILES_PER_DIRECTORY + 8).rev() {
+            dir.write(&format!("wf-{index:04}.toml"), "");
+        }
+        let listed = workflow_files_in(dir.path());
+        assert_eq!(listed.len(), MAX_WORKFLOW_FILES_PER_DIRECTORY);
+        assert_eq!(listed.first(), Some(&dir.path().join("wf-0000.toml")));
+        assert_eq!(
+            listed.last(),
+            Some(&dir.path().join(format!(
+                "wf-{:04}.toml",
+                MAX_WORKFLOW_FILES_PER_DIRECTORY - 1
+            )))
         );
     }
 
