@@ -37,3 +37,15 @@ pub fn init(identity: AppIdentity) {
 pub fn get() -> &'static AppIdentity {
     IDENTITY.get().unwrap_or(&DEFAULT)
 }
+
+/// The identity this process registered, or `None` when [`init`] has not run.
+///
+/// [`get`] answers with the neutral default instead, which is right for
+/// branding — a notification labelled "jterm" is merely generic — and wrong
+/// for anything that decides *which files to read*. `~/.config/jterm/workflows`
+/// is nobody's library: a lookup that resolves there finds nothing, reports
+/// nothing, and looks exactly like a user with no workflows. A caller whose
+/// answer must be the app's own name asks this one and handles `None` loudly.
+pub fn try_get() -> Option<&'static AppIdentity> {
+    IDENTITY.get()
+}

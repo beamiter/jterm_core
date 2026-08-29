@@ -40,3 +40,4 @@ pub mod snapshot_file;
 pub mod supervised;
 pub mod theme;
 pub mod vendored_script;
+pub mod workflows;

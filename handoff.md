@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared multi-chat AI store; shared command-correction engine)
+Updated: 2026-08-29 (shared multi-chat AI store; command-correction engine; workflow subsystem)
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -69,6 +69,65 @@ four terminals had each been carrying a private copy of.
     provider shape, malformed authorities, ambiguous hosts, and opener parity.
 
 ## Completed since the previous handoff
+
+- **`workflows` — the family's workflow subsystem, unified (2026-08-29)**:
+  the four terminals each carried the TOML/YAML "saved command with
+  parameters" library — anvil `workflows.rs` 772 + `workflow_ops.rs` 144 +
+  `dialogs/workflow.rs` 248, forge 801, ember 867 + `workflow_picker.rs` 284,
+  frost 827 + 316. The shared module is 2,610 lines across
+  mod/discovery/loader/render/picker with 62 tests; the apps shed 3,292.
+
+  The four read the *same library from the same directories*, so a difference
+  in what one accepts is a difference in what a user's file means depending on
+  which terminal opened it. The divergences were accordingly not cosmetic:
+  anvil followed symlinked workflow files (no `O_NOFOLLOW`); forge coerced
+  type-wrong TOML through `toml::Table` where the others reject the file;
+  forge skipped `render()` for zero-argument workflows, so the documented
+  `{{ }}` literal-brace escape did not apply there; forge left placeholder
+  names untrimmed, mishandled an unterminated `{{`, built descriptive errors
+  and discarded them, and resolved a CWD-relative user directory when `HOME`
+  was unset.
+
+  **The defect worth the round on its own was in all four.** `render()` is
+  supposed to refuse an unfilled argument that declares no default, and anvil,
+  ember and frost each unit-test that guard — but every UI in the family
+  pre-seeds each declared argument with an empty string, so it never fired:
+  `kill -9 {pid}` inserted as `kill -9 ` when the user tabbed past the field.
+  A guard green in isolation and dead in practice. The contract is now stated
+  once — *an empty value is meaningful only if the file says so* — and enforced
+  in two places that agree: `render()` applies it to the values map itself, so
+  a caller that pre-seeds its own map cannot seed past it, and `ArgsForm`
+  carries `Unset` vs `Supplied` in the type system so a UI can disable Insert
+  before the user gets an error. Emptying a *defaulted* field remains a
+  deliberate empty value; emptying an *undefaulted* one is a missing value.
+
+  Root cause of why forge alone could never have implemented that guard:
+  its `WorkflowArg::default` was `String`, which cannot represent "no default".
+  The shared schema uses `Option<String>`.
+
+  Injected rather than hardcoded, because each would silently change behaviour
+  for two apps: the XDG backend (`DirSources` — glib for anvil/forge, the
+  `dirs` crate for ember/frost, whose fallback chains differ), app identity,
+  `LoadOrder` (no `Default`, pinned at every construction site), and the
+  dev-tree root — `env!("CARGO_MANIFEST_DIR")` resolves against the *compiling*
+  crate, so moving that expression into core would have pointed it here.
+  `welcome_notebook_path` deliberately did not migrate; ember and frost each
+  documented not porting it.
+
+  Three adversarial audits ran before any app adopted the module and found nine
+  defects in it, five serious. Two lenses independently caught
+  `SearchPathSpec::for_current_app` silently resolving to the neutral `"jterm"`
+  identity when `identity::init` had not run — which would have changed every
+  directory read, in tests most of all. It now returns `Option`, and the test
+  that guarded it was itself vacuous: the old assertion held for `"jterm"` too,
+  so it was green precisely when the bug was present. Also fixed: the
+  unterminated-`{{` rule losing to the escape rule whenever a later `}}`
+  appeared, declared argument names never being trimmed while placeholder names
+  were, and a parse error being interpolated into a log line unsanitised while
+  the path beside it was sanitised.
+
+  Suite: 714 -> 787.
+
 
 - **`command_correction` — the family's correction engine, unified (2026-08-29)**:
   the four terminals each carried a private copy of the "that command failed,
