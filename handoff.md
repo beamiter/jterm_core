@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-29 (shared multi-chat AI store)
+Updated: 2026-08-29 (shared multi-chat AI store; shared command-correction engine)
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
 process-group lifecycle control, private atomic persistence, environment capture,
@@ -69,6 +69,76 @@ four terminals had each been carrying a private copy of.
     provider shape, malformed authorities, ambiguous hosts, and opener parity.
 
 ## Completed since the previous handoff
+
+- **`command_correction` — the family's correction engine, unified (2026-08-29)**:
+  the four terminals each carried a private copy of the "that command failed,
+  here is a fix" flow — anvil 1817 lines, forge 2148, ember 2335, frost 1552.
+  7,852 lines whose engine half contained no toolkit code at all. The shared
+  module is 3,937 lines including its tests; the apps shed 6,294.
+
+  This surface decides whether a model-proposed command may be offered for
+  execution, so the divergences were not style differences. Three were live
+  security holes, each present in some copies and absent in others:
+
+  1. **A third user's binary was a trusted system helper.** anvil and ember
+     asked `owner == euid || mode & 0o022 != 0`; forge asked the same question
+     in `host.rs` as `writable_by_current_user`. A binary owned by a third
+     account at mode 0755 answers "not untrusted" to all of them, and
+     `correction_helper_command` reached it by scanning the user's own `PATH` —
+     so a hostile `bash` earlier in `PATH` on a shared machine was spawned
+     automatically by any failed command. Clamping the *child's* `PATH` never
+     helped: the helper binary is itself the hostile one. The same expression
+     inverted for root (`owner == euid == 0`), so every system helper was
+     refused when the terminal ran as root, silently killing APT-verified
+     corrections in containers. `helper::trusted_component` already answered
+     both halves correctly and only frost used it; it is now `pub`, and the
+     engine's PATH-scan strategy resolves through it.
+
+  2. **A candidate could add a pipe into a shell.** `syntax_markers` only tests
+     whether a marker is *present*, so against an original that already
+     contains a pipe, appending `| sh` introduces no new marker and passes the
+     superset rule. Only forge checked for it, and only as four literal
+     spellings — `|  sh` with two spaces, `| /bin/sh`, `| zsh`, `| dash` and
+     `| python3` all defeated it. The shared rule splits the pipeline and
+     compares the *set* of interpreters its stages run, over a list a test pins
+     against `jagent::safety::is_interpreter` so the two cannot drift. It
+     deliberately does not refuse every new stage name: `ls | gerp foo` →
+     `ls | grep foo` is the commonest correction this surface exists for.
+
+  3. **The consent switch was honoured by one app.** All four ship
+     `ai_share_command_context` and honour it elsewhere, but only ember checked
+     it before sending the failed command, its cwd and up to 8 KiB of terminal
+     output to a provider. It is now a `ContextSharing` value with no `Default`,
+     so a caller cannot acquire the permissive case by forgetting.
+
+  Alongside those: forge exempted deterministic candidates from the
+  privilege/syntax/remote guards entirely, so hostile target output could reach
+  its prompt buffer; forge lacked the 64 KiB reply cap, the error-token cap and
+  cwd sanitisation; ember and frost rendered raw model prose into their cards
+  with no spoof sanitisation and no destructive-risk label. `CorrectionCandidate`
+  now holds only pre-sanitised display strings, so an app physically cannot
+  render unsanitised model text, and `Original`/`Candidate` newtypes make the
+  argument-order swap that already existed in one app's test uncompilable.
+
+  Three legitimate disagreements became construction-time policy rather than
+  silent defaults, following `BusyChatPolicy`: `LocalEvidence`
+  (same-namespace / Flatpak-bridged / unavailable — the question `is_flatpak()`
+  was silently answering three different ways), `HelperStrategy` (fixed
+  candidates or a trusted PATH scan, both through the core predicate), and
+  `ContextSharing`. The engine reads no environment, calls no `is_flatpak()`
+  and looks up no config: those are arguments, which is what makes it testable
+  and what stops two siblings getting different policies by accident.
+
+  A note for anyone reading the `HelperStrategy` docs: the PATH scan does *not*
+  rescue a multi-user Nix host. `/nix/store` is mode 1775 — group-writable by
+  `nixbld` — so the ancestor check rejects every helper beneath it, by design.
+  That is a real trade-off, recorded rather than papered over.
+
+  Verified by three adversarial audits before any app adopted the module; they
+  found eight defects in it, including the four-spelling pipe rule above, all
+  fixed with regression tests that fail when the fix is reverted. Suite:
+  660 -> 715.
+
 
 - **`ai::chat_store` — the family's multi-chat AI store, unified (2026-08-29)**:
   all four terminals had grown a private copy of the same state machine over

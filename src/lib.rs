@@ -14,6 +14,7 @@ pub mod bounded_json;
 pub mod char_width;
 pub mod child_env;
 pub mod click_cursor;
+pub mod command_correction;
 pub mod command_history;
 pub mod execution_journal;
 pub mod exit_status;

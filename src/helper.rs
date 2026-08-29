@@ -33,6 +33,11 @@ const TRUSTED_CHILD_PATH: &str = "/usr/bin:/bin";
 /// The candidate list is part of the trust decision: it is the complete set
 /// of pathnames this process will ever execute for the helper, in preference
 /// order.
+///
+/// `Debug` is derived because a helper is a *field* of the policies callers
+/// build — [`crate::command_correction::LocalEvidence::Bridged`] names its
+/// bridge launcher this way — and those policies are logged.
+#[derive(Debug)]
 pub struct TrustedHelper {
     name: &'static str,
     candidates: &'static [&'static str],
@@ -205,8 +210,14 @@ fn trusted_system_executable_inner(candidate: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
+/// The family's automatic-helper trust predicate for one path component.
+///
+/// Public because it is the single answer to a question three apps re-derived
+/// independently and got wrong in both directions — see
+/// [`crate::command_correction`], whose PATH-scan helper strategy resolves
+/// through [`trusted_system_executable`] and therefore through this.
 #[cfg(unix)]
-fn trusted_component(mode: u32, owner: u32, euid: u32) -> bool {
+pub fn trusted_component(mode: u32, owner: u32, euid: u32) -> bool {
     if mode & 0o022 != 0 || (owner != 0 && owner != euid) {
         return false;
     }
