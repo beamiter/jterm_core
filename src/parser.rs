@@ -1284,6 +1284,21 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
+    // iTerm2's legacy CurrentDir field is a raw path with no documented
+    // escaping. Let a bounded, unambiguous exact value reach VTE, but do not
+    // forward delimiters or invisible formatting into semantic-history state.
+    // OSC 7 remains the canonical encoded cwd signal used by jsh.
+    if let Some(path) = s.strip_prefix("1337;CurrentDir=") {
+        if path.is_empty()
+            || path.len() > MAX_OSC133_CWD_BYTES
+            || path.chars().any(char::is_control)
+            || path.contains(';')
+            || crate::review_input::contains_visual_spoofing(path)
+        {
+            return;
+        }
+    }
+
     // Title/icon strings become trusted-looking window and tab chrome in the
     // frontends. Drop an unsafe update instead of letting terminal output
     // reorder or invisibly alter that UI label.
@@ -2744,6 +2759,38 @@ mod tests {
         let oversized_title = format!("\x1b]2;{}\x07", "x".repeat(MAX_TITLE_BYTES + 1));
         p.feed(oversized_title.as_bytes(), &mut events);
         assert!(collect_bytes(&events).is_empty());
+    }
+
+    #[test]
+    fn iterm_current_dir_requires_one_exact_unambiguous_path() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+
+        parser.feed(
+            "\x1b]1337;CurrentDir=/tmp/left\u{202e}right\x07".as_bytes(),
+            &mut events,
+        );
+        parser.feed(
+            b"\x1b]1337;CurrentDir=/tmp/a;RemoteHost=evil\x07",
+            &mut events,
+        );
+        parser.feed(b"\x1b]1337;CurrentDir=\x07", &mut events);
+        let oversized = format!(
+            "\x1b]1337;CurrentDir=/{}\x07",
+            "x".repeat(MAX_OSC133_CWD_BYTES)
+        );
+        parser.feed(oversized.as_bytes(), &mut events);
+        assert!(collect_bytes(&events).is_empty());
+
+        events.clear();
+        parser.feed(
+            "\x1b]1337;CurrentDir=/home/u/my project/雪\x07".as_bytes(),
+            &mut events,
+        );
+        assert_eq!(
+            collect_bytes(&events),
+            "\x1b]1337;CurrentDir=/home/u/my project/雪\x07".as_bytes()
+        );
     }
 
     #[test]

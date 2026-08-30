@@ -45,6 +45,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   Ground-state UTF-8 suffix classifier prevents an unrelated continuation
   byte `9B` inside normal Unicode text from becoming a control event, so
   renderers can invalidate row authority without rescanning arbitrary output.
+  Raw iTerm2 `OSC 1337;CurrentDir` compatibility values reach the terminal only
+  when the exact path is bounded and visually unambiguous; OSC 7 remains the
+  canonical encoded cwd channel.
 - PTY input guarding, review-only command insertion, child environments,
   process-group lifecycle management, and restorable-command quoting.
 - Private atomic snapshots, command history, jsh execution journals, pane
