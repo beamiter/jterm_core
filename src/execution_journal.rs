@@ -446,9 +446,12 @@ fn validate_journal_path(path: &Path) -> io::Result<()> {
         let bytes = path.as_os_str().as_bytes();
         if bytes.len() > MAX_JOURNAL_PATH_BYTES
             || bytes.iter().any(|byte| matches!(*byte, 0..=0x1f | 0x7f))
-            || path
-                .to_str()
-                .is_some_and(crate::review_input::contains_visual_spoofing)
+            || path.to_str().is_some_and(|text| {
+                text.chars().any(|ch| {
+                    ch.is_control()
+                        || crate::review_input::is_terminal_visual_spoofing_character(ch)
+                })
+            })
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -461,7 +464,9 @@ fn validate_journal_path(path: &Path) -> io::Result<()> {
         let text = path.to_string_lossy();
         if text.len() > MAX_JOURNAL_PATH_BYTES
             || text.chars().any(char::is_control)
-            || crate::review_input::contains_visual_spoofing(&text)
+            || text
+                .chars()
+                .any(crate::review_input::is_terminal_visual_spoofing_character)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1569,7 +1574,9 @@ mod tests {
     fn journal_paths_are_bounded_and_safe_to_report() {
         assert!(validate_journal_path(Path::new("executions.jsonl")).is_ok());
         assert!(validate_journal_path(Path::new("bad\nname.jsonl")).is_err());
+        assert!(validate_journal_path(Path::new("bad\u{0080}name.jsonl")).is_err());
         assert!(validate_journal_path(Path::new("bad\u{202e}name.jsonl")).is_err());
+        assert!(validate_journal_path(Path::new("bad\u{fff9}name.jsonl")).is_err());
         let oversized = PathBuf::from("x".repeat(MAX_JOURNAL_PATH_BYTES + 1));
         assert!(validate_journal_path(&oversized).is_err());
     }
