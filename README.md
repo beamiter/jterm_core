@@ -79,11 +79,12 @@ v2 is selected only for a peer that has already advertised v2 support.
   `started_at_ms` Start generation; old or incomplete marks remain valid UI
   boundaries but cannot reach the journal writer. The asynchronous writer
   validates that capability against the current authoritative Start while
-  holding the journal's exclusive lock. A reset/restart, existing Output slot,
-  or unterminated physical tail rejects the event before writing. If a complete
+  holding the journal's exclusive lock. A reset/restart, authoritative Finish
+  (including a Finish conflict tombstone), existing Output slot, or
+  unterminated physical tail rejects the event before writing. If a complete
   Output becomes visible but its durability barrier fails, only one unique,
-  exact physical-tail match can retry the barriers; the event itself is never
-  appended again.
+  exact physical-tail match with no Finish before or after it can retry the
+  barriers; the event itself is never appended again.
   `is_valid_jsh_cwd` gives both channels one exact, nonempty, bounded, visually
   unambiguous cwd identity rule.
   Journal finish and output slots accept exact duplicate delivery idempotently;

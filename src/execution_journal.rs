@@ -1377,6 +1377,7 @@ fn inspect_bound_output_snapshot(
     let mut line = Vec::new();
     let mut event_lines = 0usize;
     let mut active_lifecycle = false;
+    let mut lifecycle_finished = false;
     let mut output_seen = false;
     let mut output_conflicted = false;
     let mut matching_outputs = 0usize;
@@ -1405,6 +1406,7 @@ fn inspect_bound_output_snapshot(
         let decoded = serde_json::from_slice::<PersistedEvent>(&line).ok();
         if recognized_v1_start_id(&line).as_deref() == Some(lifecycle.id.as_str()) {
             active_lifecycle = false;
+            lifecycle_finished = false;
             output_seen = false;
             output_conflicted = false;
             matching_outputs = 0;
@@ -1419,6 +1421,22 @@ fn inspect_bound_output_snapshot(
         }
 
         match decoded {
+            Some(PersistedEvent::Finish {
+                jsh_execution_version,
+                id,
+                cwd_after,
+                ..
+            }) if jsh_execution_version == EXECUTION_JOURNAL_VERSION
+                && id == lifecycle.id
+                && is_valid_jsh_execution_id(&id)
+                && is_valid_jsh_cwd(&cwd_after) =>
+            {
+                // Finish is the authoritative end of this exact Start
+                // generation. Captured terminal bytes that arrive later may
+                // still be useful to the UI, but they no longer have an open
+                // journal Output slot and must not be attached retroactively.
+                lifecycle_finished = true;
+            }
             Some(PersistedEvent::Output {
                 jsh_execution_version,
                 id,
@@ -1460,21 +1478,36 @@ fn inspect_bound_output_snapshot(
                 output_seen = true;
                 output_conflicted = true;
             }
+            Some(PersistedEvent::Conflict(ConflictEvent {
+                jsh_execution_version,
+                id,
+                slot: ConflictSlot::Finish,
+            })) if jsh_execution_version == EXECUTION_JOURNAL_VERSION
+                && id == lifecycle.id
+                && is_valid_jsh_execution_id(&id) =>
+            {
+                // A durable Finish conflict tombstone proves that the
+                // lifecycle's terminal-status slot was already consumed even
+                // though its value is intentionally unavailable.
+                lifecycle_finished = true;
+            }
             _ => {}
         }
     }
 
-    Ok(if !active_lifecycle || output_conflicted {
-        BoundOutputSnapshot::Rejected
-    } else if output_seen {
-        if terminal_exact && matching_outputs == 1 {
-            BoundOutputSnapshot::ExactTerminal
-        } else {
+    Ok(
+        if !active_lifecycle || lifecycle_finished || output_conflicted {
             BoundOutputSnapshot::Rejected
-        }
-    } else {
-        BoundOutputSnapshot::Ready
-    })
+        } else if output_seen {
+            if terminal_exact && matching_outputs == 1 {
+                BoundOutputSnapshot::ExactTerminal
+            } else {
+                BoundOutputSnapshot::Rejected
+            }
+        } else {
+            BoundOutputSnapshot::Ready
+        },
+    )
 }
 
 fn recover_exact_terminal_output_locked(
@@ -2398,8 +2431,8 @@ mod tests {
         finished.extend_from_slice(finish);
         assert_eq!(
             inspect("finish-before-output", &finished, &expected_lifecycle),
-            BoundOutputSnapshot::Ready,
-            "a late terminal snapshot may follow its own Finish"
+            BoundOutputSnapshot::Rejected,
+            "an authoritative Finish closes the durable Output slot"
         );
 
         let replacement = ExecutionLifecycle {
@@ -2515,12 +2548,34 @@ mod tests {
         );
 
         let mut successor = exact.clone();
-        successor.extend_from_slice(
-            b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-output-recovery\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp\",\"ended_at_ms\":2}\n",
-        );
+        let finish = b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-output-recovery\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp\",\"ended_at_ms\":2}\n";
+        successor.extend_from_slice(finish);
         assert_eq!(
             inspect("successor-after-output", &successor),
             BoundOutputSnapshot::Rejected
+        );
+
+        let mut finish_then_output = start.clone();
+        finish_then_output.extend_from_slice(finish);
+        finish_then_output.extend_from_slice(&encoded);
+        assert_eq!(
+            inspect("finish-before-exact-output", &finish_then_output),
+            BoundOutputSnapshot::Rejected,
+            "commit-unknown recovery cannot use an existing Finish as the Output predecessor"
+        );
+
+        let mut finish_conflict_then_output = start.clone();
+        finish_conflict_then_output.extend_from_slice(
+            b"{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-output-recovery\",\"slot\":\"finish\"}\n",
+        );
+        finish_conflict_then_output.extend_from_slice(&encoded);
+        assert_eq!(
+            inspect(
+                "finish-conflict-before-output",
+                &finish_conflict_then_output
+            ),
+            BoundOutputSnapshot::Rejected,
+            "a durable Finish tombstone also closes the lifecycle"
         );
 
         let mut torn = start;
@@ -2606,6 +2661,22 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(no_write.write_calls.get(), 0);
         assert_eq!(fs::read(&path).unwrap(), torn_source);
+
+        let finish = b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-stale-output\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n";
+        let mut finished_source = lifecycle_start_line(&current_output.lifecycle);
+        finished_source.extend_from_slice(finish);
+        write_temporary_journal(&path, &finished_source);
+        let error = append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &current_encoded,
+            MAX_JOURNAL_EVENT_LINES,
+            &no_write,
+            Some(&current_output),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(no_write.write_calls.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), finished_source);
     }
 
     #[test]
