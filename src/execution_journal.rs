@@ -1753,6 +1753,37 @@ mod tests {
     }
 
     #[test]
+    fn later_start_resets_prior_slots_even_when_restart_metadata_goes_backwards() {
+        let path = temporary_journal("restart-reset-order");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"restarted\",\"session_id\":\"wanted\",\"seq\":90,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":900}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"restarted\",\"exit_code\":9,\"duration_ms\":8,\"cwd_after\":\"/old-after\",\"ended_at_ms\":908}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"restarted\",\"text\":\"old output\",\"truncated\":false,\"total_bytes\":10,\"captured_at_ms\":909}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"restarted\",\"slot\":\"finish\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"restarted\",\"slot\":\"output\"}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"restarted\",\"session_id\":\"wanted\",\"seq\":0,\"command\":\"future\",\"cwd\":\"/future\",\"started_at_ms\":0}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"future\",\"id\":\"restarted\",\"payload\":true}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"restarted\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"new\",\"cwd\":\"/new\",\"started_at_ms\":10}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 1);
+        let restarted = &records[0];
+        assert_eq!(restarted.seq, 1);
+        assert_eq!(restarted.started_at_ms, 10);
+        assert_eq!(restarted.command, "new");
+        assert_eq!(restarted.cwd, "/new");
+        assert_eq!(restarted.exit_code, None);
+        assert_eq!(restarted.duration_ms, None);
+        assert_eq!(restarted.cwd_after, None);
+        assert_eq!(restarted.ended_at_ms, None);
+        assert_eq!(restarted.output, None);
+    }
+
+    #[test]
     fn legacy_v1_readers_ignore_additive_conflict_tombstones() {
         #[derive(Deserialize)]
         #[serde(tag = "event")]
