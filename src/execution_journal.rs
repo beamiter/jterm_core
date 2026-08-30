@@ -519,6 +519,38 @@ fn validate_journal_file(file: &File, description: &str) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn validate_journal_directory_trust(
+    dir: &Path,
+    owner_uid: u32,
+    mode: u32,
+    effective_uid: u32,
+) -> io::Result<()> {
+    if owner_uid != effective_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "execution journal parent {} is not owned by the current user",
+                dir.display()
+            ),
+        ));
+    }
+    // The sidecar name is fixed (`executions.lock`). Even a sticky shared
+    // directory would let another account pre-create that name and split or
+    // deny the cross-process lock namespace. Custom journals therefore live
+    // in a namespace writable only by their owner.
+    if mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "execution journal parent {} is writable by another user or group",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn open_journal_directory(dir: &Path) -> io::Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -537,31 +569,9 @@ fn open_journal_directory(dir: &Path) -> io::Result<File> {
         ));
     }
     let mode = metadata.permissions().mode();
-    // The sticky bit does not constrain the directory owner. Accept a shared
-    // namespace only when it is owned by us or by root (for example `/tmp`).
     // SAFETY: geteuid has no preconditions and only reads process state.
     let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid && metadata.uid() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "execution journal parent {} is not owned by the current user or root",
-                dir.display()
-            ),
-        ));
-    }
-    // A sticky shared directory such as /tmp protects entries by owner. Other
-    // group/world-writable parents permit a different uid to replace the lock
-    // or journal pathname between otherwise safe descriptor operations.
-    if mode & 0o022 != 0 && mode & libc::S_ISVTX == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "execution journal parent {} is group/world writable without the sticky bit",
-                dir.display()
-            ),
-        ));
-    }
+    validate_journal_directory_trust(dir, metadata.uid(), mode, effective_uid)?;
     Ok(directory)
 }
 
@@ -1715,6 +1725,29 @@ mod tests {
 
         assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
         assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sticky_writable_journal_parent_is_also_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("sticky-writable-parent");
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o1777)).unwrap();
+        let journal_path = root.0.join("executions.jsonl");
+
+        assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
+        assert!(!journal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_parent_trust_never_exempts_a_different_owner() {
+        let path = Path::new("/shared");
+
+        assert!(validate_journal_directory_trust(path, 1_000, 0o700, 1_000).is_ok());
+        assert!(validate_journal_directory_trust(path, 0, 0o700, 1_000).is_err());
+        assert!(validate_journal_directory_trust(path, 1_000, 0o1777, 1_000).is_err());
     }
 
     #[cfg(unix)]

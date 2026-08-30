@@ -55,6 +55,10 @@ v2 is selected only for a peer that has already advertised v2 support.
   journal v1 version and byte/record ceilings are public, and its reader keeps
   jsh's JSON-escaped multiline commands plus the pre-rename version alias so
   migrated shell history and live OSC metadata resolve identically.
+  A custom journal override must use a directory owned by the current user and
+  not writable by group or other; shared namespaces such as `/tmp` are refused
+  because the journal and its fixed `executions.lock` sidecar form one trust
+  boundary.
   `is_valid_jsh_cwd` gives both channels one exact, nonempty, bounded, visually
   unambiguous cwd identity rule.
   OSC metadata that claims a command is truncated (or encodes that disclosure
