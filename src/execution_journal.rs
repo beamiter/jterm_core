@@ -867,6 +867,13 @@ fn read_session_history_file_with_line_limit(
         if !within_limit {
             continue;
         }
+        // JSON object identity must be unambiguous before even the lightweight
+        // Start envelope can retire an existing lifecycle. This also rejects
+        // duplicate unknown members that Serde would otherwise skip while
+        // decoding Finish/Output events.
+        if crate::bounded_json::validate_no_duplicate_members(&line).is_err() {
+            continue;
+        }
         // A recognized v1 Start with a valid ID is authoritative even when
         // strict decoding of its remaining metadata fails. Clear the old
         // lifecycle first so later Finish/Output events cannot bind to it.
@@ -1376,6 +1383,19 @@ mod tests {
             )
             .as_bytes(),
         );
+        event
+    }
+
+    fn unknown_event_with_raw_bytes(id: &str, raw_bytes: usize) -> Vec<u8> {
+        let prefix = format!(
+            "{{\"jsh_execution_version\":1,\"event\":\"future\",\"id\":\"{id}\",\"payload\":\""
+        );
+        let suffix = b"\"}";
+        assert!(raw_bytes >= prefix.len() + suffix.len());
+        let mut event = prefix.into_bytes();
+        event.resize(raw_bytes - suffix.len(), b'x');
+        event.extend_from_slice(suffix);
+        assert_eq!(event.len(), raw_bytes);
         event
     }
 
@@ -1902,6 +1922,55 @@ mod tests {
         let _ = fs::remove_file(&path);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "survivor");
+        assert_eq!(records[0].exit_code, Some(9));
+    }
+
+    #[test]
+    fn duplicate_json_members_never_mutate_lifecycle_state() {
+        let path = temporary_journal("duplicate-members");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"duplicate-start\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"duplicate-start\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/old\",\"ended_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"duplicate-start\",\"session_id\":\"wanted\",\"seq\":4,\"command\":\"new\",\"cwd\":\"/new\",\"started_at_ms\":4,\"extension\":1,\"\\u0065xtension\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"duplicate-finish\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"two\",\"cwd\":\"/\",\"started_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"duplicate-finish\",\"exit_code\":7,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":3,\"extension\":1,\"\\u0065xtension\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"duplicate-output\",\"session_id\":\"wanted\",\"seq\":3,\"command\":\"three\",\"cwd\":\"/\",\"started_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"duplicate-output\",\"text\":\"wrong\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4,\"extension\":{\"nested\":1,\"nested\":2}}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].id, "duplicate-start");
+        assert_eq!(records[0].command, "old");
+        assert_eq!(records[0].exit_code, Some(9));
+        assert_eq!(records[1].id, "duplicate-finish");
+        assert_eq!(records[1].exit_code, None);
+        assert_eq!(records[2].id, "duplicate-output");
+        assert_eq!(records[2].output, None);
+    }
+
+    #[test]
+    fn unknown_additive_events_never_accumulate_state_at_raw_boundaries() {
+        let path = temporary_journal("unknown-additive-boundaries");
+        let mut journal = b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n".to_vec();
+        journal.extend_from_slice(&unknown_event_with_raw_bytes("known", MAX_EVENT_LINE_BYTES));
+        journal.push(b'\n');
+        journal.extend_from_slice(&unknown_event_with_raw_bytes(
+            "orphan-over",
+            MAX_EVENT_LINE_BYTES + 1,
+        ));
+        journal.extend_from_slice(b"\n{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"known\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/old\",\"ended_at_ms\":2}\n");
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "known");
+        assert_eq!(records[0].command, "old");
         assert_eq!(records[0].exit_code, Some(9));
     }
 
