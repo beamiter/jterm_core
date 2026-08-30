@@ -8,6 +8,8 @@
 //! terminal as an `output` event with the same execution id.
 //! Existing owner-only journal files with extra read bits are tightened to
 //! `0600` after validation; group/world-writable files are rejected.
+//! The implicit default directory is restored to `0700` after verifying its
+//! owner, while an existing custom namespace is never repaired in place.
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use once_cell::sync::OnceCell;
@@ -558,7 +560,7 @@ fn validate_journal_directory_trust(
 }
 
 #[cfg(unix)]
-fn open_journal_directory(dir: &Path) -> io::Result<File> {
+fn open_journal_directory_with_policy(dir: &Path, harden: bool) -> io::Result<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let directory = OpenOptions::new()
@@ -575,10 +577,21 @@ fn open_journal_directory(dir: &Path) -> io::Result<File> {
             ),
         ));
     }
-    let mode = metadata.permissions().mode();
     // SAFETY: geteuid has no preconditions and only reads process state.
     let effective_uid = unsafe { libc::geteuid() };
-    validate_journal_directory_trust(dir, metadata.uid(), mode, effective_uid)?;
+    // Only the implicit default (or a directory just created for either
+    // source) may be repaired. Check ownership on the opened inode first so a
+    // path race or another account's directory can never be chmodded.
+    if harden && metadata.uid() == effective_uid {
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    let metadata = directory.metadata()?;
+    validate_journal_directory_trust(
+        dir,
+        metadata.uid(),
+        metadata.permissions().mode(),
+        effective_uid,
+    )?;
     Ok(directory)
 }
 
@@ -628,8 +641,13 @@ struct JournalFileLock {
 }
 
 impl JournalFileLock {
-    fn acquire(dir: &Path, lock_path: &Path, mode: JournalLockMode) -> io::Result<Self> {
-        Self::acquire_with_timeout(dir, lock_path, mode, JOURNAL_LOCK_TIMEOUT)
+    fn acquire(
+        dir: &Path,
+        lock_path: &Path,
+        mode: JournalLockMode,
+        harden_directory: bool,
+    ) -> io::Result<Self> {
+        Self::acquire_with_timeout(dir, lock_path, mode, JOURNAL_LOCK_TIMEOUT, harden_directory)
     }
 
     fn acquire_with_timeout(
@@ -637,6 +655,7 @@ impl JournalFileLock {
         lock_path: &Path,
         mode: JournalLockMode,
         timeout: Duration,
+        harden_directory: bool,
     ) -> io::Result<Self> {
         let started = Instant::now();
         let wait = |file: &File| -> io::Result<()> {
@@ -664,7 +683,7 @@ impl JournalFileLock {
         // locked sidecar and creating a new inode cannot split the protocol.
         #[cfg(unix)]
         let directory = {
-            let directory = open_journal_directory(dir)?;
+            let directory = open_journal_directory_with_policy(dir, harden_directory)?;
             wait(&directory)?;
             directory
         };
@@ -719,7 +738,7 @@ fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>>
             "invalid jsh session ID",
         ));
     }
-    let (path, _) = journal_path()?;
+    let (path, custom_path) = journal_path()?;
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -729,7 +748,7 @@ fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>>
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
     let lock_path = dir.join("executions.lock");
-    let _lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Shared)?;
+    let _lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Shared, !custom_path)?;
 
     match read_session_history_file(&path, session_id) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -937,27 +956,14 @@ fn prepare_journal_path() -> io::Result<PathBuf> {
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::os::unix::fs::DirBuilderExt;
 
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        let directory = open_journal_directory(dir)?;
-        if !custom_path || !dir_already_existed {
-            let metadata = directory.metadata()?;
-            // SAFETY: geteuid has no preconditions and only reads process state.
-            if metadata.uid() != unsafe { libc::geteuid() } {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "execution journal directory {} is not owned by the current user",
-                        dir.display()
-                    ),
-                ));
-            }
-            directory.set_permissions(fs::Permissions::from_mode(0o700))?;
-        }
+        let _directory =
+            open_journal_directory_with_policy(dir, !custom_path || !dir_already_existed)?;
     }
     #[cfg(not(unix))]
     fs::create_dir_all(dir)?;
@@ -976,7 +982,7 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
     let lock_path = dir.join("executions.lock");
 
-    let lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Exclusive)?;
+    let lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Exclusive, false)?;
 
     (|| {
         let mut journal = open_journal_for_append(journal_path)?;
@@ -1661,8 +1667,8 @@ mod tests {
         let root = TestDir::new("lock-replacement");
         let lock_path = root.0.join("executions.lock");
         let retired_path = root.0.join("retired.lock");
-        let held =
-            JournalFileLock::acquire(&root.0, &lock_path, JournalLockMode::Exclusive).unwrap();
+        let held = JournalFileLock::acquire(&root.0, &lock_path, JournalLockMode::Exclusive, false)
+            .unwrap();
         fs::rename(&lock_path, &retired_path).unwrap();
 
         let started = Instant::now();
@@ -1671,6 +1677,7 @@ mod tests {
             &lock_path,
             JournalLockMode::Exclusive,
             Duration::from_millis(25),
+            false,
         )
         .err()
         .expect("renaming the sidecar must not bypass the directory lock");
@@ -1683,6 +1690,7 @@ mod tests {
             &lock_path,
             JournalLockMode::Exclusive,
             Duration::from_millis(25),
+            false,
         )
         .expect("the protocol remains usable after the original guard exits");
         drop(reacquired);
@@ -1696,8 +1704,8 @@ mod tests {
 
         let root = TestDir::new("lock-cloexec");
         let lock_path = root.0.join("executions.lock");
-        let held =
-            JournalFileLock::acquire(&root.0, &lock_path, JournalLockMode::Exclusive).unwrap();
+        let held = JournalFileLock::acquire(&root.0, &lock_path, JournalLockMode::Exclusive, false)
+            .unwrap();
         for file in [&held.directory, &held.file] {
             // SAFETY: each File owns a live descriptor and F_GETFD only reads
             // descriptor flags.
@@ -1759,6 +1767,28 @@ mod tests {
         assert!(validate_journal_directory_trust(path, 1_000, 0o700, 1_000).is_ok());
         assert!(validate_journal_directory_trust(path, 0, 0o700, 1_000).is_err());
         assert!(validate_journal_directory_trust(path, 1_000, 0o1777, 1_000).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_default_parent_is_hardened_before_the_mode_gate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("default-parent-hardening");
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let directory = open_journal_directory_with_policy(&root.0, true).unwrap();
+        assert_eq!(
+            directory.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(open_journal_directory_with_policy(&root.0, false).is_err());
+        assert_eq!(
+            fs::metadata(&root.0).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
     }
 
     #[cfg(unix)]
