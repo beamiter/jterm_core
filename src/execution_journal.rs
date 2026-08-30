@@ -205,24 +205,38 @@ impl OutputEvent {
             return None;
         }
         let observed_bytes = completed.output.len();
-        let retained_bytes = u64::try_from(observed_bytes).unwrap_or(u64::MAX);
+        let observed_total_bytes = u64::try_from(observed_bytes).unwrap_or(u64::MAX);
         let (text, truncated) = if observed_bytes > MAX_OUTPUT_BYTES {
             (bounded_text(&completed.output, MAX_OUTPUT_BYTES), true)
         } else {
             (completed.output, completed.truncated)
         };
+        let supplied_total = u64::try_from(completed.total_bytes).unwrap_or(u64::MAX);
+        let (truncated, total_bytes) = normalize_output_metadata(
+            text.len(),
+            truncated,
+            supplied_total.max(observed_total_bytes),
+        );
         Some(Self {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             event: "output",
             id: completed.id,
             text,
             truncated,
-            total_bytes: u64::try_from(completed.total_bytes)
-                .unwrap_or(u64::MAX)
-                .max(retained_bytes),
+            total_bytes,
             captured_at_ms: unix_time_ms(),
         })
     }
+}
+
+fn normalize_output_metadata(
+    retained_bytes: usize,
+    truncated: bool,
+    total_bytes: u64,
+) -> (bool, u64) {
+    let retained_bytes = u64::try_from(retained_bytes).unwrap_or(u64::MAX);
+    let total_bytes = total_bytes.max(retained_bytes);
+    (truncated || total_bytes > retained_bytes, total_bytes)
 }
 
 static WRITER: OnceCell<Option<Sender<JournalMessage>>> = OnceCell::new();
@@ -814,8 +828,10 @@ fn read_session_history_file(
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
+                    let (truncated, total_bytes) =
+                        normalize_output_metadata(text.len(), truncated, total_bytes);
                     record.output = Some(PersistedExecutionOutput {
-                        total_bytes: total_bytes.max(text.len() as u64),
+                        total_bytes,
                         text,
                         truncated,
                         captured_at_ms,
@@ -1202,8 +1218,28 @@ mod tests {
         assert_eq!(value["event"], "output");
         assert_eq!(value["id"], "exec-1");
         assert_eq!(value["text"], "hi");
+        assert_eq!(value["truncated"], false);
         assert_eq!(value["total_bytes"], 2);
         assert!(value.get("command").is_none());
+    }
+
+    #[test]
+    fn output_metadata_cannot_deny_bytes_it_says_were_observed() {
+        assert_eq!(normalize_output_metadata(2, false, 1), (false, 2));
+        assert_eq!(normalize_output_metadata(2, false, 2), (false, 2));
+        assert_eq!(normalize_output_metadata(2, false, 3), (true, 3));
+        assert_eq!(normalize_output_metadata(2, true, 2), (true, 2));
+
+        let event = OutputEvent::from_completed(CompletedExecution {
+            id: "exec-inconsistent".to_owned(),
+            output: "hi".to_owned(),
+            output_available: true,
+            truncated: false,
+            total_bytes: 3,
+        })
+        .unwrap();
+        assert!(event.truncated);
+        assert_eq!(event.total_bytes, 3);
     }
 
     #[test]
@@ -1271,7 +1307,25 @@ mod tests {
         assert_eq!(record.cwd_after.as_deref(), Some("/tmp/after"));
         let output = record.output.as_ref().unwrap();
         assert_eq!(output.text, "hi");
+        assert!(!output.truncated);
         assert_eq!(output.total_bytes, 2);
+    }
+
+    #[test]
+    fn history_reader_marks_a_contradictory_output_as_truncated() {
+        let path = temporary_journal("contradictory-output");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-1\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"hi\",\"truncated\":false,\"total_bytes\":3,\"captured_at_ms\":2}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        let output = records[0].output.as_ref().unwrap();
+        assert!(output.truncated);
+        assert_eq!(output.total_bytes, 3);
     }
 
     #[test]
