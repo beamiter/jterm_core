@@ -59,6 +59,8 @@ v2 is selected only for a peer that has already advertised v2 support.
   charged before parsing so ignored extensions cannot bypass the event budget.
   A writer also checks that budget before emitting a separator or event, and an
   exact-limit journal is left byte-for-byte unchanged when an append is refused.
+  Its incremental counter treats an unterminated peer tail as one physical line;
+  a later LF only terminates that line rather than charging it twice.
   A custom journal override must use a directory owned by the current user and
   not writable by group or other; shared namespaces such as `/tmp` are refused
   because the journal and its fixed `executions.lock` sidecar form one trust

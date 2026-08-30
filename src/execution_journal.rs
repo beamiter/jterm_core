@@ -2541,6 +2541,74 @@ mod tests {
     }
 
     #[test]
+    fn peer_tail_growth_is_counted_once_by_the_append_cache() {
+        let root = TestDir::new("peer-line-cache");
+        let journal_path = root.0.join("executions.jsonl");
+        let start = b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n";
+        fs::write(&journal_path, start).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut observer = open_journal_for_append(&journal_path).unwrap();
+        let mut observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, &journal_path, observed_len).unwrap(),
+            1
+        );
+
+        let mut peer = OpenOptions::new().append(true).open(&journal_path).unwrap();
+        peer.write_all(b"{\"jsh_execution_version\":1,\"event\":\"future\",\"payload\":true}\n")
+            .unwrap();
+        observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, &journal_path, observed_len).unwrap(),
+            2
+        );
+        assert_eq!(
+            read_session_history_file_with_line_limit(&journal_path, "wanted", 2)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        peer.write_all(b"{\"malformed\":").unwrap();
+        observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, &journal_path, observed_len).unwrap(),
+            3
+        );
+        assert_eq!(
+            read_session_history_file_with_line_limit(&journal_path, "wanted", 3)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        peer.write_all(b"\n").unwrap();
+        drop(peer);
+        observed_len = observer.metadata().unwrap().len();
+        assert_eq!(
+            count_physical_lines_cached(&mut observer, &journal_path, observed_len).unwrap(),
+            3,
+            "a later LF terminates the cached tail instead of adding a line"
+        );
+        drop(observer);
+
+        let output = b"{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"known\",\"text\":\"new\",\"truncated\":false,\"total_bytes\":3,\"captured_at_ms\":2}\n";
+        let unchanged = fs::read(&journal_path).unwrap();
+        let error =
+            append_encoded_event_to_path_with_line_limit(&journal_path, output, 3).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(fs::read(&journal_path).unwrap(), unchanged);
+
+        append_encoded_event_to_path_with_line_limit(&journal_path, output, 4).unwrap();
+        let reopened =
+            read_session_history_file_with_line_limit(&journal_path, "wanted", 4).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].output.as_ref().unwrap().text, "new");
+    }
+
+    #[test]
     fn ordinary_journal_append_still_creates_private_regular_files() {
         let root = TestDir::new("ordinary-append");
         let journal_path = root.0.join("executions.jsonl");
