@@ -2575,41 +2575,76 @@ mod tests {
     }
 
     #[test]
-    fn terminal_append_rejects_an_exact_event_budget_atomically() {
-        let root = TestDir::new("event-budget-append");
+    fn terminal_append_rejects_ambiguous_exact_budget_atomically() {
+        let root = TestDir::new("ambiguous-event-budget-append");
         let journal_path = root.0.join("executions.jsonl");
         let original = concat!(
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
-            "{\"jsh_execution_version\":1,\"event\":\"future\",\"payload\":true}\n",
-            "{\"malformed\":\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"known\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"event\":\"finish\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":3,\"command\":\"exact duplicate\",\"cwd\":\"/wrong\",\"started_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"known\",\"\\u0069d\":\"other\",\"exit_code\":30,\"duration_ms\":30,\"cwd_after\":\"/wrong\",\"ended_at_ms\":30}\n",
+            "{\"jsh_execution_version\":2,\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":4,\"command\":\"canonical first\",\"cwd\":\"/wrong\",\"started_at_ms\":4}\n",
+            "{\"rsh_execution_version\":1,\"jsh_execution_version\":2,\"event\":\"finish\",\"id\":\"known\",\"exit_code\":40,\"duration_ms\":40,\"cwd_after\":\"/wrong\",\"ended_at_ms\":40}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":5,\"command\":\"future start\",\"cwd\":\"/future\",\"started_at_ms\":5}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"finish\",\"id\":\"known\",\"exit_code\":50,\"duration_ms\":50,\"cwd_after\":\"/future\",\"ended_at_ms\":50}\n",
             "{\"jsh_execution_version\":2,\"event\":\"output\",\"id\":\"known\",\"text\":\"future\",\"truncated\":false,\"total_bytes\":6,\"captured_at_ms\":2}\n"
         );
         fs::write(&journal_path, original).unwrap();
         #[cfg(unix)]
         fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            read_session_history_file_with_line_limit(&journal_path, "wanted", 4)
-                .unwrap()
-                .len(),
-            1
+        let records = read_session_history_file_with_line_limit(&journal_path, "wanted", 9)
+            .expect("ambiguous and future-version rows are forward-compatible");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].exit_code, Some(9));
+        assert_eq!(records[0].output, None);
+
+        // Establish the protocol sidecar before taking the atomicity snapshot:
+        // a rejected append may lock existing coordination state, but must not
+        // create, replace, or remove any directory entry of its own.
+        drop(
+            JournalFileLock::acquire(
+                &root.0,
+                &root.0.join(JOURNAL_LOCK_FILE_NAME),
+                JournalLockMode::Exclusive,
+                false,
+            )
+            .unwrap(),
         );
+        let directory_entries = || {
+            let mut entries = fs::read_dir(&root.0)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        };
+        let entries_before = directory_entries();
+        #[cfg(unix)]
+        let identity_before = {
+            let metadata = fs::metadata(&journal_path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
 
         let event = b"{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"known\",\"text\":\"new\",\"truncated\":false,\"total_bytes\":3,\"captured_at_ms\":2}\n";
         let error =
-            append_encoded_event_to_path_with_line_limit(&journal_path, event, 4).unwrap_err();
+            append_encoded_event_to_path_with_line_limit(&journal_path, event, 9).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
         assert_eq!(fs::read(&journal_path).unwrap(), original.as_bytes());
-        assert_eq!(
-            read_session_history_file_with_line_limit(&journal_path, "wanted", 4)
-                .unwrap()
-                .len(),
-            1
-        );
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(&journal_path).unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), identity_before);
+        }
+        assert_eq!(directory_entries(), entries_before);
+        let rejected = read_session_history_file_with_line_limit(&journal_path, "wanted", 9)
+            .expect("a rejected append leaves the source readable");
+        assert_eq!(rejected, records);
 
-        append_encoded_event_to_path_with_line_limit(&journal_path, event, 5).unwrap();
+        append_encoded_event_to_path_with_line_limit(&journal_path, event, 10).unwrap();
         let restarted =
-            read_session_history_file_with_line_limit(&journal_path, "wanted", 5).unwrap();
+            read_session_history_file_with_line_limit(&journal_path, "wanted", 10).unwrap();
         assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0].exit_code, Some(9));
         assert_eq!(restarted[0].output.as_ref().unwrap().text, "new");
     }
 
