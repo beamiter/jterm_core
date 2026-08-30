@@ -71,8 +71,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   Command-end outcomes accept FinalTerm's positional status and the family's
   `exit`, `exit_code`, and `exit_status` aliases; repeated outcome slots degrade
   only that status to unknown while independent metadata survives.
-  Numeric outcome and duration aliases accept Ember-compatible surrounding
-  whitespace without percent-decoding malformed values into numbers.
+  Numeric outcome, duration, and truncation-boolean aliases accept
+  Ember-compatible surrounding whitespace without percent-decoding malformed
+  values into authoritative metadata.
   `bounded_json::validate_no_duplicate_members` re-exports jagent's wire
   preflight and gives bounded credential, IPC, and persistence decoders one
   allocation-light recursive preflight, so escaped or plain duplicate object

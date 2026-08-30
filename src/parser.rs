@@ -1159,6 +1159,7 @@ impl CommandMeta {
                         meta.command_truncated = true;
                         continue;
                     }
+                    let value = value.trim();
                     meta.command_truncated = match value {
                         "0" => false,
                         "1" => true,
@@ -2782,6 +2783,44 @@ mod tests {
         };
         assert!(!meta.command_truncated);
         assert_eq!(meta.command.as_deref(), Some("complete"));
+    }
+
+    #[test]
+    fn osc133_truncation_aliases_follow_the_family_boolean_grammar() {
+        for key in ["cmd_truncated", "command_truncated"] {
+            for value in [" 0 ", " FALSE "] {
+                let packet = format!("\x1b]133;C;cmdline_url=complete;{key}={value};id=jsh-2\x07");
+                let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                    panic!("expected CommandStart");
+                };
+                assert!(!meta.command_truncated, "key={key}, value={value:?}");
+                assert_eq!(meta.command.as_deref(), Some("complete"), "key={key}");
+                assert_eq!(meta.id.as_deref(), Some("jsh-2"), "key={key}");
+            }
+
+            for value in [" 1 ", " TRUE "] {
+                let packet =
+                    format!("\x1b]133;C;cmdline_url=partial-prefix;{key}={value};id=jsh-2\x07");
+                let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                    panic!("expected CommandStart");
+                };
+                assert!(meta.command_truncated, "key={key}, value={value:?}");
+                assert_eq!(meta.command, None, "key={key}");
+                assert_eq!(meta.id.as_deref(), Some("jsh-2"), "key={key}");
+            }
+        }
+
+        let ParserEvent::CommandStart(meta) = only_event(
+            b"\x1b]133;C;cmdline_url=partial-prefix;cmd_truncated=%20false%20;id=jsh-2\x07",
+        ) else {
+            panic!("expected CommandStart");
+        };
+        assert!(
+            meta.command_truncated,
+            "boolean fields are not percent-decoded"
+        );
+        assert_eq!(meta.command, None);
+        assert_eq!(meta.id.as_deref(), Some("jsh-2"));
     }
 
     /// A missing or unparseable status is `None`, not success. It used to
