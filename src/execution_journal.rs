@@ -71,12 +71,93 @@ struct AppendLineCountCache {
 
 static APPEND_LINE_COUNT_CACHE: Mutex<Option<AppendLineCountCache>> = Mutex::new(None);
 
+#[derive(Debug)]
+struct CommitStateUnknown(String);
+
+impl std::fmt::Display for CommitStateUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CommitStateUnknown {}
+
+fn commit_state_unknown(kind: io::ErrorKind, message: String) -> io::Error {
+    io::Error::new(kind, CommitStateUnknown(message))
+}
+
+fn is_commit_state_unknown(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<CommitStateUnknown>().is_some())
+}
+
+/// Exact Start identity carried from one parsed OSC 133 `C` mark to its
+/// asynchronous terminal-output completion.
+///
+/// The fields are private so a durable-output producer must derive the token
+/// from one complete [`crate::parser::CommandMeta`] rather than combining
+/// partial metadata observed at different times.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionLifecycle {
+    id: String,
+    session_id: String,
+    seq: u64,
+    started_at_ms: u64,
+}
+
+impl ExecutionLifecycle {
+    /// Build a durable journal capability only from a complete, exact jsh
+    /// lifecycle envelope. Missing, duplicated, empty, or invalid slots have
+    /// already degraded to `None` in the OSC parser and fail closed here.
+    pub fn from_command_meta(meta: &crate::parser::CommandMeta) -> Option<Self> {
+        let id = meta
+            .id
+            .as_deref()
+            .filter(|id| is_valid_jsh_execution_id(id))?;
+        let session_id = meta
+            .session_id
+            .as_deref()
+            .filter(|id| valid_jsh_session_id(id))?;
+        Some(Self {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            seq: meta.seq?,
+            started_at_ms: meta.started_at_ms?,
+        })
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    #[must_use]
+    pub const fn started_at_ms(&self) -> u64 {
+        self.started_at_ms
+    }
+
+    fn is_valid(&self) -> bool {
+        is_valid_jsh_execution_id(&self.id) && valid_jsh_session_id(&self.session_id)
+    }
+}
+
 /// One completed command's captured output, as reported by a terminal app.
-/// Only correlation id and output payload matter here; jsh's own events carry
-/// the command line, cwd, exit code, and duration.
+/// The lifecycle token binds the asynchronous payload to the exact journal
+/// Start generation that the terminal observed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletedExecution {
-    pub id: String,
+    pub lifecycle: ExecutionLifecycle,
     pub output: String,
     pub output_available: bool,
     pub truncated: bool,
@@ -152,7 +233,7 @@ pub enum HistoryRequestError {
     Closed,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct OutputEvent {
     jsh_execution_version: u32,
     event: &'static str,
@@ -161,6 +242,12 @@ struct OutputEvent {
     truncated: bool,
     total_bytes: u64,
     captured_at_ms: u64,
+}
+
+#[derive(Debug)]
+struct BoundOutput {
+    lifecycle: ExecutionLifecycle,
+    event: OutputEvent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,7 +352,7 @@ fn recognized_v1_start_id(line: &[u8]) -> Option<Cow<'_, str>> {
 }
 
 enum JournalMessage {
-    Output(OutputEvent),
+    Output(BoundOutput),
     Flush(Sender<()>),
 }
 
@@ -275,11 +362,11 @@ struct HistoryRequest {
 }
 
 impl OutputEvent {
-    fn from_completed(completed: CompletedExecution) -> Option<Self> {
+    fn from_completed(completed: CompletedExecution) -> Option<BoundOutput> {
         // Bare FinalTerm markers receive terminal-local ids so the timeline
         // still works, but there is no matching jsh start/finish lifecycle to
         // correlate on disk.
-        if !completed.output_available || !is_valid_jsh_execution_id(&completed.id) {
+        if !completed.output_available || !completed.lifecycle.is_valid() {
             return None;
         }
         let observed_bytes = completed.output.len();
@@ -295,15 +382,17 @@ impl OutputEvent {
             truncated,
             supplied_total.max(observed_total_bytes),
         );
-        Some(Self {
+        let lifecycle = completed.lifecycle;
+        let event = Self {
             jsh_execution_version: EXECUTION_JOURNAL_VERSION,
             event: "output",
-            id: completed.id,
+            id: lifecycle.id.clone(),
             text,
             truncated,
             total_bytes,
             captured_at_ms: unix_time_ms(),
-        })
+        };
+        Some(BoundOutput { lifecycle, event })
     }
 }
 
@@ -329,9 +418,15 @@ fn writer() -> Option<&'static Sender<JournalMessage>> {
                 .spawn(move || {
                     while let Ok(message) = rx.recv() {
                         match message {
-                            JournalMessage::Output(event) => {
-                                if let Err(error) = append_event(event) {
-                                    log::warn!("cannot append jsh execution output: {error}");
+                            JournalMessage::Output(output) => {
+                                if let Err(error) = append_event(output) {
+                                    // Journal diagnostics can describe a
+                                    // command or captured output. The terminal
+                                    // log needs only the stable error class.
+                                    log::warn!(
+                                        "cannot append jsh execution output ({:?})",
+                                        error.kind()
+                                    );
                                 }
                             }
                             JournalMessage::Flush(acknowledge) => {
@@ -421,12 +516,12 @@ pub fn submit(completed: CompletedExecution) -> Result<(), SubmitError> {
     if !output_capture_enabled() {
         return Ok(());
     }
-    let Some(event) = OutputEvent::from_completed(completed) else {
+    let Some(output) = OutputEvent::from_completed(completed) else {
         return Ok(());
     };
     let writer = writer().ok_or(SubmitError::Closed)?;
     writer
-        .try_send(JournalMessage::Output(event))
+        .try_send(JournalMessage::Output(output))
         .map_err(|error| match error {
             TrySendError::Full(_) => SubmitError::Full,
             TrySendError::Disconnected(_) => SubmitError::Closed,
@@ -879,19 +974,23 @@ fn write_all_counted(
 }
 
 fn append_write_error(error: io::Error, written: usize) -> io::Error {
-    let point = if written == 0 {
-        "before writing any bytes"
+    if written == 0 {
+        io::Error::new(
+            error.kind(),
+            format!("execution journal append failed before writing any bytes: {error}"),
+        )
     } else {
-        "after writing a visible prefix; commit state is unknown"
-    };
-    io::Error::new(
-        error.kind(),
-        format!("execution journal append failed {point}: {error}"),
-    )
+        commit_state_unknown(
+            error.kind(),
+            format!(
+                "execution journal append failed after writing a visible prefix; commit state is unknown: {error}"
+            ),
+        )
+    }
 }
 
 fn append_durability_error(stage: &str, error: io::Error) -> io::Error {
-    io::Error::new(
+    commit_state_unknown(
         error.kind(),
         format!(
             "execution journal {stage} durability barrier failed after writing; commit state is unknown: {error}"
@@ -900,7 +999,7 @@ fn append_durability_error(stage: &str, error: io::Error) -> io::Error {
 }
 
 fn append_post_write_error(stage: &str, error: io::Error) -> io::Error {
-    io::Error::new(
+    commit_state_unknown(
         error.kind(),
         format!("execution journal {stage} failed after writing; commit state is unknown: {error}"),
     )
@@ -1221,6 +1320,186 @@ fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Resul
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundOutputSnapshot {
+    Ready,
+    ExactTerminal,
+    Rejected,
+}
+
+fn start_matches_lifecycle(start: &StartEvent, lifecycle: &ExecutionLifecycle) -> bool {
+    start.jsh_execution_version == EXECUTION_JOURNAL_VERSION
+        && start.id == lifecycle.id
+        && start.session_id.as_deref() == Some(lifecycle.session_id.as_str())
+        && start.seq == lifecycle.seq
+        && start.started_at_ms == lifecycle.started_at_ms
+        && is_valid_jsh_execution_id(&start.id)
+        && start
+            .session_id
+            .as_deref()
+            .is_some_and(valid_jsh_session_id)
+        && is_valid_jsh_command(&start.command)
+        && is_valid_jsh_cwd(&start.cwd)
+}
+
+fn output_matches_expected(
+    jsh_execution_version: u32,
+    id: &str,
+    text: &str,
+    truncated: bool,
+    total_bytes: u64,
+    captured_at_ms: u64,
+    expected: &OutputEvent,
+) -> bool {
+    jsh_execution_version == expected.jsh_execution_version
+        && id == expected.id
+        && text == expected.text
+        && truncated == expected.truncated
+        && total_bytes == expected.total_bytes
+        && captured_at_ms == expected.captured_at_ms
+}
+
+/// Inspect the exact inode snapshot protected by the writer's exclusive lock.
+/// A bound Output may be appended only while its complete Start remains the
+/// authoritative same-ID lifecycle and its output slot is still empty.
+fn inspect_bound_output_snapshot(
+    journal: &mut File,
+    current_len: u64,
+    lifecycle: &ExecutionLifecycle,
+    expected: &OutputEvent,
+    max_event_lines: usize,
+) -> io::Result<BoundOutputSnapshot> {
+    if current_len == 0 || current_len > MAX_JOURNAL_READ_BYTES {
+        return Ok(BoundOutputSnapshot::Rejected);
+    }
+    journal.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new((&mut *journal).take(current_len));
+    let mut line = Vec::new();
+    let mut event_lines = 0usize;
+    let mut active_lifecycle = false;
+    let mut output_seen = false;
+    let mut output_conflicted = false;
+    let mut matching_outputs = 0usize;
+    let mut terminal_exact = false;
+
+    while let Some(within_limit) = read_bounded_line(&mut reader, &mut line)? {
+        event_lines = event_lines.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution journal event count overflowed during Output binding",
+            )
+        })?;
+        if event_lines > max_event_lines {
+            return Ok(BoundOutputSnapshot::Rejected);
+        }
+        terminal_exact = false;
+        // No unterminated physical tail is a safe boundary for asynchronous
+        // output. In particular, never place a second Output after a torn one.
+        if !within_limit || !line.ends_with(b"\n") {
+            return Ok(BoundOutputSnapshot::Rejected);
+        }
+        if crate::bounded_json::validate_no_duplicate_members(&line).is_err() {
+            continue;
+        }
+
+        let decoded = serde_json::from_slice::<PersistedEvent>(&line).ok();
+        if recognized_v1_start_id(&line).as_deref() == Some(lifecycle.id.as_str()) {
+            active_lifecycle = false;
+            output_seen = false;
+            output_conflicted = false;
+            matching_outputs = 0;
+            if matches!(decoded, Some(PersistedEvent::Start(ref start)) if start_matches_lifecycle(start, lifecycle))
+            {
+                active_lifecycle = true;
+            }
+            continue;
+        }
+        if !active_lifecycle {
+            continue;
+        }
+
+        match decoded {
+            Some(PersistedEvent::Output {
+                jsh_execution_version,
+                id,
+                text,
+                truncated,
+                total_bytes,
+                captured_at_ms,
+            }) if jsh_execution_version == EXECUTION_JOURNAL_VERSION
+                && id == lifecycle.id
+                && is_valid_jsh_execution_id(&id)
+                && text.len() <= MAX_OUTPUT_BYTES =>
+            {
+                if output_seen || output_conflicted {
+                    output_conflicted = true;
+                } else {
+                    output_seen = true;
+                    if output_matches_expected(
+                        jsh_execution_version,
+                        &id,
+                        &text,
+                        truncated,
+                        total_bytes,
+                        captured_at_ms,
+                        expected,
+                    ) {
+                        matching_outputs = matching_outputs.saturating_add(1);
+                        terminal_exact = true;
+                    }
+                }
+            }
+            Some(PersistedEvent::Conflict(ConflictEvent {
+                jsh_execution_version,
+                id,
+                slot: ConflictSlot::Output,
+            })) if jsh_execution_version == EXECUTION_JOURNAL_VERSION
+                && id == lifecycle.id
+                && is_valid_jsh_execution_id(&id) =>
+            {
+                output_seen = true;
+                output_conflicted = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(if !active_lifecycle || output_conflicted {
+        BoundOutputSnapshot::Rejected
+    } else if output_seen {
+        if terminal_exact && matching_outputs == 1 {
+            BoundOutputSnapshot::ExactTerminal
+        } else {
+            BoundOutputSnapshot::Rejected
+        }
+    } else {
+        BoundOutputSnapshot::Ready
+    })
+}
+
+fn recover_exact_terminal_output_locked(
+    journal_path: &Path,
+    lock: &JournalFileLock,
+    output: &BoundOutput,
+    max_event_lines: usize,
+) -> io::Result<bool> {
+    let mut journal = open_existing_journal_for_append(journal_path)?;
+    let current_len = journal.metadata()?.len();
+    if inspect_bound_output_snapshot(
+        &mut journal,
+        current_len,
+        &output.lifecycle,
+        &output.event,
+        max_event_lines,
+    )? != BoundOutputSnapshot::ExactTerminal
+    {
+        return Ok(false);
+    }
+    journal.sync_data()?;
+    lock.sync_directory()?;
+    Ok(true)
+}
+
 fn prepare_journal_path() -> io::Result<PathBuf> {
     let (path, custom_path) = journal_path()?;
     let dir = path
@@ -1247,16 +1526,33 @@ fn prepare_journal_path() -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn append_event(event: OutputEvent) -> io::Result<()> {
-    let encoded = encode_event(event)?;
+fn append_event(mut output: BoundOutput) -> io::Result<()> {
+    let (event, encoded) = encode_event_with_value(output.event)?;
+    output.event = event;
     let journal_path = prepare_journal_path()?;
-    append_encoded_event_to_path(&journal_path, &encoded)
+    append_bound_output_to_path(&journal_path, &encoded, &output)
 }
 
+fn append_bound_output_to_path(
+    journal_path: &Path,
+    encoded: &[u8],
+    output: &BoundOutput,
+) -> io::Result<()> {
+    append_encoded_event_to_path_with_line_limit_and_io_inner(
+        journal_path,
+        encoded,
+        MAX_JOURNAL_EVENT_LINES,
+        &SyncJournalAppendIo,
+        Some(output),
+    )
+}
+
+#[cfg(test)]
 fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) -> io::Result<()> {
     append_encoded_event_to_path_with_line_limit(journal_path, encoded, MAX_JOURNAL_EVENT_LINES)
 }
 
+#[cfg(test)]
 fn append_encoded_event_to_path_with_line_limit(
     journal_path: &std::path::Path,
     encoded: &[u8],
@@ -1270,11 +1566,28 @@ fn append_encoded_event_to_path_with_line_limit(
     )
 }
 
+#[cfg(test)]
 fn append_encoded_event_to_path_with_line_limit_and_io(
     journal_path: &std::path::Path,
     encoded: &[u8],
     max_event_lines: usize,
     append_io: &impl JournalAppendIo,
+) -> io::Result<()> {
+    append_encoded_event_to_path_with_line_limit_and_io_inner(
+        journal_path,
+        encoded,
+        max_event_lines,
+        append_io,
+        None,
+    )
+}
+
+fn append_encoded_event_to_path_with_line_limit_and_io_inner(
+    journal_path: &Path,
+    encoded: &[u8],
+    max_event_lines: usize,
+    append_io: &impl JournalAppendIo,
+    bound_output: Option<&BoundOutput>,
 ) -> io::Result<()> {
     if !encoded.ends_with(b"\n") || encoded[..encoded.len() - 1].contains(&b'\n') {
         return Err(io::Error::new(
@@ -1289,9 +1602,27 @@ fn append_encoded_event_to_path_with_line_limit_and_io(
 
     let lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Exclusive, false)?;
 
-    (|| {
-        let (mut journal, created_pathname) = open_or_create_journal_for_append(journal_path)?;
+    let append_result = (|| {
+        let (mut journal, created_pathname) = match bound_output {
+            Some(_) => (open_existing_journal_for_append(journal_path)?, false),
+            None => open_or_create_journal_for_append(journal_path)?,
+        };
         let current_len = journal.metadata()?.len();
+        if let Some(output) = bound_output {
+            if inspect_bound_output_snapshot(
+                &mut journal,
+                current_len,
+                &output.lifecycle,
+                &output.event,
+                max_event_lines,
+            )? != BoundOutputSnapshot::Ready
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "execution output does not match the current journal lifecycle",
+                ));
+            }
+        }
         let needs_separator = if current_len == 0 {
             false
         } else {
@@ -1361,7 +1692,29 @@ fn append_encoded_event_to_path_with_line_limit_and_io(
                 .map_err(|error| append_durability_error("directory", error))?;
         }
         Ok(())
-    })()
+    })();
+
+    match append_result {
+        Err(error) if bound_output.is_some() && is_commit_state_unknown(&error) => {
+            let output = bound_output.expect("presence checked above");
+            match recover_exact_terminal_output_locked(
+                journal_path,
+                &lock,
+                output,
+                max_event_lines,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(error),
+                Err(recovery_error) => Err(commit_state_unknown(
+                    recovery_error.kind(),
+                    format!(
+                        "execution journal Output recovery failed after an unknown append result: {recovery_error}; original error: {error}"
+                    ),
+                )),
+            }
+        }
+        result => result,
+    }
 }
 
 fn finish_failed_append_write(
@@ -1598,7 +1951,12 @@ fn bounded_text(value: &str, max_bytes: usize) -> String {
 /// Serialize within the same one-line limit enforced by jsh's reader. JSON
 /// escaping can expand control-heavy terminal text well beyond its UTF-8 byte
 /// count, so retry with a smaller UTF-8-safe head/tail snapshot when needed.
-fn encode_event(mut event: OutputEvent) -> io::Result<Vec<u8>> {
+#[cfg(test)]
+fn encode_event(event: OutputEvent) -> io::Result<Vec<u8>> {
+    encode_event_with_value(event).map(|(_, encoded)| encoded)
+}
+
+fn encode_event_with_value(mut event: OutputEvent) -> io::Result<(OutputEvent, Vec<u8>)> {
     let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
     if encoded.len() > MAX_EVENT_LINE_BYTES {
         event.text = bounded_text(&event.text, MAX_OUTPUT_BYTES / 2);
@@ -1613,7 +1971,7 @@ fn encode_event(mut event: OutputEvent) -> io::Result<Vec<u8>> {
         ));
     }
     encoded.push(b'\n');
-    Ok(encoded)
+    Ok((event, encoded))
 }
 
 #[cfg(unix)]
@@ -1668,6 +2026,41 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn lifecycle(id: &str) -> ExecutionLifecycle {
+        ExecutionLifecycle {
+            id: id.to_owned(),
+            session_id: "wanted".to_owned(),
+            seq: 1,
+            started_at_ms: 1,
+        }
+    }
+
+    fn lifecycle_start_line(lifecycle: &ExecutionLifecycle) -> Vec<u8> {
+        format!(
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"{}\",\"session_id\":\"{}\",\"seq\":{},\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":{}}}\n",
+            lifecycle.id, lifecycle.session_id, lifecycle.seq, lifecycle.started_at_ms
+        )
+        .into_bytes()
+    }
+
+    fn bound_output(lifecycle: ExecutionLifecycle, text: &str) -> BoundOutput {
+        OutputEvent::from_completed(CompletedExecution {
+            lifecycle,
+            output: text.to_owned(),
+            output_available: true,
+            truncated: false,
+            total_bytes: text.len(),
+        })
+        .expect("valid available test output")
+    }
+
+    fn encoded_bound_output(lifecycle: ExecutionLifecycle, text: &str) -> (BoundOutput, Vec<u8>) {
+        let mut output = bound_output(lifecycle, text);
+        let (event, encoded) = encode_event_with_value(output.event).unwrap();
+        output.event = event;
+        (output, encoded)
+    }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum AppendFaultStage {
@@ -1833,7 +2226,7 @@ mod tests {
     #[test]
     fn unavailable_output_is_not_persisted() {
         let completed = CompletedExecution {
-            id: "id".to_owned(),
+            lifecycle: lifecycle("id"),
             output: String::new(),
             output_available: false,
             truncated: false,
@@ -1846,7 +2239,7 @@ mod tests {
     fn only_jsh_compatible_execution_ids_are_persisted() {
         for id in ["local:1", "jsh:1", "contains space", "雪"] {
             let completed = CompletedExecution {
-                id: id.to_owned(),
+                lifecycle: lifecycle(id),
                 output: "output".to_owned(),
                 output_available: true,
                 truncated: false,
@@ -1856,7 +2249,7 @@ mod tests {
         }
 
         let valid = CompletedExecution {
-            id: "jsh-a_b.c-1".to_owned(),
+            lifecycle: lifecycle("jsh-a_b.c-1"),
             output: "output".to_owned(),
             output_available: true,
             truncated: false,
@@ -1888,13 +2281,14 @@ mod tests {
     #[test]
     fn output_event_matches_jsh_envelope() {
         let completed = CompletedExecution {
-            id: "exec-1".to_owned(),
+            lifecycle: lifecycle("exec-1"),
             output: "hi".to_owned(),
             output_available: true,
             truncated: false,
             total_bytes: 2,
         };
-        let value = serde_json::to_value(OutputEvent::from_completed(completed).unwrap()).unwrap();
+        let value =
+            serde_json::to_value(OutputEvent::from_completed(completed).unwrap().event).unwrap();
         assert_eq!(value["jsh_execution_version"], 1);
         assert_eq!(value["event"], "output");
         assert_eq!(value["id"], "exec-1");
@@ -1912,13 +2306,14 @@ mod tests {
         assert_eq!(normalize_output_metadata(2, true, 2), (true, 2));
 
         let event = OutputEvent::from_completed(CompletedExecution {
-            id: "exec-inconsistent".to_owned(),
+            lifecycle: lifecycle("exec-inconsistent"),
             output: "hi".to_owned(),
             output_available: true,
             truncated: false,
             total_bytes: 3,
         })
-        .unwrap();
+        .unwrap()
+        .event;
         assert!(event.truncated);
         assert_eq!(event.total_bytes, 3);
     }
@@ -1928,13 +2323,14 @@ mod tests {
         let output = "界".repeat(MAX_OUTPUT_BYTES);
         let observed = output.len();
         let event = OutputEvent::from_completed(CompletedExecution {
-            id: "exec-large".to_owned(),
+            lifecycle: lifecycle("exec-large"),
             output,
             output_available: true,
             truncated: false,
             total_bytes: 0,
         })
-        .unwrap();
+        .unwrap()
+        .event;
         assert!(event.text.len() <= MAX_OUTPUT_BYTES);
         assert!(event.truncated);
         assert_eq!(event.total_bytes, observed as u64);
@@ -1945,13 +2341,13 @@ mod tests {
         let output = "\0".repeat(MAX_OUTPUT_BYTES);
         let total_bytes = output.len();
         let completed = CompletedExecution {
-            id: "jsh-control-heavy".to_owned(),
+            lifecycle: lifecycle("jsh-control-heavy"),
             output,
             output_available: true,
             truncated: false,
             total_bytes,
         };
-        let encoded = encode_event(OutputEvent::from_completed(completed).unwrap()).unwrap();
+        let encoded = encode_event(OutputEvent::from_completed(completed).unwrap().event).unwrap();
 
         assert!(encoded.len() <= MAX_EVENT_LINE_BYTES + 1);
         assert_eq!(encoded.last(), Some(&b'\n'));
@@ -1969,6 +2365,287 @@ mod tests {
         let records = read_session_history_file(&path, "wanted").unwrap();
         let _ = fs::remove_file(&path);
         assert_eq!(records[0].output.as_ref().unwrap().text, retained_text);
+    }
+
+    #[test]
+    fn bound_output_snapshot_tracks_the_exact_current_start_generation() {
+        let expected_lifecycle = lifecycle("jsh-bound-output");
+        let expected = bound_output(expected_lifecycle.clone(), "captured");
+        let start = lifecycle_start_line(&expected_lifecycle);
+        let inspect = |label: &str, bytes: &[u8], lifecycle: &ExecutionLifecycle| {
+            let directory = TestDir::new(label);
+            let path = directory.0.join("executions.jsonl");
+            write_temporary_journal(&path, bytes);
+            let mut file = open_existing_journal_for_append(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            inspect_bound_output_snapshot(
+                &mut file,
+                len,
+                lifecycle,
+                &expected.event,
+                MAX_JOURNAL_EVENT_LINES,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            inspect("matching-start", &start, &expected_lifecycle),
+            BoundOutputSnapshot::Ready
+        );
+
+        let finish = b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-bound-output\",\"exit_code\":7,\"duration_ms\":2,\"cwd_after\":\"/after\",\"ended_at_ms\":3}\n";
+        let mut finished = start.clone();
+        finished.extend_from_slice(finish);
+        assert_eq!(
+            inspect("finish-before-output", &finished, &expected_lifecycle),
+            BoundOutputSnapshot::Ready,
+            "a late terminal snapshot may follow its own Finish"
+        );
+
+        let replacement = ExecutionLifecycle {
+            id: expected_lifecycle.id.clone(),
+            session_id: "new-session".to_owned(),
+            seq: 2,
+            started_at_ms: 9,
+        };
+        let mut reset = finished.clone();
+        reset.extend_from_slice(&lifecycle_start_line(&replacement));
+        assert_eq!(
+            inspect("restart-stale", &reset, &expected_lifecycle),
+            BoundOutputSnapshot::Rejected,
+            "old PTY bytes must not bind after a same-ID reset"
+        );
+
+        let replacement_expected = bound_output(replacement.clone(), "captured");
+        let directory = TestDir::new("restart-current");
+        let path = directory.0.join("executions.jsonl");
+        write_temporary_journal(&path, &reset);
+        let mut file = open_existing_journal_for_append(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        assert_eq!(
+            inspect_bound_output_snapshot(
+                &mut file,
+                len,
+                &replacement,
+                &replacement_expected.event,
+                MAX_JOURNAL_EVENT_LINES,
+            )
+            .unwrap(),
+            BoundOutputSnapshot::Ready
+        );
+
+        for (label, mut conflicting_start) in [
+            ("session", expected_lifecycle.clone()),
+            ("sequence", expected_lifecycle.clone()),
+            ("generation", expected_lifecycle.clone()),
+        ] {
+            match label {
+                "session" => conflicting_start.session_id = "other".to_owned(),
+                "sequence" => conflicting_start.seq += 1,
+                "generation" => conflicting_start.started_at_ms += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                inspect(
+                    label,
+                    &lifecycle_start_line(&conflicting_start),
+                    &expected_lifecycle
+                ),
+                BoundOutputSnapshot::Rejected,
+                "mismatched {label}"
+            );
+        }
+
+        let mut malformed_barrier = start;
+        malformed_barrier.extend_from_slice(
+            b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-bound-output\",\"extra\":true}\n",
+        );
+        assert_eq!(
+            inspect(
+                "malformed-same-id-barrier",
+                &malformed_barrier,
+                &expected_lifecycle
+            ),
+            BoundOutputSnapshot::Rejected
+        );
+    }
+
+    #[test]
+    fn output_recovery_requires_one_complete_exact_physical_tail() {
+        let lifecycle = lifecycle("jsh-output-recovery");
+        let (expected, encoded) = encoded_bound_output(lifecycle.clone(), "captured");
+        let start = lifecycle_start_line(&lifecycle);
+        let inspect = |label: &str, bytes: &[u8]| {
+            let directory = TestDir::new(label);
+            let path = directory.0.join("executions.jsonl");
+            write_temporary_journal(&path, bytes);
+            let mut file = open_existing_journal_for_append(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            inspect_bound_output_snapshot(
+                &mut file,
+                len,
+                &lifecycle,
+                &expected.event,
+                MAX_JOURNAL_EVENT_LINES,
+            )
+            .unwrap()
+        };
+
+        let mut exact = start.clone();
+        exact.extend_from_slice(&encoded);
+        assert_eq!(
+            inspect("exact-terminal-output", &exact),
+            BoundOutputSnapshot::ExactTerminal
+        );
+
+        let mut duplicate = exact.clone();
+        duplicate.extend_from_slice(&encoded);
+        assert_eq!(
+            inspect("duplicate-output", &duplicate),
+            BoundOutputSnapshot::Rejected
+        );
+
+        let (_, different) = encoded_bound_output(lifecycle.clone(), "different");
+        let mut conflict = start.clone();
+        conflict.extend_from_slice(&different);
+        conflict.extend_from_slice(&encoded);
+        assert_eq!(
+            inspect("conflicting-output", &conflict),
+            BoundOutputSnapshot::Rejected
+        );
+
+        let mut successor = exact.clone();
+        successor.extend_from_slice(
+            b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-output-recovery\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp\",\"ended_at_ms\":2}\n",
+        );
+        assert_eq!(
+            inspect("successor-after-output", &successor),
+            BoundOutputSnapshot::Rejected
+        );
+
+        let mut torn = start;
+        torn.extend_from_slice(&encoded[..encoded.len() / 2]);
+        assert_eq!(
+            inspect("torn-output", &torn),
+            BoundOutputSnapshot::Rejected,
+            "a partial Output is never a safe continuation boundary"
+        );
+    }
+
+    #[test]
+    fn bound_output_append_recovers_barriers_without_rewriting() {
+        let directory = TestDir::new("bound-output-barriers");
+        let path = directory.0.join("executions.jsonl");
+        let lifecycle = lifecycle("jsh-bound-barrier");
+        let start = lifecycle_start_line(&lifecycle);
+        write_temporary_journal(&path, &start);
+        let (output, encoded) = encoded_bound_output(lifecycle.clone(), "captured");
+        let data_fault = FaultingAppendIo::new(AppendFaultStage::DataSync);
+
+        append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &encoded,
+            MAX_JOURNAL_EVENT_LINES,
+            &data_fault,
+            Some(&output),
+        )
+        .unwrap();
+        assert_eq!(data_fault.data_sync_calls.get(), 1);
+        assert_eq!(data_fault.directory_sync_calls.get(), 0);
+        let mut expected_bytes = start;
+        expected_bytes.extend_from_slice(&encoded);
+        assert_eq!(fs::read(&path).unwrap(), expected_bytes);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().count(),
+            2,
+            "barrier recovery must not append Output twice"
+        );
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        assert_eq!(records[0].output.as_ref().unwrap().text, "captured");
+    }
+
+    #[test]
+    fn bound_output_append_rejects_stale_and_torn_state_before_writing() {
+        let directory = TestDir::new("bound-output-rejections");
+        let path = directory.0.join("executions.jsonl");
+        let stale = lifecycle("jsh-stale-output");
+        let current = ExecutionLifecycle {
+            id: stale.id.clone(),
+            session_id: "new-session".to_owned(),
+            seq: 2,
+            started_at_ms: 2,
+        };
+        let current_start = lifecycle_start_line(&current);
+        write_temporary_journal(&path, &current_start);
+        let (stale_output, stale_encoded) = encoded_bound_output(stale, "old bytes");
+        let no_write = FaultingAppendIo::new(AppendFaultStage::DataSync);
+        let error = append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &stale_encoded,
+            MAX_JOURNAL_EVENT_LINES,
+            &no_write,
+            Some(&stale_output),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(no_write.write_calls.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), current_start);
+
+        let (current_output, current_encoded) = encoded_bound_output(current, "new bytes");
+        let mut torn_source = current_start;
+        torn_source.extend_from_slice(&current_encoded[..17]);
+        write_temporary_journal(&path, &torn_source);
+        let error = append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &current_encoded,
+            MAX_JOURNAL_EVENT_LINES,
+            &no_write,
+            Some(&current_output),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(no_write.write_calls.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), torn_source);
+    }
+
+    #[test]
+    fn partial_bound_output_stays_unknown_and_is_never_retried() {
+        let directory = TestDir::new("bound-output-partial");
+        let path = directory.0.join("executions.jsonl");
+        let lifecycle = lifecycle("jsh-partial-output");
+        let start = lifecycle_start_line(&lifecycle);
+        write_temporary_journal(&path, &start);
+        let (output, encoded) = encoded_bound_output(lifecycle, "captured");
+        let zero = FaultingAppendIo::new(AppendFaultStage::WriteAfter(0));
+        let error = append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &encoded,
+            MAX_JOURNAL_EVENT_LINES,
+            &zero,
+            Some(&output),
+        )
+        .unwrap_err();
+        assert!(!is_commit_state_unknown(&error));
+        assert_eq!(zero.written.get(), 0);
+        assert_eq!(zero.data_sync_calls.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), start);
+
+        let partial = FaultingAppendIo::new(AppendFaultStage::WriteAfter(19));
+        let error = append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &encoded,
+            MAX_JOURNAL_EVENT_LINES,
+            &partial,
+            Some(&output),
+        )
+        .unwrap_err();
+        assert!(is_commit_state_unknown(&error));
+        assert_eq!(partial.written.get(), 19);
+        assert_eq!(partial.data_sync_calls.get(), 0);
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..start.len()], start.as_slice());
+        assert!(!bytes.ends_with(b"\n"));
+        assert_eq!(bytes.len(), start.len() + 19);
     }
 
     #[test]

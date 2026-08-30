@@ -74,6 +74,16 @@ v2 is selected only for a peer that has already advertised v2 support.
   `is_valid_jsh_execution_id` exposes the exact 1–192-byte ASCII token grammar
   that correlates jsh lifecycle and output events without narrowing generic
   OSC 133 identifiers used only in a terminal's in-memory timeline.
+  A durable terminal Output additionally requires one complete OSC `C`
+  capability containing the exact `session_id`, `id`, `seq`, and
+  `started_at_ms` Start generation; old or incomplete marks remain valid UI
+  boundaries but cannot reach the journal writer. The asynchronous writer
+  validates that capability against the current authoritative Start while
+  holding the journal's exclusive lock. A reset/restart, existing Output slot,
+  or unterminated physical tail rejects the event before writing. If a complete
+  Output becomes visible but its durability barrier fails, only one unique,
+  exact physical-tail match can retry the barriers; the event itself is never
+  appended again.
   `is_valid_jsh_cwd` gives both channels one exact, nonempty, bounded, visually
   unambiguous cwd identity rule.
   Journal finish and output slots accept exact duplicate delivery idempotently;

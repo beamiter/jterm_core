@@ -34,6 +34,9 @@ pub const MAX_OSC133_CWD_BYTES: usize = 4 * 1024;
 /// other than jsh may use longer opaque correlation ids; journal persistence
 /// independently applies jsh's narrower 192-byte grammar.
 pub const MAX_OSC133_ID_BYTES: usize = 1024;
+/// Maximum decoded persistent-session identity bytes. Unlike display-only
+/// metadata, this must match jsh's exact journal correlation grammar.
+pub const MAX_OSC133_SESSION_ID_BYTES: usize = 128;
 
 /// Which color slot an OSC 10/11/12/4 query asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1073,14 +1076,22 @@ fn emit_dcs_passthrough(payload: &[u8], passthrough: &mut Vec<u8>) {
 /// output with a journal record — while [`crate::execution_journal::submit`]
 /// existed for exactly that.
 ///
-/// Every field is optional: the same mark is emitted by shells that send no
-/// metadata at all, and a field whose encoding is malformed, oversized or not
-/// UTF-8 is dropped rather than guessed at, so a hostile producer degrades the
-/// metadata instead of the mark.
+/// Every field is optional for terminal UI: the same mark is emitted by shells
+/// that send no metadata at all, and a field whose encoding is malformed,
+/// oversized or not UTF-8 is dropped rather than guessed at. Durable Output is
+/// stricter: all four Start identity slots must come from one C packet before
+/// [`crate::execution_journal::ExecutionLifecycle`] can be constructed. D
+/// packets never populate those Start-only slots.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandMeta {
     /// The shell's own execution id — the correlation key into its journal.
     pub id: Option<String>,
+    /// Persistent shell session that owns this execution lifecycle.
+    pub session_id: Option<String>,
+    /// Shell-local sequence number of this exact Start generation.
+    pub seq: Option<u64>,
+    /// Wall-clock identity copied from the matching journal Start.
+    pub started_at_ms: Option<u64>,
     /// The command line as the shell parsed it, not as the screen rendered it.
     pub command: Option<String>,
     /// Working directory the command ran in.
@@ -1101,12 +1112,15 @@ impl CommandMeta {
     /// and has been reading jsh's packets in production; accepting its spellings
     /// means the shared parser cannot understand *less* than the frontend that
     /// already had its own.
-    fn from_fields<'a>(fields: impl Iterator<Item = &'a str>) -> Self {
+    fn from_fields<'a>(fields: impl Iterator<Item = &'a str>, accept_start_identity: bool) -> Self {
         let mut meta = Self::default();
         // Aliases name the same semantic slot. Reject a repeated slot instead
         // of applying last-wins semantics to a journal correlation id,
         // command, cwd, or duration supplied by untrusted PTY output.
         let mut seen_id = false;
+        let mut seen_session_id = false;
+        let mut seen_seq = false;
+        let mut seen_started_at_ms = false;
         let mut seen_command = false;
         let mut seen_cwd = false;
         let mut seen_duration = false;
@@ -1128,6 +1142,37 @@ impl CommandMeta {
                                 .chars()
                                 .any(crate::review_input::is_terminal_visual_spoofing_character)
                     });
+                }
+                "session_id" => {
+                    if !accept_start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_session_id, true) {
+                        meta.session_id = None;
+                        continue;
+                    }
+                    meta.session_id = decode_osc133(value, MAX_OSC133_SESSION_ID_BYTES)
+                        .filter(|id| crate::execution_journal::is_valid_jsh_session_id(id));
+                }
+                "seq" => {
+                    if !accept_start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_seq, true) {
+                        meta.seq = None;
+                        continue;
+                    }
+                    meta.seq = value.parse().ok();
+                }
+                "started_at_ms" => {
+                    if !accept_start_identity {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen_started_at_ms, true) {
+                        meta.started_at_ms = None;
+                        continue;
+                    }
+                    meta.started_at_ms = value.parse().ok();
                 }
                 "cmdline_url" | "command_url" | "command" | "cmdline" => {
                     if std::mem::replace(&mut seen_command, true) {
@@ -1265,13 +1310,15 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
             Some("A") => events.push(ParserEvent::PromptStart),
             Some("B") => events.push(ParserEvent::PromptEnd),
             Some("C") => {
-                events.push(ParserEvent::CommandStart(CommandMeta::from_fields(fields)));
+                events.push(ParserEvent::CommandStart(CommandMeta::from_fields(
+                    fields, true,
+                )));
             }
             Some("D") => {
                 let exit = parse_osc133_exit_status(fields.clone());
                 events.push(ParserEvent::CommandEnd {
                     exit,
-                    meta: CommandMeta::from_fields(fields),
+                    meta: CommandMeta::from_fields(fields, false),
                 });
             }
             _ => {}
@@ -2583,11 +2630,16 @@ mod tests {
     /// either end changes the packet format, this reddens.
     #[test]
     fn osc133_start_decodes_the_packet_jsh_actually_emits() {
-        let event = only_event(b"\x1b]133;C;id=jsh-1;cmd_truncated=1;cwd_url=%2Ftmp\x07");
+        let event = only_event(
+            b"\x1b]133;C;id=jsh-1;session_id=session-1;seq=7;started_at_ms=11;cmd_truncated=1;cwd_url=%2Ftmp\x07",
+        );
         assert_eq!(
             event,
             ParserEvent::CommandStart(CommandMeta {
                 id: Some("jsh-1".to_string()),
+                session_id: Some("session-1".to_string()),
+                seq: Some(7),
+                started_at_ms: Some(11),
                 command: None,
                 cwd: Some("/tmp".to_string()),
                 duration_ms: None,
@@ -2596,6 +2648,120 @@ mod tests {
                 command_truncated: true,
             })
         );
+    }
+
+    #[test]
+    fn osc133_lifecycle_identity_is_complete_order_independent_and_packet_local() {
+        for fields in [
+            "id=jsh-1;session_id=session-1;seq=7;started_at_ms=11",
+            "started_at_ms=11;seq=7;session_id=session-1;id=jsh-1",
+            "seq=7;id=jsh-1;started_at_ms=11;session_id=session-1",
+        ] {
+            let packet = format!("\x1b]133;C;{fields}\x07");
+            let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                panic!("expected CommandStart");
+            };
+            let lifecycle = crate::execution_journal::ExecutionLifecycle::from_command_meta(&meta)
+                .expect("complete jsh lifecycle");
+            assert_eq!(lifecycle.id(), "jsh-1", "fields={fields}");
+            assert_eq!(lifecycle.session_id(), "session-1", "fields={fields}");
+            assert_eq!(lifecycle.seq(), 7, "fields={fields}");
+            assert_eq!(lifecycle.started_at_ms(), 11, "fields={fields}");
+        }
+
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(
+            b"\x1b]133;C;id=jsh-1;session_id=session-1;seq=7;started_at_ms=11\x07\x1b]133;C;id=jsh-2\x07",
+            &mut events,
+        );
+        let ParserEvent::CommandStart(second) = &events[1] else {
+            panic!("expected second CommandStart");
+        };
+        assert_eq!(second.id.as_deref(), Some("jsh-2"));
+        assert_eq!(second.session_id, None);
+        assert_eq!(second.seq, None);
+        assert_eq!(second.started_at_ms, None);
+        assert!(
+            crate::execution_journal::ExecutionLifecycle::from_command_meta(second).is_none(),
+            "one packet must not inherit another packet's identity slots"
+        );
+
+        let ParserEvent::CommandEnd { meta, .. } =
+            only_event(b"\x1b]133;D;0;id=jsh-1;session_id=session-1;seq=7;started_at_ms=11\x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(meta.id.as_deref(), Some("jsh-1"));
+        assert!(
+            crate::execution_journal::ExecutionLifecycle::from_command_meta(&meta).is_none(),
+            "a D packet cannot mint a Start capability"
+        );
+    }
+
+    #[test]
+    fn osc133_lifecycle_identity_rejects_missing_duplicate_alias_and_invalid_slots() {
+        for fields in [
+            "id=jsh-1;session_id=session-1;seq=7",
+            "id=jsh-1;session_id=session-1;started_at_ms=11",
+            "id=jsh-1;seq=7;started_at_ms=11",
+            "session_id=session-1;seq=7;started_at_ms=11",
+            "id=jsh-1;session=session-1;sequence=7;start_time_ms=11",
+            "id=jsh-1;session_id=;seq=7;started_at_ms=11",
+            "id=jsh-1;session_id=bad%2Fsession;seq=7;started_at_ms=11",
+            "id=jsh-1;session_id=session-1;seq=-1;started_at_ms=11",
+            "id=jsh-1;session_id=session-1;seq=%207;started_at_ms=11",
+            "id=jsh-1;session_id=session-1;seq=7;started_at_ms=18446744073709551616",
+        ] {
+            let packet = format!("\x1b]133;C;{fields}\x07");
+            let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                panic!("expected CommandStart");
+            };
+            assert!(
+                crate::execution_journal::ExecutionLifecycle::from_command_meta(&meta).is_none(),
+                "fields={fields}"
+            );
+        }
+
+        for duplicate in [
+            "id=jsh-1;id=jsh-1;session_id=session-1;seq=7;started_at_ms=11",
+            "id=jsh-1;session_id=session-1;session_id=session-1;seq=7;started_at_ms=11",
+            "id=jsh-1;session_id=session-1;seq=7;seq=7;started_at_ms=11",
+            "id=jsh-1;session_id=session-1;seq=7;started_at_ms=11;started_at_ms=11",
+        ] {
+            let packet = format!("\x1b]133;C;{duplicate}\x07");
+            let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                panic!("expected CommandStart");
+            };
+            assert!(
+                crate::execution_journal::ExecutionLifecycle::from_command_meta(&meta).is_none(),
+                "duplicate={duplicate}"
+            );
+        }
+
+        let maximum_session = "s".repeat(MAX_OSC133_SESSION_ID_BYTES);
+        let packet = format!(
+            "\x1b]133;C;id=jsh-1;session_id={maximum_session};seq={};started_at_ms={}\x07",
+            u64::MAX,
+            u64::MAX
+        );
+        let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+            panic!("expected CommandStart");
+        };
+        let lifecycle = crate::execution_journal::ExecutionLifecycle::from_command_meta(&meta)
+            .expect("exact maxima remain valid");
+        assert_eq!(lifecycle.session_id(), maximum_session);
+        assert_eq!(lifecycle.seq(), u64::MAX);
+        assert_eq!(lifecycle.started_at_ms(), u64::MAX);
+
+        let oversized_session = "s".repeat(MAX_OSC133_SESSION_ID_BYTES + 1);
+        let packet = format!(
+            "\x1b]133;C;id=jsh-1;session_id={oversized_session};seq=7;started_at_ms=11\x07"
+        );
+        let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+            panic!("expected CommandStart");
+        };
+        assert!(crate::execution_journal::ExecutionLifecycle::from_command_meta(&meta).is_none());
     }
 
     #[test]
@@ -2608,6 +2774,9 @@ mod tests {
                 exit: Some(127),
                 meta: CommandMeta {
                     id: Some("jsh-2".to_string()),
+                    session_id: None,
+                    seq: None,
+                    started_at_ms: None,
                     command: None,
                     // `;` is percent-escaped by jsh precisely so it cannot forge
                     // a field boundary; it must come back as data.
