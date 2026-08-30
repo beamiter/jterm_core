@@ -84,6 +84,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   including an invalid Start barrier. Unknown event kinds remain skippable for
   forward compatibility, but known v1 events reject extra members so an
   injected identity or session hint cannot alter lifecycle correlation.
+  Decoded-key duplicates and simultaneous canonical/legacy version names are
+  invalid envelopes, while future versions of known event kinds remain
+  forward-compatible non-barriers and cannot select v1 lifecycle state.
   A recognized v1 start with a valid execution id retires that id's prior
   lifecycle before its remaining fields are decoded strictly, so an invalid
   replacement cannot redirect later finish/output events back to stale state;

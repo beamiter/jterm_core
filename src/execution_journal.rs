@@ -2177,6 +2177,48 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_envelopes_and_future_known_kinds_never_select_v1_state() {
+        let path = temporary_journal("ambiguous-event-envelopes");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"stable\",\"exit_code\":9,\"duration_ms\":2,\"cwd_after\":\"/old-after\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"stable\",\"text\":\"old output\",\"truncated\":false,\"total_bytes\":10,\"captured_at_ms\":4}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"\\u0065vent\":\"finish\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":10,\"command\":\"duplicate kind\",\"cwd\":\"/new\",\"started_at_ms\":10}\n",
+            "{\"jsh_execution_version\":1,\"jsh_execution_\\u0076ersion\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":11,\"command\":\"duplicate version\",\"cwd\":\"/new\",\"started_at_ms\":11}\n",
+            "{\"jsh_execution_version\":2,\"rsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":12,\"command\":\"alias last v1\",\"cwd\":\"/new\",\"started_at_ms\":12}\n",
+            "{\"rsh_execution_version\":1,\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":13,\"command\":\"alias first v1\",\"cwd\":\"/new\",\"started_at_ms\":13}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"\\u0069d\":\"other\",\"session_id\":\"wanted\",\"seq\":14,\"command\":\"duplicate id\",\"cwd\":\"/new\",\"started_at_ms\":14}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"\\u0073ession_id\":\"other\",\"seq\":15,\"command\":\"duplicate session\",\"cwd\":\"/new\",\"started_at_ms\":15}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"other\",\"\\u0069d\":\"stable\",\"exit_code\":70,\"duration_ms\":70,\"cwd_after\":\"/wrong\",\"ended_at_ms\":70}\n",
+            "{\"jsh_execution_version\":2,\"rsh_execution_version\":1,\"event\":\"finish\",\"id\":\"stable\",\"exit_code\":71,\"duration_ms\":71,\"cwd_after\":\"/wrong\",\"ended_at_ms\":71}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"other\",\"\\u0069d\":\"stable\",\"text\":\"duplicate id output\",\"truncated\":false,\"total_bytes\":19,\"captured_at_ms\":72}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"stable\",\"session_id\":\"wanted\",\"seq\":20,\"command\":\"future start\",\"cwd\":\"/future\",\"started_at_ms\":20}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"finish\",\"id\":\"stable\",\"exit_code\":72,\"duration_ms\":72,\"cwd_after\":\"/future\",\"ended_at_ms\":72}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"output\",\"id\":\"stable\",\"text\":\"future output\",\"truncated\":false,\"total_bytes\":13,\"captured_at_ms\":73}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "stable");
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[0].command, "old");
+        assert_eq!(records[0].cwd, "/old");
+        assert_eq!(records[0].exit_code, Some(9));
+        assert_eq!(records[0].duration_ms, Some(2));
+        assert_eq!(records[0].cwd_after.as_deref(), Some("/old-after"));
+        assert_eq!(
+            records[0]
+                .output
+                .as_ref()
+                .map(|output| output.text.as_str()),
+            Some("old output")
+        );
+    }
+
+    #[test]
     fn unknown_additive_events_never_accumulate_state_at_raw_boundaries() {
         let path = temporary_journal("unknown-additive-boundaries");
         let mut journal = b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n".to_vec();
