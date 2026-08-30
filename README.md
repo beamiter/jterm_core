@@ -60,6 +60,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   because the journal and its fixed `executions.lock` sidecar form one trust
   boundary. The journal file itself cannot use that reserved sidecar name
   (including case aliases on case-insensitive filesystems).
+  `is_valid_jsh_execution_id` exposes the exact 1–192-byte ASCII token grammar
+  that correlates jsh lifecycle and output events without narrowing generic
+  OSC 133 identifiers used only in a terminal's in-memory timeline.
   `is_valid_jsh_cwd` gives both channels one exact, nonempty, bounded, visually
   unambiguous cwd identity rule.
   OSC metadata that claims a command is truncated (or encodes that disclosure

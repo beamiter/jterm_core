@@ -211,7 +211,7 @@ impl OutputEvent {
         // Bare FinalTerm markers receive terminal-local ids so the timeline
         // still works, but there is no matching jsh start/finish lifecycle to
         // correlate on disk.
-        if !completed.output_available || !valid_jsh_execution_id(&completed.id) {
+        if !completed.output_available || !is_valid_jsh_execution_id(&completed.id) {
             return None;
         }
         let observed_bytes = completed.output.len();
@@ -810,7 +810,7 @@ fn read_session_history_file(
                 started_at_ms,
                 ..
             } => {
-                if !valid_jsh_execution_id(&id)
+                if !is_valid_jsh_execution_id(&id)
                     || event_session_id
                         .as_deref()
                         .is_some_and(|id| !valid_jsh_session_id(id))
@@ -864,7 +864,7 @@ fn read_session_history_file(
                 ended_at_ms,
                 ..
             } => {
-                if !valid_jsh_execution_id(&id) || !is_valid_jsh_cwd(&cwd_after) {
+                if !is_valid_jsh_execution_id(&id) || !is_valid_jsh_cwd(&cwd_after) {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
@@ -882,7 +882,7 @@ fn read_session_history_file(
                 captured_at_ms,
                 ..
             } => {
-                if !valid_jsh_execution_id(&id) || text.len() > MAX_OUTPUT_BYTES {
+                if !is_valid_jsh_execution_id(&id) || text.len() > MAX_OUTPUT_BYTES {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
@@ -1030,10 +1030,12 @@ fn journal_append_within_bound(current_bytes: u64, event_bytes: usize) -> bool {
         <= MAX_JOURNAL_READ_BYTES
 }
 
-/// Match jsh's public execution-id grammar. Generic FinalTerm producers still
-/// get the in-memory timeline, but their unrelated IDs must not add orphan
-/// output events to jsh's journal.
-fn valid_jsh_execution_id(id: &str) -> bool {
+/// Whether an execution id can correlate jsh's OSC lifecycle with its journal.
+///
+/// Generic FinalTerm producers may use broader opaque IDs in the in-memory
+/// timeline, but only this exact ASCII token grammar identifies jsh's durable
+/// lifecycle and output events.
+pub fn is_valid_jsh_execution_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_EXECUTION_ID_BYTES
         && id
@@ -1252,6 +1254,26 @@ mod tests {
             total_bytes: 6,
         };
         assert!(OutputEvent::from_completed(valid).is_some());
+    }
+
+    #[test]
+    fn jsh_execution_id_validation_matches_the_public_grammar() {
+        for valid in [
+            "jsh-a_b.c-1".to_string(),
+            "x".repeat(MAX_EXECUTION_ID_BYTES),
+        ] {
+            assert!(is_valid_jsh_execution_id(&valid), "id={valid:?}");
+        }
+        for invalid in [
+            String::new(),
+            "x".repeat(MAX_EXECUTION_ID_BYTES + 1),
+            "jsh:1".to_string(),
+            "has space".to_string(),
+            "line\nbreak".to_string(),
+            "雪".to_string(),
+        ] {
+            assert!(!is_valid_jsh_execution_id(&invalid), "id={invalid:?}");
+        }
     }
 
     #[test]
