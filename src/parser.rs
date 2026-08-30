@@ -1298,12 +1298,7 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     // forward delimiters or invisible formatting into semantic-history state.
     // OSC 7 remains the canonical encoded cwd signal used by jsh.
     if let Some(path) = s.strip_prefix("1337;CurrentDir=") {
-        if path.is_empty()
-            || path.len() > MAX_OSC133_CWD_BYTES
-            || path.chars().any(char::is_control)
-            || path.contains(';')
-            || crate::review_input::contains_visual_spoofing(path)
-        {
+        if path.contains(';') || !crate::execution_journal::is_valid_jsh_cwd(path) {
             return;
         }
     }
@@ -2841,6 +2836,10 @@ mod tests {
             "\x1b]1337;CurrentDir=/tmp/left\u{202e}right\x07".as_bytes(),
             &mut events,
         );
+        for hidden in ['\u{fff9}', '\u{fffa}', '\u{fffb}'] {
+            let frame = format!("\x1b]1337;CurrentDir=/tmp/left{hidden}right\x07");
+            parser.feed(frame.as_bytes(), &mut events);
+        }
         parser.feed(
             b"\x1b]1337;CurrentDir=/tmp/a;RemoteHost=evil\x07",
             &mut events,
