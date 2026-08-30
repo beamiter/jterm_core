@@ -52,9 +52,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   process-group lifecycle management, and restorable-command quoting.
 - Private atomic snapshots, command history, jsh execution journals, pane
   layouts, Git metadata, notifications, and host/Flatpak command routing. The
-  journal v1 version and byte/record ceilings are public, and its reader keeps
-  jsh's JSON-escaped multiline commands plus the pre-rename version alias so
-  migrated shell history and live OSC metadata resolve identically.
+  journal v1 version and byte/event/record ceilings are public, and its reader
+  keeps jsh's JSON-escaped multiline commands plus the pre-rename version alias
+  so migrated shell history and live OSC metadata resolve identically.
   A custom journal override must use a directory owned by the current user and
   not writable by group or other; shared namespaces such as `/tmp` are refused
   because the journal and its fixed `executions.lock` sidecar form one trust

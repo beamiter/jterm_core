@@ -42,6 +42,12 @@ const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
 const JOURNAL_LOCK_FILE_NAME: &str = "executions.lock";
 /// Size at which jsh compacts its append-only journal.
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum physical JSONL records inspected during one journal read.
+///
+/// This is above the number of shortest recognized v1 events that fit in the
+/// byte window, so conforming journals remain governed by the byte ceiling.
+/// It separately bounds CPU spent rejecting empty or malformed short lines.
+pub const MAX_JOURNAL_EVENT_LINES: usize = 512 * 1024;
 /// Maximum folded execution records retained by either reader.
 pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
 // jsh compacts after its own event. jterm's correlated output can be the next
@@ -817,6 +823,14 @@ fn read_session_history_file(
     path: &std::path::Path,
     session_id: &str,
 ) -> io::Result<Vec<PersistedExecution>> {
+    read_session_history_file_with_line_limit(path, session_id, MAX_JOURNAL_EVENT_LINES)
+}
+
+fn read_session_history_file_with_line_limit(
+    path: &std::path::Path,
+    session_id: &str,
+    max_event_lines: usize,
+) -> io::Result<Vec<PersistedExecution>> {
     let file = open_journal_for_read(path)?;
     if file.metadata()?.len() > MAX_JOURNAL_READ_BYTES {
         return Err(io::Error::new(
@@ -836,7 +850,20 @@ fn read_session_history_file(
     let read_limit = MAX_JOURNAL_READ_BYTES.saturating_add(1);
     let mut reader = BufReader::new(file.take(read_limit));
     let mut line = Vec::new();
+    let mut event_lines = 0usize;
     while let Some(within_limit) = read_bounded_line(&mut reader, &mut line)? {
+        event_lines = event_lines.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "jsh execution journal event count overflowed",
+            )
+        })?;
+        if event_lines > max_event_lines {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "jsh execution journal exceeds its event-count limit",
+            ));
+        }
         if !within_limit {
             continue;
         }
@@ -1830,6 +1857,7 @@ mod tests {
         assert_eq!(MAX_CWD_BYTES, 4 * 1024);
         assert_eq!(MAX_OUTPUT_BYTES, 256 * 1024);
         assert_eq!(MAX_JOURNAL_FILE_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_JOURNAL_EVENT_LINES, 512 * 1024);
         assert_eq!(MAX_RETAINED_EXECUTIONS, 2_000);
         assert_eq!(MAX_JSH_SESSION_ID_BYTES, 128);
 
@@ -1859,6 +1887,29 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "after-large");
+    }
+
+    #[test]
+    fn history_reader_rejects_excess_event_lines_before_parsing_them() {
+        let path = temporary_journal("event-count-limit");
+        let accepted = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"bounded\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}\n"
+        );
+        write_temporary_journal(&path, accepted);
+        let records = read_session_history_file_with_line_limit(&path, "wanted", 2).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].exit_code, Some(0));
+
+        let over_limit = format!(
+            "{accepted}{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"unexpected\":true}}\n"
+        );
+        write_temporary_journal(&path, over_limit);
+        let error = read_session_history_file_with_line_limit(&path, "wanted", 2).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("event-count limit"));
     }
 
     #[test]
