@@ -1347,6 +1347,38 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    fn start_event_with_raw_bytes(id: &str, raw_bytes: usize) -> Vec<u8> {
+        let prefix = format!(
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"{id}\",\"session_id\":\"wanted\",\"seq\":9,\"command\":\""
+        );
+        let suffix = b"\",\"cwd\":\"/new\",\"started_at_ms\":9}";
+        assert!(raw_bytes >= prefix.len() + suffix.len());
+        let mut event = prefix.into_bytes();
+        event.resize(raw_bytes - suffix.len(), b'x');
+        event.extend_from_slice(suffix);
+        assert_eq!(event.len(), raw_bytes);
+        assert!(serde_json::from_slice::<serde_json::Value>(&event).is_ok());
+        event
+    }
+
+    fn escaped_multibyte_output_event(id: &str, decoded_bytes: usize) -> Vec<u8> {
+        let mut event = format!(
+            "{{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"{id}\",\"text\":\""
+        )
+        .into_bytes();
+        for _ in 0..decoded_bytes / "界".len() {
+            event.extend_from_slice(br"\u754c");
+        }
+        event.resize(event.len() + decoded_bytes % "界".len(), b'x');
+        event.extend_from_slice(
+            format!(
+                "\",\"truncated\":false,\"total_bytes\":{decoded_bytes},\"captured_at_ms\":2}}"
+            )
+            .as_bytes(),
+        );
+        event
+    }
+
     #[test]
     fn unavailable_output_is_not_persisted() {
         let completed = CompletedExecution {
@@ -1477,6 +1509,81 @@ mod tests {
         assert_eq!(value["truncated"], true);
         assert_eq!(value["total_bytes"], total_bytes as u64);
         assert!(value["text"].as_str().unwrap().len() <= MAX_OUTPUT_BYTES / 2);
+
+        let retained_text = value["text"].as_str().unwrap().to_owned();
+        let path = temporary_journal("control-heavy-round-trip");
+        let mut journal = b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-control-heavy\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n".to_vec();
+        journal.extend_from_slice(&encoded);
+        write_temporary_journal(&path, journal);
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(records[0].output.as_ref().unwrap().text, retained_text);
+    }
+
+    #[test]
+    fn raw_line_budget_precedes_start_barrier_semantics() {
+        let path = temporary_journal("raw-line-before-barrier");
+        let mut journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"raw-exact\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"raw-exact\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/old\",\"ended_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"raw-over\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"old\",\"cwd\":\"/old\",\"started_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"raw-over\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/old\",\"ended_at_ms\":3}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        journal.extend_from_slice(&start_event_with_raw_bytes(
+            "raw-exact",
+            MAX_EVENT_LINE_BYTES,
+        ));
+        journal.push(b'\n');
+        journal.extend_from_slice(&start_event_with_raw_bytes(
+            "raw-over",
+            MAX_EVENT_LINE_BYTES + 1,
+        ));
+        journal.push(b'\n');
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "raw-over");
+        assert_eq!(records[0].command, "old");
+        assert_eq!(records[0].exit_code, Some(9));
+    }
+
+    #[test]
+    fn decoded_utf8_budget_is_charged_after_json_unescaping() {
+        let path = temporary_journal("decoded-utf8-budget");
+        let mut journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"decoded-exact\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"decoded-over\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":2}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        journal.extend_from_slice(&escaped_multibyte_output_event(
+            "decoded-exact",
+            MAX_OUTPUT_BYTES,
+        ));
+        journal.push(b'\n');
+        journal.extend_from_slice(&escaped_multibyte_output_event(
+            "decoded-over",
+            MAX_OUTPUT_BYTES + 1,
+        ));
+        journal.push(b'\n');
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, "decoded-exact");
+        assert_eq!(
+            records[0].output.as_ref().unwrap().text.len(),
+            MAX_OUTPUT_BYTES
+        );
+        assert_eq!(records[1].id, "decoded-over");
+        assert_eq!(records[1].output, None);
     }
 
     #[test]
