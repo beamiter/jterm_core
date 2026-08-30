@@ -58,7 +58,8 @@ v2 is selected only for a peer that has already advertised v2 support.
   A custom journal override must use a directory owned by the current user and
   not writable by group or other; shared namespaces such as `/tmp` are refused
   because the journal and its fixed `executions.lock` sidecar form one trust
-  boundary.
+  boundary. The journal file itself cannot use that reserved sidecar name
+  (including case aliases on case-insensitive filesystems).
   `is_valid_jsh_cwd` gives both channels one exact, nonempty, bounded, visually
   unambiguous cwd identity rule.
   OSC metadata that claims a command is truncated (or encodes that disclosure

@@ -38,6 +38,7 @@ pub const MAX_CWD_BYTES: usize = 4 * 1024;
 /// Maximum retained UTF-8 bytes in one terminal-output snapshot.
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
+const JOURNAL_LOCK_FILE_NAME: &str = "executions.lock";
 /// Size at which jsh compacts its append-only journal.
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum folded execution records retained by either reader.
@@ -436,10 +437,19 @@ fn journal_path() -> io::Result<(PathBuf, bool)> {
 }
 
 fn validate_journal_path(path: &Path) -> io::Result<()> {
-    if path.file_name().is_none() {
+    let Some(file_name) = path.file_name() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "execution journal path has no file name",
+        ));
+    };
+    if file_name
+        .to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(JOURNAL_LOCK_FILE_NAME))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution journal path collides with its lock sidecar",
         ));
     }
     #[cfg(unix)]
@@ -747,7 +757,7 @@ fn read_session_history(session_id: &str) -> io::Result<Vec<PersistedExecution>>
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
-    let lock_path = dir.join("executions.lock");
+    let lock_path = dir.join(JOURNAL_LOCK_FILE_NAME);
     let _lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Shared, !custom_path)?;
 
     match read_session_history_file(&path, session_id) {
@@ -980,7 +990,7 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
     let dir = journal_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
-    let lock_path = dir.join("executions.lock");
+    let lock_path = dir.join(JOURNAL_LOCK_FILE_NAME);
 
     let lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Exclusive, false)?;
 
@@ -1579,6 +1589,18 @@ mod tests {
     #[test]
     fn journal_paths_are_bounded_and_safe_to_report() {
         assert!(validate_journal_path(Path::new("executions.jsonl")).is_ok());
+        assert!(validate_journal_path(Path::new("executions.locked")).is_ok());
+        for reserved in [
+            "executions.lock",
+            "/tmp/executions.lock",
+            "/tmp/./executions.lock",
+            "/tmp/EXECUTIONS.LOCK",
+        ] {
+            assert!(
+                validate_journal_path(Path::new(reserved)).is_err(),
+                "accepted reserved lock alias {reserved:?}"
+            );
+        }
         assert!(validate_journal_path(Path::new("bad\nname.jsonl")).is_err());
         assert!(validate_journal_path(Path::new("bad\u{0080}name.jsonl")).is_err());
         assert!(validate_journal_path(Path::new("bad\u{202e}name.jsonl")).is_err());
