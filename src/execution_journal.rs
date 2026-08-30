@@ -743,7 +743,7 @@ fn read_session_history_file(
                     || event_session_id
                         .as_deref()
                         .is_some_and(|id| !valid_jsh_session_id(id))
-                    || !valid_command_text(&command)
+                    || !is_valid_jsh_command(&command)
                     || !is_valid_jsh_cwd(&cwd)
                 {
                     continue;
@@ -977,7 +977,13 @@ fn valid_jsh_session_id(id: &str) -> bool {
     is_valid_jsh_session_id(id)
 }
 
-fn valid_command_text(command: &str) -> bool {
+/// Whether command text matches the exact metadata contract emitted by jsh.
+///
+/// The generic review validator intentionally permits the assigned interlinear
+/// annotation controls U+FFF9..=U+FFFB. jsh's terminal renderer rejects them
+/// because they remain invisible there, so its OSC and journal consumers must
+/// apply that narrower protocol contract too.
+pub(crate) fn is_valid_jsh_command(command: &str) -> bool {
     !command.is_empty()
         && command.len() <= MAX_COMMAND_BYTES
         // jsh commands are structurally multiline. Preserve newline and tab,
@@ -987,6 +993,7 @@ fn valid_command_text(command: &str) -> bool {
             .chars()
             .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
         && !crate::review_input::contains_noncontrol_visual_spoofing(command)
+        && !contains_jsh_terminal_only_invisible(command)
 }
 
 /// Whether a cwd can identify the same directory across jsh's OSC and journal
@@ -996,6 +1003,11 @@ pub fn is_valid_jsh_cwd(cwd: &str) -> bool {
         && cwd.len() <= MAX_CWD_BYTES
         && !cwd.chars().any(char::is_control)
         && !crate::review_input::contains_visual_spoofing(cwd)
+        && !contains_jsh_terminal_only_invisible(cwd)
+}
+
+fn contains_jsh_terminal_only_invisible(text: &str) -> bool {
+    text.chars().any(|ch| matches!(ch, '\u{fff9}'..='\u{fffb}'))
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {
@@ -1255,10 +1267,13 @@ mod tests {
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bad-command\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"echo\\nrun\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bad-cwd\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"true\",\"cwd\":\"/tmp/SPOOFhidden\",\"started_at_ms\":2}\n",
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"safe\",\"session_id\":\"wanted\",\"seq\":3,\"command\":\"printf hi\",\"cwd\":\"/tmp/a b\",\"started_at_ms\":3}\n",
-            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"safe\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp/SPACEhidden\",\"ended_at_ms\":4}\n"
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"safe\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp/SPACEhidden\",\"ended_at_ms\":4}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-hidden-command\",\"session_id\":\"wanted\",\"seq\":4,\"command\":\"echoANCHORhidden\",\"cwd\":\"/tmp\",\"started_at_ms\":5}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-hidden-cwd\",\"session_id\":\"wanted\",\"seq\":5,\"command\":\"true\",\"cwd\":\"/tmp/ANCHORhidden\",\"started_at_ms\":6}\n"
         )
         .replace("SPOOF", "\u{202e}")
-        .replace("SPACE", "\u{00a0}");
+        .replace("SPACE", "\u{00a0}")
+        .replace("ANCHOR", "\u{fff9}");
         write_temporary_journal(&path, journal);
 
         let records = read_session_history_file(&path, "wanted").unwrap();

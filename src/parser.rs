@@ -1132,12 +1132,8 @@ impl CommandMeta {
                         meta.command = None;
                         continue;
                     }
-                    meta.command = decode_osc133(value, MAX_OSC133_COMMAND_BYTES).filter(|text| {
-                        !text
-                            .chars()
-                            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-                            && !crate::review_input::contains_noncontrol_visual_spoofing(text)
-                    });
+                    meta.command = decode_osc133(value, MAX_OSC133_COMMAND_BYTES)
+                        .filter(|text| crate::execution_journal::is_valid_jsh_command(text));
                 }
                 "cwd_url" | "cwd" => {
                     if std::mem::replace(&mut seen_cwd, true) {
@@ -2705,6 +2701,28 @@ mod tests {
         assert_eq!(exit, Some(0));
         assert_eq!(meta.id.as_deref(), Some("jsh-4"));
         assert_eq!(meta.cwd, None);
+    }
+
+    #[test]
+    fn osc133_refuses_empty_or_jsh_invisible_command_metadata() {
+        let ParserEvent::CommandStart(meta) = only_event(b"\x1b]133;C;id=jsh-4;cmdline_url=\x07")
+        else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(meta.id.as_deref(), Some("jsh-4"));
+        assert_eq!(meta.command, None);
+
+        for hidden in ['\u{fff9}', '\u{fffa}', '\u{fffb}'] {
+            let packet = format!(
+                "\x1b]133;C;id=jsh-4;cmdline_url=echo{hidden}hidden;cwd_url=/tmp/{hidden}hidden\x07"
+            );
+            let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                panic!("expected CommandStart");
+            };
+            assert_eq!(meta.id.as_deref(), Some("jsh-4"));
+            assert_eq!(meta.command, None, "accepted U+{:04X}", u32::from(hidden));
+            assert_eq!(meta.cwd, None, "accepted U+{:04X}", u32::from(hidden));
+        }
     }
 
     #[test]
