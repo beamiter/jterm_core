@@ -1220,6 +1220,37 @@ fn valid_remote_session_id(id: &str) -> bool {
     crate::execution_journal::is_valid_jsh_session_id(id)
 }
 
+/// Decode the one outcome slot supported by the family's OSC 133 D packets.
+///
+/// FinalTerm places it positionally, while existing family integrations also
+/// use one of three named spellings. An attempted second slot is ambiguous even
+/// if either value is malformed, so it cannot leave an apparently authoritative
+/// success or failure behind.
+fn parse_osc133_exit_status<'a>(fields: impl Iterator<Item = &'a str>) -> Option<i32> {
+    let mut seen = false;
+    let mut parsed = None;
+    for field in fields {
+        let candidate = match field.split_once('=') {
+            Some(("exit" | "exit_code" | "exit_status", value)) => {
+                Some(value.trim().parse::<i32>().ok())
+            }
+            Some(_) => None,
+            // Unknown bare extension flags are not outcome slots. A numeric
+            // bare field is the portable positional status wherever Ember's
+            // established decoder already accepts it.
+            None => field.trim().parse::<i32>().ok().map(Some),
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        if std::mem::replace(&mut seen, true) {
+            return None;
+        }
+        parsed = candidate;
+    }
+    parsed
+}
+
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     let s = match std::str::from_utf8(payload) {
         Ok(s) => s,
@@ -1236,19 +1267,10 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
                 events.push(ParserEvent::CommandStart(CommandMeta::from_fields(fields)));
             }
             Some("D") => {
-                // The exit status is positional and comes first, but a shell may
-                // omit it and send only `key=value` metadata, so a field that
-                // carries an `=` is metadata rather than an unparseable status.
-                let mut rest = fields.peekable();
-                let exit = match rest.peek() {
-                    Some(field) if !field.contains('=') => {
-                        rest.next().and_then(|field| field.parse::<i32>().ok())
-                    }
-                    _ => None,
-                };
+                let exit = parse_osc133_exit_status(fields.clone());
                 events.push(ParserEvent::CommandEnd {
                     exit,
-                    meta: CommandMeta::from_fields(rest),
+                    meta: CommandMeta::from_fields(fields),
                 });
             }
             _ => {}
@@ -2594,6 +2616,89 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn osc133_end_accepts_each_family_exit_status_spelling() {
+        for key in ["exit", "exit_code", "exit_status"] {
+            let packet = format!("\x1b]133;D;{key}=7;id=jsh-2;duration_ms=42;cwd_url=%2Ftmp\x07");
+            let ParserEvent::CommandEnd { exit, meta } = only_event(packet.as_bytes()) else {
+                panic!("expected CommandEnd");
+            };
+            assert_eq!(exit, Some(7), "key={key}");
+            assert_eq!(meta.id.as_deref(), Some("jsh-2"), "key={key}");
+            assert_eq!(meta.duration_ms, Some(42), "key={key}");
+            assert_eq!(meta.cwd.as_deref(), Some("/tmp"), "key={key}");
+        }
+
+        let ParserEvent::CommandEnd { exit, meta } =
+            only_event(b"\x1b]133;D;id=jsh-2;7;duration_ms=42\x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(exit, Some(7));
+        assert_eq!(meta.id.as_deref(), Some("jsh-2"));
+        assert_eq!(meta.duration_ms, Some(42));
+
+        let ParserEvent::CommandEnd { exit, .. } =
+            only_event(b"\x1b]133;D;unknown-extension;exit_code=%20;exit_status=7\x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(
+            exit, None,
+            "two explicit aliases stay ambiguous even when one is malformed"
+        );
+
+        let ParserEvent::CommandEnd { exit, .. } =
+            only_event(b"\x1b]133;D;unknown-extension;exit_code=%207%20\x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(exit, None, "numeric fields are not percent-decoded");
+
+        let ParserEvent::CommandEnd { exit, .. } =
+            only_event(b"\x1b]133;D;unknown-extension;exit_code= 7 \x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(exit, Some(7));
+    }
+
+    #[test]
+    fn osc133_repeated_exit_status_slots_degrade_only_the_outcome() {
+        for fields in [
+            "0;7",
+            "0;exit=7",
+            "exit=0;exit_code=7",
+            "exit_code=0;exit_status=7",
+            "exit_status=0;7",
+        ] {
+            let packet = format!("\x1b]133;D;{fields};id=jsh-2;duration_ms=42;cwd_url=%2Ftmp\x07");
+            let ParserEvent::CommandEnd { exit, meta } = only_event(packet.as_bytes()) else {
+                panic!("expected CommandEnd");
+            };
+            assert_eq!(exit, None, "fields={fields}");
+            assert_eq!(meta.id.as_deref(), Some("jsh-2"), "fields={fields}");
+            assert_eq!(meta.duration_ms, Some(42), "fields={fields}");
+            assert_eq!(meta.cwd.as_deref(), Some("/tmp"), "fields={fields}");
+        }
+
+        let ParserEvent::CommandEnd { exit, meta } =
+            only_event(b"\x1b]133;D;exit_code=not-a-number;id=jsh-2;duration_ms=42\x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(exit, None);
+        assert_eq!(meta.id.as_deref(), Some("jsh-2"));
+        assert_eq!(meta.duration_ms, Some(42));
+
+        let ParserEvent::CommandEnd { exit, .. } =
+            only_event(b"\x1b]133;D;0;unknown-extension;id=jsh-2\x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(exit, Some(0), "an unknown bare extension is not a status");
     }
 
     #[test]

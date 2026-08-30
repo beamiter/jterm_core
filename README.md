@@ -68,6 +68,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   OSC metadata that claims a command is truncated (or encodes that disclosure
   ambiguously) never enters the exact-command slot, even if a producer also
   supplies a partial command field.
+  Command-end outcomes accept FinalTerm's positional status and the family's
+  `exit`, `exit_code`, and `exit_status` aliases; repeated outcome slots degrade
+  only that status to unknown while independent metadata survives.
   `bounded_json::validate_no_duplicate_members` re-exports jagent's wire
   preflight and gives bounded credential, IPC, and persistence decoders one
   allocation-light recursive preflight, so escaped or plain duplicate object
