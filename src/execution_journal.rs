@@ -744,7 +744,7 @@ fn read_session_history_file(
                         .as_deref()
                         .is_some_and(|id| !valid_jsh_session_id(id))
                     || !valid_command_text(&command)
-                    || !valid_cwd_text(&cwd)
+                    || !is_valid_jsh_cwd(&cwd)
                 {
                     continue;
                 }
@@ -790,7 +790,7 @@ fn read_session_history_file(
                 ended_at_ms,
                 ..
             } => {
-                if !valid_jsh_execution_id(&id) || !valid_cwd_text(&cwd_after) {
+                if !valid_jsh_execution_id(&id) || !is_valid_jsh_cwd(&cwd_after) {
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
@@ -989,7 +989,9 @@ fn valid_command_text(command: &str) -> bool {
         && !crate::review_input::contains_noncontrol_visual_spoofing(command)
 }
 
-fn valid_cwd_text(cwd: &str) -> bool {
+/// Whether a cwd can identify the same directory across jsh's OSC and journal
+/// channels without truncation, terminal controls, or visual ambiguity.
+pub fn is_valid_jsh_cwd(cwd: &str) -> bool {
     !cwd.is_empty()
         && cwd.len() <= MAX_CWD_BYTES
         && !cwd.chars().any(char::is_control)
@@ -1304,6 +1306,17 @@ mod tests {
         assert_eq!(MAX_JOURNAL_FILE_BYTES, 32 * 1024 * 1024);
         assert_eq!(MAX_RETAINED_EXECUTIONS, 2_000);
         assert_eq!(MAX_JSH_SESSION_ID_BYTES, 128);
+
+        assert!(is_valid_jsh_cwd("/home/u/my project/雪"));
+        assert!(is_valid_jsh_cwd(&"x".repeat(MAX_CWD_BYTES)));
+        for invalid in [
+            String::new(),
+            "x".repeat(MAX_CWD_BYTES + 1),
+            "/tmp/line\nbreak".to_string(),
+            "/tmp/left\u{202e}right".to_string(),
+        ] {
+            assert!(!is_valid_jsh_cwd(&invalid), "cwd={invalid:?}");
+        }
     }
 
     #[test]

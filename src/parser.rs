@@ -1144,10 +1144,8 @@ impl CommandMeta {
                         meta.cwd = None;
                         continue;
                     }
-                    meta.cwd = decode_osc133(value, MAX_OSC133_CWD_BYTES).filter(|text| {
-                        !text.chars().any(char::is_control)
-                            && !crate::review_input::contains_visual_spoofing(text)
-                    });
+                    meta.cwd = decode_osc133(value, MAX_OSC133_CWD_BYTES)
+                        .filter(|text| crate::execution_journal::is_valid_jsh_cwd(text));
                 }
                 "duration_ms" | "duration" => {
                     if std::mem::replace(&mut seen_duration, true) {
@@ -2688,6 +2686,25 @@ mod tests {
                 meta: CommandMeta::default()
             }
         );
+    }
+
+    #[test]
+    fn osc133_empty_cwd_is_absent_on_both_lifecycle_marks() {
+        let ParserEvent::CommandStart(start) = only_event(b"\x1b]133;C;id=jsh-4;cwd_url=\x07")
+        else {
+            panic!("expected CommandStart");
+        };
+        assert_eq!(start.id.as_deref(), Some("jsh-4"));
+        assert_eq!(start.cwd, None);
+
+        let ParserEvent::CommandEnd { exit, meta } =
+            only_event(b"\x1b]133;D;0;id=jsh-4;cwd_url=\x07")
+        else {
+            panic!("expected CommandEnd");
+        };
+        assert_eq!(exit, Some(0));
+        assert_eq!(meta.id.as_deref(), Some("jsh-4"));
+        assert_eq!(meta.cwd, None);
     }
 
     #[test]

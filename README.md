@@ -55,6 +55,8 @@ v2 is selected only for a peer that has already advertised v2 support.
   journal v1 version and byte/record ceilings are public, and its reader keeps
   jsh's JSON-escaped multiline commands plus the pre-rename version alias so
   migrated shell history and live OSC metadata resolve identically.
+  `is_valid_jsh_cwd` gives both channels one exact, nonempty, bounded, visually
+  unambiguous cwd identity rule.
   OSC metadata that claims a command is truncated (or encodes that disclosure
   ambiguously) never enters the exact-command slot, even if a producer also
   supplies a partial command field.
