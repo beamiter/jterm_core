@@ -2066,22 +2066,25 @@ mod tests {
     }
 
     #[test]
-    fn history_reader_rejects_excess_event_lines_before_parsing_them() {
+    fn history_reader_charges_unknown_events_to_the_physical_line_limit() {
         let path = temporary_journal("event-count-limit");
         let accepted = concat!(
             "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":2,\"event\":\"start\",\"id\":\"bounded\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"future\",\"cwd\":\"/future\",\"started_at_ms\":2}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"future\",\"id\":\"bounded\",\"payload\":true}\n",
             "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"bounded\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/\",\"ended_at_ms\":2}\n"
         );
         write_temporary_journal(&path, accepted);
-        let records = read_session_history_file_with_line_limit(&path, "wanted", 2).unwrap();
+        let records = read_session_history_file_with_line_limit(&path, "wanted", 4).unwrap();
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].command, "true");
         assert_eq!(records[0].exit_code, Some(0));
 
         let over_limit = format!(
-            "{accepted}{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"bounded\",\"unexpected\":true}}\n"
+            "{accepted}{{\"jsh_execution_version\":2,\"event\":\"future\",\"id\":\"orphan\"}}\n"
         );
         write_temporary_journal(&path, over_limit);
-        let error = read_session_history_file_with_line_limit(&path, "wanted", 2).unwrap_err();
+        let error = read_session_history_file_with_line_limit(&path, "wanted", 4).unwrap_err();
         let _ = fs::remove_file(&path);
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

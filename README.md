@@ -54,7 +54,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   layouts, Git metadata, notifications, and host/Flatpak command routing. The
   journal v1 version and byte/event/record ceilings are public, and its reader
   keeps jsh's JSON-escaped multiline commands plus the pre-rename version alias
-  so migrated shell history and live OSC metadata resolve identically.
+  so migrated shell history and live OSC metadata resolve identically. Every
+  physical line, including future-version and unknown additive events, is
+  charged before parsing so ignored extensions cannot bypass the event budget.
   A custom journal override must use a directory owned by the current user and
   not writable by group or other; shared namespaces such as `/tmp` are refused
   because the journal and its fixed `executions.lock` sidecar form one trust
