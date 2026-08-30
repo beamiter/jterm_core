@@ -606,6 +606,18 @@ fn validate_journal_file(file: &File, description: &str) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn set_private_open_file_permissions(file: &File) -> io::Result<()> {
+    // fchmod updates ctime even when the requested mode is already present.
+    // Reads and rejected appends must not manufacture metadata changes on an
+    // already-private journal or lockfile.
+    if file.metadata()?.permissions().mode() & 0o7777 == 0o600 {
+        Ok(())
+    } else {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+    }
+}
+
+#[cfg(unix)]
 fn validate_journal_directory_trust(
     dir: &Path,
     owner_uid: u32,
@@ -680,7 +692,7 @@ fn open_journal_lock(path: &std::path::Path) -> io::Result<File> {
     let file = options.open(path)?;
     validate_journal_file(&file, "execution journal lock")?;
     #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    set_private_open_file_permissions(&file)?;
     Ok(file)
 }
 
@@ -691,7 +703,7 @@ fn open_journal_for_read(path: &std::path::Path) -> io::Result<File> {
     let file = options.open(path)?;
     validate_journal_file(&file, "execution journal")?;
     #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    set_private_open_file_permissions(&file)?;
     Ok(file)
 }
 
@@ -1200,7 +1212,7 @@ fn append_encoded_event_to_path_with_line_limit(
             ));
         }
         #[cfg(unix)]
-        journal.set_permissions(fs::Permissions::from_mode(0o600))?;
+        set_private_open_file_permissions(&journal)?;
         invalidate_append_line_count_cache(journal_path)?;
         if needs_separator {
             // Match jsh's lifecycle writer: a crash may leave one incomplete
@@ -1514,6 +1526,22 @@ mod tests {
         fs::write(path, contents).unwrap();
         #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn stable_metadata(path: &Path) -> (u64, u64, u32, u64, u32, i64, i64, i64, i64) {
+        let metadata = fs::metadata(path).unwrap();
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.nlink(),
+            metadata.mode(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
     }
 
     fn start_event_with_raw_bytes(id: &str, raw_bytes: usize) -> Vec<u8> {
@@ -2620,9 +2648,12 @@ mod tests {
         };
         let entries_before = directory_entries();
         #[cfg(unix)]
-        let identity_before = {
-            let metadata = fs::metadata(&journal_path).unwrap();
-            (metadata.dev(), metadata.ino())
+        let metadata_before = {
+            let journal = stable_metadata(&journal_path);
+            let lock = stable_metadata(&root.0.join(JOURNAL_LOCK_FILE_NAME));
+            let parent = stable_metadata(&root.0);
+            std::thread::sleep(Duration::from_millis(2));
+            (journal, lock, parent)
         };
 
         let event = b"{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"known\",\"text\":\"new\",\"truncated\":false,\"total_bytes\":3,\"captured_at_ms\":2}\n";
@@ -2630,15 +2661,20 @@ mod tests {
             append_encoded_event_to_path_with_line_limit(&journal_path, event, 9).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
         assert_eq!(fs::read(&journal_path).unwrap(), original.as_bytes());
-        #[cfg(unix)]
-        {
-            let metadata = fs::metadata(&journal_path).unwrap();
-            assert_eq!((metadata.dev(), metadata.ino()), identity_before);
-        }
         assert_eq!(directory_entries(), entries_before);
         let rejected = read_session_history_file_with_line_limit(&journal_path, "wanted", 9)
             .expect("a rejected append leaves the source readable");
         assert_eq!(rejected, records);
+        #[cfg(unix)]
+        assert_eq!(
+            (
+                stable_metadata(&journal_path),
+                stable_metadata(&root.0.join(JOURNAL_LOCK_FILE_NAME)),
+                stable_metadata(&root.0),
+            ),
+            metadata_before,
+            "read and rejected append must not fchmod private journal state"
+        );
 
         append_encoded_event_to_path_with_line_limit(&journal_path, event, 10).unwrap();
         let restarted =
@@ -2962,10 +2998,17 @@ mod tests {
         let journal_path = root.0.join("executions.jsonl");
         fs::write(&journal_path, "event\n").unwrap();
         fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o622)).unwrap();
+        let metadata_before = stable_metadata(&journal_path);
+        std::thread::sleep(Duration::from_millis(2));
 
         assert!(read_session_history_file(&journal_path, "wanted").is_err());
         assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
         assert_eq!(fs::read_to_string(journal_path).unwrap(), "event\n");
+        assert_eq!(
+            stable_metadata(&root.0.join("executions.jsonl")),
+            metadata_before,
+            "an unsafe mode is rejected before any attempted repair"
+        );
     }
 
     #[cfg(unix)]
