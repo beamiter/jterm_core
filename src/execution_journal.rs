@@ -12,7 +12,7 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -568,7 +568,9 @@ fn open_journal_for_read(path: &std::path::Path) -> io::Result<File> {
 
 fn open_journal_for_append(path: &std::path::Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    // Read access lets the locked writer inspect the final byte and separate a
+    // torn shell event before appending a terminal-owned output event.
+    options.create(true).read(true).append(true);
     harden_open_options(&mut options);
     let file = options.open(path)?;
     validate_journal_file(&file, "execution journal")?;
@@ -929,7 +931,16 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
     (|| {
         let mut journal = open_journal_for_append(journal_path)?;
         let current_len = journal.metadata()?.len();
-        if !journal_append_within_bound(current_len, encoded.len()) {
+        let needs_separator = if current_len == 0 {
+            false
+        } else {
+            journal.seek(SeekFrom::End(-1))?;
+            let mut last = [0_u8; 1];
+            journal.read_exact(&mut last)?;
+            last[0] != b'\n'
+        };
+        let appended_bytes = encoded.len().saturating_add(usize::from(needs_separator));
+        if !journal_append_within_bound(current_len, appended_bytes) {
             return Err(io::Error::new(
                 io::ErrorKind::FileTooLarge,
                 "jsh execution journal is awaiting lifecycle compaction",
@@ -937,6 +948,11 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
         }
         #[cfg(unix)]
         journal.set_permissions(fs::Permissions::from_mode(0o600))?;
+        if needs_separator {
+            // Match jsh's lifecycle writer: a crash may leave one incomplete
+            // JSON object, but it must not consume the next complete event.
+            journal.write_all(b"\n")?;
+        }
         journal.write_all(encoded)?;
         journal.sync_data()?;
         lock.sync_directory()
@@ -1473,6 +1489,45 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn terminal_append_separates_a_torn_shell_event_tail() {
+        let root = TestDir::new("torn-tail");
+        let journal_path = root.0.join("executions.jsonl");
+        fs::write(&journal_path, b"{\"partial\":true").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        append_encoded_event_to_path(&journal_path, b"terminal-output\n").unwrap();
+
+        assert_eq!(
+            fs::read(&journal_path).unwrap(),
+            b"{\"partial\":true\nterminal-output\n"
+        );
+    }
+
+    #[test]
+    fn torn_tail_separator_counts_toward_the_reader_bound() {
+        let root = TestDir::new("torn-tail-bound");
+        let journal_path = root.0.join("executions.jsonl");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&journal_path)
+            .unwrap();
+        file.set_len(MAX_JOURNAL_READ_BYTES - 2).unwrap();
+        drop(file);
+        #[cfg(unix)]
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = append_encoded_event_to_path(&journal_path, b"x\n").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            fs::metadata(&journal_path).unwrap().len(),
+            MAX_JOURNAL_READ_BYTES - 2
+        );
     }
 
     #[cfg(unix)]
