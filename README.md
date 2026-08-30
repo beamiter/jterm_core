@@ -73,8 +73,10 @@ v2 is selected only for a peer that has already advertised v2 support.
   the poison as an additive `conflict` tombstone that legacy v1 readers ignore
   to the same unknown result. Start authority follows physical event order, so
   a restart still clears both prior slots when its sequence or wall clock moves
-  backwards. Recursive duplicate-member validation runs before any event can
-  mutate lifecycle state, including an invalid Start barrier.
+  backwards. The bounded fold likewise evicts by physical Start ordinal;
+  presentation remains deterministically sorted by `started_at_ms`, `seq`, and
+  id. Recursive duplicate-member validation runs before any event can mutate
+  lifecycle state, including an invalid Start barrier.
   A recognized v1 start with a valid execution id retires that id's prior
   lifecycle before its remaining fields are decoded strictly, so an invalid
   replacement cannot redirect later finish/output events back to stale state;

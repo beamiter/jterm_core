@@ -844,9 +844,12 @@ fn read_session_history_file_with_line_limit(
     // tiny start records. The file byte cap alone does not bound HashMap
     // overhead. jsh applies this limit globally before filtering one terminal
     // session, and its compactor permanently discards the same global oldest
-    // records. This index mirrors that ordering and lets us evict the oldest
-    // record in logarithmic time.
-    let mut record_order = BTreeMap::<(u64, u64, String), String>::new();
+    // records. Retention authority follows physical Start order rather than
+    // untrusted or reset-prone event timestamps and sequence numbers. Keep the
+    // presentation sort separate below. The two indexes make replacement and
+    // eviction logarithmic without storing the ordinal in the public record.
+    let mut record_order = BTreeMap::<usize, String>::new();
+    let mut record_positions = HashMap::<String, usize>::new();
     let read_limit = MAX_JOURNAL_READ_BYTES.saturating_add(1);
     let mut reader = BufReader::new(file.take(read_limit));
     let mut line = Vec::new();
@@ -878,12 +881,10 @@ fn read_session_history_file_with_line_limit(
         // strict decoding of its remaining metadata fails. Clear the old
         // lifecycle first so later Finish/Output events cannot bind to it.
         if let Some(id) = recognized_v1_start_id(&line) {
-            if let Some(previous) = records.remove(id.as_ref()) {
-                record_order.remove(&(
-                    previous.record.started_at_ms,
-                    previous.record.seq,
-                    previous.record.id,
-                ));
+            if records.remove(id.as_ref()).is_some() {
+                if let Some(position) = record_positions.remove(id.as_ref()) {
+                    record_order.remove(&position);
+                }
             }
         }
         let Ok(event) = serde_json::from_slice::<PersistedEvent>(&line) else {
@@ -925,7 +926,8 @@ fn read_session_history_file_with_line_limit(
                     ended_at_ms: None,
                     output: None,
                 };
-                record_order.insert((started_at_ms, seq, id.clone()), id.clone());
+                record_order.insert(event_lines, id.clone());
+                record_positions.insert(id.clone(), event_lines);
                 records.insert(
                     id,
                     FoldedExecution {
@@ -939,6 +941,7 @@ fn read_session_history_file_with_line_limit(
                     let Some((_, oldest_id)) = record_order.pop_first() else {
                         break;
                     };
+                    record_positions.remove(&oldest_id);
                     records.remove(&oldest_id);
                 }
             }
@@ -2177,6 +2180,48 @@ mod tests {
             records.last().unwrap().id,
             format!("exec-{MAX_RETAINED_EXECUTIONS}")
         );
+    }
+
+    #[test]
+    fn history_retention_uses_physical_start_order_across_restart() {
+        let path = temporary_journal("physical-record-order");
+        let mut journal = Vec::new();
+        writeln!(
+            journal,
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"restarted\",\"session_id\":\"wanted\",\"seq\":{},\"command\":\"old\",\"cwd\":\"/\",\"started_at_ms\":{}}}",
+            u64::MAX,
+            u64::MAX
+        )
+        .unwrap();
+        for ordinal in 1..MAX_RETAINED_EXECUTIONS {
+            writeln!(
+                journal,
+                "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"other-{ordinal}\",\"session_id\":\"wanted\",\"seq\":{ordinal},\"command\":\"other\",\"cwd\":\"/\",\"started_at_ms\":{ordinal}}}"
+            )
+            .unwrap();
+        }
+        writeln!(
+            journal,
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"restarted\",\"session_id\":\"wanted\",\"seq\":0,\"command\":\"new\",\"cwd\":\"/\",\"started_at_ms\":0}}"
+        )
+        .unwrap();
+        writeln!(
+            journal,
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"zz-newest\",\"session_id\":\"wanted\",\"seq\":0,\"command\":\"newest\",\"cwd\":\"/\",\"started_at_ms\":0}}"
+        )
+        .unwrap();
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), MAX_RETAINED_EXECUTIONS);
+        assert!(records.iter().any(|record| {
+            record.id == "restarted" && record.seq == 0 && record.command == "new"
+        }));
+        assert!(records.iter().any(|record| record.id == "zz-newest"));
+        assert!(!records.iter().any(|record| record.id == "other-1"));
+        assert!(records.iter().any(|record| record.id == "other-2"));
     }
 
     #[test]
