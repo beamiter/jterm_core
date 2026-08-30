@@ -59,6 +59,11 @@ v2 is selected only for a peer that has already advertised v2 support.
   charged before parsing so ignored extensions cannot bypass the event budget.
   A writer also checks that budget before emitting a separator or event, and an
   exact-limit journal is left byte-for-byte unchanged when an append is refused.
+  Successful appends sync their data, and a newly created journal additionally
+  syncs its parent directory. A failure before the first event byte removes a
+  newly created empty pathname; after any byte becomes visible, write or
+  durability-barrier failures report an unknown commit state and never roll
+  back or retry the event internally.
   Its incremental counter treats an unterminated peer tail as one physical line;
   a later LF only terminates that line rather than charging it twice.
   A custom journal override must use a directory owned by the current user and

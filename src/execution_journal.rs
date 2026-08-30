@@ -707,15 +707,31 @@ fn open_journal_for_read(path: &std::path::Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn open_journal_for_append(path: &std::path::Path) -> io::Result<File> {
+fn open_existing_journal_for_append(path: &std::path::Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     // Read access lets the locked writer inspect the final byte and separate a
     // torn shell event before appending a terminal-owned output event.
-    options.create(true).read(true).append(true);
+    options.read(true).append(true);
     harden_open_options(&mut options);
     let file = options.open(path)?;
     validate_journal_file(&file, "execution journal")?;
     Ok(file)
+}
+
+fn open_or_create_journal_for_append(path: &std::path::Path) -> io::Result<(File, bool)> {
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create_new(true);
+    harden_open_options(&mut options);
+    match options.open(path) {
+        Ok(file) => {
+            validate_journal_file(&file, "execution journal")?;
+            Ok((file, true))
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_existing_journal_for_append(path).map(|file| (file, false))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -807,6 +823,87 @@ impl JournalFileLock {
             Ok(())
         }
     }
+}
+
+trait JournalAppendIo {
+    fn write(&self, file: &mut File, bytes: &[u8]) -> io::Result<usize>;
+    fn sync_data(&self, file: &File) -> io::Result<()>;
+    fn sync_directory(&self, lock: &JournalFileLock) -> io::Result<()>;
+}
+
+struct SyncJournalAppendIo;
+
+impl JournalAppendIo for SyncJournalAppendIo {
+    fn write(&self, file: &mut File, bytes: &[u8]) -> io::Result<usize> {
+        file.write(bytes)
+    }
+
+    fn sync_data(&self, file: &File) -> io::Result<()> {
+        file.sync_data()
+    }
+
+    fn sync_directory(&self, lock: &JournalFileLock) -> io::Result<()> {
+        lock.sync_directory()
+    }
+}
+
+fn write_all_counted(
+    append_io: &impl JournalAppendIo,
+    file: &mut File,
+    mut bytes: &[u8],
+    written: &mut usize,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match append_io.write(file, bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write the complete execution journal event",
+                ));
+            }
+            Ok(count) if count <= bytes.len() => {
+                *written = written.saturating_add(count);
+                bytes = &bytes[count..];
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "execution journal writer reported an invalid byte count",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn append_write_error(error: io::Error, written: usize) -> io::Error {
+    let point = if written == 0 {
+        "before writing any bytes"
+    } else {
+        "after writing a visible prefix; commit state is unknown"
+    };
+    io::Error::new(
+        error.kind(),
+        format!("execution journal append failed {point}: {error}"),
+    )
+}
+
+fn append_durability_error(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "execution journal {stage} durability barrier failed after writing; commit state is unknown: {error}"
+        ),
+    )
+}
+
+fn append_post_write_error(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("execution journal {stage} failed after writing; commit state is unknown: {error}"),
+    )
 }
 
 impl Drop for JournalFileLock {
@@ -1165,6 +1262,20 @@ fn append_encoded_event_to_path_with_line_limit(
     encoded: &[u8],
     max_event_lines: usize,
 ) -> io::Result<()> {
+    append_encoded_event_to_path_with_line_limit_and_io(
+        journal_path,
+        encoded,
+        max_event_lines,
+        &SyncJournalAppendIo,
+    )
+}
+
+fn append_encoded_event_to_path_with_line_limit_and_io(
+    journal_path: &std::path::Path,
+    encoded: &[u8],
+    max_event_lines: usize,
+    append_io: &impl JournalAppendIo,
+) -> io::Result<()> {
     if !encoded.ends_with(b"\n") || encoded[..encoded.len() - 1].contains(&b'\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1179,7 +1290,7 @@ fn append_encoded_event_to_path_with_line_limit(
     let lock = JournalFileLock::acquire(dir, &lock_path, JournalLockMode::Exclusive, false)?;
 
     (|| {
-        let mut journal = open_journal_for_append(journal_path)?;
+        let (mut journal, created_pathname) = open_or_create_journal_for_append(journal_path)?;
         let current_len = journal.metadata()?.len();
         let needs_separator = if current_len == 0 {
             false
@@ -1214,18 +1325,83 @@ fn append_encoded_event_to_path_with_line_limit(
         #[cfg(unix)]
         set_private_open_file_permissions(&journal)?;
         invalidate_append_line_count_cache(journal_path)?;
+        let mut written = 0;
         if needs_separator {
             // Match jsh's lifecycle writer: a crash may leave one incomplete
             // JSON object, but it must not consume the next complete event.
-            journal.write_all(b"\n")?;
+            if let Err(error) = write_all_counted(append_io, &mut journal, b"\n", &mut written) {
+                return finish_failed_append_write(
+                    journal_path,
+                    journal,
+                    created_pathname,
+                    written,
+                    error,
+                );
+            }
         }
-        journal.write_all(encoded)?;
+        if let Err(error) = write_all_counted(append_io, &mut journal, encoded, &mut written) {
+            return finish_failed_append_write(
+                journal_path,
+                journal,
+                created_pathname,
+                written,
+                error,
+            );
+        }
         if let Some(line_count) = exact_line_count {
-            cache_completed_append(journal_path, &journal, line_count + 1)?;
+            cache_completed_append(journal_path, &journal, line_count + 1)
+                .map_err(|error| append_post_write_error("line-count bookkeeping", error))?;
         }
-        journal.sync_data()?;
-        lock.sync_directory()
+        append_io
+            .sync_data(&journal)
+            .map_err(|error| append_durability_error("data", error))?;
+        if created_pathname {
+            append_io
+                .sync_directory(&lock)
+                .map_err(|error| append_durability_error("directory", error))?;
+        }
+        Ok(())
     })()
+}
+
+fn finish_failed_append_write(
+    journal_path: &Path,
+    journal: File,
+    created_pathname: bool,
+    written: usize,
+    error: io::Error,
+) -> io::Result<()> {
+    if created_pathname && written == 0 {
+        remove_created_empty_journal(journal_path, &journal).map_err(|cleanup_error| {
+            io::Error::new(
+                cleanup_error.kind(),
+                format!(
+                    "execution journal append failed before writing and its empty pathname could not be removed: {error}; cleanup failed: {cleanup_error}"
+                ),
+            )
+        })?;
+    }
+    drop(journal);
+    Err(append_write_error(error, written))
+}
+
+fn remove_created_empty_journal(journal_path: &Path, journal: &File) -> io::Result<()> {
+    let opened = journal.metadata()?;
+    let named = fs::symlink_metadata(journal_path)?;
+    if opened.len() != 0 || !named.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "new execution journal pathname no longer names the empty opened file",
+        ));
+    }
+    #[cfg(unix)]
+    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "new execution journal pathname was replaced before cleanup",
+        ));
+    }
+    fs::remove_file(journal_path)
 }
 
 fn count_physical_lines_cached(
@@ -1492,6 +1668,71 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AppendFaultStage {
+        WriteAfter(usize),
+        DataSync,
+        DirectorySync,
+    }
+
+    struct FaultingAppendIo {
+        stage: AppendFaultStage,
+        write_calls: std::cell::Cell<usize>,
+        written: std::cell::Cell<usize>,
+        data_sync_calls: std::cell::Cell<usize>,
+        directory_sync_calls: std::cell::Cell<usize>,
+    }
+
+    impl FaultingAppendIo {
+        fn new(stage: AppendFaultStage) -> Self {
+            Self {
+                stage,
+                write_calls: std::cell::Cell::new(0),
+                written: std::cell::Cell::new(0),
+                data_sync_calls: std::cell::Cell::new(0),
+                directory_sync_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl JournalAppendIo for FaultingAppendIo {
+        fn write(&self, file: &mut File, bytes: &[u8]) -> io::Result<usize> {
+            self.write_calls.set(self.write_calls.get() + 1);
+            let requested = match self.stage {
+                AppendFaultStage::WriteAfter(limit) => {
+                    let remaining = limit.saturating_sub(self.written.get());
+                    if remaining == 0 {
+                        return Err(io::Error::other("injected append-write failure"));
+                    }
+                    remaining.min(bytes.len())
+                }
+                AppendFaultStage::DataSync | AppendFaultStage::DirectorySync => bytes.len(),
+            };
+            let count = file.write(&bytes[..requested])?;
+            self.written.set(self.written.get() + count);
+            Ok(count)
+        }
+
+        fn sync_data(&self, file: &File) -> io::Result<()> {
+            self.data_sync_calls.set(self.data_sync_calls.get() + 1);
+            if self.stage == AppendFaultStage::DataSync {
+                Err(io::Error::other("injected data-sync failure"))
+            } else {
+                file.sync_data()
+            }
+        }
+
+        fn sync_directory(&self, lock: &JournalFileLock) -> io::Result<()> {
+            self.directory_sync_calls
+                .set(self.directory_sync_calls.get() + 1);
+            if self.stage == AppendFaultStage::DirectorySync {
+                Err(io::Error::other("injected directory-sync failure"))
+            } else {
+                lock.sync_directory()
+            }
+        }
+    }
 
     struct TestDir(PathBuf);
 
@@ -2693,7 +2934,7 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        let mut observer = open_journal_for_append(&journal_path).unwrap();
+        let mut observer = open_existing_journal_for_append(&journal_path).unwrap();
         let mut observed_len = observer.metadata().unwrap().len();
         assert_eq!(
             count_physical_lines_cached(&mut observer, &journal_path, observed_len).unwrap(),
@@ -2775,6 +3016,146 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn append_failures_preserve_their_visible_commit_stage_without_retry() {
+        let event = b"event\n";
+
+        let absent_root = TestDir::new("pre-write-create-fault");
+        let absent_path = absent_root.0.join("executions.jsonl");
+        drop(
+            JournalFileLock::acquire(
+                &absent_root.0,
+                &absent_root.0.join(JOURNAL_LOCK_FILE_NAME),
+                JournalLockMode::Exclusive,
+                false,
+            )
+            .unwrap(),
+        );
+        let mut entries_before = fs::read_dir(&absent_root.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries_before.sort();
+        let pre_write = FaultingAppendIo::new(AppendFaultStage::WriteAfter(0));
+        let error = append_encoded_event_to_path_with_line_limit_and_io(
+            &absent_path,
+            event,
+            MAX_JOURNAL_EVENT_LINES,
+            &pre_write,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("commit state is unknown"));
+        assert!(
+            !absent_path.exists(),
+            "the new empty pathname is rolled back"
+        );
+        let mut entries_after = fs::read_dir(&absent_root.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries_after.sort();
+        assert_eq!(entries_after, entries_before);
+        assert_eq!(pre_write.write_calls.get(), 1);
+        assert_eq!(pre_write.written.get(), 0);
+        assert_eq!(pre_write.data_sync_calls.get(), 0);
+        assert_eq!(pre_write.directory_sync_calls.get(), 0);
+
+        let existing_root = TestDir::new("pre-write-existing-fault");
+        let existing_path = existing_root.0.join("executions.jsonl");
+        fs::write(&existing_path, b"stable\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&existing_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let existing_identity = fs::metadata(&existing_path).unwrap();
+        let pre_write = FaultingAppendIo::new(AppendFaultStage::WriteAfter(0));
+        let error = append_encoded_event_to_path_with_line_limit_and_io(
+            &existing_path,
+            event,
+            MAX_JOURNAL_EVENT_LINES,
+            &pre_write,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("commit state is unknown"));
+        assert_eq!(fs::read(&existing_path).unwrap(), b"stable\n");
+        #[cfg(unix)]
+        {
+            let after = fs::metadata(&existing_path).unwrap();
+            assert_eq!(
+                (after.dev(), after.ino()),
+                (existing_identity.dev(), existing_identity.ino())
+            );
+        }
+
+        let partial_root = TestDir::new("partial-write-fault");
+        let partial_path = partial_root.0.join("executions.jsonl");
+        fs::write(&partial_path, b"torn").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&partial_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let partial = FaultingAppendIo::new(AppendFaultStage::WriteAfter(3));
+        let error = append_encoded_event_to_path_with_line_limit_and_io(
+            &partial_path,
+            event,
+            MAX_JOURNAL_EVENT_LINES,
+            &partial,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("commit state is unknown"));
+        assert_eq!(fs::read(&partial_path).unwrap(), b"torn\nev");
+        assert_eq!(partial.write_calls.get(), 3);
+        assert_eq!(partial.written.get(), 3);
+        assert_eq!(partial.data_sync_calls.get(), 0);
+        assert_eq!(partial.directory_sync_calls.get(), 0);
+        append_encoded_event_to_path(&partial_path, event).unwrap();
+        assert_eq!(fs::read(&partial_path).unwrap(), b"torn\nev\nevent\n");
+
+        let data_root = TestDir::new("data-sync-fault");
+        let data_path = data_root.0.join("executions.jsonl");
+        let data = FaultingAppendIo::new(AppendFaultStage::DataSync);
+        let error = append_encoded_event_to_path_with_line_limit_and_io(
+            &data_path,
+            event,
+            MAX_JOURNAL_EVENT_LINES,
+            &data,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("commit state is unknown"));
+        assert_eq!(fs::read(&data_path).unwrap(), event);
+        assert_eq!(data.written.get(), event.len());
+        assert_eq!(data.data_sync_calls.get(), 1);
+        assert_eq!(data.directory_sync_calls.get(), 0);
+
+        let directory_root = TestDir::new("directory-sync-fault");
+        let directory_path = directory_root.0.join("executions.jsonl");
+        let directory = FaultingAppendIo::new(AppendFaultStage::DirectorySync);
+        let error = append_encoded_event_to_path_with_line_limit_and_io(
+            &directory_path,
+            event,
+            MAX_JOURNAL_EVENT_LINES,
+            &directory,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("commit state is unknown"));
+        assert_eq!(fs::read(&directory_path).unwrap(), event);
+        assert_eq!(directory.written.get(), event.len());
+        assert_eq!(directory.data_sync_calls.get(), 1);
+        assert_eq!(directory.directory_sync_calls.get(), 1);
+
+        let existing = FaultingAppendIo::new(AppendFaultStage::DirectorySync);
+        append_encoded_event_to_path_with_line_limit_and_io(
+            &directory_path,
+            b"second\n",
+            MAX_JOURNAL_EVENT_LINES,
+            &existing,
+        )
+        .unwrap();
+        assert_eq!(existing.data_sync_calls.get(), 1);
+        assert_eq!(
+            existing.directory_sync_calls.get(),
+            0,
+            "an existing journal pathname needs only the data barrier"
+        );
+        assert_eq!(fs::read(&directory_path).unwrap(), b"event\nsecond\n");
     }
 
     #[test]
