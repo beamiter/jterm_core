@@ -70,6 +70,10 @@ v2 is selected only for a peer that has already advertised v2 support.
   authoritative start resets that execution id's lifecycle. Compaction carries
   the poison as an additive `conflict` tombstone that legacy v1 readers ignore
   to the same unknown result.
+  A recognized v1 start with a valid execution id retires that id's prior
+  lifecycle before its remaining fields are decoded strictly, so an invalid
+  replacement cannot redirect later finish/output events back to stale state;
+  malformed, future-version, and unknown additive events remain non-barriers.
   OSC metadata that claims a command is truncated (or encodes that disclosure
   ambiguously) never enters the exact-command slot, even if a producer also
   supplies a partial command field.

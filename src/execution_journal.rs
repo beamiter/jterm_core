@@ -14,6 +14,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -145,18 +146,7 @@ struct OutputEvent {
 #[serde(tag = "event")]
 enum PersistedEvent {
     #[serde(rename = "start")]
-    Start {
-        #[serde(alias = "rsh_execution_version")]
-        jsh_execution_version: u32,
-        id: String,
-        session_id: Option<String>,
-        seq: u64,
-        command: String,
-        #[serde(default)]
-        command_truncated: bool,
-        cwd: String,
-        started_at_ms: u64,
-    },
+    Start(StartEvent),
     #[serde(rename = "finish")]
     Finish {
         #[serde(alias = "rsh_execution_version")]
@@ -185,6 +175,31 @@ enum PersistedEvent {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StartEvent {
+    #[serde(alias = "rsh_execution_version")]
+    jsh_execution_version: u32,
+    id: String,
+    session_id: Option<String>,
+    seq: u64,
+    command: String,
+    #[serde(default)]
+    command_truncated: bool,
+    cwd: String,
+    started_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventIdentity<'a> {
+    #[serde(borrow)]
+    event: Cow<'a, str>,
+    #[serde(alias = "rsh_execution_version")]
+    jsh_execution_version: u32,
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConflictEvent {
     #[serde(alias = "rsh_execution_version")]
     jsh_execution_version: u32,
@@ -202,11 +217,8 @@ enum ConflictSlot {
 impl PersistedEvent {
     fn version(&self) -> u32 {
         match self {
-            Self::Start {
-                jsh_execution_version,
-                ..
-            }
-            | Self::Finish {
+            Self::Start(event) => event.jsh_execution_version,
+            Self::Finish {
                 jsh_execution_version,
                 ..
             }
@@ -217,6 +229,18 @@ impl PersistedEvent {
             Self::Conflict(event) => event.jsh_execution_version,
         }
     }
+}
+
+/// Extract only the fields that make a v1 Start an authoritative lifecycle
+/// barrier. Other Start fields are deliberately skipped here so a wrong type,
+/// unknown member, or oversized semantic value cannot leave an older record
+/// with the same valid correlation ID active.
+fn recognized_v1_start_id(line: &[u8]) -> Option<Cow<'_, str>> {
+    let identity = serde_json::from_slice::<EventIdentity<'_>>(line).ok()?;
+    (identity.event == "start"
+        && identity.jsh_execution_version == EXECUTION_JOURNAL_VERSION
+        && is_valid_jsh_execution_id(&identity.id))
+    .then_some(identity.id)
 }
 
 enum JournalMessage {
@@ -816,6 +840,18 @@ fn read_session_history_file(
         if !within_limit {
             continue;
         }
+        // A recognized v1 Start with a valid ID is authoritative even when
+        // strict decoding of its remaining metadata fails. Clear the old
+        // lifecycle first so later Finish/Output events cannot bind to it.
+        if let Some(id) = recognized_v1_start_id(&line) {
+            if let Some(previous) = records.remove(id.as_ref()) {
+                record_order.remove(&(
+                    previous.record.started_at_ms,
+                    previous.record.seq,
+                    previous.record.id,
+                ));
+            }
+        }
         let Ok(event) = serde_json::from_slice::<PersistedEvent>(&line) else {
             continue;
         };
@@ -823,7 +859,7 @@ fn read_session_history_file(
             continue;
         }
         match event {
-            PersistedEvent::Start {
+            PersistedEvent::Start(StartEvent {
                 id,
                 session_id: event_session_id,
                 seq,
@@ -832,7 +868,7 @@ fn read_session_history_file(
                 cwd,
                 started_at_ms,
                 ..
-            } => {
+            }) => {
                 if !is_valid_jsh_execution_id(&id)
                     || event_session_id
                         .as_deref()
@@ -841,15 +877,6 @@ fn read_session_history_file(
                     || !is_valid_jsh_cwd(&cwd)
                 {
                     continue;
-                }
-                // A later duplicate start is authoritative, including when it
-                // moves an ID out of the requested session.
-                if let Some(previous) = records.remove(&id) {
-                    record_order.remove(&(
-                        previous.record.started_at_ms,
-                        previous.record.seq,
-                        previous.record.id.clone(),
-                    ));
                 }
                 let record = PersistedExecution {
                     id: id.clone(),
@@ -1588,6 +1615,160 @@ mod tests {
             Ok(LegacyEvent::Start)
         ));
         assert!(serde_json::from_str::<LegacyEvent>(conflict).is_err());
+    }
+
+    #[test]
+    fn recognized_start_ids_barrier_invalid_replacement_lifecycles() {
+        let path = temporary_journal("invalid-start-barriers");
+        let mut journal = Vec::new();
+        let valid_start = |id: &str, seq: u64| {
+            serde_json::json!({
+                "jsh_execution_version": 1,
+                "event": "start",
+                "id": id,
+                "session_id": "wanted",
+                "seq": seq,
+                "command": "old",
+                "cwd": "/old",
+                "started_at_ms": seq,
+            })
+        };
+        let finish = |id: &str| {
+            serde_json::json!({
+                "jsh_execution_version": 1,
+                "event": "finish",
+                "id": id,
+                "exit_code": 9,
+                "duration_ms": 1,
+                "cwd_after": "/after",
+                "ended_at_ms": 99,
+            })
+        };
+
+        let mut replacements = vec![
+            (
+                "bad-session",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-session",
+                    "session_id": "bad session",
+                    "seq": 10,
+                    "command": "new",
+                    "cwd": "/new",
+                    "started_at_ms": 10,
+                }),
+            ),
+            (
+                "bad-command",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-command",
+                    "session_id": "wanted",
+                    "seq": 11,
+                    "command": "hidden\u{202e}command",
+                    "cwd": "/new",
+                    "started_at_ms": 11,
+                }),
+            ),
+            (
+                "bad-cwd",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-cwd",
+                    "session_id": "wanted",
+                    "seq": 12,
+                    "command": "new",
+                    "cwd": "",
+                    "started_at_ms": 12,
+                }),
+            ),
+            (
+                "bad-type",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "bad-type",
+                    "session_id": "wanted",
+                    "seq": "13",
+                    "command": "new",
+                    "cwd": "/new",
+                    "started_at_ms": 13,
+                }),
+            ),
+            (
+                "extra-field",
+                serde_json::json!({
+                    "jsh_execution_version": 1,
+                    "event": "start",
+                    "id": "extra-field",
+                    "session_id": "wanted",
+                    "seq": 14,
+                    "command": "new",
+                    "cwd": "/new",
+                    "started_at_ms": 14,
+                    "extra": true,
+                }),
+            ),
+            (
+                "legacy-barrier",
+                serde_json::json!({
+                    "rsh_execution_version": 1,
+                    "event": "start",
+                    "id": "legacy-barrier",
+                    "session_id": "wanted",
+                    "seq": 15,
+                    "command": "new",
+                    "cwd": "",
+                    "started_at_ms": 15,
+                }),
+            ),
+        ];
+        replacements.push((
+            "oversized-command",
+            serde_json::json!({
+                "jsh_execution_version": 1,
+                "event": "start",
+                "id": "oversized-command",
+                "session_id": "wanted",
+                "seq": 16,
+                "command": "x".repeat(MAX_COMMAND_BYTES + 1),
+                "cwd": "/new",
+                "started_at_ms": 16,
+            }),
+        ));
+
+        for (index, (id, replacement)) in replacements.iter().enumerate() {
+            writeln!(journal, "{}", valid_start(id, index as u64 + 1)).unwrap();
+            writeln!(journal, "{replacement}").unwrap();
+            writeln!(journal, "{}", finish(id)).unwrap();
+        }
+
+        writeln!(journal, "{}", valid_start("escaped-id", 17)).unwrap();
+        writeln!(journal, "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"escaped\\u002did\",\"session_id\":\"wanted\",\"seq\":17,\"command\":\"new\",\"cwd\":\"\",\"started_at_ms\":17}}").unwrap();
+        writeln!(journal, "{}", finish("escaped-id")).unwrap();
+
+        writeln!(journal, "{}", valid_start("survivor", 20)).unwrap();
+        for ignored in [
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"session_id\":\"wanted\",\"seq\":21,\"command\":\"missing id\",\"cwd\":\"/new\",\"started_at_ms\":21}",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":7,\"session_id\":\"wanted\",\"seq\":22,\"command\":\"wrong id type\",\"cwd\":\"/new\",\"started_at_ms\":22}",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"survivor \" ,\"session_id\":\"wanted\",\"seq\":22,\"command\":\"invalid id\",\"cwd\":\"/new\",\"started_at_ms\":22}",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"survivor\"",
+            "{\"jsh_execution_version\":99,\"event\":\"start\",\"id\":\"survivor\",\"session_id\":\"wanted\",\"seq\":23,\"command\":\"future\",\"cwd\":\"/new\",\"started_at_ms\":23}",
+            "{\"jsh_execution_version\":1,\"event\":\"future-start\",\"id\":\"survivor\",\"session_id\":\"wanted\",\"seq\":24,\"command\":\"extension\",\"cwd\":\"/new\",\"started_at_ms\":24}",
+        ] {
+            writeln!(journal, "{ignored}").unwrap();
+        }
+        writeln!(journal, "{}", finish("survivor")).unwrap();
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "survivor");
+        assert_eq!(records[0].exit_code, Some(9));
     }
 
     #[test]
