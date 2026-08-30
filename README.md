@@ -81,7 +81,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   session history keeps that same physical chronology across clock or sequence
   resets, while timestamps remain untrusted display fields. Recursive
   duplicate-member validation runs before any event can mutate lifecycle state,
-  including an invalid Start barrier.
+  including an invalid Start barrier. Unknown event kinds remain skippable for
+  forward compatibility, but known v1 events reject extra members so an
+  injected identity or session hint cannot alter lifecycle correlation.
   A recognized v1 start with a valid execution id retires that id's prior
   lifecycle before its remaining fields are decoded strictly, so an invalid
   replacement cannot redirect later finish/output events back to stale state;

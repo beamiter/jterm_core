@@ -164,7 +164,7 @@ struct OutputEvent {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "event")]
+#[serde(tag = "event", deny_unknown_fields)]
 enum PersistedEvent {
     #[serde(rename = "start")]
     Start(StartEvent),
@@ -1911,6 +1911,37 @@ mod tests {
                 .map(|output| output.text.as_str()),
             Some("exact"),
             "malformed, extra-field, and future-version tombstones are ignored"
+        );
+    }
+
+    #[test]
+    fn known_finish_and_output_reject_extra_identity_fields() {
+        let path = temporary_journal("strict-known-event-fields");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"strict-known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"vendor_extension\",\"id\":\"strict-known\",\"session_id\":\"other\",\"execution_id\":\"other\",\"exit_code\":90,\"text\":\"ignored\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"strict-known\",\"session_id\":\"other\",\"exit_code\":91,\"duration_ms\":91,\"cwd_after\":\"/wrong\",\"ended_at_ms\":91}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"strict-known\",\"execution_id\":\"other\",\"text\":\"wrong\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":92}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"strict-known\",\"exit_code\":7,\"duration_ms\":2,\"cwd_after\":\"/after\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"strict-known\",\"text\":\"exact\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].exit_code, Some(7));
+        assert_eq!(records[0].duration_ms, Some(2));
+        assert_eq!(records[0].cwd_after.as_deref(), Some("/after"));
+        assert_eq!(records[0].ended_at_ms, Some(3));
+        assert_eq!(
+            records[0]
+                .output
+                .as_ref()
+                .map(|output| output.text.as_str()),
+            Some("exact"),
+            "unknown event kinds remain skippable while known variants are strict"
         );
     }
 
