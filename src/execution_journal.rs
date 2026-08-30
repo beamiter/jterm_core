@@ -85,6 +85,11 @@ pub struct PersistedExecution {
     pub output: Option<PersistedExecutionOutput>,
 }
 
+struct FoldedExecution {
+    session_id: Option<String>,
+    record: PersistedExecution,
+}
+
 #[derive(Debug)]
 pub struct HistorySnapshot {
     pub session_id: String,
@@ -725,11 +730,13 @@ fn read_session_history_file(
         ));
     }
 
-    let mut records = HashMap::<String, PersistedExecution>::new();
+    let mut records = HashMap::<String, FoldedExecution>::new();
     // Keep the working set bounded while folding a journal containing many
     // tiny start records. The file byte cap alone does not bound HashMap
-    // overhead. This index mirrors the final ordering and lets us evict the
-    // oldest record in logarithmic time.
+    // overhead. jsh applies this limit globally before filtering one terminal
+    // session, and its compactor permanently discards the same global oldest
+    // records. This index mirrors that ordering and lets us evict the oldest
+    // record in logarithmic time.
     let mut record_order = BTreeMap::<(u64, u64, String), String>::new();
     let read_limit = MAX_JOURNAL_READ_BYTES.saturating_add(1);
     let mut reader = BufReader::new(file.take(read_limit));
@@ -768,13 +775,10 @@ fn read_session_history_file(
                 // moves an ID out of the requested session.
                 if let Some(previous) = records.remove(&id) {
                     record_order.remove(&(
-                        previous.started_at_ms,
-                        previous.seq,
-                        previous.id.clone(),
+                        previous.record.started_at_ms,
+                        previous.record.seq,
+                        previous.record.id.clone(),
                     ));
-                }
-                if event_session_id.as_deref() != Some(session_id) {
-                    continue;
                 }
                 let record = PersistedExecution {
                     id: id.clone(),
@@ -790,7 +794,13 @@ fn read_session_history_file(
                     output: None,
                 };
                 record_order.insert((started_at_ms, seq, id.clone()), id.clone());
-                records.insert(id, record);
+                records.insert(
+                    id,
+                    FoldedExecution {
+                        session_id: event_session_id,
+                        record,
+                    },
+                );
                 while records.len() > MAX_RETAINED_EXECUTIONS {
                     let Some((_, oldest_id)) = record_order.pop_first() else {
                         break;
@@ -810,10 +820,10 @@ fn read_session_history_file(
                     continue;
                 }
                 if let Some(record) = records.get_mut(&id) {
-                    record.exit_code = Some(exit_code);
-                    record.duration_ms = Some(duration_ms);
-                    record.cwd_after = Some(cwd_after);
-                    record.ended_at_ms = Some(ended_at_ms);
+                    record.record.exit_code = Some(exit_code);
+                    record.record.duration_ms = Some(duration_ms);
+                    record.record.cwd_after = Some(cwd_after);
+                    record.record.ended_at_ms = Some(ended_at_ms);
                 }
             }
             PersistedEvent::Output {
@@ -830,7 +840,7 @@ fn read_session_history_file(
                 if let Some(record) = records.get_mut(&id) {
                     let (truncated, total_bytes) =
                         normalize_output_metadata(text.len(), truncated, total_bytes);
-                    record.output = Some(PersistedExecutionOutput {
+                    record.record.output = Some(PersistedExecutionOutput {
                         total_bytes,
                         text,
                         truncated,
@@ -849,7 +859,12 @@ fn read_session_history_file(
         ));
     }
 
-    let mut records = records.into_values().collect::<Vec<_>>();
+    let mut records = records
+        .into_values()
+        .filter_map(|entry| {
+            (entry.session_id.as_deref() == Some(session_id)).then_some(entry.record)
+        })
+        .collect::<Vec<_>>();
     records.sort_by(|left, right| {
         (left.started_at_ms, left.seq, &left.id).cmp(&(right.started_at_ms, right.seq, &right.id))
     });
@@ -1472,6 +1487,43 @@ mod tests {
         assert_eq!(
             records.last().unwrap().id,
             format!("exec-{MAX_RETAINED_EXECUTIONS}")
+        );
+    }
+
+    #[test]
+    fn history_reader_applies_the_retention_limit_before_session_filtering() {
+        let path = temporary_journal("global-record-limit");
+        let mut journal = Vec::new();
+        writeln!(
+            journal,
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-old\",\"session_id\":\"wanted\",\"seq\":0,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":0}}"
+        )
+        .unwrap();
+        for seq in 1..=MAX_RETAINED_EXECUTIONS {
+            writeln!(
+                journal,
+                "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"other-{seq}\",\"session_id\":\"other\",\"seq\":{seq},\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":{seq}}}"
+            )
+            .unwrap();
+        }
+        writeln!(
+            journal,
+            "{{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-new\",\"session_id\":\"wanted\",\"seq\":{},\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":{}}}",
+            MAX_RETAINED_EXECUTIONS + 1,
+            MAX_RETAINED_EXECUTIONS + 1
+        )
+        .unwrap();
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["wanted-new"]
         );
     }
 
