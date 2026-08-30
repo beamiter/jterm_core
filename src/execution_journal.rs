@@ -1008,8 +1008,9 @@ pub(crate) fn is_valid_jsh_command(command: &str) -> bool {
         && !command
             .chars()
             .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-        && !crate::review_input::contains_noncontrol_visual_spoofing(command)
-        && !contains_jsh_terminal_only_invisible(command)
+        && !command.chars().any(|ch| {
+            !ch.is_control() && crate::review_input::is_terminal_visual_spoofing_character(ch)
+        })
 }
 
 /// Whether a cwd can identify the same directory across jsh's OSC and journal
@@ -1018,12 +1019,9 @@ pub fn is_valid_jsh_cwd(cwd: &str) -> bool {
     !cwd.is_empty()
         && cwd.len() <= MAX_CWD_BYTES
         && !cwd.chars().any(char::is_control)
-        && !crate::review_input::contains_visual_spoofing(cwd)
-        && !contains_jsh_terminal_only_invisible(cwd)
-}
-
-fn contains_jsh_terminal_only_invisible(text: &str) -> bool {
-    text.chars().any(|ch| matches!(ch, '\u{fff9}'..='\u{fffb}'))
+        && !cwd
+            .chars()
+            .any(crate::review_input::is_terminal_visual_spoofing_character)
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {

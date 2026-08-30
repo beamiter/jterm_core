@@ -132,30 +132,42 @@ fn safe_display(text: &str, max_bytes: usize, multiline: bool) -> String {
 pub fn is_visual_spoofing_character(ch: char) -> bool {
     (ch.is_whitespace() && ch != ' ')
         || matches!(
-        ch,
-        // Unicode default-ignorable and bidi formatting code points that can
-        // make reviewed shell text display differently from the bytes the
-        // child receives. This boundary intentionally errs on the strict side:
-        // a command can spell these explicitly (for example with printf) when
-        // they are genuinely data.
-        '\u{00ad}'
-            | '\u{034f}'
-            | '\u{061c}'
-            | '\u{115f}'..='\u{1160}'
-            | '\u{17b4}'..='\u{17b5}'
-            | '\u{180b}'..='\u{180f}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{206f}'
-            | '\u{3164}'
-            | '\u{fe00}'..='\u{fe0f}'
-            | '\u{feff}'
-            | '\u{ffa0}'
-            | '\u{fff0}'..='\u{fff8}'
-            | '\u{1bca0}'..='\u{1bca3}'
-            | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0000}'..='\u{e0fff}'
+            ch,
+            // Unicode default-ignorable and bidi formatting code points that can
+            // make reviewed shell text display differently from the bytes the
+            // child receives. This boundary intentionally errs on the strict side:
+            // a command can spell these explicitly (for example with printf) when
+            // they are genuinely data.
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fff8}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'
         )
+}
+
+/// Whether a scalar is ambiguous specifically on a terminal-rendered surface.
+///
+/// U+FFF9..=U+FFFB are assigned interlinear annotation controls, so the
+/// generic review contract above deliberately does not call them Unicode
+/// default-ignorables. Terminal renderers used by the family nevertheless
+/// display them as nothing. OSC chrome, notifications, shell metadata and cwd
+/// correlation therefore use this stricter predicate while review-only APIs
+/// retain their established contract.
+pub(crate) fn is_terminal_visual_spoofing_character(ch: char) -> bool {
+    is_visual_spoofing_character(ch) || matches!(ch, '\u{fff9}'..='\u{fffb}')
 }
 
 #[cfg(test)]
@@ -217,8 +229,12 @@ mod tests {
     /// keeps outside Default_Ignorable_Code_Point stay allowed.
     #[test]
     fn reserved_ranges_fail_closed_while_assigned_layout_controls_stay_allowed() {
-        assert!(!is_visual_spoofing_character('\u{fff9}'));
+        for annotation in ['\u{fff9}', '\u{fffa}', '\u{fffb}'] {
+            assert!(!is_visual_spoofing_character(annotation));
+            assert!(is_terminal_visual_spoofing_character(annotation));
+        }
         assert!(!is_visual_spoofing_character('\u{13430}'));
+        assert!(!is_terminal_visual_spoofing_character('\u{13430}'));
     }
 
     #[test]

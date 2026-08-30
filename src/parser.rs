@@ -1124,7 +1124,9 @@ impl CommandMeta {
                     meta.id = decode_osc133(value, MAX_OSC133_ID_BYTES).filter(|id| {
                         !id.is_empty()
                             && !id.chars().any(char::is_control)
-                            && !crate::review_input::contains_visual_spoofing(id)
+                            && !id
+                                .chars()
+                                .any(crate::review_input::is_terminal_visual_spoofing_character)
                     });
                 }
                 "cmdline_url" | "command_url" | "command" | "cmdline" => {
@@ -1309,7 +1311,8 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     if matches!(s.split_once(';'), Some(("0" | "1" | "2", _)))
         && (payload.len() > MAX_TITLE_BYTES
             || s.chars().any(char::is_control)
-            || crate::review_input::contains_visual_spoofing(s))
+            || s.chars()
+                .any(crate::review_input::is_terminal_visual_spoofing_character))
     {
         return;
     }
@@ -1427,7 +1430,11 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
 /// percent decoding. Checking only the former lets `%0a` or `%E2%80%AE`
 /// reappear as a line break or bidi override in cwd-derived terminal chrome.
 fn safe_osc7_text(value: &str) -> bool {
-    if value.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(value) {
+    if value.chars().any(char::is_control)
+        || value
+            .chars()
+            .any(crate::review_input::is_terminal_visual_spoofing_character)
+    {
         return false;
     }
 
@@ -1454,7 +1461,9 @@ fn safe_osc7_text(value: &str) -> bool {
     }
     String::from_utf8(decoded).is_ok_and(|decoded| {
         !decoded.chars().any(char::is_control)
-            && !crate::review_input::contains_visual_spoofing(&decoded)
+            && !decoded
+                .chars()
+                .any(crate::review_input::is_terminal_visual_spoofing_character)
     })
 }
 
@@ -1465,7 +1474,7 @@ fn safe_osc7_text(value: &str) -> bool {
 fn bounded_notification_field(raw: &str) -> String {
     raw.chars()
         .map(|ch| {
-            if ch.is_control() || crate::review_input::is_visual_spoofing_character(ch) {
+            if ch.is_control() || crate::review_input::is_terminal_visual_spoofing_character(ch) {
                 '\u{fffd}'
             } else {
                 ch
@@ -2165,6 +2174,10 @@ mod tests {
             "\x1b]9;left\u{202e}right\u{00a0}tail\x07".as_bytes(),
             &mut events,
         );
+        parser.feed(
+            "\x1b]9;anchor\u{fff9}separator\u{fffa}terminator\u{fffb}\x07".as_bytes(),
+            &mut events,
+        );
         parser.feed(format!("\x1b]9;{long}\x07").as_bytes(), &mut events);
         let bodies: Vec<&String> = events
             .iter()
@@ -2175,7 +2188,11 @@ mod tests {
             .collect();
         assert_eq!(bodies[0], "evil\u{fffd}tab");
         assert_eq!(bodies[1], "left\u{fffd}right\u{fffd}tail");
-        assert_eq!(bodies[2].chars().count(), MAX_NOTIFICATION_CHARS);
+        assert_eq!(
+            bodies[2],
+            "anchor\u{fffd}separator\u{fffd}terminator\u{fffd}"
+        );
+        assert_eq!(bodies[3].chars().count(), MAX_NOTIFICATION_CHARS);
 
         // Empty notifications and non-notify OSC 777 subcommands emit nothing.
         events.clear();
@@ -2717,6 +2734,14 @@ mod tests {
             assert_eq!(meta.id.as_deref(), Some("jsh-4"));
             assert_eq!(meta.command, None, "accepted U+{:04X}", u32::from(hidden));
             assert_eq!(meta.cwd, None, "accepted U+{:04X}", u32::from(hidden));
+
+            let packet = format!("\x1b]133;C;id=jsh{hidden}4;cmdline_url=true;cwd_url=/tmp\x07");
+            let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                panic!("expected CommandStart");
+            };
+            assert_eq!(meta.id, None, "accepted U+{:04X}", u32::from(hidden));
+            assert_eq!(meta.command.as_deref(), Some("true"));
+            assert_eq!(meta.cwd.as_deref(), Some("/tmp"));
         }
     }
 
@@ -2813,6 +2838,15 @@ mod tests {
         p.feed(b"\x1b]7;file://host/tmp/invalid%FFutf8\x07", &mut events);
         p.feed(b"\x1b]7;file://host/tmp/incomplete%2\x07", &mut events);
         p.feed("\x1b]2;build\u{00a0}done\x07".as_bytes(), &mut events);
+        p.feed(
+            "\x1b]7;file://host/tmp/left\u{fff9}right\x07".as_bytes(),
+            &mut events,
+        );
+        p.feed(
+            b"\x1b]7;file://host/tmp/left%EF%BF%B9right\x07",
+            &mut events,
+        );
+        p.feed("\x1b]2;build\u{fffa}done\x07".as_bytes(), &mut events);
         assert!(collect_bytes(&events).is_empty());
 
         events.clear();
