@@ -93,6 +93,8 @@ pub struct PersistedExecution {
 struct FoldedExecution {
     session_id: Option<String>,
     record: PersistedExecution,
+    finish_conflicted: bool,
+    output_conflicted: bool,
 }
 
 #[derive(Debug)]
@@ -175,6 +177,26 @@ enum PersistedEvent {
         total_bytes: u64,
         captured_at_ms: u64,
     },
+    /// Durable ambiguity marker emitted by jsh's compactor. Older v1 readers
+    /// ignore this additive event and therefore also leave the slot unknown.
+    #[serde(rename = "conflict")]
+    Conflict(ConflictEvent),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictEvent {
+    #[serde(alias = "rsh_execution_version")]
+    jsh_execution_version: u32,
+    id: String,
+    slot: ConflictSlot,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ConflictSlot {
+    Finish,
+    Output,
 }
 
 impl PersistedEvent {
@@ -192,6 +214,7 @@ impl PersistedEvent {
                 jsh_execution_version,
                 ..
             } => *jsh_execution_version,
+            Self::Conflict(event) => event.jsh_execution_version,
         }
     }
 }
@@ -847,6 +870,8 @@ fn read_session_history_file(
                     FoldedExecution {
                         session_id: event_session_id,
                         record,
+                        finish_conflicted: false,
+                        output_conflicted: false,
                     },
                 );
                 while records.len() > MAX_RETAINED_EXECUTIONS {
@@ -867,11 +892,27 @@ fn read_session_history_file(
                 if !is_valid_jsh_execution_id(&id) || !is_valid_jsh_cwd(&cwd_after) {
                     continue;
                 }
-                if let Some(record) = records.get_mut(&id) {
-                    record.record.exit_code = Some(exit_code);
-                    record.record.duration_ms = Some(duration_ms);
-                    record.record.cwd_after = Some(cwd_after);
-                    record.record.ended_at_ms = Some(ended_at_ms);
+                if let Some(folded) = records.get_mut(&id) {
+                    if folded.finish_conflicted {
+                        continue;
+                    }
+                    let record = &mut folded.record;
+                    if record.exit_code.is_none() {
+                        record.exit_code = Some(exit_code);
+                        record.duration_ms = Some(duration_ms);
+                        record.cwd_after = Some(cwd_after);
+                        record.ended_at_ms = Some(ended_at_ms);
+                    } else if record.exit_code != Some(exit_code)
+                        || record.duration_ms != Some(duration_ms)
+                        || record.cwd_after.as_deref() != Some(cwd_after.as_str())
+                        || record.ended_at_ms != Some(ended_at_ms)
+                    {
+                        record.exit_code = None;
+                        record.duration_ms = None;
+                        record.cwd_after = None;
+                        record.ended_at_ms = None;
+                        folded.finish_conflicted = true;
+                    }
                 }
             }
             PersistedEvent::Output {
@@ -885,15 +926,46 @@ fn read_session_history_file(
                 if !is_valid_jsh_execution_id(&id) || text.len() > MAX_OUTPUT_BYTES {
                     continue;
                 }
-                if let Some(record) = records.get_mut(&id) {
+                if let Some(folded) = records.get_mut(&id) {
                     let (truncated, total_bytes) =
                         normalize_output_metadata(text.len(), truncated, total_bytes);
-                    record.record.output = Some(PersistedExecutionOutput {
+                    let output = PersistedExecutionOutput {
                         total_bytes,
                         text,
                         truncated,
                         captured_at_ms,
-                    });
+                    };
+                    if folded.output_conflicted {
+                        continue;
+                    }
+                    match folded.record.output.as_ref() {
+                        None => folded.record.output = Some(output),
+                        Some(existing) if existing == &output => {}
+                        Some(_) => {
+                            folded.record.output = None;
+                            folded.output_conflicted = true;
+                        }
+                    }
+                }
+            }
+            PersistedEvent::Conflict(event) => {
+                if !is_valid_jsh_execution_id(&event.id) {
+                    continue;
+                }
+                if let Some(folded) = records.get_mut(&event.id) {
+                    match event.slot {
+                        ConflictSlot::Finish => {
+                            folded.record.exit_code = None;
+                            folded.record.duration_ms = None;
+                            folded.record.cwd_after = None;
+                            folded.record.ended_at_ms = None;
+                            folded.finish_conflicted = true;
+                        }
+                        ConflictSlot::Output => {
+                            folded.record.output = None;
+                            folded.output_conflicted = true;
+                        }
+                    }
                 }
             }
         }
@@ -1398,6 +1470,124 @@ mod tests {
         let output = records[0].output.as_ref().unwrap();
         assert!(output.truncated);
         assert_eq!(output.total_bytes, 3);
+    }
+
+    #[test]
+    fn history_reader_does_not_last_win_conflicting_lifecycle_slots() {
+        let path = temporary_journal("conflicting-lifecycle-slots");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-1\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"first\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-1\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-1\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-1\",\"exit_code\":9,\"duration_ms\":8,\"cwd_after\":\"/other\",\"ended_at_ms\":9}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-1\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"first\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"first\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"second\",\"truncated\":false,\"total_bytes\":6,\"captured_at_ms\":10}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-1\",\"text\":\"first\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":4}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-2\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"stale\",\"cwd\":\"/tmp\",\"started_at_ms\":11}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-2\",\"exit_code\":1,\"duration_ms\":1,\"cwd_after\":\"/tmp\",\"ended_at_ms\":12}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-2\",\"exit_code\":2,\"duration_ms\":2,\"cwd_after\":\"/other\",\"ended_at_ms\":13}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-2\",\"text\":\"stale-a\",\"truncated\":false,\"total_bytes\":7,\"captured_at_ms\":14}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-2\",\"text\":\"stale-b\",\"truncated\":false,\"total_bytes\":7,\"captured_at_ms\":15}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"wanted-2\",\"session_id\":\"wanted\",\"seq\":3,\"command\":\"fresh\",\"cwd\":\"/tmp\",\"started_at_ms\":20}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"wanted-2\",\"exit_code\":7,\"duration_ms\":2,\"cwd_after\":\"/after\",\"ended_at_ms\":22}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"wanted-2\",\"text\":\"ok\",\"truncated\":false,\"total_bytes\":2,\"captured_at_ms\":23}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 2);
+        let ambiguous = &records[0];
+        assert_eq!(ambiguous.id, "wanted-1");
+        assert_eq!(ambiguous.exit_code, None);
+        assert_eq!(ambiguous.duration_ms, None);
+        assert_eq!(ambiguous.cwd_after, None);
+        assert_eq!(ambiguous.ended_at_ms, None);
+        assert_eq!(ambiguous.output, None);
+
+        let exact = &records[1];
+        assert_eq!(exact.seq, 3);
+        assert_eq!(exact.command, "fresh");
+        assert_eq!(exact.exit_code, Some(7));
+        assert_eq!(exact.duration_ms, Some(2));
+        assert_eq!(exact.cwd_after.as_deref(), Some("/after"));
+        assert_eq!(exact.ended_at_ms, Some(22));
+        assert_eq!(
+            exact.output.as_ref().map(|output| output.text.as_str()),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn history_reader_applies_strict_durable_conflict_tombstones() {
+        let path = temporary_journal("conflict-tombstones");
+        let journal = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"orphan\",\"slot\":\"finish\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"finish-poisoned\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"one\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"finish-poisoned\",\"slot\":\"finish\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"finish-poisoned\",\"slot\":\"finish\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"finish-poisoned\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/after\",\"ended_at_ms\":3}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"finish-poisoned\",\"text\":\"kept\",\"truncated\":false,\"total_bytes\":4,\"captured_at_ms\":4}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"output-poisoned\",\"session_id\":\"wanted\",\"seq\":2,\"command\":\"two\",\"cwd\":\"/tmp\",\"started_at_ms\":5}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"output-poisoned\",\"slot\":\"output\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"output-poisoned\",\"slot\":\"output\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"output-poisoned\",\"text\":\"dropped\",\"truncated\":false,\"total_bytes\":7,\"captured_at_ms\":6}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"output-poisoned\",\"exit_code\":7,\"duration_ms\":2,\"cwd_after\":\"/after\",\"ended_at_ms\":7}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"strict\",\"session_id\":\"wanted\",\"seq\":3,\"command\":\"three\",\"cwd\":\"/tmp\",\"started_at_ms\":8}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"strict\",\"slot\":\"finish\",\"extra\":true}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"strict\",\"slot\":\"unknown\"}\n",
+            "{\"jsh_execution_version\":99,\"event\":\"conflict\",\"id\":\"strict\",\"slot\":\"finish\"}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"strict\",\"exit_code\":9,\"duration_ms\":1,\"cwd_after\":\"/after\",\"ended_at_ms\":9}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"strict\",\"text\":\"exact\",\"truncated\":false,\"total_bytes\":5,\"captured_at_ms\":10}\n"
+        );
+        write_temporary_journal(&path, journal);
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(records.len(), 3, "orphan tombstones create no lifecycle");
+        assert_eq!(records[0].exit_code, None);
+        assert_eq!(
+            records[0]
+                .output
+                .as_ref()
+                .map(|output| output.text.as_str()),
+            Some("kept"),
+            "finish poison does not affect output"
+        );
+        assert_eq!(records[1].exit_code, Some(7));
+        assert_eq!(records[1].output, None, "output poison survives replay");
+        assert_eq!(records[2].exit_code, Some(9));
+        assert_eq!(
+            records[2]
+                .output
+                .as_ref()
+                .map(|output| output.text.as_str()),
+            Some("exact"),
+            "malformed, extra-field, and future-version tombstones are ignored"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_readers_ignore_additive_conflict_tombstones() {
+        #[derive(Deserialize)]
+        #[serde(tag = "event")]
+        enum LegacyEvent {
+            #[serde(rename = "start")]
+            Start,
+        }
+
+        let start = r#"{"jsh_execution_version":1,"event":"start","id":"one"}"#;
+        let conflict =
+            r#"{"jsh_execution_version":1,"event":"conflict","id":"one","slot":"finish"}"#;
+        assert!(matches!(
+            serde_json::from_str::<LegacyEvent>(start),
+            Ok(LegacyEvent::Start)
+        ));
+        assert!(serde_json::from_str::<LegacyEvent>(conflict).is_err());
     }
 
     #[test]

@@ -65,6 +65,11 @@ v2 is selected only for a peer that has already advertised v2 support.
   OSC 133 identifiers used only in a terminal's in-memory timeline.
   `is_valid_jsh_cwd` gives both channels one exact, nonempty, bounded, visually
   unambiguous cwd identity rule.
+  Journal finish and output slots accept exact duplicate delivery idempotently;
+  conflicting duplicates degrade only their own slot to unknown until a new
+  authoritative start resets that execution id's lifecycle. Compaction carries
+  the poison as an additive `conflict` tombstone that legacy v1 readers ignore
+  to the same unknown result.
   OSC metadata that claims a command is truncated (or encodes that disclosure
   ambiguously) never enters the exact-command slot, even if a producer also
   supplies a partial command field.
