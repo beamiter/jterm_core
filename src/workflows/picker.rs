@@ -1,21 +1,21 @@
 //! The searchable overlay ember, frost and forge put in front of a loaded
 //! library.
 //!
-//! anvil folds workflows into its tiered command palette instead, as does
-//! forge's unified command palette; neither of those surfaces uses this
-//! workflow-only state machine. What is shared here is a query, a highlight,
-//! a filtered view, and the invariant that binds them.
+//! anvil folds workflows into its tiered command palette and does not use this
+//! workflow-only state machine. ember and frost use it for their overlays;
+//! forge uses it for its standalone Workflows palette. What is shared here is
+//! a query, a highlight, a filtered view, and the invariant that binds them.
 //!
 //! # The invariant
 //!
-//! **The highlight can never point past a drawn row.** Navigation and drawing
-//! both go through [`WorkflowPicker::filtered`], so the same cap applies to
-//! both; the highlight resets to the first row on every query change, because
-//! a query that shrinks the result list would otherwise leave the highlight
-//! selecting a workflow the user can no longer see. frost had that reset
-//! written out at three separate call sites in `main.rs`; forge's standalone
-//! palette instead built as many as 1,024 GTK rows on the main thread. Both
-//! now share the same bounded state and drawn-row invariant.
+//! **The highlight can never point past a drawn row.** Navigation, drawing and
+//! activation all read the same cached filtered-index list, so the same cap
+//! applies to each; the highlight resets to the first row on every query
+//! change, because a query that shrinks the result list would otherwise leave
+//! the highlight selecting a workflow the user can no longer see. frost had
+//! that reset written out at three separate call sites in `main.rs`; forge's
+//! standalone palette instead built as many as 1,024 GTK rows on the main
+//! thread. Both now share the same bounded state and drawn-row invariant.
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
