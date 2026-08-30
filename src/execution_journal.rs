@@ -1043,15 +1043,22 @@ fn read_session_history_file_with_line_limit(
         ));
     }
 
-    let mut records = records
-        .into_values()
-        .filter_map(|entry| {
-            (entry.session_id.as_deref() == Some(session_id)).then_some(entry.record)
-        })
+    let mut ordered_records = Vec::with_capacity(records.len());
+    for entry in records.into_values() {
+        let Some(position) = record_positions.remove(&entry.record.id) else {
+            return Err(io::Error::other(
+                "jsh execution journal retention index became inconsistent",
+            ));
+        };
+        if entry.session_id.as_deref() == Some(session_id) {
+            ordered_records.push((position, entry.record));
+        }
+    }
+    ordered_records.sort_by(|left, right| (left.0, &left.1.id).cmp(&(right.0, &right.1.id)));
+    let mut records = ordered_records
+        .into_iter()
+        .map(|(_, record)| record)
         .collect::<Vec<_>>();
-    records.sort_by(|left, right| {
-        (left.started_at_ms, left.seq, &left.id).cmp(&(right.started_at_ms, right.seq, &right.id))
-    });
     let keep_from = records.len().saturating_sub(MAX_RETAINED_EXECUTIONS);
     Ok(records.split_off(keep_from))
 }
@@ -2179,6 +2186,30 @@ mod tests {
         assert_eq!(
             records.last().unwrap().id,
             format!("exec-{MAX_RETAINED_EXECUTIONS}")
+        );
+    }
+
+    #[test]
+    fn session_history_uses_physical_start_order_across_clock_reset() {
+        let path = temporary_journal("physical-history-order");
+        write_temporary_journal(
+            &path,
+            concat!(
+                "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"older\",\"session_id\":\"wanted\",\"seq\":99,\"command\":\"old\",\"cwd\":\"/\",\"started_at_ms\":999}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"newer\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"new\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+                "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"newest\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"newest\",\"cwd\":\"/\",\"started_at_ms\":1}\n"
+            ),
+        );
+
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["older", "newer", "newest"]
         );
     }
 
