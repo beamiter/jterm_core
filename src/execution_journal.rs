@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +56,20 @@ pub const MAX_RETAINED_EXECUTIONS: usize = 2_000;
 const MAX_JOURNAL_READ_BYTES: u64 = MAX_JOURNAL_FILE_BYTES + MAX_EVENT_LINE_BYTES as u64 + 1;
 const JOURNAL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const JOURNAL_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+#[derive(Debug)]
+struct AppendLineCountCache {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    scanned_bytes: u64,
+    newline_count: usize,
+    ends_with_newline: bool,
+}
+
+static APPEND_LINE_COUNT_CACHE: Mutex<Option<AppendLineCountCache>> = Mutex::new(None);
 
 /// One completed command's captured output, as reported by a terminal app.
 /// Only correlation id and output payload matter here; jsh's own events carry
@@ -1130,6 +1145,20 @@ fn append_event(event: OutputEvent) -> io::Result<()> {
 }
 
 fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) -> io::Result<()> {
+    append_encoded_event_to_path_with_line_limit(journal_path, encoded, MAX_JOURNAL_EVENT_LINES)
+}
+
+fn append_encoded_event_to_path_with_line_limit(
+    journal_path: &std::path::Path,
+    encoded: &[u8],
+    max_event_lines: usize,
+) -> io::Result<()> {
+    if !encoded.ends_with(b"\n") || encoded[..encoded.len() - 1].contains(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "encoded journal event must contain exactly one trailing newline",
+        ));
+    }
     let dir = journal_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "journal has no parent"))?;
@@ -1155,17 +1184,140 @@ fn append_encoded_event_to_path(journal_path: &std::path::Path, encoded: &[u8]) 
                 "jsh execution journal is awaiting lifecycle compaction",
             ));
         }
+        let exact_line_count = if current_len < max_event_lines as u64 {
+            None
+        } else {
+            Some(count_physical_lines_cached(
+                &mut journal,
+                journal_path,
+                current_len,
+            )?)
+        };
+        if exact_line_count.is_some_and(|line_count| line_count >= max_event_lines) {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "jsh execution journal append exceeds its event-count limit",
+            ));
+        }
         #[cfg(unix)]
         journal.set_permissions(fs::Permissions::from_mode(0o600))?;
+        invalidate_append_line_count_cache(journal_path)?;
         if needs_separator {
             // Match jsh's lifecycle writer: a crash may leave one incomplete
             // JSON object, but it must not consume the next complete event.
             journal.write_all(b"\n")?;
         }
         journal.write_all(encoded)?;
+        if let Some(line_count) = exact_line_count {
+            cache_completed_append(journal_path, &journal, line_count + 1)?;
+        }
         journal.sync_data()?;
         lock.sync_directory()
     })()
+}
+
+fn count_physical_lines_cached(
+    journal: &mut File,
+    journal_path: &Path,
+    current_len: u64,
+) -> io::Result<usize> {
+    let metadata = journal.metadata()?;
+    let mut cache = APPEND_LINE_COUNT_CACHE
+        .lock()
+        .map_err(|_| io::Error::other("journal line-count cache is poisoned"))?;
+    let can_resume = cache.as_ref().is_some_and(|cached| {
+        cached.path == journal_path
+            && cached.scanned_bytes <= current_len
+            && same_cached_file(cached, &metadata)
+    });
+    let (offset, mut newline_count, mut ends_with_newline) = if can_resume {
+        let cached = cache.as_ref().expect("cache presence checked above");
+        (
+            cached.scanned_bytes,
+            cached.newline_count,
+            cached.ends_with_newline,
+        )
+    } else {
+        (0, 0, false)
+    };
+
+    journal.seek(SeekFrom::Start(offset))?;
+    let mut remaining = current_len.saturating_sub(offset);
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let requested = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = journal.read(&mut buffer[..requested])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "execution journal changed while counting events",
+            ));
+        }
+        newline_count = newline_count
+            .checked_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count())
+            .ok_or_else(|| io::Error::other("execution journal event count overflowed"))?;
+        ends_with_newline = buffer[read - 1] == b'\n';
+        remaining -= read as u64;
+    }
+
+    *cache = Some(AppendLineCountCache {
+        path: journal_path.to_owned(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        scanned_bytes: current_len,
+        newline_count,
+        ends_with_newline,
+    });
+    newline_count
+        .checked_add(usize::from(current_len != 0 && !ends_with_newline))
+        .ok_or_else(|| io::Error::other("execution journal event count overflowed"))
+}
+
+#[cfg(unix)]
+fn same_cached_file(cache: &AppendLineCountCache, metadata: &fs::Metadata) -> bool {
+    cache.device == metadata.dev() && cache.inode == metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn same_cached_file(_cache: &AppendLineCountCache, _metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn invalidate_append_line_count_cache(journal_path: &Path) -> io::Result<()> {
+    let mut cache = APPEND_LINE_COUNT_CACHE
+        .lock()
+        .map_err(|_| io::Error::other("journal line-count cache is poisoned"))?;
+    if cache
+        .as_ref()
+        .is_some_and(|cached| cached.path == journal_path)
+    {
+        *cache = None;
+    }
+    Ok(())
+}
+
+fn cache_completed_append(
+    journal_path: &Path,
+    journal: &File,
+    physical_lines: usize,
+) -> io::Result<()> {
+    let metadata = journal.metadata()?;
+    let mut cache = APPEND_LINE_COUNT_CACHE
+        .lock()
+        .map_err(|_| io::Error::other("journal line-count cache is poisoned"))?;
+    *cache = Some(AppendLineCountCache {
+        path: journal_path.to_owned(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        scanned_bytes: metadata.len(),
+        newline_count: physical_lines,
+        ends_with_newline: true,
+    });
+    Ok(())
 }
 
 fn journal_append_within_bound(current_bytes: u64, event_bytes: usize) -> bool {
@@ -2347,6 +2499,45 @@ mod tests {
             11
         ));
         assert!(!journal_append_within_bound(u64::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn terminal_append_rejects_an_exact_event_budget_atomically() {
+        let root = TestDir::new("event-budget-append");
+        let journal_path = root.0.join("executions.jsonl");
+        let original = concat!(
+            "{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"known\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/\",\"started_at_ms\":1}\n",
+            "{\"jsh_execution_version\":1,\"event\":\"future\",\"payload\":true}\n",
+            "{\"malformed\":\n",
+            "{\"jsh_execution_version\":2,\"event\":\"output\",\"id\":\"known\",\"text\":\"future\",\"truncated\":false,\"total_bytes\":6,\"captured_at_ms\":2}\n"
+        );
+        fs::write(&journal_path, original).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_session_history_file_with_line_limit(&journal_path, "wanted", 4)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let event = b"{\"jsh_execution_version\":1,\"event\":\"output\",\"id\":\"known\",\"text\":\"new\",\"truncated\":false,\"total_bytes\":3,\"captured_at_ms\":2}\n";
+        let error =
+            append_encoded_event_to_path_with_line_limit(&journal_path, event, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(fs::read(&journal_path).unwrap(), original.as_bytes());
+        assert_eq!(
+            read_session_history_file_with_line_limit(&journal_path, "wanted", 4)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        append_encoded_event_to_path_with_line_limit(&journal_path, event, 5).unwrap();
+        let restarted =
+            read_session_history_file_with_line_limit(&journal_path, "wanted", 5).unwrap();
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0].output.as_ref().unwrap().text, "new");
     }
 
     #[test]
