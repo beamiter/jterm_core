@@ -1150,7 +1150,7 @@ impl CommandMeta {
                         meta.duration_ms = None;
                         continue;
                     }
-                    meta.duration_ms = value.parse().ok();
+                    meta.duration_ms = value.trim().parse().ok();
                 }
                 "cmd_truncated" | "command_truncated" => {
                     if std::mem::replace(&mut seen_command_truncated, true) {
@@ -2699,6 +2699,29 @@ mod tests {
             panic!("expected CommandEnd");
         };
         assert_eq!(exit, Some(0), "an unknown bare extension is not a status");
+    }
+
+    #[test]
+    fn osc133_duration_aliases_follow_the_family_numeric_grammar() {
+        for key in ["duration", "duration_ms"] {
+            let packet = format!("\x1b]133;D;0;{key}= 42 ;id=jsh-2\x07");
+            let ParserEvent::CommandEnd { exit, meta } = only_event(packet.as_bytes()) else {
+                panic!("expected CommandEnd");
+            };
+            assert_eq!(exit, Some(0), "key={key}");
+            assert_eq!(meta.duration_ms, Some(42), "key={key}");
+            assert_eq!(meta.id.as_deref(), Some("jsh-2"), "key={key}");
+        }
+
+        for invalid in ["%2042", "-1", "18446744073709551616"] {
+            let packet = format!("\x1b]133;D;0;duration_ms={invalid};id=jsh-2\x07");
+            let ParserEvent::CommandEnd { exit, meta } = only_event(packet.as_bytes()) else {
+                panic!("expected CommandEnd");
+            };
+            assert_eq!(exit, Some(0), "value={invalid}");
+            assert_eq!(meta.duration_ms, None, "value={invalid}");
+            assert_eq!(meta.id.as_deref(), Some("jsh-2"), "value={invalid}");
+        }
     }
 
     #[test]
