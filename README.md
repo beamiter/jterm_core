@@ -55,6 +55,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   journal v1 version and byte/record ceilings are public, and its reader keeps
   jsh's JSON-escaped multiline commands plus the pre-rename version alias so
   migrated shell history and live OSC metadata resolve identically.
+  OSC metadata that claims a command is truncated (or encodes that disclosure
+  ambiguously) never enters the exact-command slot, even if a producer also
+  supplies a partial command field.
   `bounded_json::validate_no_duplicate_members` re-exports jagent's wire
   preflight and gives bounded credential, IPC, and persistence decoders one
   allocation-light recursive preflight, so escaped or plain duplicate object

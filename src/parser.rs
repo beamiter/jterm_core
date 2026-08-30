@@ -1163,10 +1163,25 @@ impl CommandMeta {
                         meta.command_truncated = true;
                         continue;
                     }
-                    meta.command_truncated = value == "1" || value.eq_ignore_ascii_case("true");
+                    meta.command_truncated = match value {
+                        "0" => false,
+                        "1" => true,
+                        value if value.eq_ignore_ascii_case("false") => false,
+                        value if value.eq_ignore_ascii_case("true") => true,
+                        // A producer chose to send the disclosure but did not
+                        // encode its state. Treat that as inexact, not as the
+                        // default `false` that claims a command is complete.
+                        _ => true,
+                    };
                 }
                 _ => {}
             }
+        }
+        // jsh emits either an exact command or `cmd_truncated=1`, never both.
+        // A contradictory producer must not smuggle a partial prefix into the
+        // exact-command path merely by attaching the honest disclosure too.
+        if meta.command_truncated {
+            meta.command = None;
         }
         meta
     }
@@ -2612,6 +2627,27 @@ mod tests {
             meta.command_truncated,
             "ambiguous truncation disclosure must fail toward the safe fallback"
         );
+    }
+
+    #[test]
+    fn osc133_truncation_disclosure_never_leaves_an_exact_command() {
+        for disclosure in ["1", "true", "unknown"] {
+            let packet =
+                format!("\x1b]133;C;cmdline_url=partial-prefix;cmd_truncated={disclosure}\x07");
+            let ParserEvent::CommandStart(meta) = only_event(packet.as_bytes()) else {
+                panic!("expected CommandStart");
+            };
+            assert!(meta.command_truncated, "disclosure={disclosure}");
+            assert_eq!(meta.command, None, "disclosure={disclosure}");
+        }
+
+        let ParserEvent::CommandStart(meta) =
+            only_event(b"\x1b]133;C;cmdline_url=complete;cmd_truncated=false\x07")
+        else {
+            panic!("expected CommandStart");
+        };
+        assert!(!meta.command_truncated);
+        assert_eq!(meta.command.as_deref(), Some("complete"));
     }
 
     /// A missing or unparseable status is `None`, not success. It used to
