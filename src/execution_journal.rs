@@ -6,6 +6,8 @@
 //! writer thread.  jsh owns the rest of the execution lifecycle (`start` and
 //! `finish`); jterm contributes the text that was actually rendered by the
 //! terminal as an `output` event with the same execution id.
+//! Existing owner-only journal files with extra read bits are tightened to
+//! `0600` after validation; group/world-writable files are rejected.
 
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use once_cell::sync::OnceCell;
@@ -592,6 +594,8 @@ fn open_journal_for_read(path: &std::path::Path) -> io::Result<File> {
     harden_open_options(&mut options);
     let file = options.open(path)?;
     validate_journal_file(&file, "execution journal")?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
 
@@ -1806,6 +1810,32 @@ mod tests {
         assert!(read_session_history_file(&journal_path, "wanted").is_err());
         assert!(append_encoded_event_to_path(&journal_path, b"event\n").is_err());
         assert_eq!(fs::read_to_string(journal_path).unwrap(), "event\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_readable_journal_is_tightened_after_validation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDir::new("owner-readable");
+        let journal_path = root.0.join("executions.jsonl");
+        fs::write(
+            &journal_path,
+            b"{\"jsh_execution_version\":1,\"event\":\"start\",\"id\":\"jsh-readable\",\"session_id\":\"wanted\",\"seq\":1,\"command\":\"true\",\"cwd\":\"/tmp\",\"started_at_ms\":1}\n",
+        )
+        .unwrap();
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            read_session_history_file(&journal_path, "wanted")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs::metadata(&journal_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
