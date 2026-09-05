@@ -630,6 +630,315 @@ four terminals had each been carrying a private copy of.
   adds without claiming to know what it is. A test pins the byte count the
   TooLarge message spells out against jagent's actual ceiling.
 
+## 2026-09-05 organism subsystem move
+
+- `src/organism.rs`, `src/organism_memory.rs` and `src/organism_attention.rs`
+  are now core modules. anvil and forge each carried a private copy of all
+  three — 9004 lines duplicated, differing in 11 lines, none of them design.
+  Four of those were rename damage: a blanket `s/Forge/Anvil/` in anvil had
+  turned "Forget" into "Anvilt" in a doc comment and `forged` into `anvild` in
+  a test. forge's spelling is the one that moved, so the damage is gone rather
+  than canonised. The remaining seven are two doc headers, two spellings of the
+  same `review_input` path, and three test fixtures. Everything else is carried
+  verbatim: same reducer, same bounded schema, same transaction, same 119
+  tests. The modules were already toolkit-free — neither imports gtk, relm4,
+  egui or iced — and there is no app name in production code at all; the one
+  `format!` that named a binary sat in a `#[cfg(test)]` `TestDir` helper. So
+  nothing here needs `identity`.
+
+- Naming is core-neutral where a test named an app. The `TestDir` scratch
+  prefix is `jterm-core-organism-memory-…`; the four subprocess handshake
+  variables are `JTERM_CORE_ORGANISM_{DST_TEST,TEST_PATH,TEST_REPO,TEST_COUNT}`;
+  two fixture repo paths that read `/work/forge` read `/work/repo`. A fixture
+  that names one app in a crate shared by four is a small lie a later reader
+  has to check, and the subprocess variables are worse than cosmetic. They are
+  read from the inherited environment, so a name shared with an app's own
+  harness is answered by whichever binary happens to see it: core's helper
+  would silently early-return under a value forge's parent set, and the outer
+  test would then assert against a file nobody wrote.
+
+- `nix::libc::…` became `libc::…` in 22 places. It was always a re-export —
+  the apps pull `nix` for termios and signals, which core has no use for — and
+  `command_history`, `atomic_file` and `execution_journal` already reach the
+  same `flock`/`getrandom`/`localtime_r` symbols through the `libc` crate core
+  already depends on. Keeping `nix` would have added a dependency to buy
+  nothing but a longer path to the same symbol.
+
+- `transact` — the single-event spelling of `transact_batch` — is now
+  `#[cfg(test)]`. Nothing in production has ever called it: both apps set
+  `#![allow(dead_code)]` crate-wide, which hid that for as long as the code
+  lived in a binary. Core does not allow dead code, and the alternative to
+  gating it was making it `pub`, which would hand an app a way to write to the
+  memory file behind the queue that owns retry and acknowledgement.
+
+### Coupling 1: `review_input`
+
+`contains_visual_spoofing` was already core's. anvil reached it through
+`crate::review_input`, a re-export of the same module, and forge through
+`jterm_core::review_input`. Both are now `crate::review_input` and the two
+call sites are one function again rather than two spellings of one.
+
+### Coupling 2: the memory path
+
+`OrganismMemory::load_default()` is gone and `load(path)` is public. The
+default it wrapped was `crate::config::default_ascii_organism_memory_path()`,
+and the two apps do not agree on it: forge implements the XDG rule by hand and
+joins `forge`, anvil calls `glib::user_state_dir()` and joins `anvil`. Core has
+no opinion about where an app keeps its state, and a default here could only be
+wrong — not loudly wrong, either. A memory file read from a path nobody writes
+is indistinguishable from an organism that has never seen this machine: it
+loads clean, remembers nothing, and reports no error. The caller owns the path
+because the caller is the only one who can be right about it.
+
+### Coupling 3: the persistence lane
+
+Persistence could not move with the organism. anvil's `persistence.rs` is 1428
+lines and forge's is 1118, with 794 differing lines once the app name is
+normalised — one lane versus several, different admission and byte accounting.
+They are two designs, not a duplicate, and merging them to satisfy this move
+would have been the tail wagging the dog.
+
+So core states the contract and each app satisfies it with the worker it
+already has, injected once at startup beside `identity::init`:
+
+```rust
+pub trait MemoryScheduler: Send + Sync + 'static {
+    fn schedule(&self, write: MemoryWrite) -> io::Result<()>;
+}
+
+pub fn init_scheduler(scheduler: Box<dyn MemoryScheduler>);
+```
+
+A **trait object**, not a function pointer and not a boxed closure. A function
+pointer would have fit both apps today — each `enqueue` is a free function over
+a global worker — and it forecloses an app whose lane lives in a value rather
+than a static. The deciding difference is that two apps have to implement this:
+a trait is a written contract that rustdoc renders and that `impl` forces an
+author to acknowledge, where a bare `fn(MemoryWrite) -> io::Result<()>` alias
+carries its obligations only in prose that nothing checks. A boxed closure has
+the same anonymity problem with none of the fn pointer's compensating
+cheapness. The one allocation `Box<dyn …>` costs happens once, at startup.
+
+`MemoryWrite` is what crosses the boundary, and its fields are private:
+
+```rust
+pub struct MemoryWrite { /* kind, path, operation, job */ }
+
+impl MemoryWrite {
+    pub fn kind(&self) -> &'static str;   // "ascii-organism"
+    pub fn path(&self) -> &Path;          // the memory file
+    pub fn operation(&self) -> &'static str; // "Save ASCII organism memory"
+    pub fn run(self) -> io::Result<()>;   // the whole transaction
+}
+```
+
+Only core constructs one, so the split holds in both directions: core decides
+what is written and when the app is asked, and the app cannot rewrite the
+transaction, reorder it against another write, or run half of it. The app
+decides which thread, which queue, what admission limit, and whether to
+coalesce. Nothing app-shaped — no `PersistenceKey`, no lane selection, no byte
+estimate — appears in core, which is the point: `PersistenceKey` is a forge and
+anvil type with two different definitions, and taking one of them would have
+made core depend on the app it was copied from.
+
+The contract an implementation owes core, in full:
+
+1. Run `MemoryWrite::run` exactly once per accepted write, or return `Err`.
+   Dropping an accepted write does *not* lose that update — core removes
+   events from the queue only after a transaction succeeds, so the next command
+   or `flush_pending` asks again with the same events. What it costs is
+   admission: the per-path queue holds 256 events, and once it is full
+   `apply_and_enqueue` returns `WouldBlock` and the organism stops recording
+   while the local view is deliberately held back so it cannot diverge from
+   disk. So the failure to size a lane against is the 256-event cliff, not one
+   lost command per drop. (`a_full_durable_queue_never_diverges_the_local_cache`
+   pins the cliff; the release point is the single `queue.retain` after
+   `transact_batch` succeeds.)
+2. `Ok(())` means *accepted*, not *completed*. Core never waits.
+3. Report saturation as `io::ErrorKind::WouldBlock`. `flush_pending` retries
+   that kind until its deadline and gives up at once on anything else.
+4. Do not run the job on the UI thread. The transaction takes two
+   cross-process `flock`s with a two-second timeout each, so a second jterm
+   holding the memory file freezes that thread for up to four seconds per
+   command and then fails. Core's own fallback obeys this rule as well.
+5. Coalesce only writes sharing both `kind()` and `path()`. Superseding a
+   pending write with a newer one for the same key is correct — each job drains
+   the whole queue, so the newer one subsumes the older.
+6. Survive a panicking job without poisoning the lane. Core's queues take their
+   locks poison-tolerantly and the events stay retained for the next attempt.
+
+**With no lane registered, core writes through a background worker thread of
+its own.** This is the part that had to be decided rather than defaulted.
+`identity` can answer with a neutral "jterm" because a generically-labelled
+notification is merely generic; a persistence lane has no harmless neutral
+answer. Three candidate answers were rejected:
+
+- *Report success without writing.* Silent data loss the moment an app forgets
+  `init_scheduler`.
+- *Report failure.* Core's own tests, and any app that never wires a lane, could
+  then not remember a single command.
+- *Run the transaction inline on the calling thread.* This was the first
+  answer, and it is wrong for the reason rule 4 exists. Every caller of
+  `apply_and_enqueue` in an app is the GTK main thread — forge's is inside an
+  `Rc<RefCell<_>>` borrow in `src/ui/organism.rs`, anvil's has the same shape —
+  and the transaction takes two cross-process `flock`s at two seconds each. A
+  second jterm holding the memory file would freeze the window for seconds per
+  finished command and then report `WouldBlock`. It is the same defect forge
+  had just removed elsewhere (a revision mutex held across `fsync` on the GTK
+  thread), reintroduced in core's default. It also made `flush_pending`'s
+  deadline bound nothing: the deadline was only read between attempts, so one
+  attempt could outlive the whole 500 ms shutdown budget eightfold.
+
+A fourth option — making the lane non-optional by construction, so the question
+cannot arise — was rejected for a different reason. It is achievable (thread an
+`Arc<dyn MemoryScheduler>` through `OrganismMemory`, or panic on an
+unregistered `load`), but the queues and `flush_pending` are process-global and
+keyed by path, so a per-instance lane needs a second path→lane registry to
+answer the shutdown drain; and it converts a forgotten adoption step into a
+startup abort for four apps while leaving core unusable without a lane at all.
+Registration should be *checkable*, not load-bearing.
+
+So the fallback is a worker thread that satisfies the same six rules core asks
+an app for: one job at a time on a thread that is never the caller's, a bounded
+64-slot queue reporting saturation as `WouldBlock`, `Ok` meaning accepted, and
+a `catch_unwind` so a panicking job cannot disconnect the channel and end
+organism memory for the rest of the process. `execution_journal` and
+`command_history` already own background writer threads here, so this is the
+crate's existing shape rather than a new kind of thing. `flush_pending` sends a
+barrier down the same channel and waits with whatever budget is left, which is
+what makes the caller's deadline real: a contended `flock` now keeps running on
+the worker after `flush_pending` reports `TimedOut`, instead of holding the
+close-request handler open for it.
+
+The fallback is a floor, not a substitute. It has one thread, no view of the
+app's other writes, and no shared admission accounting, so an app with a
+persistence worker should still register. That makes a missing registration a
+misconfiguration that nothing breaks on, which is exactly the kind no compiler
+error catches — so it is observable twice: the first unregistered write logs one
+warning naming `init_scheduler`, and `scheduler_is_registered() -> bool` lets a
+doctor or self-check command assert it. `init_scheduler` is first-call-wins like
+`identity::init`, so a lane cannot be swapped underneath writes already in
+flight; an app that registers *late* keeps the events it produced first, and
+`flush_pending` still joins the fallback writer that took them.
+
+- `CircadianProfile::from_mask` is now `CircadianProfile::from_window_start`,
+  and public. Un-gating alone was not enough. The gate had been doing real
+  work: `session_day` finds the one window start with `.expect(..)`, and most
+  `u8` masks have no start — `0` sets nothing, and `0b1111_1111`, which reads
+  as the obvious "always active", sets every bucket's circular predecessor too.
+  Inside one binary only that binary's tests could build such a value; as `pub`
+  it became a public constructor for a value whose public method aborts the
+  process, reachable from the GTK thread that calls `session_day`. Production
+  was safe only because the sole learned constructor happened to emit three
+  contiguous bits, an invariant written down nowhere.
+
+  Taking a window start instead of a mask makes the invalid state
+  unrepresentable rather than merely rejected, so there is no `Option` for six
+  call sites to unwrap and no second place where the invariant is established:
+  `infer_circadian_profile` now builds through the same function. The bucket
+  space is circular, so the argument is reduced modulo eight and a night shift
+  still wraps past midnight.
+  `every_constructible_circadian_profile_has_a_session_day` exhausts all 256
+  arguments against all 8 local buckets; with the old signature the same
+  exhaustive test panics at the first mask.
+
+- Five tests are new, covering the seam itself rather than the subsystem.
+  `an_unregistered_process_writes_off_the_calling_thread_without_losing_the_event`
+  drives the fallback in a child process while that process *holds the memory
+  file's own `flock`* — `flock` is per-open-file-description, so one process
+  contends with itself and the second-jterm stall is reproduced without a
+  helper. It asserts that accepting the write returns in well under the
+  two-second lock timeout, that nothing reached disk while the lock was held,
+  that a 100 ms `flush_pending` returns `TimedOut` inside 100 ms instead of
+  inheriting the transaction's wait, that the same update lands once the lock
+  is released (nothing was lost), and that a deliberately panicking job does
+  not stop the writes that follow it. Reverted to the inline fallback it fails
+  after exactly 2.00 s with `WouldBlock`; with the `flush_pending` join removed
+  it fails on the bounded-drain assertion instead.
+  `a_registered_lane_owns_every_write_and_the_first_registration_wins` drives a
+  registered lane in a child process — asserting that nothing reaches disk
+  until the lane runs the write, that `kind`/`path`/`operation` arrive intact,
+  that a second `init_scheduler` is ignored, and that
+  `scheduler_is_registered()` flips exactly once. The child processes are not
+  ceremony: the lane, the fallback writer and the event queues are all
+  process-wide, and `flush_pending` drains every queued path in the process, so
+  either test sharing a binary with the others would corrupt them. The existing
+  DST and concurrency tests already re-exec for the same class of reason.
+  `every_constructible_circadian_profile_has_a_session_day` covers the
+  constructor change above.
+
+  841 tests before, 965 after — all 119 organism tests moved, none were left
+  behind, plus the five above.
+
+### What the apps must call
+
+Adoption is mechanical. Delete `src/organism.rs`, `src/organism_memory.rs` and
+`src/organism_attention.rs` and their `mod` lines — in forge, not `src/ui/organism.rs`,
+which is the UI module that happens to share the name — then:
+
+```rust
+// once at startup, beside identity::init and BEFORE the first
+// OrganismMemory::load — a write produced before this call goes to core's
+// fallback writer instead of the app's worker.
+struct OrganismLane;
+
+impl jterm_core::organism_memory::MemoryScheduler for OrganismLane {
+    fn schedule(
+        &self,
+        write: jterm_core::organism_memory::MemoryWrite,
+    ) -> std::io::Result<()> {
+        let key = persistence::PersistenceKey::for_path(write.kind(), write.path());
+        let operation = write.operation();
+        persistence::enqueue(key, operation, move || write.run())
+    }
+}
+
+jterm_core::organism_memory::init_scheduler(Box::new(OrganismLane));
+debug_assert!(jterm_core::organism_memory::scheduler_is_registered());
+```
+
+`PersistenceKey::for_path` copies out of `write` before the closure takes it,
+so the borrow ends where it should. Both apps' `enqueue` is
+`(PersistenceKey, impl Into<String>, impl FnOnce() -> io::Result<()> + Send +
+'static) -> io::Result<()>`, reports saturation as `WouldBlock`, and already
+runs its task under `catch_unwind`, so both satisfy the six rules unchanged;
+neither needs a persistence change.
+
+`scheduler_is_registered()` is the assertable form of the one adoption step no
+compiler error catches. A doctor or self-check command should assert it too,
+not only a `debug_assert`: without it the organism still remembers — core falls
+back to a writer thread of its own — so a forgotten registration produces one
+warning line at startup and nothing else.
+
+The second call-site change is the memory path:
+
+```rust
+// was: OrganismMemory::load_default()
+OrganismMemory::load(config::default_ascii_organism_memory_path())
+```
+
+The third is the circadian test constructor, in three UI tests per app
+(`forge/src/ui/organism.rs:4844,4868,4890`, `anvil/src/organism_ui.rs:4884,4908,4930`).
+It takes the window's first bucket instead of a bit mask, which the call sites
+already spell out in a trailing comment:
+
+```rust
+// was: CircadianProfile::from_mask(0b0001_1100) // buckets 2, 3, 4
+CircadianProfile::from_window_start(2)
+
+// was: CircadianProfile::from_mask(0b1000_0011) // buckets 7, 0, 1
+CircadianProfile::from_window_start(7)
+```
+
+Everything else is an import rewrite: `crate::organism*` becomes
+`jterm_core::organism*`. The exported surface is otherwise identical — the same
+38 items both apps import today, with the same names and signatures, plus
+`scheduler_is_registered` — and `organism_memory::flush_pending(timeout)` still
+belongs in the shutdown drain, ahead of the app's own persistence shutdown,
+exactly where it is now. Its deadline now bounds the caller rather than the
+transaction, so forge's `Duration::from_millis(500)` at `src/main.rs:1919` and
+anvil's at `workspace_ops.rs:1291` mean what they say.
+
 ## Previously completed
 
 - `src/supervised.rs` now owns every short-lived core helper used by host

@@ -129,6 +129,23 @@ v2 is selected only for a peer that has already advertised v2 support.
   Callers enforce their raw byte ceiling first; the preflight also rejects
   serde_json's private RawValue escape key before a feature-unified `Value`
   decoder can reinterpret its string as unchecked JSON.
+- The native ASCII organism: its simulation, attention model, and bounded
+  repo-scoped long-term memory. Only structured counters, a short transition
+  window, and a quantized life snapshot are stored; command text, output, and
+  PIDs never enter the file, which is capped at 512 KiB with bounded day,
+  observation, and pending-event ceilings. The memory path is caller-owned —
+  core has no opinion about where an app keeps state, and a wrong default is
+  indistinguishable from an organism that has never run. Durability is the
+  app's: every consumer must implement `organism_memory::MemoryScheduler` and
+  register it once at startup with `init_scheduler`, beside `identity::init`.
+  A durable update is a single cross-process transaction and must never run on
+  a UI thread. Not registering is not silent — the first write logs a warning
+  naming `init_scheduler`, `scheduler_is_registered()` answers a doctor
+  command, and core falls back to a writer thread of its own so the organism
+  still remembers — but the fallback is one thread with a bounded queue and no
+  knowledge of the app's other writes, so it is a floor rather than a lane.
+  `flush_pending(timeout)` belongs in the shutdown drain ahead of the app's own
+  persistence shutdown; its deadline bounds the caller, not the transaction.
 - Provider-neutral AI requests, bounded conversations, secret redaction, and
   the review-first `jagent` session surface. Request construction reports any
   omitted history, while system instructions are rejected rather than sampled
@@ -156,20 +173,30 @@ v2 is selected only for a peer that has already advertised v2 support.
    then unlink and sync the consumed private claim. A failed retirement barrier
    exposes no session and preserves the evidence; a failed post-unlink cleanup
    sync is logged but the already non-replayable live session remains usable.
-3. Restored argv boundaries are preserved. Legacy joined command strings may
+3. The ASCII organism's memory file follows the same lock-using store rules as
+   the execution journal: a private, user-owned parent directory, a fixed
+   `<memory>.lock` sidecar, and time-bounded `flock`s on both taken in one
+   order, then a bounded reread and private atomic replacement inside them. The
+   directory and its sidecar form one trust boundary, so neither can be
+   replaced to split the namespace. Events are released only after a
+   transaction succeeds, so a failed or dropped write delays an update rather
+   than losing it; once a path's queue holds its 256-event maximum, admission
+   rejects with `WouldBlock` and the in-memory view is deliberately held back
+   so it cannot diverge from disk.
+4. Restored argv boundaries are preserved. Legacy joined command strings may
    be read for migration but are never replayed.
-4. Model output is only a proposal. Every command requires explicit user
+5. Model output is only a proposal. Every command requires explicit user
    review; the historical read-only auto-approval hook always fails closed.
-5. UI event loops must adapt these synchronous primitives without moving GUI
+6. UI event loops must adapt these synchronous primitives without moving GUI
    objects across threads.
-6. Executable cache materialization (including the embedded jsh installer) is
+7. Executable cache materialization (including the embedded jsh installer) is
    private, bounded, no-follow, and content-verified before launch; custom
    themes and provider-key files use the same hostile-filesystem policy.
-7. Atomic replacement on Unix is relative to one validated directory
+8. Atomic replacement on Unix is relative to one validated directory
    descriptor (`openat`/`renameat`/`unlinkat`), so replacing a pathname during
    a save cannot redirect the commit. Shared writable parents require sticky
    semantics and temporary names include OS entropy.
-8. Git metadata subprocess output, queues, cache entries, waiters, branch
+9. Git metadata subprocess output, queues, cache entries, waiters, branch
    labels, and lifetime are bounded. Short-lived helpers are supervised under
    one absolute deadline; on Unix their root remains waitable until the fresh
    process group is cleared and is then synchronously reaped, including when a
@@ -180,16 +207,16 @@ v2 is selected only for a peer that has already advertised v2 support.
    splitting rejects oversized input and fence storms, and Pango rendering
    exposes control/invisible/bidirectional formatting instead of displaying a
    reordered review surface.
-9. Review-only text uses one shared visual-spoof predicate (non-ASCII spacing,
-   bidi, zero-width, and default-ignorable formatting). Prompt insertion,
-   restored argv, history metadata, shell-quoted paths, and theme names fail
-   closed; clipboard paste reports the risk for explicit confirmation.
-10. AI curl and jsh update-check pipes are drained nonblocking with byte/time
+10. Review-only text uses one shared visual-spoof predicate (non-ASCII spacing,
+    bidi, zero-width, and default-ignorable formatting). Prompt insertion,
+    restored argv, history metadata, shell-quoted paths, and theme names fail
+    closed; clipboard paste reports the risk for explicit confirmation.
+11. AI curl and jsh update-check pipes are drained nonblocking with byte/time
     caps and process-group cleanup. Slow consumers apply kernel backpressure;
     a descendant retaining stdout cannot pin a reader thread. Successful
     non-streaming AI bodies are decoded only after jagent's 1 MiB gate, while
     non-2xx JSON is parsed only within the 2 KiB diagnostic budget.
-11. A completed block is successful only when a frontend-resolved, non-blank
+12. A completed block is successful only when a frontend-resolved, non-blank
     command has an explicitly reported exit code of zero. An absent resolved
     command is background output, and a missing exit code remains unknown;
     neither is rewritten into a synthetic success or failure. Resolution must
