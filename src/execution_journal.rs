@@ -1362,6 +1362,26 @@ fn output_matches_expected(
 /// Inspect the exact inode snapshot protected by the writer's exclusive lock.
 /// A bound Output may be appended only while its complete Start remains the
 /// authoritative same-ID lifecycle and its output slot is still empty.
+///
+/// A Finish for that same generation does not close an *empty* slot. It cannot:
+/// jsh emits OSC 133 `D` and then appends its Finish on the same thread, in the
+/// next statement (`jsh/src/shell.rs`, "OSC 133;D must reach the terminal before
+/// the journal finish event is appended"), while a terminal only learns the
+/// command ended by parsing that `D` — from another process, through its own
+/// queue and this file's exclusive lock. The shell therefore wins that race
+/// essentially always, so a Finish that closed an empty slot would reject every
+/// terminal-contributed Output rather than only late ones. Measured against a
+/// real journal: of 2,014 lifecycles carrying terminal output, 2,014 are ordered
+/// Start, Finish, Output and none is ordered Start, Output, Finish.
+///
+/// What makes the late Output safe is the lifecycle token, not the Finish. The
+/// bound [`ExecutionLifecycle`] pins `id`, `session_id`, `seq` and
+/// `started_at_ms` to one exact Start generation, and `start_matches_lifecycle`
+/// re-checks all four against the authoritative on-disk Start under this lock,
+/// so a restart, a reused id or a compacted-away lifecycle still rejects. A
+/// Finish closes the slot only once something already occupies it: an existing
+/// Output, or a Finish conflict tombstone, both of which mean the terminal
+/// contribution for this generation has already been decided.
 fn inspect_bound_output_snapshot(
     journal: &mut File,
     current_len: u64,
@@ -1378,6 +1398,7 @@ fn inspect_bound_output_snapshot(
     let mut event_lines = 0usize;
     let mut active_lifecycle = false;
     let mut lifecycle_finished = false;
+    let mut finish_conflicted = false;
     let mut output_seen = false;
     let mut output_conflicted = false;
     let mut matching_outputs = 0usize;
@@ -1407,6 +1428,7 @@ fn inspect_bound_output_snapshot(
         if recognized_v1_start_id(&line).as_deref() == Some(lifecycle.id.as_str()) {
             active_lifecycle = false;
             lifecycle_finished = false;
+            finish_conflicted = false;
             output_seen = false;
             output_conflicted = false;
             matching_outputs = 0;
@@ -1432,9 +1454,12 @@ fn inspect_bound_output_snapshot(
                 && is_valid_jsh_cwd(&cwd_after) =>
             {
                 // Finish is the authoritative end of this exact Start
-                // generation. Captured terminal bytes that arrive later may
-                // still be useful to the UI, but they no longer have an open
-                // journal Output slot and must not be attached retroactively.
+                // generation, and the ordinary position for it is *before* the
+                // terminal's Output — the shell appends it in the statement
+                // after the `D` mark the terminal is still parsing. So it does
+                // not close an empty Output slot; it only means the physical
+                // tail can no longer prove that an existing Output is the one
+                // this writer appended.
                 lifecycle_finished = true;
             }
             Some(PersistedEvent::Output {
@@ -1488,23 +1513,34 @@ fn inspect_bound_output_snapshot(
             {
                 // A durable Finish conflict tombstone proves that the
                 // lifecycle's terminal-status slot was already consumed even
-                // though its value is intentionally unavailable.
-                lifecycle_finished = true;
+                // though its value is intentionally unavailable. Unlike an
+                // ordinary Finish this is an anomaly, not the expected order,
+                // so it fails closed and does close the Output slot.
+                finish_conflicted = true;
             }
             _ => {}
         }
     }
 
     Ok(
-        if !active_lifecycle || lifecycle_finished || output_conflicted {
+        if !active_lifecycle || output_conflicted || finish_conflicted {
             BoundOutputSnapshot::Rejected
         } else if output_seen {
-            if terminal_exact && matching_outputs == 1 {
+            // The barrier retry is only ever safe when the expected event is
+            // the whole physical tail, so the append that may or may not have
+            // committed is provably this one. A Finish anywhere in the
+            // generation breaks that proof: before the Output it means another
+            // writer was interleaved, after it means the tail is not ours.
+            if terminal_exact && matching_outputs == 1 && !lifecycle_finished {
                 BoundOutputSnapshot::ExactTerminal
             } else {
                 BoundOutputSnapshot::Rejected
             }
         } else {
+            // The slot is still empty. The lifecycle token — not the Finish —
+            // is what proves this output belongs to the authoritative Start,
+            // and `start_matches_lifecycle` has already checked all four of its
+            // fields above.
             BoundOutputSnapshot::Ready
         },
     )
@@ -2431,8 +2467,25 @@ mod tests {
         finished.extend_from_slice(finish);
         assert_eq!(
             inspect("finish-before-output", &finished, &expected_lifecycle),
+            BoundOutputSnapshot::Ready,
+            "a Finish does not close an empty Output slot: it is the ordinary \
+             order, because the shell appends it in the statement after the D \
+             mark the terminal is still parsing"
+        );
+
+        let mut finish_conflicted = start.clone();
+        finish_conflicted.extend_from_slice(
+            b"{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-bound-output\",\"slot\":\"finish\"}\n",
+        );
+        assert_eq!(
+            inspect(
+                "finish-tombstone-before-output",
+                &finish_conflicted,
+                &expected_lifecycle
+            ),
             BoundOutputSnapshot::Rejected,
-            "an authoritative Finish closes the durable Output slot"
+            "a Finish conflict tombstone is an anomaly, not the expected order, \
+             so it fails closed"
         );
 
         let replacement = ExecutionLifecycle {
@@ -2662,10 +2715,10 @@ mod tests {
         assert_eq!(no_write.write_calls.get(), 0);
         assert_eq!(fs::read(&path).unwrap(), torn_source);
 
-        let finish = b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-stale-output\",\"exit_code\":0,\"duration_ms\":1,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n";
-        let mut finished_source = lifecycle_start_line(&current_output.lifecycle);
-        finished_source.extend_from_slice(finish);
-        write_temporary_journal(&path, &finished_source);
+        let tombstone = b"{\"jsh_execution_version\":1,\"event\":\"conflict\",\"id\":\"jsh-stale-output\",\"slot\":\"finish\"}\n";
+        let mut tombstoned_source = lifecycle_start_line(&current_output.lifecycle);
+        tombstoned_source.extend_from_slice(tombstone);
+        write_temporary_journal(&path, &tombstoned_source);
         let error = append_encoded_event_to_path_with_line_limit_and_io_inner(
             &path,
             &current_encoded,
@@ -2676,7 +2729,66 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(no_write.write_calls.get(), 0);
-        assert_eq!(fs::read(&path).unwrap(), finished_source);
+        assert_eq!(fs::read(&path).unwrap(), tombstoned_source);
+    }
+
+    /// The order every real terminal produces, reproduced end to end.
+    ///
+    /// jsh emits OSC 133 `D` and appends its journal Finish in the next
+    /// statement on the same thread, while a terminal only learns the command
+    /// ended by parsing that `D` — from another process, through its own queue
+    /// and this file's exclusive lock. Measured over a real
+    /// `~/.local/state/jsh/executions.jsonl` with 11,492 events: of the 2,014
+    /// lifecycles that carry a terminal Output, 2,014 are ordered Start,
+    /// Finish, Output and none is ordered Start, Output, Finish. A rule that
+    /// closed the Output slot at Finish therefore did not reject *late* output;
+    /// it rejected *all* of it, silently, because `submit` is fire-and-forget.
+    #[test]
+    fn a_finish_that_precedes_the_terminal_output_still_accepts_it() {
+        let directory = TestDir::new("bound-output-after-finish");
+        let path = directory.0.join("executions.jsonl");
+        let lifecycle = lifecycle("jsh-after-finish");
+        let mut journal = lifecycle_start_line(&lifecycle);
+        journal.extend_from_slice(
+            b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-after-finish\",\"exit_code\":0,\"duration_ms\":4,\"cwd_after\":\"/tmp\",\"ended_at_ms\":5}\n",
+        );
+        write_temporary_journal(&path, &journal);
+
+        let (output, encoded) = encoded_bound_output(lifecycle.clone(), "captured");
+        append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &encoded,
+            MAX_JOURNAL_EVENT_LINES,
+            &SyncJournalAppendIo,
+            Some(&output),
+        )
+        .expect("a Finish must not close an empty Output slot");
+
+        let mut expected = journal.clone();
+        expected.extend_from_slice(&encoded);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+
+        // The reader folds it back onto the same record, which is the whole
+        // point: the sidebar shows the captured output beside jsh's own exit
+        // code and duration.
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].exit_code, Some(0));
+        assert_eq!(records[0].output.as_ref().unwrap().text, "captured");
+
+        // A second Output for the same finished lifecycle is still refused, so
+        // reopening the slot cannot become a rewrite channel.
+        let (_, again) = encoded_bound_output(lifecycle, "replacement");
+        let error = append_encoded_event_to_path_with_line_limit_and_io_inner(
+            &path,
+            &again,
+            MAX_JOURNAL_EVENT_LINES,
+            &SyncJournalAppendIo,
+            Some(&output),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), expected);
     }
 
     #[test]
