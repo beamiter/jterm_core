@@ -121,52 +121,49 @@ fn safe_display(text: &str, max_bytes: usize, multiline: bool) -> String {
 /// Whether one Unicode scalar is unsafe in text whose displayed spelling is a
 /// security boundary. Prefer [`contains_visual_spoofing`] for whole strings.
 ///
-/// Two ranges are kept wider than Unicode's current default-ignorable
-/// assignments: the unassigned specials `FFF0..=FFF8` and the entire
-/// supplementary tag plane `E0000..=E0FFF` (rather than the enumerated tag
-/// characters). A future format assignment inside a reserved range must fail
-/// closed without waiting for a release, while the assigned interlinear
-/// annotation anchors (`FFF9..=FFFB`) and Egyptian layout controls
-/// (`U+13430` onward) stay allowed because Unicode does not classify them as
-/// default-ignorable.
+/// This is `jagent::is_unsafe_invisible_char` under the family's historical
+/// name, not a second opinion about it. The two tables used to be identical
+/// copies with nothing binding them, which is the failure jagent's own doc
+/// names: "a copy stops widening the day this one does, and nothing fails
+/// until a reply aims at the difference". jagent is the crate every model
+/// reply crosses before becoming a proposal, and it promises this set may be
+/// widened and never narrowed, so core delegating to it means a code point
+/// jagent starts refusing is refused here in the same release — across all
+/// four apps and every core surface that renders untrusted text, not just the
+/// agent path.
+///
+/// Two ranges are wider than Unicode's current default-ignorable assignments:
+/// the unassigned specials `FFF0..=FFF8` and the entire supplementary tag
+/// plane `E0000..=E0FFF` (rather than the enumerated tag characters). A future
+/// format assignment inside a reserved range must fail closed without waiting
+/// for a release, while the assigned interlinear annotation anchors
+/// (`FFF9..=FFFB`) and Egyptian layout controls (`U+13430` onward) stay
+/// allowed because Unicode does not classify them as default-ignorable.
+/// Terminal-rendered surfaces need the annotation anchors refused as well;
+/// that is [`is_terminal_visual_spoofing_character`], deliberately kept as a
+/// separate strict superset rather than pushed into this shared contract.
 pub fn is_visual_spoofing_character(ch: char) -> bool {
-    (ch.is_whitespace() && ch != ' ')
-        || matches!(
-            ch,
-            // Unicode default-ignorable and bidi formatting code points that can
-            // make reviewed shell text display differently from the bytes the
-            // child receives. This boundary intentionally errs on the strict side:
-            // a command can spell these explicitly (for example with printf) when
-            // they are genuinely data.
-            '\u{00ad}'
-                | '\u{034f}'
-                | '\u{061c}'
-                | '\u{115f}'..='\u{1160}'
-                | '\u{17b4}'..='\u{17b5}'
-                | '\u{180b}'..='\u{180f}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{3164}'
-                | '\u{fe00}'..='\u{fe0f}'
-                | '\u{feff}'
-                | '\u{ffa0}'
-                | '\u{fff0}'..='\u{fff8}'
-                | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0000}'..='\u{e0fff}'
-        )
+    jagent::is_unsafe_invisible_char(ch)
 }
 
 /// Whether a scalar is ambiguous specifically on a terminal-rendered surface.
 ///
-/// U+FFF9..=U+FFFB are assigned interlinear annotation controls, so the
-/// generic review contract above deliberately does not call them Unicode
-/// default-ignorables. Terminal renderers used by the family nevertheless
-/// display them as nothing. OSC chrome, notifications, shell metadata and cwd
-/// correlation therefore use this stricter predicate while review-only APIs
-/// retain their established contract.
-pub(crate) fn is_terminal_visual_spoofing_character(ch: char) -> bool {
+/// The contract: everything [`is_visual_spoofing_character`] refuses, plus the
+/// assigned interlinear annotation controls `U+FFF9..=U+FFFB`. That is the one
+/// and only difference, and it is a strict superset — never a different
+/// opinion about a code point the shared rule allows.
+///
+/// U+FFF9..=U+FFFB carry a Unicode general category that is not
+/// Default_Ignorable_Code_Point, so the shared review contract, which core now
+/// takes from `jagent`, deliberately allows them. Every terminal this family
+/// renders in nevertheless draws them as nothing, so on a terminal surface
+/// they hide text exactly the way a zero-width space does. Anything whose
+/// displayed spelling is correlated with a shell's own state — an OSC 133
+/// cwd or command, notification chrome, journal metadata — must use this
+/// predicate; ember and frost could not, because it was `pub(crate)` while
+/// core's parser had already begun enforcing it on the OSC 133 text those two
+/// apps read back.
+pub fn is_terminal_visual_spoofing_character(ch: char) -> bool {
     is_visual_spoofing_character(ch) || matches!(ch, '\u{fff9}'..='\u{fffb}')
 }
 
@@ -235,6 +232,58 @@ mod tests {
         }
         assert!(!is_visual_spoofing_character('\u{13430}'));
         assert!(!is_terminal_visual_spoofing_character('\u{13430}'));
+    }
+
+    /// One character from every class the two predicates disagree about or
+    /// agree about, asserted from BOTH sides.
+    ///
+    /// The shared rule must be jagent's answer, not a copy of it that happens
+    /// to match today, and the terminal rule must be a strict superset of the
+    /// shared one — the exact contract ember and frost now build on. A jagent
+    /// widening therefore lands here for free, and a jagent narrowing (which
+    /// its own doc forbids) fails this suite instead of quietly reopening
+    /// every core surface that renders untrusted text.
+    #[test]
+    fn the_shared_rule_is_jagents_and_the_terminal_rule_is_its_strict_superset() {
+        // Exhaustive over every Unicode scalar, not a sample. A sampled table
+        // cannot detect the thing this test exists to detect: a future edit
+        // that re-inlines a copy of jagent's ranges here, which would agree on
+        // whatever characters the table happened to list and diverge on the
+        // one it did not.
+        //
+        // The first assertion is trivially true while the body of
+        // `is_visual_spoofing_character` is a delegate — that is the point, and
+        // it is what makes a re-inlined copy fail here instead of in
+        // production. The second is the real content: the terminal rule has its
+        // own implementation, and the contract says it is the shared rule plus
+        // exactly `U+FFF9..=U+FFFB` — no more, and no different opinion about
+        // anything the shared rule allows.
+        const ANNOTATION_ANCHORS: std::ops::RangeInclusive<char> = '\u{fff9}'..='\u{fffb}';
+        let mut extra = 0_u32;
+        for scalar in 0..=0x10_FFFF_u32 {
+            let Some(ch) = char::from_u32(scalar) else {
+                continue;
+            };
+            let shared = is_visual_spoofing_character(ch);
+            assert_eq!(
+                shared,
+                jagent::is_unsafe_invisible_char(ch),
+                "U+{scalar:04X} forks the shared contract"
+            );
+            assert_eq!(
+                is_terminal_visual_spoofing_character(ch),
+                shared || ANNOTATION_ANCHORS.contains(&ch),
+                "U+{scalar:04X} is a difference the documented contract does not allow"
+            );
+            if is_terminal_visual_spoofing_character(ch) && !shared {
+                extra += 1;
+            }
+        }
+        assert_eq!(
+            extra, 3,
+            "the terminal rule must refuse exactly the three interlinear \
+             annotation anchors beyond the shared rule"
+        );
     }
 
     #[test]

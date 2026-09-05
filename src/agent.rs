@@ -16,7 +16,14 @@ pub use jagent::capabilities::{
 };
 pub use jagent::provider::{Message as AgentMessage, Provider as AgentProvider, Role as AgentRole};
 pub use jagent::response::{AgentResponse, AgentStream};
-pub use jagent::safety::is_dangerous;
+// jagent owns the shared command-text contract: the ceiling, the typed reason,
+// and the check itself. Re-exported rather than reimplemented so the four apps
+// and this crate enforce one rule — a local copy of the ceiling or of the
+// predicate stops widening the day jagent's does, and nothing fails until a
+// model reply aims at the difference.
+pub use jagent::safety::{
+    is_dangerous, validate_command_text, CommandTextError, MAX_COMMAND_BYTES,
+};
 pub use jagent::session::{
     parse_action, sample_observation, AgentSessionSnapshot, AgentSnapshotError, AgentState,
     ApprovedCommand, CancellationToken, CommandExecutionFailure, CommandExecutionOutcome,
@@ -24,13 +31,11 @@ pub use jagent::session::{
     MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
 pub use jagent::tools::AgentProtocol;
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_SESSION_TURNS: u32 = 1_000;
 const MAX_STORED_TRANSCRIPT_ENTRIES: usize = 128;
 const MAX_STORED_TRANSCRIPT_BYTES: usize = 128 * 1024;
-const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_OBSERVATION_BYTES: usize = 4 * 1024;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_THOUGHT_BYTES: usize = 4 * 1024;
@@ -279,6 +284,37 @@ impl AgentSession {
     }
 }
 
+/// The family's own ceilings on a persisted snapshot, applied before jagent's
+/// restore audits the same document.
+///
+/// This used to carry a ~135-line near-copy of jagent's
+/// `validate_snapshot_lifecycle`: the same state/final-turn binding, the same
+/// turn-counter arithmetic, the same approved-proposal outcome rule, and a
+/// duplicate of its documented-diagnostic matcher. A copy of a rule that runs
+/// FIRST is the worst place for one to rot, because the weaker of the two is
+/// then the one that always answers — and it had already rotted. jagent has
+/// since gained transcript-shape adjacency rules the copy never had (a model
+/// action must follow a model-request boundary, a thought must sit against its
+/// own action, a protocol error needs an outstanding operation, an observation
+/// must immediately follow its approved proposal), and two of the copy's reason
+/// strings had drifted from the wording the user actually reads.
+///
+/// So the lifecycle is jagent's now. What stays here is what jagent's restore
+/// does not decide the same way:
+///
+/// * the transcript's ENCODED size. jagent bounds the prompt reconstruction of
+///   a transcript at 128 KiB and one whole snapshot document at
+///   [`MAX_AGENT_SNAPSHOT_JSON_BYTES`] (256 KiB); neither is a bound on the
+///   JSON the family actually writes to `agent_session.json` and reads back.
+/// * a stale next proposal id. jagent REPAIRS one, taking the maximum of the
+///   stored value and `highest + 1`. Proposal ids are the binding between an
+///   approval card and the command handed back on approval, so a document whose
+///   counter disagrees with its own transcript is evidence of editing, and this
+///   family refuses it rather than continuing from a silently corrected value.
+/// * the per-turn text budgets. jagent enforces the same numbers today, but
+///   these are the family's own ceilings — the apps size their storage and
+///   their panels against these constants — so they are checked here rather
+///   than assumed to stay wherever jagent's happen to sit.
 fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapshotError> {
     // jagent decoded this immutable view through allocation-aware seeds. Audit
     // it directly: re-serializing into an ordinary `Vec<Turn>` decoder would
@@ -298,75 +334,36 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
         ));
     }
 
+    // No wildcard arm: a turn variant jagent adds must be a compile error
+    // here, not a shape that silently carries unbudgeted text.
     let mut highest_proposal_id = 0_u64;
-    let mut proposal_statuses: HashMap<u64, (ProposalStatus, usize)> = HashMap::new();
-    let mut pending_proposal = None;
-    let mut observed_proposals = HashSet::new();
-    let mut model_actions = 0_u32;
-    let mut protocol_errors = 0_u32;
-    for (index, turn) in transcript.iter().enumerate() {
+    for turn in transcript {
         match turn {
-            Turn::User(message) => {
+            Turn::User(message) | Turn::AssistantSay(message) => {
                 validate_snapshot_text(message, MAX_MESSAGE_BYTES, true)?;
-            }
-            Turn::AssistantSay(message) => {
-                validate_snapshot_text(message, MAX_MESSAGE_BYTES, true)?;
-                model_actions = model_actions.saturating_add(1);
             }
             Turn::AssistantThought(thought) => {
                 validate_snapshot_text(thought, MAX_THOUGHT_BYTES, true)?;
             }
-            Turn::AssistantProposed {
-                id,
-                command,
-                status,
-            } => {
-                model_actions = model_actions.saturating_add(1);
-                let id_value = id.get();
-                if id_value == 0 || id_value <= highest_proposal_id {
-                    return Err(AgentSnapshotError::Invalid(
-                        "proposal ids are zero, duplicated, or out of order",
-                    ));
-                }
-                validate_snapshot_command(command)?;
-                highest_proposal_id = id_value;
-                proposal_statuses.insert(id_value, (*status, index));
-                if *status == ProposalStatus::Pending
-                    && pending_proposal.replace((*id, index)).is_some()
-                {
-                    return Err(AgentSnapshotError::Invalid(
-                        "snapshot contains multiple pending proposals",
-                    ));
-                }
+            Turn::AssistantProposed { id, .. } => {
+                highest_proposal_id = highest_proposal_id.max(id.get());
             }
-            Turn::Observation {
-                proposal_id,
-                output_sample,
-                ..
-            } => {
-                if proposal_id.get() == 0 || output_sample.len() > MAX_OBSERVATION_BYTES {
+            Turn::Observation { output_sample, .. } => {
+                if output_sample.len() > MAX_OBSERVATION_BYTES {
                     return Err(AgentSnapshotError::Invalid(
                         "observation violates its safety bounds",
-                    ));
-                }
-                if proposal_statuses
-                    .get(&proposal_id.get())
-                    .map(|(status, _)| status)
-                    != Some(&ProposalStatus::Approved)
-                    || !observed_proposals.insert(proposal_id.get())
-                {
-                    return Err(AgentSnapshotError::Invalid(
-                        "observation does not identify one approved proposal",
                     ));
                 }
             }
             Turn::ProtocolError(message) => {
                 validate_snapshot_text(message, MAX_MESSAGE_BYTES, false)?;
-                protocol_errors = protocol_errors.saturating_add(1);
             }
         }
     }
 
+    // Ordering, duplication and every id/status/state binding are jagent's;
+    // only the counter's own consistency with the transcript is decided here,
+    // because that is the one jagent repairs instead of refusing.
     if snapshot.next_proposal_id() == 0
         || snapshot.next_proposal_id() == u64::MAX
         || snapshot.next_proposal_id() <= highest_proposal_id
@@ -375,185 +372,7 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
             "next proposal id is stale or exhausted",
         ));
     }
-
-    // Every retained proposal/say consumed one model turn. A ProtocolError may
-    // be either a parse failure (one turn) or a transport failure (no turn),
-    // which gives an exact range while the transcript is untruncated.
-    let turns_used = snapshot.turns_used();
-    if turns_used < model_actions
-        || (!snapshot.transcript_truncated()
-            && turns_used > model_actions.saturating_add(protocol_errors))
-    {
-        return Err(AgentSnapshotError::Invalid(
-            "turn counter is inconsistent with the transcript",
-        ));
-    }
-
-    // An empty transcript is rejected by jagent's own restore below; every
-    // remaining check reasons about the final turn, so there is nothing more
-    // to audit on one here.
-    let Some(final_index) = transcript.len().checked_sub(1) else {
-        return Ok(());
-    };
-    let final_turn = &transcript[final_index];
-
-    // The state must bind to the transcript's final turn: an approval card
-    // (or an in-flight execution) anywhere else would split the reviewed UI
-    // identity from the session's authorizable action.
-    match snapshot.state() {
-        AgentState::AwaitingApproval { proposal_id }
-            if pending_proposal == Some((proposal_id, final_index)) => {}
-        AgentState::AwaitingApproval { .. } => {
-            return Err(AgentSnapshotError::Invalid(
-                "approval state does not identify the final pending proposal",
-            ));
-        }
-        AgentState::AwaitingObservation { proposal_id }
-            if pending_proposal.is_none()
-                && proposal_statuses.get(&proposal_id.get())
-                    == Some(&(ProposalStatus::Approved, final_index))
-                && !observed_proposals.contains(&proposal_id.get()) => {}
-        AgentState::AwaitingObservation { .. } => {
-            return Err(AgentSnapshotError::Invalid(
-                "observation state does not identify the final unobserved approved proposal",
-            ));
-        }
-        _ if pending_proposal.is_some() => {
-            return Err(AgentSnapshotError::Invalid(
-                "pending proposal exists outside approval state",
-            ));
-        }
-        _ => {}
-    }
-
-    // Terminal and waiting states must match the final turn's shape exactly
-    // the way the live transitions produce it.
-    let final_state_is_valid = match snapshot.state() {
-        AgentState::Ready => {
-            turns_used < snapshot.max_turns()
-                && matches!(
-                    final_turn,
-                    Turn::AssistantSay(_)
-                        | Turn::ProtocolError(_)
-                        | Turn::AssistantProposed {
-                            status: ProposalStatus::ManualReview,
-                            ..
-                        }
-                )
-        }
-        AgentState::AwaitingModel => {
-            turns_used < snapshot.max_turns()
-                && matches!(
-                    final_turn,
-                    Turn::User(_)
-                        | Turn::ProtocolError(_)
-                        | Turn::Observation { .. }
-                        | Turn::AssistantProposed {
-                            status: ProposalStatus::Rejected,
-                            ..
-                        }
-                )
-        }
-        // Both in-flight states were pinned to the final turn above.
-        AgentState::AwaitingApproval { .. } | AgentState::AwaitingObservation { .. } => true,
-        AgentState::Completed => matches!(final_turn, Turn::AssistantSay(_)),
-        AgentState::TurnLimitReached => {
-            turns_used == snapshot.max_turns()
-                && matches!(
-                    final_turn,
-                    Turn::AssistantSay(_)
-                        | Turn::ProtocolError(_)
-                        | Turn::Observation { .. }
-                        | Turn::AssistantProposed {
-                            status: ProposalStatus::Rejected | ProposalStatus::ManualReview,
-                            ..
-                        }
-                )
-        }
-        AgentState::Cancelled => false,
-    };
-    if !final_state_is_valid {
-        return Err(AgentSnapshotError::Invalid(
-            "session state does not match the final transcript turn or budget",
-        ));
-    }
-
-    // An approved proposal's fate must be recorded: either its observation is
-    // in the transcript, or it is the one in-flight execution the
-    // AwaitingObservation state names, or — the shape jagent's
-    // AwaitingObservation restore normalization produces — its unknown result
-    // is documented by the note that normalization appended immediately after
-    // it. Anything else silently erases the command's outcome.
-    for (proposal_id, (status, index)) in &proposal_statuses {
-        if *status != ProposalStatus::Approved {
-            continue;
-        }
-        let is_current_unobserved = matches!(
-            snapshot.state(),
-            AgentState::AwaitingObservation {
-                proposal_id: current
-            } if current.get() == *proposal_id
-        );
-        if observed_proposals.contains(proposal_id) {
-            // The state arm above already proved the AwaitingObservation
-            // proposal is unobserved, so an observed proposal can never be the
-            // in-flight one.
-            if is_current_unobserved {
-                return Err(AgentSnapshotError::Invalid(
-                    "approved proposal observation lifecycle is inconsistent",
-                ));
-            }
-            continue;
-        }
-        if !is_current_unobserved
-            && !is_documented_unknown_result(transcript.get(index + 1), *proposal_id)
-        {
-            return Err(AgentSnapshotError::Invalid(
-                "approved proposal observation lifecycle is inconsistent",
-            ));
-        }
-    }
     Ok(())
-}
-
-fn is_documented_unknown_result(turn: Option<&Turn>, proposal_id: u64) -> bool {
-    let Some(Turn::ProtocolError(message)) = turn else {
-        return false;
-    };
-    // 0.6 and 0.7 both normalize a process lost during execution, but 0.7
-    // generalized the note to the same diagnostic framing used by explicit
-    // execution failures. Accept only those two exact, proposal-bound forms;
-    // arbitrary protocol text must not erase an approved command's fate.
-    if message
-        == &format!(
-            "the application exited before proposal #{proposal_id}'s output was observed; its \
-             result is unknown"
-        )
-        || message
-            == &format!(
-                "command execution for proposal #{proposal_id} has an unknown result: the \
-                 application exited before its output was observed; no normal exit status was \
-                 available"
-            )
-    {
-        return true;
-    }
-
-    ["failed to start", "timed out", "was cancelled"]
-        .into_iter()
-        .any(|failure| {
-            let prefix = format!(
-                "command execution for proposal #{proposal_id} {failure}; no normal exit status \
-                 was available"
-            );
-            if message == &format!("{prefix}.") {
-                return true;
-            }
-            let detail_prefix = format!("{prefix}. Untrusted diagnostic or partial output:\n");
-            message.strip_prefix(&detail_prefix).is_some_and(|detail| {
-                !detail.trim().is_empty() && detail.len() <= MAX_OBSERVATION_BYTES
-            })
-        })
 }
 
 fn validate_snapshot_text(
@@ -569,25 +388,39 @@ fn validate_snapshot_text(
     Ok(())
 }
 
-fn validate_snapshot_command(command: &str) -> Result<(), AgentSnapshotError> {
-    validate_agent_command(command)
-        .map_err(|_| AgentSnapshotError::Invalid("proposal command violates its safety bounds"))
-}
-
+/// The family's `&'static str` spelling of jagent's command-text contract.
+///
+/// The rule itself is [`validate_command_text`]; this is only the mapping from
+/// its typed reason onto the strings this module has always returned, which
+/// reach the user through [`ParseError::InvalidCommand`]. The reimplementation
+/// this replaces had already drifted in shape from jagent's (it checked empty
+/// before size, and knew nothing of the line-break case), and a fork of the
+/// invisible-character table is exactly the failure the shared crate exists to
+/// prevent.
 fn validate_agent_command(command: &str) -> Result<(), &'static str> {
-    if command.trim().is_empty() {
-        return Err("command must not be empty");
-    }
-    if command.len() > MAX_COMMAND_BYTES {
-        return Err("command exceeds the 16384-byte safety limit");
-    }
-    if command.chars().any(char::is_control) {
-        return Err("command contains a control character");
-    }
-    if crate::review_input::contains_visual_spoofing(command) {
-        return Err("command contains invisible or bidirectional formatting");
-    }
-    Ok(())
+    validate_command_text(command)
+        .map(|_| ())
+        .map_err(|error| match error {
+            CommandTextError::Empty => "command must not be empty",
+            // The literal byte count is pinned to jagent's ceiling by a test,
+            // so a change there is a red suite rather than a message that
+            // quotes a limit the code no longer enforces.
+            CommandTextError::TooLarge => "command exceeds the 16384-byte safety limit",
+            // jagent separates a line break from other controls; this module
+            // never has, and a line break IS a control character, so keep the
+            // spelling the family already ships rather than introduce a new
+            // user-visible string for text that was refused before.
+            CommandTextError::LineBreak | CommandTextError::ControlCharacter => {
+                "command contains a control character"
+            }
+            CommandTextError::VisualSpoof => {
+                "command contains invisible or bidirectional formatting"
+            }
+            // `CommandTextError` is `#[non_exhaustive]`: a reason jagent adds
+            // must still refuse the command here, with a reason that does not
+            // claim to know more than it does.
+            _ => "command violates the shared command-text contract",
+        })
 }
 
 fn invalid_command_error(reason: &'static str) -> SessionError {
@@ -1338,6 +1171,11 @@ mod tests {
 
     #[test]
     fn restore_rejects_duplicate_ids_before_approval_can_bind_to_the_wrong_command() {
+        // The planted turn is Rejected, and the counter follows it, so the
+        // document satisfies every transcript-shape rule that runs before the
+        // id rule: a model action may follow a rejected proposal. Anything
+        // else (an approved planted turn, say) is refused one rule earlier for
+        // its shape, which would leave the id binding itself untested.
         let snapshot = snapshot_with_json_mutation(|value| {
             let proposal_id = value
                 .pointer("/state/AwaitingApproval/proposal_id")
@@ -1354,10 +1192,11 @@ mod tests {
                     "AssistantProposed": {
                         "id": proposal_id,
                         "command": "rm -rf important-data",
-                        "status": "Approved"
+                        "status": "Rejected"
                     }
                 }),
             );
+            value["turns_used"] = serde_json::json!(2);
         });
 
         assert!(matches!(
@@ -1382,9 +1221,17 @@ mod tests {
             value["state"] = serde_json::json!({"AwaitingApproval": {"proposal_id": 2}});
             value["next_proposal_id"] = serde_json::json!(3);
         });
+        // Two pending proposals can no longer be spelled at all: a model
+        // action must follow a user turn, an observation, a diagnostic, or a
+        // REJECTED proposal, so the second one is refused for its position
+        // before the multiple-pending rule is ever consulted. Strictly
+        // stronger than the rule this used to name, and the reason string is
+        // what the user reads, so it is the one pinned here.
         assert!(matches!(
             AgentSession::restore(multiple_pending),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("multiple pending")
+            Err(AgentSnapshotError::Invalid(
+                "model action does not follow a model-request boundary"
+            ))
         ));
 
         let approved_but_awaiting_approval = snapshot_with_json_mutation(|value| {
@@ -1415,6 +1262,72 @@ mod tests {
         assert!(matches!(
             AgentSession::restore(pending_but_awaiting_observation),
             Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation state")
+        ));
+    }
+
+    /// The two answers core still gives that jagent's own restore does not.
+    ///
+    /// Both are asserted against jagent directly as well, because a check that
+    /// only duplicates jagent's is worse than none: it runs first, so the
+    /// weaker copy would be the one that always answers.
+    #[test]
+    fn the_family_budget_and_the_stale_counter_are_still_cores_own_answer() {
+        // jagent bounds a transcript by the size of the PROMPT it reconstructs,
+        // which is not the size of the document this family writes to disk and
+        // reads back. JSON escaping is the whole gap: a message of quote
+        // characters doubles on the wire and does not grow the prompt at all.
+        let mut turns = Vec::new();
+        for id in 1..=8 {
+            turns.push(serde_json::json!({ "User": "\"".repeat(8 * 1024) }));
+            turns.push(serde_json::json!({
+                "AssistantProposed": {"command": "printf x", "id": id, "status": "Rejected"}
+            }));
+        }
+        let encoded = serde_json::json!({
+            "version": 1,
+            "transcript": turns,
+            "transcript_truncated": false,
+            "state": "AwaitingModel",
+            "turns_used": 8,
+            "max_turns": 100,
+            "next_proposal_id": 9,
+        })
+        .to_string();
+        let wide = AgentSessionSnapshot::from_json(&encoded)
+            .expect("jagent's own document ceiling accepts this");
+        assert!(
+            serde_json::to_vec(wide.transcript()).unwrap().len() > MAX_STORED_TRANSCRIPT_BYTES,
+            "the fixture must actually exceed the family's stored-transcript budget"
+        );
+        assert!(
+            jagent::session::AgentSession::restore(wide.clone()).is_ok(),
+            "jagent restores this; the refusal below is this family's own budget"
+        );
+        assert!(matches!(
+            AgentSession::restore(wide),
+            Err(AgentSnapshotError::Invalid(
+                "transcript exceeds its byte limit"
+            ))
+        ));
+
+        // jagent REPAIRS a next proposal id that has fallen behind its own
+        // transcript, by taking the maximum of the stored value and
+        // `highest + 1`. A counter that disagrees with the transcript it was
+        // saved beside is evidence the document was edited, and proposal ids
+        // are what bind an approval card to the command handed back on
+        // approval, so this family refuses the document instead.
+        let stale = snapshot_with_json_mutation(|value| {
+            value["next_proposal_id"] = serde_json::json!(1);
+        });
+        assert!(
+            jagent::session::AgentSession::restore(stale.clone()).is_ok(),
+            "jagent repairs the counter; the refusal below is this family's own"
+        );
+        assert!(matches!(
+            AgentSession::restore(stale),
+            Err(AgentSnapshotError::Invalid(
+                "next proposal id is stale or exhausted"
+            ))
         ));
     }
 
@@ -1450,7 +1363,10 @@ mod tests {
 
         // Hidden: the sole pending status sits on an older proposal behind a
         // newer final one. An approval card bound to it would authorize a
-        // command the user never saw as current.
+        // command the user never saw as current. The shape is now refused for
+        // its position — nothing may follow a pending proposal, because the
+        // model cannot be asked for anything while a card is open — so the
+        // covering turn is rejected before the approval binding is examined.
         let mut hidden = base.clone();
         let mut seen = 0;
         for turn in hidden["transcript"].as_array_mut().unwrap() {
@@ -1463,11 +1379,17 @@ mod tests {
         hidden["state"] = serde_json::json!({"AwaitingApproval": {"proposal_id": 1}});
         assert!(matches!(
             AgentSession::restore(decode_snapshot_json(&hidden)),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("approval state")
+            Err(AgentSnapshotError::Invalid(
+                "model action does not follow a model-request boundary"
+            ))
         ));
 
         // Covered: the pending proposal is buried under a later turn, so the
-        // visible final turn and the authorizable action disagree.
+        // visible final turn and the authorizable action disagree. A
+        // diagnostic needs an outstanding model request or an approved
+        // command's result to belong to, and a pending card is neither, so a
+        // persisted diagnostic cannot manufacture a boundary that hides a
+        // card.
         let mut covered = base;
         covered["transcript"]
             .as_array_mut()
@@ -1475,18 +1397,24 @@ mod tests {
             .push(serde_json::json!({"ProtocolError": "cover pending proposal"}));
         assert!(matches!(
             AgentSession::restore(decode_snapshot_json(&covered)),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("approval state")
+            Err(AgentSnapshotError::Invalid(
+                "protocol error has no outstanding operation"
+            ))
         ));
     }
 
     #[test]
     fn restore_rejects_an_unobserved_approved_proposal_outside_observation_state() {
         // The state machine only reaches Ready with a final AssistantSay,
-        // ProtocolError, or manual-review proposal, so burying an unobserved
-        // approved proposal under a say keeps every other check satisfied and
-        // isolates the lifecycle rule: without AwaitingObservation (whose
-        // restore normalization records an explicit unknown-result note) the
-        // command's fate would be silently erased.
+        // ProtocolError, or manual-review proposal, so this buries an
+        // unobserved approved proposal under a say: without
+        // AwaitingObservation (whose restore normalization records an explicit
+        // unknown-result note) the command's fate would be silently erased.
+        // The burial is now refused for its shape — the only turns that may
+        // follow an approved proposal are its observation or a diagnostic that
+        // documents its result, both of which record the fate — so the
+        // outcome rule this used to name has become unreachable rather than
+        // optional.
         let mut buried = rejected_then_pending_snapshot_json();
         let mut seen = 0;
         for turn in buried["transcript"].as_array_mut().unwrap() {
@@ -1504,7 +1432,9 @@ mod tests {
         buried["turns_used"] = serde_json::json!(3);
         assert!(matches!(
             AgentSession::restore(decode_snapshot_json(&buried)),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+            Err(AgentSnapshotError::Invalid(
+                "model action does not follow a model-request boundary"
+            ))
         ));
 
         // The same shape as the final turn in Ready fails the state/final-turn
@@ -1603,7 +1533,9 @@ mod tests {
         );
         assert!(matches!(
             AgentSession::restore(decode_snapshot_json(&wrong_proposal)),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+            Err(AgentSnapshotError::Invalid(
+                "protocol error has no outstanding operation"
+            ))
         ));
 
         let mut smuggled = execution_failure_snapshot_json(CommandExecutionFailure::TimedOut, "");
@@ -1613,7 +1545,9 @@ mod tests {
         );
         assert!(matches!(
             AgentSession::restore(decode_snapshot_json(&smuggled)),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+            Err(AgentSnapshotError::Invalid(
+                "protocol error has no outstanding operation"
+            ))
         ));
 
         let mut oversized = execution_failure_snapshot_json(CommandExecutionFailure::Cancelled, "");
@@ -1624,7 +1558,9 @@ mod tests {
         ));
         assert!(matches!(
             AgentSession::restore(decode_snapshot_json(&oversized)),
-            Err(AgentSnapshotError::Invalid(reason)) if reason.contains("observation lifecycle")
+            Err(AgentSnapshotError::Invalid(
+                "protocol error has no outstanding operation"
+            ))
         ));
     }
 
@@ -1887,6 +1823,54 @@ mod tests {
             SessionError::Protocol(ParseError::InvalidCommand(_))
         ));
         assert_eq!(tool_session.state(), AgentState::Ready);
+    }
+
+    /// The command rule is jagent's; this module only names its reasons.
+    ///
+    /// Every reason the family shipped before delegation still has to come
+    /// back for the same input, and the one message that quotes a number has
+    /// to quote the number jagent actually enforces.
+    #[test]
+    fn the_command_contract_is_jagents_and_every_family_reason_survives_it() {
+        assert_eq!(
+            MAX_COMMAND_BYTES,
+            16 * 1024,
+            "the TooLarge reason spells this limit out, so it cannot drift silently"
+        );
+        for (command, reason) in [
+            ("   ", "command must not be empty"),
+            (
+                &"x".repeat(MAX_COMMAND_BYTES + 1),
+                "command exceeds the 16384-byte safety limit",
+            ),
+            (
+                "printf one\nprintf two",
+                "command contains a control character",
+            ),
+            ("printf \u{1b}[31m", "command contains a control character"),
+            (
+                "printf safe\u{202e}gnp.exe",
+                "command contains invisible or bidirectional formatting",
+            ),
+        ] {
+            assert_eq!(validate_agent_command(command), Err(reason), "{command:?}");
+        }
+        assert_eq!(validate_agent_command("printf safe"), Ok(()));
+        // The rule really is jagent's, not a copy that agrees today.
+        for command in [
+            "   ",
+            "printf one\nprintf two",
+            "printf \u{1b}[31m",
+            "printf safe\u{202e}gnp.exe",
+            "printf safe\u{e0000}",
+            "printf safe",
+        ] {
+            assert_eq!(
+                validate_agent_command(command).is_ok(),
+                validate_command_text(command).is_ok(),
+                "{command:?} forks jagent's command-text contract"
+            );
+        }
     }
 
     #[test]

@@ -487,6 +487,149 @@ four terminals had each been carrying a private copy of.
   bytes through, and the oversized APC/DCS discard states abort and reprocess
   a non-ST escape exactly like the OSC discard state.
 
+## 2026-09-05 jagent delegation round
+
+- `src/command_correction.rs` closes the pipe-to-interpreter gate, which was a
+  strict subset of jagent's and whose drift test could not see the gap.
+  `PIPE_INTERPRETERS` listed 19 names; `jagent::safety::is_interpreter`
+  recognises the Linux personality wrappers (`unshare`, `nsenter`, and
+  `setarch`'s `uname26`/`linux32`/`linux64`/`i386`/`i486`/`i586`/`i686`/
+  `athlon`/`x86_64` aliases) and `script` as interpreters in their own right,
+  and reaches one through a child argv for `setarch`, `systemd-run`, `capsh`
+  and `start-stop-daemon`. `validate_candidate` is the only gate between a
+  model- or hostile-target-derived candidate and an auto-focused, pre-filled
+  command field, and the marker-superset rule is structurally blind to a pipe
+  the original already carries, so `ls -l | head` -> `ls -l | unshare -r sh`
+  was offered. The twelve bare-interpreter names joined `PIPE_INTERPRETERS`;
+  the four dispatchers joined `STAGE_PREFIXES` instead, because a name that
+  runs nothing on its own must be stepped over so the scan judges the program
+  it actually dispatches — which is also what jagent does, and is why
+  `| setarch` alone is still not a refusal while `| setarch x86_64 sh` is.
+  `STAGE_PREFIXES` also gained the six privilege dispatchers it was missing.
+  Their operands are a known limit rather than a closed one: the scan skips
+  words that *begin* with `-`, not the separate value an option may take, so
+  `| runuser -u root sh` resolves to the program `root` and is not seen through
+  to the `sh`. Skipping the word after every option would be wrong the other
+  way — `unshare -r sh` takes no value there and the `sh` would be lost — and
+  choosing correctly needs per-option arity, which is jagent's job.
+  `a_dispatcher_option_value_still_hides_the_interpreter_from_this_scan` pins
+  the gap so a future improvement has a red test to flip, and records why it
+  stays narrow: the privilege rule refuses any candidate that introduces one of
+  the nine elevation programs at all, and `adds_pipe_to_interpreter` still asks
+  jagent about the whole candidate, so a pipeline carrying network provenance
+  is refused regardless.
+
+  The test that claimed to prevent this drift iterated over
+  `PIPE_INTERPRETERS`, so a name jagent knew and this module did not could
+  never be reached: it was blind to exactly the gap it guarded. It now walks a
+  table fixed in the test — the sixteen missing names, the thirteen it already
+  checked, the rest of the module's own set, and ordinary filters — asks
+  `agent::is_dangerous` about each, and requires this module's answer to match
+  jagent's, with `busybox` named as the single deliberate widening rather than
+  tolerating any disagreement.
+
+- `src/command_correction.rs`'s privilege-escalation rule was three names
+  (`sudo`, `doas`, `su`) against the nine `jagent`'s `is_privilege_dispatcher`
+  treats as elevation, and compared raw normalized words, which keep interior
+  slashes: `/usr/bin/sudo` was offered untouched. The rule now compares
+  path-stripped, quote-stripped, case-folded program names — the same reduction
+  `stage_word_name` already performed for the interpreter rule — against the
+  full set, so `sudoedit`, `pkexec`, `runuser`, `run0`, `gosu` and `su-exec`
+  are refused, and a directory or a pair of quotes no longer spells one past a
+  set lookup. A privilege program the *original* already RUNS stays the user's
+  own decision — but only one it runs. Asking the question of every word, which
+  is how this landed first, read `stat /usr/bin/sudo` as a command that already
+  elevates and then excused a candidate that really did, handing back
+  `sudo rm -rf /var/cache/apt/archives` pre-filled; reading a file whose name
+  happens to be an elevation binary is an ordinary thing to have just typed and
+  must not hold the gate open for the rest of the exchange. `stage_programs`
+  therefore collects, per stage and per `;`/`&&`/`||`/`&` segment, the
+  dispatchers the scan passes through plus the program it finally reaches, and
+  nothing after that. The remote-execution rule three lines below now uses the
+  same reduction, which closes the same two holes there.
+
+- `src/command_correction.rs` gains the two API shapes the four shims asked
+  for. `CorrectionPolicy::probe_thread_name` replaces asserting on
+  `format!("{policy:?}")`, which coupled four test suites to a derive and still
+  could not catch a rename, because the substring they searched for was the
+  constant they had just passed in. `CorrectionCandidate::for_tests` is a
+  `#[doc(hidden)]` delegate to the private `new`, so a shim can reach the
+  *verified* candidate branch — which each app renders and acts on differently,
+  direct run against insert-for-review — without a network reply.
+  `#[doc(hidden)]` rather than a cargo feature: the crate ships no features and
+  the apps pin it by git rev, which would make a feature invisible to their
+  dependency graph. The message still crosses the same sanitiser, so a fixture
+  cannot mint a spelling the real constructor would have flattened.
+
+- `CompletionFacts::output` is now `&'a str`. It was a `String`, so every
+  trusted completion copied the finished block's whole captured output to hand
+  it to `should_start`, which only borrows it and immediately re-derives a
+  bounded head/tail sample that is what the request actually keeps. **This is a
+  breaking signature change for all four apps**: the struct is now
+  `CompletionFacts<'a>` and `should_start` takes `CompletionFacts<'_>`.
+
+- `src/review_input.rs::is_visual_spoofing_character` now delegates to
+  `jagent::is_unsafe_invisible_char` instead of holding a byte-identical copy
+  of its table with nothing binding the two. This predicate is the sole
+  invisible/bidi gate on model-proposed command text for all four apps and for
+  every core surface that renders untrusted text, and jagent's own doc names
+  the failure mode precisely: a copy "stops widening the day this one does, and
+  nothing fails until a reply aims at the difference". jagent promises the set
+  may be widened and never narrowed, so a code point it starts refusing is now
+  refused family-wide in the same release. A table test asserts the shared rule
+  is jagent's answer for one character from every class involved, and that the
+  terminal rule remains a strict superset.
+
+- `src/review_input.rs::is_terminal_visual_spoofing_character` is `pub`.
+  Core's parser already enforces it on OSC 133 cwd and command text, but it was
+  `pub(crate)`, so ember and frost could not apply the same rule to the text
+  they read back from those marks. Its doc now states the contract: everything
+  the shared rule refuses, plus the assigned interlinear annotation controls
+  `U+FFF9..=U+FFFB`, which Unicode does not classify as default-ignorable and
+  which every terminal in this family draws as nothing. That one range is the
+  whole difference, and the test proves it is the only one.
+
+- `src/agent.rs::validate_snapshot` sheds the ~135-line near-copy of jagent's
+  `validate_snapshot_lifecycle` it carried. A copy of a rule that runs *first*
+  is the worst place for one to rot, because the weaker of the two is then the
+  one that always answers — and it had rotted: two of its reason strings had
+  drifted from the wording the user reads, and jagent had since gained
+  transcript-shape adjacency rules the copy never had (a model action must
+  follow a model-request boundary, a thought must sit against its own action, a
+  protocol error needs an outstanding operation, an observation must
+  immediately follow its approved proposal). Those rules are strictly stronger
+  than what they replace: a second pending proposal, a pending card buried
+  under a later turn, and an approved proposal whose outcome is unrecorded can
+  no longer be *spelled*, rather than being spelled and then caught. The ported
+  adversarial tests are kept and now pin jagent's reason strings; the
+  duplicate-proposal-id fixture was reshaped so the document satisfies the
+  adjacency rules and the id binding is still the rule that answers.
+
+  What stays core's own is what jagent decides differently: the transcript's
+  **encoded** size, because jagent bounds the prompt it reconstructs (128 KiB)
+  and one whole document (256 KiB) but never the JSON this family writes to
+  `agent_session.json` — JSON escaping alone opens a factor-of-two gap, and a
+  new test builds a snapshot jagent restores happily and core refuses; a stale
+  `next_proposal_id`, which jagent *repairs* by taking `max(stored, highest+1)`
+  while a counter disagreeing with its own transcript is evidence of editing
+  and proposal ids are what bind an approval card to the command handed back;
+  and the family's per-turn text budgets, which jagent's decoder happens to
+  enforce at the same numbers today but which the apps size their storage
+  against.
+
+- `src/agent.rs` re-exports jagent's `validate_command_text`,
+  `CommandTextError` and `MAX_COMMAND_BYTES`, deletes its local 16 KiB
+  constant, and reduces `validate_agent_command` to a mapping from jagent's
+  typed reason onto the `&'static str` reasons this module has always returned.
+  The reimplementation had already drifted in shape — it checked empty before
+  size, where jagent checks size first — and it carried its own invisible-
+  character branch, which is the fork the shared crate exists to prevent.
+  `CommandTextError::LineBreak` maps onto the existing control-character
+  wording rather than introducing a new user-visible string for text that was
+  already refused, and the `#[non_exhaustive]` wildcard refuses a reason jagent
+  adds without claiming to know what it is. A test pins the byte count the
+  TooLarge message spells out against jagent's actual ceiling.
+
 ## Previously completed
 
 - `src/supervised.rs` now owns every short-lived core helper used by host
