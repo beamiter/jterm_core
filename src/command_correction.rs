@@ -1066,10 +1066,17 @@ fn adds_pipe_to_interpreter(original: &str, candidate: &str) -> bool {
         && crate::agent::is_dangerous(original) != Some(NETWORK_TO_INTERPRETER)
 }
 
-/// jagent's reason string for its own narrower form of this rule. Pinned by a
-/// test, so a change on jagent's side is a red suite rather than a silently
-/// weaker gate here.
-const NETWORK_TO_INTERPRETER: &str = "piping network content directly to an interpreter";
+/// jagent's reason string for its own form of this rule. Pinned by a test, so a
+/// change on jagent's side is a red suite rather than a silently weaker gate
+/// here — the gate compares against this exact string, so a stale copy would
+/// never match and would open the check instead of closing it.
+///
+/// jagent widened the rule to track a whole pipeline rather than only the stage
+/// adjacent to the fetch (`curl … | tee setup.sh | sh` is network content
+/// reaching an interpreter), and renamed the reason with it. The reason is
+/// user-visible on the approval card, so the copy here follows jagent's wording
+/// exactly rather than keeping the older phrasing.
+const NETWORK_TO_INTERPRETER: &str = "piping network content into an interpreter";
 
 /// Programs that execute whatever is piped into them.
 ///
