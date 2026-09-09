@@ -381,7 +381,7 @@ pub struct CodexAppServerExitReport {
 /// Version-gated Codex app-server driver for the experimental native slice.
 /// `workspace` is deliberately consumed and cannot be cloned; the worker
 /// retains it until after child reap.
-pub(crate) struct CodexAppServerDriver {
+pub struct CodexAppServerDriver {
     launch_argv: Vec<String>,
     workspace: Option<PreparedNativeWorkspace>,
     native_home: Option<PreparedNativeCodexHome>,
@@ -397,7 +397,7 @@ pub(crate) struct CodexAppServerDriver {
 }
 
 impl CodexAppServerDriver {
-    pub(crate) fn new(
+    pub fn new(
         launch_argv: Vec<String>,
         workspace: PreparedNativeWorkspace,
         native_home: PreparedNativeCodexHome,
@@ -421,25 +421,25 @@ impl CodexAppServerDriver {
         }
     }
 
-    pub(crate) fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
+    pub fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
         self.view.lock().clone()
     }
 
-    pub(crate) fn phase(&self) -> CodexAppServerPhase {
+    pub fn phase(&self) -> CodexAppServerPhase {
         self.view.lock().phase
     }
 
-    pub(crate) fn take_exit_report(&self) -> Option<CodexAppServerExitReport> {
+    pub fn take_exit_report(&self) -> Option<CodexAppServerExitReport> {
         self.exit_report.lock().take()
     }
 
-    pub(crate) fn worker_is_finished(&self) -> bool {
+    pub fn worker_is_finished(&self) -> bool {
         self.worker.as_ref().is_some_and(JoinHandle::is_finished)
     }
 
     /// Join only an already-finished worker. This method never waits for future
     /// provider progress and is therefore safe to call from the runtime tick.
-    pub(crate) fn join_finished_worker(&mut self) -> Result<bool, AgentDriverError> {
+    pub fn join_finished_worker(&mut self) -> Result<bool, AgentDriverError> {
         if !self.worker_is_finished() {
             return Ok(false);
         }

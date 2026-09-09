@@ -432,7 +432,7 @@ impl AgentCancellation {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    pub(crate) fn shared_flag(&self) -> Arc<AtomicBool> {
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancelled)
     }
 }
@@ -473,7 +473,7 @@ pub enum AgentCommand {
 }
 
 impl AgentCommand {
-    pub(crate) fn validate(&self) -> Result<(), AgentDriverError> {
+    pub fn validate(&self) -> Result<(), AgentDriverError> {
         let text = match self {
             Self::Prompt(prompt) => Some(prompt.text.as_str()),
             Self::FinishSession => None,

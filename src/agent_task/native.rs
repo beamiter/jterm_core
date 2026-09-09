@@ -31,13 +31,13 @@ const NATIVE_CODEX_HOME_CREATE_ATTEMPTS: usize = 8;
 /// A session-private Codex home containing an empty config and an in-memory,
 /// access-token-only login grant. User trust, refresh tokens, MCP, hooks,
 /// plugins, marketplaces, and state are never copied into this boundary.
-pub(crate) struct PreparedNativeCodexHome {
+pub struct PreparedNativeCodexHome {
     path: PathBuf,
     credentials: Option<NativeCodexCredentials>,
 }
 
 impl PreparedNativeCodexHome {
-    pub(crate) fn prepare() -> Result<Self, NativeCodexHomeError> {
+    pub fn prepare() -> Result<Self, NativeCodexHomeError> {
         let source_home = match std::env::var_os("CODEX_HOME") {
             Some(path) => PathBuf::from(path),
             None => dirs::home_dir()
@@ -97,17 +97,15 @@ impl PreparedNativeCodexHome {
         Ok(prepared)
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn config_path(&self) -> PathBuf {
+    pub fn config_path(&self) -> PathBuf {
         self.path.join("config.toml")
     }
 
-    pub(crate) fn take_credentials(
-        &mut self,
-    ) -> Result<NativeCodexCredentials, NativeCodexHomeError> {
+    pub fn take_credentials(&mut self) -> Result<NativeCodexCredentials, NativeCodexHomeError> {
         self.credentials
             .take()
             .ok_or(NativeCodexHomeError::CredentialsUnavailable)
@@ -332,16 +330,13 @@ fn read_native_credentials(
     NativeCodexCredentials::new(parsed.tokens.access_token, parsed.tokens.account_id)
 }
 
-pub(crate) struct NativeCodexCredentials {
+pub struct NativeCodexCredentials {
     access_token: Vec<u8>,
     account_id: String,
 }
 
 impl NativeCodexCredentials {
-    pub(crate) fn new(
-        access_token: String,
-        account_id: String,
-    ) -> Result<Self, NativeCodexHomeError> {
+    pub fn new(access_token: String, account_id: String) -> Result<Self, NativeCodexHomeError> {
         if access_token.is_empty() || access_token.len() > 32 * 1024 {
             return Err(NativeCodexHomeError::CredentialsMalformed);
         }
@@ -357,13 +352,13 @@ impl NativeCodexCredentials {
         })
     }
 
-    pub(crate) fn access_token(&self) -> &str {
+    pub fn access_token(&self) -> &str {
         // The token originates in a serde_json String, hence valid UTF-8, and
         // this byte vector is never mutated until Drop zeroes it.
         std::str::from_utf8(&self.access_token).expect("credential token remains UTF-8")
     }
 
-    pub(crate) fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &str {
         &self.account_id
     }
 }
@@ -451,7 +446,7 @@ pub struct NativePromptPolicy {
 /// child and used as its writable root. `wire_cwd` is a separately pinned
 /// descendant descriptor matching the source command's repository-relative cwd.
 #[derive(Debug)]
-pub(crate) struct PreparedNativeWorkspace {
+pub struct PreparedNativeWorkspace {
     repository_path: PathBuf,
     display_path: PathBuf,
     wire_path: PathBuf,
@@ -463,26 +458,26 @@ pub(crate) struct PreparedNativeWorkspace {
 }
 
 impl PreparedNativeWorkspace {
-    pub(crate) fn repository_path(&self) -> &Path {
+    pub fn repository_path(&self) -> &Path {
         &self.repository_path
     }
 
-    pub(crate) fn display_path(&self) -> &Path {
+    pub fn display_path(&self) -> &Path {
         &self.display_path
     }
 
-    pub(crate) fn wire_path(&self) -> &Path {
+    pub fn wire_path(&self) -> &Path {
         &self.wire_path
     }
 
     /// Descriptor-relative provider cwd corresponding to the source command's
     /// repository-relative directory. The sandbox writable root remains the
     /// pinned worktree root returned by [`Self::wire_path`].
-    pub(crate) fn wire_cwd(&self) -> &Path {
+    pub fn wire_cwd(&self) -> &Path {
         &self.wire_cwd
     }
 
-    pub(crate) fn relative_cwd(&self) -> &Path {
+    pub fn relative_cwd(&self) -> &Path {
         &self.relative_cwd
     }
 
@@ -490,7 +485,7 @@ impl PreparedNativeWorkspace {
     /// registered task worktree immediately before the provider worker spawns.
     /// This closes the asynchronous result-queue window without moving Git I/O
     /// back onto the UI thread.
-    pub(crate) fn revalidate_before_spawn(
+    pub fn revalidate_before_spawn(
         &self,
         cancel: Arc<AtomicBool>,
     ) -> Result<(), NativeWorkspaceError> {
@@ -556,7 +551,7 @@ impl PreparedNativeWorkspace {
     /// app-server so its `/proc/self/fd/N` cwd and sandbox roots remain valid.
     /// The provider's private process group is killed and reaped before the
     /// driver drops this owner.
-    pub(crate) fn configure_child_command(&self, command: &mut Command) {
+    pub fn configure_child_command(&self, command: &mut Command) {
         use std::os::unix::process::CommandExt;
 
         let root_fd: RawFd = self.pinned_root.as_raw_fd();
@@ -727,7 +722,7 @@ impl fmt::Display for NativePromptError {
 impl std::error::Error for NativePromptError {}
 
 /// Revalidate and pin the exact registered task worktree before provider spawn.
-pub(crate) fn prepare_native_agent_workspace(
+pub fn prepare_native_agent_workspace(
     task: &AgentTask,
     cancel: Arc<AtomicBool>,
 ) -> Result<PreparedNativeWorkspace, NativeWorkspaceError> {
@@ -825,7 +820,7 @@ struct NativeCommandEvidence<'a> {
 
 /// Build one user-role prompt whose fixed instruction is separate from the
 /// untrusted terminal-evidence JSON. Redaction precedes byte budgeting.
-pub(crate) fn build_native_task_prompt(
+pub fn build_native_task_prompt(
     task: &AgentTask,
     relative_cwd: &Path,
     policy: NativePromptPolicy,
@@ -907,7 +902,7 @@ pub(crate) fn build_native_task_prompt(
 /// native session. Unlike terminal evidence, this text is intentionally model
 /// instructions; it is still exact, bounded, display-safe, and subject to the
 /// current AI redaction policy before it crosses the provider boundary.
-pub(crate) fn build_native_follow_up_prompt(
+pub fn build_native_follow_up_prompt(
     text: &str,
     policy: NativePromptPolicy,
 ) -> Result<AgentPrompt, NativePromptError> {

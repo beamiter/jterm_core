@@ -38,7 +38,7 @@ impl NativeAgentSessionId {
     /// Native task persistence is not implemented yet; this is primarily
     /// useful for deterministic tests and future hardened checkpoint restore.
     #[cfg(test)]
-    pub(crate) fn parse(value: impl Into<String>) -> Result<Self, InvalidNativeAgentSessionId> {
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidNativeAgentSessionId> {
         let value = value.into();
         if value.is_empty()
             || value.len() > MAX_NATIVE_AGENT_SESSION_ID_BYTES
@@ -225,20 +225,11 @@ impl AgentEventStream {
     }
 
     /// Build one bounded event carrying this stream's complete correlation.
-    pub(crate) fn event(
-        &self,
-        sequence: u64,
-        kind: AgentEventKind,
-        detail: Option<String>,
-    ) -> AgentEvent {
+    pub fn event(&self, sequence: u64, kind: AgentEventKind, detail: Option<String>) -> AgentEvent {
         AgentEvent::new(self.clone(), sequence, kind, detail)
     }
 
-    pub(super) fn new(
-        task_id: TaskId,
-        session_id: NativeAgentSessionId,
-        epoch: AgentEventEpoch,
-    ) -> Self {
+    pub fn new(task_id: TaskId, session_id: NativeAgentSessionId, epoch: AgentEventEpoch) -> Self {
         Self {
             task_id,
             session_id,
@@ -299,7 +290,7 @@ pub enum AgentEventKind {
 }
 
 impl AgentEventKind {
-    pub(crate) fn owned_payload_bytes(&self) -> usize {
+    pub fn owned_payload_bytes(&self) -> usize {
         match self {
             Self::SessionStarted {
                 provider_session_id: Some(session),
@@ -328,7 +319,7 @@ pub struct AgentEvent {
 }
 
 impl AgentEvent {
-    pub(crate) fn new(
+    pub fn new(
         stream: AgentEventStream,
         sequence: u64,
         kind: AgentEventKind,
@@ -358,7 +349,7 @@ impl AgentEvent {
         self.detail.as_deref()
     }
 
-    pub(super) fn into_parts(self) -> (AgentEventStream, u64, AgentEventKind, Option<String>) {
+    pub fn into_parts(self) -> (AgentEventStream, u64, AgentEventKind, Option<String>) {
         (self.stream, self.sequence, self.kind, self.detail)
     }
 }
@@ -518,7 +509,7 @@ impl fmt::Display for AgentEventError {
 
 impl std::error::Error for AgentEventError {}
 
-pub(super) fn next_agent_event_epoch() -> Result<AgentEventEpoch, AgentEventError> {
+pub fn next_agent_event_epoch() -> Result<AgentEventEpoch, AgentEventError> {
     NEXT_AGENT_EVENT_EPOCH
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             (current != 0 && current != u64::MAX).then_some(current + 1)
@@ -527,7 +518,7 @@ pub(super) fn next_agent_event_epoch() -> Result<AgentEventEpoch, AgentEventErro
         .map_err(|_| AgentEventError::EpochExhausted)
 }
 
-pub(super) fn status_after_event(
+pub fn status_after_event(
     current: TaskStatus,
     event: &AgentEventKind,
 ) -> Option<(TaskStatus, bool)> {
@@ -639,7 +630,7 @@ pub(super) fn status_after_event(
     }
 }
 
-pub(super) fn event_ends_stream(event: &AgentEventKind) -> bool {
+pub fn event_ends_stream(event: &AgentEventKind) -> bool {
     // TurnCompleted is deliberately absent: one provider session/stream may
     // carry another strictly correlated turn after its review point.
     matches!(
@@ -650,7 +641,7 @@ pub(super) fn event_ends_stream(event: &AgentEventKind) -> bool {
     )
 }
 
-pub(super) fn bounded_event_detail(detail: Option<String>) -> Option<String> {
+pub fn bounded_event_detail(detail: Option<String>) -> Option<String> {
     let detail = detail?;
     let mut bounded = String::with_capacity(detail.len().min(MAX_AGENT_EVENT_DETAIL_BYTES));
     for character in detail.chars() {

@@ -12,7 +12,7 @@ use std::os::unix::io::RawFd;
 type Result<T> = std::result::Result<T, String>;
 
 #[cfg(unix)]
-pub(crate) struct PinnedDirectory(std::fs::File);
+pub struct PinnedDirectory(std::fs::File);
 
 #[cfg(unix)]
 impl std::fmt::Debug for PinnedDirectory {
@@ -27,7 +27,7 @@ impl std::fmt::Debug for PinnedDirectory {
 
 #[cfg(unix)]
 impl PinnedDirectory {
-    pub(crate) fn open(path: &std::path::Path) -> Result<Self> {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
 
         let directory = std::fs::OpenOptions::new()
@@ -58,7 +58,7 @@ impl PinnedDirectory {
         Ok(Self(directory))
     }
 
-    pub(crate) fn proc_path(&self) -> std::path::PathBuf {
+    pub fn proc_path(&self) -> std::path::PathBuf {
         use std::os::fd::AsRawFd;
         std::path::PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
     }
@@ -70,7 +70,7 @@ impl PinnedDirectory {
     /// This closes the canonicalize-then-open race for nested task working
     /// directories: replacing an ancestor with a symlink can no longer move
     /// the returned capability outside `self`.
-    pub(crate) fn open_beneath(&self, relative: &std::path::Path) -> Result<Self> {
+    pub fn open_beneath(&self, relative: &std::path::Path) -> Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
         use std::path::Component;
@@ -123,7 +123,7 @@ impl PinnedDirectory {
         Ok(Self(directory))
     }
 
-    pub(crate) fn as_raw_fd(&self) -> RawFd {
+    pub fn as_raw_fd(&self) -> RawFd {
         use std::os::fd::AsRawFd;
         self.0.as_raw_fd()
     }

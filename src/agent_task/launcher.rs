@@ -138,7 +138,7 @@ impl AgentLaunchSpec {
     /// needs to search `PATH`. This stricter API is intentionally separate
     /// from [`Self::resolve`], preserving compatibility for opaque PTY
     /// launchers with other valid shebangs.
-    pub(crate) fn resolve_native(
+    pub fn resolve_native(
         provider: AgentProvider,
         repository: &Path,
         worktree: &Path,

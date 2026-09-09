@@ -22,7 +22,7 @@ pub struct PreparedTaskValidation {
     pub cwd: PathBuf,
     pub source_shell: String,
     #[allow(dead_code)]
-    pub(crate) pinned_cwd: crate::agent_task::pinned_dir::PinnedDirectory,
+    pub pinned_cwd: crate::agent_task::pinned_dir::PinnedDirectory,
 }
 
 /// Filesystem location involved in a validation preflight failure.

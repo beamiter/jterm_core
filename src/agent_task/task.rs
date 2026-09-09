@@ -664,7 +664,7 @@ impl TaskManager {
     /// creating a worker or provider process. The caller owns that pre-spawn
     /// proof; this method contributes the stream-incarnation CAS so a stale
     /// startup attempt cannot reset a replacement task.
-    pub(crate) fn rollback_agent_event_stream_before_spawn(
+    pub fn rollback_agent_event_stream_before_spawn(
         &mut self,
         expected: &AgentEventStream,
         detail: String,
@@ -1117,10 +1117,7 @@ impl TaskManager {
     // The library target does not compile the desktop Tasks UI that consumes
     // this crate-private gate; keep it sealed despite that target-local fact.
     #[allow(dead_code)]
-    pub(crate) fn native_terminal_fallback_eligible(
-        &self,
-        task_id: TaskId,
-    ) -> Result<(), TaskError> {
+    pub fn native_terminal_fallback_eligible(&self, task_id: TaskId) -> Result<(), TaskError> {
         if self.native_event_streams.contains_key(&task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
@@ -1143,7 +1140,7 @@ impl TaskManager {
     /// and native provenance remain unchanged. A successful bind makes the
     /// terminal fallback sticky and invalidates any older validation result.
     #[allow(dead_code)]
-    pub(crate) fn bind_native_terminal_fallback_session(
+    pub fn bind_native_terminal_fallback_session(
         &mut self,
         task_id: TaskId,
         session_id: String,
