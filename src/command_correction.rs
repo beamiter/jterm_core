@@ -2827,6 +2827,75 @@ mod tests {
     /// an interpreter and this module did not structurally unreachable — blind
     /// to exactly the gap it claimed to guard, and sixteen names were sitting
     /// in that gap.
+    /// The sibling of the test below, for the OTHER table.
+    ///
+    /// `STAGE_PREFIXES` names the wrappers this module steps over to reach the
+    /// program a stage really runs. jagent has to step over the same ones, or a
+    /// command hides behind a prefix: `unbuffer` sat in `STAGE_PREFIXES` while
+    /// jagent had never heard of it, so this module refused
+    /// `… | unbuffer sh` as pipe-to-interpreter while jagent — the module that
+    /// actually gates execution — reported no danger for `unbuffer rm -rf /`.
+    ///
+    /// The test below probes bare names only, which is why it could not see
+    /// that. This one probes the dispatcher form, so a prefix either module
+    /// learns to step over must be taught to both.
+    #[test]
+    fn every_stage_prefix_is_transparent_to_jagent_too() {
+        // One realistic invocation per prefix, each dispatching the same
+        // destructive child. Several of these wrappers refuse to be parsed
+        // without their own options — `stdbuf` needs a buffering mode,
+        // `timeout` a duration, `capsh` a `--` — so probing `<prefix> rm` alone
+        // would report a gap that is really just an invalid command line.
+        const DISPATCHES: &[(&str, &str)] = &[
+            ("capsh", "capsh -- -c 'rm -rf /'"),
+            ("command", "command rm -rf /"),
+            ("doas", "doas rm -rf /"),
+            ("env", "env FOO=1 rm -rf /"),
+            ("exec", "exec rm -rf /"),
+            ("gosu", "gosu root rm -rf /"),
+            ("ionice", "ionice -c3 rm -rf /"),
+            ("nice", "nice -n 5 rm -rf /"),
+            ("nohup", "nohup rm -rf /"),
+            ("pkexec", "pkexec rm -rf /"),
+            ("run0", "run0 rm -rf /"),
+            ("runuser", "runuser -u root -- rm -rf /"),
+            ("setarch", "setarch x86_64 rm -rf /"),
+            ("setsid", "setsid rm -rf /"),
+            (
+                "start-stop-daemon",
+                "start-stop-daemon --start --exec /bin/rm -- -rf /",
+            ),
+            ("stdbuf", "stdbuf -o0 rm -rf /"),
+            ("su", "su -c 'rm -rf /'"),
+            ("su-exec", "su-exec root rm -rf /"),
+            ("sudo", "sudo rm -rf /"),
+            ("sudoedit", "sudoedit rm -rf /"),
+            ("systemd-run", "systemd-run rm -rf /"),
+            ("time", "time rm -rf /"),
+            ("timeout", "timeout 5 rm -rf /"),
+            ("unbuffer", "unbuffer rm -rf /"),
+            ("xargs", "xargs rm -rf /"),
+        ];
+        for prefix in STAGE_PREFIXES {
+            let form = DISPATCHES
+                .iter()
+                .find(|(name, _)| name == prefix)
+                .map(|(_, form)| *form)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "STAGE_PREFIXES gained `{prefix}`: add a realistic dispatcher form above so \
+                         jagent is checked for it too, which is the whole point of this test"
+                    )
+                });
+            assert!(
+                crate::agent::is_dangerous(form).is_some(),
+                "this module steps over `{prefix}` to reach the program behind it, but jagent \
+                 reports no danger for `{form}` — so every destructive command behind `{prefix}` \
+                 reaches an approval card unflagged"
+            );
+        }
+    }
+
     #[test]
     fn the_interpreter_set_agrees_with_jagents_own_rule() {
         for name in [
