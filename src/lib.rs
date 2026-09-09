@@ -6,6 +6,7 @@
 //! binary name in shared code.
 
 pub mod agent;
+pub mod agent_task;
 pub mod ai;
 pub mod atomic_file;
 pub mod block_contract;

@@ -14,6 +14,10 @@ categories = ["command-line-utilities", "development-tools"]
 # Pin the policy engine so a branch move cannot silently change the contract.
 jagent = { git = "https://github.com/beamiter/jagent.git", rev = "6ed0b9f037eff9359d62ed448e0d117327fabe26" }
 crossbeam-channel = "0.5"
+# The agent_task worktree/session machinery: shared locks and the ids that
+# name isolated Codex homes and systemd scopes.
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2.189"
 log = "0.4"
 lru = "0.18"
