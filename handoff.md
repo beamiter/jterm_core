@@ -1027,15 +1027,17 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   before any path or URL is built, archive members are checked for links,
   traversal, and extra payload before extracting exactly the expected binary, and
   the update-check cache is private, symlink-safe, and atomically replaced.
+- The vendored installer now also verifies a detached minisign signature over
+  `manifest.json` against the pubkey pinned in upstream jsh
+  (`348b9a0ad9c86832e7d1a0d1dfa5758685abbbdb`), then takes the artifact digest
+  from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
+  `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
 ## Remaining boundaries
 
-### Add a signed release manifest to the installer
-
-The mandatory SHA-256 is same-origin: it proves the bytes match what the release
-published, not who published them. A detached signature over the manifest,
-verified against a key pinned in the installer, is the missing half. That needs a
-release-side signing decision, so it is deliberately not approximated here.
+None open for the installer trust chain. After changing either vendored script,
+keep the three-line provenance header and re-test every terminal that embeds
+the scripts via `include_str!`.
 
 ## Release checks
 
