@@ -1,6 +1,6 @@
 #!/bin/sh
 # vendored from https://github.com/beamiter/jsh -> scripts/jsh-remote.sh
-# Keep this copy in sync with upstream commit fd605616b56bd73265a3a6141c814938aa2859f9;
+# Keep this copy in sync with upstream commit 348b9a0ad9c86832e7d1a0d1dfa5758685abbbdb;
 # every jterm embeds it with include_str! so a remote host can get jsh without one installed.
 # Run jsh on a machine that does not have jsh installed.
 #
