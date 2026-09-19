@@ -1,8 +1,12 @@
 //! Provider adapters for the native Agent runtime.
 
+pub mod claude_stream_json;
 pub mod codex_app_server;
 pub mod fake;
 
+pub use claude_stream_json::{
+    claude_print_argv, parse_stream_json_line, ClaudeStreamJsonDriver, ClaudeStreamSignal,
+};
 pub use codex_app_server::{
     CodexAppServerApproval, CodexAppServerApprovalFileChange, CodexAppServerApprovalKind,
     CodexAppServerCommandView, CodexAppServerExitCause, CodexAppServerExitReport,

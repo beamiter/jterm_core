@@ -78,6 +78,7 @@ pub use driver::{
 };
 #[allow(unused_imports)]
 pub use drivers::{
+    claude_print_argv, parse_stream_json_line, ClaudeStreamJsonDriver, ClaudeStreamSignal,
     CodexAppServerApproval, CodexAppServerApprovalFileChange, CodexAppServerApprovalKind,
     CodexAppServerCommandView, CodexAppServerExitCause, CodexAppServerExitReport,
     CodexAppServerFileChange, CodexAppServerFileChangeView, CodexAppServerPhase,

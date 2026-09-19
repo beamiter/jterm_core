@@ -5,9 +5,10 @@
 //! with an additional frame budget, and retains the adapter's bounded view
 //! after its worker has stopped. No method here waits for a running worker.
 
+use super::drivers::claude_stream_json::ClaudeStreamJsonDriver;
 use super::drivers::codex_app_server::{
     CodexAppServerDriver, CodexAppServerExitCause, CodexAppServerExitReport,
-    CodexAppServerViewSnapshot,
+    CodexAppServerPhase, CodexAppServerViewSnapshot,
 };
 use super::native::{
     build_native_follow_up_prompt, build_native_task_prompt, prepare_native_agent_workspace,
@@ -15,7 +16,7 @@ use super::native::{
     PreparedNativeWorkspace,
 };
 use super::{
-    AgentCommand, AgentDriver, AgentDriverError, AgentEventError, AgentEventStream,
+    AgentCommand, AgentDriver, AgentDriverError, AgentEvent, AgentEventError, AgentEventStream,
     AgentLaunchError, AgentLaunchSpec, AgentPrompt, AgentProvider, AgentSessionOutcome,
     AgentStartRequest, AgentTask, ApprovalDecision, ApprovalId, NativeCodexHomeError, TaskId,
     TaskManager, TaskRuntimeKind, TaskStatus, TaskValidationStatus,
@@ -40,7 +41,11 @@ pub const NATIVE_AGENT_EVENTS_PER_TASK_PER_FRAME: usize = 16;
 pub const NATIVE_AGENT_PREPARATIONS_MAX: usize = 8;
 
 struct RunningCodexAgent {
-    driver: CodexAppServerDriver,
+    driver: NativeRunningDriver,
+    /// Keeps Claude MVP workspace capabilities alive for the session. Codex
+    /// ownership moves into the driver instead.
+    #[allow(dead_code)]
+    retained_workspace: Option<PreparedNativeWorkspace>,
     stream: AgentEventStream,
     worker_joined: bool,
     forced_failure: Option<String>,
@@ -49,10 +54,79 @@ struct RunningCodexAgent {
     finish_requested: bool,
 }
 
-struct RetainedCodexAgent {
-    view: CodexAppServerViewSnapshot,
-    exit_report: Option<CodexAppServerExitReport>,
-    effective_outcome: AgentSessionOutcome,
+enum NativeRunningDriver {
+    Codex(CodexAppServerDriver),
+    Claude(ClaudeStreamJsonDriver),
+}
+
+impl NativeRunningDriver {
+    fn try_next_event(&mut self) -> Result<Option<AgentEvent>, AgentDriverError> {
+        match self {
+            Self::Codex(driver) => driver.try_next_event(),
+            Self::Claude(driver) => driver.try_next_event(),
+        }
+    }
+
+    fn cancel(&mut self) {
+        match self {
+            Self::Codex(driver) => driver.cancel(),
+            Self::Claude(driver) => driver.cancel(),
+        }
+    }
+
+    fn worker_is_finished(&self) -> bool {
+        match self {
+            Self::Codex(driver) => driver.worker_is_finished(),
+            Self::Claude(driver) => driver.worker_is_finished(),
+        }
+    }
+
+    fn join_finished_worker(&mut self) -> Result<bool, AgentDriverError> {
+        match self {
+            Self::Codex(driver) => driver.join_finished_worker(),
+            Self::Claude(driver) => driver.join_finished_worker(),
+        }
+    }
+
+    fn take_exit_report(&self) -> Option<CodexAppServerExitReport> {
+        match self {
+            Self::Codex(driver) => driver.take_exit_report(),
+            Self::Claude(driver) => driver.take_exit_report(),
+        }
+    }
+
+    fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
+        match self {
+            Self::Codex(driver) => driver.view_snapshot(),
+            Self::Claude(driver) => driver.view_snapshot(),
+        }
+    }
+
+    fn phase(&self) -> CodexAppServerPhase {
+        match self {
+            Self::Codex(driver) => driver.phase(),
+            Self::Claude(driver) => driver.phase(),
+        }
+    }
+
+    fn send(&mut self, command: AgentCommand) -> Result<(), AgentDriverError> {
+        match self {
+            Self::Codex(driver) => driver.send(command),
+            Self::Claude(driver) => driver.send(command),
+        }
+    }
+
+    fn as_codex_mut(&mut self) -> Option<&mut CodexAppServerDriver> {
+        match self {
+            Self::Codex(driver) => Some(driver),
+            Self::Claude(_) => None,
+        }
+    }
+}
+
+enum PreparedNativeStart {
+    Codex(PreparedCodexStart),
+    Claude(PreparedClaudeStart),
 }
 
 struct PreparedCodexStart {
@@ -63,9 +137,23 @@ struct PreparedCodexStart {
     native_home: PreparedNativeCodexHome,
 }
 
+struct PreparedClaudeStart {
+    task: AgentTask,
+    #[allow(dead_code)] // retained for future Claude containment parity with Codex
+    workspace: PreparedNativeWorkspace,
+    prompt: AgentPrompt,
+    launch_argv: Vec<String>,
+}
+
 struct PreparationResult {
     generation: u64,
-    result: Result<PreparedCodexStart, AgentRuntimeError>,
+    result: Result<PreparedNativeStart, AgentRuntimeError>,
+}
+
+struct RetainedCodexAgent {
+    view: CodexAppServerViewSnapshot,
+    exit_report: Option<CodexAppServerExitReport>,
+    effective_outcome: AgentSessionOutcome,
 }
 
 struct PendingCodexPreparation {
@@ -387,7 +475,147 @@ impl AgentRuntimeManager {
         self.running.insert(
             task_id,
             RunningCodexAgent {
-                driver,
+                driver: NativeRunningDriver::Codex(driver),
+                retained_workspace: None,
+                stream,
+                worker_joined: false,
+                forced_failure: None,
+                exit_report: None,
+                pending_prompt: None,
+                finish_requested: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Begin preparing a Claude Code print/stream-json session without blocking.
+    ///
+    /// Unlike Codex, this MVP skips private home and cgroup containment. Prefer
+    /// the opaque PTY path when stronger isolation is required.
+    pub fn start_claude(
+        &mut self,
+        task_manager: &mut TaskManager,
+        task_id: TaskId,
+        policy: NativePromptPolicy,
+    ) -> Result<(), AgentRuntimeError> {
+        if self.running.contains_key(&task_id) || self.preparing.contains_key(&task_id) {
+            return Err(AgentRuntimeError::AlreadyRunning(task_id));
+        }
+        self.reap_cancelled_preparations();
+        if self
+            .preparing
+            .len()
+            .saturating_add(self.cancelled_preparations.len())
+            .saturating_add(self.running.len())
+            >= NATIVE_AGENT_PREPARATIONS_MAX
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "at most {NATIVE_AGENT_PREPARATIONS_MAX} native tasks may prepare or remain live concurrently"
+            )));
+        }
+        let task = task_manager
+            .get(task_id)
+            .cloned()
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
+        if task.provider != AgentProvider::Claude {
+            return Err(AgentRuntimeError::UnsupportedProvider {
+                task_id,
+                provider: task.provider,
+            });
+        }
+        if !policy.share_command_context {
+            return Err(AgentRuntimeError::Prompt(
+                NativePromptError::SharingDisabled,
+            ));
+        }
+        if task.status != TaskStatus::Created
+            || task.runtime_kind != TaskRuntimeKind::Unassigned
+            || task.terminal_session_id.is_some()
+            || task.validation.status == TaskValidationStatus::Running
+            || task_manager.has_active_agent_event_stream(task_id)
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "task must remain Created and unassigned (currently {} / {:?})",
+                task.status.label(),
+                task.runtime_kind
+            )));
+        }
+
+        let generation = self
+            .next_preparation_generation
+            .checked_add(1)
+            .ok_or_else(|| AgentRuntimeError::Preparation("generation counter exhausted".into()))?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::Builder::new()
+            .name(format!(
+                "{}-claude-prepare-{task_id}-{generation}",
+                crate::agent_task::app_slug()
+            ))
+            .spawn(move || {
+                let result = prepare_claude_start(task, policy, worker_cancel);
+                let _ = sender.send(PreparationResult { generation, result });
+            })
+            .map_err(|error| {
+                AgentRuntimeError::Preparation(format!(
+                    "could not start background preparation worker: {error}"
+                ))
+            })?;
+        self.next_preparation_generation = generation;
+        self.preparing.insert(
+            task_id,
+            PendingCodexPreparation {
+                generation,
+                policy,
+                receiver,
+                cancel,
+                worker: Some(worker),
+            },
+        );
+        Ok(())
+    }
+
+    fn start_prepared_claude(
+        &mut self,
+        task_manager: &mut TaskManager,
+        prepared: PreparedClaudeStart,
+    ) -> Result<(), AgentRuntimeError> {
+        let task_id = prepared.task.id;
+        let current = task_manager
+            .get(task_id)
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
+        if current != &prepared.task {
+            return Err(AgentRuntimeError::Preparation(
+                "task changed while native prerequisites were being prepared".into(),
+            ));
+        }
+        let stream = task_manager.start_agent_event_stream(task_id)?;
+        let worktree_path = prepared.task.worktree_path.clone();
+        let mut driver = ClaudeStreamJsonDriver::new(prepared.launch_argv, worktree_path.clone());
+        let request = AgentStartRequest {
+            provider: AgentProvider::Claude,
+            stream: stream.clone(),
+            worktree_path,
+            source_context: None,
+            initial_prompt: Some(prepared.prompt),
+            resume_from: None,
+        };
+        if let Err(error) = driver.start(request) {
+            driver.cancel();
+            return Err(rollback_failed_start(
+                task_manager,
+                &stream,
+                AgentRuntimeError::Driver(error),
+            ));
+        }
+
+        self.retained.remove(&task_id);
+        self.running.insert(
+            task_id,
+            RunningCodexAgent {
+                driver: NativeRunningDriver::Claude(driver),
+                retained_workspace: Some(prepared.workspace),
                 stream,
                 worker_joined: false,
                 forced_failure: None,
@@ -655,6 +883,11 @@ impl AgentRuntimeManager {
             .running
             .get_mut(&task_id)
             .ok_or(AgentRuntimeError::NotRunning(task_id))?;
+        if runtime.driver.as_codex_mut().is_none() {
+            return Err(AgentRuntimeError::Preparation(
+                "follow-up turns require a live Codex native session".into(),
+            ));
+        }
         if runtime.pending_prompt.is_some() || runtime.finish_requested {
             return Err(AgentRuntimeError::Preparation(
                 "native Codex session already has a queued turn or finish request".into(),
@@ -764,7 +997,7 @@ impl AgentRuntimeManager {
     pub fn needs_fast_poll(&self) -> bool {
         self.running
             .values()
-            .any(|runtime| runtime.driver.phase() != super::CodexAppServerPhase::Ready)
+            .any(|runtime| runtime.driver.phase() != CodexAppServerPhase::Ready)
     }
 
     pub fn has_any_activity(&self) -> bool {
@@ -886,9 +1119,14 @@ impl AgentRuntimeManager {
                 });
                 continue;
             }
-            let result = message
-                .result
-                .and_then(|prepared| self.start_prepared_codex(task_manager, prepared));
+            let result = message.result.and_then(|prepared| match prepared {
+                PreparedNativeStart::Codex(prepared) => {
+                    self.start_prepared_codex(task_manager, prepared)
+                }
+                PreparedNativeStart::Claude(prepared) => {
+                    self.start_prepared_claude(task_manager, prepared)
+                }
+            });
             match result {
                 Ok(()) => report.preparations_started += 1,
                 Err(error) => report.issues.push(AgentRuntimeIssue {
@@ -912,7 +1150,7 @@ fn prepare_codex_start(
     task: AgentTask,
     policy: NativePromptPolicy,
     cancel: Arc<AtomicBool>,
-) -> Result<PreparedCodexStart, AgentRuntimeError> {
+) -> Result<PreparedNativeStart, AgentRuntimeError> {
     preparation_cancelled(cancel.as_ref())?;
     // The capability owns its pinned directory descriptors. It stays in this
     // result until the UI thread either consumes it or drops a stale result.
@@ -928,13 +1166,37 @@ fn prepare_codex_start(
     preparation_cancelled(cancel.as_ref())?;
     let native_home = PreparedNativeCodexHome::prepare()?;
     preparation_cancelled(cancel.as_ref())?;
-    Ok(PreparedCodexStart {
+    Ok(PreparedNativeStart::Codex(PreparedCodexStart {
         task,
         workspace,
         prompt,
         launch_argv,
         native_home,
-    })
+    }))
+}
+
+fn prepare_claude_start(
+    task: AgentTask,
+    policy: NativePromptPolicy,
+    cancel: Arc<AtomicBool>,
+) -> Result<PreparedNativeStart, AgentRuntimeError> {
+    preparation_cancelled(cancel.as_ref())?;
+    let workspace = prepare_native_agent_workspace(&task, Arc::clone(&cancel))?;
+    preparation_cancelled(cancel.as_ref())?;
+    let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
+    preparation_cancelled(cancel.as_ref())?;
+    let launch_argv = AgentLaunchSpec::resolve_native(
+        AgentProvider::Claude,
+        &task.repo_root,
+        &task.worktree_path,
+    )?;
+    preparation_cancelled(cancel.as_ref())?;
+    Ok(PreparedNativeStart::Claude(PreparedClaudeStart {
+        task,
+        workspace,
+        prompt,
+        launch_argv,
+    }))
 }
 
 fn rollback_failed_start(

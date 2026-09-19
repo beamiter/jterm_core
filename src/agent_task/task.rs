@@ -53,15 +53,29 @@ pub enum AgentProvider {
     Codex,
     Claude,
     OpenCode,
+    /// Moonshot Kimi Code CLI (`kimi`). Terminal/PTY path only for now.
+    Kimi,
 }
 
 impl AgentProvider {
+    /// Stable order for Fix-with / Start pickers.
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::OpenCode, Self::Kimi];
+
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
             Self::OpenCode => "OpenCode",
+            Self::Kimi => "Kimi",
         }
+    }
+
+    /// Whether the shared runtime owns a structured native driver for this CLI.
+    ///
+    /// Providers without a native driver still launch through the shared
+    /// Terminal/PTY compatibility path (`AgentLaunchSpec`).
+    pub fn supports_native_driver(self) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
     }
 }
 

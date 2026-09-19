@@ -411,6 +411,7 @@ impl AgentProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Kimi => "kimi",
         }
     }
 }
@@ -445,6 +446,53 @@ mod tests {
         assert_eq!(AgentProvider::Codex.executable_name(), "codex");
         assert_eq!(AgentProvider::Claude.executable_name(), "claude");
         assert_eq!(AgentProvider::OpenCode.executable_name(), "opencode");
+        assert_eq!(AgentProvider::Kimi.executable_name(), "kimi");
+        assert_eq!(
+            AgentProvider::ALL.map(AgentProvider::executable_name),
+            ["codex", "claude", "opencode", "kimi"]
+        );
+        assert_eq!(
+            AgentProvider::ALL.map(AgentProvider::display_name),
+            ["Codex", "Claude", "OpenCode", "Kimi"]
+        );
+        assert!(AgentProvider::Codex.supports_native_driver());
+        assert!(AgentProvider::Claude.supports_native_driver());
+        assert!(!AgentProvider::OpenCode.supports_native_driver());
+        assert!(!AgentProvider::Kimi.supports_native_driver());
+    }
+
+    #[test]
+    fn resolves_kimi_executable_for_pty_compatibility() {
+        let root = TempDir::new("kimi-resolve");
+        let bin = root.0.join("bin");
+        let repository = root.0.join("repository");
+        let worktree = root.0.join("worktree");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        let kimi = bin.join("kimi");
+        fs::write(&kimi, b"\x7fELF kimi fixture").unwrap();
+        fs::set_permissions(&kimi, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let spec = AgentLaunchSpec::resolve_with_path(
+            AgentProvider::Kimi,
+            &repository,
+            &worktree,
+            Some(bin.as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(spec.executable, kimi);
+        assert_eq!(spec.argv, vec![kimi.to_string_lossy().into_owned()]);
+        assert_eq!(
+            AgentLaunchSpec::resolve_native_with_path(
+                AgentProvider::Kimi,
+                &repository,
+                &worktree,
+                Some(bin.as_os_str()),
+            )
+            .unwrap(),
+            vec![kimi.to_string_lossy().into_owned()]
+        );
     }
 
     #[test]
