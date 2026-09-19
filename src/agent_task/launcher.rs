@@ -432,6 +432,22 @@ impl AgentProvider {
             Self::Kimi => "kimi",
         }
     }
+
+    /// Fail closed before creating a worktree when the CLI is not on PATH.
+    pub fn ensure_executable_available(self) -> Result<PathBuf, AgentLaunchError> {
+        let path = std::env::var_os("PATH");
+        let executable = crate::host::find_executable_in(self.executable_name(), path.as_deref())
+            .ok_or_else(|| AgentLaunchError::ExecutableUnavailable {
+                provider: self,
+                detail: "executable was not found in an absolute PATH directory".to_string(),
+            })?;
+        std::fs::canonicalize(&executable).map_err(|error| {
+            AgentLaunchError::ExecutableUnavailable {
+                provider: self,
+                detail: format!("cannot resolve executable: {error}"),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +503,19 @@ mod tests {
         assert!(AgentProvider::Claude.supports_native_driver());
         assert!(!AgentProvider::OpenCode.supports_native_driver());
         assert!(!AgentProvider::Kimi.supports_native_driver());
+    }
+
+    #[test]
+    fn ensure_executable_available_reports_missing_or_absolute_cli() {
+        match AgentProvider::OpenCode.ensure_executable_available() {
+            Ok(path) => assert!(path.is_absolute()),
+            Err(AgentLaunchError::ExecutableUnavailable { provider, detail }) => {
+                assert_eq!(provider, AgentProvider::OpenCode);
+                assert!(detail.contains("PATH"));
+                assert!(provider.install_hint().contains("opencode"));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
