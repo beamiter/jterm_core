@@ -140,19 +140,53 @@ impl Provider {
         self.to_jagent().default_base_url()
     }
 
-    fn provider_api_key(self) -> Option<String> {
+    /// Provider-specific key variables that may be sent to `base_url`.
+    ///
+    /// OpenAI-compatible keys are bound to the endpoint's host: Moonshot /
+    /// Kimi keys go only to Moonshot / Kimi hosts, and `OPENAI_API_KEY` never
+    /// goes there. The app-prefixed key is an explicit, endpoint-neutral
+    /// choice and is handled by the callers.
+    fn provider_key_names(self, base_url: &str) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic => &["ANTHROPIC_API_KEY"],
+            Self::OpenAiCompatible if is_moonshot_base_url(base_url) => &MOONSHOT_API_KEY_NAMES,
+            Self::OpenAiCompatible => &["OPENAI_API_KEY"],
+            Self::Ollama => &["OLLAMA_API_KEY"],
+        }
+    }
+
+    fn provider_api_key(self, base_url: &str) -> Option<String> {
         let app_key = exact_api_key_env(&app_env_name("AI_API_KEY"));
         if app_key.is_some() {
             return app_key;
         }
-        match self {
-            Self::Anthropic => exact_api_key_env("ANTHROPIC_API_KEY"),
-            Self::OpenAiCompatible => exact_api_key_env("OPENAI_API_KEY")
-                .or_else(|| exact_api_key_env("MOONSHOT_API_KEY"))
-                .or_else(|| exact_api_key_env("KIMI_API_KEY")),
-            Self::Ollama => exact_api_key_env("OLLAMA_API_KEY"),
-        }
+        self.provider_key_names(base_url)
+            .iter()
+            .find_map(|name| exact_api_key_env(name))
     }
+}
+
+/// Moonshot / Kimi key variables, in preference order.
+const MOONSHOT_API_KEY_NAMES: [&str; 2] = ["MOONSHOT_API_KEY", "KIMI_API_KEY"];
+/// Hosts that may receive a Moonshot / Kimi key (Kimi Code's own default
+/// endpoint is `https://api.moonshot.ai/v1`; `api.kimi.com` serves Kimi's
+/// coding plan).
+const MOONSHOT_API_HOSTS: [&str; 3] = ["api.moonshot.ai", "api.moonshot.cn", "api.kimi.com"];
+/// Endpoint used when only a Moonshot / Kimi key is configured.
+const MOONSHOT_DEFAULT_BASE_URL: &str = "https://api.moonshot.ai/v1";
+/// Model used for a Moonshot endpoint when no model is configured; the
+/// OpenAI-compatible default (`gpt-*`) does not exist there.
+const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k2.5";
+
+fn base_url_host(base_url: &str) -> Option<String> {
+    let (_, rest) = base_url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = crate::link::authority_host(authority)?;
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+fn is_moonshot_base_url(base_url: &str) -> bool {
+    base_url_host(base_url).is_some_and(|host| MOONSHOT_API_HOSTS.contains(&host.as_str()))
 }
 
 impl FromStr for Provider {
@@ -488,7 +522,7 @@ impl AiClient {
             return Err(AiError::Disabled);
         }
         let provider = Provider::from_str(&settings.provider)?;
-        let api_key = match provider.provider_api_key() {
+        let api_key = match provider.provider_api_key(&settings.base_url) {
             Some(key) => Some(key),
             None => settings
                 .api_key_file
@@ -515,37 +549,47 @@ impl AiClient {
 
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, AiError> {
         let app_provider = app_env_name("AI_PROVIDER");
-        let openai_compatible_key = exact_nonempty(get("OPENAI_API_KEY"))
-            .or_else(|| exact_nonempty(get("MOONSHOT_API_KEY")))
-            .or_else(|| exact_nonempty(get("KIMI_API_KEY")));
+        let app_key = app_env_name("AI_API_KEY");
+        let has_openai_key = exact_nonempty(get("OPENAI_API_KEY")).is_some();
+        let has_moonshot_key = MOONSHOT_API_KEY_NAMES
+            .iter()
+            .any(|name| exact_nonempty(get(name)).is_some());
+        let has_app_key = exact_nonempty(get(&app_key)).is_some();
         let provider = match trimmed_nonempty(get(&app_provider)) {
             Some(value) => Provider::from_str(&value)?,
             None if exact_nonempty(get("ANTHROPIC_API_KEY")).is_some() => Provider::Anthropic,
-            None if openai_compatible_key.is_some() => Provider::OpenAiCompatible,
+            None if has_openai_key || has_moonshot_key => Provider::OpenAiCompatible,
             None => Provider::Ollama,
         };
-        let model =
-            get(&app_env_name("AI_MODEL")).unwrap_or_else(|| provider.default_model().to_string());
-        let base_url = get(&app_env_name("AI_BASE_URL"))
-            .unwrap_or_else(|| provider.default_base_url().to_string());
+        // With only a Moonshot / Kimi credential, default to Moonshot's
+        // endpoint instead of sending that key to OpenAI.
+        let base_url = match get(&app_env_name("AI_BASE_URL")) {
+            Some(base_url) => base_url,
+            None if provider == Provider::OpenAiCompatible
+                && has_moonshot_key
+                && !has_openai_key
+                && !has_app_key =>
+            {
+                MOONSHOT_DEFAULT_BASE_URL.to_string()
+            }
+            None => provider.default_base_url().to_string(),
+        };
+        let model = match get(&app_env_name("AI_MODEL")) {
+            Some(model) => model,
+            None if provider == Provider::OpenAiCompatible && is_moonshot_base_url(&base_url) => {
+                MOONSHOT_DEFAULT_MODEL.to_string()
+            }
+            None => provider.default_model().to_string(),
+        };
         let max_tokens =
             parse_optional_env_value(get(&app_env_name("AI_MAX_TOKENS")), "AI_MAX_TOKENS")?
                 .unwrap_or(1024);
         let temperature =
             parse_optional_env_value(get(&app_env_name("AI_TEMPERATURE")), "AI_TEMPERATURE")?;
-        let app_key = app_env_name("AI_API_KEY");
-        let provider_keys: &[&str] = match provider {
-            Provider::Anthropic => &["ANTHROPIC_API_KEY"],
-            Provider::OpenAiCompatible => &["OPENAI_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"],
-            Provider::Ollama => &["OLLAMA_API_KEY"],
-        };
-        let mut provider_key_value = None;
-        for name in provider_keys {
-            if let Some(key) = exact_nonempty(get(name)) {
-                provider_key_value = Some(key);
-                break;
-            }
-        }
+        let provider_key_value = provider
+            .provider_key_names(&base_url)
+            .iter()
+            .find_map(|name| exact_nonempty(get(name)));
         let api_key = match exact_nonempty(get(&app_key)).or(provider_key_value) {
             Some(key) => Some(key),
             None => exact_nonempty(get(&app_env_name("AI_API_KEY_FILE")))
@@ -4010,6 +4054,99 @@ mod tests {
         assert_eq!(exact.base_url, "http://localhost:11434");
         assert_eq!(exact.max_tokens, 512);
         assert_eq!(exact.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn openai_compatible_keys_are_bound_to_the_endpoint_host() {
+        use std::collections::HashMap;
+
+        let build = |pairs: &[(&str, &str)]| {
+            let values: HashMap<String, String> = pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
+            AiClient::from_lookup(|name| values.get(name).cloned()).unwrap()
+        };
+        let base_name = app_env_name("AI_BASE_URL");
+        let app_key = app_env_name("AI_API_KEY");
+        let openai_key = "sk-openai-0123456789";
+        let moonshot_key = "sk-moonshot-0123456789";
+
+        // Only a Moonshot/Kimi key and no base URL: Moonshot endpoint and
+        // model, never OpenAI's default endpoint.
+        for name in ["MOONSHOT_API_KEY", "KIMI_API_KEY"] {
+            let client = build(&[(name, moonshot_key)]);
+            assert_eq!(client.provider, Provider::OpenAiCompatible);
+            assert_eq!(client.base_url, MOONSHOT_DEFAULT_BASE_URL);
+            assert_eq!(client.model, MOONSHOT_DEFAULT_MODEL);
+            assert_eq!(client.api_key.as_deref(), Some(moonshot_key));
+        }
+
+        // Explicit OpenAI endpoint with only a Moonshot key: no key is sent.
+        let client = build(&[
+            ("MOONSHOT_API_KEY", moonshot_key),
+            (base_name.as_str(), "https://api.openai.com/v1"),
+        ]);
+        assert_eq!(client.api_key, None);
+
+        // Both keys, no base URL: OpenAI endpoint gets the OpenAI key.
+        let client = build(&[
+            ("OPENAI_API_KEY", openai_key),
+            ("MOONSHOT_API_KEY", moonshot_key),
+        ]);
+        assert_eq!(
+            client.base_url,
+            Provider::OpenAiCompatible.default_base_url()
+        );
+        assert_eq!(client.api_key.as_deref(), Some(openai_key));
+
+        // Moonshot/Kimi endpoint with an OpenAI key: the OpenAI key is never
+        // sent there, with or without a Moonshot key alongside it.
+        for base_url in [
+            "https://api.moonshot.ai/v1",
+            "https://API.Moonshot.CN/v1",
+            "https://api.kimi.com/coding/v1",
+        ] {
+            let client = build(&[
+                ("OPENAI_API_KEY", openai_key),
+                (base_name.as_str(), base_url),
+            ]);
+            assert_eq!(client.api_key, None, "{base_url}");
+            let client = build(&[
+                ("OPENAI_API_KEY", openai_key),
+                ("KIMI_API_KEY", moonshot_key),
+                (base_name.as_str(), base_url),
+            ]);
+            assert_eq!(client.api_key.as_deref(), Some(moonshot_key), "{base_url}");
+        }
+
+        // The explicit app key is endpoint-neutral and keeps OpenAI's
+        // default endpoint even when a Moonshot key is also present.
+        let client = build(&[
+            (app_key.as_str(), openai_key),
+            ("MOONSHOT_API_KEY", moonshot_key),
+        ]);
+        assert_eq!(
+            client.base_url,
+            Provider::OpenAiCompatible.default_base_url()
+        );
+        assert_eq!(client.api_key.as_deref(), Some(openai_key));
+
+        assert!(is_moonshot_base_url("https://api.moonshot.ai./v1"));
+        assert!(!is_moonshot_base_url(
+            "https://api.moonshot.ai.evil.example/v1"
+        ));
+        assert!(!is_moonshot_base_url(
+            "https://evil.example/api.moonshot.ai"
+        ));
+        assert_eq!(
+            Provider::OpenAiCompatible.provider_key_names("https://example.com/v1"),
+            &["OPENAI_API_KEY"]
+        );
+        assert_eq!(
+            Provider::OpenAiCompatible.provider_key_names("https://api.moonshot.cn/v1"),
+            &MOONSHOT_API_KEY_NAMES
+        );
     }
 
     #[test]

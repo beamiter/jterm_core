@@ -900,14 +900,42 @@ pub fn build_native_task_prompt(
     Ok(AgentPrompt::new(text))
 }
 
-/// Relative path of the PTY compatibility brief written into a task worktree.
+/// Relative path of ember's PTY compatibility brief (`.ember/task-brief.md`).
+///
+/// The directory is named after the running app, so frost/forge/anvil write
+/// `.<app>/task-brief.md`; use [`pty_task_brief_relative`] for the running
+/// app's path. This constant stays for ember's existing callers.
 pub const PTY_TASK_BRIEF_RELATIVE: &str = ".ember/task-brief.md";
+
+const PTY_TASK_BRIEF_FILE: &str = "task-brief.md";
+
+/// Per-app brief directory inside a task worktree, e.g. `.ember`.
+pub fn pty_task_brief_dir_name() -> String {
+    format!(".{}", crate::agent_task::app_slug())
+}
+
+/// Per-app brief path relative to the task worktree, e.g.
+/// `.ember/task-brief.md`.
+pub fn pty_task_brief_relative() -> String {
+    format!("{}/{PTY_TASK_BRIEF_FILE}", pty_task_brief_dir_name())
+}
 
 /// Write a markdown brief so opaque Claude/OpenCode/Kimi PTYs can read the
 /// same failed-command evidence native drivers receive as a prompt.
 ///
 /// Returns `Ok(None)` when sharing is disabled. The file lives under
-/// [`.ember/`](PTY_TASK_BRIEF_RELATIVE) inside the task worktree.
+/// [`pty_task_brief_relative`] inside the task worktree.
+///
+/// The worktree is repository-controlled, so nothing here follows a symlink:
+/// the worktree and brief directory are opened `O_NOFOLLOW|O_DIRECTORY`, and
+/// the brief is written to a fresh `O_EXCL` 0600 temporary file relative to
+/// that descriptor and renamed over the old name (never written through an
+/// existing inode, which could be a hard link). The directory also gets a
+/// self-ignoring `.gitignore` (`*`) so `git add -A` in the task worktree never
+/// stages the brief. That is used instead of `info/exclude` because a linked
+/// worktree has no private exclude file: `git rev-parse --git-path
+/// info/exclude` resolves to the shared common directory, i.e. the user's
+/// primary checkout.
 pub fn write_pty_task_brief(
     task: &AgentTask,
     policy: NativePromptPolicy,
@@ -917,9 +945,6 @@ pub fn write_pty_task_brief(
     }
     let relative_cwd = Path::new(".");
     let prompt = build_native_task_prompt(task, relative_cwd, policy)?;
-    let brief_dir = task.worktree_path.join(".ember");
-    std::fs::create_dir_all(&brief_dir).map_err(|error| NativePromptError::Io(error.to_string()))?;
-    let path = task.worktree_path.join(PTY_TASK_BRIEF_RELATIVE);
     let body = format!(
         "# {} task brief\n\n\
          Provider: {}\n\
@@ -934,8 +959,119 @@ pub fn write_pty_task_brief(
         task.worktree_path.display(),
         prompt.text
     );
-    std::fs::write(&path, body).map_err(|error| NativePromptError::Io(error.to_string()))?;
-    Ok(Some(path))
+    let dir_name = pty_task_brief_dir_name();
+    write_brief_beneath(&task.worktree_path, &dir_name, body.as_bytes())
+        .map_err(|error| NativePromptError::Io(format!("cannot write the task brief: {error}")))?;
+    Ok(Some(
+        task.worktree_path.join(&dir_name).join(PTY_TASK_BRIEF_FILE),
+    ))
+}
+
+#[cfg(unix)]
+fn write_brief_beneath(worktree: &Path, dir_name: &str, body: &[u8]) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    fn c_name(name: &str) -> io::Result<CString> {
+        CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in name"))
+    }
+    fn open_dir_at(parent: RawFd, name: &CString) -> io::Result<OwnedFd> {
+        // SAFETY: parent is a live directory descriptor and name is a valid C
+        // string; openat returns a new owned descriptor on success.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned by openat and is owned here.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    /// Create `name` exclusively (never following or reusing an entry).
+    fn create_exclusive_at(parent: RawFd, name: &CString) -> io::Result<File> {
+        // SAFETY: as above; O_EXCL|O_NOFOLLOW never opens an existing entry.
+        let fd = unsafe {
+            libc::openat(
+                parent,
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd was just returned by openat and is owned here.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    let root = PinnedDirectory::open(worktree).map_err(io::Error::other)?;
+    let dir_c = c_name(dir_name)?;
+    // SAFETY: root is a live directory descriptor; mkdirat never follows a
+    // final-component symlink (it fails with EEXIST instead).
+    if unsafe { libc::mkdirat(root.as_raw_fd(), dir_c.as_ptr(), 0o700) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    // ELOOP/ENOTDIR here means the repository planted a symlink or file.
+    let directory = open_dir_at(root.as_raw_fd(), &dir_c).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("refusing {dir_name} in the task worktree (not a real directory): {error}"),
+        )
+    })?;
+
+    let gitignore = c_name(".gitignore")?;
+    match create_exclusive_at(directory.as_raw_fd(), &gitignore) {
+        Ok(mut file) => file.write_all(b"*\n")?,
+        // Keep an existing entry: rewriting it could modify a tracked file.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let target = c_name(PTY_TASK_BRIEF_FILE)?;
+    let temporary = c_name(&format!(
+        ".{PTY_TASK_BRIEF_FILE}.{}.tmp",
+        Uuid::new_v4().simple()
+    ))?;
+    let written = create_exclusive_at(directory.as_raw_fd(), &temporary)
+        .and_then(|mut file| file.write_all(body));
+    // SAFETY: both names are relative to the same pinned directory; renameat
+    // replaces the directory entry and never writes through its old inode.
+    let renamed = written.and_then(|()| {
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                target.as_ptr(),
+            )
+        } < 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if renamed.is_err() {
+        // SAFETY: removes only the temporary entry this call created.
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+    }
+    renamed
+}
+
+#[cfg(not(unix))]
+fn write_brief_beneath(_worktree: &Path, _dir_name: &str, _body: &[u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "task briefs require Unix directory descriptors",
+    ))
 }
 
 /// Build one explicit, user-authored follow-up turn for an already-running
@@ -1141,6 +1277,79 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    fn brief_policy() -> NativePromptPolicy {
+        NativePromptPolicy {
+            share_command_context: true,
+            redact_secrets: true,
+        }
+    }
+
+    fn git_status(worktree: &Path) -> String {
+        let output = Command::new("/usr/bin/git")
+            .current_dir(worktree)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn pty_brief_is_private_app_named_and_ignored_by_git() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (root, task) = managed_task_fixture();
+        let path = write_pty_task_brief(&task, brief_policy())
+            .unwrap()
+            .unwrap();
+        let dir_name = pty_task_brief_dir_name();
+        assert_eq!(dir_name, format!(".{}", crate::agent_task::app_slug()));
+        assert_eq!(path, task.worktree_path.join(pty_task_brief_relative()));
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("Read this file, stay inside the worktree"));
+        // Idempotent, and `git add -A` would not stage the brief.
+        write_pty_task_brief(&task, brief_policy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(git_status(&task.worktree_path), "");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pty_brief_refuses_symlinked_directory_and_never_writes_through_links() {
+        let (root, task) = managed_task_fixture();
+        let outside = private_test_directory("brief-outside");
+        let dir = task.worktree_path.join(pty_task_brief_dir_name());
+
+        symlink(&outside, &dir).unwrap();
+        assert!(matches!(
+            write_pty_task_brief(&task, brief_policy()),
+            Err(NativePromptError::Io(_))
+        ));
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        std::fs::remove_file(&dir).unwrap();
+
+        std::fs::create_dir(&dir).unwrap();
+        let victim = outside.join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        let brief = dir.join("task-brief.md");
+        symlink(&victim, &brief).unwrap();
+        write_pty_task_brief(&task, brief_policy()).unwrap();
+        assert!(std::fs::symlink_metadata(&brief).unwrap().is_file());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+
+        std::fs::remove_file(&brief).unwrap();
+        std::fs::hard_link(&victim, &brief).unwrap();
+        write_pty_task_brief(&task, brief_policy()).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(outside);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

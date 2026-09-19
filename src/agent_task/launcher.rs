@@ -161,8 +161,7 @@ impl AgentLaunchSpec {
         let launch = Self::resolve_with_path(provider, repository, worktree, path)?;
         resolve_native_argv(
             provider,
-            repository,
-            worktree,
+            Some((repository, worktree)),
             &launch.executable,
             &launch.argv[0],
             path,
@@ -240,10 +239,11 @@ impl AgentLaunchSpec {
     }
 }
 
+/// `containment` is the task's (repository, worktree) pair; the pre-worktree
+/// preflight has none yet and passes `None`, running every other check.
 fn resolve_native_argv(
     provider: AgentProvider,
-    repository: &Path,
-    worktree: &Path,
+    containment: Option<(&Path, &Path)>,
     executable: &Path,
     executable_arg: &str,
     path: Option<&OsStr>,
@@ -251,7 +251,7 @@ fn resolve_native_argv(
     validate_native_launch_artifact(executable).map_err(|detail| {
         AgentLaunchError::UntrustedNativeExecutable {
             path: executable.to_path_buf(),
-            detail,
+            detail: native_artifact_hint(provider, detail),
         }
     })?;
     if provider != AgentProvider::Codex {
@@ -286,7 +286,9 @@ fn resolve_native_argv(
             detail: format!("cannot resolve native Codex interpreter: {error}"),
         }
     })?;
-    if interpreter.starts_with(repository) || interpreter.starts_with(worktree) {
+    if containment.is_some_and(|(repository, worktree)| {
+        interpreter.starts_with(repository) || interpreter.starts_with(worktree)
+    }) {
         return Err(AgentLaunchError::NativeInterpreterInsideRepository(
             interpreter,
         ));
@@ -322,7 +324,10 @@ fn validate_native_launch_artifact(path: &Path) -> Result<(), String> {
         return Err("canonical target has no executable bit".into());
     }
     if metadata.nlink() != 1 {
-        return Err("canonical target must have exactly one hard link".into());
+        return Err(format!(
+            "canonical target has {} hard links; native sessions require exactly one",
+            metadata.nlink()
+        ));
     }
     if mode & (libc::S_ISUID | libc::S_ISGID) != 0 {
         return Err("canonical target must not be setuid or setgid".into());
@@ -434,12 +439,31 @@ impl AgentProvider {
     }
 
     /// Fail closed before creating a worktree when the CLI is not on PATH.
+    ///
+    /// This is the check for launching the CLI in a terminal, which runs it
+    /// the way the user's shell would. It deliberately does not apply the
+    /// native launcher's artifact rules: an npm-installed Claude has a second
+    /// hard link and can never run natively, but it runs fine in a terminal.
     pub fn ensure_executable_available(self) -> Result<PathBuf, AgentLaunchError> {
-        let path = std::env::var_os("PATH");
-        let executable = crate::host::find_executable_in(self.executable_name(), path.as_deref())
-            .ok_or_else(|| AgentLaunchError::ExecutableUnavailable {
-                provider: self,
-                detail: "executable was not found in an absolute PATH directory".to_string(),
+        self.resolve_on_path(std::env::var_os("PATH").as_deref())
+    }
+
+    /// [`Self::ensure_executable_available`] plus, for providers with a native
+    /// driver, the same artifact trust checks as
+    /// [`AgentLaunchSpec::resolve_native`] (except the per-task repository
+    /// containment check, which needs the worktree), so a caller about to
+    /// start a native session can report a refusal synchronously.
+    pub fn ensure_native_launch_available(self) -> Result<PathBuf, AgentLaunchError> {
+        self.ensure_native_launch_available_with_path(std::env::var_os("PATH").as_deref())
+    }
+
+    fn resolve_on_path(self, path: Option<&OsStr>) -> Result<PathBuf, AgentLaunchError> {
+        let executable =
+            crate::host::find_executable_in(self.executable_name(), path).ok_or_else(|| {
+                AgentLaunchError::ExecutableUnavailable {
+                    provider: self,
+                    detail: "executable was not found in an absolute PATH directory".to_string(),
+                }
             })?;
         std::fs::canonicalize(&executable).map_err(|error| {
             AgentLaunchError::ExecutableUnavailable {
@@ -447,6 +471,34 @@ impl AgentProvider {
                 detail: format!("cannot resolve executable: {error}"),
             }
         })
+    }
+
+    fn ensure_native_launch_available_with_path(
+        self,
+        path: Option<&OsStr>,
+    ) -> Result<PathBuf, AgentLaunchError> {
+        let executable = self.resolve_on_path(path)?;
+        if self.supports_native_driver() {
+            let executable_arg = executable
+                .to_str()
+                .ok_or_else(|| AgentLaunchError::ExecutablePathNotUtf8(executable.clone()))?;
+            resolve_native_argv(self, None, &executable, executable_arg, path)?;
+        }
+        Ok(executable)
+    }
+}
+
+/// Turn a native trust failure into an actionable message.
+fn native_artifact_hint(provider: AgentProvider, detail: String) -> String {
+    if detail.contains("hard link") {
+        format!(
+            "{detail} (another name for the same file could be rewritten in place outside the checked directories). \
+             Reinstall {} so its binary has a single link (e.g. an npm install whose platform package \
+             hard-links the same binary), or run this task in a Terminal instead of natively",
+            provider.display_name()
+        )
+    } else {
+        detail
     }
 }
 
@@ -648,6 +700,46 @@ mod tests {
                 codex.to_string_lossy().into_owned()
             ]
         );
+    }
+
+    #[test]
+    fn preflight_runs_the_native_artifact_checks_before_any_worktree_exists() {
+        let root = TempDir::new("preflight");
+        let bin = root.0.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let claude = bin.join("claude");
+        fs::write(&claude, b"\x7fELF native fixture").unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = AgentProvider::Claude
+            .ensure_native_launch_available_with_path(Some(bin.as_os_str()))
+            .unwrap();
+        assert_eq!(resolved, fs::canonicalize(&claude).unwrap());
+
+        // The npm layout on real machines: a second hard link to the same
+        // binary. The native launcher refuses it, so the preflight must too.
+        fs::hard_link(&claude, root.0.join("claude-platform-copy")).unwrap();
+        // A terminal launch runs it the way the shell would, so it still passes.
+        assert_eq!(
+            AgentProvider::Claude
+                .resolve_on_path(Some(bin.as_os_str()))
+                .unwrap(),
+            resolved
+        );
+        match AgentProvider::Claude.ensure_native_launch_available_with_path(Some(bin.as_os_str()))
+        {
+            Err(AgentLaunchError::UntrustedNativeExecutable { detail, .. }) => {
+                assert!(detail.contains("2 hard links"), "{detail}");
+                assert!(detail.contains("Reinstall Claude"), "{detail}");
+                assert!(detail.contains("Terminal"), "{detail}");
+            }
+            other => panic!("preflight accepted a multiply-linked native CLI: {other:?}"),
+        }
+        // PTY-only providers keep the broader PATH-only preflight.
+        let opencode = bin.join("opencode");
+        fs::hard_link(&claude, &opencode).unwrap();
+        assert!(AgentProvider::OpenCode
+            .ensure_native_launch_available_with_path(Some(bin.as_os_str()))
+            .is_ok());
     }
 
     #[test]

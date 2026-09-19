@@ -7,8 +7,8 @@
 
 use super::drivers::claude_stream_json::ClaudeStreamJsonDriver;
 use super::drivers::codex_app_server::{
-    CodexAppServerDriver, CodexAppServerExitCause, CodexAppServerExitReport,
-    CodexAppServerPhase, CodexAppServerViewSnapshot,
+    CodexAppServerDriver, CodexAppServerExitCause, CodexAppServerExitReport, CodexAppServerPhase,
+    CodexAppServerViewSnapshot,
 };
 use super::drivers::kimi_stream_json::KimiStreamJsonDriver;
 use super::native::{
@@ -1370,11 +1370,8 @@ fn prepare_kimi_start(
     preparation_cancelled(cancel.as_ref())?;
     let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
     preparation_cancelled(cancel.as_ref())?;
-    let launch_argv = AgentLaunchSpec::resolve_native(
-        AgentProvider::Kimi,
-        &task.repo_root,
-        &task.worktree_path,
-    )?;
+    let launch_argv =
+        AgentLaunchSpec::resolve_native(AgentProvider::Kimi, &task.repo_root, &task.worktree_path)?;
     preparation_cancelled(cancel.as_ref())?;
     Ok(PreparedNativeStart::Kimi(PreparedKimiStart {
         task,

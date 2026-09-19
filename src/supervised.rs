@@ -263,6 +263,48 @@ impl SupervisedChild {
         }
     }
 
+    /// The dedicated process-group id, while the root is still owned.
+    ///
+    /// The value is informational after [`Self::reap_after_group_kill`]: it
+    /// may then only be used for a signal-0 emptiness probe, never to deliver
+    /// a real signal, because the numeric id is recyclable once the group is
+    /// empty.
+    #[cfg(unix)]
+    pub fn process_group_id(&self) -> i32 {
+        self.process_group
+    }
+
+    /// Ask the whole owned process group to stop (SIGTERM) without reaping.
+    ///
+    /// The root must still be owned and unreaped (running or a retained
+    /// zombie), which anchors the PGID against reuse exactly like the
+    /// SIGKILL in [`Self::reap_after_group_kill`]. Callers follow up with that
+    /// method after a grace period so TERM-ignoring members are still killed.
+    #[cfg(unix)]
+    pub fn terminate_group(&mut self) -> io::Result<()> {
+        if self.child.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "supervised child was already reaped",
+            ));
+        }
+        self.probe_unix_root()?;
+        require_waitable_sigchld()?;
+        // SAFETY: getpgrp has no preconditions and only reads process state.
+        if self.process_group > 1 && self.process_group != unsafe { libc::getpgrp() } {
+            // SAFETY: the root is still unreaped (just probed), so this PGID
+            // still names the dedicated group spawn() created.
+            let result = unsafe { libc::kill(-self.process_group, libc::SIGTERM) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn signal_group(&self) {
         // SAFETY: getpgrp has no preconditions and only reads process state.

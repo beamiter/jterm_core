@@ -3923,7 +3923,7 @@ fn compact_json(value: &Value, limit: usize) -> String {
     visible_bounded(&encoded, limit).0
 }
 
-fn visible_bounded(value: &str, limit: usize) -> (String, bool) {
+pub(super) fn visible_bounded(value: &str, limit: usize) -> (String, bool) {
     let mut bounded = String::with_capacity(value.len().min(limit));
     let mut truncated = false;
     for character in value.chars() {
@@ -3943,7 +3943,12 @@ fn visible_bounded(value: &str, limit: usize) -> (String, bool) {
     (bounded, truncated)
 }
 
-fn append_visible_bounded(target: &mut String, truncated: &mut bool, delta: &str, limit: usize) {
+pub(super) fn append_visible_bounded(
+    target: &mut String,
+    truncated: &mut bool,
+    delta: &str,
+    limit: usize,
+) {
     if target.len() >= limit {
         *truncated |= !delta.is_empty();
         return;
