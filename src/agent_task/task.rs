@@ -53,7 +53,7 @@ pub enum AgentProvider {
     Codex,
     Claude,
     OpenCode,
-    /// Moonshot Kimi Code CLI (`kimi`). Terminal/PTY path only for now.
+    /// Moonshot Kimi Code CLI (`kimi`). Native print/stream-json MVP plus PTY fallback.
     Kimi,
 }
 
@@ -75,7 +75,7 @@ impl AgentProvider {
     /// Providers without a native driver still launch through the shared
     /// Terminal/PTY compatibility path (`AgentLaunchSpec`).
     pub fn supports_native_driver(self) -> bool {
-        matches!(self, Self::Codex | Self::Claude)
+        matches!(self, Self::Codex | Self::Claude | Self::Kimi)
     }
 
     /// Stable config / settings value (`codex`, `claude`, …).

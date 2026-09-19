@@ -3,6 +3,7 @@
 pub mod claude_stream_json;
 pub mod codex_app_server;
 pub mod fake;
+pub mod kimi_stream_json;
 
 pub use claude_stream_json::{
     claude_print_argv, parse_stream_json_line, ClaudeStreamJsonDriver, ClaudeStreamSignal,
@@ -17,3 +18,7 @@ pub use codex_app_server::{
 };
 #[allow(unused_imports)] // test-support adapter, exercised by driver tests
 pub use fake::{FakeAgentDriver, FakeAgentEvent, FakeAgentProgress};
+pub use kimi_stream_json::{
+    kimi_print_argv, parse_stream_json_line as parse_kimi_stream_json_line, KimiStreamJsonDriver,
+    KimiStreamSignal,
+};

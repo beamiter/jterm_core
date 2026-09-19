@@ -10,6 +10,7 @@ use super::drivers::codex_app_server::{
     CodexAppServerDriver, CodexAppServerExitCause, CodexAppServerExitReport,
     CodexAppServerPhase, CodexAppServerViewSnapshot,
 };
+use super::drivers::kimi_stream_json::KimiStreamJsonDriver;
 use super::native::{
     build_native_follow_up_prompt, build_native_task_prompt, prepare_native_agent_workspace,
     NativePromptError, NativePromptPolicy, NativeWorkspaceError, PreparedNativeCodexHome,
@@ -57,6 +58,7 @@ struct RunningCodexAgent {
 enum NativeRunningDriver {
     Codex(CodexAppServerDriver),
     Claude(ClaudeStreamJsonDriver),
+    Kimi(KimiStreamJsonDriver),
 }
 
 impl NativeRunningDriver {
@@ -64,6 +66,7 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.try_next_event(),
             Self::Claude(driver) => driver.try_next_event(),
+            Self::Kimi(driver) => driver.try_next_event(),
         }
     }
 
@@ -71,6 +74,7 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.cancel(),
             Self::Claude(driver) => driver.cancel(),
+            Self::Kimi(driver) => driver.cancel(),
         }
     }
 
@@ -78,6 +82,7 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.worker_is_finished(),
             Self::Claude(driver) => driver.worker_is_finished(),
+            Self::Kimi(driver) => driver.worker_is_finished(),
         }
     }
 
@@ -85,6 +90,7 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.join_finished_worker(),
             Self::Claude(driver) => driver.join_finished_worker(),
+            Self::Kimi(driver) => driver.join_finished_worker(),
         }
     }
 
@@ -92,6 +98,7 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.take_exit_report(),
             Self::Claude(driver) => driver.take_exit_report(),
+            Self::Kimi(driver) => driver.take_exit_report(),
         }
     }
 
@@ -99,6 +106,7 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.view_snapshot(),
             Self::Claude(driver) => driver.view_snapshot(),
+            Self::Kimi(driver) => driver.view_snapshot(),
         }
     }
 
@@ -106,6 +114,7 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.phase(),
             Self::Claude(driver) => driver.phase(),
+            Self::Kimi(driver) => driver.phase(),
         }
     }
 
@@ -113,13 +122,14 @@ impl NativeRunningDriver {
         match self {
             Self::Codex(driver) => driver.send(command),
             Self::Claude(driver) => driver.send(command),
+            Self::Kimi(driver) => driver.send(command),
         }
     }
 
     fn as_codex_mut(&mut self) -> Option<&mut CodexAppServerDriver> {
         match self {
             Self::Codex(driver) => Some(driver),
-            Self::Claude(_) => None,
+            Self::Claude(_) | Self::Kimi(_) => None,
         }
     }
 }
@@ -127,6 +137,7 @@ impl NativeRunningDriver {
 enum PreparedNativeStart {
     Codex(PreparedCodexStart),
     Claude(PreparedClaudeStart),
+    Kimi(PreparedKimiStart),
 }
 
 struct PreparedCodexStart {
@@ -140,6 +151,14 @@ struct PreparedCodexStart {
 struct PreparedClaudeStart {
     task: AgentTask,
     #[allow(dead_code)] // retained for future Claude containment parity with Codex
+    workspace: PreparedNativeWorkspace,
+    prompt: AgentPrompt,
+    launch_argv: Vec<String>,
+}
+
+struct PreparedKimiStart {
+    task: AgentTask,
+    #[allow(dead_code)] // retained for future Kimi containment parity with Codex
     workspace: PreparedNativeWorkspace,
     prompt: AgentPrompt,
     launch_argv: Vec<String>,
@@ -615,6 +634,145 @@ impl AgentRuntimeManager {
             task_id,
             RunningCodexAgent {
                 driver: NativeRunningDriver::Claude(driver),
+                retained_workspace: Some(prepared.workspace),
+                stream,
+                worker_joined: false,
+                forced_failure: None,
+                exit_report: None,
+                pending_prompt: None,
+                finish_requested: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Begin preparing a Kimi Code print/stream-json session without blocking.
+    ///
+    /// Like Claude, this MVP skips private home and cgroup containment. Prefer
+    /// the opaque PTY path when stronger isolation is required.
+    pub fn start_kimi(
+        &mut self,
+        task_manager: &mut TaskManager,
+        task_id: TaskId,
+        policy: NativePromptPolicy,
+    ) -> Result<(), AgentRuntimeError> {
+        if self.running.contains_key(&task_id) || self.preparing.contains_key(&task_id) {
+            return Err(AgentRuntimeError::AlreadyRunning(task_id));
+        }
+        self.reap_cancelled_preparations();
+        if self
+            .preparing
+            .len()
+            .saturating_add(self.cancelled_preparations.len())
+            .saturating_add(self.running.len())
+            >= NATIVE_AGENT_PREPARATIONS_MAX
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "at most {NATIVE_AGENT_PREPARATIONS_MAX} native tasks may prepare or remain live concurrently"
+            )));
+        }
+        let task = task_manager
+            .get(task_id)
+            .cloned()
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
+        if task.provider != AgentProvider::Kimi {
+            return Err(AgentRuntimeError::UnsupportedProvider {
+                task_id,
+                provider: task.provider,
+            });
+        }
+        if !policy.share_command_context {
+            return Err(AgentRuntimeError::Prompt(
+                NativePromptError::SharingDisabled,
+            ));
+        }
+        if task.status != TaskStatus::Created
+            || task.runtime_kind != TaskRuntimeKind::Unassigned
+            || task.terminal_session_id.is_some()
+            || task.validation.status == TaskValidationStatus::Running
+            || task_manager.has_active_agent_event_stream(task_id)
+        {
+            return Err(AgentRuntimeError::Preparation(format!(
+                "task must remain Created and unassigned (currently {} / {:?})",
+                task.status.label(),
+                task.runtime_kind
+            )));
+        }
+
+        let generation = self
+            .next_preparation_generation
+            .checked_add(1)
+            .ok_or_else(|| AgentRuntimeError::Preparation("generation counter exhausted".into()))?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::Builder::new()
+            .name(format!(
+                "{}-kimi-prepare-{task_id}-{generation}",
+                crate::agent_task::app_slug()
+            ))
+            .spawn(move || {
+                let result = prepare_kimi_start(task, policy, worker_cancel);
+                let _ = sender.send(PreparationResult { generation, result });
+            })
+            .map_err(|error| {
+                AgentRuntimeError::Preparation(format!(
+                    "could not start background preparation worker: {error}"
+                ))
+            })?;
+        self.next_preparation_generation = generation;
+        self.preparing.insert(
+            task_id,
+            PendingCodexPreparation {
+                generation,
+                policy,
+                receiver,
+                cancel,
+                worker: Some(worker),
+            },
+        );
+        Ok(())
+    }
+
+    fn start_prepared_kimi(
+        &mut self,
+        task_manager: &mut TaskManager,
+        prepared: PreparedKimiStart,
+    ) -> Result<(), AgentRuntimeError> {
+        let task_id = prepared.task.id;
+        let current = task_manager
+            .get(task_id)
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
+        if current != &prepared.task {
+            return Err(AgentRuntimeError::Preparation(
+                "task changed while native prerequisites were being prepared".into(),
+            ));
+        }
+        let stream = task_manager.start_agent_event_stream(task_id)?;
+        let worktree_path = prepared.task.worktree_path.clone();
+        let mut driver = KimiStreamJsonDriver::new(prepared.launch_argv, worktree_path.clone());
+        let request = AgentStartRequest {
+            provider: AgentProvider::Kimi,
+            stream: stream.clone(),
+            worktree_path,
+            source_context: None,
+            initial_prompt: Some(prepared.prompt),
+            resume_from: None,
+        };
+        if let Err(error) = driver.start(request) {
+            driver.cancel();
+            return Err(rollback_failed_start(
+                task_manager,
+                &stream,
+                AgentRuntimeError::Driver(error),
+            ));
+        }
+
+        self.retained.remove(&task_id);
+        self.running.insert(
+            task_id,
+            RunningCodexAgent {
+                driver: NativeRunningDriver::Kimi(driver),
                 retained_workspace: Some(prepared.workspace),
                 stream,
                 worker_joined: false,
@@ -1126,6 +1284,9 @@ impl AgentRuntimeManager {
                 PreparedNativeStart::Claude(prepared) => {
                     self.start_prepared_claude(task_manager, prepared)
                 }
+                PreparedNativeStart::Kimi(prepared) => {
+                    self.start_prepared_kimi(task_manager, prepared)
+                }
             });
             match result {
                 Ok(()) => report.preparations_started += 1,
@@ -1192,6 +1353,30 @@ fn prepare_claude_start(
     )?;
     preparation_cancelled(cancel.as_ref())?;
     Ok(PreparedNativeStart::Claude(PreparedClaudeStart {
+        task,
+        workspace,
+        prompt,
+        launch_argv,
+    }))
+}
+
+fn prepare_kimi_start(
+    task: AgentTask,
+    policy: NativePromptPolicy,
+    cancel: Arc<AtomicBool>,
+) -> Result<PreparedNativeStart, AgentRuntimeError> {
+    preparation_cancelled(cancel.as_ref())?;
+    let workspace = prepare_native_agent_workspace(&task, Arc::clone(&cancel))?;
+    preparation_cancelled(cancel.as_ref())?;
+    let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
+    preparation_cancelled(cancel.as_ref())?;
+    let launch_argv = AgentLaunchSpec::resolve_native(
+        AgentProvider::Kimi,
+        &task.repo_root,
+        &task.worktree_path,
+    )?;
+    preparation_cancelled(cancel.as_ref())?;
+    Ok(PreparedNativeStart::Kimi(PreparedKimiStart {
         task,
         workspace,
         prompt,

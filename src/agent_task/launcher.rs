@@ -502,7 +502,7 @@ mod tests {
         assert!(AgentProvider::Codex.supports_native_driver());
         assert!(AgentProvider::Claude.supports_native_driver());
         assert!(!AgentProvider::OpenCode.supports_native_driver());
-        assert!(!AgentProvider::Kimi.supports_native_driver());
+        assert!(AgentProvider::Kimi.supports_native_driver());
     }
 
     #[test]

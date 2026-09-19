@@ -78,13 +78,15 @@ pub use driver::{
 };
 #[allow(unused_imports)]
 pub use drivers::{
-    claude_print_argv, parse_stream_json_line, ClaudeStreamJsonDriver, ClaudeStreamSignal,
-    CodexAppServerApproval, CodexAppServerApprovalFileChange, CodexAppServerApprovalKind,
-    CodexAppServerCommandView, CodexAppServerExitCause, CodexAppServerExitReport,
-    CodexAppServerFileChange, CodexAppServerFileChangeView, CodexAppServerPhase,
-    CodexAppServerProcessExit, CodexAppServerTurnCommandSummary, CodexAppServerTurnFileSummary,
-    CodexAppServerTurnHistory, CodexAppServerViewSnapshot, CODEX_APP_SERVER_LIVE_TURN_MAX,
-    CODEX_APP_SERVER_TURN_HISTORY_CAPACITY, CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES,
+    claude_print_argv, kimi_print_argv, parse_kimi_stream_json_line, parse_stream_json_line,
+    ClaudeStreamJsonDriver, ClaudeStreamSignal, CodexAppServerApproval,
+    CodexAppServerApprovalFileChange, CodexAppServerApprovalKind, CodexAppServerCommandView,
+    CodexAppServerExitCause, CodexAppServerExitReport, CodexAppServerFileChange,
+    CodexAppServerFileChangeView, CodexAppServerPhase, CodexAppServerProcessExit,
+    CodexAppServerTurnCommandSummary, CodexAppServerTurnFileSummary, CodexAppServerTurnHistory,
+    CodexAppServerViewSnapshot, KimiStreamJsonDriver, KimiStreamSignal,
+    CODEX_APP_SERVER_LIVE_TURN_MAX, CODEX_APP_SERVER_TURN_HISTORY_CAPACITY,
+    CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES,
 };
 #[allow(unused_imports)]
 pub use event::{
