@@ -96,8 +96,8 @@ pub use event::{
 pub use launcher::{AgentLaunchError, AgentLaunchSpec};
 #[allow(unused_imports)]
 pub use native::{
-    NativeCodexHomeError, NativePromptError, NativePromptPolicy, NativeWorkspaceError,
-    NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
+    write_pty_task_brief, NativeCodexHomeError, NativePromptError, NativePromptPolicy,
+    NativeWorkspaceError, PTY_TASK_BRIEF_RELATIVE, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
 };
 #[allow(unused_imports)]
 pub use runtime::{

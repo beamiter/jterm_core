@@ -220,6 +220,23 @@ impl AgentLaunchSpec {
             argv: vec![executable_arg],
         })
     }
+
+    /// Optionally seed an interactive PTY argv with a short initial prompt.
+    ///
+    /// Claude Code accepts a trailing prompt for interactive sessions. Kimi /
+    /// OpenCode / Codex TUIs own their composers; callers should write
+    /// [`crate::agent_task::native::PTY_TASK_BRIEF_RELATIVE`] instead.
+    pub fn with_pty_seed_prompt(mut self, prompt: &str) -> Self {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return self;
+        }
+        match self.provider {
+            AgentProvider::Claude => self.argv.push(prompt.to_string()),
+            AgentProvider::Codex | AgentProvider::OpenCode | AgentProvider::Kimi => {}
+        }
+        self
+    }
 }
 
 fn resolve_native_argv(
@@ -459,6 +476,28 @@ mod tests {
         assert!(AgentProvider::Claude.supports_native_driver());
         assert!(!AgentProvider::OpenCode.supports_native_driver());
         assert!(!AgentProvider::Kimi.supports_native_driver());
+    }
+
+    #[test]
+    fn pty_seed_prompt_only_extends_claude_argv() {
+        let mut claude = AgentLaunchSpec {
+            provider: AgentProvider::Claude,
+            executable: PathBuf::from("/usr/bin/claude"),
+            argv: vec!["/usr/bin/claude".into()],
+        };
+        claude = claude.with_pty_seed_prompt(" fix me ");
+        assert_eq!(
+            claude.argv,
+            vec!["/usr/bin/claude".to_string(), "fix me".to_string()]
+        );
+
+        let kimi = AgentLaunchSpec {
+            provider: AgentProvider::Kimi,
+            executable: PathBuf::from("/usr/bin/kimi"),
+            argv: vec!["/usr/bin/kimi".into()],
+        }
+        .with_pty_seed_prompt("fix me");
+        assert_eq!(kimi.argv, vec!["/usr/bin/kimi".to_string()]);
     }
 
     #[test]

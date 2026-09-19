@@ -685,6 +685,7 @@ pub enum NativePromptError {
     FollowUpVisualSpoof,
     TooLarge { limit: usize },
     Encode,
+    Io(String),
 }
 
 impl fmt::Display for NativePromptError {
@@ -715,6 +716,7 @@ impl fmt::Display for NativePromptError {
                 write!(formatter, "native Agent prompt exceeds the {limit}-byte limit")
             }
             Self::Encode => formatter.write_str("could not encode native Agent context"),
+            Self::Io(detail) => write!(formatter, "could not write task brief: {detail}"),
         }
     }
 }
@@ -896,6 +898,44 @@ pub fn build_native_task_prompt(
         });
     }
     Ok(AgentPrompt::new(text))
+}
+
+/// Relative path of the PTY compatibility brief written into a task worktree.
+pub const PTY_TASK_BRIEF_RELATIVE: &str = ".ember/task-brief.md";
+
+/// Write a markdown brief so opaque Claude/OpenCode/Kimi PTYs can read the
+/// same failed-command evidence native drivers receive as a prompt.
+///
+/// Returns `Ok(None)` when sharing is disabled. The file lives under
+/// [`.ember/`](PTY_TASK_BRIEF_RELATIVE) inside the task worktree.
+pub fn write_pty_task_brief(
+    task: &AgentTask,
+    policy: NativePromptPolicy,
+) -> Result<Option<PathBuf>, NativePromptError> {
+    if !policy.share_command_context {
+        return Ok(None);
+    }
+    let relative_cwd = Path::new(".");
+    let prompt = build_native_task_prompt(task, relative_cwd, policy)?;
+    let brief_dir = task.worktree_path.join(".ember");
+    std::fs::create_dir_all(&brief_dir).map_err(|error| NativePromptError::Io(error.to_string()))?;
+    let path = task.worktree_path.join(PTY_TASK_BRIEF_RELATIVE);
+    let body = format!(
+        "# {} task brief\n\n\
+         Provider: {}\n\
+         Title: {}\n\
+         Worktree: {}\n\n\
+         Read this file, stay inside the worktree, and fix the failed command.\n\n\
+         ---\n\n\
+         {}\n",
+        crate::agent_task::app_display(),
+        task.provider.display_name(),
+        task.title,
+        task.worktree_path.display(),
+        prompt.text
+    );
+    std::fs::write(&path, body).map_err(|error| NativePromptError::Io(error.to_string()))?;
+    Ok(Some(path))
 }
 
 /// Build one explicit, user-authored follow-up turn for an already-running
