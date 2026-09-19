@@ -53,9 +53,27 @@ pub enum ColorKind {
 
 pub use crate::kitty_keyboard::KittyKeyboardOp;
 
-/// Which terminal-capability handshake an app sent. The active VTE in block view
-/// has no real PTY return path, so we synthesize a sensible "not supported"
-/// reply ourselves to keep neovim/helix from blocking on a missing response.
+/// Which terminal-capability handshake an app sent.
+///
+/// The query bytes also pass through to the live VTE, and the live VTE does
+/// have a reply path even with no PTY attached: libvte 0.76 emits every reply
+/// through its `commit` signal (`send_child` → `emit_commit`), and the hosts
+/// forward commits to the child. For the queries libvte implements, DA1, DA2,
+/// DA3, XTVERSION, DSR 5 and CPR, that commit is the answer. A host that
+/// synthesises one as well makes the child read two different answers, a
+/// frame or more apart. crossterm keeps the unsolicited second CPR for its next
+/// cursor query, and a synthesised CPR computed from the host's own view of
+/// the grid can disagree with the VTE's. (See
+/// [`crate::terminal_report`] for telling those reply commits apart from
+/// keystrokes.)
+///
+/// The host must still answer what libvte does not implement:
+/// - `CSI ? u`, because VTE knows nothing of the kitty keyboard protocol and
+///   the host owns the flag stacks ([`crate::kitty_keyboard`]);
+/// - `CSI ? 4 m` (XTQMODKEYS), which VTE 0.76 ignores.
+///
+/// A surface with no VTE behind it (headless, recording) answers all of them,
+/// or neovim, helix and friends block on the missing response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardProtocolQuery {
     /// `CSI ? u` — kitty progressive-enhancement flag query.
@@ -117,17 +135,24 @@ pub enum ParserEvent {
     /// We reply with an empty payload (`\e]52;c;\e\\`) so probers (tmux/vim)
     /// know we accept SET but don't expose clipboard contents to the shell.
     ClipboardQuery,
-    /// APC sequence (ESC _) — Kitty graphics protocol or similar.
+    /// APC sequence (ESC _) — Kitty graphics protocol or similar. APC never
+    /// reaches the live VTE, and libvte has no kitty graphics anyway, so a
+    /// graphics query (`ESC _ G a=q … ESC \`) is answered by the caller or
+    /// not at all.
     ApcSequence(Vec<u8>),
     /// CSI private-mode set/reset — DEC private mode change. Emitted in addition to
     /// pass-through so block_view can track reporting modes.
     DecsetMode { mode: u32, set: bool },
     /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
-    /// The caller must write a `\e]<n>;rgb:RRRR/GGGG/BBBB\e\\` reply to the PTY.
+    /// The query is consumed and never reaches the live VTE, so the caller is
+    /// its only answer and must write a `\e]<n>;rgb:RRRR/GGGG/BBBB\e\\` reply
+    /// to the PTY.
     ColorQuery(ColorKind),
-    /// App queried a keyboard/capability protocol. Caller should reply on the PTY
-    /// with a canned "not supported" / level-0 response so the app falls back
-    /// gracefully (otherwise neovim, helix, etc. hang waiting on the reply).
+    /// App queried a keyboard/capability protocol. The bytes still pass
+    /// through, and the live VTE answers some of these itself; the caller
+    /// replies on the PTY only for the ones it does not (see
+    /// [`KeyboardProtocolQuery`]), so the app falls back gracefully instead of
+    /// hanging on the reply or reading two.
     KeyboardProtocolQuery(KeyboardProtocolQuery),
     /// `OSC 9 ; <body>` (iTerm2/ConEmu) or
     /// `OSC 777 ; notify ; <title> ; <body>`.
@@ -336,9 +361,12 @@ enum State {
     IgnoreEsc,
 }
 
-/// Which mouse-tracking mode the shell asked for. The active VTE in block-view
-/// has no real PTY, so VTE never auto-generates mouse reports; the caller drives
-/// reporting itself by reading this state.
+/// Which mouse-tracking mode the shell asked for. The mode bytes also reach the
+/// live VTE, and libvte 0.76 generates SGR (`?1006`) click, drag and motion
+/// reports itself, emitted through its `commit` signal even with no PTY. It
+/// cannot send the legacy X10 or UTF-8 encodings without one (its
+/// `feed_child_binary` returns early), and the hosts synthesise their own
+/// wheel reports, so callers read this state for the reports they generate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MouseMode {
     #[default]
@@ -802,12 +830,14 @@ impl Parser {
                         {
                             // Drop: keep VTE out of focus reporting mode.
                         } else if !erase_barrier {
-                            // Detect terminal-capability handshakes whose response
-                            // the active VTE would write back through its own PTY
-                            // (which is not connected). The caller synthesizes a
-                            // canned reply on `ctx.pty` so neovim/helix/etc. don't
-                            // hang waiting on it. The byte stream itself is still
-                            // passed through so the VTE updates its internal state.
+                            // Detect terminal-capability handshakes. The byte
+                            // stream itself is still passed through, and the live
+                            // VTE answers the ones libvte implements (DA1/2/3,
+                            // XTVERSION, DSR 5/6) through its `commit` signal, which
+                            // the host forwards to the PTY; the host must not answer
+                            // those twice. It synthesizes the rest (kitty `?u`,
+                            // `?4m`), and a surface with no VTE answers them all —
+                            // see `KeyboardProtocolQuery`.
                             //
                             // `CSI ? u`                       — kitty keyboard query
                             // `CSI ? 4 m`                     — XTQMODKEYS query
@@ -1414,11 +1444,16 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     }
 
     // OSC 10 ; ? / OSC 11 ; ? / OSC 12 ; ?  — color queries (XParseColor reply).
-    // The active VTE in block view has no return PTY, so the response we'd
-    // expect VTE to emit never reaches the app. Emit a semantic event and let
-    // the caller write a reply on the real PTY. A SET (any non-`?` value)
-    // additionally emits ColorSet and falls through to the byte pass-through
-    // so the live view recolors natively while the caller tracks the value.
+    // The query is consumed here and never reaches the live VTE, so the caller
+    // is its only answer (libvte would otherwise reply through `commit` too).
+    // The caller owns these colors, the theme plus any tracked OSC 10/11/12
+    // override, and it answers at parse time: ahead of a DA1 sentinel that
+    // follows, and without waiting for the VTE's next processing tick, which
+    // in an unmapped pane is 100 ms away. So: emit a semantic event and let
+    // the caller write the one reply on the real PTY. A SET (any non-`?`
+    // value) additionally emits ColorSet and falls through to the byte
+    // pass-through so the live view recolors natively while the caller
+    // tracks the value.
     for (prefix, kind) in [
         ("10;", ColorKind::Foreground),
         ("11;", ColorKind::Background),

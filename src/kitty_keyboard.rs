@@ -16,6 +16,12 @@
 //! use. Pushes of the other bits are accepted and masked off, and the query
 //! reports what is really in effect, so a client never assumes release events
 //! or alternate-key reports it will not get.
+//!
+//! libvte sends an Alt chord on a letter or Backspace as two commits, ESC and
+//! then the key. [`AltEscapeJoiner`] puts them back together before
+//! [`rewrite_commit`] sees them, with or without flags in effect.
+
+use std::borrow::Cow;
 
 /// Disambiguate escape codes (`0b1`). Implemented.
 pub const DISAMBIGUATE: u8 = 0b1;
@@ -245,15 +251,22 @@ pub fn rewrite_commit(key: KittyKey, mods: Modifiers, legacy: &[u8], flags: u8) 
 /// Whether `legacy` is a form the VTE emits for `key` — including the forms it
 /// emits when the modifiers the protocol would report were held, since those
 /// are exactly the presses being rewritten.
+///
+/// Alt puts an ESC in front of the key's bytes. VTE 0.76's keymap carries that
+/// ESC inside one string for Enter, Tab and Space (`ESC CR`, `ESC TAB`,
+/// `ESC SP`, and `ESC NUL` for Ctrl+Alt+Space); for Backspace it sends the ESC
+/// and the DEL/BS as two commits, which [`AltEscapeJoiner`] puts back together
+/// before they get here.
 fn legacy_form_matches(key: KittyKey, legacy: &[u8]) -> bool {
     match key {
         KittyKey::Escape => legacy == b"\x1b",
-        KittyKey::Enter => matches!(legacy, b"\r" | b"\n" | b"\r\n"),
+        KittyKey::Enter => matches!(legacy, b"\r" | b"\n" | b"\r\n" | b"\x1b\r"),
         // Shift+Tab is CSI Z (back-tab) in the legacy encoding.
-        KittyKey::Tab => matches!(legacy, b"\t" | b"\x1b[Z"),
-        KittyKey::Backspace => matches!(legacy, b"\x7f" | b"\x08"),
+        KittyKey::Tab => matches!(legacy, b"\t" | b"\x1b[Z" | b"\x1b\t"),
+        // Ctrl flips DEL and BS.
+        KittyKey::Backspace => matches!(legacy, b"\x7f" | b"\x08" | b"\x1b\x7f" | b"\x1b\x08"),
         // Ctrl+Space is NUL.
-        KittyKey::Space => matches!(legacy, b" " | b"\0"),
+        KittyKey::Space => matches!(legacy, b" " | b"\0" | b"\x1b " | b"\x1b\0"),
         KittyKey::Unicode(ch) => {
             let mut buf = [0u8; 4];
             let text = ch.encode_utf8(&mut buf).as_bytes();
@@ -272,6 +285,96 @@ fn legacy_form_matches(key: KittyKey, legacy: &[u8]) -> bool {
                     && (is_c0(&legacy[1..]) || same_text(&legacy[1..])))
         }
         KittyKey::Functional => false,
+    }
+}
+
+/// What [`AltEscapeJoiner::on_commit`] makes of one commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JoinStep<'a> {
+    /// The commit is the ESC half of an Alt chord. Write nothing and keep the
+    /// recorded key press: the key's own bytes are the next commit.
+    Hold,
+    /// The bytes this commit stands for, joined with a held ESC when there
+    /// was one. The host passes them to [`rewrite_commit`] and writes the
+    /// result — or, when nothing is rewritten, these bytes — as ONE write.
+    Emit(Cow<'a, [u8]>),
+}
+
+/// Puts back together an Alt chord that libvte splits across two `commit`
+/// signals.
+///
+/// VTE 0.76 sends an Alt chord as ESC and then the key's bytes, in two separate
+/// sends. `Terminal::widget_key_press` (vte.cc ~5438-5446) does
+/// `feed_child(_VTE_CAP_ESC, 1)` when meta-sends-escape is on, which it is by
+/// default, and then `send_child({normal, normal_length})`. Each call goes
+/// through `send_child` → `emit_commit`, so the host's `commit` handler runs
+/// twice. That path serves every key the keymap has no entry for (letters,
+/// digits, punctuation) and Backspace. The keymap's own Alt entries (Enter,
+/// Tab, Space, Escape) already carry their ESC inside one commit.
+///
+/// Taken one commit at a time, the chord falls apart:
+/// - Under the kitty disambiguate flag, the lone ESC matches the recorded
+///   Alt+b as a C0 byte and becomes `CSI 98;3u`. The `b` then goes out as
+///   typed text, so every Alt shortcut in claude, codex and kimi also types
+///   its letter.
+/// - Without flags, ESC and `b` become two PTY writes. A reader that sees
+///   the ESC on its own can decode a bare Esc, which interrupts an agent's
+///   turn.
+///
+/// The joiner holds a lone ESC while the recorded key press has Alt down and
+/// prefixes it to the next commit. Plain Esc is never held (its key is
+/// [`KittyKey::Escape`]), and neither is Alt+Esc, which VTE sends as one
+/// `ESC ESC` commit. Both halves arrive synchronously within one key-press
+/// dispatch, so a held ESC never waits in practice. The host still releases
+/// it through [`take_held`](Self::take_held) before it records the next key
+/// press and from an idle callback, so a missing second half cannot swallow
+/// the ESC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AltEscapeJoiner {
+    holding: bool,
+}
+
+impl AltEscapeJoiner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one `commit`. `recorded` is the key press the host recorded for
+    /// it, already taken out of the host's slot. On [`JoinStep::Hold`] the
+    /// host puts it back, because the key's own bytes are still to come; on
+    /// [`JoinStep::Emit`] it goes to [`rewrite_commit`] with the bytes.
+    pub fn on_commit<'a>(
+        &mut self,
+        recorded: Option<(KittyKey, Modifiers)>,
+        commit: &'a [u8],
+    ) -> JoinStep<'a> {
+        if self.holding {
+            // Whatever follows a held ESC is the rest of its chord, even
+            // another lone ESC: Ctrl+Alt+[ commits the Alt ESC and then
+            // Ctrl+['s own ESC byte. Holding again would drop one of them.
+            self.holding = false;
+            let mut joined = Vec::with_capacity(commit.len() + 1);
+            joined.push(0x1b);
+            joined.extend_from_slice(commit);
+            return JoinStep::Emit(Cow::Owned(joined));
+        }
+        let alt_prefix = commit == b"\x1b"
+            && matches!(recorded, Some((key, mods)) if mods.alt && key != KittyKey::Escape);
+        if alt_prefix {
+            self.holding = true;
+            return JoinStep::Hold;
+        }
+        JoinStep::Emit(Cow::Borrowed(commit))
+    }
+
+    /// Release a held ESC unjoined, as the one byte it is. `None` when
+    /// nothing is held.
+    pub fn take_held(&mut self) -> Option<&'static [u8]> {
+        std::mem::take(&mut self.holding).then_some(b"\x1b".as_slice())
+    }
+
+    pub fn is_holding(&self) -> bool {
+        self.holding
     }
 }
 
@@ -488,24 +591,11 @@ mod tests {
             rewrite_commit(KittyKey::Escape, mods(false, false, false), b"\x1b", 1).as_deref(),
             Some(&b"\x1b[27u"[..])
         );
-        // Ctrl+c is 0x03 in legacy; Alt+x is ESC x; Alt+Shift+a is ESC A.
+        // Ctrl+c is 0x03 in legacy. (Alt+letter reaches rewrite_commit only
+        // as the joined `ESC x`; see the AltEscapeJoiner tests.)
         assert_eq!(
             rewrite_commit(KittyKey::Unicode('c'), mods(false, false, true), b"\x03", 1).as_deref(),
             Some(&b"\x1b[99;5u"[..])
-        );
-        assert_eq!(
-            rewrite_commit(
-                KittyKey::Unicode('x'),
-                mods(false, true, false),
-                b"\x1bx",
-                1
-            )
-            .as_deref(),
-            Some(&b"\x1b[120;3u"[..])
-        );
-        assert_eq!(
-            rewrite_commit(KittyKey::Unicode('a'), mods(true, true, false), b"\x1bA", 1).as_deref(),
-            Some(&b"\x1b[97;4u"[..])
         );
         // Shift+Tab arrives as back-tab.
         assert_eq!(
@@ -532,5 +622,209 @@ mod tests {
             rewrite_commit(KittyKey::Enter, mods(true, false, false), b"\r", 0),
             None
         );
+    }
+
+    #[test]
+    fn alt_forms_of_the_named_keys_are_their_legacy_bytes() {
+        let alt = mods(false, true, false);
+        let ctrl_alt = mods(false, true, true);
+        let cases: [(KittyKey, Modifiers, &[u8], &[u8]); 7] = [
+            // Single commits straight from VTE 0.76's keymap.
+            (KittyKey::Enter, alt, b"\x1b\r", b"\x1b[13;3u"),
+            (KittyKey::Tab, alt, b"\x1b\t", b"\x1b[9;3u"),
+            (KittyKey::Space, alt, b"\x1b ", b"\x1b[32;3u"),
+            (KittyKey::Space, ctrl_alt, b"\x1b\0", b"\x1b[32;7u"),
+            // Backspace as the joiner hands it over (DEL, or BS under Ctrl).
+            (KittyKey::Backspace, alt, b"\x1b\x7f", b"\x1b[127;3u"),
+            (KittyKey::Backspace, ctrl_alt, b"\x1b\x08", b"\x1b[127;7u"),
+            // Ctrl flips DEL to BS without Alt too.
+            (
+                KittyKey::Backspace,
+                mods(false, false, true),
+                b"\x08",
+                b"\x1b[127;5u",
+            ),
+        ];
+        for (key, m, legacy, expected) in cases {
+            assert_eq!(
+                rewrite_commit(key, m, legacy, 1).as_deref(),
+                Some(expected),
+                "{key:?} {m:?} {legacy:?}"
+            );
+            assert_eq!(rewrite_commit(key, m, legacy, 0), None, "no flags");
+        }
+        // An ESC prefix is not a licence for other keys' bytes.
+        assert_eq!(rewrite_commit(KittyKey::Enter, alt, b"\x1b\t", 1), None);
+        assert_eq!(rewrite_commit(KittyKey::Backspace, alt, b"\x1b\r", 1), None);
+    }
+
+    /// Run commits through the joiner and rewrite exactly the way the hosts'
+    /// `commit` handlers do, and return the PTY writes they would make. One
+    /// key press is recorded before the first commit; every commit consumes
+    /// the recorded key unless the joiner holds it.
+    fn host_writes(
+        recorded: Option<(KittyKey, Modifiers)>,
+        commits: &[&[u8]],
+        flags: u8,
+    ) -> Vec<Vec<u8>> {
+        let mut joiner = AltEscapeJoiner::new();
+        let mut slot = recorded;
+        let mut writes = Vec::new();
+        for commit in commits {
+            let key = slot.take();
+            match joiner.on_commit(key, commit) {
+                JoinStep::Hold => slot = key,
+                JoinStep::Emit(bytes) => writes.push(
+                    key.and_then(|(k, m)| rewrite_commit(k, m, &bytes, flags))
+                        .unwrap_or_else(|| bytes.into_owned()),
+                ),
+            }
+        }
+        // The idle safety flush.
+        writes.extend(joiner.take_held().map(<[u8]>::to_vec));
+        writes
+    }
+
+    #[test]
+    fn alt_letter_split_by_vte_becomes_one_kitty_key() {
+        // What VTE 0.76 really commits for Alt+b: "\x1b", then "b".
+        let alt_b = Some((KittyKey::Unicode('b'), mods(false, true, false)));
+        assert_eq!(
+            host_writes(alt_b, &[b"\x1b", b"b"], DISAMBIGUATE),
+            [b"\x1b[98;3u".to_vec()],
+            "the chord, and no stray 'b'"
+        );
+        // Alt+Shift+a: the second commit is the shifted text.
+        let alt_shift_a = Some((KittyKey::Unicode('a'), mods(true, true, false)));
+        assert_eq!(
+            host_writes(alt_shift_a, &[b"\x1b", b"A"], DISAMBIGUATE),
+            [b"\x1b[97;4u".to_vec()]
+        );
+        // Ctrl+Alt+b: the second commit is Ctrl+b's C0 byte.
+        let ctrl_alt_b = Some((KittyKey::Unicode('b'), mods(false, true, true)));
+        assert_eq!(
+            host_writes(ctrl_alt_b, &[b"\x1b", b"\x02"], DISAMBIGUATE),
+            [b"\x1b[98;7u".to_vec()]
+        );
+    }
+
+    #[test]
+    fn alt_letter_without_flags_is_one_legacy_write() {
+        let alt_b = Some((KittyKey::Unicode('b'), mods(false, true, false)));
+        assert_eq!(
+            host_writes(alt_b, &[b"\x1b", b"b"], 0),
+            [b"\x1bb".to_vec()],
+            "ESC and the letter in ONE write, never a lone ESC"
+        );
+    }
+
+    #[test]
+    fn alt_backspace_is_joined_and_encoded() {
+        let alt_bs = Some((KittyKey::Backspace, mods(false, true, false)));
+        assert_eq!(
+            host_writes(alt_bs, &[b"\x1b", b"\x7f"], DISAMBIGUATE),
+            [b"\x1b[127;3u".to_vec()]
+        );
+        assert_eq!(
+            host_writes(alt_bs, &[b"\x1b", b"\x7f"], 0),
+            [b"\x1b\x7f".to_vec()]
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_bracket_keeps_both_escapes() {
+        // Ctrl+[ is ESC, so Ctrl+Alt+[ commits "\x1b" twice. The second must
+        // join the first rather than be held in its place.
+        let key = Some((KittyKey::Unicode('['), mods(false, true, true)));
+        assert_eq!(
+            host_writes(key, &[b"\x1b", b"\x1b"], DISAMBIGUATE),
+            [b"\x1b[91;7u".to_vec()]
+        );
+        assert_eq!(
+            host_writes(key, &[b"\x1b", b"\x1b"], 0),
+            [b"\x1b\x1b".to_vec()]
+        );
+    }
+
+    #[test]
+    fn plain_escape_is_never_held() {
+        let mut joiner = AltEscapeJoiner::new();
+        let esc = Some((KittyKey::Escape, mods(false, false, false)));
+        assert_eq!(
+            joiner.on_commit(esc, b"\x1b"),
+            JoinStep::Emit(Cow::Borrowed(&b"\x1b"[..]))
+        );
+        assert!(!joiner.is_holding());
+        assert_eq!(
+            host_writes(esc, &[b"\x1b"], DISAMBIGUATE),
+            [b"\x1b[27u".to_vec()]
+        );
+        assert_eq!(host_writes(esc, &[b"\x1b"], 0), [b"\x1b".to_vec()]);
+        // Nor is a lone ESC with no Alt behind it: Ctrl+[, or no key at all.
+        let ctrl_bracket = Some((KittyKey::Unicode('['), mods(false, false, true)));
+        assert_eq!(
+            host_writes(ctrl_bracket, &[b"\x1b"], DISAMBIGUATE),
+            [b"\x1b[91;5u".to_vec()]
+        );
+        assert_eq!(
+            host_writes(None, &[b"\x1b"], DISAMBIGUATE),
+            [b"\x1b".to_vec()]
+        );
+    }
+
+    #[test]
+    fn alt_escape_is_a_single_commit_and_passes_through() {
+        // VTE's keymap sends Alt+Esc as one "\x1b\x1b" commit; the joiner
+        // leaves it alone, borrowed, and holds nothing.
+        let mut joiner = AltEscapeJoiner::new();
+        let alt_esc = Some((KittyKey::Escape, mods(false, true, false)));
+        assert_eq!(
+            joiner.on_commit(alt_esc, b"\x1b\x1b"),
+            JoinStep::Emit(Cow::Borrowed(&b"\x1b\x1b"[..]))
+        );
+        assert!(!joiner.is_holding());
+        // Even a lone ESC recorded as Alt+Esc is the Escape key's own byte.
+        assert_eq!(
+            joiner.on_commit(alt_esc, b"\x1b"),
+            JoinStep::Emit(Cow::Borrowed(&b"\x1b"[..]))
+        );
+        assert!(!joiner.is_holding());
+    }
+
+    #[test]
+    fn a_held_escape_is_released_unchanged() {
+        let mut joiner = AltEscapeJoiner::new();
+        let alt_b = Some((KittyKey::Unicode('b'), mods(false, true, false)));
+        assert_eq!(joiner.take_held(), None);
+        assert_eq!(joiner.on_commit(alt_b, b"\x1b"), JoinStep::Hold);
+        assert!(joiner.is_holding());
+        assert_eq!(joiner.take_held(), Some(&b"\x1b"[..]));
+        assert!(!joiner.is_holding());
+        assert_eq!(joiner.take_held(), None);
+        // After the flush the next commit is no longer joined.
+        assert_eq!(
+            joiner.on_commit(None, b"b"),
+            JoinStep::Emit(Cow::Borrowed(&b"b"[..]))
+        );
+        // The held ESC joins the next commit whatever key is recorded for it.
+        assert_eq!(joiner.on_commit(alt_b, b"\x1b"), JoinStep::Hold);
+        assert_eq!(
+            joiner.on_commit(None, "é".as_bytes()),
+            JoinStep::Emit(Cow::Owned("\x1bé".as_bytes().to_vec()))
+        );
+        assert!(!joiner.is_holding());
+    }
+
+    #[test]
+    fn commits_other_than_a_lone_escape_are_borrowed_untouched() {
+        let mut joiner = AltEscapeJoiner::new();
+        let alt_b = Some((KittyKey::Unicode('b'), mods(false, true, false)));
+        for commit in [&b"b"[..], b"\x1b\r", b"\x1b[O", b"\x1b[<35;1;1M", b"hello"] {
+            assert_eq!(
+                joiner.on_commit(alt_b, commit),
+                JoinStep::Emit(Cow::Borrowed(commit))
+            );
+            assert!(!joiner.is_holding());
+        }
     }
 }

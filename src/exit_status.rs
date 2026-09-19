@@ -3,6 +3,13 @@
 /// Shell convention: exit code 128+n means the process died from signal n.
 /// Name the signals a terminal user actually meets so "exit:130" reads as
 /// Ctrl-C and "exit:137" as the OOM killer at a glance.
+///
+/// The job-control stops (19-22) are named too. A shell reports a stopped
+/// foreground job the same way (bash and zsh return 128+n once `waitpid`
+/// says the job stopped; jsh returns 148), so Ctrl+Z on an agent TUI
+/// surfaces as "exit:148". That is a suspension the user resumes with `fg`,
+/// not a death, and it must at least say SIGTSTP rather than look like a
+/// bare failure.
 pub fn signal_name_for_exit(exit_code: i32) -> Option<&'static str> {
     match exit_code.checked_sub(128)? {
         1 => Some("SIGHUP"),
@@ -20,6 +27,10 @@ pub fn signal_name_for_exit(exit_code: i32) -> Option<&'static str> {
         13 => Some("SIGPIPE"),
         14 => Some("SIGALRM"),
         15 => Some("SIGTERM"),
+        19 => Some("SIGSTOP"),
+        20 => Some("SIGTSTP"),
+        21 => Some("SIGTTIN"),
+        22 => Some("SIGTTOU"),
         24 => Some("SIGXCPU"),
         25 => Some("SIGXFSZ"),
         _ => None,
@@ -36,6 +47,19 @@ mod tests {
         assert_eq!(signal_name_for_exit(137), Some("SIGKILL"));
         assert_eq!(signal_name_for_exit(139), Some("SIGSEGV"));
         assert_eq!(signal_name_for_exit(143), Some("SIGTERM"));
+    }
+
+    #[test]
+    fn names_job_control_stops() {
+        // Ctrl+Z on a foreground job: the shell reports 128 + SIGTSTP.
+        assert_eq!(signal_name_for_exit(148), Some("SIGTSTP"));
+        assert_eq!(signal_name_for_exit(147), Some("SIGSTOP"));
+        assert_eq!(signal_name_for_exit(149), Some("SIGTTIN"));
+        assert_eq!(signal_name_for_exit(150), Some("SIGTTOU"));
+        // The Linux numbers between them that no shell user meets stay unnamed.
+        for unnamed in [144, 145, 146, 151] {
+            assert_eq!(signal_name_for_exit(unnamed), None, "code {unnamed}");
+        }
     }
 
     #[test]

@@ -1,4 +1,8 @@
-//! notify — fire-and-forget desktop notification for long-running blocks.
+//! notify — fire-and-forget desktop notification for long-running blocks,
+//! application requests (OSC 9 / 777) and bells from an unfocused window.
+//! The pure policies that decide whether a toast is worth posting
+//! ([`long_block_should_notify`], [`bell_should_notify`]) live here too, so
+//! every frontend draws the line in the same place.
 //!
 //! Shells out to `notify-send` rather than wiring `gio::Notification`. The
 //! TermView block-finished callback runs without a window/application
@@ -19,8 +23,14 @@
 
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const NOTIFICATION_QUEUE_CAPACITY: usize = 16;
+
+/// Minimum spacing between two bell toasts from one pane. An agent that rings
+/// on every finished turn, or a build that beeps per error, must not bury the
+/// desktop; the first ring is the one that tells the user to come back.
+pub const BELL_NOTIFY_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 struct Notification {
     urgency: &'static str,
@@ -58,6 +68,61 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
     let timeout_ms = if exit_code == 0 { "5000" } else { "10000" };
 
     spawn_notify_send(urgency, timeout_ms, &title, &body);
+}
+
+/// Whether a block that just finished after `duration_ms` deserves the
+/// [`long_block_finished`] toast.
+///
+/// Long is not enough. The long blocks this family now runs most are
+/// interactive: a three-hour claude or codex session, a vim or htop run. The
+/// user ends those by hand, looking at them, and a "✓ claude — Exit 0 after
+/// 3h 2m" toast is then pure noise. The toast is for a user who is somewhere
+/// else, so it also needs the window to be inactive or the pane to be off
+/// screen (`pane_mapped` is false on a background tab). GNOME Console and
+/// Warp draw the same line. Whether the command took keystrokes is
+/// deliberately not consulted: a long build the user nudged once still wants
+/// its toast when they have switched away.
+pub fn long_block_should_notify(
+    duration_ms: u64,
+    threshold_ms: u64,
+    window_active: bool,
+    pane_mapped: bool,
+) -> bool {
+    duration_ms >= threshold_ms && (!window_active || !pane_mapped)
+}
+
+/// Whether a BEL from a pane should become an [`attention`] toast.
+///
+/// BEL is how codex (by default) and claude (with its terminal-bell channel)
+/// say "your turn". Inside a focused window the tab badge already shows it,
+/// so the toast is only for an inactive window — the case where the agent's
+/// tab is also the current one and nothing else would be visible. `last` is
+/// when this pane last toasted; the caller owns it and sets it to `now`
+/// whenever this returns true, so the limit is per pane.
+pub fn bell_should_notify(window_active: bool, last: Option<Instant>, now: Instant) -> bool {
+    !window_active
+        && last.is_none_or(|last| now.saturating_duration_since(last) >= BELL_NOTIFY_MIN_INTERVAL)
+}
+
+/// Post a normal-urgency toast that asks the user to come back to a pane: a
+/// bell from a program running in an inactive window. `title` names the pane
+/// (its tab label) and is cut to one line like a command title; `body` says
+/// what happened. Both are untrusted, since a tab label is often program
+/// output, and pass the same sanitising as [`app_notification`]. Callers
+/// rate-limit through [`bell_should_notify`].
+pub fn attention(title: &str, body: &str) {
+    let (title, body) = attention_fields(title, body);
+    spawn_notify_send("normal", "5000", &title, &body);
+}
+
+fn attention_fields(title: &str, body: &str) -> (String, String) {
+    let title = notification_title(title.trim());
+    let title = if title.is_empty() {
+        safe_notification_field(crate::identity::get().app_name)
+    } else {
+        title
+    };
+    (title, safe_notification_field(body))
 }
 
 /// Post an application-driven desktop notification (OSC 9 / OSC 777). The
@@ -240,6 +305,69 @@ mod tests {
                 cmd.chars().take(60).collect::<String>()
             );
         }
+    }
+
+    #[test]
+    fn long_block_toast_is_for_a_user_who_is_elsewhere() {
+        const HOURS_3: u64 = 3 * 3_600_000;
+        const THRESHOLD: u64 = 10_000;
+        // (duration, window active, pane mapped) → toast?
+        let cases = [
+            // Ending a long claude session in the focused window: no toast.
+            (HOURS_3, true, true, false),
+            // The window is in the background: toast.
+            (HOURS_3, false, true, true),
+            // The pane is a background tab of the focused window: toast.
+            (HOURS_3, true, false, true),
+            (HOURS_3, false, false, true),
+            // Exactly the threshold counts as long.
+            (THRESHOLD, false, true, true),
+            // Short blocks never toast, wherever the user is.
+            (THRESHOLD - 1, false, false, false),
+            (5_000, false, true, false),
+        ];
+        for (duration, active, mapped, expected) in cases {
+            assert_eq!(
+                long_block_should_notify(duration, THRESHOLD, active, mapped),
+                expected,
+                "duration={duration} active={active} mapped={mapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn bell_toasts_only_from_an_inactive_window_and_at_most_every_30s() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        // A focused window shows the bell in its tab strip; no toast.
+        assert!(!bell_should_notify(true, None, t0));
+        assert!(!bell_should_notify(true, Some(t0), at(3600)));
+        // Unfocused, first ring: toast.
+        assert!(bell_should_notify(false, None, t0));
+        // The same pane rings again 5 s later: suppressed.
+        assert!(!bell_should_notify(false, Some(t0), at(5)));
+        assert!(!bell_should_notify(false, Some(t0), at(29)));
+        // After the interval it may toast again.
+        assert!(bell_should_notify(false, Some(t0), at(30)));
+        assert!(bell_should_notify(false, Some(t0), at(31)));
+        // A `last` in the future (a caller mixing clocks) never toasts early.
+        assert!(!bell_should_notify(false, Some(at(10)), t0));
+    }
+
+    #[test]
+    fn attention_fields_are_bounded_and_attributed() {
+        let (title, body) = attention_fields("codex\u{202e} ~/src", "Bell from\tcodex");
+        assert_eq!(title, "codex\u{fffd} ~/src");
+        assert_eq!(body, "Bell from\u{fffd}codex");
+        // A long tab label is cut to one short line like a command title.
+        let (title, _) = attention_fields(&format!("{}\nsecond line", "x".repeat(80)), "b");
+        assert_eq!(title, format!("{}…", "x".repeat(60)));
+        // An empty label still names the app.
+        let (title, _) = attention_fields("  \n", "b");
+        assert_eq!(title, crate::identity::get().app_name);
+        let long = "y".repeat(crate::parser::MAX_NOTIFICATION_CHARS + 10);
+        let (_, body) = attention_fields("t", &long);
+        assert_eq!(body.chars().count(), crate::parser::MAX_NOTIFICATION_CHARS);
     }
 
     #[test]

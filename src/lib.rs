@@ -42,6 +42,8 @@ pub mod redact;
 pub mod review_input;
 pub mod snapshot_file;
 pub mod supervised;
+pub mod terminal_report;
 pub mod theme;
 pub mod vendored_script;
+pub mod wheel;
 pub mod workflows;
