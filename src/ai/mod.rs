@@ -72,11 +72,13 @@ fn app_env_name(suffix: &str) -> String {
     )
 }
 
-fn api_key_env_names() -> [String; 4] {
+fn api_key_env_names() -> [String; 6] {
     [
         app_env_name("AI_API_KEY"),
         "ANTHROPIC_API_KEY".to_string(),
         "OPENAI_API_KEY".to_string(),
+        "MOONSHOT_API_KEY".to_string(),
+        "KIMI_API_KEY".to_string(),
         "OLLAMA_API_KEY".to_string(),
     ]
 }
@@ -139,12 +141,17 @@ impl Provider {
     }
 
     fn provider_api_key(self) -> Option<String> {
-        let provider_key = match self {
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::OpenAiCompatible => "OPENAI_API_KEY",
-            Self::Ollama => "OLLAMA_API_KEY",
-        };
-        exact_api_key_env(&app_env_name("AI_API_KEY")).or_else(|| exact_api_key_env(provider_key))
+        let app_key = exact_api_key_env(&app_env_name("AI_API_KEY"));
+        if app_key.is_some() {
+            return app_key;
+        }
+        match self {
+            Self::Anthropic => exact_api_key_env("ANTHROPIC_API_KEY"),
+            Self::OpenAiCompatible => exact_api_key_env("OPENAI_API_KEY")
+                .or_else(|| exact_api_key_env("MOONSHOT_API_KEY"))
+                .or_else(|| exact_api_key_env("KIMI_API_KEY")),
+            Self::Ollama => exact_api_key_env("OLLAMA_API_KEY"),
+        }
     }
 }
 
@@ -508,10 +515,13 @@ impl AiClient {
 
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, AiError> {
         let app_provider = app_env_name("AI_PROVIDER");
+        let openai_compatible_key = exact_nonempty(get("OPENAI_API_KEY"))
+            .or_else(|| exact_nonempty(get("MOONSHOT_API_KEY")))
+            .or_else(|| exact_nonempty(get("KIMI_API_KEY")));
         let provider = match trimmed_nonempty(get(&app_provider)) {
             Some(value) => Provider::from_str(&value)?,
             None if exact_nonempty(get("ANTHROPIC_API_KEY")).is_some() => Provider::Anthropic,
-            None if exact_nonempty(get("OPENAI_API_KEY")).is_some() => Provider::OpenAiCompatible,
+            None if openai_compatible_key.is_some() => Provider::OpenAiCompatible,
             None => Provider::Ollama,
         };
         let model =
@@ -524,19 +534,25 @@ impl AiClient {
         let temperature =
             parse_optional_env_value(get(&app_env_name("AI_TEMPERATURE")), "AI_TEMPERATURE")?;
         let app_key = app_env_name("AI_API_KEY");
-        let provider_key = match provider {
-            Provider::Anthropic => "ANTHROPIC_API_KEY",
-            Provider::OpenAiCompatible => "OPENAI_API_KEY",
-            Provider::Ollama => "OLLAMA_API_KEY",
+        let provider_keys: &[&str] = match provider {
+            Provider::Anthropic => &["ANTHROPIC_API_KEY"],
+            Provider::OpenAiCompatible => &["OPENAI_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"],
+            Provider::Ollama => &["OLLAMA_API_KEY"],
         };
-        let api_key =
-            match exact_nonempty(get(&app_key)).or_else(|| exact_nonempty(get(provider_key))) {
-                Some(key) => Some(key),
-                None => exact_nonempty(get(&app_env_name("AI_API_KEY_FILE")))
-                    .as_deref()
-                    .map(read_api_key_file)
-                    .transpose()?,
-            };
+        let mut provider_key_value = None;
+        for name in provider_keys {
+            if let Some(key) = exact_nonempty(get(name)) {
+                provider_key_value = Some(key);
+                break;
+            }
+        }
+        let api_key = match exact_nonempty(get(&app_key)).or(provider_key_value) {
+            Some(key) => Some(key),
+            None => exact_nonempty(get(&app_env_name("AI_API_KEY_FILE")))
+                .as_deref()
+                .map(read_api_key_file)
+                .transpose()?,
+        };
         Self::new(
             provider,
             api_key,
