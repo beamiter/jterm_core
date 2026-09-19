@@ -108,8 +108,9 @@ impl fmt::Display for AgentLaunchError {
             ),
             Self::ExecutableUnavailable { provider, detail } => write!(
                 formatter,
-                "{} is not available: {detail}",
-                provider.display_name()
+                "{} is not available ({detail}); {}",
+                provider.display_name(),
+                provider.install_hint()
             ),
         }
     }
@@ -472,6 +473,16 @@ mod tests {
             AgentProvider::ALL.map(AgentProvider::display_name),
             ["Codex", "Claude", "OpenCode", "Kimi"]
         );
+        assert_eq!(
+            AgentProvider::ALL.map(AgentProvider::config_value),
+            ["codex", "claude", "opencode", "kimi"]
+        );
+        assert_eq!(
+            AgentProvider::from_config_value("Kimi"),
+            Some(AgentProvider::Kimi)
+        );
+        assert!(AgentProvider::from_config_value("nope").is_none());
+        assert!(AgentProvider::Kimi.install_hint().contains("kimi"));
         assert!(AgentProvider::Codex.supports_native_driver());
         assert!(AgentProvider::Claude.supports_native_driver());
         assert!(!AgentProvider::OpenCode.supports_native_driver());

@@ -77,6 +77,36 @@ impl AgentProvider {
     pub fn supports_native_driver(self) -> bool {
         matches!(self, Self::Codex | Self::Claude)
     }
+
+    /// Stable config / settings value (`codex`, `claude`, …).
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+            Self::Kimi => "kimi",
+        }
+    }
+
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            "opencode" | "open_code" => Some(Self::OpenCode),
+            "kimi" => Some(Self::Kimi),
+            _ => None,
+        }
+    }
+
+    /// Short install guidance when the CLI is missing from PATH.
+    pub fn install_hint(self) -> &'static str {
+        match self {
+            Self::Codex => "install the Codex CLI and ensure `codex` is on PATH",
+            Self::Claude => "install Claude Code (`claude`) and ensure it is on PATH",
+            Self::OpenCode => "install OpenCode (`opencode`) and ensure it is on PATH",
+            Self::Kimi => "install Kimi Code (`kimi`) and ensure it is on PATH",
+        }
+    }
 }
 
 /// Normalized task activity used by both opaque PTY agents and native drivers.
