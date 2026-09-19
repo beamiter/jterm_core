@@ -431,7 +431,74 @@ fn dec_special_graphics_and_tabs() {
     // SO alone selects G1, which is ASCII until designated.
     assert_eq!(plain(20, 2, b"\x0eq\x0fq"), "qq");
     assert_eq!(plain(20, 2, b"a\tb"), "a\tb");
-    assert_eq!(replay(20, 2, b"a\tb").to_ansi(), "a       b");
+    // A tab on a default stop goes to the card as a tab, so a copy from the
+    // card keeps it; one that ends elsewhere (cleared stops) stays spaces.
+    assert_eq!(replay(20, 2, b"a\tb").to_ansi(), "a\tb");
+    assert_eq!(
+        replay(20, 2, b"\x1b[31ma\tb\x1b[m\tc").to_ansi(),
+        "\x1b[31ma\x1b[0m\t\x1b[31mb\x1b[0m\tc"
+    );
+    assert_eq!(
+        replay(20, 2, b"\x1b[3g\x1b[1;4H\x1bH\ra\tb").to_ansi(),
+        "a  b"
+    );
+}
+
+#[test]
+fn to_ansi_keeps_soft_wraps_so_the_card_can_reflow() {
+    // A full soft-wrapped row is continued, not hard-broken: the target
+    // autowraps at the same width and joins the line when wider.
+    let out = replay(10, 5, b"0123456789abc\r\nnext");
+    assert_eq!(out.to_ansi(), "0123456789abc\r\nnext");
+    // Feeding it back reproduces the same rows and logical lines.
+    let again = replay(10, 5, out.to_ansi().as_bytes());
+    assert_eq!(again.to_plain(), out.to_plain());
+    assert_eq!(again.row_count(), out.row_count());
+    // A wide character that did not fit leaves the last column free; the
+    // target wraps it the same way, so the line is continued too.
+    let out = replay(5, 5, "abcd中".as_bytes());
+    assert_eq!(out.to_ansi(), "abcd中");
+    // A short soft-wrapped row followed by a narrow one is a hard break.
+    let out = replay(5, 5, "abcd中\x1b[2;1Hx".as_bytes());
+    assert_eq!(out.to_ansi(), "abcd\r\nx");
+    // A tab at the start of a continued row would be a no-op at the pending
+    // wrap position, so it stays spaces there.
+    let out = replay(16, 5, b"0123456789abcdefX\r\x1b[K\tx");
+    assert_eq!(out.to_ansi(), "0123456789abcdef        x");
+    let again = replay(16, 5, out.to_ansi().as_bytes());
+    assert_eq!(again.to_plain(), "0123456789abcdef        x");
+    assert_eq!(again.row_count(), 2);
+}
+
+#[test]
+fn blank_history_rows_are_charged_and_evicted() {
+    // Mass scrolling makes history rows that show nothing. They still cost
+    // memory, so they must count against the budget and be evicted.
+    let budget = 10_000;
+    let mut r = ScreenReplay::with_budget(20, 10, budget);
+    r.feed(b"head\r\n");
+    for _ in 0..1_000 {
+        r.feed(b"\x1b[999S");
+    }
+    r.feed(b"tail");
+    let out = r.finish();
+    assert!(out.head_dropped);
+    assert!(
+        out.row_count() <= budget / emulator::ROW_OVERHEAD_CELLS + 10,
+        "{}",
+        out.row_count()
+    );
+    assert!(out.to_plain().ends_with("tail"));
+    assert!(!out.to_plain().contains("head"));
+}
+
+#[test]
+fn a_wide_character_on_a_one_column_screen_does_not_panic() {
+    for bytes in ["\x1b[?7l中x", "中\x1b[b", "中x\x1b[3b", "\x1b[?7l中\x1b[5b"] {
+        let out = replay(1, 3, bytes.as_bytes());
+        let _ = (out.to_plain(), out.to_ansi());
+    }
+    assert_eq!(plain(1, 3, "\x1b[?7l中x".as_bytes()), "x");
 }
 
 #[test]
@@ -451,6 +518,15 @@ fn needs_screen_replay_detects_vertical_motion_only() {
     assert!(stream_needs_screen_replay(b"\x1b[2J"));
     assert!(stream_needs_screen_replay(CODEX_16ROWS));
     assert!(stream_needs_screen_replay(&synth_ink(3)));
+    // CUD, RIS, DECSED and a C1 (U+009B) CSI move or clear the screen too.
+    assert!(stream_needs_screen_replay(b"a\x1b[2Bb"));
+    assert!(stream_needs_screen_replay(b"old\x1bcnew"));
+    assert!(stream_needs_screen_replay(b"\x1b[?2J"));
+    assert!(stream_needs_screen_replay("\u{9b}1;1HX".as_bytes()));
+    // Other private CSIs and a stray 0x9B continuation byte do not.
+    assert!(!stream_needs_screen_replay(b"\x1b[?1049h\x1b[?2K"));
+    assert!(!stream_needs_screen_replay("\u{29b}x".as_bytes()));
+    assert!(!stream_needs_screen_replay(b"\x9b1;1H"));
 }
 
 #[test]
@@ -657,24 +733,21 @@ fn uses_ed2(bytes: &[u8]) -> bool {
 /// tests/fixtures/screen_replay/vte_export.py. Needs python3-gi with Vte 3.91
 /// and a display: run it through the headless wrapper, e.g.
 /// `headless-gtk.sh cargo test --lib screen_replay::tests::vte_differential_matches_real_vte -- --ignored --exact`.
-#[test]
-#[ignore]
-fn vte_differential_matches_real_vte() {
-    let dir = std::env::temp_dir().join(format!("screen-replay-diff-{}", std::process::id()));
+/// One libvte input: bytes, starting cols and rows, and resizes
+/// `(byte offset, cols, rows)`.
+type VteInput<'a> = (&'a [u8], usize, usize, &'a [(usize, usize, usize)]);
+
+/// Feeds each `(bytes, cols, rows, resizes)` to a real libvte through
+/// vte_export.py and returns its text exports in order.
+fn vte_exports(tag: &str, inputs: &[VteInput<'_>]) -> Vec<String> {
+    let dir = std::env::temp_dir().join(format!("screen-replay-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let cases = differential_cases();
     let mut manifest = String::new();
-    for (i, case) in cases.iter().enumerate() {
+    for (i, (bytes, cols, rows, resizes)) in inputs.iter().enumerate() {
         let path = dir.join(format!("case{i}.bin"));
-        std::fs::write(&path, &case.bytes).unwrap();
-        // Every capture with resizes started at ptycap.py's default 120x40.
-        let (cols, rows) = if case.resizes.is_empty() {
-            (case.cols, case.rows)
-        } else {
-            (120, 40)
-        };
+        std::fs::write(&path, bytes).unwrap();
         let _ = write!(manifest, "{} {cols} {rows}", path.display());
-        for (off, c, r) in &case.resizes {
+        for (off, c, r) in *resizes {
             let _ = write!(manifest, " {off}:{c}:{r}");
         }
         manifest.push('\n');
@@ -698,17 +771,44 @@ fn vte_differential_matches_real_vte() {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut rest = &output.stdout[..];
-    let mut failures = Vec::new();
-    for case in &cases {
+    let mut exports = Vec::new();
+    for _ in inputs {
         let newline = rest.iter().position(|&b| b == b'\n').unwrap();
         let len: usize = std::str::from_utf8(&rest[..newline])
             .unwrap()
             .parse()
             .unwrap();
-        let vte = String::from_utf8_lossy(&rest[newline + 1..newline + 1 + len]).into_owned();
+        exports.push(String::from_utf8_lossy(&rest[newline + 1..newline + 1 + len]).into_owned());
         rest = &rest[newline + 1 + len..];
+    }
+    exports
+}
+
+/// Differential check against real libvte 0.76 through
+/// tests/fixtures/screen_replay/vte_export.py. Needs python3-gi with Vte 3.91
+/// and a display: run it through the headless wrapper, e.g.
+/// `headless-gtk.sh cargo test --lib screen_replay::tests::vte_differential_matches_real_vte -- --ignored --exact`.
+#[test]
+#[ignore]
+fn vte_differential_matches_real_vte() {
+    let cases = differential_cases();
+    let inputs: Vec<_> = cases
+        .iter()
+        .map(|case| {
+            // Every capture with resizes started at ptycap.py's default 120x40.
+            let (cols, rows) = if case.resizes.is_empty() {
+                (case.cols, case.rows)
+            } else {
+                (120, 40)
+            };
+            (&case.bytes[..], cols, rows, &case.resizes[..])
+        })
+        .collect();
+    let exports = vte_exports("diff", &inputs);
+    let mut failures = Vec::new();
+    for (case, vte) in cases.iter().zip(&exports) {
         let ours = normalise(&plain(case.cols, case.rows, &case.bytes));
-        let theirs = normalise(&vte);
+        let theirs = normalise(vte);
         let ok = if uses_ed2(&case.bytes) {
             theirs.ends_with(&ours)
         } else {
@@ -727,6 +827,52 @@ fn vte_differential_matches_real_vte() {
                 theirs.len(),
                 ours.get(at),
                 theirs.get(at)
+            ));
+        } else {
+            eprintln!("{}: {} lines match", case.name, ours.len());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The card side: `to_ansi` fed to a real libvte of the replay's width must
+/// export the same logical lines as `to_plain` (soft wraps rejoined, so the
+/// card can reflow). Tabs VTE could not store as tabs come back as spaces, so
+/// whitespace runs are compared collapsed. Same wrapper as above.
+#[test]
+#[ignore]
+fn to_ansi_round_trips_through_real_vte() {
+    let cases = differential_cases();
+    let replays: Vec<Replay> = cases
+        .iter()
+        .map(|case| replay(case.cols, case.rows, &case.bytes))
+        .collect();
+    let ansi: Vec<String> = replays.iter().map(Replay::to_ansi).collect();
+    let inputs: Vec<_> = cases
+        .iter()
+        .zip(&ansi)
+        .map(|(case, ansi)| (ansi.as_bytes(), case.cols, case.rows, &[][..]))
+        .collect();
+    let exports = vte_exports("ansi", &inputs);
+    let collapse = |lines: Vec<String>| -> Vec<String> {
+        lines
+            .into_iter()
+            .map(|l| {
+                l.split([' ', '\t'])
+                    .filter(|w| !w.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    };
+    let mut failures = Vec::new();
+    for ((case, out), vte) in cases.iter().zip(&replays).zip(&exports) {
+        let ours = collapse(normalise(&out.to_plain()));
+        let theirs = collapse(normalise(vte));
+        if ours != theirs {
+            failures.push(format!(
+                "{}:\n  ours: {ours:?}\n  vte:  {theirs:?}",
+                case.name
             ));
         } else {
             eprintln!("{}: {} lines match", case.name, ours.len());

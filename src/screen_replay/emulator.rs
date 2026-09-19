@@ -15,6 +15,13 @@ use super::pen::{apply_sgr, Color, Pen};
 use super::tables::{CompactRoots, Tables};
 use unicode_width::UnicodeWidthChar;
 
+/// Cells charged for each history row on top of its own cells: the row's
+/// `VecDeque` slot (a 32-byte `Row`) plus its heap allocation's header, in
+/// 8-byte cells. Without it a blank history row costs nothing, is never
+/// evicted, and mass scrolling (`CSI 999 S`, `CSI 50 M`, megabytes of `\n`)
+/// grows the history without bound.
+pub(super) const ROW_OVERHEAD_CELLS: usize = 8;
+
 const NORMAL: usize = 0;
 const ALTERNATE: usize = 1;
 
@@ -255,7 +262,7 @@ impl Emulator {
         let tables = &self.tables;
         for row in screen.lines.range_mut(first..first + count) {
             row.trim_invisible_tail(|pen| tables.pen(pen).blank_is_visible());
-            screen.history_cells += row.cells.len();
+            screen.history_cells += row.cells.len() + ROW_OVERHEAD_CELLS;
         }
         self.enforce_budget();
     }
@@ -269,7 +276,7 @@ impl Emulator {
         let screen = &mut self.screens[NORMAL];
         while screen.history_len() > 0 && screen.history_cells + screen_cells > self.budget {
             if let Some(row) = screen.lines.pop_front() {
-                screen.history_cells -= row.cells.len();
+                screen.history_cells -= row.cells.len() + ROW_OVERHEAD_CELLS;
                 self.head_dropped = true;
             }
         }
@@ -391,6 +398,9 @@ impl Emulator {
         }
         self.last_graphic = Some(unmapped);
         let cols = self.cols;
+        // A wide character cannot fit a one-column screen; print it narrow so
+        // the cursor never passes `cols` (and `cols - width` cannot underflow).
+        let width = width.min(cols);
         if self.scr().col + width > cols {
             if self.autowrap {
                 self.autowrap_newline();
@@ -774,7 +784,7 @@ impl Emulator {
         let Some(c) = self.last_graphic else {
             return;
         };
-        let room = (self.cols - self.scr().col) as i32;
+        let room = self.cols.saturating_sub(self.scr().col) as i32;
         for _ in 0..params.collect1(0, 1, 1, room) {
             self.print_char(c);
         }

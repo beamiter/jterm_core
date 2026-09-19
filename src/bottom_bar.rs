@@ -182,6 +182,13 @@ fn last_command_segment(snapshot: &Snapshot) -> Option<Segment> {
     if exit == 0 {
         text = "✓".to_string();
         tone = Tone::Positive;
+    } else if crate::exit_status::is_job_stop(exit) {
+        // Ctrl+Z: suspended, resumable with `fg`, not a failure.
+        text = match crate::exit_status::signal_name_for_exit(exit) {
+            Some(signal) => format!("⏸ suspended {signal}"),
+            None => "⏸ suspended".to_string(),
+        };
+        tone = Tone::Muted;
     } else {
         text = format!("✗ {exit}");
         if let Some(signal) = crate::exit_status::signal_name_for_exit(exit) {
@@ -324,6 +331,17 @@ mod tests {
         });
         assert_eq!(content.right[0].text, "✗ 130 SIGINT · 0s");
         assert_eq!(content.right[0].tone, Tone::Negative);
+    }
+
+    #[test]
+    fn ctrl_z_reads_as_a_muted_suspension_not_a_failure() {
+        let content = compose(&Snapshot {
+            last_exit: Some(148),
+            last_duration_ms: Some(3_000),
+            ..Snapshot::default()
+        });
+        assert_eq!(content.right[0].text, "⏸ suspended SIGTSTP · 3s");
+        assert_eq!(content.right[0].tone, Tone::Muted);
     }
 
     #[test]

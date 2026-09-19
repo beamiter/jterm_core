@@ -135,7 +135,6 @@ impl Row {
     }
 
     /// Number of columns the tab whose head is at `col` covers.
-    #[cfg(test)]
     pub(super) fn tab_width(&self, col: usize) -> usize {
         1 + self.cells[col + 1..]
             .iter()
@@ -177,7 +176,8 @@ pub(super) struct Screen {
     /// History rows first, then exactly `rows` visible rows.
     pub(super) lines: VecDeque<Row>,
     pub(super) rows: usize,
-    /// Sum of the cell counts of the history rows (the budget's variable part).
+    /// Sum of the cell counts of the history rows, plus a fixed per-row
+    /// overhead (`ROW_OVERHEAD_CELLS`) each (the budget's variable part).
     pub(super) history_cells: usize,
     pub(super) keeps_history: bool,
     /// Visible row of the cursor, `0..rows`.

@@ -64,7 +64,8 @@
 //!
 //! Memory is bounded by a cell budget ([`DEFAULT_CELL_BUDGET`], or
 //! [`ScreenReplay::with_budget`]): history rows (trimmed of invisible trailing
-//! cells) plus one full screen. When the history would exceed it, the OLDEST
+//! cells, each charged a fixed per-row overhead so blank rows are not free)
+//! plus one full screen. When the history would exceed it, the OLDEST
 //! history rows are evicted and [`Replay::head_dropped`] is set — exactly like
 //! a terminal whose scrollback limit was reached. Input is never discarded,
 //! so a long session keeps its final answer and exit hint. Attribute,
@@ -114,9 +115,11 @@ use pen::{write_sgr_transition, Pen, SgrScratch};
 use tables::Tables;
 
 /// Default cell budget: history plus one screen. Cells are 8 bytes, so this
-/// is about 16 MiB, which holds roughly 17 thousand full 120-column rows —
+/// is about 16 MiB, which holds roughly 16 thousand full 120-column rows —
 /// and far more of the short rows real transcripts consist of, because
-/// history rows are stored without their blank tails.
+/// history rows are stored without their blank tails. Each history row also
+/// costs a fixed 8-cell overhead, so even blank rows are capped (at about a
+/// quarter of a million).
 pub const DEFAULT_CELL_BUDGET: usize = 2 * 1024 * 1024;
 
 /// Geometry bounds. Anything outside is clamped; a zero-sized winsize (a PTY
@@ -157,6 +160,7 @@ impl ScreenReplay {
     /// returns the normal screen's history and screen.
     pub fn finish(self) -> Replay {
         let Emulator {
+            cols,
             mut screens,
             tables,
             head_dropped,
@@ -180,6 +184,7 @@ impl ScreenReplay {
         }
         Replay {
             rows,
+            cols,
             tables,
             head_dropped,
         }
@@ -189,6 +194,8 @@ impl ScreenReplay {
 /// The result of a replay: trimmed rows plus the attribute tables they use.
 pub struct Replay {
     rows: Vec<Row>,
+    /// The replayed screen's width.
+    cols: usize,
     tables: Tables,
     /// The cell budget evicted the oldest history rows.
     pub head_dropped: bool,
@@ -238,17 +245,42 @@ impl Replay {
     /// closed around linked cells, and a final `CSI 0 m` when a style is
     /// still active at the end. Rows never exceed the replay's width, so feeding this to a
     /// terminal at least that wide reproduces the rows one-to-one.
+    ///
+    /// A soft-wrapped row that fills the whole width (or all but the column a
+    /// wide character did not fit) is not followed by `\r\n`: the next row's text continues the logical line, so the target
+    /// terminal autowraps it (or, when wider, joins it) and keeps it one line
+    /// it can rewrap on resize. A tab that ends on a default tab stop (every
+    /// 8 columns) is written as `\t`, so copying from the target yields the
+    /// tab the program wrote; other tabs stay spaces.
     pub fn to_ansi(&self) -> String {
         let mut out = String::new();
         let mut scratch = SgrScratch::default();
         let mut pen = Pen::default();
         let mut link = 0u32;
+        // Visible length of the previous row when it soft-wrapped.
+        let mut prev_wrapped_len = None;
         for (index, row) in self.rows.iter().enumerate() {
-            if index > 0 {
+            // A soft-wrapped row continues when it fills the width, or leaves
+            // only the last column free for a wide character that did not
+            // fit (the target leaves that gap and wraps it the same way). A
+            // continued row starts at the pending-wrap position, where a
+            // `\t` would do nothing; its tabs stay spaces there.
+            let starts_wide = row
+                .cells
+                .first()
+                .is_some_and(|c| c.code & grid::WIDE != 0 && !c.is_fragment());
+            let continued = prev_wrapped_len
+                .is_some_and(|len| len == self.cols || (starts_wide && len + 1 == self.cols));
+            if index > 0 && !continued {
                 out.push_str("\r\n");
             }
             let end = visible_len(&self.tables, row);
-            for &cell in &row.cells[..end] {
+            prev_wrapped_len = row.wrapped.then_some(end);
+            let mut skip_until = 0;
+            for (col, &cell) in row.cells[..end].iter().enumerate() {
+                if col < skip_until {
+                    continue;
+                }
                 if cell.is_fragment() && !cell.is_tab_head_fragment() {
                     continue;
                 }
@@ -267,7 +299,18 @@ impl Replay {
                     write_sgr_transition(&mut out, &mut scratch, &pen, &cell_pen);
                     pen = cell_pen;
                 }
-                if cell.is_tab_head() || cell.is_tab_head_fragment() {
+                let tab_width = if cell.is_tab_head() {
+                    row.tab_width(col)
+                } else {
+                    0
+                };
+                if tab_width > 0
+                    && !(continued && col == 0)
+                    && tab_ends_on_default_stop(col, tab_width)
+                {
+                    out.push('\t');
+                    skip_until = col + tab_width;
+                } else if cell.is_tab_head() || cell.is_tab_head_fragment() {
                     out.push(' ');
                 } else {
                     push_cell_text(&mut out, &self.tables, cell);
@@ -333,64 +376,100 @@ fn visible_len(tables: &Tables, row: &Row) -> usize {
     end
 }
 
+/// Whether a tab at `col` spanning `width` columns is exactly what `\t`
+/// produces under the default tab stops (every 8 columns).
+fn tab_ends_on_default_stop(col: usize, width: usize) -> bool {
+    col + width == (col / 8 + 1) * 8
+}
+
 fn row_is_visible(tables: &Tables, row: &Row) -> bool {
     visible_len(tables, row) > 0
 }
 
 /// Whether a captured stream moves the cursor vertically or edits the screen
-/// in ways a line-oriented strip cannot reproduce: absolute or upward cursor
-/// motion (`CUP`, `HVP`, `VPA`, `CUU`, `CPL`, `CNL`), scroll regions
+/// in ways a line-oriented strip cannot reproduce: absolute or vertical cursor
+/// motion (`CUP`, `HVP`, `VPA`, `CUU`, `CUD`, `CPL`, `CNL`), scroll regions
 /// (`DECSTBM`), reverse index, line insertion/deletion, scrolling (`SU`/`SD`),
-/// cursor restore (`DECRC`, `CSI u`) or an erase beyond the current line
-/// (`ED`). False positives only cost time — the screen replay of plain line
-/// output equals the plain strip — so the scan errs on the side of `true`.
+/// cursor restore (`DECRC`, `CSI u`), a full reset (`RIS`) or an erase beyond
+/// the current line (`ED`, `DECSED`). CSI introduced by the UTF-8 encoded C1
+/// control U+009B counts like `ESC [`. False positives only cost time — the
+/// screen replay of plain line output equals the plain strip — so the scan
+/// errs on the side of `true`.
 pub fn stream_needs_screen_replay(bytes: &[u8]) -> bool {
     let mut i = 0;
-    while let Some(offset) = memchr::memchr(0x1b, &bytes[i..]) {
-        let esc = i + offset;
-        match bytes.get(esc + 1) {
-            Some(b'M' | b'8') => return true,
-            Some(b'[') => {
-                let mut j = esc + 2;
-                let private = matches!(bytes.get(j), Some(0x3c..=0x3f));
-                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
-                    if bytes[j] == 0x1b {
-                        break;
-                    }
-                    j += 1;
-                }
-                let Some(&fin) = bytes.get(j) else {
-                    return false;
-                };
-                let intermediate = bytes[esc + 2..j].iter().any(|b| (0x20..=0x2f).contains(b));
-                if !private
-                    && !intermediate
-                    && matches!(
-                        fin,
-                        b'A' | b'E'
-                            | b'F'
-                            | b'H'
-                            | b'f'
-                            | b'd'
-                            | b'J'
-                            | b'L'
-                            | b'M'
-                            | b'S'
-                            | b'T'
-                            | b'r'
-                            | b'u'
-                    )
-                {
-                    return true;
-                }
-                i = j;
+    while let Some(offset) = memchr::memchr2(0x1b, 0x9b, &bytes[i..]) {
+        let at = i + offset;
+        let body = if bytes[at] == 0x9b {
+            // U+009B is `C2 9B` in UTF-8; a lone 0x9B is a continuation byte.
+            if at == 0 || bytes[at - 1] != 0xc2 {
+                i = at + 1;
                 continue;
             }
-            _ => {}
+            at + 1
+        } else {
+            match bytes.get(at + 1) {
+                Some(b'M' | b'8' | b'c') => return true,
+                Some(b'[') => at + 2,
+                _ => {
+                    i = at + 1;
+                    continue;
+                }
+            }
+        };
+        match csi_needs_screen_replay(bytes, body) {
+            CsiScan::Needs => return true,
+            CsiScan::Unterminated => return false,
+            CsiScan::Plain(next) => i = next,
         }
-        i = esc + 1;
     }
     false
+}
+
+enum CsiScan {
+    Needs,
+    Unterminated,
+    /// A CSI the strip handles; scanning resumes at this index.
+    Plain(usize),
+}
+
+/// Scans the CSI whose parameters start at `body` (just past `ESC [` or C1).
+fn csi_needs_screen_replay(bytes: &[u8], body: usize) -> CsiScan {
+    let mut j = body;
+    let private = matches!(bytes.get(j), Some(0x3c..=0x3f));
+    while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+        if bytes[j] == 0x1b {
+            break;
+        }
+        j += 1;
+    }
+    let Some(&fin) = bytes.get(j) else {
+        return CsiScan::Unterminated;
+    };
+    let intermediate = bytes[body..j].iter().any(|b| (0x20..=0x2f).contains(b));
+    // DECSED (`CSI ? J`) erases like ED; other private sequences are modes.
+    let decsed = private && bytes[body] == b'?' && fin == b'J';
+    if (!private || decsed)
+        && !intermediate
+        && matches!(
+            fin,
+            b'A' | b'B'
+                | b'E'
+                | b'F'
+                | b'H'
+                | b'f'
+                | b'd'
+                | b'J'
+                | b'L'
+                | b'M'
+                | b'S'
+                | b'T'
+                | b'r'
+                | b'u'
+        )
+    {
+        return CsiScan::Needs;
+    }
+    CsiScan::Plain(j)
 }
 
 /// Re-synchronises a byte ring whose front was dropped at an arbitrary byte:

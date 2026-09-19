@@ -37,9 +37,51 @@ pub fn signal_name_for_exit(exit_code: i32) -> Option<&'static str> {
     }
 }
 
+/// Whether `exit_code` is a shell's report of a stopped foreground job
+/// (128 + SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU). The job is suspended, not dead:
+/// surfaces should show it neutrally rather than as a failure.
+pub const fn is_job_stop(exit_code: i32) -> bool {
+    matches!(exit_code, 147..=150)
+}
+
+/// The exit codes a user causes on purpose rather than a program failing:
+/// Ctrl+C (130), a closed pipe (141), a polite kill (143) and Ctrl+Z (148).
+/// Returns the signal name for those, `None` for every other code. Frontends
+/// treat these as "interrupted", not "failed".
+pub const fn interrupt_signal(exit_code: i32) -> Option<&'static str> {
+    match exit_code {
+        130 => Some("SIGINT"),
+        141 => Some("SIGPIPE"),
+        143 => Some("SIGTERM"),
+        148 => Some("SIGTSTP"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::signal_name_for_exit;
+    use super::{interrupt_signal, is_job_stop, signal_name_for_exit};
+
+    #[test]
+    fn job_stops_are_the_four_stop_signals() {
+        for code in 147..=150 {
+            assert!(is_job_stop(code), "code {code}");
+        }
+        for code in [0, 1, 130, 137, 143, 146, 151] {
+            assert!(!is_job_stop(code), "code {code}");
+        }
+    }
+
+    #[test]
+    fn interrupts_are_the_user_caused_signals() {
+        assert_eq!(interrupt_signal(130), Some("SIGINT"));
+        assert_eq!(interrupt_signal(141), Some("SIGPIPE"));
+        assert_eq!(interrupt_signal(143), Some("SIGTERM"));
+        assert_eq!(interrupt_signal(148), Some("SIGTSTP"));
+        for code in [0, 1, 2, 137, 139, 147] {
+            assert_eq!(interrupt_signal(code), None, "code {code}");
+        }
+    }
 
     #[test]
     fn names_common_fatal_signals() {

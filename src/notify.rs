@@ -43,7 +43,7 @@ static NOTIFICATION_WORKER: OnceLock<Option<SyncSender<Notification>>> = OnceLoc
 
 /// Post a desktop notification for a command that just finished. `cmd` is
 /// the displayed command (truncated to keep the toast readable);
-/// `exit_code` drives the urgency hint (non-zero → critical, since failed
+/// `exit_code` drives the urgency hint (a real failure → critical, since failed
 /// long builds are the case users most want to come back to).
 ///
 /// `duration_ms` shows up in the body so the user knows whether they
@@ -52,7 +52,7 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
     // Truncate the cmd so the notification title stays one line.
     let title_cmd = notification_title(cmd);
 
-    let status = if exit_code == 0 { "✓" } else { "✗" };
+    let (status, urgency, timeout_ms) = long_block_outcome(exit_code);
     let title = format!("{status} {title_cmd}");
     let exit_text = match crate::exit_status::signal_name_for_exit(exit_code) {
         Some(sig) => format!("Exit {exit_code} ({sig})"),
@@ -60,14 +60,25 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
     };
     let body = format!("{exit_text} after {}", humanize_duration(duration_ms));
 
-    let urgency = if exit_code == 0 { "normal" } else { "critical" };
-
-    // -t 0 = sticky-until-dismissed by some servers; -t 8000 = 8s. We pick a
-    // mid value (5s) so success toasts decay quickly but failures still get
-    // a moment of attention.
-    let timeout_ms = if exit_code == 0 { "5000" } else { "10000" };
-
     spawn_notify_send(urgency, timeout_ms, &title, &body);
+}
+
+/// Title glyph, urgency and timeout for a [`long_block_finished`] toast.
+///
+/// Success and the user-caused stops (Ctrl+C, a closed pipe, SIGTERM, Ctrl+Z;
+/// see [`crate::exit_status::interrupt_signal`]) are normal-urgency and decay
+/// after 5 s; a suspension or interruption is marked `⏸`, not `✗`. Real
+/// failures are critical and linger for 10 s so the user comes back to them.
+fn long_block_outcome(exit_code: i32) -> (&'static str, &'static str, &'static str) {
+    if exit_code == 0 {
+        ("✓", "normal", "5000")
+    } else if crate::exit_status::interrupt_signal(exit_code).is_some()
+        || crate::exit_status::is_job_stop(exit_code)
+    {
+        ("⏸", "normal", "5000")
+    } else {
+        ("✗", "critical", "10000")
+    }
 }
 
 /// Whether a block that just finished after `duration_ms` deserves the
@@ -264,6 +275,25 @@ pub fn humanize_duration(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_block_toast_treats_interrupts_and_stops_as_neutral() {
+        assert_eq!(long_block_outcome(0), ("✓", "normal", "5000"));
+        for neutral in [130, 141, 143, 147, 148, 149, 150] {
+            assert_eq!(
+                long_block_outcome(neutral),
+                ("⏸", "normal", "5000"),
+                "code {neutral}"
+            );
+        }
+        for failure in [1, 2, 127, 137, 139] {
+            assert_eq!(
+                long_block_outcome(failure),
+                ("✗", "critical", "10000"),
+                "code {failure}"
+            );
+        }
+    }
 
     #[test]
     fn humanize_seconds_only() {

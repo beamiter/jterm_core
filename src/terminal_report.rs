@@ -136,12 +136,11 @@ fn classify_csi(csi: &[u8], cpr_outstanding: bool) -> Option<TerminalReport> {
             TerminalReport::StatusReport
         }
         (params, b't') if fields_in(params, 1..=3) => TerminalReport::WindowReport,
+        // No key press commits `CSI ? … R`, so the private DECXCPR reply is
+        // always a report. The host's CPR ledger only counts plain `CSI 6 n`
+        // queries, so this form must not wait for it (nor use up its credit).
+        ([b'?', params @ ..], b'R') if fields_in(params, 2..=3) => TerminalReport::CursorPosition,
         // The one shape a key shares: `CSI 1;2 R` is Shift+F3 in VTE 0.76.
-        // The private DECXCPR form never collides, but the host's ledger
-        // counts both, so both wait for it.
-        ([b'?', params @ ..], b'R') if cpr_outstanding && fields_in(params, 2..=3) => {
-            TerminalReport::CursorPosition
-        }
         ([b'0'..=b'9', ..], b'R') if cpr_outstanding && fields_in(head, 2..=2) => {
             TerminalReport::CursorPosition
         }
@@ -420,7 +419,6 @@ mod tests {
             assert_eq!(classify_terminal_report(f3, false), None);
         }
         assert_eq!(classify_terminal_report(b"\x1b[12;40R", false), None);
-        assert_eq!(classify_terminal_report(b"\x1b[?12;40;1R", false), None);
         // ...and answers while the VTE owes one.
         for cpr in [
             &b"\x1b[1;1R"[..],
@@ -430,8 +428,16 @@ mod tests {
         ] {
             assert_eq!(classify_terminal_report(cpr, true), Some(CursorPosition));
         }
+        // DECXCPR (`CSI ? r;c;p R`) never collides with a key, and the
+        // host's ledger never counts its `CSI ? 6 n` query, so it is a
+        // report whether or not a plain CPR is pending.
         for xcpr in [&b"\x1b[?12;40;1R"[..], b"\x1b[?3;7R"] {
-            assert_eq!(classify_terminal_report(xcpr, true), Some(CursorPosition));
+            for cpr_outstanding in [false, true] {
+                assert_eq!(
+                    classify_terminal_report(xcpr, cpr_outstanding),
+                    Some(CursorPosition)
+                );
+            }
         }
         // A bare `SS3 R` (F3) is never a CPR; nor is a one-field CSI R.
         assert_eq!(classify_terminal_report(b"\x1bOR", true), None);
