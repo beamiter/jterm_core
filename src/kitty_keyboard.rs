@@ -6,9 +6,9 @@
 //! tracks these flags nor encodes keys for them. Until this module, the live
 //! surface answered the `CSI ? u` query with `CSI ? 0 u` — which crossterm and
 //! every other client reads as "the protocol is available" — and then kept
-//! sending legacy key bytes. Shift+Enter therefore reached codex and kimi as a
-//! plain Enter and submitted the composer instead of inserting a newline, and
-//! Esc stayed ambiguous with the start of an Alt sequence.
+//! sending legacy key bytes. Shift+Enter therefore reached codex, kimi, claude,
+//! and opencode composers as a plain Enter and submitted instead of inserting a
+//! newline, and Esc stayed ambiguous with the start of an Alt sequence.
 //!
 //! Only the first flag, *disambiguate escape codes*, is implemented: it is the
 //! bit that makes Esc, Shift+Enter, Ctrl+letter and Alt+letter unambiguous, and
