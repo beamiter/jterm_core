@@ -333,6 +333,7 @@ impl Drop for PrintStreamDriver {
 enum StdoutMessage {
     Line(String),
     Overlong,
+    InvalidUtf8,
     Failed(String),
     Eof,
 }
@@ -397,9 +398,13 @@ fn spawn_stdout_reader(
             loop {
                 let message = match read_bounded_line(&mut reader, &mut line, STDOUT_LINE_MAX_BYTES)
                 {
-                    Ok(LineRead::Line) => {
-                        StdoutMessage::Line(String::from_utf8_lossy(&line).into_owned())
-                    }
+                    // stdout is a protocol, unlike the display-only stderr
+                    // tail. Lossy decoding could invent an opaque session ID
+                    // or turn corrupt result data into an accepted record.
+                    Ok(LineRead::Line) => match std::str::from_utf8(&line) {
+                        Ok(line) => StdoutMessage::Line(line.to_owned()),
+                        Err(_) => StdoutMessage::InvalidUtf8,
+                    },
                     Ok(LineRead::Overlong) => StdoutMessage::Overlong,
                     Ok(LineRead::Eof) => StdoutMessage::Eof,
                     Err(error) => {
@@ -408,7 +413,10 @@ fn spawn_stdout_reader(
                 };
                 let last = matches!(
                     message,
-                    StdoutMessage::Eof | StdoutMessage::Failed(_) | StdoutMessage::Overlong
+                    StdoutMessage::Eof
+                        | StdoutMessage::Failed(_)
+                        | StdoutMessage::Overlong
+                        | StdoutMessage::InvalidUtf8
                 );
                 // The worker drops the receiver when it stops listening.
                 if sender.send(message).is_err() || last {
@@ -776,6 +784,14 @@ impl PrintWorker {
                             force_stop = true;
                             stdout_done = true;
                         }
+                        Ok(StdoutMessage::InvalidUtf8) => {
+                            self.fail(
+                                CodexAppServerExitCause::ProtocolFailed,
+                                format!("{label} stdout record is not valid UTF-8"),
+                            );
+                            force_stop = true;
+                            stdout_done = true;
+                        }
                         Ok(StdoutMessage::Failed(detail)) => {
                             self.fail(CodexAppServerExitCause::IoFailed, detail);
                             stdout_done = true;
@@ -1028,6 +1044,33 @@ mod tests {
         assert!(parse_json_record(&padded).is_err());
     }
 
+    #[test]
+    fn stdout_preserves_valid_unicode_across_buffer_boundaries() {
+        // The first multibyte character straddles BufReader's 8 KiB buffer.
+        // A literal U+FFFD is valid input and must remain distinguishable from
+        // a replacement invented by a lossy decoder.
+        let line = format!("{}界\u{fffd}", "x".repeat(8191));
+        let source = std::io::Cursor::new(format!("{line}\n").into_bytes());
+        let (receiver, reader) = spawn_stdout_reader(source, "test").unwrap();
+        assert!(
+            matches!(receiver.recv().unwrap(), StdoutMessage::Line(decoded) if decoded == line)
+        );
+        assert!(matches!(receiver.recv().unwrap(), StdoutMessage::Eof));
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn stdout_stops_at_invalid_utf8_without_accepting_later_records() {
+        let source = std::io::Cursor::new(b"{\"session_id\":\"bad-\xff\"}\n{}\n".to_vec());
+        let (receiver, reader) = spawn_stdout_reader(source, "test").unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            StdoutMessage::InvalidUtf8
+        ));
+        reader.join().unwrap();
+        assert!(receiver.recv().is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn ambiguous_provider_results_fail_the_session_even_with_a_zero_process_exit() {
@@ -1181,6 +1224,44 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event.kind(), AgentEventKind::TurnCompleted { .. })));
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_cannot_become_a_replacement_character_session_id() {
+        use super::test_support::*;
+        use crate::agent_task::driver::AgentDriver;
+        use crate::agent_task::drivers::claude_stream_json::ClaudeStreamJsonDriver;
+        use crate::agent_task::drivers::kimi_stream_json::KimiStreamJsonDriver;
+        use crate::agent_task::TaskStatus;
+
+        for (provider, bytes) in [
+            (
+                AgentProvider::Claude,
+                b"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"session-\xff\"}\n{\"type\":\"result\",\"is_error\":false}\n".as_slice(),
+            ),
+            (
+                AgentProvider::Kimi,
+                b"{\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session-\xff\"}\n{\"type\":\"goal.summary\",\"status\":\"complete\"}\n".as_slice(),
+            ),
+        ] {
+            let dir = TempDir::new("invalid-utf8");
+            let cli = fake_cli(&dir.0, "", "exit 0");
+            std::fs::write(dir.0.join("stdout.jsonl"), bytes).unwrap();
+            let (mut manager, task_id, stream) = native_task(provider, &dir.0);
+            let mut driver: Box<dyn AgentDriver> = match provider {
+                AgentProvider::Claude => Box::new(ClaudeStreamJsonDriver::new(fake_cli_argv(&cli), dir.0.clone())),
+                AgentProvider::Kimi => Box::new(KimiStreamJsonDriver::new(fake_cli_argv(&cli), dir.0.clone())),
+                _ => unreachable!(),
+            };
+            driver.start(start_request(provider, stream, &dir.0)).unwrap();
+            let events = drive_to_close(&mut *driver, &mut manager, Duration::from_secs(5));
+            assert_eq!(manager.get(task_id).unwrap().status, TaskStatus::Failed);
+            assert!(!events.iter().any(|event| matches!(event.kind(), AgentEventKind::SessionStarted {
+                provider_session_id: Some(_), ..
+            })));
+            assert!(!events.iter().any(|event| matches!(event.kind(), AgentEventKind::TurnCompleted { .. })));
         }
     }
 
