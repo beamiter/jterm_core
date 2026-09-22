@@ -225,6 +225,11 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 ## Development
 
+Install `curl` and `minisign` to exercise the embedded jsh installer's signed
+release contracts. Tests generate temporary signing keys and use local
+`file://` releases; they do not contact a provider or install a shell. CI
+installs these tools explicitly.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings

@@ -825,71 +825,160 @@ mod tests {
         assert_eq!(argv.last().map(String::as_str), Some("/tmp/install-jsh.sh"));
     }
 
-    /// The riskiest seam is the JSON contract: the installer lives in another
-    /// repository and can be re-vendored at any time. Run the embedded script
-    /// for real against a local release tree and parse what it prints with the
-    /// same type the terminals use.
-    #[test]
-    fn the_embedded_script_emits_json_this_module_understands() {
-        use std::process::Command;
+    /// Local release metadata is signed with a fresh, unencrypted test key so
+    /// these contracts exercise the real verifier without a production secret.
+    struct SignedRelease {
+        root: PathBuf,
+        public_key: String,
+    }
 
-        let downloader_present = Command::new("sh")
-            .arg("-c")
-            .arg("command -v curl >/dev/null || command -v wget >/dev/null")
-            .status()
-            .is_ok_and(|status| status.success());
-        if !downloader_present {
-            eprintln!("skipped: neither curl nor wget is available");
-            return;
+    impl Drop for SignedRelease {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl SignedRelease {
+        fn new() -> Option<Self> {
+            use std::process::Command;
+
+            // file:// fixtures need curl (wget does not support that scheme).
+            let mut tool_paths = Vec::new();
+            for tool in ["curl", "minisign"] {
+                let output = Command::new("/bin/sh")
+                    .args(["-c", "command -v \"$1\"", "sh", tool])
+                    .output()
+                    .expect("locate installer test prerequisite");
+                if !output.status.success() {
+                    eprintln!(
+                        "skipped: {tool} is unavailable (required for signed release fixtures)"
+                    );
+                    return None;
+                }
+                let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+                tool_paths.push(std::fs::canonicalize(path).expect("absolute tool path"));
+            }
+
+            let root =
+                std::env::temp_dir().join(format!("jterm-jsh-contract-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).expect("private fixture root");
+            let mut fixture = Self {
+                root,
+                public_key: String::new(),
+            };
+            std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o700))
+                .expect("private fixture permissions");
+            for dir in ["release/latest/download", "home", "helpers"] {
+                std::fs::create_dir_all(fixture.root.join(dir)).expect("fixture directory");
+            }
+            for (tool, path) in ["curl", "minisign"].into_iter().zip(&tool_paths) {
+                std::os::unix::fs::symlink(path, fixture.root.join("helpers").join(tool))
+                    .expect("fixture tool link");
+            }
+            let public_key_path = fixture.root.join("test.pub");
+            let secret_key_path = fixture.root.join("test.key");
+            let generated = Command::new(&tool_paths[1])
+                .args(["-G", "-W", "-p"])
+                .arg(&public_key_path)
+                .arg("-s")
+                .arg(&secret_key_path)
+                .output()
+                .expect("generate ephemeral minisign key");
+            assert!(
+                generated.status.success(),
+                "minisign key generation: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            );
+            fixture.public_key = std::fs::read_to_string(public_key_path)
+                .expect("public key")
+                .lines()
+                .nth(1)
+                .expect("minisign public key data")
+                .to_owned();
+            std::fs::write(
+                fixture.manifest(),
+                r#"{"schema":1,"name":"jsh","version":"9.9.9","tag":"v9.9.9","artifacts":[]}"#,
+            )
+            .expect("manifest");
+            let signed = Command::new(&tool_paths[1])
+                .arg("-Sm")
+                .arg(fixture.manifest())
+                .arg("-s")
+                .arg(&secret_key_path)
+                .output()
+                .expect("sign release manifest");
+            assert!(
+                signed.status.success(),
+                "minisign signing: {}",
+                String::from_utf8_lossy(&signed.stderr)
+            );
+            std::fs::write(fixture.root.join(INSTALLER.name), INSTALLER.source)
+                .expect("embedded installer");
+            Some(fixture)
         }
 
-        let root = std::env::temp_dir().join(format!("jterm-jsh-contract-{}", std::process::id()));
-        let release = root.join("release/latest/download");
-        let home = root.join("home");
-        std::fs::create_dir_all(&release).expect("release tree");
-        std::fs::create_dir_all(&home).expect("home");
-        std::fs::write(
-            release.join("manifest.json"),
-            r#"{"schema":1,"name":"jsh","version":"9.9.9","tag":"v9.9.9","artifacts":[]}"#,
-        )
-        .expect("manifest");
+        fn manifest(&self) -> PathBuf {
+            self.root.join("release/latest/download/manifest.json")
+        }
 
-        let script = root.join(INSTALLER.name);
-        std::fs::write(&script, INSTALLER.source).expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        fn command(&self) -> std::process::Command {
+            let home = self.root.join("home");
+            // Allow only system tools plus the explicit test prerequisites.
+            // In particular, the user's cargo bin is never an execution PATH.
+            let path = format!("{}:/usr/bin:/bin", self.root.join("helpers").display());
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg(self.root.join(INSTALLER.name))
+                .args(["--check", "--json", "--max-age", "0"])
+                .env("HOME", &home)
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("XDG_STATE_HOME", home.join("state"))
+                .env(
+                    "JSH_INSTALL_BASE_URL",
+                    format!("file://{}", self.root.join("release").display()),
+                )
+                .env("JSH_MINISIGN_PUBKEY", &self.public_key)
+                .env("PATH", &path)
+                .env("JSH_LOOKUP_PATH", &path);
+            command
+        }
+
+        fn parse(output: &std::process::Output) -> Status {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+                panic!(
+                    "unparseable check output {stdout:?}: {error}; stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })
+        }
+    }
+
+    /// The riskiest seam is the JSON contract: the installer lives in another
+    /// repository and can be re-vendored at any time. Run the embedded script
+    /// for real against a signed local release tree and parse what it prints
+    /// with the same type the terminals use.
+    #[test]
+    fn the_embedded_script_emits_json_this_module_understands() {
+        let Some(fixture) = SignedRelease::new() else {
+            return;
+        };
 
         // Whatever this machine has on PATH, the check must see the same thing:
         // a `jsh` that fails identification.
-        let stub_bin = root.join("bin");
-        std::fs::create_dir_all(&stub_bin).expect("stub bin");
+        let stub_bin = fixture.root.join("bin");
+        std::fs::create_dir(&stub_bin).expect("stub bin");
         let stub_jsh = stub_bin.join("jsh");
         std::fs::write(&stub_jsh, "#!/bin/sh\nexit 1\n").expect("stub jsh");
         std::fs::set_permissions(&stub_jsh, std::fs::Permissions::from_mode(0o755)).expect("mode");
-        let path = format!(
-            "{}:{}",
-            stub_bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-
-        let output = Command::new("sh")
-            .arg(&script)
-            .args(["--check", "--json", "--max-age", "0"])
-            .env("HOME", &home)
-            .env("XDG_CACHE_HOME", home.join("cache"))
-            .env("XDG_STATE_HOME", home.join("state"))
-            .env(
-                "JSH_INSTALL_BASE_URL",
-                format!("file://{}", root.join("release").display()),
-            )
-            .env("PATH", &path)
+        let output = fixture
+            .command()
+            .env("JSH_LOOKUP_PATH", &stub_bin)
             .output()
             .expect("run install-jsh.sh --check");
+        let status = SignedRelease::parse(&output);
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let status: Status = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|error| panic!("unparseable check output {stdout:?}: {error}"));
-        let _ = std::fs::remove_dir_all(&root);
-
+        assert!(output.status.success(), "{:?}", status.error);
         assert_eq!(status.latest.as_deref(), Some("9.9.9"));
         assert_eq!(status.installed, None);
         assert_eq!(status.error, None);
@@ -906,42 +995,16 @@ mod tests {
     }
 
     /// The regression that motivated `JSH_LOOKUP_PATH`, end to end: PATH
-    /// clamped to system directories the way [`crate::host`] clamps it for
-    /// helpers, a genuine jsh outside them (`~/.cargo/bin` is the common
-    /// home), and the user's real PATH passed for lookup only. The check must
-    /// find the installed shell in place and offer nothing when it is
-    /// current — before the override, this exact setup reported "nothing
-    /// installed" and raised the install banner on every launch.
+    /// clamped to system directories and explicit verification tools, a genuine
+    /// jsh outside them (`~/.cargo/bin` is the common home), and the user's real
+    /// PATH passed for lookup only. A current shell should raise no banner.
     #[test]
     fn a_clamped_check_still_finds_the_users_jsh_through_the_lookup_path() {
-        use std::process::Command;
-
-        let downloader_present = Command::new("sh")
-            .arg("-c")
-            .arg("command -v curl >/dev/null || command -v wget >/dev/null")
-            .status()
-            .is_ok_and(|status| status.success());
-        if !downloader_present {
-            eprintln!("skipped: neither curl nor wget is available");
+        let Some(fixture) = SignedRelease::new() else {
             return;
-        }
-
-        let root = std::env::temp_dir().join(format!("jterm-jsh-lookup-{}", std::process::id()));
-        let release = root.join("release/latest/download");
-        let home = root.join("home");
-        let cargo_bin = home.join(".cargo/bin");
-        std::fs::create_dir_all(&release).expect("release tree");
+        };
+        let cargo_bin = fixture.root.join("home/.cargo/bin");
         std::fs::create_dir_all(&cargo_bin).expect("cargo bin");
-        std::fs::write(
-            release.join("manifest.json"),
-            r#"{"schema":1,"name":"jsh","version":"9.9.9","tag":"v9.9.9","artifacts":[]}"#,
-        )
-        .expect("manifest");
-
-        let script = root.join(INSTALLER.name);
-        std::fs::write(&script, INSTALLER.source).expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
-
         let jsh = cargo_bin.join("jsh");
         std::fs::write(
             &jsh,
@@ -950,29 +1013,19 @@ mod tests {
         .expect("stub jsh");
         std::fs::set_permissions(&jsh, std::fs::Permissions::from_mode(0o755)).expect("mode");
 
-        let output = Command::new("sh")
-            .arg(&script)
-            .args(["--check", "--json", "--max-age", "0"])
-            .env("HOME", &home)
-            .env("XDG_CACHE_HOME", home.join("cache"))
-            .env("XDG_STATE_HOME", home.join("state"))
-            .env(
-                "JSH_INSTALL_BASE_URL",
-                format!("file://{}", root.join("release").display()),
-            )
-            .env("PATH", "/usr/bin:/bin")
+        let output = fixture
+            .command()
             .env(
                 "JSH_LOOKUP_PATH",
                 format!("{}:/usr/bin:/bin", cargo_bin.display()),
             )
             .output()
             .expect("run install-jsh.sh --check");
+        let status = SignedRelease::parse(&output);
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let status: Status = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|error| panic!("unparseable check output {stdout:?}: {error}"));
-        let _ = std::fs::remove_dir_all(&root);
-
+        assert!(output.status.success(), "{:?}", status.error);
+        assert_eq!(status.error, None);
+        assert_eq!(status.latest.as_deref(), Some("9.9.9"));
         assert_eq!(status.installed.as_deref(), Some("9.9.9"));
         assert_eq!(
             status.installed_path.as_deref(),
@@ -980,6 +1033,46 @@ mod tests {
         );
         assert!(!status.update_available);
         assert_eq!(status.shadowed_by, None);
+        assert_eq!(prompt_for(&status), None);
+    }
+
+    #[test]
+    fn an_unsigned_manifest_emits_a_failed_check_without_an_install_prompt() {
+        let Some(fixture) = SignedRelease::new() else {
+            return;
+        };
+        std::fs::remove_file(fixture.manifest().with_extension("json.minisig"))
+            .expect("remove manifest signature");
+        assert_signature_failure(&fixture, "no signature");
+    }
+
+    #[test]
+    fn a_tampered_manifest_emits_a_failed_check_without_an_install_prompt() {
+        let Some(fixture) = SignedRelease::new() else {
+            return;
+        };
+        // Keep a well-formed manifest and its real signature, but change the
+        // signed version so only cryptographic verification can reject it.
+        let manifest = std::fs::read_to_string(fixture.manifest()).expect("signed manifest");
+        std::fs::write(fixture.manifest(), manifest.replace("9.9.9", "9.9.8"))
+            .expect("tamper signed manifest");
+        assert_signature_failure(&fixture, "signature verification failed");
+    }
+
+    fn assert_signature_failure(fixture: &SignedRelease, expected_error: &str) {
+        let output = fixture.command().output().expect("run rejected check");
+        let status = SignedRelease::parse(&output);
+        assert!(!output.status.success());
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected_error)),
+            "unexpected check error: {:?}",
+            status.error
+        );
+        assert_eq!(status.latest, None);
+        assert!(!status.update_available);
         assert_eq!(prompt_for(&status), None);
     }
 }

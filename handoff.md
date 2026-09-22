@@ -1036,8 +1036,13 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
 ## Remaining boundaries
 
 None open for the installer trust chain. After changing either vendored script,
-keep the three-line provenance header and re-test every terminal that embeds
-the scripts via `include_str!`.
+keep its provenance header and re-test every terminal that embeds the scripts
+via `include_str!`. The installer body matches jsh commit
+`b6928e5e8291deed5d19e44f47cc6d836668ffc3`, including the coordinated JSON
+check-error and portable awk fixes; the header records that revision.
+Its Rust contract tests use real ephemeral minisign signatures and check that
+missing or tampered signatures return structured errors without install
+prompts. Install `curl` and `minisign` to run those tests; CI supplies both.
 
 ## Release checks
 
