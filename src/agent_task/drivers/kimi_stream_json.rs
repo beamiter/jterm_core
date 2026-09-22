@@ -8,7 +8,9 @@
 //! the shared worker in [`super::print_stream`] folds the last stderr lines
 //! into the failure detail.
 
-use super::print_stream::{bounded_detail, PrintProviderSpec, PrintSignal, PrintStreamDriver};
+use super::print_stream::{
+    bounded_detail, parse_json_record, PrintProviderSpec, PrintSignal, PrintStreamDriver,
+};
 use crate::agent_task::driver::{AgentCommand, AgentDriver, AgentDriverError, AgentStartRequest};
 use crate::agent_task::drivers::codex_app_server::{
     CodexAppServerExitReport, CodexAppServerPhase, CodexAppServerViewSnapshot,
@@ -42,13 +44,14 @@ pub enum KimiStreamSignal {
 /// - `{"role":"assistant","content":"…","tool_calls":[…]}`
 /// - `{"role":"tool","tool_call_id":…,"content":"…"}`
 /// - `{"type":"goal.summary","status":"complete"|…}`
+///
+/// Oversized records, duplicate JSON members and private decoder escape
+/// members are errors before any event can change session state.
 pub fn parse_stream_json_line(line: &str) -> KimiStreamSignal {
-    let line = line.trim();
-    if line.is_empty() {
-        return KimiStreamSignal::Ignored;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
-        return KimiStreamSignal::Ignored;
+    let value = match parse_json_record(line) {
+        Ok(Some(value)) => value,
+        Ok(None) => return KimiStreamSignal::Ignored,
+        Err(detail) => return KimiStreamSignal::Error(format!("Kimi {detail}")),
     };
 
     if value.get("type").and_then(Value::as_str) == Some("goal.summary") {
@@ -279,6 +282,22 @@ mod tests {
                 "stream-json",
             ]
         );
+    }
+
+    #[test]
+    fn ambiguous_json_cannot_rewrite_a_result_or_session() {
+        for line in [
+            r#"{"type":"goal.summary","status":"blocked","status":"complete"}"#,
+            r#"{"type":"goal.summary","status":"blocked","\u0073tatus":"complete"}"#,
+            r#"{"role":"meta","type":"session.resume_hint","session_id":"one","session_id":"two"}"#,
+            r#"{"role":"assistant","content":"done","tool_calls":[{"id":"one","id":"two"}]}"#,
+            r#"{"$serde_json::private::RawValue":"{\"type\":\"goal.summary\",\"status\":\"complete\"}"}"#,
+        ] {
+            assert!(
+                matches!(parse_stream_json_line(line), KimiStreamSignal::Error(_)),
+                "ambiguous record acquired authority: {line}"
+            );
+        }
     }
 }
 

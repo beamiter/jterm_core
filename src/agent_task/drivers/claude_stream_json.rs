@@ -6,7 +6,9 @@
 //! Process ownership and the lifecycle contract live in
 //! [`super::print_stream`].
 
-use super::print_stream::{bounded_detail, PrintProviderSpec, PrintSignal, PrintStreamDriver};
+use super::print_stream::{
+    bounded_detail, parse_json_record, PrintProviderSpec, PrintSignal, PrintStreamDriver,
+};
 use crate::agent_task::driver::{AgentCommand, AgentDriver, AgentDriverError, AgentStartRequest};
 use crate::agent_task::drivers::codex_app_server::{
     CodexAppServerExitReport, CodexAppServerPhase, CodexAppServerViewSnapshot,
@@ -41,13 +43,13 @@ pub enum ClaudeStreamSignal {
 /// `error` (`error_max_turns`, `error_during_execution`, ...) and a top-level
 /// `error` record are fatal. Other `system` records, including transient
 /// `api_retry` notices that carry an `error` field, are informational.
+/// Oversized records, duplicate JSON members and private decoder escape
+/// members are errors before any event can change session state.
 pub fn parse_stream_json_line(line: &str) -> ClaudeStreamSignal {
-    let line = line.trim();
-    if line.is_empty() {
-        return ClaudeStreamSignal::Ignored;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
-        return ClaudeStreamSignal::Ignored;
+    let value = match parse_json_record(line) {
+        Ok(Some(value)) => value,
+        Ok(None) => return ClaudeStreamSignal::Ignored,
+        Err(detail) => return ClaudeStreamSignal::Error(format!("Claude {detail}")),
     };
     let Some(event_type) = value.get("type").and_then(Value::as_str) else {
         return ClaudeStreamSignal::Ignored;
@@ -356,6 +358,22 @@ mod tests {
             parse_stream_json_line(r#"{"type":"system","subtype":"hook_response","error":"x"}"#),
             ClaudeStreamSignal::Ignored
         );
+    }
+
+    #[test]
+    fn ambiguous_json_cannot_rewrite_a_result_or_session() {
+        for line in [
+            r#"{"type":"result","is_error":true,"is_error":false,"result":"done"}"#,
+            r#"{"type":"result","is_error":true,"\u0069s_error":false}"#,
+            r#"{"type":"system","subtype":"init","session_id":"one","session_id":"two"}"#,
+            r#"{"type":"assistant","message":{"content":"one","content":"two"}}"#,
+            r#"{"$serde_json::private::RawValue":"{\"type\":\"result\",\"is_error\":false}"}"#,
+        ] {
+            assert!(
+                matches!(parse_stream_json_line(line), ClaudeStreamSignal::Error(_)),
+                "ambiguous record acquired authority: {line}"
+            );
+        }
     }
 
     #[test]

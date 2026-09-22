@@ -69,6 +69,32 @@ pub(super) const FAILURE_DETAIL_MAX_BYTES: usize = MAX_AGENT_EVENT_DETAIL_BYTES;
 /// Stderr lines folded into a failure detail when nothing better exists.
 const STDERR_DETAIL_LINES: usize = 3;
 
+/// Decode a provider record through the same uniqueness boundary as Codex.
+/// CLI banners and malformed/non-object lines retain their historical ignored
+/// behavior. Duplicate decoded keys and serde_json's private escape members
+/// are data errors: ignoring them could turn an in-band failure into a clean
+/// session when the process exits zero. Check bytes before trimming or decoding
+/// because the public provider parsers can be called without the pipe reader.
+pub(super) fn parse_json_record(line: &str) -> Result<Option<serde_json::Value>, &'static str> {
+    if line.len() > STDOUT_LINE_MAX_BYTES {
+        return Err("stream-json record exceeds its byte limit");
+    }
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    if let Err(error) = crate::bounded_json::validate_no_duplicate_members(line.as_bytes()) {
+        return if error.is_data() {
+            Err("stream-json record contains duplicate or reserved JSON members")
+        } else {
+            Ok(None)
+        };
+    }
+    Ok(serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .filter(serde_json::Value::is_object))
+}
+
 /// Provider-neutral meaning of one stdout record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PrintSignal {
@@ -986,6 +1012,72 @@ fn process_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_record_keeps_ignored_lines_and_checks_the_raw_byte_limit() {
+        for line in ["", "  ", "CLI banner", "{broken", "[]", "null", "42"] {
+            assert_eq!(parse_json_record(line), Ok(None), "{line:?}");
+        }
+        let record = r#"{"type":"future.event","nested":{"ok":true}}"#;
+        let mut padded = " ".repeat(STDOUT_LINE_MAX_BYTES - record.len());
+        padded.push_str(record);
+        assert_eq!(
+            parse_json_record(&padded).unwrap(),
+            serde_json::from_str(record).ok()
+        );
+        padded.push(' ');
+        assert!(parse_json_record(&padded).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_provider_results_fail_the_session_even_with_a_zero_process_exit() {
+        use super::test_support::*;
+        use crate::agent_task::driver::AgentDriver;
+        use crate::agent_task::drivers::claude_stream_json::ClaudeStreamJsonDriver;
+        use crate::agent_task::drivers::kimi_stream_json::KimiStreamJsonDriver;
+        use crate::agent_task::TaskStatus;
+
+        for (provider, line) in [
+            (
+                AgentProvider::Claude,
+                "{\"type\":\"result\",\"is_error\":true,\"is_error\":false}\n",
+            ),
+            (
+                AgentProvider::Kimi,
+                "{\"type\":\"goal.summary\",\"status\":\"blocked\",\"status\":\"complete\"}\n",
+            ),
+        ] {
+            let dir = TempDir::new("ambiguous-result");
+            let cli = fake_cli(&dir.0, line, "exit 0");
+            let (mut manager, task_id, stream) = native_task(provider, &dir.0);
+            let mut driver: Box<dyn AgentDriver> = match provider {
+                AgentProvider::Claude => Box::new(ClaudeStreamJsonDriver::new(
+                    fake_cli_argv(&cli),
+                    dir.0.clone(),
+                )),
+                AgentProvider::Kimi => Box::new(KimiStreamJsonDriver::new(
+                    fake_cli_argv(&cli),
+                    dir.0.clone(),
+                )),
+                _ => unreachable!(),
+            };
+            driver
+                .start(start_request(provider, stream, &dir.0))
+                .unwrap();
+            let events = drive_to_close(&mut *driver, &mut manager, Duration::from_secs(20));
+            assert_eq!(manager.get(task_id).unwrap().status, TaskStatus::Failed);
+            assert!(matches!(
+                events.last().map(AgentEvent::kind),
+                Some(AgentEventKind::SessionEnded {
+                    outcome: AgentSessionOutcome::Failed
+                })
+            ));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.kind(), AgentEventKind::TurnCompleted { .. })));
+        }
+    }
 
     #[test]
     fn bounded_line_reader_splits_and_rejects_overlong_records() {
