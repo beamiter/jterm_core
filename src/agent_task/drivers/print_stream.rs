@@ -343,15 +343,16 @@ enum LineRead {
     Eof,
 }
 
-/// Read one `\n`-terminated record of at most `max` bytes. An overlong record
-/// is consumed through its newline without being retained.
+/// Read one `\n`-terminated record of at most `max` bytes. Reject an overlong
+/// record immediately: a provider may never send its newline or close stdout.
+/// The caller must stop reading after `Overlong`; this is a fatal boundary,
+/// not a request to resynchronize and accept a later record.
 fn read_bounded_line(
     reader: &mut impl BufRead,
     line: &mut Vec<u8>,
     max: usize,
 ) -> io::Result<LineRead> {
     line.clear();
-    let mut overlong = false;
     loop {
         let available = match reader.fill_buf() {
             Ok(available) => available,
@@ -359,9 +360,7 @@ fn read_bounded_line(
             Err(error) => return Err(error),
         };
         if available.is_empty() {
-            return Ok(if overlong {
-                LineRead::Overlong
-            } else if line.is_empty() {
+            return Ok(if line.is_empty() {
                 LineRead::Eof
             } else {
                 LineRead::Line
@@ -371,22 +370,16 @@ fn read_bounded_line(
             Some(index) => (&available[..index], Some(index + 1)),
             None => (available, None),
         };
-        if !overlong {
-            if line.len() + chunk.len() > max {
-                overlong = true;
-                line.clear();
-            } else {
-                line.extend_from_slice(chunk);
-            }
-        }
         let consumed = done.unwrap_or(available.len());
+        if line.len().saturating_add(chunk.len()) > max {
+            line.clear();
+            reader.consume(consumed);
+            return Ok(LineRead::Overlong);
+        }
+        line.extend_from_slice(chunk);
         reader.consume(consumed);
         if done.is_some() {
-            return Ok(if overlong {
-                LineRead::Overlong
-            } else {
-                LineRead::Line
-            });
+            return Ok(LineRead::Line);
         }
     }
 }
@@ -413,7 +406,10 @@ fn spawn_stdout_reader(
                         StdoutMessage::Failed(format!("{label} stdout read failed: {error}"))
                     }
                 };
-                let last = matches!(message, StdoutMessage::Eof | StdoutMessage::Failed(_));
+                let last = matches!(
+                    message,
+                    StdoutMessage::Eof | StdoutMessage::Failed(_) | StdoutMessage::Overlong
+                );
                 // The worker drops the receiver when it stops listening.
                 if sender.send(message).is_err() || last {
                     return;
@@ -756,7 +752,10 @@ impl PrintWorker {
                     cancelled = true;
                     break;
                 }
-                if self.critical_failure.is_some() {
+                // An in-band fatal result is already a terminal verdict. Do
+                // not wait indefinitely for the CLI to close its pipes before
+                // entering the same bounded process-group cleanup as Stop.
+                if self.fatal.is_some() || self.critical_failure.is_some() {
                     force_stop = true;
                     break;
                 }
@@ -1081,7 +1080,7 @@ mod tests {
 
     #[test]
     fn bounded_line_reader_splits_and_rejects_overlong_records() {
-        let input = b"short\n0123456789\nlast".to_vec();
+        let input = b"short\nlast".to_vec();
         let mut reader = BufReader::with_capacity(4, input.as_slice());
         let mut line = Vec::new();
         assert!(matches!(
@@ -1091,10 +1090,6 @@ mod tests {
         assert_eq!(line, b"short");
         assert!(matches!(
             read_bounded_line(&mut reader, &mut line, 8).unwrap(),
-            LineRead::Overlong
-        ));
-        assert!(matches!(
-            read_bounded_line(&mut reader, &mut line, 8).unwrap(),
             LineRead::Line
         ));
         assert_eq!(line, b"last");
@@ -1102,6 +1097,91 @@ mod tests {
             read_bounded_line(&mut reader, &mut line, 8).unwrap(),
             LineRead::Eof
         ));
+        for input in [b"01234567\n".as_slice(), b"01234567".as_slice()] {
+            let mut reader = BufReader::with_capacity(4, input);
+            assert!(matches!(
+                read_bounded_line(&mut reader, &mut line, 8).unwrap(),
+                LineRead::Line
+            ));
+            assert_eq!(line, b"01234567");
+        }
+        let mut reader = BufReader::with_capacity(4, b"0123456789\n".as_slice());
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut line, 8).unwrap(),
+            LineRead::Overlong
+        ));
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn an_overlong_record_is_rejected_before_waiting_for_its_terminator() {
+        // A live provider can write past the limit and then go silent without
+        // closing stdout. There is no need to wait for another byte to reject
+        // the record. WouldBlock makes that extra read deterministic here.
+        struct Pending;
+        impl Read for Pending {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let source = std::io::Cursor::new(b"012345678").chain(Pending);
+        let mut reader = BufReader::with_capacity(4, source);
+        let mut line = Vec::new();
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut line, 8),
+            Ok(LineRead::Overlong)
+        ));
+        assert!(line.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fatal_provider_output_stops_a_process_that_keeps_stdout_open() {
+        use super::test_support::*;
+        use crate::agent_task::driver::AgentDriver;
+        use crate::agent_task::drivers::claude_stream_json::ClaudeStreamJsonDriver;
+        use crate::agent_task::drivers::kimi_stream_json::KimiStreamJsonDriver;
+        use crate::agent_task::TaskStatus;
+
+        for provider in [AgentProvider::Claude, AgentProvider::Kimi] {
+            let fatal = match provider {
+                AgentProvider::Claude => {
+                    "{\"type\":\"error\",\"error\":\"fatal provider failure\"}\n"
+                }
+                AgentProvider::Kimi => "{\"type\":\"goal.summary\",\"status\":\"blocked\"}\n",
+                _ => unreachable!(),
+            };
+            for output in [fatal.to_owned(), "x".repeat(STDOUT_LINE_MAX_BYTES + 1)] {
+                let dir = TempDir::new("fatal-open-stdout");
+                let cli = fake_cli(&dir.0, &output, "exec sleep 30");
+                let (mut manager, task_id, stream) = native_task(provider, &dir.0);
+                let mut driver: Box<dyn AgentDriver> = match provider {
+                    AgentProvider::Claude => Box::new(ClaudeStreamJsonDriver::new(
+                        fake_cli_argv(&cli),
+                        dir.0.clone(),
+                    )),
+                    AgentProvider::Kimi => Box::new(KimiStreamJsonDriver::new(
+                        fake_cli_argv(&cli),
+                        dir.0.clone(),
+                    )),
+                    _ => unreachable!(),
+                };
+                driver
+                    .start(start_request(provider, stream, &dir.0))
+                    .unwrap();
+                let events = drive_to_close(&mut *driver, &mut manager, Duration::from_secs(5));
+                assert_eq!(manager.get(task_id).unwrap().status, TaskStatus::Failed);
+                assert!(matches!(
+                    events.last().map(AgentEvent::kind),
+                    Some(AgentEventKind::SessionEnded {
+                        outcome: AgentSessionOutcome::Failed
+                    })
+                ));
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event.kind(), AgentEventKind::TurnCompleted { .. })));
+            }
+        }
     }
 
     #[test]
