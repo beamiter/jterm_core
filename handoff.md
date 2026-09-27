@@ -1033,6 +1033,12 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-27: positional user operands on gosu/su-exec/runuser
+
+`stage_interpreter` / `stage_programs` skip a non-interpreter operand after
+`gosu`, `su-exec`, or `runuser` when a later word remains, so `gosu root sh`
+resolves to `sh` the same way `gosu -u root sh` already did.
+
 ## 2026-09-27: dispatcher option arity for pipe-to-interpreter
 
 `command_correction::stage_interpreter` (and `stage_programs`) now skip

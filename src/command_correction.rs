@@ -1325,6 +1325,15 @@ fn stage_interpreter(stage: &str) -> Option<String> {
             index += 1;
             continue;
         }
+        // `gosu root sh` / `su-exec nobody bash`: the user is a positional
+        // operand, not the program. Skip it when a later word remains to judge.
+        if active_prefix.is_some_and(prefix_takes_positional_user)
+            && !PIPE_INTERPRETERS.contains(&name.as_str())
+            && index + 1 < words.len()
+        {
+            index += 1;
+            continue;
+        }
         break word;
     };
     // An expansion picks its program at run time, so nothing here can prove it
@@ -1334,6 +1343,12 @@ fn stage_interpreter(stage: &str) -> Option<String> {
     }
     let name = stage_word_name(program);
     PIPE_INTERPRETERS.contains(&name.as_str()).then_some(name)
+}
+
+/// Dispatchers whose first non-option operand is a user/identity, not the
+/// program to run (`gosu USER CMD`, `runuser USER CMD`).
+fn prefix_takes_positional_user(prefix: &str) -> bool {
+    matches!(prefix, "gosu" | "su-exec" | "runuser")
 }
 
 /// Whether a dispatcher option consumes the next argv as its value.
@@ -1497,6 +1512,19 @@ fn stage_programs(command: &str) -> HashSet<String> {
                     && !word.chars().all(|character| character.is_ascii_digit())
                 {
                     let name = stage_word_name(word);
+                    if active_prefix.is_some_and(prefix_takes_positional_user)
+                        && !STAGE_PREFIXES.contains(&name.as_str())
+                        && !PIPE_INTERPRETERS.contains(&name.as_str())
+                        && index + 1 < words.len()
+                    {
+                        // Positional USER before CMD — not a program.
+                        index += 1;
+                        if separator_after {
+                            program_position = true;
+                            active_prefix = None;
+                        }
+                        continue;
+                    }
                     program_position = STAGE_PREFIXES.contains(&name.as_str());
                     active_prefix = if program_position {
                         STAGE_PREFIXES
@@ -3165,6 +3193,35 @@ mod tests {
             )
             .as_deref(),
             Ok("ls -l | timeout 5 tail -20")
+        );
+    }
+
+    #[test]
+    fn positional_user_dispatchers_expose_the_command_they_run() {
+        assert_eq!(stage_interpreter("gosu root sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("su-exec nobody bash -lc true").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("runuser alice /bin/zsh").as_deref(),
+            Some("zsh")
+        );
+        // Alone, the user operand is not an interpreter.
+        assert_eq!(stage_interpreter("gosu root"), None);
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | gosu root sh")
+            ),
+            Err(CorrectionRejection::AddsPrivilegeEscalation)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | env gosu root sh")
+            ),
+            Err(CorrectionRejection::AddsPrivilegeEscalation)
         );
     }
 
