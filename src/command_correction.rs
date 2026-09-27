@@ -1188,18 +1188,13 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// interpreter table. The privilege dispatchers are the full set jagent's
 /// `is_privilege_dispatcher` strips, for the same reason.
 ///
-/// KNOWN LIMIT, pinned by
-/// `a_dispatcher_option_value_still_hides_the_interpreter_from_this_scan`:
-/// [`stage_interpreter`] skips words that *begin* with `-`, not the separate
-/// values some of these options take, so `| runuser -u root sh` resolves to the
-/// program `root` and is not seen through to the `sh`. Skipping the word after
-/// every option would be wrong in the other direction — `unshare -r sh` takes
-/// no value there, and `sh` would be skipped instead — and choosing correctly
-/// needs per-option arity, which is jagent's job, not this table's. The
-/// residual gap is narrow: `adds_pipe_to_interpreter` also asks jagent about
-/// the whole candidate, so any such pipeline that carries network provenance is
-/// still refused, and a candidate that *introduces* one of the nine elevation
-/// programs is refused outright by the privilege rule above.
+/// Option arity for detached values is owned by
+/// [`stage_option_takes_detached_value`]: `| runuser -u root sh` skips `root`
+/// and judges `sh`, while flag-only spellings such as `unshare -r sh` still
+/// stop on `unshare` itself because that name is a [`PIPE_INTERPRETERS`] entry
+/// rather than a prefix. `adds_pipe_to_interpreter` still asks jagent about the
+/// whole candidate for network provenance, and introducing any of the nine
+/// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
     "capsh",
     "command",
@@ -1292,21 +1287,46 @@ fn pipeline_stages(command: &str) -> Vec<&str> {
 
 /// The interpreter one pipeline stage runs, if any.
 fn stage_interpreter(stage: &str) -> Option<String> {
-    let program = stage
-        .split_whitespace()
-        // Skip past what merely describes the run rather than being the
-        // program: an option, an environment assignment, a prefix such as
-        // `env` or `xargs`, or a bare number (`timeout 5 sh`). Test the raw
-        // word here and reduce to a name only afterwards — reducing first
-        // turns `PATH=/usr/bin sh` into the word `bin`, which is not an
-        // assignment, not an interpreter, and stops the scan one word short of
-        // the shell.
-        .find(|word| {
-            !word.starts_with('-')
-                && !is_assignment_word(word)
-                && !word.chars().all(|character| character.is_ascii_digit())
-                && !STAGE_PREFIXES.contains(&stage_word_name(word).as_str())
-        })?;
+    // Skip past what merely describes the run rather than being the program:
+    // an option (and, when the active prefix says so, its detached value), an
+    // environment assignment, a prefix such as `env` or `xargs`, or a bare
+    // number (`timeout 5 sh`). Test the raw word and reduce to a name only
+    // afterwards — reducing first turns `PATH=/usr/bin sh` into the word
+    // `bin`, which is not an assignment, not an interpreter, and stops the
+    // scan one word short of the shell.
+    let words: Vec<&str> = stage.split_whitespace().collect();
+    let mut index = 0;
+    let mut active_prefix: Option<&str> = None;
+    let program = loop {
+        let Some(word) = words.get(index).copied() else {
+            return None;
+        };
+        if word.starts_with('-') {
+            index += 1;
+            if active_prefix.is_some_and(|prefix| stage_option_takes_detached_value(prefix, word))
+                && index < words.len()
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if is_assignment_word(word) || word.chars().all(|character| character.is_ascii_digit()) {
+            index += 1;
+            continue;
+        }
+        let name = stage_word_name(word);
+        if STAGE_PREFIXES.contains(&name.as_str()) {
+            // Keep the table's spelling so option arity can match on it; the
+            // path-stripped name is enough because STAGE_PREFIXES are bare.
+            active_prefix = STAGE_PREFIXES
+                .iter()
+                .copied()
+                .find(|prefix| *prefix == name.as_str());
+            index += 1;
+            continue;
+        }
+        break word;
+    };
     // An expansion picks its program at run time, so nothing here can prove it
     // is not a shell. Unknown means unsafe.
     if program.contains('$') || program.contains('`') {
@@ -1314,6 +1334,102 @@ fn stage_interpreter(stage: &str) -> Option<String> {
     }
     let name = stage_word_name(program);
     PIPE_INTERPRETERS.contains(&name.as_str()).then_some(name)
+}
+
+/// Whether a dispatcher option consumes the next argv as its value.
+///
+/// Only detached forms are listed: `--user=root` and `-uUSER` already carry
+/// their value in the same word and must not skip the following token. The
+/// match is per active [`STAGE_PREFIXES`] name so a flag on one tool is not
+/// mistaken for a value-taking option on another (`sudo -s` is a flag;
+/// `su -s /bin/bash` takes a shell path).
+fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
+    if option.contains('=') {
+        return false;
+    }
+    match prefix {
+        // Only *meta* values belong here. Options whose next argv is itself
+        // the dispatched program or script (`--exec /bin/sh`, `-c sh`,
+        // `--startas …`) must leave that word visible so the scan can judge it.
+        "runuser" | "gosu" | "pkexec" | "run0" => {
+            matches!(option, "-u" | "--user" | "-g" | "--group" | "--userspec")
+        }
+        // `sudo -s` / `sudo -i` are flags; do not list bare `-s` / `-i` here.
+        "sudo" | "sudoedit" | "doas" => matches!(
+            option,
+            "-u" | "--user"
+                | "-g"
+                | "--group"
+                | "-h"
+                | "--host"
+                | "-p"
+                | "--prompt"
+                | "-C"
+                | "--close-from"
+                | "-D"
+                | "--chdir"
+                | "-R"
+                | "--chroot"
+                | "-T"
+                | "--command-timeout"
+                | "-r"
+                | "--role"
+                | "-t"
+                | "--type"
+        ),
+        // `su -c CMD` / `-s SHELL`: the value is the payload, not meta — leave it.
+        "su" | "su-exec" => matches!(option, "-g" | "--group" | "-G"),
+        "env" => matches!(option, "-u" | "--unset" | "-C" | "--chdir"),
+        "timeout" => matches!(option, "-s" | "--signal" | "-k" | "--kill-after"),
+        "nice" => matches!(option, "-n" | "--adjustment"),
+        "ionice" => matches!(
+            option,
+            "-c" | "--class" | "-n" | "--classdata" | "-p" | "--pid" | "-P" | "--pgid"
+        ),
+        "stdbuf" => matches!(option, "-i" | "--input" | "-o" | "--output" | "-e" | "--error"),
+        "xargs" => matches!(
+            option,
+            "-n" | "--max-args"
+                | "-I"
+                | "-i"
+                | "--replace"
+                | "-E"
+                | "-e"
+                | "--eof"
+                | "-L"
+                | "-l"
+                | "--max-lines"
+                | "-P"
+                | "--max-procs"
+                | "-s"
+                | "--max-chars"
+                | "-a"
+                | "--arg-file"
+        ),
+        // `-W` / `--wait` are flags; do not list them here.
+        "systemd-run" => matches!(
+            option,
+            "-p" | "--property"
+                | "-u"
+                | "--unit"
+                | "-E"
+                | "--setenv"
+                | "--working-directory"
+                | "--uid"
+                | "--gid"
+                | "-d"
+                | "--description"
+        ),
+        "capsh" => matches!(option, "--gid" | "--groups" | "--user" | "--uid" | "--caps"),
+        // `--exec` / `--startas` name the program — do not consume them as meta.
+        "start-stop-daemon" => matches!(
+            option,
+            "-p" | "--pidfile" | "-c" | "--chuid" | "-u" | "--user" | "-n" | "--name" | "-d" | "--chdir"
+        ),
+        "setarch" => matches!(option, "-B" | "--base-offset"),
+        "time" => matches!(option, "-o" | "--output" | "-f" | "--format"),
+        _ => false,
+    }
 }
 
 /// `FOO=bar`, an environment assignment rather than a program. The `=` has to
@@ -1344,31 +1460,60 @@ fn stage_programs(command: &str) -> HashSet<String> {
         // begin a new command too, so the word after one is a program position
         // again. Missing that would read `ls; sudo cat x` as the single program
         // `ls` and never see the elevation the candidate introduced.
+        let words: Vec<&str> = stage.split_whitespace().collect();
+        let mut index = 0;
         let mut program_position = true;
-        for raw in stage.split_whitespace() {
+        let mut active_prefix: Option<&str> = None;
+        while index < words.len() {
+            let raw = words[index];
             let separator_before = raw.starts_with([';', '&']);
             let separator_after = raw.ends_with([';', '&']);
             if separator_before {
                 program_position = true;
+                active_prefix = None;
             }
             let word = trimmed_word(raw);
             if !word.is_empty() && program_position {
+                if word.starts_with('-') {
+                    index += 1;
+                    if active_prefix
+                        .is_some_and(|prefix| stage_option_takes_detached_value(prefix, word))
+                        && index < words.len()
+                    {
+                        // Detached option value is not a program.
+                        index += 1;
+                    }
+                    if separator_after {
+                        program_position = true;
+                        active_prefix = None;
+                    }
+                    continue;
+                }
                 // What merely describes the run is not a program, so keep
                 // looking; but a dispatcher that elevates IS one, and is the
                 // thing being looked for, so it is recorded and the scan
                 // continues past it to whatever it dispatches.
-                if !word.starts_with('-')
-                    && !is_assignment_word(word)
+                if !is_assignment_word(word)
                     && !word.chars().all(|character| character.is_ascii_digit())
                 {
                     let name = stage_word_name(word);
                     program_position = STAGE_PREFIXES.contains(&name.as_str());
+                    active_prefix = if program_position {
+                        STAGE_PREFIXES
+                            .iter()
+                            .copied()
+                            .find(|prefix| *prefix == name.as_str())
+                    } else {
+                        None
+                    };
                     programs.insert(name);
                 }
             }
             if separator_after {
                 program_position = true;
+                active_prefix = None;
             }
+            index += 1;
         }
     }
     programs
@@ -3023,22 +3168,28 @@ mod tests {
         );
     }
 
-    /// The shape the list above deliberately does not contain, pinned so the
-    /// limit is a fact rather than an assumption.
-    ///
-    /// [`stage_interpreter`] skips words that begin with `-`, not the separate
-    /// value an option may take, so a dispatcher option with a detached value
-    /// stops the scan on that value. `runuser -u root sh` resolves to the
-    /// program `root`. Fixing it needs per-option arity — skipping the word
-    /// after every option would swallow the `sh` in `unshare -r sh`, which the
-    /// test above requires to be caught — so this records the gap instead of
-    /// pretending it is closed. Flip these assertions when the scan learns
-    /// arity.
+    /// Per-prefix option arity lets the scan see through detached values such
+    /// as `runuser -u root` to the dispatched interpreter, without treating
+    /// every dashed word as value-taking (`unshare -r sh` still resolves to
+    /// `unshare` because that name is itself a [`PIPE_INTERPRETERS`] entry).
     #[test]
-    fn a_dispatcher_option_value_still_hides_the_interpreter_from_this_scan() {
-        assert_eq!(stage_interpreter("runuser -u root sh"), None);
-        assert_eq!(stage_interpreter("gosu -u root sh"), None);
-        // Not every dispatcher-shaped word is affected: the personality and
+    fn a_dispatcher_option_value_no_longer_hides_the_interpreter_from_this_scan() {
+        assert_eq!(
+            stage_interpreter("runuser -u root sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("gosu -u root sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("sudo -u root bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("env -u SECRET sh").as_deref(),
+            Some("sh")
+        );
+        // Flag-only sudo `-s` must not swallow the following word.
+        assert_eq!(stage_interpreter("sudo -s").as_deref(), None);
+        // Not every dispatcher-shaped word needs arity: the personality and
         // namespace wrappers are in `PIPE_INTERPRETERS` in their own right,
         // because a bare one drops you into a shell, so the scan stops on them
         // and never has to reach their operand.
@@ -3046,14 +3197,27 @@ mod tests {
             stage_interpreter("nsenter --target 1 sh").as_deref(),
             Some("nsenter")
         );
+        assert_eq!(
+            stage_interpreter("unshare -r sh").as_deref(),
+            Some("unshare")
+        );
         // The dispatcher itself is still caught by the privilege rule whenever
-        // the candidate introduces it, which is what keeps the gap narrow.
+        // the candidate introduces it.
         assert_eq!(
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | runuser -u root sh")
             ),
             Err(CorrectionRejection::AddsPrivilegeEscalation)
+        );
+        // Without privilege introduction, the pipe-to-interpreter rule alone
+        // must refuse a candidate that newly feeds a shell through arity.
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | env -u SECRET sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
         );
         // And network provenance is jagent's question, not this scan's, so the
         // pipeline that actually matters is still refused.

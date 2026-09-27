@@ -1033,6 +1033,18 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-27: dispatcher option arity for pipe-to-interpreter
+
+`command_correction::stage_interpreter` (and `stage_programs`) now skip
+*detached meta values* for active [`STAGE_PREFIXES`] names via
+`stage_option_takes_detached_value`. `| runuser -u root sh`, `| gosu -u root sh`,
+`| sudo -u root bash`, and `| env -u SECRET sh` resolve to the dispatched
+interpreter instead of stopping on `root` / `SECRET`. Options whose next argv
+*is* the program (`start-stop-daemon --exec /bin/sh`, `su -c …`) are left
+visible. Flag-only spellings (`sudo -s`, `unshare -r sh` via
+`PIPE_INTERPRETERS`) stay correct. The former gap test flipped to
+`a_dispatcher_option_value_no_longer_hides_the_interpreter_from_this_scan`.
+
 ## Remaining boundaries
 
 None open for the installer trust chain. After changing either vendored script,
