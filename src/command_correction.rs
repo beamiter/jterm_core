@@ -1196,6 +1196,7 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// whole candidate for network provenance, and introducing any of the nine
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
+    "busybox",
     "capsh",
     "chroot",
     "command",
@@ -1298,7 +1299,7 @@ fn stage_interpreter(stage: &str) -> Option<String> {
     let words: Vec<&str> = stage.split_whitespace().collect();
     let mut index = 0;
     let mut active_prefix: Option<&str> = None;
-    let mut personality_operand_skipped = false;
+    let mut dispatch_operand_skipped = false;
     let program = loop {
         let Some(word) = words.get(index).copied() else {
             return None;
@@ -1329,12 +1330,12 @@ fn stage_interpreter(stage: &str) -> Option<String> {
         }
         // `gosu root sh` / `su-exec nobody bash`: the user is a positional
         // operand, not the program. Skip it when a later word remains to judge.
-        if active_prefix.is_some_and(prefix_takes_positional_personality)
-            && !personality_operand_skipped
+        if active_prefix.is_some_and(prefix_takes_positional_dispatch_operand)
+            && !dispatch_operand_skipped
             && index + 1 < words.len()
         {
             index += 1;
-            personality_operand_skipped = true;
+            dispatch_operand_skipped = true;
             active_prefix = None;
             continue;
         }
@@ -1370,9 +1371,10 @@ fn prefix_takes_positional_newroot(prefix: &str) -> bool {
     prefix == "chroot"
 }
 
-/// Dispatchers whose first non-option operand is a personality/arch token, not
-/// the program to run (`setarch x86_64 CMD`).
-fn prefix_takes_positional_personality(prefix: &str) -> bool {
+/// Dispatchers whose first non-option operand names how to run the next word,
+/// not the program itself (`setarch x86_64 CMD`). `busybox sh` is different:
+/// the applet name is the program and is judged directly.
+fn prefix_takes_positional_dispatch_operand(prefix: &str) -> bool {
     prefix == "setarch"
 }
 
@@ -1505,7 +1507,7 @@ fn stage_programs(command: &str) -> HashSet<String> {
         let mut index = 0;
         let mut program_position = true;
         let mut active_prefix: Option<&str> = None;
-        let mut personality_operand_skipped = false;
+        let mut dispatch_operand_skipped = false;
         while index < words.len() {
             let raw = words[index];
             let separator_before = raw.starts_with([';', '&']);
@@ -1539,12 +1541,12 @@ fn stage_programs(command: &str) -> HashSet<String> {
                     && !word.chars().all(|character| character.is_ascii_digit())
                 {
                     let name = stage_word_name(word);
-                    if active_prefix.is_some_and(prefix_takes_positional_personality)
-                        && !personality_operand_skipped
+                    if active_prefix.is_some_and(prefix_takes_positional_dispatch_operand)
+                        && !dispatch_operand_skipped
                         && index + 1 < words.len()
                     {
                         index += 1;
-                        personality_operand_skipped = true;
+                        dispatch_operand_skipped = true;
                         active_prefix = None;
                         continue;
                     }
@@ -3265,6 +3267,17 @@ mod tests {
             ),
             Err(CorrectionRejection::AddsPrivilegeEscalation)
         );
+    }
+
+    #[test]
+    fn busybox_skips_applet_to_expose_the_dispatched_command() {
+        assert_eq!(
+            stage_interpreter("busybox sh -c id").as_deref(),
+            Some("sh")
+        );
+        let programs = stage_programs("busybox ash -lc true");
+        assert!(programs.contains("busybox"), "{programs:?}");
+        assert!(programs.contains("ash"), "{programs:?}");
     }
 
     #[test]

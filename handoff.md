@@ -1033,6 +1033,12 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-28 (wave 7): busybox as a stage prefix in correction scans
+
+`busybox` joins [`STAGE_PREFIXES`], so `busybox sh` and `| busybox ash -lc …`
+step over the multiplexer and judge the applet name as the dispatched program
+instead of stopping on `busybox` itself.
+
 ## 2026-09-28 (wave 6): setarch personality and su user operands in stage scans
 
 `setarch`'s first positional operand is the personality (`x86_64`, `linux32`, …),
