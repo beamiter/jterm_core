@@ -1197,6 +1197,7 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
     "capsh",
+    "chroot",
     "command",
     "doas",
     "env",
@@ -1327,7 +1328,8 @@ fn stage_interpreter(stage: &str) -> Option<String> {
         }
         // `gosu root sh` / `su-exec nobody bash`: the user is a positional
         // operand, not the program. Skip it when a later word remains to judge.
-        if active_prefix.is_some_and(prefix_takes_positional_user)
+        if (active_prefix.is_some_and(prefix_takes_positional_user)
+            || active_prefix.is_some_and(prefix_takes_positional_newroot))
             && !PIPE_INTERPRETERS.contains(&name.as_str())
             && index + 1 < words.len()
         {
@@ -1351,6 +1353,12 @@ fn prefix_takes_positional_user(prefix: &str) -> bool {
     matches!(prefix, "gosu" | "run0" | "su-exec" | "runuser")
 }
 
+/// Dispatchers whose first non-option operand is a filesystem root, not the
+/// program to run (`chroot NEWROOT CMD`).
+fn prefix_takes_positional_newroot(prefix: &str) -> bool {
+    prefix == "chroot"
+}
+
 /// Whether a dispatcher option consumes the next argv as its value.
 ///
 /// Only detached forms are listed: `--user=root` and `-uUSER` already carry
@@ -1369,6 +1377,7 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
         "runuser" | "gosu" | "pkexec" | "run0" => {
             matches!(option, "-u" | "--user" | "-g" | "--group" | "--userspec")
         }
+        "chroot" => matches!(option, "--groups" | "--userspec" | "--skip-chdir"),
         // `sudo -s` / `sudo -i` are flags; do not list bare `-s` / `-i` here.
         "sudo" | "sudoedit" | "doas" => matches!(
             option,
@@ -1512,12 +1521,13 @@ fn stage_programs(command: &str) -> HashSet<String> {
                     && !word.chars().all(|character| character.is_ascii_digit())
                 {
                     let name = stage_word_name(word);
-                    if active_prefix.is_some_and(prefix_takes_positional_user)
+                    if (active_prefix.is_some_and(prefix_takes_positional_user)
+                        || active_prefix.is_some_and(prefix_takes_positional_newroot))
                         && !STAGE_PREFIXES.contains(&name.as_str())
                         && !PIPE_INTERPRETERS.contains(&name.as_str())
                         && index + 1 < words.len()
                     {
-                        // Positional USER before CMD — not a program.
+                        // Positional USER/NEWROOT before CMD — not a program.
                         index += 1;
                         if separator_after {
                             program_position = true;
@@ -3226,6 +3236,25 @@ mod tests {
                 Candidate("ls -l | env gosu root sh")
             ),
             Err(CorrectionRejection::AddsPrivilegeEscalation)
+        );
+    }
+
+    #[test]
+    fn chroot_skips_newroot_to_expose_the_dispatched_command() {
+        assert_eq!(
+            stage_interpreter("chroot /srv/root sh -c id").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("chroot --skip-chdir /new sh").as_deref(),
+            Some("sh")
+        );
+        let programs = stage_programs("chroot /new sh -c id");
+        assert!(programs.contains("chroot"), "{programs:?}");
+        assert!(programs.contains("sh"), "{programs:?}");
+        assert!(
+            !programs.contains("new"),
+            "NEWROOT must not look like a program: {programs:?}"
         );
     }
 

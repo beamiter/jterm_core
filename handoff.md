@@ -1033,6 +1033,14 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-27 (wave 5): chroot NEWROOT operand in stage scans
+
+`chroot` is a [`STAGE_PREFIXES`] name with detached `--groups`, `--userspec`,
+and `--skip-chdir` values. Its first positional operand is the new root, not the
+program to run, so `chroot /srv/root sh` and `chroot /new apt` resolve to the
+dispatched command the same way positional user operands already did for
+`gosu`/`runuser`.
+
 ## 2026-09-27: positional user operands on gosu/su-exec/runuser/run0
 
 `stage_interpreter` / `stage_programs` skip a non-interpreter operand after
