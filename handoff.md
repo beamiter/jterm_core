@@ -1033,6 +1033,13 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-28 (wave 6): setarch personality and su user operands in stage scans
+
+`setarch`'s first positional operand is the personality (`x86_64`, `linux32`, …),
+not the program, so `setarch x86_64 sh` resolves to the dispatched interpreter
+the same way `chroot NEWROOT CMD` already did. `su USER CMD` skips the
+positional user when a later word remains, matching `gosu`/`runuser`.
+
 ## 2026-09-27 (wave 5): chroot NEWROOT operand in stage scans
 
 `chroot` is a [`STAGE_PREFIXES`] name with detached `--groups`, `--userspec`,

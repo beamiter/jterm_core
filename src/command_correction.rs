@@ -1298,6 +1298,7 @@ fn stage_interpreter(stage: &str) -> Option<String> {
     let words: Vec<&str> = stage.split_whitespace().collect();
     let mut index = 0;
     let mut active_prefix: Option<&str> = None;
+    let mut personality_operand_skipped = false;
     let program = loop {
         let Some(word) = words.get(index).copied() else {
             return None;
@@ -1328,12 +1329,22 @@ fn stage_interpreter(stage: &str) -> Option<String> {
         }
         // `gosu root sh` / `su-exec nobody bash`: the user is a positional
         // operand, not the program. Skip it when a later word remains to judge.
+        if active_prefix.is_some_and(prefix_takes_positional_personality)
+            && !personality_operand_skipped
+            && index + 1 < words.len()
+        {
+            index += 1;
+            personality_operand_skipped = true;
+            active_prefix = None;
+            continue;
+        }
         if (active_prefix.is_some_and(prefix_takes_positional_user)
             || active_prefix.is_some_and(prefix_takes_positional_newroot))
             && !PIPE_INTERPRETERS.contains(&name.as_str())
             && index + 1 < words.len()
         {
             index += 1;
+            active_prefix = None;
             continue;
         }
         break word;
@@ -1350,13 +1361,19 @@ fn stage_interpreter(stage: &str) -> Option<String> {
 /// Dispatchers whose first non-option operand is a user/identity, not the
 /// program to run (`gosu USER CMD`, `runuser USER CMD`).
 fn prefix_takes_positional_user(prefix: &str) -> bool {
-    matches!(prefix, "gosu" | "run0" | "su-exec" | "runuser")
+    matches!(prefix, "gosu" | "run0" | "su" | "su-exec" | "runuser")
 }
 
 /// Dispatchers whose first non-option operand is a filesystem root, not the
 /// program to run (`chroot NEWROOT CMD`).
 fn prefix_takes_positional_newroot(prefix: &str) -> bool {
     prefix == "chroot"
+}
+
+/// Dispatchers whose first non-option operand is a personality/arch token, not
+/// the program to run (`setarch x86_64 CMD`).
+fn prefix_takes_positional_personality(prefix: &str) -> bool {
+    prefix == "setarch"
 }
 
 /// Whether a dispatcher option consumes the next argv as its value.
@@ -1488,6 +1505,7 @@ fn stage_programs(command: &str) -> HashSet<String> {
         let mut index = 0;
         let mut program_position = true;
         let mut active_prefix: Option<&str> = None;
+        let mut personality_operand_skipped = false;
         while index < words.len() {
             let raw = words[index];
             let separator_before = raw.starts_with([';', '&']);
@@ -1521,6 +1539,15 @@ fn stage_programs(command: &str) -> HashSet<String> {
                     && !word.chars().all(|character| character.is_ascii_digit())
                 {
                     let name = stage_word_name(word);
+                    if active_prefix.is_some_and(prefix_takes_positional_personality)
+                        && !personality_operand_skipped
+                        && index + 1 < words.len()
+                    {
+                        index += 1;
+                        personality_operand_skipped = true;
+                        active_prefix = None;
+                        continue;
+                    }
                     if (active_prefix.is_some_and(prefix_takes_positional_user)
                         || active_prefix.is_some_and(prefix_takes_positional_newroot))
                         && !STAGE_PREFIXES.contains(&name.as_str())
@@ -1529,6 +1556,7 @@ fn stage_programs(command: &str) -> HashSet<String> {
                     {
                         // Positional USER/NEWROOT before CMD — not a program.
                         index += 1;
+                        active_prefix = None;
                         if separator_after {
                             program_position = true;
                             active_prefix = None;
@@ -3237,6 +3265,27 @@ mod tests {
             ),
             Err(CorrectionRejection::AddsPrivilegeEscalation)
         );
+    }
+
+    #[test]
+    fn setarch_skips_personality_to_expose_the_dispatched_command() {
+        assert_eq!(
+            stage_interpreter("setarch x86_64 sh -c id").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("setarch --uname-2.6 sh").as_deref(),
+            Some("sh")
+        );
+        let programs = stage_programs("setarch linux64 bash -lc true");
+        assert!(programs.contains("setarch"), "{programs:?}");
+        assert!(programs.contains("bash"), "{programs:?}");
+    }
+
+    #[test]
+    fn su_skips_positional_user_to_expose_the_dispatched_command() {
+        assert_eq!(stage_interpreter("su root sh -c id").as_deref(), Some("sh"));
+        assert_eq!(stage_interpreter("su daemon bash").as_deref(), Some("bash"));
     }
 
     #[test]
