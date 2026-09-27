@@ -1348,7 +1348,7 @@ fn stage_interpreter(stage: &str) -> Option<String> {
 /// Dispatchers whose first non-option operand is a user/identity, not the
 /// program to run (`gosu USER CMD`, `runuser USER CMD`).
 fn prefix_takes_positional_user(prefix: &str) -> bool {
-    matches!(prefix, "gosu" | "su-exec" | "runuser")
+    matches!(prefix, "gosu" | "run0" | "su-exec" | "runuser")
 }
 
 /// Whether a dispatcher option consumes the next argv as its value.
@@ -3206,6 +3206,10 @@ mod tests {
         assert_eq!(
             stage_interpreter("runuser alice /bin/zsh").as_deref(),
             Some("zsh")
+        );
+        assert_eq!(
+            stage_interpreter("run0 daemon bash -lc true").as_deref(),
+            Some("bash")
         );
         // Alone, the user operand is not an interpreter.
         assert_eq!(stage_interpreter("gosu root"), None);
