@@ -1033,11 +1033,18 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-28 (wave 7 fix): busybox multiplexer without STAGE_PREFIXES
+
+Bare `busybox` stays the one documented widening over jagent (`PIPE_INTERPRETERS`).
+When a following applet word exists, scans skip the multiplexer and judge that
+applet (`busybox sh` → `sh`) without putting `busybox` in [`STAGE_PREFIXES`] —
+those names must stay transparent to jagent's own tables. Also added the missing
+`chroot` form to the stage-prefix/jagent parity table (wave 5 left it out).
+
 ## 2026-09-28 (wave 7): busybox as a stage prefix in correction scans
 
-`busybox` joins [`STAGE_PREFIXES`], so `busybox sh` and `| busybox ash -lc …`
-step over the multiplexer and judge the applet name as the dispatched program
-instead of stopping on `busybox` itself.
+Superseded by the fix above: putting `busybox` in [`STAGE_PREFIXES`] broke bare
+`busybox` interpreter detection and the jagent transparency contract.
 
 ## 2026-09-28 (wave 6): setarch personality and su user operands in stage scans
 

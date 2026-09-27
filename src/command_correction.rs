@@ -1196,7 +1196,6 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// whole candidate for network provenance, and introducing any of the nine
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
-    "busybox",
     "capsh",
     "chroot",
     "command",
@@ -1318,6 +1317,17 @@ fn stage_interpreter(stage: &str) -> Option<String> {
             continue;
         }
         let name = stage_word_name(word);
+        // `busybox` alone is a deliberate widening over jagent (see
+        // PIPE_INTERPRETERS). With an applet argv it is a multiplexer: skip it
+        // and judge the applet (`busybox sh` → `sh`). Not a STAGE_PREFIX —
+        // those must stay transparent to jagent's own tables.
+        if name == "busybox" {
+            if remaining_words_include_program(&words[index + 1..]) {
+                index += 1;
+                continue;
+            }
+            break word;
+        }
         if STAGE_PREFIXES.contains(&name.as_str()) {
             // Keep the table's spelling so option arity can match on it; the
             // path-stripped name is enough because STAGE_PREFIXES are bare.
@@ -1372,10 +1382,19 @@ fn prefix_takes_positional_newroot(prefix: &str) -> bool {
 }
 
 /// Dispatchers whose first non-option operand names how to run the next word,
-/// not the program itself (`setarch x86_64 CMD`). `busybox sh` is different:
-/// the applet name is the program and is judged directly.
+/// not the program itself (`setarch x86_64 CMD`).
 fn prefix_takes_positional_dispatch_operand(prefix: &str) -> bool {
     prefix == "setarch"
+}
+
+/// Whether later words still contain a program candidate (not an option,
+/// assignment, or bare duration).
+fn remaining_words_include_program(words: &[&str]) -> bool {
+    words.iter().any(|word| {
+        !word.starts_with('-')
+            && !is_assignment_word(word)
+            && !word.chars().all(|character| character.is_ascii_digit())
+    })
 }
 
 /// Whether a dispatcher option consumes the next argv as its value.
@@ -1563,6 +1582,20 @@ fn stage_programs(command: &str) -> HashSet<String> {
                             program_position = true;
                             active_prefix = None;
                         }
+                        continue;
+                    }
+                    // Multiplexer: record busybox and keep scanning for the
+                    // applet when one follows; bare busybox stays the program.
+                    if name == "busybox"
+                        && remaining_words_include_program(&words[index + 1..])
+                    {
+                        programs.insert(name);
+                        program_position = true;
+                        active_prefix = None;
+                        if separator_after {
+                            program_position = true;
+                        }
+                        index += 1;
                         continue;
                     }
                     program_position = STAGE_PREFIXES.contains(&name.as_str());
@@ -3061,6 +3094,7 @@ mod tests {
         // would report a gap that is really just an invalid command line.
         const DISPATCHES: &[(&str, &str)] = &[
             ("capsh", "capsh -- -c 'rm -rf /'"),
+            ("chroot", "chroot / rm -rf /"),
             ("command", "command rm -rf /"),
             ("doas", "doas rm -rf /"),
             ("env", "env FOO=1 rm -rf /"),
