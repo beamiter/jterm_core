@@ -1033,6 +1033,18 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-28 (wave 8): taskset/chrt stage prefixes in correction scans
+
+`taskset` and `chrt` join [`STAGE_PREFIXES`] so pipe-to-interpreter sees the
+dispatched child (`taskset ff sh`, `chrt 1 bash`). `taskset`'s affinity mask or
+CPU-list is a positional dispatch operand (same path as `setarch`'s personality);
+`chrt`'s priority is already skipped as a bare number. Deadline scheduler meta
+(`-T`/`-P`/`-D`) takes detached values. Without this, a non-network
+`ls | head` → `ls | taskset ff sh` passed the local scan because jagent only
+answers the pipe-to-interpreter reason when network provenance is present.
+Leftover gap: `xargs -d` / `--delimiter` detached values are still not in
+option arity (`| xargs -d , sh` can stop on `,`).
+
 ## 2026-09-28 (wave 7 fix): busybox multiplexer without STAGE_PREFIXES
 
 Bare `busybox` stays the one documented widening over jagent (`PIPE_INTERPRETERS`).

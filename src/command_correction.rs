@@ -1198,6 +1198,7 @@ const PIPE_INTERPRETERS: &[&str] = &[
 const STAGE_PREFIXES: &[&str] = &[
     "capsh",
     "chroot",
+    "chrt",
     "command",
     "doas",
     "env",
@@ -1218,6 +1219,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "sudo",
     "sudoedit",
     "systemd-run",
+    "taskset",
     "time",
     "timeout",
     "unbuffer",
@@ -1382,9 +1384,9 @@ fn prefix_takes_positional_newroot(prefix: &str) -> bool {
 }
 
 /// Dispatchers whose first non-option operand names how to run the next word,
-/// not the program itself (`setarch x86_64 CMD`).
+/// not the program itself (`setarch x86_64 CMD`, `taskset ff CMD`).
 fn prefix_takes_positional_dispatch_operand(prefix: &str) -> bool {
-    prefix == "setarch"
+    matches!(prefix, "setarch" | "taskset")
 }
 
 /// Whether later words still contain a program candidate (not an option,
@@ -1489,6 +1491,21 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
             "-p" | "--pidfile" | "-c" | "--chuid" | "-u" | "--user" | "-n" | "--name" | "-d" | "--chdir"
         ),
         "setarch" => matches!(option, "-B" | "--base-offset"),
+        // `-c` / `--cpu-list` select list syntax; the list itself is the
+        // positional mask operand skipped by
+        // [`prefix_takes_positional_dispatch_operand`], not a detached value.
+        // `-p` / `--pid` are flags (pid-mode has no child command to judge).
+        "taskset" => false,
+        // Priority is a bare number (already skipped); only the deadline
+        // schedulers take a detached meta value.
+        "chrt" => matches!(
+            option,
+            "-T" | "--sched-runtime"
+                | "-P"
+                | "--sched-period"
+                | "-D"
+                | "--sched-deadline"
+        ),
         "time" => matches!(option, "-o" | "--output" | "-f" | "--format"),
         _ => false,
     }
@@ -3095,6 +3112,7 @@ mod tests {
         const DISPATCHES: &[(&str, &str)] = &[
             ("capsh", "capsh -- -c 'rm -rf /'"),
             ("chroot", "chroot / rm -rf /"),
+            ("chrt", "chrt 1 rm -rf /"),
             ("command", "command rm -rf /"),
             ("doas", "doas rm -rf /"),
             ("env", "env FOO=1 rm -rf /"),
@@ -3118,6 +3136,7 @@ mod tests {
             ("sudo", "sudo rm -rf /"),
             ("sudoedit", "sudoedit rm -rf /"),
             ("systemd-run", "systemd-run rm -rf /"),
+            ("taskset", "taskset ff rm -rf /"),
             ("time", "time rm -rf /"),
             ("timeout", "timeout 5 rm -rf /"),
             ("unbuffer", "unbuffer rm -rf /"),
@@ -3327,6 +3346,53 @@ mod tests {
         let programs = stage_programs("setarch linux64 bash -lc true");
         assert!(programs.contains("setarch"), "{programs:?}");
         assert!(programs.contains("bash"), "{programs:?}");
+    }
+
+    /// `taskset`'s first positional is an affinity mask/list (`ff`, `0-3`), not
+    /// the program; `chrt`'s priority is a bare number the digit skip already
+    /// handles. Without the prefixes, `| taskset ff sh` looked like unknown
+    /// program `taskset` and was offered on a non-network pipeline where jagent
+    /// never answers the pipe-to-interpreter reason.
+    #[test]
+    fn taskset_and_chrt_expose_the_dispatched_interpreter() {
+        assert_eq!(
+            stage_interpreter("taskset ff sh -c id").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("taskset -c 0-3 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("chrt 1 sh -c id").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("chrt -r 1 /bin/bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("chrt -T 1000 -d 1 sh").as_deref(),
+            Some("sh")
+        );
+        let programs = stage_programs("taskset ff sh -c id");
+        assert!(programs.contains("taskset"), "{programs:?}");
+        assert!(programs.contains("sh"), "{programs:?}");
+        assert!(
+            !programs.contains("ff"),
+            "affinity mask must not look like a program: {programs:?}"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | taskset ff sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | chrt 1 bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
     }
 
     #[test]
