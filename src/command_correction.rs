@@ -3168,6 +3168,27 @@ mod tests {
         );
     }
 
+    /// `stage_programs` must skip the same meta values so a detached user name
+    /// is not recorded as a program that ran.
+    #[test]
+    fn stage_programs_skips_detached_dispatcher_meta_values() {
+        let programs = stage_programs("runuser -u root sh -c id");
+        assert!(programs.contains("runuser"), "{programs:?}");
+        assert!(programs.contains("sh"), "{programs:?}");
+        assert!(
+            !programs.contains("root"),
+            "detached -u value must not look like a program: {programs:?}"
+        );
+
+        let env_programs = stage_programs("env -u SECRET bash -lc true");
+        assert!(env_programs.contains("env"), "{env_programs:?}");
+        assert!(env_programs.contains("bash"), "{env_programs:?}");
+        assert!(
+            !env_programs.contains("secret") && !env_programs.contains("SECRET"),
+            "{env_programs:?}"
+        );
+    }
+
     /// Per-prefix option arity lets the scan see through detached values such
     /// as `runuser -u root` to the dispatched interpreter, without treating
     /// every dashed word as value-taking (`unshare -r sh` still resolves to
