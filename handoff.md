@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): flock FD-only + wrapper terminal regressions
+Updated: 2026-09-29 (wave): UnknownOutcome→Guard* vigil settle bridges
+
+## 2026-09-29 (wave): UnknownOutcome→Guard* vigil settle bridges
+
+`UnknownOutcome→GuardFailure` / `GuardStuck` / `GuardRecovery` / `GuardCautious`
+animate under Full motion when an unknown hold settles into an open repo vigil
+(open failures or recovery waiting for push). Clear-vigil Idle and
+overwrite arcs already bridged. Test:
+`unknown_outcome_vigil_settles_have_full_motion_bridges`.
+WatchAgent→CelebrateBig stays `None` (agent-driven passes never CelebrateBig).
 
 ## 2026-09-29 (wave): flock FD-only + wrapper terminal regressions
 
