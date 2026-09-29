@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 36 probe: PATH network inventory leftovers)
+
+## 2026-09-29 (wave 36 probe — PATH network inventory leftovers)
+
+- **PATH probe** — network inventory managers (`ip` / `ss` / `nmcli` /
+  `nstat` / `arp` / `route` / `netstat` / `bridge` / `tc` / `rfkill`) stay out of
+  `STAGE_PREFIXES` until taught fail-closed. Lockstep with jagent
+  `path_probe_network_inventory_leftovers_do_not_invent_a_child_peel`.
+  CLASSIFY/DISPATCHES remain **71**. **Pending push**.
+
+
 Updated: 2026-09-29 (align tip note self-hash after rounds 191/240 final)
 
 ## 2026-09-29 (point pending tip — rounds 191/240 final align)
