@@ -18,7 +18,7 @@ Updated: 2026-09-30 (align tip note self-hash after rounds 203/255 / round-59 fi
 
 ## 2026-09-30 (point pending tip note at HEAD after rounds 203/255 / round-59 final)
 
-- Pending tip note remains current at HEAD `3bef18e` (jagent `5916ecc`) after
+- Pending tip note remains current at HEAD `e4fa13b` (jagent `e8ab42f`) after
   CrossBlock MAX-10 cancel beside sticky 1804/1803 / Unknown→GuardStuck and
   round-59 smoke.
 
