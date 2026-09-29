@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip beside wave-33 deepen and round-49 smoke)
+
+## 2026-09-29 (pending tip — wave-33 deepen + round-49)
+
+- Local HEAD still path-patch-only for ember/frost round-49 smoke against
+  jagent `fa60410` after PATH wave-33 device/sysctl leftovers out of STAGE and
+  setsid busybox + timeout/nice deepen. Anvil `db42070` rounds 158–160 / forge
+  `acd144e` 200–202 / ember `296010d` / frost `0cc7094` sit beside. STAGE **71** /
+  between() **93** unchanged. Push/repin cohort still pending.
+
+
 Updated: 2026-09-29 (wave): setsid busybox deepen + STAGE 71 held
 
 ## 2026-09-29 (wave): setsid STAGE arity / pipe deepen
