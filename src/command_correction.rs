@@ -1196,6 +1196,7 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// whole candidate for network provenance, and introducing any of the nine
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
+    "aa-exec",
     "annotate-output",
     "bubblewrap",
     "bwrap",
@@ -1246,6 +1247,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "su-exec",
     "sudo",
     "sudoedit",
+    "systemd-cat",
     "systemd-run",
     "taskset",
     "time",
@@ -1640,6 +1642,20 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 | "--xauth-protocol"
                 | "-s"
                 | "--server-args"
+        ) as usize,
+        // Journal stdout wrapper: identifier/priority meta before COMMAND.
+        "systemd-cat" => matches!(
+            option,
+            "-t" | "--identifier"
+                | "-p"
+                | "--priority"
+                | "--stderr-priority"
+                | "--level-prefix"
+        ) as usize,
+        // AppArmor confine-and-exec: profile/namespace before PROGRAM.
+        "aa-exec" => matches!(
+            option,
+            "-p" | "--profile" | "-n" | "--namespace"
         ) as usize,
         "eatmydata" => 0,
         "chronic" => 0,
@@ -3479,9 +3495,9 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // 58 wrappers + strace / scriptlive.
+        // 60 wrappers + systemd-cat / aa-exec.
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 60, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 62, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
@@ -3489,6 +3505,45 @@ mod tests {
         assert!(prefixes.contains(&"xvfb-run"));
         assert!(prefixes.contains(&"strace"));
         assert!(prefixes.contains(&"scriptlive"));
+        assert!(prefixes.contains(&"systemd-cat"));
+        assert!(prefixes.contains(&"aa-exec"));
+    }
+
+    #[test]
+    fn path_probe_leftovers_stay_out_of_stage_prefixes() {
+        // Intentional non-STAGE names from the 2026-09-29 PATH probe wave.
+        // `script` / `capsh` are covered elsewhere (PIPE / already STAGE);
+        // these must not quietly join STAGE_PREFIXES without a fail-closed
+        // peel + jagent arm.
+        let prefixes = stage_prefixes_for_tests();
+        for name in [
+            "logger",
+            "setns",
+            "cgroupfs-mount",
+            "scriptreplay",
+            "run-parts",
+            "jexec",
+            "pkexec-wrapper",
+        ] {
+            assert!(
+                !prefixes.contains(&name),
+                "{name} must stay out of STAGE_PREFIXES until taught fail-closed"
+            );
+        }
+        // `script` is PIPE_INTERPRETERS (bare form starts a shell); `capsh`
+        // is already STAGE — pin both so a future edit cannot invert them.
+        assert!(
+            PIPE_INTERPRETERS.contains(&"script"),
+            "script must stay PIPE_INTERPRETERS, not migrate to STAGE alone"
+        );
+        assert!(
+            prefixes.contains(&"capsh"),
+            "capsh must remain STAGE_PREFIXES (already peeled)"
+        );
+        assert!(
+            !PIPE_INTERPRETERS.contains(&"capsh"),
+            "capsh must not also be PIPE_INTERPRETERS"
+        );
     }
 
     #[test]
@@ -3586,6 +3641,42 @@ mod tests {
     }
 
     #[test]
+    fn systemd_cat_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | systemd-cat sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | systemd-cat -t unit bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn aa_exec_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | aa-exec sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | aa-exec -p unconfined bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
     fn dispatches_table_includes_bubblewrap_ro_bind_form() {
         // Mirrors the DISPATCHES row in every_stage_prefix_is_transparent_to_jagent_too.
         assert!(
@@ -3607,6 +3698,7 @@ mod tests {
         // `timeout` a duration, `capsh` a `--` — so probing `<prefix> rm` alone
         // would report a gap that is really just an invalid command line.
         const DISPATCHES: &[(&str, &str)] = &[
+            ("aa-exec", "aa-exec -p unconfined rm -rf /"),
             ("annotate-output", "annotate-output +%H:%M:%S rm -rf /"),
             ("bubblewrap", "bubblewrap --ro-bind / / -- rm -rf /"),
             ("bwrap", "bwrap --ro-bind / / -- rm -rf /"),
@@ -3660,6 +3752,7 @@ mod tests {
             ("su-exec", "su-exec root rm -rf /"),
             ("sudo", "sudo rm -rf /"),
             ("sudoedit", "sudoedit rm -rf /"),
+            ("systemd-cat", "systemd-cat -t unit -- rm -rf /"),
             ("systemd-run", "systemd-run rm -rf /"),
             ("taskset", "taskset ff rm -rf /"),
             ("time", "time rm -rf /"),
@@ -4273,6 +4366,29 @@ mod tests {
             stage_interpreter("scriptlive -t timing -I typescript").as_deref(),
             None
         );
+        assert_eq!(
+            stage_interpreter("systemd-cat sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat -t unit bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --identifier=unit -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("systemd-cat").as_deref(), None);
+        assert_eq!(stage_interpreter("systemd-cat -t unit").as_deref(), None);
+        assert_eq!(stage_interpreter("aa-exec sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("aa-exec -p unconfined bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("aa-exec --profile=unconfined -- sh").as_deref(),
+            Some("sh")
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -4313,6 +4429,10 @@ mod tests {
             "ls -l | strace -f bash",
             "ls -l | scriptlive typescript sh",
             "ls -l | scriptlive -c bash typescript",
+            "ls -l | systemd-cat sh",
+            "ls -l | systemd-cat -t unit bash",
+            "ls -l | aa-exec sh",
+            "ls -l | aa-exec -p unconfined bash",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
