@@ -1248,6 +1248,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "sudo",
     "sudoedit",
     "systemd-cat",
+    "systemd-inhibit",
     "systemd-run",
     "taskset",
     "time",
@@ -1651,6 +1652,12 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 | "--priority"
                 | "--stderr-priority"
                 | "--level-prefix"
+        ) as usize,
+        // Inhibit-lock launcher: what/who/why/mode meta before COMMAND.
+        // `--list` is flag-only (terminal in jagent); no detached value.
+        "systemd-inhibit" => matches!(
+            option,
+            "--what" | "--who" | "--why" | "--mode"
         ) as usize,
         // AppArmor confine-and-exec: profile/namespace before PROGRAM.
         "aa-exec" => matches!(
@@ -3495,9 +3502,9 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // 60 wrappers + systemd-cat / aa-exec.
+        // 62 wrappers + systemd-inhibit.
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 62, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 63, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
@@ -3506,6 +3513,7 @@ mod tests {
         assert!(prefixes.contains(&"strace"));
         assert!(prefixes.contains(&"scriptlive"));
         assert!(prefixes.contains(&"systemd-cat"));
+        assert!(prefixes.contains(&"systemd-inhibit"));
         assert!(prefixes.contains(&"aa-exec"));
     }
 
@@ -3524,6 +3532,10 @@ mod tests {
             "run-parts",
             "jexec",
             "pkexec-wrapper",
+            "systemd-socket-activate",
+            "systemd-stdio-bridge",
+            "aa-enabled",
+            "aa-features-abi",
         ] {
             assert!(
                 !prefixes.contains(&name),
@@ -3659,6 +3671,24 @@ mod tests {
     }
 
     #[test]
+    fn systemd_inhibit_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | systemd-inhibit sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | systemd-inhibit --what=idle bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
     fn aa_exec_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
             validate_candidate(
@@ -3753,6 +3783,7 @@ mod tests {
             ("sudo", "sudo rm -rf /"),
             ("sudoedit", "sudoedit rm -rf /"),
             ("systemd-cat", "systemd-cat -t unit -- rm -rf /"),
+            ("systemd-inhibit", "systemd-inhibit --what=idle -- rm -rf /"),
             ("systemd-run", "systemd-run rm -rf /"),
             ("taskset", "taskset ff rm -rf /"),
             ("time", "time rm -rf /"),
@@ -3843,6 +3874,7 @@ mod tests {
             ("sudo", "sudo cargo test"),
             ("sudoedit", "sudoedit -- cargo test"),
             ("systemd-cat", "systemd-cat -t unit -- cargo test"),
+            ("systemd-inhibit", "systemd-inhibit --what=idle -- cargo test"),
             ("systemd-run", "systemd-run cargo test"),
             ("taskset", "taskset ff cargo test"),
             ("time", "time cargo test"),
@@ -4468,6 +4500,24 @@ mod tests {
         );
         assert_eq!(stage_interpreter("systemd-cat").as_deref(), None);
         assert_eq!(stage_interpreter("systemd-cat -t unit").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("systemd-inhibit sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --what=idle bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --what idle --who x -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("systemd-inhibit").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --what=idle").as_deref(),
+            None
+        );
+        assert_eq!(stage_interpreter("systemd-inhibit --list").as_deref(), None);
         assert_eq!(stage_interpreter("aa-exec sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("aa-exec -p unconfined bash").as_deref(),
@@ -4519,6 +4569,8 @@ mod tests {
             "ls -l | scriptlive -c bash typescript",
             "ls -l | systemd-cat sh",
             "ls -l | systemd-cat -t unit bash",
+            "ls -l | systemd-inhibit sh",
+            "ls -l | systemd-inhibit --what=idle bash",
             "ls -l | aa-exec sh",
             "ls -l | aa-exec -p unconfined bash",
         ] {
@@ -4541,6 +4593,7 @@ mod tests {
             "ls -l | strace -p 1",
             "ls -l | scriptlive typescript",
             "ls -l | scriptlive -t timing -I typescript",
+            "ls -l | systemd-inhibit --list",
         ] {
             assert_ne!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),

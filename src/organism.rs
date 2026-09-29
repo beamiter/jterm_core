@@ -2811,6 +2811,10 @@ pub fn classify_command(command: &str) -> CommandKind {
                     "--level-prefix",
                 ],
             ),
+            "systemd-inhibit" => skip_wrapper_options(
+                &mut tokens,
+                &["--what", "--who", "--why", "--mode"],
+            ),
             "aa-exec" => skip_wrapper_options(
                 &mut tokens,
                 &["-p", "--profile", "-n", "--namespace"],
@@ -3389,6 +3393,9 @@ mod tests {
             "systemd-cat cargo test",
             "systemd-cat -t unit cargo check",
             "systemd-cat --identifier=unit -- cargo nextest run",
+            "systemd-inhibit cargo test",
+            "systemd-inhibit --what=idle cargo check",
+            "systemd-inhibit --what idle --who x -- cargo nextest run",
             "aa-exec cargo test",
             "aa-exec -p unconfined cargo check",
             "aa-exec --profile=unconfined -- cargo nextest run",
@@ -3396,6 +3403,7 @@ mod tests {
             "bubblewrap --ro-bind / / -- cargo check",
             "bwrap --dev /dev --uid 0 -- cargo nextest run",
             "systemd-cat -t x aa-exec -p unconfined cargo test",
+            "systemd-inhibit --what=idle systemd-cat -t x cargo test",
             "doas cargo test",
             "doas -u root cargo check",
             "sudoedit -- cargo nextest run",
