@@ -1,5 +1,21 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): fail-closed deepen — nest + transparency partition
+
+## 2026-09-29 (wave): fail-closed deepen — nest + transparency partition
+
+Deepen fail-closed coverage beside STAGE growth to **68** (`gnome-session-inhibit`):
+- Membership pin asserts `len == 68` and still names wave-23 `daemonize` /
+  `setlock` / `s6-setuidgid` (plus `gnome-session-inhibit`). DISPATCHES
+  asserts `len == 68` lockstep.
+- `stage_prefix_jagent_transparency_surfaces_stay_partitioned` documents STAGE
+  names handled outside `select_execution_wrappers_mode` (shell `command`/
+  `exec`/`env`, privilege dispatchers, `capsh`/`xargs`/`start-stop-daemon`)
+  while still requiring `is_dangerous` transparency. `unshare` / `nsenter`
+  stay intentional [`PIPE_INTERPRETERS`] (jagent strips them; pipe scan stops).
+- Classify peels `timeout`/`nice` around daemonize/setlock/s6-setuidgid.
+  Pairs jagent nest pin + setuidgid `--` peel. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): Failure/Stuck/Cautious error-hold None pin
 
 ## 2026-09-29 (wave): Failure/Stuck/Cautious→Inspect/Sit/Unknown stay None
