@@ -5956,9 +5956,11 @@ mod tests {
 
     #[test]
     fn visual_transition_between_recognizes_ninety_one_intentional_arcs() {
-        // Recount pin: UI contract lists (anvil/forge semantic_bridges) must
-        // stay in lockstep with this Some count (90 → 91 Inspect→SitNear
-        // second-failure hold overwrite).
+        // Recount pin: anvil/forge `semantic_bridges_run_only_in_full_motion`
+        // must stay in lockstep with this Some count (91 intentional arcs —
+        // InspectError→SitNearError hold overwrite; CelebrateBig finish table
+        // pinned separately in celebrate_big_finish_arcs_mirror_celebrate_except_watch_agent
+        // is already inside the 91, not a post-wave bump).
         let mut count = 0usize;
         for from in [
             Behavior::Idle,
