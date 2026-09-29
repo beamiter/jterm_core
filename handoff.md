@@ -1,5 +1,32 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — anvil/forge sticky/find/notice + round-41)
+
+## 2026-09-29 (pending tip — UI edges + round-41 smoke)
+
+- Local HEAD `786f924` still path-patch-only (wave-30 leftovers + WatchSettled
+  finish + CrossBlock wrap; STAGE **71** / between() **93**). Anvil/forge
+  `82450d0`/`96f7bb1` rounds 131–132 / 167–169 and ember-frost round-41 smoke
+  sit beside. **Pending push/repin** with jagent/jsh.
+
+
+Updated: 2026-09-29 (wave): WatchSettled finish inside 93 + Watch*→ambient None
+
+## 2026-09-29 (wave): WatchSettled finish arcs sit inside between() 93
+
+Survey after `watch_settled_finish_arcs_cover_pass_fail_rest_and_idle`: the six
+WatchSettled→Celebrate{,Big}/Inspect/Sit/Rest/Idle Somes were already counted
+in `visual_transition_between_recognizes_ninety_three_intentional_arcs`. UI
+`semantic_bridges` lists already name all six (len still **93**). Recount
+comment now calls them out beside CelebrateBig.
+
+## 2026-09-29 (wave): Watch*→ambient utility None
+
+`watch_poses_never_bridge_to_ambient_utility` pins WatchCommand/Agent/Settled
+→Explore/Sleep/Approach intentional None beside ambient→Watch* and
+Watch*→Guard* pins. `between()` stays **93**. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): PATH wave-30 ctl/notify leftovers + WatchSettled finish + CrossBlock wrap
 
 ## 2026-09-29 (wave): PATH probe wave-30 systemd ctl/notify leftovers stay out
