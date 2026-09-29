@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 38 probe: PATH process-table monitor leftovers)
+
+## 2026-09-30 (wave 38 probe — PATH process-table monitor leftovers)
+
+- **PATH probe** — process-table / resource monitors (top / htop / free /
+  uptime / pstree / ps / pmap / slabtop) stay out of `STAGE_PREFIXES` until
+  taught fail-closed (watch already STAGE). Lockstep with jagent
+  `path_probe_process_table_monitor_leftovers_do_not_invent_a_child_peel`.
+  CLASSIFY/DISPATCHES remain **71**. **Pending push**.
+
 Updated: 2026-09-30 (wave): CrossBlock cancel MAX-10→MAX-9 beside STAGE 71
 
 ## 2026-09-30 (wave): CrossBlock cancel near-near-near-near-near-near-near-near-near-near-wrap
