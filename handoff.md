@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — rounds 179–183 / 225–230 + round-52 beside wave-34)
+
+## 2026-09-29 (pending tip — sticky FE06/FE05/MAX-5/SitNear + round-52)
+
+- Local HEAD `4c5700c` path-patch-only. CrossBlock MAX-5→MAX-4 cancel
+  `902b60b` sits under wave-34 taskset/choom/prlimit deepen beside anvil
+  179–183 / forge 225–230 sticky FE06/Manchu-full-stop + FE05 find +
+  Celebrate/Rest verify + SitNear/Inspect→Unknown and ember/frost round-52
+  smoke. STAGE **71** / between() **93** unchanged.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 181/228 final align)
 
 ## 2026-09-29 (point pending tip — rounds 181/228 final align)
