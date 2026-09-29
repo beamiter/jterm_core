@@ -4260,6 +4260,46 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_chrt_and_ionice() {
+        assert_eq!(
+            classify_command("timeout 5 chrt 1 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 chrt -r 1 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("chrt 1 timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 ionice -c 3 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 ionice -c 2 -n 5 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("ionice -c3 timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 chrt 1 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        // Busybox applet carriers remain stage_interpreter-only — classify
+        // does not peel busybox itself (parity with taskset nest classify).
+        assert_ne!(
+            classify_command("busybox ionice -c 3 cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+    }
+
+
+    #[test]
     fn classify_command_peels_timeout_nice_around_setsid() {
         assert_eq!(
             classify_command("timeout 5 setsid cargo test"),
