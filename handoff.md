@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): classify peels timeout/nice around gnome-session-inhibit
+
+## 2026-09-29 (wave): classify peels timeout/nice around gnome-session-inhibit
+
+`classify_command_peels_timeout_nice_around_gnome_session_inhibit` covers
+carriers outside and inside the peeler (plus attached inhibit meta). Pairs
+jagent nest pin. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): gnome-session-inhibit STAGE arity edges
 
 ## 2026-09-29 (wave): gnome-session-inhibit STAGE arity edges
