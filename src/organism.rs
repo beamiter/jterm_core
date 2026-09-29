@@ -4035,6 +4035,48 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_systemd_cat_and_inhibit() {
+        assert_eq!(
+            classify_command("timeout 5 systemd-inhibit cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 systemd-inhibit --what=idle cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command(
+                "timeout 5 systemd-inhibit --who burner --why burn --mode block -- cargo nextest run"
+            ),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("systemd-inhibit timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 systemd-cat -t unit cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 systemd-cat --priority warning cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("systemd-cat timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 systemd-inhibit cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 systemd-cat -t unit cargo test"),
+            CommandKind::BuildOrTest
+        );
+    }
+
+    #[test]
     fn repeated_real_failures_escalate_then_success_celebrates() {
         let mut organism = NativeOrganism::default();
         organism.command_started(CommandKind::BuildOrTest);
@@ -5766,6 +5808,27 @@ mod tests {
                     VisualTransition::between(from, to),
                     None,
                     "ambient {from:?}→{to:?} must stay None"
+                );
+            }
+        }
+        // Same ambient sources never invent bridges into error / unknown holds
+        // or RestAfterPush — those arrive from finish/push reducers, not from
+        // Explore/Sleep/Approach disposition. between() stays 91.
+        for from in [
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
+        ] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+                Behavior::RestAfterPush,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "ambient {from:?}→{to:?} must stay None (hold/rest)"
                 );
             }
         }
