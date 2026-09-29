@@ -1,5 +1,23 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): ambient→hold/rest None beside between() 91
+
+## 2026-09-29 (wave): ambient Explore/Sleep/Approach→Inspect/Sit/Unknown/Rest None
+
+Expand `ambient_disposition_exchanges_have_no_visual_transition` so utility
+ambient poses never invent bridges into error/unknown holds or RestAfterPush
+(vigil/celebrate ambient Nones already pinned). `between()` stays **91**.
+STAGE membership still asserts `len == 70`. **Pending push/repin**.
+
+Updated: 2026-09-29 (wave): between() 91 recount note after CelebrateBig
+
+## 2026-09-29 (wave): between() 91 recount note after CelebrateBig
+
+`visual_transition_between_recognizes_ninety_one_intentional_arcs` comment
+now notes CelebrateBig finish arcs sit inside the 91 (not a post-wave bump);
+UI `semantic_bridges` lists assert `len == 91` in lockstep (anvil 113 /
+forge 147). **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): PATH wave-28 systemd inspectors + cat/inhibit deepen
 
 ## 2026-09-29 (wave): PATH probe wave-28 systemd inspectors stay out
@@ -387,9 +405,9 @@ Updated: 2026-09-29 (wave): Guard*/Watch*/Celebrate*/Glance Aside None pins
 Lifted identical anvil/forge find types into [`cross_block_search`]:
 `FindScanBudget` / `ScanPrefix` / `utf8_prefix`, `CrossBlockSearchOptions` /
 `CrossBlockSearchScope`, and hit-generic `CrossBlockSearchReport<H>`.
-`CrossBlockHit` stays app-owned — anvil adds `exit_code` / `duration_ms` /
-`cwd` for palette chrome; forge does not — pinned by
-`cross_block_hit_schema_divergence_keeps_rows_app_owned`. GTK idle scheduling
+`CrossBlockHit` stays app-owned — both UIs may carry optional `exit_code` /
+`duration_ms` / `cwd` palette chrome; GTK wiring stays UI-owned — pinned by
+`cross_block_hit_schema_keeps_rows_app_owned_with_optional_palette_chrome`. GTK idle scheduling
 stays in the UIs. **Pending push/repin**.
 
 Updated: 2026-09-29 (wave): FindScanBudget + Options/Scope + generic Report
