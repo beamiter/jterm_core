@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): confirm DISPATCHES bubblewrap form
+Updated: 2026-09-29 (wave): pin bubblewrap pipe AddsPipeToInterpreter
+
+## 2026-09-29 (wave): pin bubblewrap pipe AddsPipeToInterpreter
+
+Dedicated regression `bubblewrap_ro_bind_pipe_to_sh_is_adds_pipe_to_interpreter`
+pins `| bubblewrap --ro-bind / / sh` (under the usual `ls -l | …` original) as
+`AddsPipeToInterpreter`. The stage-prefix pipe matrix already listed this form;
+the named test keeps the argv0 alias visible beside `bwrap`.
 
 ## 2026-09-29 (wave): confirm DISPATCHES bubblewrap form
 

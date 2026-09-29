@@ -3388,6 +3388,17 @@ mod tests {
     /// that. This one probes the dispatcher form, so a prefix either module
     /// learns to step over must be taught to both.
     #[test]
+    fn bubblewrap_ro_bind_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | bubblewrap --ro-bind / / sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
     fn dispatches_table_includes_bubblewrap_ro_bind_form() {
         // Mirrors the DISPATCHES row in every_stage_prefix_is_transparent_to_jagent_too.
         assert!(
