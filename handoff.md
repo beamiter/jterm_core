@@ -1,5 +1,13 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): classify_command dbus-run-session / runcon / xvfb-run
+
+`classify_command` now steps through `dbus-run-session` / `runcon` /
+`xvfb-run` (including runcon CONTEXT vs `-t/-u/-r/-l` option forms and
+xvfb-run server meta) so `xvfb-run -a cargo test` stays `BuildOrTest` for
+the organism work loop. Pairs STAGE_PREFIXES wave (len 58).
+
+
 ## 2026-09-29 (wave): launcher probe leftovers after STAGE 58
 
 `run-parts` stays out (directory script runner, not child argv).
