@@ -1,5 +1,24 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through round-46)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through round-46)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq held through PATH wave-32 leftovers +
+  aa-exec/socket-activate busybox nest deepen and ember/frost round-46 smoke.
+  No STAGE peel graduate this wave.
+
+
+Updated: 2026-09-29 (pending tip beside wave-32 deepen and round-46 smoke)
+
+## 2026-09-29 (pending tip — wave-32 deepen + round-46)
+
+- Local HEAD  still path-patch-only for ember/frost round-46 smoke
+  against jagent  after PATH wave-32 ctl/service leftovers out of
+  STAGE and aa-exec / systemd-socket-activate busybox + timeout/nice deepen.
+  STAGE **71** / between() **93** unchanged. Push/repin cohort still pending.
+
+
 Updated: 2026-09-29 (wave): aa-exec/socket-activate busybox deepen + STAGE 71 held
 
 ## 2026-09-29 (wave): aa-exec / systemd-socket-activate busybox STAGE arity / pipe deepen
