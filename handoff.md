@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — sticky FE07/FE06/MAX-6 + round-53 beside wave-35)
+
+## 2026-09-29 (pending tip — sticky FE07/FE06/MAX-6 + round-53)
+
+- Local HEAD `f09bc5d` path-patch-only. CrossBlock MAX-6→MAX-5 cancel
+  `503569f` sits under wave-35 chrt/ionice deepen beside anvil 184–187 /
+  forge 231–235 sticky FE07/birga + FE06 find + GuardRecovery→Unknown and
+  ember/frost round-53 smoke. STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 through wave-35 cohort)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 — wave-35 cohort)
