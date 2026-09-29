@@ -11,6 +11,12 @@ with the bubblewrap option table jagent already parses. Regressions cover
 
 ## 2026-09-29 (organism evolve): celebrate-hold push continuity
 
+Celebrate/CelebrateBig→RestAfterPush Full-motion bridges so a push during the
+celebrate hold does not snap. `celebrate_hold_push_has_full_motion_bridges`
+drives Celebrate + GitPush → RestAfterPush.
+
+## 2026-09-29 (wave): util-linux and container-init STAGE_PREFIXES
+
 `setpriv` / `choom` / `prlimit` / `dumb-init` / `tini` / `watch` join
 [`STAGE_PREFIXES`] with detached meta arity so
 `| setpriv --reuid 0 sh`, `| choom -n 1000 sh`, `| prlimit --nofile=1024 sh`,
