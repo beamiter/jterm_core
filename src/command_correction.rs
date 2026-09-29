@@ -3846,6 +3846,18 @@ mod tests {
             "blockdev",
             "findmnt",
             "wipefs",
+            // Wave-35 PATH leftovers: host/hw inventory managers beside
+            // STAGE peelers and wave-30–34 ctl/block leftovers (jagent pin
+            // `path_probe_host_inventory_leftovers_do_not_invent_a_child_peel`).
+            // CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "lsusb",
+            "lspci",
+            "lscpu",
+            "lsmem",
+            "lsipc",
+            "lslocks",
+            "lslogins",
+            "dmidecode",
         ] {
             assert!(
                 !prefixes.contains(&name),
