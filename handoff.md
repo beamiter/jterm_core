@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after rounds 174/219 + round-50 smoke)
+
+## 2026-09-29 (align tip — rounds 171–174 / 215–219 + round-50)
+
+- Local HEAD `e76244f` path-patch-only after sticky FE04/find/MAX-3/Celebrate→
+  Unknown pins + ember/frost round-50 smoke. STAGE **71** / between() **93**
+  unchanged. Push/repin still pending.
+
+
 Updated: 2026-09-29 (pending tip — rounds 171–174 / 215–219 + round-50 smoke)
 
 ## 2026-09-29 (pending tip — sticky FE04/find/MAX-3/Celebrate→Unknown + round-50)
