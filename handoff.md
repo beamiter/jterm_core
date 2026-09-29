@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): pin bubblewrap pipe AddsPipeToInterpreter
+Updated: 2026-09-29 (wave): WatchAgent→CelebrateBig None pin
+
+## 2026-09-29 (wave): WatchAgent→CelebrateBig None pin
+
+Dedicated regression `watch_agent_never_bridges_to_celebrate_big` pins
+`VisualTransition::between(WatchAgent, CelebrateBig) == None` so an agent-driven
+pass cannot silently gain CelebrateBig.
 
 ## 2026-09-29 (wave): pin bubblewrap pipe AddsPipeToInterpreter
 

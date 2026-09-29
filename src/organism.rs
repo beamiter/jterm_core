@@ -4021,7 +4021,13 @@ mod tests {
             VisualTransition::between(Behavior::WatchSettled, Behavior::RestAfterPush),
             Some(VisualTransition::WatchSettledToRestAfterPush)
         );
-        // WatchAgent does not celebrate-big directly.
+    }
+
+    /// Agent-driven passes celebrate quietly (`Celebrate`); `CelebrateBig` is
+    /// reserved for human-driven wins. Pin `None` so a future bridge cannot
+    /// land silently inside the WatchAgent finish table.
+    #[test]
+    fn watch_agent_never_bridges_to_celebrate_big() {
         assert_eq!(
             VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
             None
