@@ -5613,6 +5613,84 @@ mod tests {
         }
     }
 
+    /// Survey leftover beside Watch*→ambient and ambient→hold Nones: celebrate /
+    /// error / unknown / rest holds settle through Idle (or Guard*), never invent
+    /// bridges into Explore/Sleep/Approach — those arrive from ambient mind
+    /// rescoring after clear-vigil. Pin `None` so hold→ambient cannot land
+    /// beside ambient→hold. between() stays 93.
+    #[test]
+    fn hold_and_rest_poses_never_bridge_to_ambient_utility() {
+        for from in [
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::RestAfterPush,
+        ] {
+            for to in [
+                Behavior::Explore,
+                Behavior::Sleep,
+                Behavior::Approach,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None (ambient via mind, not hold)"
+                );
+            }
+        }
+    }
+
+    /// Repo vigil poses push or escalate among themselves — ambient utility
+    /// arrives from mind rescoring after clear-vigil Idle, not from a Guard*
+    /// finish. Pin `None` so Guard*→Explore/Sleep/Approach cannot land beside
+    /// hold→ambient and Watch*→ambient. between() stays 93.
+    #[test]
+    fn repo_vigil_guards_never_bridge_to_ambient_utility() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::Explore,
+                Behavior::Sleep,
+                Behavior::Approach,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None (ambient via mind, not Guard*)"
+                );
+            }
+        }
+    }
+
+    /// Watch pose family switches (Command↔Agent↔Settled) are live SurfaceMode
+    /// remaps — elapsed-onset settled vigil and agent crouch — not reducer
+    /// VisualTransition arcs. Finishes leave Watch* via the Some bridges already
+    /// counted in between() 93. Pin `None` so a silent Watch*↔Watch* bridge
+    /// cannot land beside Watch*→Idle/Celebrate.
+    #[test]
+    fn watch_pose_mode_switches_have_no_visual_transition() {
+        for (from, to) in [
+            (Behavior::WatchCommand, Behavior::WatchAgent),
+            (Behavior::WatchCommand, Behavior::WatchSettled),
+            (Behavior::WatchAgent, Behavior::WatchCommand),
+            (Behavior::WatchAgent, Behavior::WatchSettled),
+            (Behavior::WatchSettled, Behavior::WatchCommand),
+            (Behavior::WatchSettled, Behavior::WatchAgent),
+        ] {
+            assert_eq!(
+                VisualTransition::between(from, to),
+                None,
+                "{from:?}→{to:?} must stay None (live remap, not between)"
+            );
+        }
+    }
+
     /// Idle/Rest clear-vigil settle already animates to Idle; an open repo vigil
     /// appearing from Idle or RestAfterPush snaps (no bridge). Pin `None` so
     /// Idle/Rest→Guard* cannot appear beside UnknownOutcome→Guard*.
