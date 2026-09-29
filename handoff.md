@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): classify_command torsocks/proxychains
+Updated: 2026-09-29 (wave): UnknownOutcome Full-motion bridges
+
+## 2026-09-29 (wave): UnknownOutcome Full-motion bridges
+
+GlanceAside is live-only (presence cue), so it is not a VisualTransition
+source. Instead `UnknownOutcome→Idle` (clear-vigil settle) and
+`UnknownOutcome→InspectError` (first open failure overtakes the hold) animate
+under Full motion. Tests: `unknown_outcome_settle_and_overwrite_have_full_motion_bridges`.
 
 ## 2026-09-29 (wave): classify_command torsocks/proxychains
 

@@ -524,6 +524,21 @@ const REST_TO_IDLE_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( -.- )     \n > ^ <",
     " /\\_/\\      \n( -.- )     \n >~^ <",
 ];
+// UnknownOutcome hold: clear-vigil settle must not snap to Idle, and a first
+// open failure that overtakes the hold must not snap to InspectError.
+// GlanceAside is live-only (presence cue), so it is not a transition source.
+const UNKNOWN_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( ?.o )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+const UNKNOWN_TO_INSPECT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( o.? )     \n > ^ <",
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+    " /\\_/\\  ->  \n( o_o )     \n /|_|\\",
+];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
 // motion snaps on the reverse of the already-bridged recovery/escalation graph.
@@ -722,6 +737,8 @@ pub enum VisualTransition {
     CelebrateToIdle,
     CelebrateBigToIdle,
     RestAfterPushToIdle,
+    UnknownOutcomeToIdle,
+    UnknownOutcomeToInspectError,
 }
 
 impl VisualTransition {
@@ -850,6 +867,10 @@ impl VisualTransition {
             (Behavior::Celebrate, Behavior::Idle) => Some(Self::CelebrateToIdle),
             (Behavior::CelebrateBig, Behavior::Idle) => Some(Self::CelebrateBigToIdle),
             (Behavior::RestAfterPush, Behavior::Idle) => Some(Self::RestAfterPushToIdle),
+            (Behavior::UnknownOutcome, Behavior::Idle) => Some(Self::UnknownOutcomeToIdle),
+            (Behavior::UnknownOutcome, Behavior::InspectError) => {
+                Some(Self::UnknownOutcomeToInspectError)
+            }
             _ => None,
         }
     }
@@ -909,6 +930,9 @@ impl VisualTransition {
             | Self::GuardCautiousToGuardRecovery
             | Self::GuardCautiousToRestAfterPush => Behavior::GuardCautious,
             Self::RestAfterPushToIdle => Behavior::RestAfterPush,
+            Self::UnknownOutcomeToIdle | Self::UnknownOutcomeToInspectError => {
+                Behavior::UnknownOutcome
+            }
         }
     }
 
@@ -953,7 +977,8 @@ impl VisualTransition {
             | Self::WatchCommandToCelebrateBig => Behavior::CelebrateBig,
             Self::WatchSettledToInspectError
             | Self::WatchCommandToInspectError
-            | Self::WatchAgentToInspectError => Behavior::InspectError,
+            | Self::WatchAgentToInspectError
+            | Self::UnknownOutcomeToInspectError => Behavior::InspectError,
             Self::WatchSettledToSitNearError
             | Self::WatchCommandToSitNearError
             | Self::WatchAgentToSitNearError => Behavior::SitNearError,
@@ -966,7 +991,8 @@ impl VisualTransition {
             | Self::WatchCommandToRestAfterPush => Behavior::RestAfterPush,
             Self::CelebrateToIdle
             | Self::CelebrateBigToIdle
-            | Self::RestAfterPushToIdle => Behavior::Idle,
+            | Self::RestAfterPushToIdle
+            | Self::UnknownOutcomeToIdle => Behavior::Idle,
         }
     }
 
@@ -1036,6 +1062,8 @@ impl VisualTransition {
             Self::CelebrateToIdle => CELEBRATE_TO_IDLE_FRAMES[index],
             Self::CelebrateBigToIdle => CELEBRATE_BIG_TO_IDLE_FRAMES[index],
             Self::RestAfterPushToIdle => REST_TO_IDLE_FRAMES[index],
+            Self::UnknownOutcomeToIdle => UNKNOWN_TO_IDLE_FRAMES[index],
+            Self::UnknownOutcomeToInspectError => UNKNOWN_TO_INSPECT_FRAMES[index],
         }
     }
 }
@@ -3594,6 +3622,8 @@ mod tests {
             VisualTransition::CelebrateToIdle,
             VisualTransition::CelebrateBigToIdle,
             VisualTransition::RestAfterPushToIdle,
+            VisualTransition::UnknownOutcomeToIdle,
+            VisualTransition::UnknownOutcomeToInspectError,
         ];
         for transition in transitions {
             assert_eq!(
@@ -3861,6 +3891,42 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::RestAfterPush, Behavior::Idle),
             Some(VisualTransition::RestAfterPushToIdle)
+        );
+    }
+
+    #[test]
+    fn unknown_outcome_settle_and_overwrite_have_full_motion_bridges() {
+        // GlanceAside is live-only (presence cue), not a reducer transition
+        // source. UnknownOutcome is: clear-vigil settle → Idle, and a first
+        // open failure that overtakes the hold → InspectError.
+        let mut organism = NativeOrganism::default();
+        organism.command_started(CommandKind::BuildOrTest);
+        let unknown = organism.command_finished(CommandKind::BuildOrTest, None, None);
+        assert_eq!(unknown.behavior, Behavior::UnknownOutcome);
+        let idle = organism.idle_reaction();
+        assert_eq!(idle.behavior, Behavior::Idle);
+        assert_eq!(
+            VisualTransition::between(unknown.behavior, idle.behavior),
+            Some(VisualTransition::UnknownOutcomeToIdle)
+        );
+
+        let mut overwrite = NativeOrganism::default();
+        let held = overwrite.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held.behavior, Behavior::UnknownOutcome);
+        let inspect = overwrite.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(inspect.behavior, Behavior::InspectError);
+        assert_eq!(
+            VisualTransition::between(held.behavior, inspect.behavior),
+            Some(VisualTransition::UnknownOutcomeToInspectError)
+        );
+        // GlanceAside stays out of the bridge table.
+        assert_eq!(
+            VisualTransition::between(Behavior::GlanceAside, Behavior::InspectError),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::GlanceAside, Behavior::SitNearError),
+            None
         );
     }
 
