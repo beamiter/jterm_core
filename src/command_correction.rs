@@ -1207,6 +1207,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "chrt",
     "chronic",
     "command",
+    "dbus-run-session",
     "doas",
     "dumb-init",
     "eatmydata",
@@ -1229,6 +1230,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "proot",
     "rlwrap",
     "run0",
+    "runcon",
     "runuser",
     "schedtool",
     "setarch",
@@ -1251,6 +1253,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "unbuffer",
     "watch",
     "xargs",
+    "xvfb-run",
 ];
 
 /// Test-only view of [`STAGE_PREFIXES`] so count / membership pins do not
@@ -1444,9 +1447,10 @@ fn prefix_takes_positional_lockfile(prefix: &str) -> bool {
 }
 
 /// Dispatchers whose first non-option operand names how to run the next word,
-/// not the program itself (`setarch x86_64 CMD`, `taskset ff CMD`).
+/// not the program itself (`setarch x86_64 CMD`, `taskset ff CMD`,
+/// `runcon CONTEXT CMD`).
 fn prefix_takes_positional_dispatch_operand(prefix: &str) -> bool {
-    matches!(prefix, "setarch" | "taskset")
+    matches!(prefix, "setarch" | "taskset" | "runcon")
 }
 
 /// `annotate-output` optionally takes a `+FORMAT` date stamp before PROGRAM.
@@ -1618,6 +1622,23 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
             "-p" | "--kill-after" | "-g" | "--group-add" | "-e" | "--env"
         ) as usize,
         "watch" => matches!(option, "-n" | "--interval" | "-q" | "--equexit") as usize,
+        "dbus-run-session" => matches!(option, "--dbus-daemon" | "--config-file") as usize,
+        "runcon" => matches!(
+            option,
+            "-u" | "--user" | "-r" | "--role" | "-t" | "--type" | "-l" | "--range"
+        ) as usize,
+        "xvfb-run" => matches!(
+            option,
+            "-e" | "--error-file"
+                | "-f"
+                | "--auth-file"
+                | "-n"
+                | "--server-num"
+                | "-p"
+                | "--xauth-protocol"
+                | "-s"
+                | "--server-args"
+        ) as usize,
         "eatmydata" => 0,
         "chronic" => 0,
         // Optional `+FORMAT` is a leading `+…` token (not a dashed option);
@@ -3396,11 +3417,14 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // 54 wrappers + `bubblewrap` as argv0 alias of `bwrap`.
+        // 54 wrappers + `bubblewrap` + dbus-run-session / runcon / xvfb-run.
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 55, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 58, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
+        assert!(prefixes.contains(&"dbus-run-session"));
+        assert!(prefixes.contains(&"runcon"));
+        assert!(prefixes.contains(&"xvfb-run"));
     }
 
     #[test]
@@ -3409,6 +3433,53 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | bubblewrap --ro-bind / / sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn dbus_run_session_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | dbus-run-session sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn runcon_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | runcon unconfined_t sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | runcon -t unconfined_t sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn xvfb_run_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | xvfb-run sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | xvfb-run -a sh")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
@@ -3447,6 +3518,7 @@ mod tests {
             ("chronic", "chronic rm -rf /"),
             ("chpst", "chpst -u nobody rm -rf /"),
             ("command", "command rm -rf /"),
+            ("dbus-run-session", "dbus-run-session -- rm -rf /"),
             ("doas", "doas rm -rf /"),
             ("dumb-init", "dumb-init -- rm -rf /"),
             ("eatmydata", "eatmydata -- rm -rf /"),
@@ -3469,6 +3541,7 @@ mod tests {
             ("proot", "proot -r /tmp/root -- rm -rf /"),
             ("rlwrap", "rlwrap rm -rf /"),
             ("run0", "run0 rm -rf /"),
+            ("runcon", "runcon unconfined_t rm -rf /"),
             ("runuser", "runuser -u root -- rm -rf /"),
             ("schedtool", "schedtool -B -e rm -rf /"),
             ("setarch", "setarch x86_64 rm -rf /"),
@@ -3494,6 +3567,7 @@ mod tests {
             ("unbuffer", "unbuffer rm -rf /"),
             ("watch", "watch -n 1 --exec rm -rf /"),
             ("xargs", "xargs rm -rf /"),
+            ("xvfb-run", "xvfb-run -a rm -rf /"),
         ];
         for prefix in STAGE_PREFIXES {
             let form = DISPATCHES
