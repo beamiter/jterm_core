@@ -4381,12 +4381,22 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("aa-exec --profile unconfined bash").as_deref(),
+            Some("bash"),
+            "detached --profile value peels like short -p"
+        );
+        assert_eq!(
             stage_interpreter("aa-exec -n apparmorfs bash").as_deref(),
             Some("bash")
         );
         assert_eq!(
             stage_interpreter("aa-exec --namespace=apparmorfs -- sh").as_deref(),
             Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("aa-exec --namespace apparmorfs bash").as_deref(),
+            Some("bash"),
+            "detached --namespace value peels like short -n"
         );
         assert_eq!(
             stage_interpreter("busybox aa-exec sh").as_deref(),
@@ -4442,6 +4452,11 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("systemd-socket-activate --listen 2000 bash").as_deref(),
+            Some("bash"),
+            "detached --listen value peels like short -l"
+        );
+        assert_eq!(
             stage_interpreter("systemd-socket-activate -E FOO=1 bash").as_deref(),
             Some("bash")
         );
@@ -4450,8 +4465,18 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("systemd-socket-activate --setenv FOO=1 bash").as_deref(),
+            Some("bash"),
+            "detached --setenv value peels like short -E"
+        );
+        assert_eq!(
             stage_interpreter("systemd-socket-activate --fdname=conn bash").as_deref(),
             Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --fdname conn bash").as_deref(),
+            Some("bash"),
+            "detached --fdname value peels"
         );
         assert_eq!(
             stage_interpreter("busybox systemd-socket-activate sh").as_deref(),
