@@ -4114,6 +4114,34 @@ mod tests {
         );
     }
 
+    /// GlanceAside is a live presence cue, not a reducer Behavior source.
+    /// Pin the common overwrite targets so a bridge cannot land silently.
+    #[test]
+    fn glance_aside_never_bridges_as_a_transition_source() {
+        for to in [
+            Behavior::Idle,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            assert_eq!(
+                VisualTransition::between(Behavior::GlanceAside, to),
+                None,
+                "GlanceAside→{to:?} must stay None"
+            );
+        }
+    }
+
     #[test]
     fn celebrate_and_rest_settle_to_idle_has_full_motion_bridges() {
         assert_eq!(
