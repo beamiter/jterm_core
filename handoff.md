@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 199/250)
+
+## 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 199/250)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  sticky 1803/1802 find/MAX-9/Unknown→GuardCautious beside anvil 196–199 /
+  forge 246–250 (wave-37 process/IPC leftovers sit under; no further peel this
+  edge wave). Unknown↔GuardRecovery remains inside between() 93 (no
+  semantic_bridges len bump).
+
 Updated: 2026-09-30 (wave 37 probe: PATH process/IPC inventory leftovers)
 
 ## 2026-09-30 (wave 37 probe — PATH process/IPC inventory leftovers)
