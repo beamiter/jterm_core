@@ -1199,6 +1199,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "bwrap",
     "capsh",
     "choom",
+    "chpst",
     "chroot",
     "chrt",
     "chronic",
@@ -1207,6 +1208,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "dumb-init",
     "eatmydata",
     "env",
+    "envdir",
     "exec",
     "flock",
     "gosu",
@@ -1222,6 +1224,8 @@ const STAGE_PREFIXES: &[&str] = &[
     "setarch",
     "setpriv",
     "setsid",
+    "setuidgid",
+    "softlimit",
     "start-stop-daemon",
     "stdbuf",
     "su",
@@ -1389,13 +1393,16 @@ fn stage_interpreter(stage: &str) -> Option<String> {
 /// Dispatchers whose first non-option operand is a user/identity, not the
 /// program to run (`gosu USER CMD`, `runuser USER CMD`).
 fn prefix_takes_positional_user(prefix: &str) -> bool {
-    matches!(prefix, "gosu" | "run0" | "su" | "su-exec" | "runuser")
+    matches!(
+        prefix,
+        "gosu" | "run0" | "su" | "su-exec" | "runuser" | "setuidgid"
+    )
 }
 
 /// Dispatchers whose first non-option operand is a filesystem root, not the
 /// program to run (`chroot NEWROOT CMD`).
 fn prefix_takes_positional_newroot(prefix: &str) -> bool {
-    prefix == "chroot"
+    matches!(prefix, "chroot" | "envdir")
 }
 
 /// Dispatchers whose first non-option operand is a lock file/path, not the
@@ -1614,6 +1621,16 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 | "--password-prompt"
                 | "-z"
                 | "--filter"
+        ) as usize,
+        // daemontools softlimit: every common short takes a limit value.
+        "softlimit" => matches!(
+            option,
+            "-m" | "-d" | "-s" | "-a" | "-c" | "-n" | "-f" | "-r" | "-o" | "-p"
+        ) as usize,
+        // runit chpst: identity/env/limit meta values; flags return 0.
+        "chpst" => matches!(
+            option,
+            "-u" | "-U" | "-e" | "-b" | "-n" | "-m" | "-d" | "-o" | "-p" | "-f" | "-c"
         ) as usize,
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
         // listed separately. Flag-only forms return 0.
@@ -3293,11 +3310,13 @@ mod tests {
             ("chroot", "chroot / rm -rf /"),
             ("chrt", "chrt 1 rm -rf /"),
             ("chronic", "chronic rm -rf /"),
+            ("chpst", "chpst -u nobody rm -rf /"),
             ("command", "command rm -rf /"),
             ("doas", "doas rm -rf /"),
             ("dumb-init", "dumb-init -- rm -rf /"),
             ("eatmydata", "eatmydata -- rm -rf /"),
             ("env", "env FOO=1 rm -rf /"),
+            ("envdir", "envdir /env rm -rf /"),
             ("exec", "exec rm -rf /"),
             ("flock", "flock /tmp/lock rm -rf /"),
             ("gosu", "gosu root rm -rf /"),
@@ -3313,6 +3332,8 @@ mod tests {
             ("setarch", "setarch x86_64 rm -rf /"),
             ("setpriv", "setpriv --reuid 0 rm -rf /"),
             ("setsid", "setsid rm -rf /"),
+            ("setuidgid", "setuidgid nobody rm -rf /"),
+            ("softlimit", "softlimit -m 1000000 rm -rf /"),
             (
                 "start-stop-daemon",
                 "start-stop-daemon --start --exec /bin/rm -- -rf /",
@@ -3771,6 +3792,22 @@ mod tests {
             stage_interpreter("rlwrap -f /tmp/comp sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(
+            stage_interpreter("softlimit -m 1000000 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("chpst -u nobody bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("setuidgid nobody sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("envdir /var/service/x/env bash").as_deref(),
+            Some("bash")
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -3786,6 +3823,10 @@ mod tests {
             "ls -l | chronic -e sh",
             "ls -l | rlwrap sh",
             "ls -l | rlwrap -a bash",
+            "ls -l | softlimit -m 1000000 sh",
+            "ls -l | chpst -u nobody bash",
+            "ls -l | setuidgid nobody sh",
+            "ls -l | envdir /env sh",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),

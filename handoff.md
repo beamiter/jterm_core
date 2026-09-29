@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism: WatchCommand/WatchAgent finish bridges)
+Updated: 2026-09-29 (wave): softlimit/chpst/setuidgid/envdir STAGE_PREFIXES
+
+## 2026-09-29 (wave): softlimit/chpst/setuidgid/envdir STAGE_PREFIXES
+
+Paired with jagent `323119c` (pending push/repin): these four join
+[`STAGE_PREFIXES`]. `softlimit`/`chpst` consume limit/identity meta arity;
+`setuidgid` skips a user positional like gosu; `envdir` skips a directory
+positional like chroot/flock. Pipe regressions cover `| softlimit … sh` /
+`| chpst -u nobody bash` / `| setuidgid nobody sh` / `| envdir /env sh`.
+Local `.cargo/config.toml` path-patches jagent for the DISPATCHES transparency
+test — do not commit that patch or change the published jagent rev.
 
 ## 2026-09-29 (organism evolve): WatchCommand/WatchAgent finish continuity
 
