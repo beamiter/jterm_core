@@ -3897,6 +3897,18 @@ mod tests {
             "perf",
             "ipcs",
             "ipcrm",
+            // Wave-38 PATH leftovers: process-table / resource monitors beside
+            // STAGE peelers and wave-30–37 leftovers (jagent pin
+            // `path_probe_process_table_monitor_leftovers_do_not_invent_a_child_peel`).
+            // `watch` is already STAGE. CLASSIFY/DISPATCHES remain lockstep at 71.
+            "top",
+            "htop",
+            "free",
+            "uptime",
+            "pstree",
+            "ps",
+            "pmap",
+            "slabtop",
         ] {
             assert!(
                 !prefixes.contains(&name),
@@ -4693,7 +4705,6 @@ mod tests {
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
     }
-
 
     /// util-linux setsid: session flags + help/version fail closed. Busybox
     /// applet carriers peel before the STAGE name so pipe-to-bash still
