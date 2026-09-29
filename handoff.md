@@ -1,5 +1,20 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): daemonize/setlock busybox arity + DISPATCHES set-eq
+
+## 2026-09-29 (wave): daemonize/setlock/s6 busybox STAGE arity / pipe deepen
+
+`daemonize_and_setlock_stage_arity_edges` peels `busybox` applet carriers to
+sh/bash for daemonize/setlock/s6-setuidgid; help/version under busybox stay
+fail-closed. Pipe regressions cover `| busybox … bash`.
+
+## 2026-09-29 (wave): DISPATCHES set equality with STAGE 71
+
+Audit pin: DISPATCHES names must equal STAGE_PREFIXES exactly (set equality),
+matching CLASSIFY_FORMS STAGE 71 set-eq so a duplicate+gap swap cannot hide a
+missing peel form. Membership pin stays `len == 71`. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): openvt busybox STAGE arity + pipe deepen
 
 ## 2026-09-29 (wave): openvt busybox STAGE arity / pipe deepen
