@@ -1,5 +1,20 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): systemd-cat/inhibit busybox arity + classify nests
+
+## 2026-09-29 (wave): systemd-cat/inhibit busybox arity + pipe deepen
+
+`systemd_cat_and_inhibit_stage_arity_edges` and pipe regressions now peel
+`busybox <wrapper>` applet carriers to sh/bash; list/help under busybox stay
+fail-closed (jagent parity).
+**Pending push/repin**.
+
+## 2026-09-29 (wave): classify peels timeout/nice around systemd-cat/inhibit
+
+Mirror gnome/uclamp nest pin: `timeout`/`nice` outside and inside
+`systemd-inhibit` / `systemd-cat` still classify the cargo child.
+**Pending push/repin**.
+
 Updated: 2026-09-29 (wave): CelebrateBig finish arcs + output_notice gaps + Hit chrome pin
 
 ## 2026-09-29 (wave): CelebrateBig finish arcs (15 Some)
