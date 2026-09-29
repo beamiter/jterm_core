@@ -1,5 +1,28 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): CelebrateBig finish arcs + output_notice gaps + Hit chrome pin
+
+## 2026-09-29 (wave): CelebrateBig finish arcs (15 Some)
+
+`celebrate_big_finish_arcs_mirror_celebrate_except_watch_agent` pins the
+fifteen CelebrateBig inbound/outbound Some bridges and keeps
+WatchAgent→CelebrateBig / Celebrate↔CelebrateBig intentional None.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): output_notice near-miss + distinct tooltips
+
+Known-set rejects padded/cased/truncated near-miss strings; the three family
+notices keep pairwise-distinct display strings and tooltips.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): CrossBlockHit optional palette chrome may converge
+
+Retargeted the Hit schema pin: forge can carry optional exit_code /
+duration_ms / cwd without dead columns; Hit rows stay app-owned because GTK
+badge wiring still differs. Report stays generic over H.
+**Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): ambient→vigil/celebrate None + PATH wave-27 leftovers
 
 ## 2026-09-29 (wave): ambient Explore/Sleep/Approach→Guard*/Celebrate* None
