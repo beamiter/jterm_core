@@ -1033,6 +1033,26 @@ anvil's at `workspace_ops.rs:1291` mean what they say.
   from that signed manifest and cross-checks the same-origin `.sha256` sidecar.
   `scripts/jsh-remote.sh` is pinned to the same upstream revision.
 
+## 2026-09-29 (organism evolve): vigil-tier transition continuity
+
+The five-part embodiment pass left Full-motion bridges asymmetric across
+vigil tiers. `InspectError→GuardFailure` (first open failure) and
+`SitNearError→GuardStuck` (third+) animated, but the common **second** open
+failure still emits `SitNearError` while `idle_reaction` settles to
+`GuardFailure` — and `VisualTransition::between` returned `None`, so settle
+snapped. Idle escalations that `receive_repo_work_sync` retarget without a
+new command (`GuardFailure→GuardStuck`, `GuardRecovery→GuardCautious`) had
+the same hole.
+
+Added three fixed-envelope 4-frame arcs (`SitNearErrorToGuardFailure`,
+`GuardFailureToGuardStuck`, `GuardRecoveryToGuardCautious`) with the same
+bounding-box contract as the existing bridges. No schema field, no content
+perception, Calm/Static still snap. Regressions:
+`semantic_transitions_are_bounded_one_shot_arcs` lists the new variants;
+`second_open_failure_settle_has_a_full_motion_bridge` locks the reducer
+coupling (two nonzero BuildOrTest finishes → SitNearError then GuardFailure
+with a recognized bridge).
+
 ## 2026-09-28 (wave 8): taskset/chrt stage prefixes in correction scans
 
 `taskset` and `chrt` join [`STAGE_PREFIXES`] so pipe-to-interpreter sees the
