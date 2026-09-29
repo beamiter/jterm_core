@@ -1250,6 +1250,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "systemd-cat",
     "systemd-inhibit",
     "systemd-run",
+    "systemd-socket-activate",
     "taskset",
     "time",
     "timeout",
@@ -1350,6 +1351,9 @@ fn stage_interpreter(stage: &str) -> Option<String> {
         if word.starts_with('-') {
             index += 1;
             if let Some(prefix) = active_prefix {
+                if prefix_option_clears_child(prefix, word) {
+                    return None;
+                }
                 skip_detached_option_values(
                     words.len(),
                     &mut index,
@@ -1462,6 +1466,22 @@ fn prefix_takes_positional_dispatch_operand(prefix: &str) -> bool {
 /// It is not a dashed option and must not be mistaken for the child.
 fn prefix_skips_plus_format_token(prefix: &str, word: &str) -> bool {
     prefix == "annotate-output" && word.starts_with('+')
+}
+
+/// Whether a dashed option under an active STAGE prefix ends the launch
+/// (jagent clears remaining argv). The scan must not treat a following word as
+/// the child interpreter (`systemd-inhibit --list sh`, `firejail --help sh`).
+fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
+    let spelling = option
+        .strip_prefix("--")
+        .map(|long| long.split_once('=').map_or(long, |(name, _)| name))
+        .or_else(|| option.strip_prefix('-').filter(|flags| flags.len() == 1));
+    match (prefix, spelling) {
+        ("systemd-inhibit", Some("list" | "help" | "version" | "h")) => true,
+        ("systemd-cat", Some("help" | "version" | "h")) => true,
+        ("firejail", Some("help" | "version")) => true,
+        _ => false,
+    }
 }
 
 /// Whether later words still contain a program candidate (not an option,
@@ -1658,6 +1678,11 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         "systemd-inhibit" => matches!(
             option,
             "--what" | "--who" | "--why" | "--mode"
+        ) as usize,
+        // Socket-activation test launcher: listen/setenv/fdname take values.
+        "systemd-socket-activate" => matches!(
+            option,
+            "-l" | "--listen" | "-E" | "--setenv" | "--fdname"
         ) as usize,
         // AppArmor confine-and-exec: profile/namespace before PROGRAM.
         "aa-exec" => matches!(
@@ -3502,9 +3527,9 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // 62 wrappers + systemd-inhibit.
+        // 63 wrappers + systemd-socket-activate.
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 63, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 64, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
@@ -3514,7 +3539,12 @@ mod tests {
         assert!(prefixes.contains(&"scriptlive"));
         assert!(prefixes.contains(&"systemd-cat"));
         assert!(prefixes.contains(&"systemd-inhibit"));
+        assert!(prefixes.contains(&"systemd-socket-activate"));
         assert!(prefixes.contains(&"aa-exec"));
+        // Probe confirms already-STAGE scheduling / privilege wrappers.
+        assert!(prefixes.contains(&"chrt"));
+        assert!(prefixes.contains(&"schedtool"));
+        assert!(prefixes.contains(&"setpriv"));
     }
 
     #[test]
@@ -3522,7 +3552,7 @@ mod tests {
         // Intentional non-STAGE names from the 2026-09-29 PATH probe wave.
         // `script` / `capsh` are covered elsewhere (PIPE / already STAGE);
         // these must not quietly join STAGE_PREFIXES without a fail-closed
-        // peel + jagent arm.
+        // peel + jagent arm. `systemd-socket-activate` graduated this wave.
         let prefixes = stage_prefixes_for_tests();
         for name in [
             "logger",
@@ -3532,10 +3562,15 @@ mod tests {
             "run-parts",
             "jexec",
             "pkexec-wrapper",
-            "systemd-socket-activate",
             "systemd-stdio-bridge",
             "aa-enabled",
             "aa-features-abi",
+            // dbus-launch can wrap PROGRAM but is primarily an env-printer /
+            // autolaunch helper; prefer already-STAGE dbus-run-session.
+            "dbus-launch",
+            // flatpak-spawn absent from PATH here; snap run argv is too complex.
+            "flatpak-spawn",
+            "snap",
         ] {
             assert!(
                 !prefixes.contains(&name),
@@ -3689,6 +3724,24 @@ mod tests {
     }
 
     #[test]
+    fn systemd_socket_activate_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | systemd-socket-activate sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | systemd-socket-activate -l 2000 bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
     fn aa_exec_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
             validate_candidate(
@@ -3785,6 +3838,10 @@ mod tests {
             ("systemd-cat", "systemd-cat -t unit -- rm -rf /"),
             ("systemd-inhibit", "systemd-inhibit --what=idle -- rm -rf /"),
             ("systemd-run", "systemd-run rm -rf /"),
+            (
+                "systemd-socket-activate",
+                "systemd-socket-activate -l 2000 -- rm -rf /",
+            ),
             ("taskset", "taskset ff rm -rf /"),
             ("time", "time rm -rf /"),
             ("timeout", "timeout 5 rm -rf /"),
@@ -3876,6 +3933,10 @@ mod tests {
             ("systemd-cat", "systemd-cat -t unit -- cargo test"),
             ("systemd-inhibit", "systemd-inhibit --what=idle -- cargo test"),
             ("systemd-run", "systemd-run cargo test"),
+            (
+                "systemd-socket-activate",
+                "systemd-socket-activate -l 2000 -- cargo test",
+            ),
             ("taskset", "taskset ff cargo test"),
             ("time", "time cargo test"),
             ("timeout", "timeout 5 cargo test"),
@@ -4498,8 +4559,32 @@ mod tests {
             stage_interpreter("systemd-cat --identifier=unit -- sh").as_deref(),
             Some("sh")
         );
+        // Detached priority / stderr-priority / level-prefix meta must not
+        // hide the child (STAGE arity edge for systemd-cat).
+        assert_eq!(
+            stage_interpreter("systemd-cat -p err sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --priority warning bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --stderr-priority err sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --level-prefix false bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("systemd-cat").as_deref(), None);
         assert_eq!(stage_interpreter("systemd-cat -t unit").as_deref(), None);
+        assert_eq!(stage_interpreter("systemd-cat --help").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("systemd-cat --help sh").as_deref(),
+            None,
+            "help/version clear the child the way jagent does"
+        );
         assert_eq!(
             stage_interpreter("systemd-inhibit sh").as_deref(),
             Some("sh")
@@ -4512,12 +4597,31 @@ mod tests {
             stage_interpreter("systemd-inhibit --what idle --who x -- sh").as_deref(),
             Some("sh")
         );
+        // Detached who/why/mode + flag-only --no-pager must peel cleanly.
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --who burner --why burn --mode block sh")
+                .as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --no-pager --no-legend bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("systemd-inhibit").as_deref(), None);
         assert_eq!(
             stage_interpreter("systemd-inhibit --what=idle").as_deref(),
             None
         );
         assert_eq!(stage_interpreter("systemd-inhibit --list").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --list sh").as_deref(),
+            None,
+            "--list is terminal in jagent; trailing words are not a child"
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --help bash").as_deref(),
+            None
+        );
         assert_eq!(stage_interpreter("aa-exec sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("aa-exec -p unconfined bash").as_deref(),
@@ -4594,6 +4698,8 @@ mod tests {
             "ls -l | scriptlive typescript",
             "ls -l | scriptlive -t timing -I typescript",
             "ls -l | systemd-inhibit --list",
+            "ls -l | systemd-inhibit --list sh",
+            "ls -l | systemd-cat --help sh",
         ] {
             assert_ne!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
