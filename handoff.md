@@ -4,7 +4,7 @@ Updated: 2026-09-29 (point pending tip note at HEAD after rounds 187/235 final a
 
 ## 2026-09-29 (point pending tip — rounds 187/235 final align)
 
-- Pending tip note remains current at HEAD `e337e28` after STAGE 71 hold
+- Pending tip note remains current at HEAD `0a637a7` after STAGE 71 hold
   beside sticky FE07/FE06/MAX-6/GuardRecovery and round-53 smoke.
 
 Updated: 2026-09-29 (point pending tip at HEAD after wave-35 / round-54 final align)
