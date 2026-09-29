@@ -1,5 +1,21 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): output_notice round-trip + error→Watch None
+
+## 2026-09-29 (wave): output_notice parse/as_str/tooltip round-trip
+
+Pin `parse_as_str_and_tooltip_round_trip_every_variant_and_reject_blank` so every
+`FinishedOutputNotice` survives parse↔as_str↔tooltip and blank/whitespace
+strings stay out of the known set. **Pending push/repin**.
+
+## 2026-09-29 (wave): Inspect/SitNear/Unknown→Watch* stay None
+
+Error/unknown holds settle to Idle/Rest/Celebrate/Guard — a new command
+mid-hold snaps into Watch* without bridge frames. Pin
+`error_and_unknown_holds_never_bridge_to_watch_poses` beside Celebrate*/Rest/
+Recovery→Watch*. `between()` stays **90**. PATH leftovers also name
+`uclampset` / `gamemoderun` beside STAGE 68. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): fail-closed deepen — nest + transparency partition
 
 ## 2026-09-29 (wave): fail-closed deepen — nest + transparency partition
