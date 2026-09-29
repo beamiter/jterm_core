@@ -1,5 +1,24 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): Inspect→SitNear bridge + vigil→Watch None (91)
+
+## 2026-09-29 (wave): InspectError→SitNearError VisualTransition (91)
+
+Survey leftover reducer-reachable `between` Nones after the hold-overwrite
+wave: a second open failure finish-overwriting Inspect without Watch snapped.
+Animate `InspectErrorToSitNearError` (90→**91**). Recount pin
+`visual_transition_between_recognizes_ninety_one_intentional_arcs`. STAGE
+membership / DISPATCHES / CLASSIFY_FORMS still assert `len == 70`.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): Failure/Stuck/Cautious→Watch* + tier overwrite Nones
+
+Expand Rest/Recovery→Watch* into `rest_and_repo_vigil_never_bridge_to_watch_poses`
+so Failure/Stuck/Cautious (idle_reaction before `command_started`) stay None.
+Pin `sit_near_and_celebrate_tier_overwrites_stay_none` for SitNear→Inspect and
+Celebrate↔CelebrateBig (no reducer story; Inspect→SitNear animates).
+`between()` is **91**. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): uclampset/gamemoderun STAGE arity edges
 
 ## 2026-09-29 (wave): uclampset / gamemoderun STAGE arity edges
