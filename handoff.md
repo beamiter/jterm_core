@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave: shared output_notice + xargs slot-var arity)
+Updated: 2026-09-29 (organism: celebrate-hold relapse bridges)
+
+## 2026-09-29 (organism evolve): celebrate-hold relapse continuity
+
+Sibling sync during Celebrate/CelebrateBig can retarget idle vigil to
+Failure/Stuck. Recovery/Cautious settles already animated; added
+`Celebrate{,Big}→{GuardFailure,GuardStuck}` with the same 4-frame bbox
+contract. `celebrate_hold_relapse_settle_has_full_motion_bridges` drives
+Celebrate + relapse → Failure.
 
 ## 2026-09-29 (wave): shared finished-block output_notice
 

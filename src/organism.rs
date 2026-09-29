@@ -347,6 +347,32 @@ const CELEBRATE_BIG_TO_CAUTIOUS_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ?.o ) [~ ]\n /|_|\\",
     " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
 ];
+// Celebrate hold relapse: sibling sync reopens failures while arms are still
+// up. Recovery/Cautious settles already animate; Failure/Stuck must not snap.
+const CELEBRATE_TO_FAILURE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <     ",
+    " /\\_/\\      \n ( ^.^ )    \n  > ^ <     ",
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( o.o ) [! ]\n /|_|\\",
+];
+const CELEBRATE_TO_STUCK_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <     ",
+    " /\\_/\\      \n ( ^.^ )    \n  > ^ <     ",
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+];
+const CELEBRATE_BIG_TO_FAILURE_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *   ",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <     ",
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( o.o ) [! ]\n /|_|\\",
+];
+const CELEBRATE_BIG_TO_STUCK_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *   ",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <     ",
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+];
 const RECOVERY_TO_REST_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
     " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
@@ -522,8 +548,12 @@ pub enum VisualTransition {
     WatchSettledToCelebrateBig,
     CelebrateToGuardRecovery,
     CelebrateToGuardCautious,
+    CelebrateToGuardFailure,
+    CelebrateToGuardStuck,
     CelebrateBigToGuardRecovery,
     CelebrateBigToGuardCautious,
+    CelebrateBigToGuardFailure,
+    CelebrateBigToGuardStuck,
     GuardRecoveryToGuardFailure,
     GuardRecoveryToGuardStuck,
     GuardRecoveryToGuardCautious,
@@ -579,12 +609,18 @@ impl VisualTransition {
             }
             (Behavior::Celebrate, Behavior::GuardRecovery) => Some(Self::CelebrateToGuardRecovery),
             (Behavior::Celebrate, Behavior::GuardCautious) => Some(Self::CelebrateToGuardCautious),
+            (Behavior::Celebrate, Behavior::GuardFailure) => Some(Self::CelebrateToGuardFailure),
+            (Behavior::Celebrate, Behavior::GuardStuck) => Some(Self::CelebrateToGuardStuck),
             (Behavior::CelebrateBig, Behavior::GuardRecovery) => {
                 Some(Self::CelebrateBigToGuardRecovery)
             }
             (Behavior::CelebrateBig, Behavior::GuardCautious) => {
                 Some(Self::CelebrateBigToGuardCautious)
             }
+            (Behavior::CelebrateBig, Behavior::GuardFailure) => {
+                Some(Self::CelebrateBigToGuardFailure)
+            }
+            (Behavior::CelebrateBig, Behavior::GuardStuck) => Some(Self::CelebrateBigToGuardStuck),
             (Behavior::GuardRecovery, Behavior::GuardFailure) => {
                 Some(Self::GuardRecoveryToGuardFailure)
             }
@@ -632,10 +668,14 @@ impl VisualTransition {
             Self::WatchSettledToCelebrate | Self::WatchSettledToCelebrateBig => {
                 Behavior::WatchSettled
             }
-            Self::CelebrateToGuardRecovery | Self::CelebrateToGuardCautious => Behavior::Celebrate,
-            Self::CelebrateBigToGuardRecovery | Self::CelebrateBigToGuardCautious => {
-                Behavior::CelebrateBig
-            }
+            Self::CelebrateToGuardRecovery
+            | Self::CelebrateToGuardCautious
+            | Self::CelebrateToGuardFailure
+            | Self::CelebrateToGuardStuck => Behavior::Celebrate,
+            Self::CelebrateBigToGuardRecovery
+            | Self::CelebrateBigToGuardCautious
+            | Self::CelebrateBigToGuardFailure
+            | Self::CelebrateBigToGuardStuck => Behavior::CelebrateBig,
             Self::GuardRecoveryToGuardFailure
             | Self::GuardRecoveryToGuardStuck
             | Self::GuardRecoveryToGuardCautious
@@ -653,30 +693,32 @@ impl VisualTransition {
             | Self::SitNearErrorToGuardFailure
             | Self::GuardStuckToGuardFailure
             | Self::GuardRecoveryToGuardFailure
-            | Self::GuardCautiousToGuardFailure => Behavior::GuardFailure,
+            | Self::GuardCautiousToGuardFailure
+            | Self::CelebrateToGuardFailure
+            | Self::CelebrateBigToGuardFailure => Behavior::GuardFailure,
             Self::SitNearErrorToGuardStuck
             | Self::InspectErrorToGuardStuck
             | Self::GuardFailureToGuardStuck
             | Self::GuardRecoveryToGuardStuck
-            | Self::GuardCautiousToGuardStuck => Behavior::GuardStuck,
+            | Self::GuardCautiousToGuardStuck
+            | Self::CelebrateToGuardStuck
+            | Self::CelebrateBigToGuardStuck => Behavior::GuardStuck,
             Self::InspectErrorToGuardRecovery
             | Self::SitNearErrorToGuardRecovery
             | Self::GuardFailureToGuardRecovery
             | Self::GuardStuckToGuardRecovery
-            | Self::GuardCautiousToGuardRecovery => Behavior::GuardRecovery,
+            | Self::GuardCautiousToGuardRecovery
+            | Self::CelebrateToGuardRecovery
+            | Self::CelebrateBigToGuardRecovery => Behavior::GuardRecovery,
             Self::InspectErrorToGuardCautious
             | Self::SitNearErrorToGuardCautious
             | Self::GuardFailureToGuardCautious
             | Self::GuardStuckToGuardCautious
-            | Self::GuardRecoveryToGuardCautious => Behavior::GuardCautious,
+            | Self::GuardRecoveryToGuardCautious
+            | Self::CelebrateToGuardCautious
+            | Self::CelebrateBigToGuardCautious => Behavior::GuardCautious,
             Self::WatchSettledToCelebrate => Behavior::Celebrate,
             Self::WatchSettledToCelebrateBig => Behavior::CelebrateBig,
-            Self::CelebrateToGuardRecovery | Self::CelebrateBigToGuardRecovery => {
-                Behavior::GuardRecovery
-            }
-            Self::CelebrateToGuardCautious | Self::CelebrateBigToGuardCautious => {
-                Behavior::GuardCautious
-            }
             Self::GuardRecoveryToRestAfterPush | Self::GuardCautiousToRestAfterPush => {
                 Behavior::RestAfterPush
             }
@@ -714,8 +756,12 @@ impl VisualTransition {
             Self::WatchSettledToCelebrateBig => SETTLED_TO_CELEBRATE_BIG_FRAMES[index],
             Self::CelebrateToGuardRecovery => CELEBRATE_TO_RECOVERY_FRAMES[index],
             Self::CelebrateToGuardCautious => CELEBRATE_TO_CAUTIOUS_FRAMES[index],
+            Self::CelebrateToGuardFailure => CELEBRATE_TO_FAILURE_FRAMES[index],
+            Self::CelebrateToGuardStuck => CELEBRATE_TO_STUCK_FRAMES[index],
             Self::CelebrateBigToGuardRecovery => CELEBRATE_BIG_TO_RECOVERY_FRAMES[index],
             Self::CelebrateBigToGuardCautious => CELEBRATE_BIG_TO_CAUTIOUS_FRAMES[index],
+            Self::CelebrateBigToGuardFailure => CELEBRATE_BIG_TO_FAILURE_FRAMES[index],
+            Self::CelebrateBigToGuardStuck => CELEBRATE_BIG_TO_STUCK_FRAMES[index],
             Self::GuardRecoveryToGuardFailure => RECOVERY_TO_FAILURE_FRAMES[index],
             Self::GuardRecoveryToGuardStuck => RECOVERY_TO_STUCK_FRAMES[index],
             Self::GuardRecoveryToGuardCautious => RECOVERY_TO_CAUTIOUS_FRAMES[index],
@@ -3037,8 +3083,12 @@ mod tests {
             VisualTransition::WatchSettledToCelebrateBig,
             VisualTransition::CelebrateToGuardRecovery,
             VisualTransition::CelebrateToGuardCautious,
+            VisualTransition::CelebrateToGuardFailure,
+            VisualTransition::CelebrateToGuardStuck,
             VisualTransition::CelebrateBigToGuardRecovery,
             VisualTransition::CelebrateBigToGuardCautious,
+            VisualTransition::CelebrateBigToGuardFailure,
+            VisualTransition::CelebrateBigToGuardStuck,
             VisualTransition::GuardRecoveryToGuardFailure,
             VisualTransition::GuardRecoveryToGuardStuck,
             VisualTransition::GuardRecoveryToGuardCautious,
@@ -3153,6 +3203,34 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::GuardCautious, Behavior::GuardFailure),
             Some(VisualTransition::GuardCautiousToGuardFailure)
+        );
+    }
+
+    #[test]
+    fn celebrate_hold_relapse_settle_has_full_motion_bridges() {
+        let mut organism = NativeOrganism::default();
+        organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        let cele = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(cele.behavior, Behavior::Celebrate);
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardRecovery);
+
+        assert!(organism.sync_repo_work_state(RepoWorkState::new(1, false, 1)));
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardFailure);
+        assert_eq!(
+            VisualTransition::between(cele.behavior, Behavior::GuardFailure),
+            Some(VisualTransition::CelebrateToGuardFailure)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::GuardStuck),
+            Some(VisualTransition::CelebrateToGuardStuck)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardFailure),
+            Some(VisualTransition::CelebrateBigToGuardFailure)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::GuardStuck),
+            Some(VisualTransition::CelebrateBigToGuardStuck)
         );
     }
 
