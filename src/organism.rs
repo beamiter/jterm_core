@@ -5546,6 +5546,32 @@ mod tests {
         }
     }
 
+    /// Survey leftover beside WatchSettled finish arcs (6 Some inside between()
+    /// 93): live watches never invent bridges into ambient utility poses —
+    /// Explore/Sleep/Approach arrive from ambient mind rescoring, not from a
+    /// Watch* finish. Pin `None` so Watch*→ambient cannot land beside the
+    /// ambient→Watch* Nones already covered.
+    #[test]
+    fn watch_poses_never_bridge_to_ambient_utility() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [
+                Behavior::Explore,
+                Behavior::Sleep,
+                Behavior::Approach,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None (ambient via mind, not Watch*)"
+                );
+            }
+        }
+    }
+
     /// Repo vigil poses push or escalate among themselves — they do not celebrate.
     /// Celebrations come from command-finish on error holds. Pin `None` so a
     /// Guard*→Celebrate* bridge cannot appear beside Celebrate→Guard*.
@@ -6119,7 +6145,8 @@ mod tests {
         // Recount pin: anvil/forge `semantic_bridges_run_only_in_full_motion`
         // must stay in lockstep with this Some count (93 intentional arcs —
         // Inspect/SitNear→UnknownOutcome error-hold missing-exit overwrites;
-        // CelebrateBig finish table pinned separately stays inside the count).
+        // CelebrateBig finish table + WatchSettled finish arcs (6 Some) stay
+        // inside the count — UI lists already name all six WatchSettled→*).
         let mut count = 0usize;
         for from in [
             Behavior::Idle,
