@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave: rlwrap STAGE_PREFIXES)
+Updated: 2026-09-29 (organism: WatchCommand/WatchAgent finish bridges)
+
+## 2026-09-29 (organism evolve): WatchCommand/WatchAgent finish continuity
+
+`WatchCommand→{Celebrate,CelebrateBig,InspectError,SitNearError,RestAfterPush}`
+and `WatchAgent→{Celebrate,InspectError,SitNearError}` Full-motion bridges so a
+finish during live watch does not snap. Tests:
+`watch_command_and_agent_finish_have_full_motion_bridges`.
 
 ## 2026-09-29 (wave): rlwrap STAGE_PREFIXES
 
