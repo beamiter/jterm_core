@@ -1,6 +1,39 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): PATH-probe leftovers for s6-sudo / runit helpers
+Updated: 2026-09-29 (wave): Celebrate*/Rest/GuardRecovery hold overwrites (90)
+
+## 2026-09-29 (wave): Celebrate*/Rest/GuardRecovery hold-overwrite VisualTransition (90)
+
+Survey leftover `between` Nones on reducer-reachable hold overwrites:
+Celebrate*/RestAfterPush still showing when another finish lands, and
+GuardRecovery still showing when a finish lands without Watch. Those
+fourteen bridges (76→**90**). Rest/GuardRecovery→Watch* stay intentional
+None (new command mid-hold, same as Celebrate→Watch). Pin
+`visual_transition_between_recognizes_ninety_intentional_arcs`.
+Core tip still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): utf8 scan prefix zero-budget pin
+
+## 2026-09-29 (wave): utf8 scan prefix zero-budget / partial code point
+
+`utf8_scan_prefix_zero_budget_and_partial_code_point_stay_empty` pins
+`utf8_prefix` at 0 bytes and a 3-byte `char` under a 1–2 byte cap so a
+scan slice cannot emit a split code point. Pairs anvil/forge find empty-
+reason edge pins. **Pending push/repin**.
+
+Updated: 2026-09-29 (wave): classify peels `--` before s6-setuidgid account
+
+## 2026-09-29 (wave): classify peels `--` / daemonize flags / leftover s6 helpers
+
+`classify_command` now consumes optional `--` before the `setuidgid` /
+`s6-setuidgid` account positional (same skip as other wrappers) so
+`s6-setuidgid -- nobody cargo test` is BuildOrTest. Daemonize flag-only
+`-a`/`-v`/`--verbose` stay out of the value table (must not eat the child).
+PATH leftover pin adds `s6-envdir` / `s6-envuidgid` / `s6-applyuidgid` /
+`s6-log` beside `s6-sudo` / runit (STAGE stays **67**). Nested
+daemonize+setlock+s6-setuidgid classify depth pin. Find leftover:
+`utf8_prefix` zero-budget / partial-code-point stays empty. Core/jagent tips
+still **pending push/repin**.
 
 ## 2026-09-29 (wave): PATH-probe leftovers (s6-sudo / multilog / runit)
 
