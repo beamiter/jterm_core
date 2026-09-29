@@ -1342,7 +1342,17 @@ fn stage_interpreter(stage: &str) -> Option<String> {
             }
             continue;
         }
-        if is_assignment_word(word) || word.chars().all(|character| character.is_ascii_digit()) {
+        // util-linux `flock [options] FD` locks a descriptor and runs no child
+        // (jagent clears the rest of argv the same way). A bare number under
+        // any other prefix is meta (`timeout 5 sh`) and must still be skipped.
+        if word.chars().all(|character| character.is_ascii_digit()) {
+            if active_prefix.is_some_and(prefix_takes_positional_lockfile) {
+                return None;
+            }
+            index += 1;
+            continue;
+        }
+        if is_assignment_word(word) {
             index += 1;
             continue;
         }
@@ -3870,6 +3880,17 @@ mod tests {
             stage_interpreter("flock -w 1 /tmp/lock bash").as_deref(),
             Some("bash")
         );
+        // FD-only form has no child — including when junk follows the FD, which
+        // util-linux / jagent also refuse to treat as a dispatched program.
+        assert_eq!(stage_interpreter("flock 9").as_deref(), None);
+        assert_eq!(stage_interpreter("flock -n 9").as_deref(), None);
+        assert_eq!(stage_interpreter("flock 9 sh").as_deref(), None);
+        // Query / help modes: no PROGRAM word, so no interpreter.
+        assert_eq!(stage_interpreter("numactl --show").as_deref(), None);
+        assert_eq!(stage_interpreter("numactl -s").as_deref(), None);
+        assert_eq!(stage_interpreter("numactl --hardware").as_deref(), None);
+        assert_eq!(stage_interpreter("firejail --help").as_deref(), None);
+        assert_eq!(stage_interpreter("firejail --version").as_deref(), None);
         assert_eq!(stage_interpreter("eatmydata -- sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("chronic -e bash").as_deref(),
@@ -3998,6 +4019,23 @@ mod tests {
             "ls -l | proxychains3 -f /etc/proxychains.conf sh",
         ] {
             assert_eq!(
+                validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
+                Err(CorrectionRejection::AddsPipeToInterpreter),
+                "{candidate}"
+            );
+        }
+        // Terminal / query forms of the same wrappers must not be mistaken for
+        // pipe-to-interpreter just because the wrapper name is a STAGE_PREFIX.
+        for candidate in [
+            "ls -l | flock 9",
+            "ls -l | flock -n 9",
+            "ls -l | flock 9 sh",
+            "ls -l | numactl --show",
+            "ls -l | numactl -s",
+            "ls -l | firejail --help",
+            "ls -l | firejail --version",
+        ] {
+            assert_ne!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
                 Err(CorrectionRejection::AddsPipeToInterpreter),
                 "{candidate}"

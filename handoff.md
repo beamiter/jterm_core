@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): WatchAgent/WatchSettled→RestAfterPush + annotate-output
+Updated: 2026-09-29 (wave): flock FD-only + wrapper terminal regressions
+
+## 2026-09-29 (wave): flock FD-only + wrapper terminal regressions
+
+`stage_interpreter` treats util-linux `flock [options] FD` as having no child
+(matching jagent), so `| flock 9` / `| flock 9 sh` are not false
+pipe-to-interpreter hits. Regression coverage for `numactl --show` / `-s` and
+`firejail --help` / `--version` terminal forms. No new STAGE_PREFIXES:
+jagent wrappers already mirrored; `strace`/`perf` stay out (jagent does not
+strip them). jagent unchanged this wave (ionice/schedtool/cgexec already done).
 
 ## 2026-09-29 (wave): WatchAgent/WatchSettled→RestAfterPush bridges
 
