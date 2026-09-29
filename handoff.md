@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — wave-34 deepen)
+
+## 2026-09-29 (pending tip — wave-34 deepen)
+
+- Local HEAD path-patch-only after PATH wave-34 block/mount leftovers out of
+  STAGE and taskset/choom/prlimit busybox + timeout/nice deepen beside
+  CrossBlock near-near-near-near-wrap. jagent `fd1661d` sits beside. STAGE **71** /
+  between() **93** unchanged. Push/repin cohort still pending.
+
+
 Updated: 2026-09-29 (wave): taskset/choom/prlimit deepen + STAGE 71 held
 
 ## 2026-09-29 (wave): taskset / choom / prlimit STAGE arity / pipe deepen
