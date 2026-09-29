@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): classify_command fakeroot/proot/firejail
+Updated: 2026-09-29 (wave A): shared CrossBlockSearchCursor
+
+## 2026-09-29 (wave A): shared CrossBlockSearchCursor
+
+Partial lift of the cross-block palette resume contract into
+[`cross_block_search`]: `CrossBlockSearchCursor` /
+`CrossBlockSearchMidRecord`, `cross_block_search_continue_is_current`, and the
+`CROSS_BLOCK_SCAN_*` / `CROSS_BLOCK_REGEX_SIZE_LIMIT` constants. GTK idle
+scheduling, `CrossBlockSearchReport`/`CrossBlockHit`, and `FindScanBudget`
+(shared with live Find) stay in anvil/forge — hit rows differ and the budget
+type is entangled with Find overlay limits. **Pending push/repin**.
 
 ## 2026-09-29 (wave): classify_command fakeroot/proot/firejail
 

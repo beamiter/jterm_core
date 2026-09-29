@@ -17,6 +17,7 @@ pub mod child_env;
 pub mod click_cursor;
 pub mod command_correction;
 pub mod command_history;
+pub mod cross_block_search;
 pub mod execution_journal;
 pub mod exit_status;
 pub mod git_meta;
