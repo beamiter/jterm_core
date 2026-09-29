@@ -1,5 +1,30 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): PATH wave-30 ctl/notify leftovers + WatchSettled finish + CrossBlock wrap
+
+## 2026-09-29 (wave): PATH probe wave-30 systemd ctl/notify leftovers stay out
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-30 `systemctl` /
+`busctl` / `journalctl` / `timedatectl` / `resolvectl` / `systemd-notify` /
+`systemd-mount` / `chvt` / `aa-status` as intentional non-STAGE beside STAGE
+`systemd-*` / `openvt` / `aa-exec`. (`systemctl` already classifies state
+disruption directly in jagent — still not a STAGE peeler.) Membership stays
+**71**. **Pending push/repin**.
+
+## 2026-09-29 (wave): WatchSettled finish arcs (6 Some)
+
+`watch_settled_finish_arcs_cover_pass_fail_rest_and_idle` pins the six
+WatchSettled→Celebrate{,Big}/Inspect/Sit/Rest/Idle Some bridges and keeps
+UnknownOutcome intentional None. `between()` stays **93**.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): CrossBlockSearchCursor cancel live-wrapping-ahead edge
+
+`continue_idle_resume_edges_drop_stale_or_finished_walks` pins live wrapping
+ahead of scheduled (`0` vs `u64::MAX`) as cancel — with or without a resume —
+the reverse of the MAX→0 schedule bump. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): daemonize/setlock busybox arity + DISPATCHES set-eq
 
 ## 2026-09-29 (wave): daemonize/setlock/s6 busybox STAGE arity / pipe deepen
