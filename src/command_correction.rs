@@ -1219,6 +1219,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "fakeroot",
     "firejail",
     "flock",
+    "gnome-session-inhibit",
     "gosu",
     "ionice",
     "nice",
@@ -1484,6 +1485,9 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         .map(|long| long.split_once('=').map_or(long, |(name, _)| name))
         .or_else(|| option.strip_prefix('-').filter(|flags| flags.len() == 1));
     match (prefix, spelling) {
+        ("gnome-session-inhibit", Some("list" | "inhibit-only" | "help" | "version" | "h" | "l")) => {
+            true
+        }
         ("systemd-inhibit", Some("list" | "help" | "version" | "h")) => true,
         ("systemd-cat", Some("help" | "version" | "h")) => true,
         ("firejail", Some("help" | "version")) => true,
@@ -1685,6 +1689,10 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         ) as usize,
         // Inhibit-lock launcher: what/who/why/mode meta before COMMAND.
         // `--list` is flag-only (terminal in jagent); no detached value.
+        "gnome-session-inhibit" => matches!(
+            option,
+            "--app-id" | "--reason" | "--inhibit"
+        ) as usize,
         "systemd-inhibit" => matches!(
             option,
             "--what" | "--who" | "--why" | "--mode"
@@ -3565,9 +3573,10 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // 64 wrappers + daemonize / setlock / s6-setuidgid.
+        // Membership pin: len == 68 after gnome-session-inhibit (was 67 after
+        // wave-23 daemonize / setlock / s6-setuidgid).
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 67, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 68, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
@@ -3577,6 +3586,7 @@ mod tests {
         assert!(prefixes.contains(&"scriptlive"));
         assert!(prefixes.contains(&"systemd-cat"));
         assert!(prefixes.contains(&"systemd-inhibit"));
+        assert!(prefixes.contains(&"gnome-session-inhibit"));
         assert!(prefixes.contains(&"systemd-socket-activate"));
         assert!(prefixes.contains(&"aa-exec"));
         // Probe confirms already-STAGE scheduling / privilege wrappers.
@@ -3587,9 +3597,64 @@ mod tests {
         assert!(prefixes.contains(&"firejail"));
         assert!(prefixes.contains(&"softlimit"));
         assert!(prefixes.contains(&"setuidgid"));
+        // Wave-23 triple — keep named so a quiet drop fails membership.
         assert!(prefixes.contains(&"daemonize"));
         assert!(prefixes.contains(&"setlock"));
         assert!(prefixes.contains(&"s6-setuidgid"));
+    }
+
+    /// STAGE names that jagent does **not** peel inside
+    /// `select_execution_wrappers_mode` are intentional: shell prefixes live in
+    /// `select_shell_command_mode`, privilege names go through
+    /// `is_privilege_dispatcher`, and a few keep dedicated scanners. Conversely,
+    /// jagent strips `unshare` / `nsenter` but those stay [`PIPE_INTERPRETERS`]
+    /// (bare form drops into a shell) — not STAGE. DISPATCHES still requires
+    /// every STAGE name to flag danger via `is_dangerous`.
+    #[test]
+    fn stage_prefix_jagent_transparency_surfaces_stay_partitioned() {
+        let prefixes = stage_prefixes_for_tests();
+        assert_eq!(prefixes.len(), 68, "{prefixes:?}");
+        for name in ["daemonize", "setlock", "s6-setuidgid", "gnome-session-inhibit"] {
+            assert!(
+                prefixes.contains(&name),
+                "{name} must remain STAGE (select_execution_wrappers_mode peels it)"
+            );
+        }
+        // Intentional PIPE-only (jagent strips them; pipe scan must stop).
+        for name in ["unshare", "nsenter"] {
+            assert!(
+                PIPE_INTERPRETERS.contains(&name),
+                "{name} must stay PIPE_INTERPRETERS"
+            );
+            assert!(
+                !prefixes.contains(&name),
+                "{name} must not migrate into STAGE_PREFIXES"
+            );
+        }
+        // STAGE names handled outside select_execution_wrappers_mode — still
+        // transparent through is_dangerous (DISPATCHES sibling covers forms).
+        for form in [
+            "sudo rm -rf /",
+            "sudoedit /etc/hosts",
+            "doas rm -rf /",
+            "pkexec rm -rf /",
+            "su -c 'rm -rf /'",
+            "runuser -u root -- rm -rf /",
+            "run0 rm -rf /",
+            "gosu root rm -rf /",
+            "su-exec root rm -rf /",
+            "command rm -rf /",
+            "exec rm -rf /",
+            "env FOO=1 rm -rf /",
+            "capsh -- -c 'rm -rf /'",
+            "xargs rm -rf /",
+            "start-stop-daemon --start --exec /bin/rm -- -rf /",
+        ] {
+            assert!(
+                crate::agent::is_dangerous(form).is_some(),
+                "non-wrapper STAGE surface must still flag `{form}`"
+            );
+        }
     }
 
     #[test]
@@ -3629,6 +3694,10 @@ mod tests {
             "runsv",
             "runsvdir",
             "sv",
+            // util-linux scheduling twin of choom; teach fail-closed before STAGE.
+            "uclampset",
+            // GameMode env launcher — argv is the child, but not taught yet.
+            "gamemoderun",
         ] {
             assert!(
                 !prefixes.contains(&name),
@@ -3835,6 +3904,24 @@ mod tests {
     }
 
     #[test]
+    fn gnome_session_inhibit_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | gnome-session-inhibit sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | gnome-session-inhibit --inhibit idle bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
     fn systemd_cat_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
             validate_candidate(
@@ -4005,6 +4092,7 @@ mod tests {
             ("fakeroot", "fakeroot -- rm -rf /"),
             ("firejail", "firejail --noprofile rm -rf /"),
             ("flock", "flock /tmp/lock rm -rf /"),
+            ("gnome-session-inhibit", "gnome-session-inhibit --inhibit idle -- rm -rf /"),
             ("gosu", "gosu root rm -rf /"),
             ("ionice", "ionice -c3 rm -rf /"),
             ("nice", "nice -n 5 rm -rf /"),
@@ -4056,6 +4144,12 @@ mod tests {
             ("xargs", "xargs rm -rf /"),
             ("xvfb-run", "xvfb-run -a rm -rf /"),
         ];
+        assert_eq!(
+            DISPATCHES.len(),
+            STAGE_PREFIXES.len(),
+            "DISPATCHES must list exactly one form per STAGE_PREFIXES entry"
+        );
+        assert_eq!(STAGE_PREFIXES.len(), 68, "keep DISPATCHES in lockstep with membership pin");
         for prefix in STAGE_PREFIXES {
             let form = DISPATCHES
                 .iter()
@@ -4106,6 +4200,7 @@ mod tests {
             ("fakeroot", "fakeroot -- cargo test"),
             ("firejail", "firejail --noprofile cargo test"),
             ("flock", "flock /tmp/lock cargo test"),
+            ("gnome-session-inhibit", "gnome-session-inhibit --inhibit idle -- cargo test"),
             ("gosu", "gosu root cargo test"),
             ("ionice", "ionice -c3 cargo test"),
             ("nice", "nice -n 5 cargo test"),
@@ -4829,6 +4924,41 @@ mod tests {
             "help/version clear the child the way jagent does"
         );
         assert_eq!(
+            stage_interpreter("gnome-session-inhibit sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --inhibit idle bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --app-id x --reason y --inhibit idle -- sh")
+                .as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("gnome-session-inhibit").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --inhibit idle").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --list").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --list sh").as_deref(),
+            None,
+            "--list/--inhibit-only are terminal; trailing words are not a child"
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --inhibit-only bash").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --help bash").as_deref(),
+            None
+        );
+        assert_eq!(
             stage_interpreter("systemd-inhibit sh").as_deref(),
             Some("sh")
         );
@@ -4918,6 +5048,8 @@ mod tests {
             "ls -l | scriptlive -c bash typescript",
             "ls -l | systemd-cat sh",
             "ls -l | systemd-cat -t unit bash",
+            "ls -l | gnome-session-inhibit sh",
+            "ls -l | gnome-session-inhibit --inhibit idle bash",
             "ls -l | systemd-inhibit sh",
             "ls -l | systemd-inhibit --what=idle bash",
             "ls -l | aa-exec sh",
@@ -4952,6 +5084,10 @@ mod tests {
             "ls -l | scriptlive -t timing -I typescript",
             "ls -l | systemd-inhibit --list",
             "ls -l | systemd-inhibit --list sh",
+            "ls -l | gnome-session-inhibit --list",
+            "ls -l | gnome-session-inhibit --list sh",
+            "ls -l | gnome-session-inhibit --inhibit-only",
+            "ls -l | gnome-session-inhibit --inhibit-only bash",
             "ls -l | systemd-cat --help sh",
         ] {
             assert_ne!(
