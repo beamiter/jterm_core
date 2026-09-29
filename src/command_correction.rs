@@ -3819,6 +3819,16 @@ mod tests {
             "update-rc.d",
             "invoke-rc.d",
             "docker",
+            // Wave-33 PATH leftovers: device/audio/print/sysctl managers beside
+            // STAGE peelers and wave-30/31/32 ctl leftovers (jagent pin
+            // `path_probe_device_sys_ctl_leftovers_do_not_invent_a_child_peel`).
+            // CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "alsactl",
+            "cupsctl",
+            "pccardctl",
+            "rtkitctl",
+            "zramctl",
+            "sysctl",
         ] {
             assert!(
                 !prefixes.contains(&name),
