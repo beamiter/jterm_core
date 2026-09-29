@@ -3792,6 +3792,28 @@ mod tests {
             "aa-teardown",
             "aa-remove-unknown",
             "apparmor_status",
+            // Wave-32 PATH leftovers: more D-Bus/*ctl managers, SysV rc/service
+            // helpers, and docker (container CLI with its own scanners) beside
+            // STAGE peelers and wave-30/31 ctl leftovers (jagent pin
+            // `path_probe_ctl_service_leftovers_do_not_invent_a_child_peel`).
+            // `service` already classifies state disruption directly; `docker`
+            // has engine scanners — both stay out of STAGE like wave-30
+            // `systemctl`. CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "bluetoothctl",
+            "boltctl",
+            "grdctl",
+            "obexctl",
+            "oomctl",
+            "pactl",
+            "powerprofilesctl",
+            "snapctl",
+            "switcherooctl",
+            "udisksctl",
+            "wdctl",
+            "service",
+            "update-rc.d",
+            "invoke-rc.d",
+            "docker",
         ] {
             assert!(
                 !prefixes.contains(&name),
