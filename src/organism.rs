@@ -3534,17 +3534,6 @@ mod tests {
                 "{command} must see through scheduling/lock wrappers"
             );
         }
-        // Nested wrappers over a non-build child must still reach Other.
-        assert_eq!(
-            classify_command("strace timeout 5 rm -rf /"),
-            CommandKind::Other,
-            "nested strace+timeout must still classify the rm child"
-        );
-        assert_eq!(
-            classify_command("timeout 5 strace rm -rf /tmp/x"),
-            CommandKind::Other,
-            "nested timeout+strace must still classify the rm child"
-        );
         for command in [
             "git push --dry-run",
             "git push origin main -n",
@@ -3574,6 +3563,30 @@ mod tests {
             "a bounded classifier must not publish when later options were truncated"
         );
         assert_eq!(classify_command("printf done"), CommandKind::Other);
+    }
+
+    /// Nested STAGE wrappers must consume depth slots so the child still
+    /// classifies (`strace timeout rm` → Other, not opaque strace).
+    #[test]
+    fn classify_command_peels_nested_strace_timeout_wrappers() {
+        assert_eq!(
+            classify_command("strace timeout 5 rm -rf /"),
+            CommandKind::Other,
+            "nested strace+timeout must still classify the rm child"
+        );
+        assert_eq!(
+            classify_command("timeout 5 strace rm -rf /tmp/x"),
+            CommandKind::Other,
+            "nested timeout+strace must still classify the rm child"
+        );
+        assert_eq!(
+            classify_command("strace -f timeout --signal=TERM 10 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("strace timeout 5 systemd-cat -t unit cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
     }
 
     #[test]
