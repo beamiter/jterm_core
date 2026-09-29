@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): systemd-cat/inhibit busybox arity + classify nests
+Updated: 2026-09-29 (wave): PATH wave-28 systemd inspectors + cat/inhibit deepen
+
+## 2026-09-29 (wave): PATH probe wave-28 systemd inspectors stay out
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-28
+`systemd-cgls` / `systemd-cgtop` / `systemd-analyze` / `systemd-path` /
+`systemd-escape` / `systemd-detect-virt` as intentional non-STAGE beside
+already-STAGE `systemd-inhibit` / `systemd-run` / `systemd-cat`. Probe also
+reconfirmed `cgexec`/`runuser`/`chrt`/`taskset` and both `*inhibit*` are
+STAGE; `openvt` deferred. Membership pin still asserts `len == 70`.
+**Pending push/repin**.
 
 ## 2026-09-29 (wave): systemd-cat/inhibit busybox arity + pipe deepen
 
