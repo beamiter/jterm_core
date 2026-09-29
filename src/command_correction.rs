@@ -1253,6 +1253,13 @@ const STAGE_PREFIXES: &[&str] = &[
     "xargs",
 ];
 
+/// Test-only view of [`STAGE_PREFIXES`] so count / membership pins do not
+/// re-list the table. Keep private to this module's `#[cfg(test)]` suite.
+#[cfg(test)]
+fn stage_prefixes_for_tests() -> &'static [&'static str] {
+    STAGE_PREFIXES
+}
+
 /// The stage name recorded for a program this engine cannot resolve statically
 /// — `| ${SHELL}`, `| $(which sh)`, `` | `cat p` ``. It is not a valid program
 /// name, so it can never equal a real one: an unresolvable stage is excused
@@ -3387,6 +3394,15 @@ mod tests {
     /// The test below probes bare names only, which is why it could not see
     /// that. This one probes the dispatcher form, so a prefix either module
     /// learns to step over must be taught to both.
+    #[test]
+    fn stage_prefixes_len_includes_bubblewrap_alias() {
+        // 54 wrappers + `bubblewrap` as argv0 alias of `bwrap`.
+        let prefixes = stage_prefixes_for_tests();
+        assert_eq!(prefixes.len(), 55, "{prefixes:?}");
+        assert!(prefixes.contains(&"bubblewrap"));
+        assert!(prefixes.contains(&"bwrap"));
+    }
+
     #[test]
     fn bubblewrap_ro_bind_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(

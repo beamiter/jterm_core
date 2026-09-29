@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): WatchAgent→CelebrateBig None pin
+Updated: 2026-09-29 (wave): STAGE_PREFIXES len == 55 after bubblewrap
+
+## 2026-09-29 (wave): STAGE_PREFIXES len == 55 after bubblewrap
+
+`stage_prefixes_for_tests` + `stage_prefixes_len_includes_bubblewrap_alias`
+assert [`STAGE_PREFIXES`] length is **55** after the `bubblewrap` argv0 alias
+(and that both `bubblewrap` and `bwrap` remain listed).
 
 ## 2026-09-29 (wave): WatchAgent→CelebrateBig None pin
 
