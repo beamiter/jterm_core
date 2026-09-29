@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after rounds 178/224 + round-51 beside wave-34)
+
+## 2026-09-29 (align tip — rounds 175–178 / 220–224 + round-51)
+
+- Local HEAD `ea3b692` path-patch-only. Anvil rounds 175–178 / forge 220–224
+  sticky FE05/find/MAX-4/Rest→Unknown pins + ember/frost round-51 smoke beside
+  wave-34. STAGE **71** / between() **93** held.
+
+
 Updated: 2026-09-29 (pending tip — rounds 175–178 / 220–224 + round-51 beside wave-34)
 
 ## 2026-09-29 (pending tip — sticky FE05/find/MAX-4/Rest→Unknown + round-51)
