@@ -413,6 +413,14 @@ const INSPECT_TO_CELEBRATE_BIG_FRAMES: [&str; 4] = [
     "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
     "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
 ];
+// Inspect hold still showing when a second open failure lands without Watch:
+// Unknown/Celebrate/Rest/Recovery→SitNear already animate; Inspect must not snap.
+const INSPECT_TO_SIT_FRAMES: [&str; 4] = [
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+    " /\\_/\\  <-  \n( o_o )     \n /|_|\\",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+];
 const SIT_TO_CELEBRATE_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ._. )  !  \n /|_|\\",
     " /\\_/\\      \n( ._. )     \n /|_|\\",
@@ -966,6 +974,7 @@ pub enum VisualTransition {
     GuardStuckToRestAfterPush,
     InspectErrorToCelebrate,
     InspectErrorToCelebrateBig,
+    InspectErrorToSitNearError,
     SitNearErrorToCelebrate,
     SitNearErrorToCelebrateBig,
     CelebrateToRestAfterPush,
@@ -1129,6 +1138,9 @@ impl VisualTransition {
             (Behavior::InspectError, Behavior::CelebrateBig) => {
                 Some(Self::InspectErrorToCelebrateBig)
             }
+            (Behavior::InspectError, Behavior::SitNearError) => {
+                Some(Self::InspectErrorToSitNearError)
+            }
             (Behavior::SitNearError, Behavior::Celebrate) => Some(Self::SitNearErrorToCelebrate),
             (Behavior::SitNearError, Behavior::CelebrateBig) => {
                 Some(Self::SitNearErrorToCelebrateBig)
@@ -1233,6 +1245,7 @@ impl VisualTransition {
             | Self::InspectErrorToGuardStuck
             | Self::InspectErrorToCelebrate
             | Self::InspectErrorToCelebrateBig
+            | Self::InspectErrorToSitNearError
             | Self::InspectErrorToIdle
             | Self::InspectErrorToRestAfterPush => Behavior::InspectError,
             Self::SitNearErrorToGuardFailure
@@ -1382,7 +1395,8 @@ impl VisualTransition {
             | Self::CelebrateToSitNearError
             | Self::CelebrateBigToSitNearError
             | Self::RestAfterPushToSitNearError
-            | Self::GuardRecoveryToSitNearError => Behavior::SitNearError,
+            | Self::GuardRecoveryToSitNearError
+            | Self::InspectErrorToSitNearError => Behavior::SitNearError,
             Self::GuardRecoveryToRestAfterPush
             | Self::GuardCautiousToRestAfterPush
             | Self::GuardFailureToRestAfterPush
@@ -1476,6 +1490,7 @@ impl VisualTransition {
             Self::GuardStuckToRestAfterPush => STUCK_TO_REST_FRAMES[index],
             Self::InspectErrorToCelebrate => INSPECT_TO_CELEBRATE_FRAMES[index],
             Self::InspectErrorToCelebrateBig => INSPECT_TO_CELEBRATE_BIG_FRAMES[index],
+            Self::InspectErrorToSitNearError => INSPECT_TO_SIT_FRAMES[index],
             Self::SitNearErrorToCelebrate => SIT_TO_CELEBRATE_FRAMES[index],
             Self::SitNearErrorToCelebrateBig => SIT_TO_CELEBRATE_BIG_FRAMES[index],
             Self::CelebrateToRestAfterPush => CELEBRATE_TO_REST_FRAMES[index],
@@ -4803,6 +4818,7 @@ mod tests {
             VisualTransition::GuardStuckToRestAfterPush,
             VisualTransition::InspectErrorToCelebrate,
             VisualTransition::InspectErrorToCelebrateBig,
+            VisualTransition::InspectErrorToSitNearError,
             VisualTransition::SitNearErrorToCelebrate,
             VisualTransition::SitNearErrorToCelebrateBig,
             VisualTransition::CelebrateToRestAfterPush,
@@ -4996,6 +5012,21 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::GuardStuck, Behavior::RestAfterPush),
             Some(VisualTransition::GuardStuckToRestAfterPush)
+        );
+    }
+
+    #[test]
+    fn inspect_hold_second_failure_has_full_motion_bridge() {
+        // Finish-overwrite without Watch: first open failure Inspect, second
+        // SitNear — same hold class as Unknown→SitNear / Celebrate→SitNear.
+        let mut organism = NativeOrganism::default();
+        let inspect = organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(inspect.behavior, Behavior::InspectError);
+        let sit = organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(sit.behavior, Behavior::SitNearError);
+        assert_eq!(
+            VisualTransition::between(inspect.behavior, sit.behavior),
+            Some(VisualTransition::InspectErrorToSitNearError)
         );
     }
 
@@ -5369,11 +5400,18 @@ mod tests {
         }
     }
 
-    /// New command mid-rest or mid-recovery vigil snaps into Watch* without
-    /// bridge frames, same contract as Celebrate*→Watch*.
+    /// New command mid-rest or mid-vigil snaps into Watch* without bridge
+    /// frames, same contract as Celebrate*→Watch*. Failure/Stuck/Cautious join
+    /// Recovery — idle_reaction shows those poses before command_started.
     #[test]
-    fn rest_and_guard_recovery_never_bridge_to_watch_poses() {
-        for from in [Behavior::RestAfterPush, Behavior::GuardRecovery] {
+    fn rest_and_repo_vigil_never_bridge_to_watch_poses() {
+        for from in [
+            Behavior::RestAfterPush,
+            Behavior::GuardRecovery,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
             for to in [
                 Behavior::WatchCommand,
                 Behavior::WatchAgent,
@@ -5413,7 +5451,7 @@ mod tests {
         }
     }
 
-    /// Survey (between() 90): GuardFailure/Stuck/Cautious do not animate into
+    /// Survey (between() 91): GuardFailure/Stuck/Cautious do not animate into
     /// Celebrate* — a success finish reaches Celebrate through Watch*, and the
     /// vigil→Watch snap is already intentional None. Pin so a silent
     /// Guard*→Celebrate bridge cannot land beside Celebrate→Guard*.
@@ -5513,6 +5551,27 @@ mod tests {
                 "{from:?}→GlanceAside must stay None"
             );
         }
+    }
+
+
+    /// Inspect→SitNear animates (second open failure overwrite). The reverse
+    /// escalation does not happen in the reducer — pin SitNear→Inspect None.
+    /// Celebrate↔CelebrateBig likewise has no finish-overwrite story (tier is
+    /// chosen once per success finish).
+    #[test]
+    fn sit_near_and_celebrate_tier_overwrites_stay_none() {
+        assert_eq!(
+            VisualTransition::between(Behavior::SitNearError, Behavior::InspectError),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::CelebrateBig),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::Celebrate),
+            None
+        );
     }
 
     /// Ambient utility dispositions (Idle/Explore/Sleep/Approach) map to the
@@ -5670,10 +5729,10 @@ mod tests {
     }
 
     #[test]
-    fn visual_transition_between_recognizes_ninety_intentional_arcs() {
+    fn visual_transition_between_recognizes_ninety_one_intentional_arcs() {
         // Recount pin: UI contract lists (anvil/forge semantic_bridges) must
-        // stay in lockstep with this Some count (76 → 90 Celebrate*/Rest/
-        // GuardRecovery hold overwrites).
+        // stay in lockstep with this Some count (90 → 91 Inspect→SitNear
+        // second-failure hold overwrite).
         let mut count = 0usize;
         for from in [
             Behavior::Idle,
@@ -5721,7 +5780,7 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 90,
+            count, 91,
             "between() Some count drifted; sync UI contract lists"
         );
     }
