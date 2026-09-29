@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + round-55 beside wave-35)
+
+## 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + round-55)
+
+- Local HEAD `b4f5ae6` path-patch-only. CrossBlock MAX-7→MAX-6 cancel
+  `6a06b39` + ionice classify parity sit under wave-35 chrt/ionice deepen
+  beside anvil 188–191 / forge 236–240 sticky 1801 + FE07 find + GuardRecovery
+  UI sync and ember/frost round-55 smoke. STAGE **71** / between() **93**
+  unchanged.
+
 Updated: 2026-09-29 (point pending tip at HEAD after wave-35 / round-54 final align)
 
 ## 2026-09-29 (point pending tip — wave-35 / round-54 final align)
