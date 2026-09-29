@@ -4,7 +4,7 @@ Updated: 2026-09-29 (align tip note self-hash after rounds 191/240 final)
 
 ## 2026-09-29 (point pending tip — rounds 191/240 final align)
 
-- Pending tip note remains current at HEAD `d5d350f` after STAGE 71 hold
+- Pending tip note remains current at HEAD `74315cc` after STAGE 71 hold
   beside sticky 1801/FE07/MAX-7/GuardRecovery UI sync.
 
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 191/240)
