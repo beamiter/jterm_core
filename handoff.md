@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): CLASSIFY/DISPATCHES STAGE 71 lockstep held
+
+## 2026-09-29 (wave): CLASSIFY/DISPATCHES remain set-eq at STAGE 71
+
+Wave-31 PATH leftovers stay out of STAGE; `unshare`/`nsenter` stay
+PIPE_INTERPRETERS. Audit pins still assert DISPATCHES / CLASSIFY_FORMS set
+equality with STAGE_PREFIXES at **len == 71** (no graduate this wave).
+**Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): PATH wave-31 ctl/utility leftovers beside STAGE 71
 
 ## 2026-09-29 (wave): PATH probe wave-31 ctl/utility leftovers stay out
