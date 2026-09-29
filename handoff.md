@@ -1,5 +1,35 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): STAGE 70 — uclampset / gamemoderun
+
+## 2026-09-29 (wave): uclampset / gamemoderun STAGE_PREFIXES
+
+Added launchers jagent wave 25 now strips. STAGE_PREFIXES len 68 → **70**.
+`uclampset` peels `-m`/`-M`/`-p` meta (`-s`/`--system`/help terminal).
+`gamemoderun` is flagless like eatmydata. Membership, DISPATCHES, and
+CLASSIFY_FORMS all pin `len == 70` lockstep beside `gnome-session-inhibit`.
+Pipe regressions cover `| uclampset -m 512 sh` / `| gamemoderun sh`.
+Core/jagent tips still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): uclampset / gamemoderun STAGE 70 + Guard*→Celebrate* None
+
+## 2026-09-29 (wave): uclampset / gamemoderun STAGE_PREFIXES (len 70)
+
+Teach fail-closed peels for PATH leftovers `uclampset` (util-linux util clamp;
+`-p`/`--system` childless) and `gamemoderun` (GameMode env launcher, eatmydata
+shape). Membership/DISPATCHES/CLASSIFY lockstep **70**. Pipe `| uclampset sh` /
+`| gamemoderun bash` AddsPipeToInterpreter. Pairs jagent wave 25.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): GuardFailure/Stuck/Cautious→Celebrate* stay None
+
+Survey leftover `between` Nones after the hold-overwrite wave (90):
+GuardFailure/Stuck/Cautious still snap if a Celebrate pose were applied
+directly, but success finishes reach Celebrate through Watch* (vigil→Watch is
+already intentional None). Pin
+`failure_stuck_cautious_never_bridge_to_celebrate_holds`. No new animate
+candidates; `between()` stays **90**. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): output_notice round-trip + error→Watch None
 
 ## 2026-09-29 (wave): output_notice parse/as_str/tooltip round-trip
