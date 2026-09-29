@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after rounds 183/230 + round-52 beside wave-34)
+
+## 2026-09-29 (align tip — rounds 179–183 / 225–230 + round-52)
+
+- Local HEAD `c62afe1` path-patch-only. Anvil rounds 179–183 / forge 225–230
+  sticky FE06/FE05/MAX-5/Celebrate-Rest/SitNear-Inspect pins + ember/frost
+  round-52 smoke beside wave-34. STAGE **71** / between() **93** held.
+
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 183/230 + round-52)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 183/230)
