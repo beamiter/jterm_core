@@ -3785,6 +3785,94 @@ mod tests {
     }
 
     #[test]
+    fn every_stage_prefix_classifies_through_to_build_or_test() {
+        // Mirror DISPATCHES shapes with a cargo child so classify_command peels
+        // every STAGE_PREFIXES name (organism work-loop parity with the pipe
+        // scan). Forms avoid ambiguous USER/PROGRAM positionals (`su --`).
+        use crate::organism::{classify_command, CommandKind};
+        const CLASSIFY_FORMS: &[(&str, &str)] = &[
+            ("aa-exec", "aa-exec -p unconfined cargo test"),
+            ("annotate-output", "annotate-output +%H:%M:%S cargo test"),
+            ("bubblewrap", "bubblewrap --ro-bind / / -- cargo test"),
+            ("bwrap", "bwrap --ro-bind / / -- cargo test"),
+            ("capsh", "capsh -- cargo test"),
+            ("cgexec", "cgexec -g cpu:group1 cargo test"),
+            ("choom", "choom -n 1000 cargo test"),
+            ("chroot", "chroot / cargo test"),
+            ("chrt", "chrt 1 cargo test"),
+            ("chronic", "chronic cargo test"),
+            ("chpst", "chpst -u nobody cargo test"),
+            ("command", "command cargo test"),
+            ("dbus-run-session", "dbus-run-session -- cargo test"),
+            ("doas", "doas cargo test"),
+            ("dumb-init", "dumb-init -- cargo test"),
+            ("eatmydata", "eatmydata -- cargo test"),
+            ("env", "env FOO=1 cargo test"),
+            ("envdir", "envdir /env cargo test"),
+            ("exec", "exec cargo test"),
+            ("fakeroot", "fakeroot -- cargo test"),
+            ("firejail", "firejail --noprofile cargo test"),
+            ("flock", "flock /tmp/lock cargo test"),
+            ("gosu", "gosu root cargo test"),
+            ("ionice", "ionice -c3 cargo test"),
+            ("nice", "nice -n 5 cargo test"),
+            ("nohup", "nohup cargo test"),
+            ("numactl", "numactl --cpunodebind=0 cargo test"),
+            ("pkexec", "pkexec cargo test"),
+            ("prlimit", "prlimit --nofile=1024 cargo test"),
+            ("proxychains", "proxychains cargo test"),
+            ("proxychains3", "proxychains3 cargo test"),
+            ("proxychains4", "proxychains4 -q -f /etc/proxychains.conf cargo test"),
+            ("proot", "proot -r /tmp/root -- cargo test"),
+            ("rlwrap", "rlwrap cargo test"),
+            ("run0", "run0 cargo test"),
+            ("runcon", "runcon unconfined_t cargo test"),
+            ("runuser", "runuser -u root -- cargo test"),
+            ("schedtool", "schedtool -B -e cargo test"),
+            ("scriptlive", "scriptlive typescript cargo test"),
+            ("setarch", "setarch x86_64 cargo test"),
+            ("setpriv", "setpriv --reuid 0 cargo test"),
+            ("setsid", "setsid cargo test"),
+            ("setuidgid", "setuidgid nobody cargo test"),
+            ("softlimit", "softlimit -m 1000000 cargo test"),
+            ("start-stop-daemon", "start-stop-daemon --start -- cargo test"),
+            ("stdbuf", "stdbuf -o0 cargo test"),
+            ("strace", "strace -f cargo test"),
+            ("su", "su -- cargo test"),
+            ("su-exec", "su-exec root cargo test"),
+            ("sudo", "sudo cargo test"),
+            ("sudoedit", "sudoedit -- cargo test"),
+            ("systemd-cat", "systemd-cat -t unit -- cargo test"),
+            ("systemd-run", "systemd-run cargo test"),
+            ("taskset", "taskset ff cargo test"),
+            ("time", "time cargo test"),
+            ("timeout", "timeout 5 cargo test"),
+            ("tini", "tini -- cargo test"),
+            ("torsocks", "torsocks -i cargo test"),
+            ("unbuffer", "unbuffer cargo test"),
+            ("watch", "watch --exec cargo test"),
+            ("xargs", "xargs cargo test"),
+            ("xvfb-run", "xvfb-run -a cargo test"),
+        ];
+        for prefix in STAGE_PREFIXES {
+            let form = CLASSIFY_FORMS
+                .iter()
+                .find(|(name, _)| name == prefix)
+                .map(|(_, form)| *form)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "STAGE_PREFIXES gained `{prefix}`: add a classify_command peel form above"
+                    )
+                });
+            assert_eq!(
+                classify_command(form),
+                CommandKind::BuildOrTest,
+                "classify_command must see through STAGE prefix `{prefix}` in `{form}`"
+            );
+        }
+    }
+
+    #[test]
     fn the_interpreter_set_agrees_with_jagents_own_rule() {
         for name in [
             // The sixteen jagent knew and this module did not.
