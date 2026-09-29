@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 through wave-39 cohort)
+
+## 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 — wave-39 cohort)
+
+- CLASSIFY/DISPATCHES set-eq held at STAGE **71** through wave-39 user/session
+  inventory leftover pin + chpst/envdir/setuidgid help/version fail-closed
+  deepen and timeout/nice classify nests. No graduate this wave.
+
+
 Updated: 2026-09-30 (wave 39 deepen: chpst/envdir/setuidgid STAGE + CLASSIFY 71)
 
 ## 2026-09-30 (wave 39 deepen — chpst/envdir/setuidgid help fail-closed + classify)
