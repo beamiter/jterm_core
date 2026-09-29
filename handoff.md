@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 35 deepen: chrt/ionice STAGE + CLASSIFY 71)
+
+## 2026-09-29 (wave 35 deepen — chrt/ionice arity + classify)
+
+- **Thin STAGE 71 deepen** — `prefix_option_clears_child` teaches chrt/ionice
+  help/version/pid(/pgid/uid)/max fail-closed; arity + busybox ionice carriers
+  pin `chrt_and_ionice_stage_arity_edges`. Classify peels timeout/nice around
+  chrt/ionice (`classify_command_peels_timeout_nice_around_chrt_and_ionice`).
+  CLASSIFY/DISPATCHES set-eq held at **71**. **Pending push**.
+
+
 Updated: 2026-09-29 (wave 35 probe: PATH host/hw inventory leftovers)
 
 ## 2026-09-29 (wave 35 probe — PATH host/hw inventory leftovers)
