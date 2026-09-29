@@ -1,6 +1,21 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): UnknownOutcome success/sit overwrite bridges
+Updated: 2026-09-29 (wave): WatchAgent/WatchSettled→RestAfterPush + annotate-output
+
+## 2026-09-29 (wave): WatchAgent/WatchSettled→RestAfterPush bridges
+
+`WatchAgent→RestAfterPush` and `WatchSettled→RestAfterPush` animate under Full
+motion so a push mid-agent-watch or mid-settled vigil does not snap (pairs with
+`WatchCommand→RestAfterPush`). Tests updated in
+`watch_command_and_agent_finish_have_full_motion_bridges`.
+
+## 2026-09-29 (wave): annotate-output STAGE_PREFIXES + classify
+
+Paired with jagent `a16f79f` (pending push/repin): `annotate-output` joins
+[`STAGE_PREFIXES`] and skips optional `+FORMAT`. `classify_command` steps
+through the same stamp so `annotate-output +%H:%M:%S cargo test` stays
+`BuildOrTest`. Pipe transparency covers `| annotate-output sh`. moreutils
+`ts`/`sponge` stay out (stdin filters, not launchers).
 
 ## 2026-09-29 (wave): UnknownOutcome success/sit overwrite bridges
 
