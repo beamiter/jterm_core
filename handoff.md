@@ -1,16 +1,27 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): strace / scriptlive STAGE_PREFIXES
+
+Added two `/usr/bin` launchers jagent wave 19 now strips. STAGE_PREFIXES
+len 58 → **60**. `scriptlive` joins the lockfile-style positional skip so
+`| scriptlive typescript sh` judges `sh`; `-c`/`--command` leave the payload
+visible. `strace` peels common 0-/1-arg meta (`-p` attach-only stays
+childless). Pipe regressions + DISPATCHES forms pin parity with path-patched
+jagent. `classify_command` also see-throughs both. Supersedes the PATH-probe
+note below that left these open. Core/jagent tips still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): strace / scriptlive STAGE_PREFIXES
+
 ## 2026-09-29 (wave): PATH probe script/scriptreplay/perf/gdb leftovers
 
 `command -v` after STAGE 58: `script` already [`PIPE_INTERPRETERS`] (bare
 form starts an interactive shell — not a STAGE false-neg). `scriptreplay`
 on PATH but **not** a child argv launcher (typescript replay only; no
 PROGRAM operand) — leave out. `ltrace` / `valgrind` / `rr` / `catchsegv`
-absent. `perf` / `gdb` / `strace` / `scriptlive` on PATH but complex CLIs
-(subcommand / inferior / attach grammar) — **not** STAGE_PREFIXES; prefer
-fail-closed / jagent-only if ever taught (do not STAGE valgrind/gdb).
-`run-parts` stays out (directory runner). Prior leftover note still holds.
-
+absent. `perf` / `gdb` on PATH but complex CLIs (subcommand / inferior
+grammar) — **not** STAGE_PREFIXES; prefer fail-closed / jagent-only if ever
+taught (do not STAGE valgrind/gdb). `strace` / `scriptlive` closed in the
+STAGE 60 wave above. `run-parts` stays out (directory runner).
 
 ## 2026-09-29 (wave): WatchCommand→UnknownOutcome + GlanceAside None pins
 
@@ -34,7 +45,7 @@ the organism work loop. Pairs STAGE_PREFIXES wave (len 58).
 
 `run-parts` stays out (directory script runner, not child argv).
 `catchsegv` not on PATH (needs `glibc-tools`). `qemu-*-static` absent.
-`strace` / `scriptlive` remain open (complex CLIs) — not STAGE yet.
+`strace` / `scriptlive` closed in the STAGE 60 wave above.
 `systemd-run` / `pkexec` already covered.
 
 ## 2026-09-29 (wave): WatchAgent→UnknownOutcome None pin
