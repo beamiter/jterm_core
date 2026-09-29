@@ -4308,6 +4308,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn classify_command_peels_timeout_nice_around_numactl_and_schedtool() {
+        assert_eq!(
+            classify_command("timeout 5 numactl --cpunodebind=0 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 numactl -C 0 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("numactl --localalloc timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 schedtool -B -e cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 schedtool -a 0x1 -n 5 -e cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("schedtool -N -e timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 numactl --cpunodebind=0 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 schedtool -B -e cargo check"),
+            CommandKind::BuildOrTest
+        );
+        // Busybox has neither applet — classify does not peel busybox itself.
+        assert_ne!(
+            classify_command("busybox numactl --cpunodebind=0 cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+        assert_ne!(
+            classify_command("busybox schedtool -B -e cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+    }
+
 
     #[test]
     fn classify_command_peels_timeout_nice_around_setsid() {
