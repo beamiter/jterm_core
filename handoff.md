@@ -13,7 +13,7 @@ Updated: 2026-09-29 (point pending tip at HEAD after aa-exec deepen + rounds 160
 
 ## 2026-09-29 (pending tip — aa-exec deepen + cancel + celebrate survey)
 
-- Local HEAD `e72436c` path-patch-only. Anvil `db42070` rounds 158–160 /
+- Local HEAD `4d72eb1` path-patch-only. Anvil `db42070` rounds 158–160 /
   forge `acd144e` 200–202 CrossBlock near-wrap cancel +
   Failure/Stuck/Cautious→Celebrate Full-motion survey sit beside aa-exec /
   socket-activate arity+classify+detached deepen. STAGE **71** / between()
