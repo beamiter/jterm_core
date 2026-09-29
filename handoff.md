@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): softlimit/chpst/setuidgid/envdir STAGE_PREFIXES
+Updated: 2026-09-29 (wave): classify_command softlimit/chpst/setuidgid/envdir/rlwrap
 
 ## 2026-09-29 (wave): softlimit/chpst/setuidgid/envdir STAGE_PREFIXES
 
@@ -11,6 +11,13 @@ positional like chroot/flock. Pipe regressions cover `| softlimit … sh` /
 `| chpst -u nobody bash` / `| setuidgid nobody sh` / `| envdir /env sh`.
 Local `.cargo/config.toml` path-patches jagent for the DISPATCHES transparency
 test — do not commit that patch or change the published jagent rev.
+
+## 2026-09-29 (wave): classify_command daemontools/runit + rlwrap
+
+`classify_command` now steps through `softlimit` / `chpst` / `setuidgid` /
+`envdir` / `rlwrap` (including setuidgid's user and envdir's directory
+positionals) so `chpst -u nobody cargo test` stays `BuildOrTest` for the
+organism work loop.
 
 ## 2026-09-29 (organism evolve): WatchCommand/WatchAgent finish continuity
 

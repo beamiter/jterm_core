@@ -2383,6 +2383,58 @@ pub fn classify_command(command: &str) -> CommandKind {
                     }
                 }
             }
+            "softlimit" => skip_wrapper_options(
+                &mut tokens,
+                &["-m", "-d", "-s", "-a", "-c", "-n", "-f", "-r", "-o", "-p"],
+            ),
+            "chpst" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-u", "-U", "-e", "-b", "-n", "-m", "-d", "-o", "-p", "-f", "-c",
+                ],
+            ),
+            "setuidgid" => {
+                // USER positional before CMD (`setuidgid nobody cargo test`).
+                if let Some(user) = tokens.peek() {
+                    if !user.starts_with('-') {
+                        let mut lookahead = tokens.clone();
+                        lookahead.next();
+                        if lookahead.peek().is_some() {
+                            tokens.next();
+                        }
+                    }
+                }
+            }
+            "envdir" => {
+                // DIR positional before CMD (`envdir /env cargo test`).
+                if let Some(dir) = tokens.peek() {
+                    if !dir.starts_with('-') {
+                        let mut lookahead = tokens.clone();
+                        lookahead.next();
+                        if lookahead.peek().is_some() {
+                            tokens.next();
+                        }
+                    }
+                }
+            }
+            "rlwrap" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-f",
+                    "--file",
+                    "-H",
+                    "--history-filename",
+                    "-s",
+                    "--histsize",
+                    "-S",
+                    "-p",
+                    "--prompt",
+                    "-P",
+                    "--password-prompt",
+                    "-z",
+                    "--filter",
+                ],
+            ),
             _ => break,
         }
         program = tokens.next().unwrap_or_default();
@@ -2594,6 +2646,13 @@ mod tests {
             "flock /tmp/lock cargo test",
             "flock -n /var/lock/x -- cargo check",
             "nice timeout 10 flock /tmp/l cargo test",
+            "softlimit -m 1000000 cargo test",
+            "chpst -u nobody cargo test",
+            "setuidgid nobody cargo check",
+            "envdir /var/service/x/env cargo test",
+            "rlwrap cargo test",
+            "rlwrap -a cargo nextest run",
+            "softlimit -c 0 chpst -u daemon envdir /env cargo test",
         ] {
             assert_eq!(
                 classify_command(command),
