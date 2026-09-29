@@ -1,5 +1,29 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (aa-exec/socket-activate classify parity + CrossBlock cancel)
+
+## 2026-09-29 (wave): aa-exec / systemd-socket-activate arity + classify deepen
+
+`aa_exec_stage_arity_edges` / `systemd_socket_activate_stage_arity_edges` deepen
+openvt-parity: bare / dangling meta / `--version` fail-closed; `-n`/`--namespace`
+and `-E`/`--setenv`/`--fdname` peels; pipe regressions cover namespace/setenv/
+fdname beside busybox carriers. Classify peels namespace/setenv/fdname under
+timeout/nice nests (busybox stays stage_interpreter-only). STAGE membership
+stays **71**.
+
+## 2026-09-29 (wave): CrossBlock cancel near-wrap + scheduled-ahead
+
+`continue_idle_resume_edges_drop_stale_or_finished_walks` pins MAX-1→MAX bump
+cancel (with/without resume), matching-MAX resume keep, and scheduled-ahead
+MAX vs MAX-1 cancel. Pairs anvil 158–159 / forge 200–201. between() **93**
+unchanged.
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through aa-exec deepen)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq held through aa-exec / socket-activate
+  arity+classify deepen and CrossBlock near-wrap cancel. No STAGE peel this wave.
+
+
 Updated: 2026-09-29 (point pending tip note at HEAD after round-47 smoke)
 
 ## 2026-09-29 (point pending tip — round-47 smoke)
