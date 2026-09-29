@@ -1,5 +1,25 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): busybox STAGE arity + CLASSIFY set-eq + uclamp nest
+
+## 2026-09-29 (wave): busybox applet STAGE arity / pipe deepen
+
+`uclampset` / `gamemoderun` / `gnome-session-inhibit` stage_interpreter and
+pipe regressions now peel `busybox <wrapper>` applet carriers to sh/bash.
+System/list/help under busybox stay fail-closed (jagent parity). Membership
+pin still asserts `len == 70`. **Pending push/repin**.
+
+## 2026-09-29 (wave): classify peels timeout/nice around uclampset/gamemoderun
+
+Mirror gnome-session-inhibit nest pin: `timeout`/`nice` outside and inside
+`uclampset` / `gamemoderun` still classify the cargo child. **Pending push/repin**.
+
+## 2026-09-29 (wave): CLASSIFY_FORMS set equality with STAGE 70
+
+Audit pin: CLASSIFY_FORMS names must equal STAGE_PREFIXES exactly (set
+equality), not just `len == 70`, so a duplicate+gap swap cannot hide a missing
+peel form. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): PATH leftover non-STAGE pin beside STAGE 70
 
 ## 2026-09-29 (wave): PATH probe leftovers stay out of STAGE (len 70)
