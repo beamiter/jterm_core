@@ -4152,6 +4152,21 @@ mod tests {
             classify_command("timeout 5 nice -n 5 aa-exec cargo check"),
             CommandKind::BuildOrTest
         );
+        // Namespace meta stays BuildOrTest beside profile peels (arity deepen
+        // parity with openvt nest classify). Busybox applet carriers remain
+        // stage_interpreter-only — classify does not peel busybox itself.
+        assert_eq!(
+            classify_command("aa-exec -n apparmorfs cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 aa-exec --namespace=apparmorfs -- cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 aa-exec -p unconfined -n apparmorfs cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
     }
 
     #[test]
@@ -4174,6 +4189,21 @@ mod tests {
         );
         assert_eq!(
             classify_command("timeout 5 nice -n 5 systemd-socket-activate cargo check"),
+            CommandKind::BuildOrTest
+        );
+        // setenv/fdname meta stays BuildOrTest beside listen peels (arity
+        // deepen parity with openvt nest classify). Busybox applet carriers
+        // remain stage_interpreter-only — classify does not peel busybox.
+        assert_eq!(
+            classify_command("systemd-socket-activate -E FOO=1 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 systemd-socket-activate --setenv=BAR=2 -- cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 systemd-socket-activate --fdname=conn cargo nextest run"),
             CommandKind::BuildOrTest
         );
     }
