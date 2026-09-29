@@ -366,6 +366,23 @@ mod tests {
             CrossBlockSearchScope::from_index(2),
             CrossBlockSearchScope::Output
         );
+        assert_eq!(CrossBlockSearchScope::from_index(3), CrossBlockSearchScope::All);
+        assert_eq!(
+            CrossBlockSearchScope::from_index(u32::MAX),
+            CrossBlockSearchScope::All
+        );
+        assert_eq!(CrossBlockSearchScope::All.index(), 0);
+    }
+
+    /// `Default` is the live overlay constructor, never the wider palette walk.
+    #[test]
+    fn find_scan_budget_default_is_the_overlay_constructor() {
+        let defaulted = FindScanBudget::default();
+        let overlay = FindScanBudget::new();
+        assert_eq!(defaulted.remaining_bytes(), overlay.remaining_bytes());
+        assert_eq!(defaulted.time_limit, overlay.time_limit);
+        assert_eq!(defaulted.remaining_bytes(), FIND_OVERLAY_SCAN_BYTE_LIMIT);
+        assert_ne!(defaulted.remaining_bytes(), CROSS_BLOCK_SCAN_BYTE_LIMIT);
     }
 
     #[test]
