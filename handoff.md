@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (MAX-11 cancel / rounds 207/260 tip note)
+
+## 2026-09-30 (pending tip — MAX-11 cancel / anvil 204–207 / forge 256–260)
+
+- Local HEAD `129f76c` holds CrossBlock MAX-11→MAX-10 cancel beside anvil
+  **204–207** / forge **256–260** sticky 1805 / 1804 find / Unknown→GuardFailure.
+  STAGE **71** / between() **93** unchanged. Pending push/repin.
+
 Updated: 2026-09-30 (align tip note self-hash after wave-39 leftovers/deepen)
 
 ## 2026-09-30 (point pending tip — wave-39 leftovers/deepen)
