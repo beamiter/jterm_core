@@ -1531,6 +1531,12 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         // STAGE 71 deepen — stops inventing a peel after `--help sh` / `-h sh`).
         ("softlimit", Some("help" | "version")) => true,
         ("cgexec", Some("help" | "h")) => true,
+        // runit chpst / daemontools envdir / setuidgid: help/version (and chpst
+        // `-h`) terminate without PROGRAM (wave-39 thin STAGE 71 deepen —
+        // stops inventing a peel after `--help sh` / dashed "DIR"/"USER").
+        ("chpst", Some("help" | "version" | "h")) => true,
+        ("envdir", Some("help" | "version")) => true,
+        ("setuidgid", Some("help" | "version")) => true,
         _ => false,
     }
 }
@@ -4784,6 +4790,101 @@ mod tests {
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
     }
+
+    /// `chpst` privilege/env peels + `envdir` DIR peels + `setuidgid` USER
+    /// peels: help/version fail-closed so junk after `--help` / `-h` / a
+    /// dashed "DIR"/"USER" never invents a child (thin STAGE 71 deepen).
+    /// Busybox has none of these applets. `s6-setuidgid` already clears help.
+    #[test]
+    fn chpst_envdir_setuidgid_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("chpst -u nobody sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("chpst -U root -e /env -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("chpst").as_deref(), None);
+        assert_eq!(stage_interpreter("chpst -u nobody").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("chpst --help sh").as_deref(),
+            None,
+            "help mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("chpst --version bash").as_deref(),
+            None,
+            "version mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("chpst -h sh").as_deref(),
+            None,
+            "short help never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("envdir /var/service/x/env sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("envdir ./env -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("envdir").as_deref(), None);
+        assert_eq!(stage_interpreter("envdir /env").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("envdir --help sh").as_deref(),
+            None,
+            "dashed help never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("envdir --version bash").as_deref(),
+            None,
+            "dashed version never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("setuidgid nobody sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("setuidgid -- root bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("setuidgid").as_deref(), None);
+        assert_eq!(stage_interpreter("setuidgid nobody").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("setuidgid --help sh").as_deref(),
+            None,
+            "dashed help never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("setuidgid --version bash").as_deref(),
+            None,
+            "dashed version never launches a child"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | chpst -u nobody sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | envdir /env bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | setuidgid nobody sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
 
     /// util-linux setsid: session flags + help/version fail closed. Busybox
     /// applet carriers peel before the STAGE name so pipe-to-bash still
