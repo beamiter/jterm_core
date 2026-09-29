@@ -1,5 +1,39 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after rounds 170/214)
+
+## 2026-09-29 (point pending tip — rounds 170/214)
+
+- Local HEAD path-patch-only. Anvil rounds 165–170 / forge 208–214 sticky/
+  find/CrossBlock/Retry/tier sit beside GlanceAside ambient + setsid
+  ctty/wait deepen + near-near-wrap cancel. STAGE **71** / between() **93**
+  unchanged. Push/repin still pending.
+
+
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 170/214)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 170/214)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  setsid ctty/wait arity+classify deepen, GlanceAside↔ambient survey, and
+  CrossBlock near-near-wrap cancel beside anvil 165–170 / forge 208–214.
+  No STAGE peel this wave.
+
+
+Updated: 2026-09-29 (GlanceAside ambient + setsid ctty/wait + near-near-wrap cancel)
+
+## 2026-09-29 (wave): GlanceAside↔ambient + setsid ctty/wait deepen + CrossBlock near-near-wrap
+
+- GlanceAside source/target pins gain Explore/Sleep/Approach (UI Full-motion
+  ambient completeness catch-up). between() **93** unchanged.
+- `setsid_stage_arity_edges` peels `-c`/`--ctty`/`-w` beside fork/wait; dangling
+  long-opts fail-closed; pipe regressions cover ctty under busybox carriers.
+- Classify peels ctty/wait under timeout/nice; busybox stays
+  stage_interpreter-only (asserted). STAGE membership stays **71**.
+- CrossBlock cancel near-near-wrap (MAX-2→MAX-1 bump, scheduled-ahead, finished).
+  Pairs anvil 165–170 / forge 208–214. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 164/207 final)
 
 ## 2026-09-29 (point pending tip — rounds 164/207 final)
