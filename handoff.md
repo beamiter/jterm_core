@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip beside wave-35 deepen)
+
+## 2026-09-29 (pending tip — wave-35 deepen)
+
+- Pending tip through wave-35 host/hw inventory leftovers + chrt/ionice arity/
+  classify deepen beside jagent . CLASSIFY/DISPATCHES **71** held.
+
+
 Updated: 2026-09-29 (wave 35 deepen: chrt/ionice STAGE + CLASSIFY 71)
 
 ## 2026-09-29 (wave 35 deepen — chrt/ionice arity + classify)
