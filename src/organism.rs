@@ -4034,6 +4034,17 @@ mod tests {
         );
     }
 
+    /// WatchAgent finishes resolve to Celebrate/Inspect/Sit/Rest — never to the
+    /// unknown-hold pose. Pin `None` so a WatchAgent→UnknownOutcome bridge
+    /// cannot appear without an explicit reducer story.
+    #[test]
+    fn watch_agent_never_bridges_to_unknown_outcome() {
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::UnknownOutcome),
+            None
+        );
+    }
+
     #[test]
     fn celebrate_and_rest_settle_to_idle_has_full_motion_bridges() {
         assert_eq!(
