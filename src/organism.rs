@@ -4230,8 +4230,31 @@ mod tests {
             classify_command("timeout 5 nice -n 5 setsid cargo check"),
             CommandKind::BuildOrTest
         );
-        // Busybox applet carriers remain stage_interpreter-only — classify
-        // does not peel busybox itself (parity with aa-exec nest classify).
+        // -c/--ctty and -w/--wait stay BuildOrTest beside fork peels (arity
+        // deepen parity with openvt/aa-exec nest classify). Busybox applet
+        // carriers remain stage_interpreter-only — classify does not peel
+        // busybox itself.
+        assert_eq!(
+            classify_command("setsid -c cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 setsid --ctty -- cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 setsid -w cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("setsid --wait timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_ne!(
+            classify_command("busybox setsid cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
     }
 
     #[test]
@@ -5914,6 +5937,8 @@ mod tests {
 
     /// GlanceAside is a live presence cue, not a reducer Behavior source.
     /// Pin the common overwrite targets so a bridge cannot land silently.
+    /// Explore/Sleep/Approach join the set so GlanceAside↔ambient cannot invent
+    /// arcs beside the UI Full-motion completeness pin (between() stays 93).
     #[test]
     fn glance_aside_never_bridges_as_a_transition_source() {
         for to in [
@@ -5931,6 +5956,9 @@ mod tests {
             Behavior::WatchCommand,
             Behavior::WatchAgent,
             Behavior::WatchSettled,
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
         ] {
             assert_eq!(
                 VisualTransition::between(Behavior::GlanceAside, to),
@@ -5942,7 +5970,8 @@ mod tests {
 
     /// GlanceAside is also never a bridge target — the live cue overlays without
     /// a VisualTransition arc. Pin common sources so a *→GlanceAside bridge
-    /// cannot land silently beside the source-side None pin.
+    /// cannot land silently beside the source-side None pin. Ambient utility
+    /// poses join so GlanceAside↔Explore/Sleep/Approach stays intentional None.
     #[test]
     fn glance_aside_never_bridges_as_a_transition_target() {
         for from in [
@@ -5960,6 +5989,9 @@ mod tests {
             Behavior::WatchCommand,
             Behavior::WatchAgent,
             Behavior::WatchSettled,
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
         ] {
             assert_eq!(
                 VisualTransition::between(from, Behavior::GlanceAside),
