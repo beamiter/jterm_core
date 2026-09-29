@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 39 deepen: chpst/envdir/setuidgid STAGE + CLASSIFY 71)
+
+## 2026-09-30 (wave 39 deepen — chpst/envdir/setuidgid help fail-closed + classify)
+
+- **Thin STAGE 71 deepen** — chpst / envdir / setuidgid help/version/`-h` clear
+  the child so `--help sh` never invents a peel; classify peels timeout/nice
+  nests around them beside softlimit/cgexec. Busybox has none of these applets.
+  CLASSIFY/DISPATCHES set-eq held at STAGE **71**.
+
+
 Updated: 2026-09-30 (PATH wave-39 user/session inventory leftovers stay out of STAGE)
 
 ## 2026-09-30 (PATH wave-39 leftovers — user/session inventory)
