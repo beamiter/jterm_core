@@ -1,5 +1,21 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): ambient→vigil/celebrate None + PATH wave-27 leftovers
+
+## 2026-09-29 (wave): ambient Explore/Sleep/Approach→Guard*/Celebrate* None
+
+Expand `ambient_disposition_exchanges_have_no_visual_transition` so utility
+ambient poses never invent bridges into repo vigil or Celebrate holds
+(Idle/Rest→Guard* already pinned). `between()` stays **91**. STAGE membership
+still asserts `len == 70`. **Pending push/repin**.
+
+## 2026-09-29 (wave): PATH probe wave-27 identity/agent leftovers stay out
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-27 `chcon` /
+`setfacl`/`getfacl`/`sg`/`newgrp`/`ssh-agent`/`gpg-agent`/
+`systemd-ask-password` as intentional non-STAGE beside wave-26 snice/skill/
+MIME openers. Membership pin still asserts `len == 70`. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): busybox STAGE arity + CLASSIFY set-eq + uclamp nest
 
 ## 2026-09-29 (wave): busybox applet STAGE arity / pipe deepen
