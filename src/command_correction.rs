@@ -4598,6 +4598,21 @@ mod tests {
             71,
             "DISPATCHES len must match membership pin (STAGE 71 / openvt)"
         );
+        // Set equality: len lockstep alone misses a duplicate+gap swap (CLASSIFY_FORMS parity).
+        {
+            use std::collections::HashSet;
+            let stage: HashSet<&str> = STAGE_PREFIXES.iter().copied().collect();
+            let forms: HashSet<&str> = DISPATCHES.iter().map(|(name, _)| *name).collect();
+            assert_eq!(
+                forms.len(),
+                DISPATCHES.len(),
+                "DISPATCHES must not duplicate STAGE names"
+            );
+            assert_eq!(
+                stage, forms,
+                "DISPATCHES names must equal STAGE_PREFIXES exactly (STAGE 71 set-eq)"
+            );
+        }
         for prefix in STAGE_PREFIXES {
             let form = DISPATCHES
                 .iter()
@@ -4722,7 +4737,7 @@ mod tests {
             );
             assert_eq!(
                 stage, forms,
-                "CLASSIFY_FORMS names must equal STAGE_PREFIXES exactly"
+                "CLASSIFY_FORMS names must equal STAGE_PREFIXES exactly (STAGE 71 set-eq)"
             );
         }
         for prefix in STAGE_PREFIXES {
