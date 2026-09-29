@@ -4102,6 +4102,18 @@ mod tests {
         );
     }
 
+    /// Human watch with a missing exit status lands on UnknownOutcome via the
+    /// reducer, but Full motion still snaps (no bridge frames). Pin `None` so
+    /// a WatchCommand→UnknownOutcome arc cannot appear beside the WatchAgent
+    /// None pin without an explicit story.
+    #[test]
+    fn watch_command_never_bridges_to_unknown_outcome() {
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchCommand, Behavior::UnknownOutcome),
+            None
+        );
+    }
+
     #[test]
     fn celebrate_and_rest_settle_to_idle_has_full_motion_bridges() {
         assert_eq!(
