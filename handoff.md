@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through round-44)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through round-44)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  anvil 148–151 / forge 188–191 Idle/Rest Guard + hold Failure Full-motion and
+  ember/frost round-44 smoke. No STAGE peel this wave.
+
+
 Updated: 2026-09-29 (pending tip beside Idle/Rest Guard pins and round-44 smoke)
 
 ## 2026-09-29 (pending tip — Idle/Rest Guard + round-44)
