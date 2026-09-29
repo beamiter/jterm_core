@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 174/219 + round-50)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 174/219)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  sticky FE04/find/MAX-3/Celebrate→Unknown beside anvil 171–174 / forge 215–219
+  and ember/frost round-50 smoke. No STAGE peel this wave.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 174/219 final)
 
 ## 2026-09-29 (point pending tip — rounds 174/219 final)
