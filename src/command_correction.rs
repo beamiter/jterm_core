@@ -3688,7 +3688,49 @@ mod tests {
     }
 
     #[test]
-    fn systemd_cat_pipe_to_sh_is_adds_pipe_to_interpreter() {
+    /// Detached meta + terminal `--list`/`--help` for systemd-cat / inhibit.
+    #[test]
+    fn systemd_cat_and_inhibit_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("systemd-cat -p err sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --priority warning bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --stderr-priority err sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --level-prefix false bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-cat --help sh").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --who burner --why burn --mode block sh")
+                .as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --no-pager --no-legend bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --list sh").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-inhibit --help bash").as_deref(),
+            None
+        );
+    }
+
+        fn systemd_cat_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
             validate_candidate(
                 Original("ls -l | head -20"),
