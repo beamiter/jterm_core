@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (MAX-12 cancel / rounds 211/265 tip note)
+
+## 2026-09-30 (pending tip — MAX-12 cancel / anvil 208–211 / forge 261–265)
+
+- Local HEAD `8a52f2a` holds CrossBlock MAX-12→MAX-11 cancel beside anvil
+  **208–211** / forge **261–265** sticky FF1A / 1805 find / Unknown→Idle.
+  STAGE **71** / between() **93** unchanged. Pending push/repin.
+
 Updated: 2026-09-30 (MAX-11 cancel / rounds 207/260 tip note)
 
 ## 2026-09-30 (pending tip — MAX-11 cancel / anvil 204–207 / forge 256–260)
