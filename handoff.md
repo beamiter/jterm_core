@@ -1,5 +1,18 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): classify_command peels every STAGE_PREFIXES name
+
+Audit closed the remaining classify vs STAGE membership gaps: privilege
+(`doas`/`sudoedit`/`pkexec`/`run0`/`runuser`/`gosu`/`su-exec`/`su`), util-linux
+(`chroot`/`chrt`/`taskset`/`setarch`/`setsid`/`setpriv`/`ionice`/`choom`/
+`prlimit`), and container/misc (`capsh`/`dumb-init`/`tini`/`start-stop-daemon`/
+`systemd-run`/`unbuffer`/`watch`/`xargs`) now peel in `classify_command`.
+Pin `every_stage_prefix_classifies_through_to_build_or_test` requires a
+BuildOrTest form for each of the 62 STAGE names. Pairs systemd-cat/aa-exec
+STAGE 62. Core/jagent tips still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): classify_command peels every STAGE_PREFIXES name
+
 ## 2026-09-29 (wave): systemd-cat / aa-exec STAGE_PREFIXES
 
 Added two `/usr/bin` launchers jagent wave 20 now strips. STAGE_PREFIXES
