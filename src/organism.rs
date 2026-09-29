@@ -421,6 +421,20 @@ const INSPECT_TO_SIT_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ._. )     \n /|_|\\",
     " /\\_/\\      \n( ._. )  !  \n /|_|\\",
 ];
+// Error hold still showing when a missing-exit finish lands: Celebrate/Rest/
+// Recovery→Unknown already animate; Inspect/SitNear must not snap to Unknown.
+const INSPECT_TO_UNKNOWN_FRAMES: [&str; 4] = [
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+    " /\\_/\\  <-  \n( o_o )     \n /|_|\\",
+    " /\\_/\\      \n( ?.o )     \n > ^ <",
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+];
+const SIT_TO_UNKNOWN_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+    " /\\_/\\      \n( ?.o )     \n > ^ <",
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+];
 const SIT_TO_CELEBRATE_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ._. )  !  \n /|_|\\",
     " /\\_/\\      \n( ._. )     \n /|_|\\",
@@ -975,8 +989,10 @@ pub enum VisualTransition {
     InspectErrorToCelebrate,
     InspectErrorToCelebrateBig,
     InspectErrorToSitNearError,
+    InspectErrorToUnknownOutcome,
     SitNearErrorToCelebrate,
     SitNearErrorToCelebrateBig,
+    SitNearErrorToUnknownOutcome,
     CelebrateToRestAfterPush,
     CelebrateBigToRestAfterPush,
     CelebrateToIdle,
@@ -1141,9 +1157,15 @@ impl VisualTransition {
             (Behavior::InspectError, Behavior::SitNearError) => {
                 Some(Self::InspectErrorToSitNearError)
             }
+            (Behavior::InspectError, Behavior::UnknownOutcome) => {
+                Some(Self::InspectErrorToUnknownOutcome)
+            }
             (Behavior::SitNearError, Behavior::Celebrate) => Some(Self::SitNearErrorToCelebrate),
             (Behavior::SitNearError, Behavior::CelebrateBig) => {
                 Some(Self::SitNearErrorToCelebrateBig)
+            }
+            (Behavior::SitNearError, Behavior::UnknownOutcome) => {
+                Some(Self::SitNearErrorToUnknownOutcome)
             }
             (Behavior::Celebrate, Behavior::RestAfterPush) => {
                 Some(Self::CelebrateToRestAfterPush)
@@ -1246,6 +1268,7 @@ impl VisualTransition {
             | Self::InspectErrorToCelebrate
             | Self::InspectErrorToCelebrateBig
             | Self::InspectErrorToSitNearError
+            | Self::InspectErrorToUnknownOutcome
             | Self::InspectErrorToIdle
             | Self::InspectErrorToRestAfterPush => Behavior::InspectError,
             Self::SitNearErrorToGuardFailure
@@ -1254,6 +1277,7 @@ impl VisualTransition {
             | Self::SitNearErrorToGuardCautious
             | Self::SitNearErrorToCelebrate
             | Self::SitNearErrorToCelebrateBig
+            | Self::SitNearErrorToUnknownOutcome
             | Self::SitNearErrorToIdle
             | Self::SitNearErrorToRestAfterPush => Behavior::SitNearError,
             Self::GuardFailureToGuardStuck
@@ -1425,7 +1449,9 @@ impl VisualTransition {
             Self::CelebrateToUnknownOutcome
             | Self::CelebrateBigToUnknownOutcome
             | Self::RestAfterPushToUnknownOutcome
-            | Self::GuardRecoveryToUnknownOutcome => Behavior::UnknownOutcome,
+            | Self::GuardRecoveryToUnknownOutcome
+            | Self::InspectErrorToUnknownOutcome
+            | Self::SitNearErrorToUnknownOutcome => Behavior::UnknownOutcome,
         }
     }
 
@@ -1491,8 +1517,10 @@ impl VisualTransition {
             Self::InspectErrorToCelebrate => INSPECT_TO_CELEBRATE_FRAMES[index],
             Self::InspectErrorToCelebrateBig => INSPECT_TO_CELEBRATE_BIG_FRAMES[index],
             Self::InspectErrorToSitNearError => INSPECT_TO_SIT_FRAMES[index],
+            Self::InspectErrorToUnknownOutcome => INSPECT_TO_UNKNOWN_FRAMES[index],
             Self::SitNearErrorToCelebrate => SIT_TO_CELEBRATE_FRAMES[index],
             Self::SitNearErrorToCelebrateBig => SIT_TO_CELEBRATE_BIG_FRAMES[index],
+            Self::SitNearErrorToUnknownOutcome => SIT_TO_UNKNOWN_FRAMES[index],
             Self::CelebrateToRestAfterPush => CELEBRATE_TO_REST_FRAMES[index],
             Self::CelebrateBigToRestAfterPush => CELEBRATE_BIG_TO_REST_FRAMES[index],
             Self::CelebrateToIdle => CELEBRATE_TO_IDLE_FRAMES[index],
@@ -3288,6 +3316,8 @@ pub fn classify_command(command: &str) -> CommandKind {
                 skip_wrapper_positional(&mut tokens);
             }
             "setsid" => skip_wrapper_options(&mut tokens, &[]),
+            // kbd openvt: `-c`/`--console` take a VT number before COMMAND.
+            "openvt" => skip_wrapper_options(&mut tokens, &["-c", "--console"]),
             "setpriv" => skip_wrapper_options(
                 &mut tokens,
                 &[
@@ -4897,8 +4927,10 @@ mod tests {
             VisualTransition::InspectErrorToCelebrate,
             VisualTransition::InspectErrorToCelebrateBig,
             VisualTransition::InspectErrorToSitNearError,
+            VisualTransition::InspectErrorToUnknownOutcome,
             VisualTransition::SitNearErrorToCelebrate,
             VisualTransition::SitNearErrorToCelebrateBig,
+            VisualTransition::SitNearErrorToUnknownOutcome,
             VisualTransition::CelebrateToRestAfterPush,
             VisualTransition::CelebrateBigToRestAfterPush,
             VisualTransition::CelebrateToIdle,
@@ -5105,6 +5137,32 @@ mod tests {
         assert_eq!(
             VisualTransition::between(inspect.behavior, sit.behavior),
             Some(VisualTransition::InspectErrorToSitNearError)
+        );
+    }
+
+    /// Error hold still showing when a missing-exit finish lands: Celebrate/
+    /// Rest/Recovery→Unknown already animate; Inspect/SitNear must not snap.
+    #[test]
+    fn error_hold_unknown_overwrites_have_full_motion_bridges() {
+        let mut inspect_hold = NativeOrganism::default();
+        let inspect = inspect_hold.command_finished(CommandKind::Other, Some(1), None);
+        assert_eq!(inspect.behavior, Behavior::InspectError);
+        let unknown = inspect_hold.command_finished(CommandKind::Other, None, None);
+        assert_eq!(unknown.behavior, Behavior::UnknownOutcome);
+        assert_eq!(
+            VisualTransition::between(inspect.behavior, unknown.behavior),
+            Some(VisualTransition::InspectErrorToUnknownOutcome)
+        );
+
+        let mut sit_hold = NativeOrganism::default();
+        sit_hold.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        let sit = sit_hold.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(sit.behavior, Behavior::SitNearError);
+        let unknown = sit_hold.command_finished(CommandKind::Other, None, None);
+        assert_eq!(unknown.behavior, Behavior::UnknownOutcome);
+        assert_eq!(
+            VisualTransition::between(sit.behavior, unknown.behavior),
+            Some(VisualTransition::SitNearErrorToUnknownOutcome)
         );
     }
 
@@ -5529,7 +5587,7 @@ mod tests {
         }
     }
 
-    /// Survey (between() 91): GuardFailure/Stuck/Cautious do not animate into
+    /// Survey (between() 93): GuardFailure/Stuck/Cautious do not animate into
     /// Celebrate* — a success finish reaches Celebrate through Watch*, and the
     /// vigil→Watch snap is already intentional None. Pin so a silent
     /// Guard*→Celebrate bridge cannot land beside Celebrate→Guard*.
@@ -5776,10 +5834,21 @@ mod tests {
             (Behavior::Sleep, Behavior::Approach),
             (Behavior::Approach, Behavior::Sleep),
             // Typing-shaped entry from an ambient pose snaps onto WatchCommand.
+            // WatchAgent / WatchSettled entries from ambient stay None the same
+            // way — Watch*→Idle animates, Idle/ambient→Watch* never invents a
+            // bridge (pairs UI ambient→Watch* pins).
             (Behavior::Explore, Behavior::WatchCommand),
             (Behavior::Sleep, Behavior::WatchCommand),
             (Behavior::Approach, Behavior::WatchCommand),
             (Behavior::Idle, Behavior::WatchCommand),
+            (Behavior::Explore, Behavior::WatchAgent),
+            (Behavior::Sleep, Behavior::WatchAgent),
+            (Behavior::Approach, Behavior::WatchAgent),
+            (Behavior::Idle, Behavior::WatchAgent),
+            (Behavior::Explore, Behavior::WatchSettled),
+            (Behavior::Sleep, Behavior::WatchSettled),
+            (Behavior::Approach, Behavior::WatchSettled),
+            (Behavior::Idle, Behavior::WatchSettled),
         ] {
             assert_eq!(
                 VisualTransition::between(from, to),
@@ -5813,7 +5882,7 @@ mod tests {
         }
         // Same ambient sources never invent bridges into error / unknown holds
         // or RestAfterPush — those arrive from finish/push reducers, not from
-        // Explore/Sleep/Approach disposition. between() stays 91.
+        // Explore/Sleep/Approach disposition. between() stays 93.
         for from in [
             Behavior::Explore,
             Behavior::Sleep,
@@ -5831,6 +5900,25 @@ mod tests {
                     "ambient {from:?}→{to:?} must stay None (hold/rest)"
                 );
             }
+        }
+
+        // Idle→hold/cele/rest also stays None: live finishes arrive through
+        // Watch* (which already animate). A finish applied from Idle without
+        // Watch snaps; pin so Idle cannot silently gain Celebrate/Inspect arcs
+        // beside the ambient utility hold/rest Nones.
+        for to in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+        ] {
+            assert_eq!(
+                VisualTransition::between(Behavior::Idle, to),
+                None,
+                "Idle→{to:?} must stay None (finish without Watch snaps)"
+            );
         }
     }
 
@@ -5955,12 +6043,11 @@ mod tests {
     }
 
     #[test]
-    fn visual_transition_between_recognizes_ninety_one_intentional_arcs() {
+    fn visual_transition_between_recognizes_ninety_three_intentional_arcs() {
         // Recount pin: anvil/forge `semantic_bridges_run_only_in_full_motion`
-        // must stay in lockstep with this Some count (91 intentional arcs —
-        // InspectError→SitNearError hold overwrite; CelebrateBig finish table
-        // pinned separately in celebrate_big_finish_arcs_mirror_celebrate_except_watch_agent
-        // is already inside the 91, not a post-wave bump).
+        // must stay in lockstep with this Some count (93 intentional arcs —
+        // Inspect/SitNear→UnknownOutcome error-hold missing-exit overwrites;
+        // CelebrateBig finish table pinned separately stays inside the count).
         let mut count = 0usize;
         for from in [
             Behavior::Idle,
@@ -6008,7 +6095,7 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 91,
+            count, 93,
             "between() Some count drifted; sync UI contract lists"
         );
     }
