@@ -88,4 +88,23 @@ mod tests {
         );
         assert_eq!(output_notice_tooltip("<b>forged</b>"), None);
     }
+
+    #[test]
+    fn parse_as_str_and_tooltip_round_trip_every_variant_and_reject_blank() {
+        for notice in [
+            FinishedOutputNotice::EarlierNotRetained,
+            FinishedOutputNotice::TextTruncated,
+            FinishedOutputNotice::PartlyRetained,
+        ] {
+            let text = notice.as_str();
+            assert_eq!(FinishedOutputNotice::parse(text), Some(notice));
+            assert_eq!(known_output_notice(text), Some(text));
+            assert_eq!(output_notice_tooltip(text), Some(notice.tooltip()));
+            assert!(!notice.tooltip().is_empty(), "{notice:?} tooltip must stay non-empty");
+        }
+        assert_eq!(FinishedOutputNotice::parse(""), None);
+        assert_eq!(FinishedOutputNotice::parse(" "), None);
+        assert_eq!(known_output_notice(""), None);
+        assert_eq!(output_notice_tooltip(""), None);
+    }
 }
