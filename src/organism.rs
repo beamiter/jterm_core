@@ -2815,6 +2815,62 @@ pub fn classify_command(command: &str) -> CommandKind {
                 &mut tokens,
                 &["-p", "--profile", "-n", "--namespace"],
             ),
+            // Privilege dispatchers already in STAGE_PREFIXES; peel so the
+            // organism work loop still sees cargo/git behind them.
+            "doas" | "sudoedit" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-u",
+                    "--user",
+                    "-g",
+                    "--group",
+                    "-h",
+                    "--host",
+                    "-p",
+                    "--prompt",
+                    "-C",
+                    "--close-from",
+                    "-D",
+                    "--chdir",
+                    "-R",
+                    "--chroot",
+                    "-T",
+                    "--command-timeout",
+                    "-r",
+                    "--role",
+                    "-t",
+                    "--type",
+                ],
+            ),
+            "pkexec" | "run0" => skip_wrapper_options(
+                &mut tokens,
+                &["-u", "--user", "-g", "--group", "--userspec"],
+            ),
+            "runuser" => {
+                // Option form (`-u root -- CMD`) vs USER form (`USER CMD`).
+                let option_form = tokens.peek().is_some_and(|token| token.starts_with('-'));
+                skip_wrapper_options(
+                    &mut tokens,
+                    &["-u", "--user", "-g", "--group", "--userspec", "-G"],
+                );
+                if !option_form {
+                    skip_wrapper_positional(&mut tokens);
+                }
+            }
+            "gosu" | "su-exec" => {
+                // USER positional before CMD (`gosu root cargo test`).
+                skip_wrapper_options(
+                    &mut tokens,
+                    &["-u", "--user", "-g", "--group", "--userspec", "-G"],
+                );
+                skip_wrapper_positional(&mut tokens);
+            }
+            "su" => {
+                // `-c`/`-s` leave the payload word visible (not meta). Group
+                // meta only — do not guess a USER positional (ambiguous with
+                // PROGRAM after `su -- CMD` / `su -g root -- CMD`).
+                skip_wrapper_options(&mut tokens, &["-g", "--group", "-G"]);
+            }
             "bwrap" | "bubblewrap" => {
                 // Two-arg bind/setenv forms plus common one-value meta. Stop
                 // on unknown dashes so a truncated peel does not mis-eat the
@@ -2988,6 +3044,26 @@ where
         tokens.next();
         if consumes_value {
             tokens.next();
+        }
+    }
+}
+
+/// Skip one non-option positional meta operand when a following program word
+/// remains (`gosu root cargo`, `chroot / cargo`, `taskset ff cargo`).
+fn skip_wrapper_positional<I>(tokens: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = String> + Clone,
+{
+    if let Some(operand) = tokens.peek() {
+        if !operand.starts_with('-') {
+            let mut lookahead = tokens.clone();
+            lookahead.next();
+            if lookahead.peek().is_some() {
+                tokens.next();
+                if tokens.peek().is_some_and(|token| token == "--") {
+                    tokens.next();
+                }
+            }
         }
     }
 }
@@ -3167,6 +3243,18 @@ mod tests {
             "bubblewrap --ro-bind / / -- cargo check",
             "bwrap --dev /dev --uid 0 -- cargo nextest run",
             "systemd-cat -t x aa-exec -p unconfined cargo test",
+            "doas cargo test",
+            "doas -u root cargo check",
+            "sudoedit -- cargo nextest run",
+            "pkexec cargo test",
+            "pkexec --user root -- cargo check",
+            "run0 cargo test",
+            "run0 -u root -- cargo nextest run",
+            "runuser -u root -- cargo test",
+            "gosu root cargo check",
+            "su-exec nobody cargo test",
+            "su -- cargo nextest run",
+            "doas gosu root cargo test",
         ] {
             assert_eq!(
                 classify_command(command),
