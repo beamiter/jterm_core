@@ -1,12 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (point pending tip at HEAD after round-47 cancel repair)
+Updated: 2026-09-29 (point pending tip at HEAD after aa-exec deepen + rounds 160/202)
 
-## 2026-09-29 (point pending tip — round-47 cancel repair)
+## 2026-09-29 (pending tip — aa-exec deepen + cancel + celebrate survey)
 
-- Local HEAD `b557998` path-patch-only. Anvil `db42070` rounds 155–159 / forge
-  `acd144e` 196–201 + ember `13bb735` / frost `7f3b327` round-47 smoke sit
-  beside. STAGE **71** / between() **93** unchanged. Push/repin still pending.
+- Local HEAD `e72436c` path-patch-only. Anvil `db42070` rounds 158–160 /
+  forge `acd144e` 200–202 CrossBlock near-wrap cancel +
+  Failure/Stuck/Cautious→Celebrate Full-motion survey sit beside aa-exec /
+  socket-activate arity+classify+detached deepen. STAGE **71** / between()
+  **93** unchanged. Push/repin cohort still pending.
 
 
 Updated: 2026-09-29 (aa-exec/socket-activate classify parity + CrossBlock cancel)
