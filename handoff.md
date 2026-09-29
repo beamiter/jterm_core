@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 178/224 + round-51)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 178/224)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  sticky FE05/find/MAX-4/Rest→Unknown beside anvil 175–178 / forge 220–224
+  and ember/frost round-51 smoke (wave-34 deepen sits under). No STAGE peel.
+  Celebrate→Unknown remains inside between() 93 (no semantic_bridges len bump).
+
+
 Updated: 2026-09-29 (align tip after rounds 178/224 + round-51 beside wave-34)
 
 ## 2026-09-29 (align tip — rounds 175–178 / 220–224 + round-51)
