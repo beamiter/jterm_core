@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — rounds 175–178 / 220–224 + round-51 beside wave-34)
+
+## 2026-09-29 (pending tip — sticky FE05/find/MAX-4/Rest→Unknown + round-51)
+
+- Local HEAD  path-patch-only. CrossBlock MAX-4→MAX-3 cancel
+   sits under wave-34 deepen beside anvil 175–178 / forge 220–224
+  sticky FE05/Manchu + FE04 find + Rest→Unknown and ember/frost round-51 smoke.
+  STAGE **71** / between() **93** unchanged.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after wave-34 final align)
 
 ## 2026-09-29 (point pending tip at HEAD after wave-34 final align)
