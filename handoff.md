@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): fakeroot/proot/firejail STAGE_PREFIXES
+Updated: 2026-09-29 (wave): classify_command fakeroot/proot/firejail
+
+## 2026-09-29 (wave): classify_command fakeroot/proot/firejail
+
+`classify_command` now steps through `fakeroot` / `proot` / `firejail`
+(including proot's root/bind/cwd/qemu/-S meta and firejail's one-value sandbox
+options) so `firejail --noprofile cargo test` stays `BuildOrTest` for the
+organism work loop.
 
 ## 2026-09-29 (wave): fakeroot/proot/firejail STAGE_PREFIXES
 
