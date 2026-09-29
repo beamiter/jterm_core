@@ -3865,6 +3865,20 @@ mod tests {
             "lslocks",
             "lslogins",
             "dmidecode",
+            // Wave-36 PATH leftovers: network inventory managers beside STAGE
+            // peelers and wave-30–35 ctl/block/host leftovers (jagent pin
+            // `path_probe_network_inventory_leftovers_do_not_invent_a_child_peel`).
+            // CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "ip",
+            "ss",
+            "nmcli",
+            "nstat",
+            "arp",
+            "route",
+            "netstat",
+            "bridge",
+            "tc",
+            "rfkill",
         ] {
             assert!(
                 !prefixes.contains(&name),
