@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (hold/Guard→ambient + Watch* mode-switch Nones + CrossBlock wrap)
+
+## 2026-09-29 (wave): hold/Guard→ambient + Watch* mode-switch Nones
+
+Survey leftover accidental snaps beside Watch*→ambient / Guard→Celebrate /
+Celebrate→Watch pins: hold/rest→Explore/Sleep/Approach, Guard*→ambient, and
+WatchCommand↔WatchAgent↔WatchSettled stay intentional `None` (ambient via mind;
+Watch* family switches are live SurfaceMode remaps). `between()` stays **93**.
+CrossBlock cancel also pins MAX→0 schedule bump + finished walk at wrap gen
+(`MAX,MAX,false`). Anvil/forge Full-motion + sticky Retry continue-after-Err
+rounds sit beside. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (pending tip beside Ogham/Guard pins and round-42 smoke)
 
 ## 2026-09-29 (pending tip — Ogham/Guard + round-42)
