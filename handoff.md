@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (pending tip beside wave-39 deepen)
+
+## 2026-09-30 (pending tip — wave-39 deepen)
+
+- Pending tip through wave-39 user/session inventory leftovers + chpst/envdir/
+  setuidgid help fail-closed deepen beside jagent `9bcd627`. CLASSIFY/DISPATCHES
+  **71**. Ember/frost smoke numbers left for peer. **Pending push/repin**.
+
+
 Updated: 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 through wave-39 cohort)
 
 ## 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 — wave-39 cohort)
