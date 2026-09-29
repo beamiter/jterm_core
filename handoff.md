@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (align tip after wave-39 leftovers/deepen)
+
+## 2026-09-30 (align tip — wave-39 leftovers/deepen)
+
+- Local HEAD path-patch-only after wave-39 user/session inventory leftovers +
+  chpst/envdir/setuidgid help fail-closed deepen beside jagent .
+  Ember/frost smoke left for peer. CLASSIFY/DISPATCHES **71**.
+
+
 Updated: 2026-09-30 (pending tip beside wave-39 deepen)
 
 ## 2026-09-30 (pending tip — wave-39 deepen)
