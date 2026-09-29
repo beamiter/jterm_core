@@ -3723,6 +3723,18 @@ mod tests {
             "skill",
             "run-mailcap",
             "xdg-open",
+            // Wave-27 PATH leftovers: ACL/SELinux labelers, group switchers,
+            // and agent/password helpers that are on PATH here but are not
+            // fail-closed child-argv peelers (jagent pin
+            // `path_probe_identity_agent_leftovers_do_not_invent_a_child_peel`).
+            "chcon",
+            "setfacl",
+            "getfacl",
+            "sg",
+            "newgrp",
+            "ssh-agent",
+            "gpg-agent",
+            "systemd-ask-password",
         ] {
             assert!(
                 !prefixes.contains(&name),
