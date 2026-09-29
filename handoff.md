@@ -1,5 +1,15 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): WatchCommand→UnknownOutcome + GlanceAside None pins
+
+`VisualTransition::between(WatchCommand, UnknownOutcome)` stays `None` by
+design (missing exit status snaps; no bridge frames), beside the existing
+WatchAgent→UnknownOutcome None pin. Dedicated
+`glance_aside_never_bridges_as_a_transition_source` pins GlanceAside as never
+a transition source across Idle/Celebrate*/Inspect/Sit/Rest/Unknown/Guard*/
+Watch* targets (live presence cue only).
+
+
 ## 2026-09-29 (wave): classify_command dbus-run-session / runcon / xvfb-run
 
 `classify_command` now steps through `dbus-run-session` / `runcon` /
