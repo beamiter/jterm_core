@@ -3999,6 +3999,42 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_uclampset_and_gamemoderun() {
+        assert_eq!(
+            classify_command("timeout 5 uclampset -m 512 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 uclampset -m 0 -M 1024 -- cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("uclampset -m 100 timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 gamemoderun cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 gamemoderun -- cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("gamemoderun timeout 5 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 uclampset -m 512 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 gamemoderun cargo check"),
+            CommandKind::BuildOrTest
+        );
+    }
+
+    #[test]
     fn repeated_real_failures_escalate_then_success_celebrates() {
         let mut organism = NativeOrganism::default();
         organism.command_started(CommandKind::BuildOrTest);
