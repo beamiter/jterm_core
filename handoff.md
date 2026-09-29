@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 191/240)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 191/240)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  sticky 1801/FE07/MAX-7/GuardRecovery→Unknown UI sync beside anvil 188–191 /
+  forge 236–240 (wave-35 chrt/ionice deepen + thin ionice timeout+nice parity
+  sits under; no further peel this wave). GuardRecovery→Unknown remains inside
+  between() 93 (no semantic_bridges len bump).
+
 Updated: 2026-09-29 (point pending tip note at HEAD after rounds 191/240 final align)
 
 ## 2026-09-29 (point pending tip — rounds 191/240 final align)
