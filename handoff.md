@@ -8,6 +8,14 @@ Updated: 2026-09-30 (align tip note self-hash after wave-39 leftovers/deepen)
   beside wave-39 chpst/envdir/setuidgid deepen. Ember/frost smoke left for peer.
 
 
+Updated: 2026-09-30 (align tip note self-hash after wave-39 leftovers/deepen)
+
+## 2026-09-30 (point pending tip — wave-39 leftovers/deepen)
+
+- Pending tip note remains current at HEAD  after STAGE 71 hold
+  beside wave-39 chpst/envdir/setuidgid deepen. Ember/frost smoke left for peer.
+
+
 Updated: 2026-09-30 (point pending tip at HEAD after wave-39 leftovers/deepen)
 
 ## 2026-09-30 (point pending tip — wave-39 leftovers/deepen)
