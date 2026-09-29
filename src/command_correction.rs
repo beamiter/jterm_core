@@ -1489,6 +1489,7 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("firejail", Some("help" | "version")) => true,
         ("daemonize", Some("help" | "version" | "h")) => true,
         ("setlock", Some("help" | "version")) => true,
+        ("s6-setuidgid", Some("help" | "version")) => true,
         _ => false,
     }
 }
@@ -3721,6 +3722,37 @@ mod tests {
                 Candidate("ls -l | strace -f bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn daemonize_and_setlock_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("daemonize -c /tmp -u nobody sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("daemonize --pidfile /run/x.pid bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("daemonize -E FOO=1 -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("daemonize -p").as_deref(), None);
+        assert_eq!(stage_interpreter("daemonize -h sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("setlock -nNxX /tmp/x.lock sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("setlock -- /tmp/x.lock bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("setlock --version sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("s6-setuidgid --help sh").as_deref(),
+            None
         );
     }
 
