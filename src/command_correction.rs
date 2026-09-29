@@ -3687,7 +3687,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Detached meta + terminal `--list`/`--help` for systemd-cat / inhibit.
     #[test]
     fn systemd_cat_and_inhibit_stage_arity_edges() {
@@ -3730,7 +3729,8 @@ mod tests {
         );
     }
 
-        fn systemd_cat_pipe_to_sh_is_adds_pipe_to_interpreter() {
+    #[test]
+    fn systemd_cat_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
             validate_candidate(
                 Original("ls -l | head -20"),
