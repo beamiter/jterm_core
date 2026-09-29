@@ -1512,6 +1512,13 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("taskset", Some("help" | "version" | "h" | "V" | "pid" | "p")) => true,
         ("choom", Some("help" | "version" | "h" | "V" | "pid" | "p")) => true,
         ("prlimit", Some("help" | "version" | "h" | "V" | "pid" | "p")) => true,
+        // util-linux priority / I/O class wrappers: help/version, pid/pgid/uid
+        // query modes, and chrt --max terminate without PROGRAM (wave-35 deepen).
+        ("chrt", Some("help" | "version" | "h" | "V" | "pid" | "p" | "max" | "m")) => true,
+        (
+            "ionice",
+            Some("help" | "version" | "h" | "V" | "pid" | "p" | "pgid" | "P" | "uid" | "u"),
+        ) => true,
         _ => false,
     }
 }
@@ -4502,6 +4509,84 @@ mod tests {
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
     }
+
+    /// util-linux `chrt` priority peels + ionice class peels: help/version/pid
+    /// fail-closed; busybox ionice applet carriers peel before the STAGE name
+    /// so pipe-to-bash still resolves (parity with taskset deepenings). Busybox
+    /// has no chrt applet.
+    #[test]
+    fn chrt_and_ionice_stage_arity_edges() {
+        assert_eq!(stage_interpreter("chrt 1 sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("chrt -r 1 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("chrt -f 1 -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("chrt").as_deref(), None);
+        assert_eq!(stage_interpreter("chrt 1").as_deref(), None);
+        assert_eq!(stage_interpreter("chrt --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("chrt --version bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("chrt -p 1 sh").as_deref(),
+            None,
+            "pid mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("ionice -c 3 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("ionice -c2 -n5 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("busybox ionice -c 3 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox ionice -c2 -n5 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("ionice").as_deref(), None);
+        assert_eq!(stage_interpreter("ionice -c 3").as_deref(), None);
+        assert_eq!(stage_interpreter("ionice --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("ionice --version bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("ionice -p 1 sh").as_deref(),
+            None,
+            "pid mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox ionice --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | chrt 1 sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | ionice -c 3 bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox ionice -c 3 sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
 
     /// util-linux setsid: session flags + help/version fail closed. Busybox
     /// applet carriers peel before the STAGE name so pipe-to-bash still
