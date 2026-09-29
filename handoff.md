@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (pending tip through sticky 1803/1802/MAX-9 pins)
+
+## 2026-09-30 (pending tip — sticky 1803/1802/MAX-9 + rounds 199/250)
+
+- Local HEAD path-patch-only after CrossBlock MAX-9→MAX-8 cancel pin beside
+  anvil/forge sticky Mongolian full stop + 1802/comma find + Unknown→GuardCautious
+  Full-motion bridge (Unknown↔GuardRecovery already synced). STAGE **71** /
+  between() **93** held.
+
 Updated: 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 199/250)
 
 ## 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 199/250)
