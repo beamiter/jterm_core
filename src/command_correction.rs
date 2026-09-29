@@ -1210,6 +1210,8 @@ const STAGE_PREFIXES: &[&str] = &[
     "env",
     "envdir",
     "exec",
+    "fakeroot",
+    "firejail",
     "flock",
     "gosu",
     "ionice",
@@ -1218,6 +1220,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "numactl",
     "pkexec",
     "prlimit",
+    "proot",
     "rlwrap",
     "run0",
     "runuser",
@@ -1631,6 +1634,43 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         "chpst" => matches!(
             option,
             "-u" | "-U" | "-e" | "-b" | "-n" | "-m" | "-d" | "-o" | "-p" | "-f" | "-c"
+        ) as usize,
+        // fakeroot: like eatmydata/nohup — no meta values before PROGRAM.
+        "fakeroot" => 0,
+        // PRoot: root/bind/cwd/qemu/-S take a following path or command word.
+        "proot" => matches!(
+            option,
+            "-r" | "--rootfs"
+                | "-b"
+                | "--bind"
+                | "-w"
+                | "--pwd"
+                | "--cwd"
+                | "-q"
+                | "--qemu"
+                | "-S"
+        ) as usize,
+        // firejail: one-value sandbox meta; bare `--private` is flag-only
+        // (optional attached `=` already returns 0 above).
+        "firejail" => matches!(
+            option,
+            "--private-home"
+                | "--net"
+                | "--profile"
+                | "--name"
+                | "--hostname"
+                | "--join"
+                | "--whitelist"
+                | "--blacklist"
+                | "--read-only"
+                | "--read-write"
+                | "--tmpfs"
+                | "--bind"
+                | "--shell"
+                | "--dns"
+                | "--chroot"
+                | "--env"
+                | "--rmenv"
         ) as usize,
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
         // listed separately. Flag-only forms return 0.
@@ -3318,6 +3358,8 @@ mod tests {
             ("env", "env FOO=1 rm -rf /"),
             ("envdir", "envdir /env rm -rf /"),
             ("exec", "exec rm -rf /"),
+            ("fakeroot", "fakeroot -- rm -rf /"),
+            ("firejail", "firejail --noprofile rm -rf /"),
             ("flock", "flock /tmp/lock rm -rf /"),
             ("gosu", "gosu root rm -rf /"),
             ("ionice", "ionice -c3 rm -rf /"),
@@ -3326,6 +3368,7 @@ mod tests {
             ("numactl", "numactl --cpunodebind=0 rm -rf /"),
             ("pkexec", "pkexec rm -rf /"),
             ("prlimit", "prlimit --nofile=1024 rm -rf /"),
+            ("proot", "proot -r /tmp/root -- rm -rf /"),
             ("rlwrap", "rlwrap rm -rf /"),
             ("run0", "run0 rm -rf /"),
             ("runuser", "runuser -u root -- rm -rf /"),
@@ -3808,6 +3851,31 @@ mod tests {
             stage_interpreter("envdir /var/service/x/env bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(stage_interpreter("fakeroot -- sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("proot -r /tmp/root sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("proot --bind /home:/home -w / bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("proot -S /tmp/root sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("firejail --noprofile sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("firejail --private bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("firejail --net=none --whitelist /tmp sh").as_deref(),
+            Some("sh")
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -3827,6 +3895,11 @@ mod tests {
             "ls -l | chpst -u nobody bash",
             "ls -l | setuidgid nobody sh",
             "ls -l | envdir /env sh",
+            "ls -l | fakeroot sh",
+            "ls -l | proot -r / sh",
+            "ls -l | proot -S /tmp/root bash",
+            "ls -l | firejail --noprofile sh",
+            "ls -l | firejail --private bash",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),

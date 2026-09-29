@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): classify_command softlimit/chpst/setuidgid/envdir/rlwrap
+Updated: 2026-09-29 (wave): fakeroot/proot/firejail STAGE_PREFIXES
+
+## 2026-09-29 (wave): fakeroot/proot/firejail STAGE_PREFIXES
+
+Paired with jagent `2e966a9` (pending push/repin): these three join
+[`STAGE_PREFIXES`]. `fakeroot` is flagless like eatmydata/nohup; `proot`
+consumes `-r/-b/-w/-q/-S` (and matching longs); `firejail` consumes one-value
+sandbox meta while bare `--private` stays flag-only. Pipe regressions cover
+`| fakeroot sh` / `| proot -r / sh` / `| firejail --noprofile sh`. Local
+`.cargo/config.toml` path-patches jagent for the DISPATCHES transparency
+test — do not commit that patch or change the published jagent rev.
 
 ## 2026-09-29 (wave): softlimit/chpst/setuidgid/envdir STAGE_PREFIXES
 
