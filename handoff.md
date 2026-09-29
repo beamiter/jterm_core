@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after rounds 183/230 final align)
+
+## 2026-09-29 (point pending tip — rounds 183/230 final align)
+
+- Pending tip note remains current at HEAD `1409fd9` after STAGE 71 hold
+  beside sticky FE06/FE05/MAX-5/SitNear and round-52 smoke.
+
+
 Updated: 2026-09-29 (align tip after rounds 183/230 + round-52 beside wave-34)
 
 ## 2026-09-29 (align tip — rounds 179–183 / 225–230 + round-52)
