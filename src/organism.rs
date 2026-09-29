@@ -2700,6 +2700,106 @@ pub fn classify_command(command: &str) -> CommandKind {
                     "--server-args",
                 ],
             ),
+            "strace" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-e",
+                    "--trace",
+                    "-p",
+                    "--attach",
+                    "-o",
+                    "--output",
+                    "-s",
+                    "--string-limit",
+                    "-S",
+                    "--summary-sort-by",
+                    "-u",
+                    "--user",
+                    "-E",
+                    "--env",
+                    "-P",
+                    "--trace-path",
+                    "-b",
+                    "--detach-on",
+                    "-I",
+                    "--interruptible",
+                    "-O",
+                    "--summary-syscall-overhead",
+                    "-a",
+                    "--columns",
+                    "-X",
+                    "--const-print-style",
+                    "-U",
+                    "--summary-columns",
+                    "--syscall-limit",
+                ],
+            ),
+            "scriptlive" => {
+                // `scriptlive [options] typescript [command…]` — peel known
+                // meta; `-c` stays visible; skip typescript only when -I/-B
+                // did not already name it.
+                let mut saw_typescript_opt = false;
+                while let Some(option) = tokens.peek().cloned() {
+                    if option == "--" {
+                        tokens.next();
+                        break;
+                    }
+                    if !option.starts_with('-') {
+                        break;
+                    }
+                    tokens.next();
+                    let (name, attached) = if let Some(long) = option.strip_prefix("--") {
+                        long.split_once('=')
+                            .map_or((long, None), |(n, v)| (n, Some(v)))
+                    } else {
+                        let short = option.trim_start_matches('-');
+                        let flag = short.chars().next().unwrap_or('\0');
+                        let rest = &short[flag.len_utf8()..];
+                        (
+                            match flag {
+                                't' => "timing",
+                                'T' => "log-timing",
+                                'I' => "log-in",
+                                'B' => "log-io",
+                                'd' => "divisor",
+                                'm' => "maxdelay",
+                                'c' => "command",
+                                _ => "",
+                            },
+                            (!rest.is_empty()).then_some(rest),
+                        )
+                    };
+                    if name.is_empty() || name == "command" {
+                        // Unknown short cluster or `-c`: stop so CMD stays.
+                        break;
+                    }
+                    if matches!(name, "log-in" | "log-io") {
+                        saw_typescript_opt = true;
+                    }
+                    if attached.is_none()
+                        && matches!(
+                            name,
+                            "timing" | "log-timing" | "log-in" | "log-io" | "divisor" | "maxdelay"
+                        )
+                    {
+                        tokens.next();
+                    }
+                }
+                if !saw_typescript_opt {
+                    if let Some(file) = tokens.peek() {
+                        if !file.starts_with('-') {
+                            let mut lookahead = tokens.clone();
+                            lookahead.next();
+                            if lookahead.peek().is_some() {
+                                tokens.next();
+                                if tokens.peek().is_some_and(|token| token == "--") {
+                                    tokens.next();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             _ => break,
         }
         program = tokens.next().unwrap_or_default();
@@ -2953,6 +3053,12 @@ mod tests {
             "xvfb-run -a cargo check",
             "xvfb-run --auto-servernum -- cargo nextest run",
             "dbus-run-session runcon unconfined_t xvfb-run -a cargo test",
+            "strace cargo test",
+            "strace -f cargo check",
+            "strace -e trace=file -- cargo nextest run",
+            "scriptlive typescript cargo test",
+            "scriptlive -t timing -I typescript -- cargo check",
+            "strace -f scriptlive typescript cargo test",
         ] {
             assert_eq!(
                 classify_command(command),
