@@ -1,10 +1,10 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (point pending tip at HEAD after rounds 164/207 final align)
+Updated: 2026-09-29 (align pending tip note with final HEAD after rounds 164/207)
 
-## 2026-09-29 (point pending tip — rounds 164/207 final align)
+## 2026-09-29 (align pending tip — final HEAD after rounds 164/207)
 
-- Local HEAD `c149259` path-patch-only. Anvil `f40fa66` rounds 161–164 / forge
+- Local HEAD `f772516` path-patch-only. Anvil `f40fa66` rounds 161–164 / forge
   `7302823` 203–207 + ember `b651a6e` / frost `73064ed` round-48 smoke sit
   beside. STAGE **71** / between() **93** unchanged. Push/repin still pending.
 
