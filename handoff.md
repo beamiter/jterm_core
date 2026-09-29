@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): openvt busybox STAGE arity + pipe deepen
+
+## 2026-09-29 (wave): openvt busybox STAGE arity / pipe deepen
+
+`openvt_stage_arity_edges` now peels `busybox openvt` applet carriers to
+sh/bash; user/help under busybox stay fail-closed. Pipe regressions cover
+`| busybox openvt bash`. Membership / DISPATCHES / CLASSIFY_FORMS stay
+**71** with set-eq. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): classify peels timeout/nice around openvt
 
 ## 2026-09-29 (wave): classify peels timeout/nice around openvt
