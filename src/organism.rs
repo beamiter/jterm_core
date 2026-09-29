@@ -681,6 +681,98 @@ const SETTLED_TO_IDLE_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( -.- )     \n > ^ <",
     " /\\_/\\      \n( -.- )     \n >~^ <",
 ];
+// Celebrate hold still showing when another finish lands: Guard*/Idle/Rest
+// already animate; Inspect/SitNear/Unknown must not snap.
+const CELEBRATE_TO_INSPECT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^o^ )>   \n  > ^ <",
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\  <-  \n( o_o )     \n /|_|\\",
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+];
+const CELEBRATE_TO_SIT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^o^ )>   \n  > ^ <",
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+];
+const CELEBRATE_TO_UNKNOWN_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^o^ )>   \n  > ^ <",
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n( ?.o )     \n > ^ <",
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+];
+const CELEBRATE_BIG_TO_INSPECT_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\  <-  \n( o_o )     \n /|_|\\",
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+];
+const CELEBRATE_BIG_TO_SIT_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+];
+const CELEBRATE_BIG_TO_UNKNOWN_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n( o.? )     \n > ^ <",
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+];
+// Rest hold still showing when another finish lands: Rest→Idle already
+// animates; Celebrate*/Inspect/SitNear/Unknown must not snap. Rest→Watch*
+// and Rest→Guard* stay None (new command / open vigil appearing).
+const REST_TO_INSPECT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\  <-  \n( o_o )     \n /|_|\\",
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+];
+const REST_TO_SIT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+];
+const REST_TO_UNKNOWN_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ?.o )     \n > ^ <",
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+];
+const REST_TO_CELEBRATE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n ( ^.^ )    \n  > ^ <",
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <",
+];
+const REST_TO_CELEBRATE_BIG_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
+];
+// Recovery vigil still showing when a finish lands without Watch: Idle/Rest
+// already animate; Inspect/SitNear/Unknown must not snap. GuardRecovery→Watch*
+// stays None (new command from vigil, same as Celebrate→Watch).
+const RECOVERY_TO_INSPECT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
+    " /\\_/\\  <-  \n( o_o ) [~ ]\n /|_|\\",
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+];
+const RECOVERY_TO_SIT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+];
+const RECOVERY_TO_UNKNOWN_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( ?.o )     \n /|_|\\",
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
 // motion snaps on the reverse of the already-bridged recovery/escalation graph.
@@ -902,6 +994,20 @@ pub enum VisualTransition {
     WatchCommandToIdle,
     WatchAgentToIdle,
     WatchSettledToIdle,
+    CelebrateToInspectError,
+    CelebrateToSitNearError,
+    CelebrateToUnknownOutcome,
+    CelebrateBigToInspectError,
+    CelebrateBigToSitNearError,
+    CelebrateBigToUnknownOutcome,
+    RestAfterPushToInspectError,
+    RestAfterPushToSitNearError,
+    RestAfterPushToUnknownOutcome,
+    RestAfterPushToCelebrate,
+    RestAfterPushToCelebrateBig,
+    GuardRecoveryToInspectError,
+    GuardRecoveryToSitNearError,
+    GuardRecoveryToUnknownOutcome,
 }
 
 impl VisualTransition {
@@ -1079,6 +1185,42 @@ impl VisualTransition {
             (Behavior::WatchCommand, Behavior::Idle) => Some(Self::WatchCommandToIdle),
             (Behavior::WatchAgent, Behavior::Idle) => Some(Self::WatchAgentToIdle),
             (Behavior::WatchSettled, Behavior::Idle) => Some(Self::WatchSettledToIdle),
+            (Behavior::Celebrate, Behavior::InspectError) => Some(Self::CelebrateToInspectError),
+            (Behavior::Celebrate, Behavior::SitNearError) => Some(Self::CelebrateToSitNearError),
+            (Behavior::Celebrate, Behavior::UnknownOutcome) => {
+                Some(Self::CelebrateToUnknownOutcome)
+            }
+            (Behavior::CelebrateBig, Behavior::InspectError) => {
+                Some(Self::CelebrateBigToInspectError)
+            }
+            (Behavior::CelebrateBig, Behavior::SitNearError) => {
+                Some(Self::CelebrateBigToSitNearError)
+            }
+            (Behavior::CelebrateBig, Behavior::UnknownOutcome) => {
+                Some(Self::CelebrateBigToUnknownOutcome)
+            }
+            (Behavior::RestAfterPush, Behavior::InspectError) => {
+                Some(Self::RestAfterPushToInspectError)
+            }
+            (Behavior::RestAfterPush, Behavior::SitNearError) => {
+                Some(Self::RestAfterPushToSitNearError)
+            }
+            (Behavior::RestAfterPush, Behavior::UnknownOutcome) => {
+                Some(Self::RestAfterPushToUnknownOutcome)
+            }
+            (Behavior::RestAfterPush, Behavior::Celebrate) => Some(Self::RestAfterPushToCelebrate),
+            (Behavior::RestAfterPush, Behavior::CelebrateBig) => {
+                Some(Self::RestAfterPushToCelebrateBig)
+            }
+            (Behavior::GuardRecovery, Behavior::InspectError) => {
+                Some(Self::GuardRecoveryToInspectError)
+            }
+            (Behavior::GuardRecovery, Behavior::SitNearError) => {
+                Some(Self::GuardRecoveryToSitNearError)
+            }
+            (Behavior::GuardRecovery, Behavior::UnknownOutcome) => {
+                Some(Self::GuardRecoveryToUnknownOutcome)
+            }
             _ => None,
         }
     }
@@ -1133,24 +1275,38 @@ impl VisualTransition {
             | Self::CelebrateToGuardFailure
             | Self::CelebrateToGuardStuck
             | Self::CelebrateToRestAfterPush
-            | Self::CelebrateToIdle => Behavior::Celebrate,
+            | Self::CelebrateToIdle
+            | Self::CelebrateToInspectError
+            | Self::CelebrateToSitNearError
+            | Self::CelebrateToUnknownOutcome => Behavior::Celebrate,
             Self::CelebrateBigToGuardRecovery
             | Self::CelebrateBigToGuardCautious
             | Self::CelebrateBigToGuardFailure
             | Self::CelebrateBigToGuardStuck
             | Self::CelebrateBigToRestAfterPush
-            | Self::CelebrateBigToIdle => Behavior::CelebrateBig,
+            | Self::CelebrateBigToIdle
+            | Self::CelebrateBigToInspectError
+            | Self::CelebrateBigToSitNearError
+            | Self::CelebrateBigToUnknownOutcome => Behavior::CelebrateBig,
             Self::GuardRecoveryToGuardFailure
             | Self::GuardRecoveryToGuardStuck
             | Self::GuardRecoveryToGuardCautious
             | Self::GuardRecoveryToRestAfterPush
-            | Self::GuardRecoveryToIdle => Behavior::GuardRecovery,
+            | Self::GuardRecoveryToIdle
+            | Self::GuardRecoveryToInspectError
+            | Self::GuardRecoveryToSitNearError
+            | Self::GuardRecoveryToUnknownOutcome => Behavior::GuardRecovery,
             Self::GuardCautiousToGuardFailure
             | Self::GuardCautiousToGuardStuck
             | Self::GuardCautiousToGuardRecovery
             | Self::GuardCautiousToRestAfterPush
             | Self::GuardCautiousToIdle => Behavior::GuardCautious,
-            Self::RestAfterPushToIdle => Behavior::RestAfterPush,
+            Self::RestAfterPushToIdle
+            | Self::RestAfterPushToInspectError
+            | Self::RestAfterPushToSitNearError
+            | Self::RestAfterPushToUnknownOutcome
+            | Self::RestAfterPushToCelebrate
+            | Self::RestAfterPushToCelebrateBig => Behavior::RestAfterPush,
             Self::UnknownOutcomeToIdle
             | Self::UnknownOutcomeToInspectError
             | Self::UnknownOutcomeToCelebrate
@@ -1203,20 +1359,30 @@ impl VisualTransition {
             | Self::SitNearErrorToCelebrate
             | Self::WatchCommandToCelebrate
             | Self::WatchAgentToCelebrate
-            | Self::UnknownOutcomeToCelebrate => Behavior::Celebrate,
+            | Self::UnknownOutcomeToCelebrate
+            | Self::RestAfterPushToCelebrate => Behavior::Celebrate,
             Self::WatchSettledToCelebrateBig
             | Self::InspectErrorToCelebrateBig
             | Self::SitNearErrorToCelebrateBig
             | Self::WatchCommandToCelebrateBig
-            | Self::UnknownOutcomeToCelebrateBig => Behavior::CelebrateBig,
+            | Self::UnknownOutcomeToCelebrateBig
+            | Self::RestAfterPushToCelebrateBig => Behavior::CelebrateBig,
             Self::WatchSettledToInspectError
             | Self::WatchCommandToInspectError
             | Self::WatchAgentToInspectError
-            | Self::UnknownOutcomeToInspectError => Behavior::InspectError,
+            | Self::UnknownOutcomeToInspectError
+            | Self::CelebrateToInspectError
+            | Self::CelebrateBigToInspectError
+            | Self::RestAfterPushToInspectError
+            | Self::GuardRecoveryToInspectError => Behavior::InspectError,
             Self::WatchSettledToSitNearError
             | Self::WatchCommandToSitNearError
             | Self::WatchAgentToSitNearError
-            | Self::UnknownOutcomeToSitNearError => Behavior::SitNearError,
+            | Self::UnknownOutcomeToSitNearError
+            | Self::CelebrateToSitNearError
+            | Self::CelebrateBigToSitNearError
+            | Self::RestAfterPushToSitNearError
+            | Self::GuardRecoveryToSitNearError => Behavior::SitNearError,
             Self::GuardRecoveryToRestAfterPush
             | Self::GuardCautiousToRestAfterPush
             | Self::GuardFailureToRestAfterPush
@@ -1242,6 +1408,10 @@ impl VisualTransition {
             | Self::WatchCommandToIdle
             | Self::WatchAgentToIdle
             | Self::WatchSettledToIdle => Behavior::Idle,
+            Self::CelebrateToUnknownOutcome
+            | Self::CelebrateBigToUnknownOutcome
+            | Self::RestAfterPushToUnknownOutcome
+            | Self::GuardRecoveryToUnknownOutcome => Behavior::UnknownOutcome,
         }
     }
 
@@ -1334,6 +1504,20 @@ impl VisualTransition {
             Self::WatchCommandToIdle => WATCH_TO_IDLE_FRAMES[index],
             Self::WatchAgentToIdle => WATCH_AGENT_TO_IDLE_FRAMES[index],
             Self::WatchSettledToIdle => SETTLED_TO_IDLE_FRAMES[index],
+            Self::CelebrateToInspectError => CELEBRATE_TO_INSPECT_FRAMES[index],
+            Self::CelebrateToSitNearError => CELEBRATE_TO_SIT_FRAMES[index],
+            Self::CelebrateToUnknownOutcome => CELEBRATE_TO_UNKNOWN_FRAMES[index],
+            Self::CelebrateBigToInspectError => CELEBRATE_BIG_TO_INSPECT_FRAMES[index],
+            Self::CelebrateBigToSitNearError => CELEBRATE_BIG_TO_SIT_FRAMES[index],
+            Self::CelebrateBigToUnknownOutcome => CELEBRATE_BIG_TO_UNKNOWN_FRAMES[index],
+            Self::RestAfterPushToInspectError => REST_TO_INSPECT_FRAMES[index],
+            Self::RestAfterPushToSitNearError => REST_TO_SIT_FRAMES[index],
+            Self::RestAfterPushToUnknownOutcome => REST_TO_UNKNOWN_FRAMES[index],
+            Self::RestAfterPushToCelebrate => REST_TO_CELEBRATE_FRAMES[index],
+            Self::RestAfterPushToCelebrateBig => REST_TO_CELEBRATE_BIG_FRAMES[index],
+            Self::GuardRecoveryToInspectError => RECOVERY_TO_INSPECT_FRAMES[index],
+            Self::GuardRecoveryToSitNearError => RECOVERY_TO_SIT_FRAMES[index],
+            Self::GuardRecoveryToUnknownOutcome => RECOVERY_TO_UNKNOWN_FRAMES[index],
         }
     }
 }
@@ -4571,6 +4755,20 @@ mod tests {
             VisualTransition::WatchCommandToIdle,
             VisualTransition::WatchAgentToIdle,
             VisualTransition::WatchSettledToIdle,
+            VisualTransition::CelebrateToInspectError,
+            VisualTransition::CelebrateToSitNearError,
+            VisualTransition::CelebrateToUnknownOutcome,
+            VisualTransition::CelebrateBigToInspectError,
+            VisualTransition::CelebrateBigToSitNearError,
+            VisualTransition::CelebrateBigToUnknownOutcome,
+            VisualTransition::RestAfterPushToInspectError,
+            VisualTransition::RestAfterPushToSitNearError,
+            VisualTransition::RestAfterPushToUnknownOutcome,
+            VisualTransition::RestAfterPushToCelebrate,
+            VisualTransition::RestAfterPushToCelebrateBig,
+            VisualTransition::GuardRecoveryToInspectError,
+            VisualTransition::GuardRecoveryToSitNearError,
+            VisualTransition::GuardRecoveryToUnknownOutcome,
         ];
         for transition in transitions {
             assert_eq!(
@@ -4817,6 +5015,96 @@ mod tests {
         );
     }
 
+    /// Celebrate hold still showing when another finish lands: Guard*/Idle/Rest
+    /// already animate; Inspect/SitNear/Unknown must not snap.
+    #[test]
+    fn celebrate_hold_finish_overwrites_have_full_motion_bridges() {
+        let mut inspect_hold = NativeOrganism::default();
+        let cele = inspect_hold.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(cele.behavior, Behavior::Celebrate);
+        let inspect = inspect_hold.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(inspect.behavior, Behavior::InspectError);
+        assert_eq!(
+            VisualTransition::between(cele.behavior, inspect.behavior),
+            Some(VisualTransition::CelebrateToInspectError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::SitNearError),
+            Some(VisualTransition::CelebrateToSitNearError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::UnknownOutcome),
+            Some(VisualTransition::CelebrateToUnknownOutcome)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::InspectError),
+            Some(VisualTransition::CelebrateBigToInspectError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::SitNearError),
+            Some(VisualTransition::CelebrateBigToSitNearError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::UnknownOutcome),
+            Some(VisualTransition::CelebrateBigToUnknownOutcome)
+        );
+    }
+
+    /// Rest hold still showing when another finish lands: Rest→Idle already
+    /// animates; Celebrate*/Inspect/SitNear/Unknown must not snap.
+    #[test]
+    fn rest_hold_finish_overwrites_have_full_motion_bridges() {
+        let mut rest_hold = NativeOrganism::default();
+        let rest = rest_hold.command_finished(CommandKind::GitPush, Some(0), None);
+        assert_eq!(rest.behavior, Behavior::RestAfterPush);
+        let inspect = rest_hold.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(inspect.behavior, Behavior::InspectError);
+        assert_eq!(
+            VisualTransition::between(rest.behavior, inspect.behavior),
+            Some(VisualTransition::RestAfterPushToInspectError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::SitNearError),
+            Some(VisualTransition::RestAfterPushToSitNearError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::UnknownOutcome),
+            Some(VisualTransition::RestAfterPushToUnknownOutcome)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::Celebrate),
+            Some(VisualTransition::RestAfterPushToCelebrate)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::CelebrateBig),
+            Some(VisualTransition::RestAfterPushToCelebrateBig)
+        );
+    }
+
+    /// Recovery vigil still showing when a finish lands without Watch:
+    /// Idle/Rest already animate; Inspect/SitNear/Unknown must not snap.
+    #[test]
+    fn guard_recovery_finish_overwrites_have_full_motion_bridges() {
+        let mut recovered = NativeOrganism::default();
+        recovered.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        recovered.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(recovered.idle_reaction().behavior, Behavior::GuardRecovery);
+        let inspect = recovered.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(inspect.behavior, Behavior::InspectError);
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardRecovery, inspect.behavior),
+            Some(VisualTransition::GuardRecoveryToInspectError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::SitNearError),
+            Some(VisualTransition::GuardRecoveryToSitNearError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::UnknownOutcome),
+            Some(VisualTransition::GuardRecoveryToUnknownOutcome)
+        );
+    }
+
     #[test]
     fn watch_settled_failure_has_full_motion_bridges() {
         assert_eq!(
@@ -4995,6 +5283,25 @@ mod tests {
                 Behavior::GuardStuck,
                 Behavior::GuardRecovery,
                 Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
+    /// New command mid-rest or mid-recovery vigil snaps into Watch* without
+    /// bridge frames, same contract as Celebrate*→Watch*.
+    #[test]
+    fn rest_and_guard_recovery_never_bridge_to_watch_poses() {
+        for from in [Behavior::RestAfterPush, Behavior::GuardRecovery] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
             ] {
                 assert_eq!(
                     VisualTransition::between(from, to),
@@ -5217,10 +5524,10 @@ mod tests {
     }
 
     #[test]
-    fn visual_transition_between_recognizes_seventy_six_intentional_arcs() {
+    fn visual_transition_between_recognizes_ninety_intentional_arcs() {
         // Recount pin: UI contract lists (anvil/forge semantic_bridges) must
-        // stay in lockstep with this Some count (64 → 70 clear-Idle → 76
-        // error/unknown→Rest + Watch*→Idle).
+        // stay in lockstep with this Some count (76 → 90 Celebrate*/Rest/
+        // GuardRecovery hold overwrites).
         let mut count = 0usize;
         for from in [
             Behavior::Idle,
@@ -5268,7 +5575,7 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 76,
+            count, 90,
             "between() Some count drifted; sync UI contract lists"
         );
     }
