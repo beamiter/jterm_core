@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after rounds 181/228 final align)
+
+## 2026-09-29 (point pending tip — rounds 181/228 final align)
+
+- Pending tip note remains current at HEAD `b9d9834` after STAGE 71 / between() 93
+  hold beside sticky FE06/MAX-5/Celebrate-Rest→Unknown verify.
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 181/228 final)
 
 ## 2026-09-29 (point pending tip — rounds 181/228 final)
