@@ -1,5 +1,26 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through round-45)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through round-45)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  anvil 152–154 / forge 192–195 bidi sticky/find/notice + ambient disposition
+  completeness and ember/frost round-45 smoke beside wave-32 PATH leftovers +
+  aa-exec/socket-activate deepen. No STAGE peel this wave.
+
+
+Updated: 2026-09-29 (pending tip beside bidi/ambient pins and round-45 smoke)
+
+## 2026-09-29 (pending tip — bidi/ambient + round-45)
+
+- Local HEAD `af7487e` still path-patch-only for ember/frost round-45 smoke
+  against jagent `f0bc04a` after anvil `36a2a79` rounds 152–154 / forge
+  `a9d9eea` 192–195 bidi sticky/find/notice + ambient disposition beside
+  148–151 / 188–191 Idle/Rest Guard pins. STAGE **71** / between() **93**
+  unchanged. Push/repin cohort still pending.
+
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through round-46)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through round-46)
