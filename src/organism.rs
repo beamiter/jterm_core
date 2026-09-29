@@ -318,6 +318,39 @@ const CAUTIOUS_TO_REST_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
     " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
 ];
+// Idle vigil relapse: a sibling reopens failures while this pane still shows
+// Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
+// motion snaps on the reverse of the already-bridged recovery/escalation graph.
+const RECOVERY_TO_FAILURE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( o.o ) [! ]\n /|_|\\",
+];
+const RECOVERY_TO_STUCK_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [~ ]\n /|_|\\",
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+];
+const CAUTIOUS_TO_FAILURE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [~ ]\n /|_|\\",
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( o.o ) [! ]\n /|_|\\",
+];
+const CAUTIOUS_TO_STUCK_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [~ ]\n /|_|\\",
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+];
+const STUCK_TO_FAILURE_FRAMES: [&str; 4] = [
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " /\\_/\\      \n( ._. ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+];
 
 impl Behavior {
     /// Canonical single pose: the first frame of each behavior's set. Used by
@@ -436,6 +469,7 @@ pub enum VisualTransition {
     GuardFailureToGuardStuck,
     GuardFailureToGuardRecovery,
     GuardFailureToGuardCautious,
+    GuardStuckToGuardFailure,
     GuardStuckToGuardRecovery,
     GuardStuckToGuardCautious,
     WatchSettledToCelebrate,
@@ -444,7 +478,11 @@ pub enum VisualTransition {
     CelebrateToGuardCautious,
     CelebrateBigToGuardRecovery,
     CelebrateBigToGuardCautious,
+    GuardRecoveryToGuardFailure,
+    GuardRecoveryToGuardStuck,
     GuardRecoveryToGuardCautious,
+    GuardCautiousToGuardFailure,
+    GuardCautiousToGuardStuck,
     GuardRecoveryToRestAfterPush,
     GuardCautiousToRestAfterPush,
 }
@@ -468,6 +506,7 @@ impl VisualTransition {
             (Behavior::GuardFailure, Behavior::GuardCautious) => {
                 Some(Self::GuardFailureToGuardCautious)
             }
+            (Behavior::GuardStuck, Behavior::GuardFailure) => Some(Self::GuardStuckToGuardFailure),
             (Behavior::GuardStuck, Behavior::GuardRecovery) => {
                 Some(Self::GuardStuckToGuardRecovery)
             }
@@ -486,8 +525,20 @@ impl VisualTransition {
             (Behavior::CelebrateBig, Behavior::GuardCautious) => {
                 Some(Self::CelebrateBigToGuardCautious)
             }
+            (Behavior::GuardRecovery, Behavior::GuardFailure) => {
+                Some(Self::GuardRecoveryToGuardFailure)
+            }
+            (Behavior::GuardRecovery, Behavior::GuardStuck) => {
+                Some(Self::GuardRecoveryToGuardStuck)
+            }
             (Behavior::GuardRecovery, Behavior::GuardCautious) => {
                 Some(Self::GuardRecoveryToGuardCautious)
+            }
+            (Behavior::GuardCautious, Behavior::GuardFailure) => {
+                Some(Self::GuardCautiousToGuardFailure)
+            }
+            (Behavior::GuardCautious, Behavior::GuardStuck) => {
+                Some(Self::GuardCautiousToGuardStuck)
             }
             (Behavior::GuardRecovery, Behavior::RestAfterPush) => {
                 Some(Self::GuardRecoveryToRestAfterPush)
@@ -508,9 +559,9 @@ impl VisualTransition {
             Self::GuardFailureToGuardStuck
             | Self::GuardFailureToGuardRecovery
             | Self::GuardFailureToGuardCautious => Behavior::GuardFailure,
-            Self::GuardStuckToGuardRecovery | Self::GuardStuckToGuardCautious => {
-                Behavior::GuardStuck
-            }
+            Self::GuardStuckToGuardFailure
+            | Self::GuardStuckToGuardRecovery
+            | Self::GuardStuckToGuardCautious => Behavior::GuardStuck,
             Self::WatchSettledToCelebrate | Self::WatchSettledToCelebrateBig => {
                 Behavior::WatchSettled
             }
@@ -518,19 +569,27 @@ impl VisualTransition {
             Self::CelebrateBigToGuardRecovery | Self::CelebrateBigToGuardCautious => {
                 Behavior::CelebrateBig
             }
-            Self::GuardRecoveryToGuardCautious | Self::GuardRecoveryToRestAfterPush => {
-                Behavior::GuardRecovery
-            }
-            Self::GuardCautiousToRestAfterPush => Behavior::GuardCautious,
+            Self::GuardRecoveryToGuardFailure
+            | Self::GuardRecoveryToGuardStuck
+            | Self::GuardRecoveryToGuardCautious
+            | Self::GuardRecoveryToRestAfterPush => Behavior::GuardRecovery,
+            Self::GuardCautiousToGuardFailure
+            | Self::GuardCautiousToGuardStuck
+            | Self::GuardCautiousToRestAfterPush => Behavior::GuardCautious,
         }
     }
 
     pub const fn target(self) -> Behavior {
         match self {
-            Self::InspectErrorToGuardFailure | Self::SitNearErrorToGuardFailure => {
-                Behavior::GuardFailure
-            }
-            Self::SitNearErrorToGuardStuck | Self::GuardFailureToGuardStuck => Behavior::GuardStuck,
+            Self::InspectErrorToGuardFailure
+            | Self::SitNearErrorToGuardFailure
+            | Self::GuardStuckToGuardFailure
+            | Self::GuardRecoveryToGuardFailure
+            | Self::GuardCautiousToGuardFailure => Behavior::GuardFailure,
+            Self::SitNearErrorToGuardStuck
+            | Self::GuardFailureToGuardStuck
+            | Self::GuardRecoveryToGuardStuck
+            | Self::GuardCautiousToGuardStuck => Behavior::GuardStuck,
             Self::GuardFailureToGuardRecovery | Self::GuardStuckToGuardRecovery => {
                 Behavior::GuardRecovery
             }
@@ -570,6 +629,7 @@ impl VisualTransition {
             Self::GuardFailureToGuardStuck => FAILURE_TO_STUCK_FRAMES[index],
             Self::GuardFailureToGuardRecovery => FAILURE_TO_RECOVERY_FRAMES[index],
             Self::GuardFailureToGuardCautious => FAILURE_TO_CAUTIOUS_FRAMES[index],
+            Self::GuardStuckToGuardFailure => STUCK_TO_FAILURE_FRAMES[index],
             Self::GuardStuckToGuardRecovery => STUCK_TO_RECOVERY_FRAMES[index],
             Self::GuardStuckToGuardCautious => STUCK_TO_CAUTIOUS_FRAMES[index],
             Self::WatchSettledToCelebrate => SETTLED_TO_CELEBRATE_FRAMES[index],
@@ -578,7 +638,11 @@ impl VisualTransition {
             Self::CelebrateToGuardCautious => CELEBRATE_TO_CAUTIOUS_FRAMES[index],
             Self::CelebrateBigToGuardRecovery => CELEBRATE_BIG_TO_RECOVERY_FRAMES[index],
             Self::CelebrateBigToGuardCautious => CELEBRATE_BIG_TO_CAUTIOUS_FRAMES[index],
+            Self::GuardRecoveryToGuardFailure => RECOVERY_TO_FAILURE_FRAMES[index],
+            Self::GuardRecoveryToGuardStuck => RECOVERY_TO_STUCK_FRAMES[index],
             Self::GuardRecoveryToGuardCautious => RECOVERY_TO_CAUTIOUS_FRAMES[index],
+            Self::GuardCautiousToGuardFailure => CAUTIOUS_TO_FAILURE_FRAMES[index],
+            Self::GuardCautiousToGuardStuck => CAUTIOUS_TO_STUCK_FRAMES[index],
             Self::GuardRecoveryToRestAfterPush => RECOVERY_TO_REST_FRAMES[index],
             Self::GuardCautiousToRestAfterPush => CAUTIOUS_TO_REST_FRAMES[index],
         }
@@ -2882,6 +2946,7 @@ mod tests {
             VisualTransition::GuardFailureToGuardStuck,
             VisualTransition::GuardFailureToGuardRecovery,
             VisualTransition::GuardFailureToGuardCautious,
+            VisualTransition::GuardStuckToGuardFailure,
             VisualTransition::GuardStuckToGuardRecovery,
             VisualTransition::GuardStuckToGuardCautious,
             VisualTransition::WatchSettledToCelebrate,
@@ -2890,7 +2955,11 @@ mod tests {
             VisualTransition::CelebrateToGuardCautious,
             VisualTransition::CelebrateBigToGuardRecovery,
             VisualTransition::CelebrateBigToGuardCautious,
+            VisualTransition::GuardRecoveryToGuardFailure,
+            VisualTransition::GuardRecoveryToGuardStuck,
             VisualTransition::GuardRecoveryToGuardCautious,
+            VisualTransition::GuardCautiousToGuardFailure,
+            VisualTransition::GuardCautiousToGuardStuck,
             VisualTransition::GuardRecoveryToRestAfterPush,
             VisualTransition::GuardCautiousToRestAfterPush,
         ];
@@ -2962,6 +3031,43 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::GuardRecovery, Behavior::GuardCautious),
             Some(VisualTransition::GuardRecoveryToGuardCautious)
+        );
+    }
+
+    #[test]
+    fn idle_vigil_relapse_has_full_motion_bridges() {
+        let mut organism = NativeOrganism::default();
+        organism.restore_repo_work_context(RepoWorkState::new(0, true, 1), 1, 1);
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardRecovery);
+
+        assert!(organism.sync_repo_work_state(RepoWorkState::new(1, false, 1)));
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardFailure);
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::GuardFailure),
+            Some(VisualTransition::GuardRecoveryToGuardFailure)
+        );
+
+        organism.restore_repo_work_context(RepoWorkState::new(0, true, 3), 1, 1);
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardCautious);
+        assert!(organism.sync_repo_work_state(RepoWorkState::new(3, false, 3)));
+        assert_eq!(organism.idle_reaction().behavior, Behavior::GuardStuck);
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::GuardStuck),
+            Some(VisualTransition::GuardCautiousToGuardStuck)
+        );
+
+        // Stuck can also downgrade to Failure when open work shrinks.
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardStuck, Behavior::GuardFailure),
+            Some(VisualTransition::GuardStuckToGuardFailure)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardRecovery, Behavior::GuardStuck),
+            Some(VisualTransition::GuardRecoveryToGuardStuck)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardCautious, Behavior::GuardFailure),
+            Some(VisualTransition::GuardCautiousToGuardFailure)
         );
     }
 

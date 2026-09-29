@@ -1053,6 +1053,17 @@ perception, Calm/Static still snap. Regressions:
 coupling (two nonzero BuildOrTest finishes → SitNearError then GuardFailure
 with a recognized bridge).
 
+## 2026-09-29 (organism evolve): idle vigil relapse continuity
+
+The recovery/escalation graph was still one-way after the settle pass: a pane
+already on `GuardRecovery`/`GuardCautious` that receives a sibling
+`RepoWorkState` reopening failures (or Stuck downgrading to Failure) snapped
+under Full motion. Added five reverse arcs —
+`GuardRecoveryToGuardFailure`/`Stuck`, `GuardCautiousToGuardFailure`/`Stuck`,
+`GuardStuckToGuardFailure` — with the same bbox contract.
+`idle_vigil_relapse_has_full_motion_bridges` drives sync_repo_work_state from
+Recovery→Failure and Cautious→Stuck.
+
 ## 2026-09-28 (wave 8): taskset/chrt stage prefixes in correction scans
 
 `taskset` and `chrt` join [`STAGE_PREFIXES`] so pipe-to-interpreter sees the
