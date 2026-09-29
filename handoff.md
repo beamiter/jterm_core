@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 through wave-35 cohort)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 — wave-35 cohort)
+
+- CLASSIFY/DISPATCHES set-eq held at STAGE **71** through wave-35 host/hw
+  inventory leftover pin + chrt/ionice help/pid fail-closed deepen and
+  timeout/nice classify peels. Membership len unchanged.
+
+
 Updated: 2026-09-29 (pending tip beside wave-35 deepen)
 
 ## 2026-09-29 (pending tip — wave-35 deepen)
