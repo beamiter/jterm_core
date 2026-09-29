@@ -2815,6 +2815,10 @@ pub fn classify_command(command: &str) -> CommandKind {
                 &mut tokens,
                 &["--what", "--who", "--why", "--mode"],
             ),
+            "systemd-socket-activate" => skip_wrapper_options(
+                &mut tokens,
+                &["-l", "--listen", "-E", "--setenv", "--fdname"],
+            ),
             "aa-exec" => skip_wrapper_options(
                 &mut tokens,
                 &["-p", "--profile", "-n", "--namespace"],
@@ -3396,6 +3400,9 @@ mod tests {
             "systemd-inhibit cargo test",
             "systemd-inhibit --what=idle cargo check",
             "systemd-inhibit --what idle --who x -- cargo nextest run",
+            "systemd-socket-activate cargo test",
+            "systemd-socket-activate -l 2000 cargo check",
+            "systemd-socket-activate --listen=127.0.0.1:9 --inetd -a -- cargo nextest run",
             "aa-exec cargo test",
             "aa-exec -p unconfined cargo check",
             "aa-exec --profile=unconfined -- cargo nextest run",
@@ -3445,6 +3452,11 @@ mod tests {
             "xargs cargo test",
             "xargs -n 1 -- cargo nextest run",
             "capsh -- unbuffer setsid cargo test",
+            // Nested STAGE wrappers: depth loop must peel strace then timeout
+            // before classifying the cargo child.
+            "strace -f timeout --signal=TERM 10 cargo test",
+            "timeout 5 strace -e trace=file cargo check",
+            "strace timeout 5 systemd-cat -t unit cargo nextest run",
         ] {
             assert_eq!(
                 classify_command(command),
@@ -3452,6 +3464,17 @@ mod tests {
                 "{command} must see through scheduling/lock wrappers"
             );
         }
+        // Nested wrappers over a non-build child must still reach Other.
+        assert_eq!(
+            classify_command("strace timeout 5 rm -rf /"),
+            CommandKind::Other,
+            "nested strace+timeout must still classify the rm child"
+        );
+        assert_eq!(
+            classify_command("timeout 5 strace rm -rf /tmp/x"),
+            CommandKind::Other,
+            "nested timeout+strace must still classify the rm child"
+        );
         for command in [
             "git push --dry-run",
             "git push origin main -n",
