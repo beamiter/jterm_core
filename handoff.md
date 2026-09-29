@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 183/230 + round-52)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 183/230)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  sticky FE06/FE05/MAX-5/SitNear/Inspect→Unknown beside anvil 179–183 / forge
+  225–230 and ember/frost round-52 smoke (wave-34 taskset/choom/prlimit deepen
+  sits under; no further peel this wave). Celebrate/Rest/SitNear/Inspect→Unknown
+  remain inside between() 93 (no semantic_bridges len bump).
+
+
 Updated: 2026-09-29 (pending tip — rounds 179–183 / 225–230 + round-52 beside wave-34)
 
 ## 2026-09-29 (pending tip — sticky FE06/FE05/MAX-5/SitNear + round-52)
