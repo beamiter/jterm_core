@@ -1501,6 +1501,10 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("gamemoderun", Some("help" | "version" | "h")) => true,
         // `-u`/`--user` runs login as VT owner — no argv COMMAND child.
         ("openvt", Some("help" | "version" | "h" | "V" | "user" | "u")) => true,
+        // AppArmor confine-and-exec: help/version terminate without PROGRAM.
+        ("aa-exec", Some("help" | "version" | "h")) => true,
+        // Socket-activation test launcher: help/version terminate without daemon.
+        ("systemd-socket-activate", Some("help" | "version" | "h")) => true,
         _ => false,
     }
 }
@@ -3688,6 +3692,7 @@ mod tests {
         }
     }
 
+
     #[test]
     fn path_probe_leftovers_stay_out_of_stage_prefixes() {
         // Intentional non-STAGE names from the 2026-09-29 PATH probe wave.
@@ -4360,6 +4365,88 @@ mod tests {
         );
     }
 
+    /// AppArmor aa-exec: profile/namespace meta + help/version fail closed.
+    /// Busybox applet carriers peel before the STAGE name so pipe-to-bash still
+    /// resolves (parity with openvt / systemd-cat deepenings).
+    #[test]
+    fn aa_exec_stage_arity_edges() {
+        assert_eq!(stage_interpreter("aa-exec sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("aa-exec -p unconfined bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("aa-exec --profile=unconfined -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox aa-exec sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox aa-exec -p unconfined bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("aa-exec --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("aa-exec -h bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox aa-exec --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox aa-exec -h bash").as_deref(),
+            None
+        );
+    }
+
+    /// systemd-socket-activate: listen/setenv/fdname meta + help/version fail
+    /// closed. Busybox applet carriers peel before the STAGE name.
+    #[test]
+    fn systemd_socket_activate_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate -l 2000 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --listen=2000 -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-socket-activate sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-socket-activate -l 2000 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --help sh").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate -h bash").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --version sh").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-socket-activate --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-socket-activate --version bash").as_deref(),
+            None
+        );
+    }
+
     #[test]
     fn gnome_session_inhibit_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
@@ -4472,6 +4559,20 @@ mod tests {
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox systemd-socket-activate bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox systemd-socket-activate -l 2000 bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
     }
 
     #[test]
@@ -4487,6 +4588,20 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | aa-exec -p unconfined bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox aa-exec bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox aa-exec -p unconfined bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
