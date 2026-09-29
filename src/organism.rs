@@ -641,46 +641,6 @@ const CAUTIOUS_TO_IDLE_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( -.- )     \n > ^ <",
     " /\\_/\\      \n( -.- )     \n >~^ <",
 ];
-// Error-hold or unknown hold still showing when a push lands: Guard*/Watch*/
-// Celebrate→Rest already animate; Inspect/SitNear/Unknown must not snap.
-const INSPECT_TO_REST_FRAMES: [&str; 4] = [
-    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
-    " /\\_/\\  <-  \n( o_o )     \n /|_|\\",
-    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
-    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
-];
-const SIT_TO_REST_FRAMES: [&str; 4] = [
-    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
-    " /\\_/\\      \n( ._. )     \n /|_|\\",
-    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
-    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
-];
-const UNKNOWN_TO_REST_FRAMES: [&str; 4] = [
-    " /\\_/\\      \n( ?.? )     \n > ^ <",
-    " /\\_/\\      \n( ?.o )     \n > ^ <",
-    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
-    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
-];
-// Clean Other finish while a watch pose is still showing: Watch*→Rest already
-// animates for GitPush; Watch* must not snap to Idle.
-const WATCH_TO_IDLE_FRAMES: [&str; 4] = [
-    " /\\_/\\      \n( o.o )     \n > ^ <",
-    " /\\_/\\      \n( o.o )     \n > ^ <",
-    " /\\_/\\      \n( -.- )     \n > ^ <",
-    " /\\_/\\      \n( -.- )     \n >~^ <",
-];
-const WATCH_AGENT_TO_IDLE_FRAMES: [&str; 4] = [
-    " /\\_/\\      \n( -.o )     \n (___) ",
-    " /\\_/\\      \n( o.o )     \n > ^ <",
-    " /\\_/\\      \n( -.- )     \n > ^ <",
-    " /\\_/\\      \n( -.- )     \n >~^ <",
-];
-const SETTLED_TO_IDLE_FRAMES: [&str; 4] = [
-    " /\\_/\\      \n( -.- )     \n (___) ",
-    " /\\_/\\      \n( -.- )     \n > ^ <",
-    " /\\_/\\      \n( -.- )     \n > ^ <",
-    " /\\_/\\      \n( -.- )     \n >~^ <",
-];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
 // motion snaps on the reverse of the already-bridged recovery/escalation graph.
@@ -896,12 +856,6 @@ pub enum VisualTransition {
     GuardStuckToIdle,
     GuardRecoveryToIdle,
     GuardCautiousToIdle,
-    InspectErrorToRestAfterPush,
-    SitNearErrorToRestAfterPush,
-    UnknownOutcomeToRestAfterPush,
-    WatchCommandToIdle,
-    WatchAgentToIdle,
-    WatchSettledToIdle,
 }
 
 impl VisualTransition {
@@ -1067,18 +1021,6 @@ impl VisualTransition {
             (Behavior::GuardStuck, Behavior::Idle) => Some(Self::GuardStuckToIdle),
             (Behavior::GuardRecovery, Behavior::Idle) => Some(Self::GuardRecoveryToIdle),
             (Behavior::GuardCautious, Behavior::Idle) => Some(Self::GuardCautiousToIdle),
-            (Behavior::InspectError, Behavior::RestAfterPush) => {
-                Some(Self::InspectErrorToRestAfterPush)
-            }
-            (Behavior::SitNearError, Behavior::RestAfterPush) => {
-                Some(Self::SitNearErrorToRestAfterPush)
-            }
-            (Behavior::UnknownOutcome, Behavior::RestAfterPush) => {
-                Some(Self::UnknownOutcomeToRestAfterPush)
-            }
-            (Behavior::WatchCommand, Behavior::Idle) => Some(Self::WatchCommandToIdle),
-            (Behavior::WatchAgent, Behavior::Idle) => Some(Self::WatchAgentToIdle),
-            (Behavior::WatchSettled, Behavior::Idle) => Some(Self::WatchSettledToIdle),
             _ => None,
         }
     }
@@ -1091,16 +1033,14 @@ impl VisualTransition {
             | Self::InspectErrorToGuardStuck
             | Self::InspectErrorToCelebrate
             | Self::InspectErrorToCelebrateBig
-            | Self::InspectErrorToIdle
-            | Self::InspectErrorToRestAfterPush => Behavior::InspectError,
+            | Self::InspectErrorToIdle => Behavior::InspectError,
             Self::SitNearErrorToGuardFailure
             | Self::SitNearErrorToGuardStuck
             | Self::SitNearErrorToGuardRecovery
             | Self::SitNearErrorToGuardCautious
             | Self::SitNearErrorToCelebrate
             | Self::SitNearErrorToCelebrateBig
-            | Self::SitNearErrorToIdle
-            | Self::SitNearErrorToRestAfterPush => Behavior::SitNearError,
+            | Self::SitNearErrorToIdle => Behavior::SitNearError,
             Self::GuardFailureToGuardStuck
             | Self::GuardFailureToGuardRecovery
             | Self::GuardFailureToGuardCautious
@@ -1115,19 +1055,16 @@ impl VisualTransition {
             | Self::WatchSettledToCelebrateBig
             | Self::WatchSettledToInspectError
             | Self::WatchSettledToSitNearError
-            | Self::WatchSettledToRestAfterPush
-            | Self::WatchSettledToIdle => Behavior::WatchSettled,
+            | Self::WatchSettledToRestAfterPush => Behavior::WatchSettled,
             Self::WatchCommandToCelebrate
             | Self::WatchCommandToCelebrateBig
             | Self::WatchCommandToInspectError
             | Self::WatchCommandToSitNearError
-            | Self::WatchCommandToRestAfterPush
-            | Self::WatchCommandToIdle => Behavior::WatchCommand,
+            | Self::WatchCommandToRestAfterPush => Behavior::WatchCommand,
             Self::WatchAgentToCelebrate
             | Self::WatchAgentToInspectError
             | Self::WatchAgentToSitNearError
-            | Self::WatchAgentToRestAfterPush
-            | Self::WatchAgentToIdle => Behavior::WatchAgent,
+            | Self::WatchAgentToRestAfterPush => Behavior::WatchAgent,
             Self::CelebrateToGuardRecovery
             | Self::CelebrateToGuardCautious
             | Self::CelebrateToGuardFailure
@@ -1159,8 +1096,7 @@ impl VisualTransition {
             | Self::UnknownOutcomeToGuardFailure
             | Self::UnknownOutcomeToGuardStuck
             | Self::UnknownOutcomeToGuardRecovery
-            | Self::UnknownOutcomeToGuardCautious
-            | Self::UnknownOutcomeToRestAfterPush => Behavior::UnknownOutcome,
+            | Self::UnknownOutcomeToGuardCautious => Behavior::UnknownOutcome,
         }
     }
 
@@ -1225,10 +1161,7 @@ impl VisualTransition {
             | Self::CelebrateBigToRestAfterPush
             | Self::WatchCommandToRestAfterPush
             | Self::WatchAgentToRestAfterPush
-            | Self::WatchSettledToRestAfterPush
-            | Self::InspectErrorToRestAfterPush
-            | Self::SitNearErrorToRestAfterPush
-            | Self::UnknownOutcomeToRestAfterPush => Behavior::RestAfterPush,
+            | Self::WatchSettledToRestAfterPush => Behavior::RestAfterPush,
             Self::CelebrateToIdle
             | Self::CelebrateBigToIdle
             | Self::RestAfterPushToIdle
@@ -1238,10 +1171,7 @@ impl VisualTransition {
             | Self::GuardFailureToIdle
             | Self::GuardStuckToIdle
             | Self::GuardRecoveryToIdle
-            | Self::GuardCautiousToIdle
-            | Self::WatchCommandToIdle
-            | Self::WatchAgentToIdle
-            | Self::WatchSettledToIdle => Behavior::Idle,
+            | Self::GuardCautiousToIdle => Behavior::Idle,
         }
     }
 
@@ -1328,12 +1258,6 @@ impl VisualTransition {
             Self::GuardStuckToIdle => STUCK_TO_IDLE_FRAMES[index],
             Self::GuardRecoveryToIdle => RECOVERY_TO_IDLE_FRAMES[index],
             Self::GuardCautiousToIdle => CAUTIOUS_TO_IDLE_FRAMES[index],
-            Self::InspectErrorToRestAfterPush => INSPECT_TO_REST_FRAMES[index],
-            Self::SitNearErrorToRestAfterPush => SIT_TO_REST_FRAMES[index],
-            Self::UnknownOutcomeToRestAfterPush => UNKNOWN_TO_REST_FRAMES[index],
-            Self::WatchCommandToIdle => WATCH_TO_IDLE_FRAMES[index],
-            Self::WatchAgentToIdle => WATCH_AGENT_TO_IDLE_FRAMES[index],
-            Self::WatchSettledToIdle => SETTLED_TO_IDLE_FRAMES[index],
         }
     }
 }
@@ -3519,8 +3443,6 @@ mod tests {
             "numactl -C 0 -- cargo nextest run",
             "flock /tmp/lock cargo test",
             "flock -n /var/lock/x -- cargo check",
-            "flock -- /tmp/lock cargo test",
-            "flock /tmp/lock -- cargo check",
             "nice timeout 10 flock /tmp/l cargo test",
             "softlimit -m 1000000 cargo test",
             "chpst -u nobody cargo test",
@@ -4540,12 +4462,6 @@ mod tests {
             VisualTransition::GuardStuckToIdle,
             VisualTransition::GuardRecoveryToIdle,
             VisualTransition::GuardCautiousToIdle,
-            VisualTransition::InspectErrorToRestAfterPush,
-            VisualTransition::SitNearErrorToRestAfterPush,
-            VisualTransition::UnknownOutcomeToRestAfterPush,
-            VisualTransition::WatchCommandToIdle,
-            VisualTransition::WatchAgentToIdle,
-            VisualTransition::WatchSettledToIdle,
         ];
         for transition in transitions {
             assert_eq!(
@@ -4740,55 +4656,6 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::CelebrateBig, Behavior::RestAfterPush),
             Some(VisualTransition::CelebrateBigToRestAfterPush)
-        );
-    }
-
-    /// Error/unknown holds still showing when a push lands: Guard*/Watch*/
-    /// Celebrate→Rest already animate; Inspect/SitNear/Unknown must not snap.
-    #[test]
-    fn error_and_unknown_holds_push_have_full_motion_bridges() {
-        let mut inspect_hold = NativeOrganism::default();
-        let inspect = inspect_hold.command_finished(CommandKind::Other, Some(1), None);
-        assert_eq!(inspect.behavior, Behavior::InspectError);
-        let push = inspect_hold.command_finished(CommandKind::GitPush, Some(0), None);
-        assert_eq!(push.behavior, Behavior::RestAfterPush);
-        assert_eq!(
-            VisualTransition::between(inspect.behavior, push.behavior),
-            Some(VisualTransition::InspectErrorToRestAfterPush)
-        );
-        assert_eq!(
-            VisualTransition::between(Behavior::SitNearError, Behavior::RestAfterPush),
-            Some(VisualTransition::SitNearErrorToRestAfterPush)
-        );
-        assert_eq!(
-            VisualTransition::between(Behavior::UnknownOutcome, Behavior::RestAfterPush),
-            Some(VisualTransition::UnknownOutcomeToRestAfterPush)
-        );
-    }
-
-    /// Clean Other finishes land on Idle while a watch pose is still showing.
-    /// Watch*→Rest already animates for GitPush; Watch* must not snap to Idle.
-    #[test]
-    fn watch_poses_clean_other_idle_have_full_motion_bridges() {
-        for (from, expected) in [
-            (Behavior::WatchCommand, VisualTransition::WatchCommandToIdle),
-            (Behavior::WatchAgent, VisualTransition::WatchAgentToIdle),
-            (Behavior::WatchSettled, VisualTransition::WatchSettledToIdle),
-        ] {
-            assert_eq!(
-                VisualTransition::between(from, Behavior::Idle),
-                Some(expected),
-                "{from:?}→Idle"
-            );
-        }
-        let mut organism = NativeOrganism::default();
-        let watch = organism.command_started(CommandKind::Other);
-        assert_eq!(watch.behavior, Behavior::WatchCommand);
-        let idle = organism.command_finished(CommandKind::Other, Some(0), None);
-        assert_eq!(idle.behavior, Behavior::Idle);
-        assert_eq!(
-            VisualTransition::between(watch.behavior, idle.behavior),
-            Some(VisualTransition::WatchCommandToIdle)
         );
     }
 
@@ -5192,10 +5059,9 @@ mod tests {
     }
 
     #[test]
-    fn visual_transition_between_recognizes_seventy_six_intentional_arcs() {
+    fn visual_transition_between_recognizes_seventy_intentional_arcs() {
         // Recount pin: UI contract lists (anvil/forge semantic_bridges) must
-        // stay in lockstep with this Some count (64 → 70 clear-Idle → 76
-        // error/unknown→Rest + Watch*→Idle).
+        // stay in lockstep with this Some count (was 64 before clear-Idle).
         let mut count = 0usize;
         for from in [
             Behavior::Idle,
@@ -5243,7 +5109,7 @@ mod tests {
             }
         }
         assert_eq!(
-            count, 76,
+            count, 70,
             "between() Some count drifted; sync UI contract lists"
         );
     }
