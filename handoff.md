@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): STAGE_PREFIXES parity with jagent dispatchers
+Updated: 2026-09-29 (wave): FIND_OVERLAY_SCAN_* shared constants
+
+## 2026-09-29 (wave): FIND_OVERLAY_SCAN_* shared constants
+
+`FIND_OVERLAY_SCAN_BYTE_LIMIT` (4 MiB) and `FIND_OVERLAY_SCAN_TIME_LIMIT`
+(12 ms) join `cross_block_search` beside the existing CROSS_BLOCK_* caps so
+anvil/forge live Find overlays cannot drift. Cross-block palette walks keep
+the wider CROSS_BLOCK_* budgets.
 
 ## 2026-09-29 (wave): STAGE_PREFIXES parity with jagent dispatchers
 
