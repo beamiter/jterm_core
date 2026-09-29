@@ -3857,6 +3857,10 @@ mod tests {
         );
     }
 
+    /// Detached pid/cwd/user meta + terminal help for daemonize; lockfile
+    /// positional for setlock; account positional for s6-setuidgid. Busybox
+    /// applet carriers peel before the STAGE name so pipe-to-bash still
+    /// resolves (parity with openvt / systemd-cat deepenings).
     #[test]
     fn daemonize_and_setlock_stage_arity_edges() {
         assert_eq!(
@@ -3879,8 +3883,21 @@ mod tests {
             stage_interpreter("daemonize --verbose -- bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(
+            stage_interpreter("busybox daemonize -p /run/x.pid sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox daemonize -- bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("daemonize -p").as_deref(), None);
         assert_eq!(stage_interpreter("daemonize -h sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox daemonize --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
         assert_eq!(
             stage_interpreter("setlock -nNxX /tmp/x.lock sh").as_deref(),
             Some("sh")
@@ -3889,7 +3906,20 @@ mod tests {
             stage_interpreter("setlock -- /tmp/x.lock bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(
+            stage_interpreter("busybox setlock /tmp/x.lock sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox setlock -n /tmp/x.lock -- bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("setlock --version sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox setlock --version sh").as_deref(),
+            None,
+            "busybox carrier does not invent a version-mode child"
+        );
         assert_eq!(
             stage_interpreter("s6-setuidgid --help sh").as_deref(),
             None
@@ -3897,6 +3927,40 @@ mod tests {
         assert_eq!(
             stage_interpreter("s6-setuidgid -- nobody sh").as_deref(),
             Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox s6-setuidgid nobody sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox s6-setuidgid -- nobody bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("busybox s6-setuidgid --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox daemonize bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox setlock /tmp/x.lock bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox s6-setuidgid nobody bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
         );
     }
 
