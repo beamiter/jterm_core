@@ -1519,6 +1519,14 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
             "ionice",
             Some("help" | "version" | "h" | "V" | "pid" | "p" | "pgid" | "P" | "uid" | "u"),
         ) => true,
+        // numactl query/help modes and schedtool help/reset terminate without
+        // PROGRAM (wave-36 thin STAGE 71 deepen — stops inventing a peel after
+        // `--show sh` / `-h sh`).
+        (
+            "numactl",
+            Some("show" | "hardware" | "help" | "version" | "s" | "H" | "h" | "V"),
+        ) => true,
+        ("schedtool", Some("h" | "r" | "help")) => true,
         _ => false,
     }
 }
@@ -4596,6 +4604,81 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | busybox ionice -c 3 sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    /// `numactl` NUMA policy peels + `schedtool -e` exec peels: query/help/
+    /// reset fail-closed so junk after `--show` / `-h` never invents a child
+    /// (thin STAGE 71 deepen). Busybox has neither applet.
+    #[test]
+    fn numactl_and_schedtool_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("numactl --cpunodebind=0 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("numactl -C 0 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("numactl --localalloc sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("numactl").as_deref(), None);
+        assert_eq!(stage_interpreter("numactl --cpunodebind=0").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("numactl --show sh").as_deref(),
+            None,
+            "query mode never launches a child"
+        );
+        assert_eq!(stage_interpreter("numactl -s bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("numactl --hardware sh").as_deref(),
+            None
+        );
+        assert_eq!(stage_interpreter("numactl --help bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("numactl --version sh").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("schedtool -B -e sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("schedtool -a 0x1 -n 5 -e bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("schedtool").as_deref(), None);
+        assert_eq!(stage_interpreter("schedtool -B -e").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("schedtool -h sh").as_deref(),
+            None,
+            "help mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("schedtool -r bash").as_deref(),
+            None,
+            "reset/query mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("schedtool --help sh").as_deref(),
+            None,
+            "unknown long help must not invent a child"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | numactl --cpunodebind=0 sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | schedtool -B -e bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
