@@ -381,6 +381,33 @@ mod tests {
         assert_eq!(stopped.hits, [1u8]);
     }
 
+    /// finished() and budget_stopped() are the only constructors after the
+    /// lift: a finished walk never carries a resume, and a budget stop always
+    /// does. Pin both shapes across two distinct H types so a regression that
+    /// re-specializes the report on one frontend's hit row fails closed.
+    #[test]
+    fn cross_block_search_report_constructors_preserve_incomplete_contract() {
+        let done_str: CrossBlockSearchReport<&str> = CrossBlockSearchReport::finished(vec![]);
+        assert!(!done_str.scan_incomplete);
+        assert!(done_str.resume.is_none());
+        assert!(done_str.hits.is_empty());
+
+        let cursor = CrossBlockSearchCursor {
+            record_index: 0,
+            mid: None,
+        };
+        let paused_u32 = CrossBlockSearchReport::budget_stopped(vec![7u32, 8], cursor.clone());
+        assert!(paused_u32.scan_incomplete);
+        assert_eq!(paused_u32.resume, Some(cursor));
+        assert_eq!(paused_u32.hits, [7, 8]);
+
+        // A finished report with hits still discloses completeness honestly.
+        let capped = CrossBlockSearchReport::finished(vec![(1u8, "x"), (2, "y")]);
+        assert!(!capped.scan_incomplete);
+        assert!(capped.resume.is_none());
+        assert_eq!(capped.hits.len(), 2);
+    }
+
     /// Pins why full CrossBlockHit stays out of core: the navigation field set
     /// both UIs share is six fields; anvil alone adds three palette-chrome
     /// fields. Unifying would either force forge to carry dead Option columns
