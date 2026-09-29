@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave): CrossBlock cancel MAX-10→MAX-9 beside STAGE 71
+
+## 2026-09-30 (wave): CrossBlock cancel near-near-near-near-near-near-near-near-near-near-wrap
+
+`continue_idle_resume_edges_drop_stale_or_finished_walks` now pins MAX-10→MAX-9
+generation bumps (with/without resume), scheduled-ahead MAX-9 vs MAX-10, and
+finished walks at MAX-10 — beside the MAX-9→MAX-8 sibling. STAGE **71** /
+between() **93** held. **Pending push/repin**.
+
 Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / wave-37 final)
 
 ## 2026-09-30 (point pending tip — rounds 199/250)
