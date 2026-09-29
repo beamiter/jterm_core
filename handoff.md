@@ -4,8 +4,8 @@ Updated: 2026-09-29 (point pending tip at HEAD after rounds 170/214 final)
 
 ## 2026-09-29 (point pending tip — rounds 170/214 final)
 
-- Local HEAD  path-patch-only. Anvil  rounds 165–170 / forge
-   208–214 sticky/find/CrossBlock/Retry/tier sit beside GlanceAside
+- Local HEAD `PLACEHOLDER` path-patch-only. Anvil `90b7c5e` rounds 165–170 / forge
+  `19715cd` 208–214 sticky/find/CrossBlock/Retry/tier sit beside GlanceAside
   ambient + setsid ctty/wait deepen + near-near-wrap cancel. STAGE **71** /
   between() **93** unchanged. Push/repin still pending.
 
