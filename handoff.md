@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): classify_command cgexec/schedtool
+Updated: 2026-09-29 (wave): torsocks/proxychains STAGE_PREFIXES
+
+## 2026-09-29 (wave): torsocks/proxychains STAGE_PREFIXES
+
+Paired with jagent `3b7ebda` (pending push/repin): `torsocks` /
+`proxychains` / `proxychains3` / `proxychains4` join [`STAGE_PREFIXES`].
+`torsocks` consumes user/pass/address/port meta; proxychains consumes `-f`.
+Pipe regressions cover `| torsocks sh` / `| proxychains4 -q bash`. Local
+`.cargo/config.toml` path-patches jagent for the DISPATCHES transparency
+test — do not commit that patch or change the published jagent rev.
 
 ## 2026-09-29 (wave): classify_command cgexec/schedtool
 

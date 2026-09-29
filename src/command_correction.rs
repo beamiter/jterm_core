@@ -1221,6 +1221,9 @@ const STAGE_PREFIXES: &[&str] = &[
     "numactl",
     "pkexec",
     "prlimit",
+    "proxychains",
+    "proxychains3",
+    "proxychains4",
     "proot",
     "rlwrap",
     "run0",
@@ -1242,6 +1245,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "time",
     "timeout",
     "tini",
+    "torsocks",
     "unbuffer",
     "watch",
     "xargs",
@@ -1679,6 +1683,15 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         // schedtool: affinity/prio/nice/policy meta; `-e` leaves the program
         // word visible (like watch `--exec`).
         "schedtool" => matches!(option, "-a" | "-p" | "-n" | "-M") as usize,
+        // torsocks: Tor auth/endpoint meta before COMMAND.
+        "torsocks" => matches!(
+            option,
+            "-u" | "--user" | "-p" | "--pass" | "-a" | "--address" | "-P" | "--port"
+        ) as usize,
+        // proxychains: optional config-file path before PROGRAM.
+        "proxychains" | "proxychains3" | "proxychains4" => {
+            matches!(option, "-f") as usize
+        }
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
         // listed separately. Flag-only forms return 0.
         "bwrap" => {
@@ -3376,6 +3389,9 @@ mod tests {
             ("numactl", "numactl --cpunodebind=0 rm -rf /"),
             ("pkexec", "pkexec rm -rf /"),
             ("prlimit", "prlimit --nofile=1024 rm -rf /"),
+            ("proxychains", "proxychains rm -rf /"),
+            ("proxychains3", "proxychains3 rm -rf /"),
+            ("proxychains4", "proxychains4 -q -f /etc/proxychains.conf rm -rf /"),
             ("proot", "proot -r /tmp/root -- rm -rf /"),
             ("rlwrap", "rlwrap rm -rf /"),
             ("run0", "run0 rm -rf /"),
@@ -3400,6 +3416,7 @@ mod tests {
             ("time", "time rm -rf /"),
             ("timeout", "timeout 5 rm -rf /"),
             ("tini", "tini -- rm -rf /"),
+            ("torsocks", "torsocks -i rm -rf /"),
             ("unbuffer", "unbuffer rm -rf /"),
             ("watch", "watch -n 1 --exec rm -rf /"),
             ("xargs", "xargs rm -rf /"),
@@ -3901,6 +3918,30 @@ mod tests {
             stage_interpreter("schedtool -a 0x1 -n 5 -e bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(
+            stage_interpreter("torsocks sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("torsocks --isolate bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("torsocks -a 127.0.0.1 -P 9050 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("proxychains sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("proxychains4 -q -f /etc/proxychains.conf bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("proxychains3 -- sh").as_deref(),
+            Some("sh")
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -3929,6 +3970,12 @@ mod tests {
             "ls -l | cgexec --sticky -g *:box bash",
             "ls -l | schedtool -B -e sh",
             "ls -l | schedtool -a 0x1 -e bash",
+            "ls -l | torsocks sh",
+            "ls -l | torsocks -i bash",
+            "ls -l | torsocks -a 127.0.0.1 -P 9050 sh",
+            "ls -l | proxychains sh",
+            "ls -l | proxychains4 -q bash",
+            "ls -l | proxychains3 -f /etc/proxychains.conf sh",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
