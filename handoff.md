@@ -1,5 +1,20 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): PATH wave-32 ctl/service leftovers beside STAGE 71
+
+## 2026-09-29 (wave): PATH probe wave-32 ctl/service leftovers stay out
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-32 `bluetoothctl` /
+`boltctl` / `grdctl` / `obexctl` / `oomctl` / `pactl` / `powerprofilesctl` /
+`snapctl` / `switcherooctl` / `udisksctl` / `wdctl` / `update-rc.d` /
+`invoke-rc.d` / `service` / `docker` as intentional non-STAGE beside STAGE
+peelers and wave-30/31 ctl leftovers (jagent pin
+`path_probe_ctl_service_leftovers_do_not_invent_a_child_peel`). `service`
+already classifies state disruption directly; `docker` has engine scanners —
+both stay out of STAGE like wave-30 `systemctl`. Membership / DISPATCHES /
+CLASSIFY_FORMS stay **71** with set-eq. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through round-44)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through round-44)
