@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (eatmydata/chronic/numactl/flock STAGE_PREFIXES)
+Updated: 2026-09-29 (organism: WatchSettled fail + Celebrate/Rest→Idle)
+
+## 2026-09-29 (organism evolve): WatchSettled failure + idle settles
+
+`WatchSettled→InspectError/SitNearError` and
+`Celebrate{,Big}/RestAfterPush→Idle` Full-motion bridges. Tests:
+`watch_settled_failure_has_full_motion_bridges`,
+`celebrate_and_rest_settle_to_idle_has_full_motion_bridges`.
 
 ## 2026-09-29 (wave): eatmydata/chronic/numactl/flock STAGE_PREFIXES
 

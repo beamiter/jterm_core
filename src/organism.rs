@@ -439,6 +439,40 @@ const CELEBRATE_BIG_TO_REST_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
     " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
 ];
+// Long-watch fail: Celebrate already bridges from WatchSettled; Inspect/SitNear
+// must not snap when a settled vigil ends in error.
+const SETTLED_TO_INSPECT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- )     \n (___) ",
+    " /\\_/\\      \n( o.o )     \n > ^ <",
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+    " /\\_/\\  ->  \n( o_o )     \n /|_|\\",
+];
+const SETTLED_TO_SIT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- )     \n (___) ",
+    " /\\_/\\      \n( ._. )     \n (___) ",
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+];
+// Hold settles back to Idle when repo vigil is clear: Celebrate→Guard* and
+// Guard*→Rest exist; Celebrate/Rest→Idle must not snap.
+const CELEBRATE_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n ( ^.^ )    \n  > ^ <",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+const CELEBRATE_BIG_TO_IDLE_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+const REST_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ^.^ )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
 // motion snaps on the reverse of the already-bridged recovery/escalation graph.
@@ -600,6 +634,8 @@ pub enum VisualTransition {
     GuardStuckToGuardCautious,
     WatchSettledToCelebrate,
     WatchSettledToCelebrateBig,
+    WatchSettledToInspectError,
+    WatchSettledToSitNearError,
     CelebrateToGuardRecovery,
     CelebrateToGuardCautious,
     CelebrateToGuardFailure,
@@ -624,6 +660,9 @@ pub enum VisualTransition {
     SitNearErrorToCelebrateBig,
     CelebrateToRestAfterPush,
     CelebrateBigToRestAfterPush,
+    CelebrateToIdle,
+    CelebrateBigToIdle,
+    RestAfterPushToIdle,
 }
 
 impl VisualTransition {
@@ -668,6 +707,12 @@ impl VisualTransition {
             (Behavior::WatchSettled, Behavior::Celebrate) => Some(Self::WatchSettledToCelebrate),
             (Behavior::WatchSettled, Behavior::CelebrateBig) => {
                 Some(Self::WatchSettledToCelebrateBig)
+            }
+            (Behavior::WatchSettled, Behavior::InspectError) => {
+                Some(Self::WatchSettledToInspectError)
+            }
+            (Behavior::WatchSettled, Behavior::SitNearError) => {
+                Some(Self::WatchSettledToSitNearError)
             }
             (Behavior::Celebrate, Behavior::GuardRecovery) => Some(Self::CelebrateToGuardRecovery),
             (Behavior::Celebrate, Behavior::GuardCautious) => Some(Self::CelebrateToGuardCautious),
@@ -727,6 +772,9 @@ impl VisualTransition {
             (Behavior::CelebrateBig, Behavior::RestAfterPush) => {
                 Some(Self::CelebrateBigToRestAfterPush)
             }
+            (Behavior::Celebrate, Behavior::Idle) => Some(Self::CelebrateToIdle),
+            (Behavior::CelebrateBig, Behavior::Idle) => Some(Self::CelebrateBigToIdle),
+            (Behavior::RestAfterPush, Behavior::Idle) => Some(Self::RestAfterPushToIdle),
             _ => None,
         }
     }
@@ -753,19 +801,22 @@ impl VisualTransition {
             | Self::GuardStuckToGuardRecovery
             | Self::GuardStuckToGuardCautious
             | Self::GuardStuckToRestAfterPush => Behavior::GuardStuck,
-            Self::WatchSettledToCelebrate | Self::WatchSettledToCelebrateBig => {
-                Behavior::WatchSettled
-            }
+            Self::WatchSettledToCelebrate
+            | Self::WatchSettledToCelebrateBig
+            | Self::WatchSettledToInspectError
+            | Self::WatchSettledToSitNearError => Behavior::WatchSettled,
             Self::CelebrateToGuardRecovery
             | Self::CelebrateToGuardCautious
             | Self::CelebrateToGuardFailure
             | Self::CelebrateToGuardStuck
-            | Self::CelebrateToRestAfterPush => Behavior::Celebrate,
+            | Self::CelebrateToRestAfterPush
+            | Self::CelebrateToIdle => Behavior::Celebrate,
             Self::CelebrateBigToGuardRecovery
             | Self::CelebrateBigToGuardCautious
             | Self::CelebrateBigToGuardFailure
             | Self::CelebrateBigToGuardStuck
-            | Self::CelebrateBigToRestAfterPush => Behavior::CelebrateBig,
+            | Self::CelebrateBigToRestAfterPush
+            | Self::CelebrateBigToIdle => Behavior::CelebrateBig,
             Self::GuardRecoveryToGuardFailure
             | Self::GuardRecoveryToGuardStuck
             | Self::GuardRecoveryToGuardCautious
@@ -774,6 +825,7 @@ impl VisualTransition {
             | Self::GuardCautiousToGuardStuck
             | Self::GuardCautiousToGuardRecovery
             | Self::GuardCautiousToRestAfterPush => Behavior::GuardCautious,
+            Self::RestAfterPushToIdle => Behavior::RestAfterPush,
         }
     }
 
@@ -813,12 +865,17 @@ impl VisualTransition {
             Self::WatchSettledToCelebrateBig
             | Self::InspectErrorToCelebrateBig
             | Self::SitNearErrorToCelebrateBig => Behavior::CelebrateBig,
+            Self::WatchSettledToInspectError => Behavior::InspectError,
+            Self::WatchSettledToSitNearError => Behavior::SitNearError,
             Self::GuardRecoveryToRestAfterPush
             | Self::GuardCautiousToRestAfterPush
             | Self::GuardFailureToRestAfterPush
             | Self::GuardStuckToRestAfterPush
             | Self::CelebrateToRestAfterPush
             | Self::CelebrateBigToRestAfterPush => Behavior::RestAfterPush,
+            Self::CelebrateToIdle
+            | Self::CelebrateBigToIdle
+            | Self::RestAfterPushToIdle => Behavior::Idle,
         }
     }
 
@@ -851,6 +908,8 @@ impl VisualTransition {
             Self::GuardStuckToGuardCautious => STUCK_TO_CAUTIOUS_FRAMES[index],
             Self::WatchSettledToCelebrate => SETTLED_TO_CELEBRATE_FRAMES[index],
             Self::WatchSettledToCelebrateBig => SETTLED_TO_CELEBRATE_BIG_FRAMES[index],
+            Self::WatchSettledToInspectError => SETTLED_TO_INSPECT_FRAMES[index],
+            Self::WatchSettledToSitNearError => SETTLED_TO_SIT_FRAMES[index],
             Self::CelebrateToGuardRecovery => CELEBRATE_TO_RECOVERY_FRAMES[index],
             Self::CelebrateToGuardCautious => CELEBRATE_TO_CAUTIOUS_FRAMES[index],
             Self::CelebrateToGuardFailure => CELEBRATE_TO_FAILURE_FRAMES[index],
@@ -875,6 +934,9 @@ impl VisualTransition {
             Self::SitNearErrorToCelebrateBig => SIT_TO_CELEBRATE_BIG_FRAMES[index],
             Self::CelebrateToRestAfterPush => CELEBRATE_TO_REST_FRAMES[index],
             Self::CelebrateBigToRestAfterPush => CELEBRATE_BIG_TO_REST_FRAMES[index],
+            Self::CelebrateToIdle => CELEBRATE_TO_IDLE_FRAMES[index],
+            Self::CelebrateBigToIdle => CELEBRATE_BIG_TO_IDLE_FRAMES[index],
+            Self::RestAfterPushToIdle => REST_TO_IDLE_FRAMES[index],
         }
     }
 }
@@ -3186,6 +3248,8 @@ mod tests {
             VisualTransition::GuardStuckToGuardCautious,
             VisualTransition::WatchSettledToCelebrate,
             VisualTransition::WatchSettledToCelebrateBig,
+            VisualTransition::WatchSettledToInspectError,
+            VisualTransition::WatchSettledToSitNearError,
             VisualTransition::CelebrateToGuardRecovery,
             VisualTransition::CelebrateToGuardCautious,
             VisualTransition::CelebrateToGuardFailure,
@@ -3210,6 +3274,9 @@ mod tests {
             VisualTransition::SitNearErrorToCelebrateBig,
             VisualTransition::CelebrateToRestAfterPush,
             VisualTransition::CelebrateBigToRestAfterPush,
+            VisualTransition::CelebrateToIdle,
+            VisualTransition::CelebrateBigToIdle,
+            VisualTransition::RestAfterPushToIdle,
         ];
         for transition in transitions {
             assert_eq!(
@@ -3404,6 +3471,34 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::CelebrateBig, Behavior::RestAfterPush),
             Some(VisualTransition::CelebrateBigToRestAfterPush)
+        );
+    }
+
+    #[test]
+    fn watch_settled_failure_has_full_motion_bridges() {
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::InspectError),
+            Some(VisualTransition::WatchSettledToInspectError)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::SitNearError),
+            Some(VisualTransition::WatchSettledToSitNearError)
+        );
+    }
+
+    #[test]
+    fn celebrate_and_rest_settle_to_idle_has_full_motion_bridges() {
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::Idle),
+            Some(VisualTransition::CelebrateToIdle)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::Idle),
+            Some(VisualTransition::CelebrateBigToIdle)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::RestAfterPush, Behavior::Idle),
+            Some(VisualTransition::RestAfterPushToIdle)
         );
     }
 
