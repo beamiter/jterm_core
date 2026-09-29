@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after wave-34 deepen final)
+
+## 2026-09-29 (align tip after wave-34 deepen final)
+
+- Local HEAD `c26fdfa` path-patch-only after wave-34 leftovers + taskset/choom/
+  prlimit arity+classify deepen and CrossBlock near-near-near-near-wrap.
+  STAGE **71** / between() **93** unchanged. Push/repin still pending.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after wave-34 deepen)
 
 ## 2026-09-29 (point pending tip at HEAD after wave-34 deepen)
