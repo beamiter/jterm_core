@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip note at HEAD after rounds 195/245)
+
+## 2026-09-29 (point pending tip — rounds 195/245)
+
+- Pending tip note remains current at HEAD `595639b` after STAGE 71 hold
+  beside sticky 1802/1801/MAX-8/Unknown→GuardRecovery.
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 195/245)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 195/245)
