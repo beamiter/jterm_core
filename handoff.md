@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after round-47 cancel cohort)
+
+## 2026-09-29 (align tip — round-47 cancel cohort)
+
+- Local HEAD  path-patch-only. Anvil  rounds 155–159 / forge
+   196–201 sticky VS/find/GlanceAside + CrossBlock cancel and ember
+   / frost  round-47 smoke sit beside. STAGE **71** /
+  between() **93** unchanged. Push/repin still pending.
+
+
 Updated: 2026-09-29 (aa-exec/socket-activate classify parity + CrossBlock cancel)
 
 ## 2026-09-29 (wave): aa-exec / systemd-socket-activate arity + classify deepen
