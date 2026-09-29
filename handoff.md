@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after rounds 178/224 repair align)
+
+## 2026-09-29 (point pending tip — rounds 178/224 repair align)
+
+- Pending tip note remains current at HEAD `26e5dba` after mangled-hash repair
+  beside sticky FE05/find/MAX-4/Rest→Unknown and round-51 smoke.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 178/224 final align)
 
 ## 2026-09-29 (point pending tip — rounds 178/224 final align)
