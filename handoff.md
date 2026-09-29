@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after round-45 edges beside round-46 cohort)
+
+## 2026-09-29 (align tip — round-45 edges beside round-46 cohort)
+
+- Local HEAD `8f79132` path-patch-only. Anvil `36a2a79` rounds 152–154 / forge
+  `a9d9eea` 192–195 bidi sticky/find/notice + ambient disposition and
+  ember/frost round-45 smoke sit beside wave-32 / round-46 tip cohort.
+  STAGE **71** / between() **93** unchanged. Push/repin still pending.
+
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through round-45)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through round-45)
