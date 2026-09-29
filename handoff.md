@@ -1,42 +1,11 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (align tip note self-hash after rounds 191/240 final)
-
-## 2026-09-29 (point pending tip — rounds 191/240 final align)
-
-- Pending tip note remains current at HEAD  after STAGE 71 hold
-  beside sticky 1801/FE07/MAX-7/GuardRecovery UI sync.
-
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 191/240 final align)
 
 ## 2026-09-29 (point pending tip — rounds 191/240 final align)
 
-- Pending tip note remains current at HEAD `7d14ee5` after STAGE 71 hold
+- Pending tip note remains current at HEAD `5f81dc6` after STAGE 71 hold
   beside sticky 1801/FE07/MAX-7/GuardRecovery UI sync.
-
-Updated: 2026-09-29 (point pending tip note at HEAD after rounds 191/240 final align)
-
-## 2026-09-29 (point pending tip — rounds 191/240 final align)
-
-- Pending tip note remains current at HEAD `40b36fc` after STAGE 71 hold
-  beside sticky 1801/FE07/MAX-7/GuardRecovery UI sync.
-
-Updated: 2026-09-29 (align tip after rounds 191/240 beside wave-35 deepen)
-
-## 2026-09-29 (align tip — rounds 188–191 / 236–240)
-
-- Local HEAD `7b2bc1d` path-patch-only. Anvil rounds 188–191 / forge 236–240
-  sticky 1801/FE07/MAX-7/GuardRecovery UI sync pins beside wave-35. STAGE **71**
-  / between() **93** held.
-
-Updated: 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + rounds 191/240)
-
-## 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + rounds 191/240)
-
-- Local HEAD `4ee0478` path-patch-only. CrossBlock MAX-7→MAX-6 cancel
-  `6a06b39` + thin ionice classify parity `b4f5ae6` sit under anvil
-  188–191 / forge 236–240 sticky 1801 + FE07 find + GuardRecovery UI sync.
-  STAGE **71** / between() **93** unchanged.
 
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 191/240)
 
