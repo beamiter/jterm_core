@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): UnknownOutcome Full-motion bridges
+Updated: 2026-09-29 (wave): UnknownOutcome success/sit overwrite bridges
+
+## 2026-09-29 (wave): UnknownOutcome success/sit overwrite bridges
+
+`UnknownOutcome→Celebrate` / `CelebrateBig` (pass overtakes the hold) and
+`UnknownOutcome→SitNearError` (second open failure) animate under Full motion.
+Idle/Inspect overwrites already bridged. Tests:
+`unknown_outcome_success_and_sit_overwrites_have_full_motion_bridges`.
 
 ## 2026-09-29 (wave): UnknownOutcome Full-motion bridges
 

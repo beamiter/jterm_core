@@ -526,7 +526,8 @@ const REST_TO_IDLE_FRAMES: [&str; 4] = [
 ];
 // UnknownOutcome hold: clear-vigil settle must not snap to Idle, and a first
 // open failure that overtakes the hold must not snap to InspectError.
-// GlanceAside is live-only (presence cue), so it is not a transition source.
+// Success / second-failure overwrites (Celebrate{,Big}, SitNearError) are the
+// same hold class. GlanceAside is live-only, so it is not a transition source.
 const UNKNOWN_TO_IDLE_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ?.? )     \n > ^ <",
     " /\\_/\\      \n( ?.o )     \n > ^ <",
@@ -538,6 +539,24 @@ const UNKNOWN_TO_INSPECT_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( o.? )     \n > ^ <",
     " /\\_/\\  --> \n( o_o )     \n /|_|\\",
     " /\\_/\\  ->  \n( o_o )     \n /|_|\\",
+];
+const UNKNOWN_TO_CELEBRATE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( ?.o )     \n > ^ <",
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n<( ^o^ )>   \n  > ^ <",
+];
+const UNKNOWN_TO_CELEBRATE_BIG_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( o.? )     \n > ^ <",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
+];
+const UNKNOWN_TO_SIT_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( ._. )     \n > ^ <",
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
 ];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
@@ -739,6 +758,9 @@ pub enum VisualTransition {
     RestAfterPushToIdle,
     UnknownOutcomeToIdle,
     UnknownOutcomeToInspectError,
+    UnknownOutcomeToCelebrate,
+    UnknownOutcomeToCelebrateBig,
+    UnknownOutcomeToSitNearError,
 }
 
 impl VisualTransition {
@@ -871,6 +893,15 @@ impl VisualTransition {
             (Behavior::UnknownOutcome, Behavior::InspectError) => {
                 Some(Self::UnknownOutcomeToInspectError)
             }
+            (Behavior::UnknownOutcome, Behavior::Celebrate) => {
+                Some(Self::UnknownOutcomeToCelebrate)
+            }
+            (Behavior::UnknownOutcome, Behavior::CelebrateBig) => {
+                Some(Self::UnknownOutcomeToCelebrateBig)
+            }
+            (Behavior::UnknownOutcome, Behavior::SitNearError) => {
+                Some(Self::UnknownOutcomeToSitNearError)
+            }
             _ => None,
         }
     }
@@ -930,9 +961,11 @@ impl VisualTransition {
             | Self::GuardCautiousToGuardRecovery
             | Self::GuardCautiousToRestAfterPush => Behavior::GuardCautious,
             Self::RestAfterPushToIdle => Behavior::RestAfterPush,
-            Self::UnknownOutcomeToIdle | Self::UnknownOutcomeToInspectError => {
-                Behavior::UnknownOutcome
-            }
+            Self::UnknownOutcomeToIdle
+            | Self::UnknownOutcomeToInspectError
+            | Self::UnknownOutcomeToCelebrate
+            | Self::UnknownOutcomeToCelebrateBig
+            | Self::UnknownOutcomeToSitNearError => Behavior::UnknownOutcome,
         }
     }
 
@@ -970,18 +1003,21 @@ impl VisualTransition {
             | Self::InspectErrorToCelebrate
             | Self::SitNearErrorToCelebrate
             | Self::WatchCommandToCelebrate
-            | Self::WatchAgentToCelebrate => Behavior::Celebrate,
+            | Self::WatchAgentToCelebrate
+            | Self::UnknownOutcomeToCelebrate => Behavior::Celebrate,
             Self::WatchSettledToCelebrateBig
             | Self::InspectErrorToCelebrateBig
             | Self::SitNearErrorToCelebrateBig
-            | Self::WatchCommandToCelebrateBig => Behavior::CelebrateBig,
+            | Self::WatchCommandToCelebrateBig
+            | Self::UnknownOutcomeToCelebrateBig => Behavior::CelebrateBig,
             Self::WatchSettledToInspectError
             | Self::WatchCommandToInspectError
             | Self::WatchAgentToInspectError
             | Self::UnknownOutcomeToInspectError => Behavior::InspectError,
             Self::WatchSettledToSitNearError
             | Self::WatchCommandToSitNearError
-            | Self::WatchAgentToSitNearError => Behavior::SitNearError,
+            | Self::WatchAgentToSitNearError
+            | Self::UnknownOutcomeToSitNearError => Behavior::SitNearError,
             Self::GuardRecoveryToRestAfterPush
             | Self::GuardCautiousToRestAfterPush
             | Self::GuardFailureToRestAfterPush
@@ -1064,6 +1100,9 @@ impl VisualTransition {
             Self::RestAfterPushToIdle => REST_TO_IDLE_FRAMES[index],
             Self::UnknownOutcomeToIdle => UNKNOWN_TO_IDLE_FRAMES[index],
             Self::UnknownOutcomeToInspectError => UNKNOWN_TO_INSPECT_FRAMES[index],
+            Self::UnknownOutcomeToCelebrate => UNKNOWN_TO_CELEBRATE_FRAMES[index],
+            Self::UnknownOutcomeToCelebrateBig => UNKNOWN_TO_CELEBRATE_BIG_FRAMES[index],
+            Self::UnknownOutcomeToSitNearError => UNKNOWN_TO_SIT_FRAMES[index],
         }
     }
 }
@@ -2377,6 +2416,16 @@ pub fn classify_command(command: &str) -> CommandKind {
             ),
             "eatmydata" => skip_wrapper_options(&mut tokens, &[]),
             "chronic" => skip_wrapper_options(&mut tokens, &[]),
+            "annotate-output" => {
+                // Optional +FORMAT date stamp before PROGRAM (devscripts).
+                if tokens
+                    .peek()
+                    .is_some_and(|token| token.starts_with('+'))
+                {
+                    tokens.next();
+                }
+                skip_wrapper_options(&mut tokens, &[]);
+            }
             "numactl" => skip_wrapper_options(
                 &mut tokens,
                 &[
@@ -2725,6 +2774,9 @@ mod tests {
             "stdbuf -oL cargo test",
             "eatmydata cargo test",
             "chronic cargo test",
+            "annotate-output cargo test",
+            "annotate-output +%H:%M:%S cargo check",
+            "annotate-output -- cargo nextest run",
             "numactl --cpunodebind=0 cargo test",
             "numactl -C 0 -- cargo nextest run",
             "flock /tmp/lock cargo test",
@@ -3624,6 +3676,9 @@ mod tests {
             VisualTransition::RestAfterPushToIdle,
             VisualTransition::UnknownOutcomeToIdle,
             VisualTransition::UnknownOutcomeToInspectError,
+            VisualTransition::UnknownOutcomeToCelebrate,
+            VisualTransition::UnknownOutcomeToCelebrateBig,
+            VisualTransition::UnknownOutcomeToSitNearError,
         ];
         for transition in transitions {
             assert_eq!(
@@ -3927,6 +3982,44 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::GlanceAside, Behavior::SitNearError),
             None
+        );
+    }
+
+    #[test]
+    fn unknown_outcome_success_and_sit_overwrites_have_full_motion_bridges() {
+        // Unknown hold can also be overtaken by a pass (Celebrate/CelebrateBig)
+        // or by a second open failure (SitNearError). Idle/Inspect already
+        // animate; these three keep the same hold from snapping.
+        let mut pass = NativeOrganism::default();
+        let held = pass.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held.behavior, Behavior::UnknownOutcome);
+        let cele = pass.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(cele.behavior, Behavior::Celebrate);
+        assert_eq!(
+            VisualTransition::between(held.behavior, cele.behavior),
+            Some(VisualTransition::UnknownOutcomeToCelebrate)
+        );
+
+        let mut big = NativeOrganism::default();
+        big.restore_repo_work_context(RepoWorkState::new(5, false, 0), 0, 0);
+        let held_big = big.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held_big.behavior, Behavior::UnknownOutcome);
+        let cele_big = big.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(cele_big.behavior, Behavior::CelebrateBig);
+        assert_eq!(
+            VisualTransition::between(held_big.behavior, cele_big.behavior),
+            Some(VisualTransition::UnknownOutcomeToCelebrateBig)
+        );
+
+        let mut sit_hold = NativeOrganism::default();
+        sit_hold.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        let held_sit = sit_hold.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held_sit.behavior, Behavior::UnknownOutcome);
+        let sit = sit_hold.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(sit.behavior, Behavior::SitNearError);
+        assert_eq!(
+            VisualTransition::between(held_sit.behavior, sit.behavior),
+            Some(VisualTransition::UnknownOutcomeToSitNearError)
         );
     }
 
