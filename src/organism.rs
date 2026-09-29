@@ -455,7 +455,8 @@ const SETTLED_TO_SIT_FRAMES: [&str; 4] = [
 ];
 // Live watch still showing when the command finishes: WatchSettled already
 // bridges from the post-output vigil; WatchCommand/WatchAgent must not snap
-// into Celebrate/Inspect/Sit (or RestAfterPush for a push mid-watch).
+// into Celebrate/Inspect/Sit (or RestAfterPush for a push mid-watch /
+// mid-settle).
 const WATCH_TO_CELEBRATE_FRAMES: [&str; 4] = [
     " /\\_/\\\n ( o.o ) \n  > ^ <  ",
     " /\\_/\\\n ( o.o ) \n  > ^ <  ",
@@ -503,6 +504,20 @@ const WATCH_AGENT_TO_SIT_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ._. )     \n (___) ",
     " /\\_/\\      \n( ._. )  !  \n /|_|\\",
     " /\\_/\\      \n( ._. )     \n /|_|\\",
+];
+// Agent watch or settled vigil still showing when a push lands: WatchCommand→Rest
+// already animates; WatchAgent/WatchSettled must not snap to RestAfterPush.
+const WATCH_AGENT_TO_REST_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.o )     \n (___) ",
+    " /\\_/\\      \n( o.o )     \n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+];
+const SETTLED_TO_REST_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- )     \n (___) ",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
 ];
 // Hold settles back to Idle when repo vigil is clear: Celebrate→Guard* and
 // Guard*→Rest exist; Celebrate/Rest→Idle must not snap.
@@ -721,6 +736,7 @@ pub enum VisualTransition {
     WatchSettledToCelebrateBig,
     WatchSettledToInspectError,
     WatchSettledToSitNearError,
+    WatchSettledToRestAfterPush,
     WatchCommandToCelebrate,
     WatchCommandToCelebrateBig,
     WatchCommandToInspectError,
@@ -729,6 +745,7 @@ pub enum VisualTransition {
     WatchAgentToCelebrate,
     WatchAgentToInspectError,
     WatchAgentToSitNearError,
+    WatchAgentToRestAfterPush,
     CelebrateToGuardRecovery,
     CelebrateToGuardCautious,
     CelebrateToGuardFailure,
@@ -812,6 +829,9 @@ impl VisualTransition {
             (Behavior::WatchSettled, Behavior::SitNearError) => {
                 Some(Self::WatchSettledToSitNearError)
             }
+            (Behavior::WatchSettled, Behavior::RestAfterPush) => {
+                Some(Self::WatchSettledToRestAfterPush)
+            }
             (Behavior::WatchCommand, Behavior::Celebrate) => Some(Self::WatchCommandToCelebrate),
             (Behavior::WatchCommand, Behavior::CelebrateBig) => {
                 Some(Self::WatchCommandToCelebrateBig)
@@ -828,6 +848,9 @@ impl VisualTransition {
             (Behavior::WatchAgent, Behavior::Celebrate) => Some(Self::WatchAgentToCelebrate),
             (Behavior::WatchAgent, Behavior::InspectError) => Some(Self::WatchAgentToInspectError),
             (Behavior::WatchAgent, Behavior::SitNearError) => Some(Self::WatchAgentToSitNearError),
+            (Behavior::WatchAgent, Behavior::RestAfterPush) => {
+                Some(Self::WatchAgentToRestAfterPush)
+            }
             (Behavior::Celebrate, Behavior::GuardRecovery) => Some(Self::CelebrateToGuardRecovery),
             (Behavior::Celebrate, Behavior::GuardCautious) => Some(Self::CelebrateToGuardCautious),
             (Behavior::Celebrate, Behavior::GuardFailure) => Some(Self::CelebrateToGuardFailure),
@@ -931,7 +954,8 @@ impl VisualTransition {
             Self::WatchSettledToCelebrate
             | Self::WatchSettledToCelebrateBig
             | Self::WatchSettledToInspectError
-            | Self::WatchSettledToSitNearError => Behavior::WatchSettled,
+            | Self::WatchSettledToSitNearError
+            | Self::WatchSettledToRestAfterPush => Behavior::WatchSettled,
             Self::WatchCommandToCelebrate
             | Self::WatchCommandToCelebrateBig
             | Self::WatchCommandToInspectError
@@ -939,7 +963,8 @@ impl VisualTransition {
             | Self::WatchCommandToRestAfterPush => Behavior::WatchCommand,
             Self::WatchAgentToCelebrate
             | Self::WatchAgentToInspectError
-            | Self::WatchAgentToSitNearError => Behavior::WatchAgent,
+            | Self::WatchAgentToSitNearError
+            | Self::WatchAgentToRestAfterPush => Behavior::WatchAgent,
             Self::CelebrateToGuardRecovery
             | Self::CelebrateToGuardCautious
             | Self::CelebrateToGuardFailure
@@ -1024,7 +1049,9 @@ impl VisualTransition {
             | Self::GuardStuckToRestAfterPush
             | Self::CelebrateToRestAfterPush
             | Self::CelebrateBigToRestAfterPush
-            | Self::WatchCommandToRestAfterPush => Behavior::RestAfterPush,
+            | Self::WatchCommandToRestAfterPush
+            | Self::WatchAgentToRestAfterPush
+            | Self::WatchSettledToRestAfterPush => Behavior::RestAfterPush,
             Self::CelebrateToIdle
             | Self::CelebrateBigToIdle
             | Self::RestAfterPushToIdle
@@ -1063,6 +1090,7 @@ impl VisualTransition {
             Self::WatchSettledToCelebrateBig => SETTLED_TO_CELEBRATE_BIG_FRAMES[index],
             Self::WatchSettledToInspectError => SETTLED_TO_INSPECT_FRAMES[index],
             Self::WatchSettledToSitNearError => SETTLED_TO_SIT_FRAMES[index],
+            Self::WatchSettledToRestAfterPush => SETTLED_TO_REST_FRAMES[index],
             Self::WatchCommandToCelebrate => WATCH_TO_CELEBRATE_FRAMES[index],
             Self::WatchCommandToCelebrateBig => WATCH_TO_CELEBRATE_BIG_FRAMES[index],
             Self::WatchCommandToInspectError => WATCH_TO_INSPECT_FRAMES[index],
@@ -1071,6 +1099,7 @@ impl VisualTransition {
             Self::WatchAgentToCelebrate => WATCH_AGENT_TO_CELEBRATE_FRAMES[index],
             Self::WatchAgentToInspectError => WATCH_AGENT_TO_INSPECT_FRAMES[index],
             Self::WatchAgentToSitNearError => WATCH_AGENT_TO_SIT_FRAMES[index],
+            Self::WatchAgentToRestAfterPush => WATCH_AGENT_TO_REST_FRAMES[index],
             Self::CelebrateToGuardRecovery => CELEBRATE_TO_RECOVERY_FRAMES[index],
             Self::CelebrateToGuardCautious => CELEBRATE_TO_CAUTIOUS_FRAMES[index],
             Self::CelebrateToGuardFailure => CELEBRATE_TO_FAILURE_FRAMES[index],
@@ -3639,6 +3668,7 @@ mod tests {
             VisualTransition::WatchSettledToCelebrateBig,
             VisualTransition::WatchSettledToInspectError,
             VisualTransition::WatchSettledToSitNearError,
+            VisualTransition::WatchSettledToRestAfterPush,
             VisualTransition::WatchCommandToCelebrate,
             VisualTransition::WatchCommandToCelebrateBig,
             VisualTransition::WatchCommandToInspectError,
@@ -3647,6 +3677,7 @@ mod tests {
             VisualTransition::WatchAgentToCelebrate,
             VisualTransition::WatchAgentToInspectError,
             VisualTransition::WatchAgentToSitNearError,
+            VisualTransition::WatchAgentToRestAfterPush,
             VisualTransition::CelebrateToGuardRecovery,
             VisualTransition::CelebrateToGuardCautious,
             VisualTransition::CelebrateToGuardFailure,
@@ -3922,13 +3953,17 @@ mod tests {
             VisualTransition::between(Behavior::WatchAgent, Behavior::SitNearError),
             Some(VisualTransition::WatchAgentToSitNearError)
         );
-        // WatchAgent does not celebrate-big or rest-from-push directly.
-        assert_eq!(
-            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
-            None
-        );
         assert_eq!(
             VisualTransition::between(Behavior::WatchAgent, Behavior::RestAfterPush),
+            Some(VisualTransition::WatchAgentToRestAfterPush)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::RestAfterPush),
+            Some(VisualTransition::WatchSettledToRestAfterPush)
+        );
+        // WatchAgent does not celebrate-big directly.
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
             None
         );
     }
