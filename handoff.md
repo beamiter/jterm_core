@@ -1,5 +1,27 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): systemd-inhibit STAGE_PREFIXES
+
+Added `/usr/bin` launcher jagent wave 21 now strips. STAGE_PREFIXES len 62 →
+**63**. `systemd-inhibit` peels `--what`/`--who`/`--why`/`--mode` meta; bare /
+options-only / `--list` stay childless. Pipe regressions + DISPATCHES forms
+pin parity with path-patched jagent. `classify_command` see-throughs inhibit
+too. PATH-probe leftovers now also pin `systemd-socket-activate` /
+`systemd-stdio-bridge` / `aa-enabled` / `aa-features-abi` outs. Core/jagent
+tips still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): systemd-inhibit STAGE_PREFIXES
+
+## 2026-09-29 (wave): CrossBlockSearchReport constructor pins after lift
+
+`cross_block_search_report_constructors_preserve_incomplete_contract` pins
+`finished` / `budget_stopped` across distinct `H` types so the hit-generic
+report cannot be re-specialized on one frontend's row. Pairs anvil/forge
+`cross_block_search_report_alias_stays_hit_generic_after_lift` local alias
+pins. **Pending push/repin**.
+
+Updated: 2026-09-29 (wave): CrossBlockSearchReport constructor pins after lift
+
 ## 2026-09-29 (wave): classify_command peels every STAGE_PREFIXES name
 
 Audit closed the remaining classify vs STAGE membership gaps: privilege
@@ -8,8 +30,9 @@ Audit closed the remaining classify vs STAGE membership gaps: privilege
 `prlimit`), and container/misc (`capsh`/`dumb-init`/`tini`/`start-stop-daemon`/
 `systemd-run`/`unbuffer`/`watch`/`xargs`) now peel in `classify_command`.
 Pin `every_stage_prefix_classifies_through_to_build_or_test` requires a
-BuildOrTest form for each of the 62 STAGE names. Pairs systemd-cat/aa-exec
-STAGE 62. Core/jagent tips still **pending push/repin**.
+BuildOrTest form for each of the 63 STAGE names. Pairs systemd-inhibit
+STAGE 63 (after systemd-cat/aa-exec STAGE 62). Core/jagent tips still
+**pending push/repin**.
 
 Updated: 2026-09-29 (wave): classify_command peels every STAGE_PREFIXES name
 
