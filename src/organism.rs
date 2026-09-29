@@ -2702,16 +2702,11 @@ pub fn classify_command(command: &str) -> CommandKind {
                 ],
             ),
             "setuidgid" | "s6-setuidgid" => {
-                // USER positional before CMD (`setuidgid nobody cargo test`).
-                if let Some(user) = tokens.peek() {
-                    if !user.starts_with('-') {
-                        let mut lookahead = tokens.clone();
-                        lookahead.next();
-                        if lookahead.peek().is_some() {
-                            tokens.next();
-                        }
-                    }
-                }
+                // Optional `--` then USER positional (`s6-setuidgid -- nobody
+                // cargo test`). No option table; dashed help stays a flag so
+                // skip_wrapper_options does not eat the account word.
+                skip_wrapper_options(&mut tokens, &[]);
+                skip_wrapper_positional(&mut tokens);
             }
             "setlock" => {
                 skip_wrapper_options(&mut tokens, &[]);
@@ -2736,6 +2731,8 @@ pub fn classify_command(command: &str) -> CommandKind {
                     "--user",
                     "-l",
                     "--lockfile",
+                    // `-a` / `-v` / `--verbose` are flag-only (append/verbose);
+                    // they must not sit in this list or they eat the child path.
                 ],
             ),
             "envdir" => {
@@ -3128,7 +3125,7 @@ pub fn classify_command(command: &str) -> CommandKind {
                 &mut tokens,
                 &["-p", "--pid", "-o", "--output"],
             ),
-            // Container-init / misc STAGE_PREFIXES still opaque to classify.
+            // Remaining STAGE_PREFIXES already peeled above this arm.
             "capsh" => skip_wrapper_options(
                 &mut tokens,
                 &["--gid", "--groups", "--user", "--uid", "--caps"],
@@ -3529,6 +3526,10 @@ mod tests {
             "daemonize cargo test",
             "daemonize -p /run/x.pid cargo check",
             "daemonize --pidfile=/run/x.pid -- cargo nextest run",
+            "daemonize -a -v cargo test",
+            "daemonize --verbose -- cargo check",
+            "daemonize -c /tmp -u nobody cargo nextest run",
+            "s6-setuidgid -- nobody cargo test",
             "envdir /var/service/x/env cargo test",
             "rlwrap cargo test",
             "rlwrap -a cargo nextest run",
@@ -3709,6 +3710,16 @@ mod tests {
         assert_eq!(
             classify_command("daemonize -p /run/x.pid setlock /tmp/x.lock rm -rf /"),
             CommandKind::Other
+        );
+        assert_eq!(
+            classify_command(
+                "daemonize -a setlock -n /tmp/x.lock s6-setuidgid nobody cargo test"
+            ),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("s6-setuidgid -- nobody cargo check"),
+            CommandKind::BuildOrTest
         );
     }
 
