@@ -3899,6 +3899,8 @@ mod tests {
     }
 
     /// Detached meta + terminal `--list`/`--help` for systemd-cat / inhibit.
+    /// Busybox applet carriers peel before the STAGE name so pipe-to-bash still
+    /// resolves (parity with gnome-session-inhibit / uclampset deepenings).
     #[test]
     fn systemd_cat_and_inhibit_stage_arity_edges() {
         assert_eq!(
@@ -3918,8 +3920,21 @@ mod tests {
             Some("bash")
         );
         assert_eq!(
+            stage_interpreter("busybox systemd-cat -t unit sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-cat -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
             stage_interpreter("systemd-cat --help sh").as_deref(),
             None
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-cat --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
         );
         assert_eq!(
             stage_interpreter("systemd-inhibit --who burner --why burn --mode block sh")
@@ -3931,11 +3946,28 @@ mod tests {
             Some("bash")
         );
         assert_eq!(
+            stage_interpreter("busybox systemd-inhibit --what=idle sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-inhibit -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
             stage_interpreter("systemd-inhibit --list sh").as_deref(),
             None
         );
         assert_eq!(
             stage_interpreter("systemd-inhibit --help bash").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-inhibit --list sh").as_deref(),
+            None,
+            "busybox carrier does not invent a list-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-inhibit --help bash").as_deref(),
             None
         );
     }
@@ -4143,6 +4175,20 @@ mod tests {
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox systemd-cat bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox systemd-cat -t unit bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
     }
 
     #[test]
@@ -4158,6 +4204,20 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | systemd-inhibit --what=idle bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox systemd-inhibit bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox systemd-inhibit --what=idle bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
