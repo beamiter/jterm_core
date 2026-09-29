@@ -3887,6 +3887,16 @@ mod tests {
             "bridge",
             "tc",
             "rfkill",
+            // Wave-37 PATH leftovers: process/IPC inventory managers beside STAGE
+            // peelers and wave-30–36 ctl/block/host/network leftovers (jagent pin
+            // `path_probe_process_ipc_inventory_leftovers_do_not_invent_a_child_peel`).
+            // CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "lsof",
+            "fuser",
+            "vmstat",
+            "perf",
+            "ipcs",
+            "ipcrm",
         ] {
             assert!(
                 !prefixes.contains(&name),
