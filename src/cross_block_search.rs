@@ -1,11 +1,12 @@
 //! Shared cross-block palette search cursor, scan budget, and report helpers.
 //!
 //! Frontends own GTK idle scheduling and hit row schemas (`CrossBlockHit`
-//! differs: anvil carries exit_code/duration_ms/cwd for palette chrome; forge
-//! does not). This module holds the resume-cursor shape, generation-current
-//! predicate, scan-budget type, options/scope enums, and the hit-generic
-//! report both UIs already agree on, plus the CROSS_BLOCK_* /
-//! FIND_OVERLAY_* constants so anvil and forge cannot drift.
+//! stays app-owned: both UIs may carry optional exit_code/duration_ms/cwd
+//! palette chrome, but badge helpers and ActionRow wiring still differ). This
+//! module holds the resume-cursor shape, generation-current predicate,
+//! scan-budget type, options/scope enums, and the hit-generic report both UIs
+//! already agree on, plus the CROSS_BLOCK_* / FIND_OVERLAY_* constants so
+//! anvil and forge cannot drift.
 
 use std::time::{Duration, Instant};
 
@@ -387,10 +388,10 @@ mod tests {
 
     #[test]
     fn cross_block_search_report_is_hit_generic() {
-        // Hit rows stay app-owned: anvil's CrossBlockHit adds exit_code /
-        // duration_ms / cwd for palette chrome; forge's does not. The shared
-        // report is therefore generic over H so both UIs can reuse the
-        // scan_incomplete + resume contract without unifying hit schemas.
+        // Hit rows stay app-owned (optional palette chrome may converge; GTK
+        // badge wiring still differs). The shared report is therefore generic
+        // over H so both UIs can reuse the scan_incomplete + resume contract
+        // without lifting a shared CrossBlockHit into core.
         let finished = CrossBlockSearchReport::finished(vec!["a", "b"]);
         assert!(!finished.scan_incomplete);
         assert!(finished.resume.is_none());
@@ -437,13 +438,13 @@ mod tests {
         assert_eq!(capped.hits.len(), 2);
     }
 
-    /// Pins why full CrossBlockHit stays out of core: the navigation field set
-    /// both UIs share is six fields; anvil alone adds three palette-chrome
-    /// fields. Unifying would either force forge to carry dead Option columns
-    /// or strip anvil's palette metadata — neither is free. Report stays
-    /// generic; hit structs stay local.
+    /// Hit rows stay app-owned even when both UIs carry the same optional
+    /// palette-chrome columns (`exit_code` / `duration_ms` / `cwd`). Report is
+    /// generic over `H` because GTK wiring, badge helpers, and ActionRow
+    /// suffixes still differ — lifting a shared `CrossBlockHit` would drag
+    /// those UI contracts into core. Navigation (6) + optional chrome (3) = 9.
     #[test]
-    fn cross_block_hit_schema_divergence_keeps_rows_app_owned() {
+    fn cross_block_hit_schema_keeps_rows_app_owned_with_optional_palette_chrome() {
         const SHARED_NAVIGATION_FIELDS: &[&str] = &[
             "block_id",
             "is_output",
@@ -452,13 +453,21 @@ mod tests {
             "cmd_preview",
             "occurrence",
         ];
-        const ANVIL_ONLY_PALETTE_FIELDS: &[&str] = &["exit_code", "duration_ms", "cwd"];
+        const OPTIONAL_PALETTE_CHROME_FIELDS: &[&str] = &["exit_code", "duration_ms", "cwd"];
         assert_eq!(SHARED_NAVIGATION_FIELDS.len(), 6);
-        assert_eq!(ANVIL_ONLY_PALETTE_FIELDS.len(), 3);
-        // Forge hit == shared set; anvil hit == shared + anvil-only.
+        assert_eq!(OPTIONAL_PALETTE_CHROME_FIELDS.len(), 3);
         assert_eq!(
-            SHARED_NAVIGATION_FIELDS.len() + ANVIL_ONLY_PALETTE_FIELDS.len(),
+            SHARED_NAVIGATION_FIELDS.len() + OPTIONAL_PALETTE_CHROME_FIELDS.len(),
             9
         );
+        // Optional columns must stay Option-shaped at the contract level so a
+        // metadata-only or background hit can omit them without inventing
+        // sentinel exit codes / empty cwd strings.
+        for name in OPTIONAL_PALETTE_CHROME_FIELDS {
+            assert!(
+                matches!(*name, "exit_code" | "duration_ms" | "cwd"),
+                "{name} is not an agreed optional palette-chrome column"
+            );
+        }
     }
 }
