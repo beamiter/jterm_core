@@ -1,5 +1,19 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): systemd-socket-activate STAGE_PREFIXES
+
+Added `/usr/bin` launcher jagent wave 22 now strips. STAGE_PREFIXES len 63 →
+**64**. `systemd-socket-activate` peels `--listen`/`-l`, `--setenv`/`-E`,
+`--fdname` meta; bare / options-only stay childless. Pipe regressions +
+DISPATCHES / classify forms pin parity with path-patched jagent.
+`classify_command` see-throughs socket-activate (and already peels
+`systemd-inhibit`). Membership pin asserts len 64 + `chrt`/`schedtool`/
+`setpriv` stay STAGE. PATH-probe leftovers drop socket-activate and pin
+`dbus-launch` / `flatpak-spawn` / `snap` outs beside `systemd-stdio-bridge`.
+Core/jagent tips still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): systemd-socket-activate STAGE_PREFIXES
+
 ## 2026-09-29 (wave): systemd-inhibit STAGE_PREFIXES
 
 Added `/usr/bin` launcher jagent wave 21 now strips. STAGE_PREFIXES len 62 →
@@ -7,8 +21,8 @@ Added `/usr/bin` launcher jagent wave 21 now strips. STAGE_PREFIXES len 62 →
 options-only / `--list` stay childless. Pipe regressions + DISPATCHES forms
 pin parity with path-patched jagent. `classify_command` see-throughs inhibit
 too. PATH-probe leftovers now also pin `systemd-socket-activate` /
-`systemd-stdio-bridge` / `aa-enabled` / `aa-features-abi` outs. Core/jagent
-tips still **pending push/repin**.
+`systemd-stdio-bridge` / `aa-enabled` / `aa-features-abi` outs (socket-activate
+graduated in the wave above). Core/jagent tips still **pending push/repin**.
 
 Updated: 2026-09-29 (wave): systemd-inhibit STAGE_PREFIXES
 
