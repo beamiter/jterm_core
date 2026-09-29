@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip beside Ogham/Guard pins and round-42 smoke)
+
+## 2026-09-29 (pending tip — Ogham/Guard + round-42)
+
+- Local HEAD `c660336` still path-patch-only. Anvil rounds
+  137–140 / forge 175–179 pin Ogham sticky, All-scope whitespace find,
+  Guard→Celebrate / Celebrate→Watch Full-motion Nones beside STAGE **71** /
+  between() **93**. Ember/frost round-42 smoke notes the tip. **Pending
+  push/repin**.
+
+
 Updated: 2026-09-29 (wave): CLASSIFY/DISPATCHES STAGE 71 lockstep held
 
 ## 2026-09-29 (wave): CLASSIFY/DISPATCHES remain set-eq at STAGE 71
