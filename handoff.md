@@ -13,8 +13,8 @@ Updated: 2026-09-29 (pending tip beside wave-32 deepen and round-46 smoke)
 
 ## 2026-09-29 (pending tip — wave-32 deepen + round-46)
 
-- Local HEAD `1766328` still path-patch-only for ember/frost round-46 smoke
-  against jagent `47cee0b` after PATH wave-32 ctl/service leftovers out of
+- Local HEAD `d6ff257` still path-patch-only for ember/frost round-46 smoke
+  against jagent `2f87180` after PATH wave-32 ctl/service leftovers out of
   STAGE and aa-exec / systemd-socket-activate busybox + timeout/nice deepen.
   STAGE **71** / between() **93** unchanged. Push/repin cohort still pending.
 
