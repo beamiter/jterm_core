@@ -4402,6 +4402,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn classify_command_peels_timeout_nice_around_chpst_envdir_and_setuidgid() {
+        assert_eq!(
+            classify_command("timeout 5 chpst -u nobody cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 chpst -e /env cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("chpst -u daemon timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 envdir /var/service/x/env cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 envdir ./env cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("envdir /env timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 setuidgid nobody cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 setuidgid -- root cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("setuidgid daemon timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 chpst -u nobody cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 envdir /env cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 setuidgid nobody cargo check"),
+            CommandKind::BuildOrTest
+        );
+        // Busybox has none of these applets — classify does not peel busybox.
+        assert_ne!(
+            classify_command("busybox chpst -u nobody cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+        assert_ne!(
+            classify_command("busybox envdir /env cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+        assert_ne!(
+            classify_command("busybox setuidgid nobody cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+    }
+
 
     #[test]
     fn classify_command_peels_timeout_nice_around_setsid() {
