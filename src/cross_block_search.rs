@@ -1,9 +1,9 @@
 //! Shared cross-block palette search cursor and generation-cancel helpers.
 //!
-//! Frontends own GTK idle scheduling, hit row schemas, and scan budgets that
-//! also serve the live Find overlay. This module holds the resume-cursor shape
-//! and the generation-current predicate both UIs already agree on, plus the
-//! cross-block-only budget constants so anvil and forge cannot drift.
+//! Frontends own GTK idle scheduling and hit row schemas. This module holds
+//! the resume-cursor shape and the generation-current predicate both UIs
+//! already agree on, plus the cross-block and live Find-overlay scan budget
+//! constants so anvil and forge cannot drift.
 
 use std::time::Duration;
 
@@ -14,6 +14,13 @@ pub const CROSS_BLOCK_SCAN_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 pub const CROSS_BLOCK_SCAN_TIME_LIMIT: Duration = Duration::from_millis(48);
 /// Regex compile size cap shared by anvil/forge cross-block pattern scans.
 pub const CROSS_BLOCK_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Live Find overlay per-surface byte cap. Tighter than
+/// [`CROSS_BLOCK_SCAN_BYTE_LIMIT`] because overlay scans run on every keystroke
+/// against the active block, not a user-initiated palette walk.
+pub const FIND_OVERLAY_SCAN_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+/// Live Find overlay wall-clock cap for one surface scan slice.
+pub const FIND_OVERLAY_SCAN_TIME_LIMIT: Duration = Duration::from_millis(12);
 
 /// Mid-record resume point for a pattern scan that stopped inside one record's
 /// command or output lines. Metadata browse never sets this.
@@ -64,5 +71,7 @@ mod tests {
         assert_eq!(CROSS_BLOCK_SCAN_BYTE_LIMIT, 8 * 1024 * 1024);
         assert_eq!(CROSS_BLOCK_SCAN_TIME_LIMIT, Duration::from_millis(48));
         assert_eq!(CROSS_BLOCK_REGEX_SIZE_LIMIT, 2 * 1024 * 1024);
+        assert_eq!(FIND_OVERLAY_SCAN_BYTE_LIMIT, 4 * 1024 * 1024);
+        assert_eq!(FIND_OVERLAY_SCAN_TIME_LIMIT, Duration::from_millis(12));
     }
 }
