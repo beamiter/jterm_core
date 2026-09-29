@@ -4209,6 +4209,32 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_setsid() {
+        assert_eq!(
+            classify_command("timeout 5 setsid cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 setsid -f cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 setsid -fw -- cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("setsid timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 setsid cargo check"),
+            CommandKind::BuildOrTest
+        );
+        // Busybox applet carriers remain stage_interpreter-only — classify
+        // does not peel busybox itself (parity with aa-exec nest classify).
+    }
+
+    #[test]
     fn repeated_real_failures_escalate_then_success_celebrates() {
         let mut organism = NativeOrganism::default();
         organism.command_started(CommandKind::BuildOrTest);
