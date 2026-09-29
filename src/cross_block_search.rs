@@ -73,5 +73,10 @@ mod tests {
         assert_eq!(CROSS_BLOCK_REGEX_SIZE_LIMIT, 2 * 1024 * 1024);
         assert_eq!(FIND_OVERLAY_SCAN_BYTE_LIMIT, 4 * 1024 * 1024);
         assert_eq!(FIND_OVERLAY_SCAN_TIME_LIMIT, Duration::from_millis(12));
+        // Palette walks (`FindScanBudget::for_cross_block`) must keep the wider
+        // CROSS_BLOCK_* caps; live overlay (`FindScanBudget::new`) stays on the
+        // tighter FIND_OVERLAY_* pair — never interchange the two.
+        assert!(CROSS_BLOCK_SCAN_BYTE_LIMIT > FIND_OVERLAY_SCAN_BYTE_LIMIT);
+        assert!(CROSS_BLOCK_SCAN_TIME_LIMIT > FIND_OVERLAY_SCAN_TIME_LIMIT);
     }
 }
