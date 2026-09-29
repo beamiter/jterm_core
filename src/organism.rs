@@ -4209,6 +4209,57 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_choom_prlimit_taskset() {
+        assert_eq!(
+            classify_command("timeout 5 taskset ff cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 taskset -c 0-3 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("taskset ff timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 choom -n 0 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 choom --adjust=0 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("choom -n 0 timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 prlimit --nofile=1024 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 prlimit --core=0 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("prlimit --nproc=1 timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 taskset ff cargo check"),
+            CommandKind::BuildOrTest
+        );
+        // Busybox applet carriers remain stage_interpreter-only — classify
+        // does not peel busybox itself (parity with setsid nest classify).
+        assert_ne!(
+            classify_command("busybox taskset ff cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+    }
+
+    #[test]
     fn classify_command_peels_timeout_nice_around_setsid() {
         assert_eq!(
             classify_command("timeout 5 setsid cargo test"),
