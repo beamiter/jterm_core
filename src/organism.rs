@@ -2473,6 +2473,8 @@ pub fn classify_command(command: &str) -> CommandKind {
                     "--rmenv",
                 ],
             ),
+            "cgexec" => skip_wrapper_options(&mut tokens, &["-g"]),
+            "schedtool" => skip_wrapper_options(&mut tokens, &["-a", "-p", "-n", "-M"]),
             _ => break,
         }
         program = tokens.next().unwrap_or_default();
@@ -2700,6 +2702,11 @@ mod tests {
             "firejail --private cargo check",
             "firejail --net=none --whitelist=/tmp cargo test",
             "fakeroot proot -r / firejail --noprofile cargo test",
+            "cgexec -g cpu:group1 cargo test",
+            "cgexec --sticky -g *:box cargo check",
+            "schedtool -B -e cargo test",
+            "schedtool -a 0x1 -n 5 -e cargo nextest run",
+            "cgexec -g cpu:g schedtool -B -e cargo test",
         ] {
             assert_eq!(
                 classify_command(command),

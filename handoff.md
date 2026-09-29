@@ -1,6 +1,22 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave A): shared CrossBlockSearchCursor
+Updated: 2026-09-29 (wave): classify_command cgexec/schedtool
+
+## 2026-09-29 (wave): classify_command cgexec/schedtool
+
+`classify_command` now steps through `cgexec` / `schedtool` (including
+cgexec's `-g` controllers:path and schedtool's `-a/-p/-n/-M` meta before
+`-e`) so `schedtool -B -e cargo test` stays `BuildOrTest` for the organism
+work loop.
+
+## 2026-09-29 (wave): cgexec/schedtool STAGE_PREFIXES
+
+Paired with jagent `10eca1a` (pending push/repin): these two join
+[`STAGE_PREFIXES`]. `cgexec` consumes `-g`; `schedtool` consumes
+`-a/-p/-n/-M` while `-e` leaves the program word visible. Pipe regressions
+cover `| cgexec -g cpu:g sh` / `| schedtool -B -e bash`. Local
+`.cargo/config.toml` path-patches jagent for the DISPATCHES transparency
+test — do not commit that patch or change the published jagent rev.
 
 ## 2026-09-29 (wave A): shared CrossBlockSearchCursor
 

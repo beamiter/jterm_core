@@ -1198,6 +1198,7 @@ const PIPE_INTERPRETERS: &[&str] = &[
 const STAGE_PREFIXES: &[&str] = &[
     "bwrap",
     "capsh",
+    "cgexec",
     "choom",
     "chpst",
     "chroot",
@@ -1224,6 +1225,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "rlwrap",
     "run0",
     "runuser",
+    "schedtool",
     "setarch",
     "setpriv",
     "setsid",
@@ -1672,6 +1674,11 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 | "--env"
                 | "--rmenv"
         ) as usize,
+        // libcgroup cgexec: only `-g controllers:path` takes a value.
+        "cgexec" => matches!(option, "-g") as usize,
+        // schedtool: affinity/prio/nice/policy meta; `-e` leaves the program
+        // word visible (like watch `--exec`).
+        "schedtool" => matches!(option, "-a" | "-p" | "-n" | "-M") as usize,
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
         // listed separately. Flag-only forms return 0.
         "bwrap" => {
@@ -3346,6 +3353,7 @@ mod tests {
         const DISPATCHES: &[(&str, &str)] = &[
             ("bwrap", "bwrap --ro-bind / / -- rm -rf /"),
             ("capsh", "capsh -- -c 'rm -rf /'"),
+            ("cgexec", "cgexec -g cpu:group1 rm -rf /"),
             ("choom", "choom -n 1000 rm -rf /"),
             ("chroot", "chroot / rm -rf /"),
             ("chrt", "chrt 1 rm -rf /"),
@@ -3372,6 +3380,7 @@ mod tests {
             ("rlwrap", "rlwrap rm -rf /"),
             ("run0", "run0 rm -rf /"),
             ("runuser", "runuser -u root -- rm -rf /"),
+            ("schedtool", "schedtool -B -e rm -rf /"),
             ("setarch", "setarch x86_64 rm -rf /"),
             ("setpriv", "setpriv --reuid 0 rm -rf /"),
             ("setsid", "setsid rm -rf /"),
@@ -3876,6 +3885,22 @@ mod tests {
             stage_interpreter("firejail --net=none --whitelist /tmp sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(
+            stage_interpreter("cgexec -g cpu:group1 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("cgexec --sticky -g *:box bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("schedtool -B -e sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("schedtool -a 0x1 -n 5 -e bash").as_deref(),
+            Some("bash")
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -3900,6 +3925,10 @@ mod tests {
             "ls -l | proot -S /tmp/root bash",
             "ls -l | firejail --noprofile sh",
             "ls -l | firejail --private bash",
+            "ls -l | cgexec -g cpu:g sh",
+            "ls -l | cgexec --sticky -g *:box bash",
+            "ls -l | schedtool -B -e sh",
+            "ls -l | schedtool -a 0x1 -e bash",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
