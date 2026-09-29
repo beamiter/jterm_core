@@ -1,5 +1,36 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): Inspect/Sit→Unknown (93) + Idle/ambient Watch + CrossBlock cancel + openvt 71
+
+## 2026-09-29 (wave): Inspect/SitNear→UnknownOutcome VisualTransition (93)
+
+Survey leftover reducer-reachable `between` Nones: error holds still snapped
+when a missing-exit finish overwrote Inspect/SitNear, while Celebrate/Rest/
+Recovery→Unknown already animated. Animate `InspectErrorToUnknownOutcome` and
+`SitNearErrorToUnknownOutcome` (91→**93**). Recount pin
+`visual_transition_between_recognizes_ninety_three_intentional_arcs`.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): ambient→WatchAgent/Settled + Idle→hold/cele/rest None
+
+Expand `ambient_disposition_exchanges_have_no_visual_transition` so Idle/
+Explore/Sleep/Approach never invent bridges into WatchAgent/WatchSettled
+(UI ambient→Watch* parity), and Idle→Inspect/Sit/Unknown/Celebrate{,Big}/Rest
+stays None (live finishes via Watch*). `between()` stays **93**.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): CrossBlockSearchCursor cancel/resume scheduled-ahead edge
+
+`continue_idle_resume_edges_drop_stale_or_finished_walks` pins scheduled
+generation ahead of live and gen-0 finished walks as cancel.
+**Pending push/repin**.
+
+## 2026-09-29 (wave): openvt STAGE_PREFIXES (len 71)
+
+Wave-29: graduate deferred `openvt` into STAGE_PREFIXES (70→**71**). Peels
+`-c`/`--console`; `-u`/`--user`/help/version terminal; unknown `-C` fail-closed.
+Membership / DISPATCHES / CLASSIFY_FORMS lockstep. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): ambient→hold/rest None beside between() 91
 
 ## 2026-09-29 (wave): ambient Explore/Sleep/Approach→Inspect/Sit/Unknown/Rest None
@@ -27,7 +58,7 @@ Updated: 2026-09-29 (wave): PATH wave-28 systemd inspectors + cat/inhibit deepen
 `systemd-escape` / `systemd-detect-virt` as intentional non-STAGE beside
 already-STAGE `systemd-inhibit` / `systemd-run` / `systemd-cat`. Probe also
 reconfirmed `cgexec`/`runuser`/`chrt`/`taskset` and both `*inhibit*` are
-STAGE; `openvt` deferred. Membership pin still asserts `len == 70`.
+STAGE; `openvt` graduated in wave-29 (STAGE 71). Membership pin was `len == 70` here.
 **Pending push/repin**.
 
 ## 2026-09-29 (wave): systemd-cat/inhibit busybox arity + pipe deepen
