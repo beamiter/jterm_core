@@ -3967,6 +3967,56 @@ mod tests {
         );
     }
 
+    /// Detached util clamp meta + terminal system/help for uclampset, and
+    /// eatmydata-shaped `--` / help for gamemoderun (jagent fail-closed parity).
+    #[test]
+    fn uclampset_and_gamemoderun_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("uclampset -m 512 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("uclampset -m 0 -M 1024 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("uclampset -m512 -M256 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("uclampset -m").as_deref(), None);
+        assert_eq!(stage_interpreter("uclampset -M").as_deref(), None);
+        assert_eq!(stage_interpreter("uclampset -p").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("uclampset -s sh").as_deref(),
+            None,
+            "system mode never launches a child"
+        );
+        assert_eq!(stage_interpreter("uclampset --system bash").as_deref(), None);
+        assert_eq!(stage_interpreter("uclampset --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("uclampset -h bash").as_deref(), None);
+        assert_eq!(stage_interpreter("uclampset -V sh").as_deref(), None);
+        assert_eq!(stage_interpreter("gamemoderun sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("gamemoderun -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("gamemoderun --help sh").as_deref(), None);
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | uclampset -m 512 sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | gamemoderun -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
     #[test]
     fn gnome_session_inhibit_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
@@ -4768,23 +4818,6 @@ mod tests {
             stage_interpreter("choom -n 1000 sh").as_deref(),
             Some("sh")
         );
-        assert_eq!(
-            stage_interpreter("uclampset -m 512 sh").as_deref(),
-            Some("sh")
-        );
-        assert_eq!(
-            stage_interpreter("uclampset -m 0 -M 1024 -- bash").as_deref(),
-            Some("bash")
-        );
-        assert_eq!(stage_interpreter("uclampset -s sh").as_deref(), None);
-        assert_eq!(stage_interpreter("uclampset --system bash").as_deref(), None);
-        assert_eq!(stage_interpreter("uclampset --help sh").as_deref(), None);
-        assert_eq!(stage_interpreter("gamemoderun sh").as_deref(), Some("sh"));
-        assert_eq!(
-            stage_interpreter("gamemoderun -- bash").as_deref(),
-            Some("bash")
-        );
-        assert_eq!(stage_interpreter("gamemoderun --help sh").as_deref(), None);
         assert_eq!(
             stage_interpreter("prlimit --nofile=1024 sh").as_deref(),
             Some("sh")
