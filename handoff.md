@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (point pending tip note at HEAD after rounds 199/250)
+
+## 2026-09-30 (point pending tip — rounds 199/250)
+
+- Pending tip note remains current at HEAD  after STAGE 71 hold
+  beside sticky 1803/1802/MAX-9/Unknown→GuardCautious.
+
 Updated: 2026-09-30 (pending tip through sticky 1803/1802/MAX-9 pins)
 
 ## 2026-09-30 (pending tip — sticky 1803/1802/MAX-9 + rounds 199/250)
