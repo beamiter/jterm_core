@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 36 deepen: numactl/schedtool STAGE + CLASSIFY 71)
+
+## 2026-09-29 (wave 36 deepen — numactl/schedtool query fail-closed + classify)
+
+- **Thin STAGE 71 deepen** — `prefix_option_clears_child` teaches numactl
+  show/hardware/help/version and schedtool help/reset fail-closed; arity pins
+  `numactl_and_schedtool_stage_arity_edges`. Classify peels timeout/nice around
+  numactl/schedtool (`classify_command_peels_timeout_nice_around_numactl_and_schedtool`).
+  CLASSIFY/DISPATCHES set-eq held at **71**. **Pending push**.
+
+
 Updated: 2026-09-29 (wave 36 probe: PATH network inventory leftovers)
 
 ## 2026-09-29 (wave 36 probe — PATH network inventory leftovers)
