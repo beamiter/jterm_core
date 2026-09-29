@@ -4,7 +4,7 @@ Updated: 2026-09-30 (MAX-11 cancel / rounds 207/260 tip note)
 
 ## 2026-09-30 (pending tip — MAX-11 cancel / anvil 204–207 / forge 256–260)
 
-- Local HEAD `129f76c` holds CrossBlock MAX-11→MAX-10 cancel beside anvil
+- Local HEAD `a9629da` holds CrossBlock MAX-11→MAX-10 cancel beside anvil
   **204–207** / forge **256–260** sticky 1805 / 1804 find / Unknown→GuardFailure.
   STAGE **71** / between() **93** unchanged. Pending push/repin.
 
