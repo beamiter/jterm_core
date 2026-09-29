@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): classify peels timeout/nice around openvt
+
+## 2026-09-29 (wave): classify peels timeout/nice around openvt
+
+Mirror systemd-cat nest pin: `timeout`/`nice` outside and inside `openvt`
+still classify the cargo child. STAGE membership stays **71**.
+**Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): Inspect/Sit→Unknown (93) + Idle/ambient Watch + CrossBlock cancel + openvt 71
 
 ## 2026-09-29 (wave): Inspect/SitNear→UnknownOutcome VisualTransition (93)
