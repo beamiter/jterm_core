@@ -3388,6 +3388,20 @@ mod tests {
     /// that. This one probes the dispatcher form, so a prefix either module
     /// learns to step over must be taught to both.
     #[test]
+    fn dispatches_table_includes_bubblewrap_ro_bind_form() {
+        // Mirrors the DISPATCHES row in every_stage_prefix_is_transparent_to_jagent_too.
+        assert!(
+            STAGE_PREFIXES.contains(&"bubblewrap"),
+            "bubblewrap must stay in STAGE_PREFIXES beside bwrap"
+        );
+        let form = "bubblewrap --ro-bind / / -- rm -rf /";
+        assert!(
+            crate::agent::is_dangerous(form).is_some(),
+            "DISPATCHES-style bubblewrap form must be dangerous via jagent"
+        );
+    }
+
+    #[test]
     fn every_stage_prefix_is_transparent_to_jagent_too() {
         // One realistic invocation per prefix, each dispatching the same
         // destructive child. Several of these wrappers refuse to be parsed

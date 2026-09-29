@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): busybox `--` applet end-of-options
+Updated: 2026-09-29 (wave): confirm DISPATCHES bubblewrap form
+
+## 2026-09-29 (wave): confirm DISPATCHES bubblewrap form
+
+[`DISPATCHES`] already includes
+`("bubblewrap", "bubblewrap --ro-bind / / -- rm -rf /")` beside `bwrap`, so
+`every_stage_prefix_is_transparent_to_jagent_too` keeps the argv0 alias in
+lockstep with jagent. Dedicated regression
+`dispatches_table_includes_bubblewrap_ro_bind_form` pins the STAGE_PREFIXES
+membership and jagent danger of that form.
 
 ## 2026-09-29 (wave): busybox `--` applet end-of-options
 
