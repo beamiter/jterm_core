@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): Failure/Stuck/Cautious error-hold None pin
+
+## 2026-09-29 (wave): Failure/Stuck/Cautious→Inspect/Sit/Unknown stay None
+
+Recovery finish-overwrites animate; Failure/Stuck/Cautious still snap into
+error/unknown holds. Pin
+`failure_stuck_cautious_never_bridge_to_error_or_unknown_holds`.
+**Pending push/repin**. `between()` stays **90**.
+
 Updated: 2026-09-29 (wave): Celebrate*/Rest/GuardRecovery hold overwrites (90)
 
 ## 2026-09-29 (wave): Celebrate*/Rest/GuardRecovery hold-overwrite VisualTransition (90)
