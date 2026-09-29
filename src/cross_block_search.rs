@@ -267,6 +267,11 @@ mod tests {
         // Gen-0 finished walk (no resume) cancels the same way as any other
         // matching-generation empty cursor.
         assert!(!cross_block_search_continue_is_current(0, 0, false));
+        // Live wrapping ahead of scheduled (0 vs MAX) cancels even with a
+        // resume still in hand — the reverse of the MAX→0 schedule bump.
+        assert!(!cross_block_search_continue_is_current(0, u64::MAX, true));
+        // Same reverse-wrap cancel without a resume still drops the idle slice.
+        assert!(!cross_block_search_continue_is_current(0, u64::MAX, false));
     }
 
     #[test]
