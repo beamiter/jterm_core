@@ -1,5 +1,28 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): taskset/choom/prlimit deepen + STAGE 71 held
+
+## 2026-09-29 (wave): taskset / choom / prlimit STAGE arity / pipe deepen
+
+`taskset_choom_prlimit_stage_arity_edges` peels `busybox taskset` applet
+carriers to sh/bash; help/version/pid under taskset/choom/prlimit stay
+fail-closed (`prefix_option_clears_child`). Pipe regressions cover
+`| busybox taskset ff bash` / `| choom -n 1000 sh` / `| prlimit --nofile=1024 bash`.
+
+## 2026-09-29 (wave): classify peels timeout/nice around taskset/choom/prlimit
+
+Mirror setsid nest pin: `timeout`/`nice` outside and inside still classify the
+cargo child. Busybox stays stage_interpreter-only (asserted). STAGE membership
+stays **71**.
+
+## 2026-09-29 (wave): CLASSIFY/DISPATCHES STAGE 71 lockstep held through wave-34
+
+Wave-34 PATH leftovers stay out of STAGE; thin `taskset`/`choom`/`prlimit`
+STAGE peels deepen without graduating new names. CrossBlock near-near-near-near-
+wrap cancel sits beside. Audit pins still assert DISPATCHES / CLASSIFY_FORMS
+set equality with STAGE_PREFIXES at **len == 71**. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): PATH wave-34 block/mount leftovers beside STAGE 71
 
 ## 2026-09-29 (wave): PATH probe wave-34 block/mount leftovers stay out
