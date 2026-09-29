@@ -39,8 +39,8 @@ Updated: 2026-09-29 (pending tip — rounds 175–178 / 220–224 + round-51 bes
 
 ## 2026-09-29 (pending tip — sticky FE05/find/MAX-4/Rest→Unknown + round-51)
 
-- Local HEAD  path-patch-only. CrossBlock MAX-4→MAX-3 cancel
-   sits under wave-34 deepen beside anvil 175–178 / forge 220–224
+- Local HEAD `4f34555` path-patch-only. CrossBlock MAX-4→MAX-3 cancel
+  `35bff85` sits under wave-34 deepen beside anvil 175–178 / forge 220–224
   sticky FE05/Manchu + FE04 find + Rest→Unknown and ember/frost round-51 smoke.
   STAGE **71** / between() **93** unchanged.
 
