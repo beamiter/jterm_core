@@ -4761,6 +4761,40 @@ mod tests {
         }
     }
 
+    /// Ambient utility dispositions (Idle/Explore/Sleep/Approach) map to the
+    /// same-named Behavior poses for display, but disposition *exchanges* are
+    /// not VisualTransition arcs — ambient mind rescoring snaps. Typing is a
+    /// SurfaceMode that collapses to WatchCommand in the UIs; there is still
+    /// no Explore→WatchCommand (or similar) ambient entry bridge here.
+    #[test]
+    fn ambient_disposition_exchanges_have_no_visual_transition() {
+        for (from, to) in [
+            (Behavior::Idle, Behavior::Explore),
+            (Behavior::Explore, Behavior::Idle),
+            (Behavior::Explore, Behavior::Sleep),
+            (Behavior::Sleep, Behavior::Explore),
+            (Behavior::Sleep, Behavior::Idle),
+            (Behavior::Idle, Behavior::Sleep),
+            (Behavior::Explore, Behavior::Approach),
+            (Behavior::Approach, Behavior::Explore),
+            (Behavior::Approach, Behavior::Idle),
+            (Behavior::Idle, Behavior::Approach),
+            (Behavior::Sleep, Behavior::Approach),
+            (Behavior::Approach, Behavior::Sleep),
+            // Typing-shaped entry from an ambient pose snaps onto WatchCommand.
+            (Behavior::Explore, Behavior::WatchCommand),
+            (Behavior::Sleep, Behavior::WatchCommand),
+            (Behavior::Approach, Behavior::WatchCommand),
+            (Behavior::Idle, Behavior::WatchCommand),
+        ] {
+            assert_eq!(
+                VisualTransition::between(from, to),
+                None,
+                "ambient/typing {from:?}→{to:?} must stay None"
+            );
+        }
+    }
+
     #[test]
     fn celebrate_and_rest_settle_to_idle_has_full_motion_bridges() {
         assert_eq!(
