@@ -1226,6 +1226,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "nice",
     "nohup",
     "numactl",
+    "openvt",
     "pkexec",
     "prlimit",
     "proxychains",
@@ -1498,6 +1499,8 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("s6-setuidgid", Some("help" | "version")) => true,
         ("uclampset", Some("help" | "version" | "h" | "V" | "system" | "s")) => true,
         ("gamemoderun", Some("help" | "version" | "h")) => true,
+        // `-u`/`--user` runs login as VT owner — no argv COMMAND child.
+        ("openvt", Some("help" | "version" | "h" | "V" | "user" | "u")) => true,
         _ => false,
     }
 }
@@ -1965,6 +1968,9 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 | "--fault"
                 | "--kvm"
         ) as usize,
+        // kbd openvt: `-c`/`--console` take a VT number; `-C` is rejected by
+        // this binary (help text drift) so leave it for unknown fail-closed.
+        "openvt" => matches!(option, "-c" | "--console") as usize,
         _ => 0,
     }
 }
@@ -3585,10 +3591,10 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // Membership pin: len == 70 after uclampset / gamemoderun (was 68 after
-        // gnome-session-inhibit).
+        // Membership pin: len == 71 after openvt (was 70 after uclampset /
+        // gamemoderun).
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 70, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 71, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
@@ -3616,6 +3622,8 @@ mod tests {
         // Wave-25 scheduling / GameMode launchers.
         assert!(prefixes.contains(&"uclampset"));
         assert!(prefixes.contains(&"gamemoderun"));
+        // Wave-29 VT launcher.
+        assert!(prefixes.contains(&"openvt"));
     }
 
     /// STAGE names that jagent does **not** peel inside
@@ -3628,7 +3636,7 @@ mod tests {
     #[test]
     fn stage_prefix_jagent_transparency_surfaces_stay_partitioned() {
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 70, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 71, "{prefixes:?}");
         for name in [
             "daemonize",
             "setlock",
@@ -3636,6 +3644,7 @@ mod tests {
             "gnome-session-inhibit",
             "uclampset",
             "gamemoderun",
+            "openvt",
         ] {
             assert!(
                 prefixes.contains(&name),
@@ -3739,7 +3748,7 @@ mod tests {
             // STAGE systemd-inhibit/run/cat (jagent pin
             // `path_probe_systemd_inspector_leftovers_do_not_invent_a_child_peel`).
             // `cgexec`/`runuser`/`chrt`/`taskset` and both `*inhibit*` are
-            // already STAGE; `openvt` stays a deferred peelable candidate.
+            // already STAGE; `openvt` graduated to STAGE (wave-29).
             "systemd-cgls",
             "systemd-cgtop",
             "systemd-analyze",
@@ -4138,6 +4147,63 @@ mod tests {
         );
     }
 
+    /// kbd openvt: `-c`/`--console` detached meta, `-u`/`--user` clears child,
+    /// help/version fail closed. Pipe-to-sh still AddsPipeToInterpreter.
+    #[test]
+    fn openvt_stage_arity_edges() {
+        assert_eq!(stage_interpreter("openvt sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("openvt -f -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("openvt -c 3 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("openvt --console=5 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("openvt -sw sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("openvt").as_deref(), None);
+        assert_eq!(stage_interpreter("openvt -f").as_deref(), None);
+        assert_eq!(stage_interpreter("openvt -c").as_deref(), None);
+        assert_eq!(stage_interpreter("openvt -c 3").as_deref(), None);
+        assert_eq!(stage_interpreter("openvt --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("openvt -h bash").as_deref(), None);
+        assert_eq!(stage_interpreter("openvt --version sh").as_deref(), None);
+        assert_eq!(stage_interpreter("openvt -V bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("openvt -u sh").as_deref(),
+            None,
+            "user/login mode never invents an argv child"
+        );
+        assert_eq!(stage_interpreter("openvt --user bash").as_deref(), None);
+        // Help text spells `-C` but this binary rejects it; the lightweight
+        // STAGE scan still steps the unknown short (jagent fail-closes `-C`).
+        assert_eq!(
+            stage_interpreter("openvt -C 3 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | openvt sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | openvt -c 3 -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
     #[test]
     fn gnome_session_inhibit_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
@@ -4376,6 +4442,7 @@ mod tests {
             ("nice", "nice -n 5 rm -rf /"),
             ("nohup", "nohup rm -rf /"),
             ("numactl", "numactl --cpunodebind=0 rm -rf /"),
+            ("openvt", "openvt -c 3 -- rm -rf /"),
             ("pkexec", "pkexec rm -rf /"),
             ("prlimit", "prlimit --nofile=1024 rm -rf /"),
             ("proxychains", "proxychains rm -rf /"),
@@ -4428,11 +4495,11 @@ mod tests {
             STAGE_PREFIXES.len(),
             "DISPATCHES must list exactly one form per STAGE_PREFIXES entry"
         );
-        assert_eq!(STAGE_PREFIXES.len(), 70, "keep DISPATCHES in lockstep with membership pin");
+        assert_eq!(STAGE_PREFIXES.len(), 71, "keep DISPATCHES in lockstep with membership pin");
         assert_eq!(
             DISPATCHES.len(),
-            70,
-            "DISPATCHES len must match membership pin (STAGE 70 / uclampset+gamemoderun)"
+            71,
+            "DISPATCHES len must match membership pin (STAGE 71 / openvt)"
         );
         for prefix in STAGE_PREFIXES {
             let form = DISPATCHES
@@ -4491,6 +4558,7 @@ mod tests {
             ("nice", "nice -n 5 cargo test"),
             ("nohup", "nohup cargo test"),
             ("numactl", "numactl --cpunodebind=0 cargo test"),
+            ("openvt", "openvt -c 3 -- cargo test"),
             ("pkexec", "pkexec cargo test"),
             ("prlimit", "prlimit --nofile=1024 cargo test"),
             ("proxychains", "proxychains cargo test"),
@@ -4542,8 +4610,8 @@ mod tests {
         );
         assert_eq!(
             CLASSIFY_FORMS.len(),
-            70,
-            "CLASSIFY_FORMS len must match membership/DISPATCHES pin (STAGE 70)"
+            71,
+            "CLASSIFY_FORMS len must match membership/DISPATCHES pin (STAGE 71)"
         );
         // Set equality: len lockstep alone misses a duplicate+gap swap.
         {
