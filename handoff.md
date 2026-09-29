@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): STAGE_PREFIXES len == 55 after bubblewrap
+Updated: 2026-09-29 (wave): CROSS_BLOCK_* vs FIND_OVERLAY_* constructor split
+
+## 2026-09-29 (wave): CROSS_BLOCK_* vs FIND_OVERLAY_* constructor split
+
+`cross_block_budget_constants_match_the_family_contract` now also asserts the
+palette caps are strictly wider than the live Find-overlay caps so frontends
+cannot quietly swap `FindScanBudget::for_cross_block` onto `FIND_OVERLAY_*`
+(or the reverse). Values stay 8 MiB / 48 ms vs 4 MiB / 12 ms.
 
 ## 2026-09-29 (wave): STAGE_PREFIXES len == 55 after bubblewrap
 
