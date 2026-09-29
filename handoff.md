@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): UnknownOutcome→Guard* vigil settle bridges
+Updated: 2026-09-29 (wave): STAGE_PREFIXES parity with jagent dispatchers
+
+## 2026-09-29 (wave): STAGE_PREFIXES parity with jagent dispatchers
+
+Scanned `jagent::safety::select_execution_wrappers_mode` against
+[`STAGE_PREFIXES`] (54 names). The only execution wrappers jagent strips that
+are not prefixes are `unshare` / `nsenter` (2) — intentional
+[`PIPE_INTERPRETERS`] entries because a bare form drops into a shell, so the
+pipe scan must stop on them rather than step through. Shell `builtin` is a
+prefix stripper in `select_shell_command_mode`, not a stage launcher.
+No new STAGE_PREFIXES this wave.
 
 ## 2026-09-29 (wave): UnknownOutcome→Guard* vigil settle bridges
 
