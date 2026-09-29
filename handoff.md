@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (align tip note self-hash after wave-38 / round-60 final)
+
+## 2026-09-30 (point pending tip — wave-38 / round-60 final align)
+
+- Pending tip note remains current at HEAD `5be7667` after STAGE 71 hold
+  beside wave-38 softlimit/cgexec deepen and round-60 smoke.
+
+
 Updated: 2026-09-30 (point pending tip at HEAD after wave-38 / round-60 final align)
 
 ## 2026-09-30 (point pending tip — wave-38 / round-60 final align)
