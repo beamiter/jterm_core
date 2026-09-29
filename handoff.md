@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 38 deepen: softlimit/cgexec STAGE + CLASSIFY 71)
+
+## 2026-09-30 (wave 38 deepen — softlimit/cgexec help fail-closed + classify)
+
+- **Thin STAGE 71 deepen** — softlimit / cgexec help/version/-h clear the
+  child in `prefix_option_clears_child` so --help sh never invents a peel;
+  arity edges + pipe-to-interpreter pins; classify peels timeout/nice nests.
+  Membership / DISPATCHES / CLASSIFY_FORMS remain set-eq at STAGE **71**.
+  **Pending push**.
+
 Updated: 2026-09-30 (wave 38 probe: PATH process-table monitor leftovers)
 
 ## 2026-09-30 (wave 38 probe — PATH process-table monitor leftovers)
