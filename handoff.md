@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism: error-hold heal settle bridges; wave A/C)
+Updated: 2026-09-29 (wave: xargs --process-slot-var / -J arity)
+
+## 2026-09-29 (wave): xargs process-slot-var and BSD -J arity
+
+`xargs --process-slot-var` and BSD `-J`/`-R`/`-S`/`-O` join the detached-value
+table so `| xargs --process-slot-var SLOT sh` and `| xargs -J % sh` no longer
+stop the stage scan on the meta token. jagent already skipped these; no
+classifier change. Regressions extend
+`a_dispatcher_option_value_no_longer_hides_the_interpreter_from_this_scan`.
 
 ## 2026-09-29 (organism evolve): error-hold heal settle continuity
 

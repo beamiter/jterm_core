@@ -1471,6 +1471,12 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "--arg-file"
                 | "-d"
                 | "--delimiter"
+                | "--process-slot-var"
+                // BSD/GNU-adjacent forms that consume a replacement token.
+                | "-J"
+                | "-R"
+                | "-S"
+                | "-O"
         ),
         // `-W` / `--wait` are flags; do not list them here.
         "systemd-run" => matches!(
@@ -3509,6 +3515,23 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | xargs -d , sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        // `--process-slot-var` / BSD `-J` are the same class of detached meta
+        // values jagent already skips; without arity the scan stops on SLOT/% .
+        assert_eq!(
+            stage_interpreter("xargs --process-slot-var SLOT sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("xargs -J % sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | xargs --process-slot-var SLOT sh")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
