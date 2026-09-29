@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after rounds 178/224 final align)
+
+## 2026-09-29 (point pending tip — rounds 178/224 final align)
+
+- Pending tip note remains current at HEAD `cecb3a0` after STAGE 71 hold
+  beside sticky FE05/find/MAX-4/Rest→Unknown and round-51 smoke.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 178/224 final)
 
 ## 2026-09-29 (point pending tip — rounds 178/224 final)
