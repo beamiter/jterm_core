@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after rounds 191/240 beside wave-35 deepen)
+
+## 2026-09-29 (align tip — rounds 188–191 / 236–240)
+
+- Local HEAD `7b2bc1d` path-patch-only. Anvil rounds 188–191 / forge 236–240
+  sticky 1801/FE07/MAX-7/GuardRecovery UI sync pins beside wave-35. STAGE **71**
+  / between() **93** held.
+
 Updated: 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + rounds 191/240)
 
 ## 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + rounds 191/240)
