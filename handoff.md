@@ -1,15 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism: celebrate-hold push bridges)
+Updated: 2026-09-29 (bwrap two-arg stage option arity)
+
+## 2026-09-29 (wave): bwrap STAGE_PREFIXES with two-arg bind arity
+
+`stage_option_detached_value_count` replaces the bool arity helper so bind /
+setenv forms can skip **two** following words. `bwrap` joins [`STAGE_PREFIXES`]
+with the bubblewrap option table jagent already parses. Regressions cover
+`| bwrap --ro-bind / / sh` and `| bwrap --dev /dev --uid 0 sh`.
 
 ## 2026-09-29 (organism evolve): celebrate-hold push continuity
-
-Celebrate/CelebrateBig→RestAfterPush Full-motion bridges so a push during the
-celebrate hold does not snap. `celebrate_hold_push_has_full_motion_bridges`
-drives Celebrate + GitPush → RestAfterPush. Left open: `bwrap` still needs
-two-arg bind arity before it can join STAGE_PREFIXES safely.
-
-## 2026-09-29 (wave): util-linux and container-init STAGE_PREFIXES
 
 `setpriv` / `choom` / `prlimit` / `dumb-init` / `tini` / `watch` join
 [`STAGE_PREFIXES`] with detached meta arity so

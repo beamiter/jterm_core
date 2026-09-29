@@ -1189,13 +1189,14 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// `is_privilege_dispatcher` strips, for the same reason.
 ///
 /// Option arity for detached values is owned by
-/// [`stage_option_takes_detached_value`]: `| runuser -u root sh` skips `root`
+/// [`stage_option_detached_value_count`]: `| runuser -u root sh` skips `root`
 /// and judges `sh`, while flag-only spellings such as `unshare -r sh` still
 /// stop on `unshare` itself because that name is a [`PIPE_INTERPRETERS`] entry
 /// rather than a prefix. `adds_pipe_to_interpreter` still asks jagent about the
 /// whole candidate for network provenance, and introducing any of the nine
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
+    "bwrap",
     "capsh",
     "choom",
     "chroot",
@@ -1313,10 +1314,12 @@ fn stage_interpreter(stage: &str) -> Option<String> {
         };
         if word.starts_with('-') {
             index += 1;
-            if active_prefix.is_some_and(|prefix| stage_option_takes_detached_value(prefix, word))
-                && index < words.len()
-            {
-                index += 1;
+            if let Some(prefix) = active_prefix {
+                skip_detached_option_values(
+                    words.len(),
+                    &mut index,
+                    stage_option_detached_value_count(prefix, word),
+                );
             }
             continue;
         }
@@ -1405,25 +1408,27 @@ fn remaining_words_include_program(words: &[&str]) -> bool {
     })
 }
 
-/// Whether a dispatcher option consumes the next argv as its value.
+/// How many following argv words a dispatcher option consumes as meta values.
 ///
-/// Only detached forms are listed: `--user=root` and `-uUSER` already carry
-/// their value in the same word and must not skip the following token. The
-/// match is per active [`STAGE_PREFIXES`] name so a flag on one tool is not
-/// mistaken for a value-taking option on another (`sudo -s` is a flag;
-/// `su -s /bin/bash` takes a shell path).
-fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
+/// Only detached forms are counted: `--user=root` and `-uUSER` already carry
+/// their value in the same word and must not skip following tokens. The match
+/// is per active [`STAGE_PREFIXES`] name so a flag on one tool is not mistaken
+/// for a value-taking option on another (`sudo -s` is a flag; `su -s /bin/bash`
+/// takes a shell path). Bubblewrap bind/setenv forms consume **two** words.
+fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
     if option.contains('=') {
-        return false;
+        return 0;
     }
     match prefix {
         // Only *meta* values belong here. Options whose next argv is itself
         // the dispatched program or script (`--exec /bin/sh`, `-c sh`,
         // `--startas …`) must leave that word visible so the scan can judge it.
         "runuser" | "gosu" | "pkexec" | "run0" => {
-            matches!(option, "-u" | "--user" | "-g" | "--group" | "--userspec")
+            matches!(option, "-u" | "--user" | "-g" | "--group" | "--userspec") as usize
         }
-        "chroot" => matches!(option, "--groups" | "--userspec" | "--skip-chdir"),
+        "chroot" => {
+            matches!(option, "--groups" | "--userspec" | "--skip-chdir") as usize
+        }
         // `sudo -s` / `sudo -i` are flags; do not list bare `-s` / `-i` here.
         "sudo" | "sudoedit" | "doas" => matches!(
             option,
@@ -1446,17 +1451,19 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "--role"
                 | "-t"
                 | "--type"
-        ),
+        ) as usize,
         // `su -c CMD` / `-s SHELL`: the value is the payload, not meta — leave it.
-        "su" | "su-exec" => matches!(option, "-g" | "--group" | "-G"),
-        "env" => matches!(option, "-u" | "--unset" | "-C" | "--chdir"),
-        "timeout" => matches!(option, "-s" | "--signal" | "-k" | "--kill-after"),
-        "nice" => matches!(option, "-n" | "--adjustment"),
+        "su" | "su-exec" => matches!(option, "-g" | "--group" | "-G") as usize,
+        "env" => matches!(option, "-u" | "--unset" | "-C" | "--chdir") as usize,
+        "timeout" => matches!(option, "-s" | "--signal" | "-k" | "--kill-after") as usize,
+        "nice" => matches!(option, "-n" | "--adjustment") as usize,
         "ionice" => matches!(
             option,
             "-c" | "--class" | "-n" | "--classdata" | "-p" | "--pid" | "-P" | "--pgid"
-        ),
-        "stdbuf" => matches!(option, "-i" | "--input" | "-o" | "--output" | "-e" | "--error"),
+        ) as usize,
+        "stdbuf" => {
+            matches!(option, "-i" | "--input" | "-o" | "--output" | "-e" | "--error") as usize
+        }
         "xargs" => matches!(
             option,
             "-n" | "--max-args"
@@ -1483,7 +1490,7 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "-R"
                 | "-S"
                 | "-O"
-        ),
+        ) as usize,
         // `-W` / `--wait` are flags; do not list them here.
         "systemd-run" => matches!(
             option,
@@ -1497,19 +1504,21 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "--gid"
                 | "-d"
                 | "--description"
-        ),
-        "capsh" => matches!(option, "--gid" | "--groups" | "--user" | "--uid" | "--caps"),
+        ) as usize,
+        "capsh" => {
+            matches!(option, "--gid" | "--groups" | "--user" | "--uid" | "--caps") as usize
+        }
         // `--exec` / `--startas` name the program — do not consume them as meta.
         "start-stop-daemon" => matches!(
             option,
             "-p" | "--pidfile" | "-c" | "--chuid" | "-u" | "--user" | "-n" | "--name" | "-d" | "--chdir"
-        ),
-        "setarch" => matches!(option, "-B" | "--base-offset"),
+        ) as usize,
+        "setarch" => matches!(option, "-B" | "--base-offset") as usize,
         // `-c` / `--cpu-list` select list syntax; the list itself is the
         // positional mask operand skipped by
         // [`prefix_takes_positional_dispatch_operand`], not a detached value.
         // `-p` / `--pid` are flags (pid-mode has no child command to judge).
-        "taskset" => false,
+        "taskset" => 0,
         // Priority is a bare number (already skipped); only the deadline
         // schedulers take a detached meta value.
         "chrt" => matches!(
@@ -1519,8 +1528,8 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "--sched-period"
                 | "-D"
                 | "--sched-deadline"
-        ),
-        "time" => matches!(option, "-o" | "--output" | "-f" | "--format"),
+        ) as usize,
+        "time" => matches!(option, "-o" | "--output" | "-f" | "--format") as usize,
         // util-linux wrappers already stripped by jagent; without arity the
         // scan stops on the meta value (`--reuid 0`, `-n 1000`) and misses `sh`.
         "setpriv" => matches!(
@@ -1539,20 +1548,88 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "--pdeathsig"
                 | "--selinux-label"
                 | "--apparmor-profile"
-        ),
-        "choom" => matches!(option, "-n" | "--adjust" | "-p" | "--pid"),
+        ) as usize,
+        "choom" => matches!(option, "-n" | "--adjust" | "-p" | "--pid") as usize,
         // Resource limits usually attach with `=`; only meta that takes a
         // following argv word belongs here.
-        "prlimit" => matches!(option, "-p" | "--pid" | "-o" | "--output"),
+        "prlimit" => matches!(option, "-p" | "--pid" | "-o" | "--output") as usize,
         // Container PID-1 wrappers: flag-only forms need no arity; tini's
         // value-taking shorts/longs still skip the meta word.
-        "dumb-init" => false,
+        "dumb-init" => 0,
         "tini" => matches!(
             option,
             "-p" | "--kill-after" | "-g" | "--group-add" | "-e" | "--env"
-        ),
-        "watch" => matches!(option, "-n" | "--interval" | "-q" | "--equexit"),
-        _ => false,
+        ) as usize,
+        "watch" => matches!(option, "-n" | "--interval" | "-q" | "--equexit") as usize,
+        // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
+        // listed separately. Flag-only forms return 0.
+        "bwrap" => {
+            if matches!(
+                option,
+                "--setenv"
+                    | "--bind"
+                    | "--bind-try"
+                    | "--dev-bind"
+                    | "--dev-bind-try"
+                    | "--ro-bind"
+                    | "--ro-bind-try"
+                    | "--bind-fd"
+                    | "--ro-bind-fd"
+                    | "--file"
+                    | "--bind-data"
+                    | "--ro-bind-data"
+                    | "--symlink"
+                    | "--chmod"
+            ) {
+                2
+            } else if matches!(
+                option,
+                "--args"
+                    | "--argv0"
+                    | "--userns"
+                    | "--userns2"
+                    | "--pidns"
+                    | "--uid"
+                    | "--gid"
+                    | "--hostname"
+                    | "--chdir"
+                    | "--unsetenv"
+                    | "--lock-file"
+                    | "--sync-fd"
+                    | "--remount-ro"
+                    | "--exec-label"
+                    | "--file-label"
+                    | "--proc"
+                    | "--dev"
+                    | "--tmpfs"
+                    | "--mqueue"
+                    | "--dir"
+                    | "--seccomp"
+                    | "--add-seccomp-fd"
+                    | "--block-fd"
+                    | "--userns-block-fd"
+                    | "--info-fd"
+                    | "--json-status-fd"
+                    | "--cap-add"
+                    | "--cap-drop"
+                    | "--perms"
+                    | "--size"
+            ) {
+                1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn skip_detached_option_values(words_len: usize, index: &mut usize, count: usize) {
+    for _ in 0..count {
+        if *index >= words_len {
+            break;
+        }
+        *index += 1;
     }
 }
 
@@ -1601,12 +1678,12 @@ fn stage_programs(command: &str) -> HashSet<String> {
             if !word.is_empty() && program_position {
                 if word.starts_with('-') {
                     index += 1;
-                    if active_prefix
-                        .is_some_and(|prefix| stage_option_takes_detached_value(prefix, word))
-                        && index < words.len()
-                    {
-                        // Detached option value is not a program.
-                        index += 1;
+                    if let Some(prefix) = active_prefix {
+                        skip_detached_option_values(
+                            words.len(),
+                            &mut index,
+                            stage_option_detached_value_count(prefix, word),
+                        );
                     }
                     if separator_after {
                         program_position = true;
@@ -3155,6 +3232,7 @@ mod tests {
         // `timeout` a duration, `capsh` a `--` — so probing `<prefix> rm` alone
         // would report a gap that is really just an invalid command line.
         const DISPATCHES: &[(&str, &str)] = &[
+            ("bwrap", "bwrap --ro-bind / / -- rm -rf /"),
             ("capsh", "capsh -- -c 'rm -rf /'"),
             ("choom", "choom -n 1000 rm -rf /"),
             ("chroot", "chroot / rm -rf /"),
@@ -3609,6 +3687,8 @@ mod tests {
             "ls -l | dumb-init sh",
             "ls -l | tini -- sh",
             "ls -l | watch -n 1 --exec sh",
+            "ls -l | bwrap --ro-bind / / sh",
+            "ls -l | bwrap --dev /dev --uid 0 sh",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
@@ -3616,6 +3696,14 @@ mod tests {
                 "{candidate}"
             );
         }
+        assert_eq!(
+            stage_interpreter("bwrap --ro-bind / / sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("bwrap --setenv FOO bar sh").as_deref(),
+            Some("sh")
+        );
         // And network provenance is jagent's question, not this scan's, so the
         // pipeline that actually matters is still refused.
         assert_eq!(
