@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): uclampset/gamemoderun STAGE arity edges
+
+## 2026-09-29 (wave): uclampset / gamemoderun STAGE arity edges
+
+`uclampset_and_gamemoderun_stage_arity_edges` pins detached `-m`/`-M` meta,
+missing-value fail-closed, terminal `-s`/`--system`/help/version, and
+gamemoderun `--` / help (jagent parity). Dedicated pipe forms beside the
+bulk STAGE regression. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): STAGE 70 — uclampset / gamemoderun + Guard*→Celebrate* None
 
 ## 2026-09-29 (wave): uclampset / gamemoderun STAGE_PREFIXES (len 70)
