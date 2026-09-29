@@ -1233,6 +1233,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "runcon",
     "runuser",
     "schedtool",
+    "scriptlive",
     "setarch",
     "setpriv",
     "setsid",
@@ -1240,6 +1241,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "softlimit",
     "start-stop-daemon",
     "stdbuf",
+    "strace",
     "su",
     "su-exec",
     "sudo",
@@ -1440,10 +1442,10 @@ fn prefix_takes_positional_newroot(prefix: &str) -> bool {
     matches!(prefix, "chroot" | "envdir")
 }
 
-/// Dispatchers whose first non-option operand is a lock file/path, not the
-/// program (`flock FILE CMD`).
+/// Dispatchers whose first non-option operand is a lock/typescript file path,
+/// not the program (`flock FILE CMD`, `scriptlive typescript CMD`).
 fn prefix_takes_positional_lockfile(prefix: &str) -> bool {
-    prefix == "flock"
+    matches!(prefix, "flock" | "scriptlive")
 }
 
 /// Dispatchers whose first non-option operand names how to run the next word,
@@ -1805,6 +1807,66 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 0
             }
         }
+        // util-linux scriptlive: timing/log/divisor meta; `-c`/`--command`
+        // leave the shell string visible (like flock). Typescript positional
+        // is skipped via [`prefix_takes_positional_lockfile`].
+        "scriptlive" => matches!(
+            option,
+            "-t" | "--timing"
+                | "-T"
+                | "--log-timing"
+                | "-I"
+                | "--log-in"
+                | "-B"
+                | "--log-io"
+                | "-d"
+                | "--divisor"
+                | "-m"
+                | "--maxdelay"
+        ) as usize,
+        // strace: common one-value meta; attach `-p`/`--attach` is meta too
+        // (PID-only leaves no PROG for the scan to judge).
+        "strace" => matches!(
+            option,
+            "-e" | "--trace"
+                | "-p"
+                | "--attach"
+                | "-o"
+                | "--output"
+                | "-s"
+                | "--string-limit"
+                | "-S"
+                | "--summary-sort-by"
+                | "-u"
+                | "--user"
+                | "-E"
+                | "--env"
+                | "-P"
+                | "--trace-path"
+                | "-b"
+                | "--detach-on"
+                | "-I"
+                | "--interruptible"
+                | "-O"
+                | "--summary-syscall-overhead"
+                | "-a"
+                | "--columns"
+                | "-X"
+                | "--const-print-style"
+                | "-U"
+                | "--summary-columns"
+                | "--syscall-limit"
+                | "--signal"
+                | "--status"
+                | "--abbrev"
+                | "--verbose"
+                | "--raw"
+                | "--read"
+                | "--write"
+                | "--inject"
+                | "--fault"
+                | "--kvm"
+        ) as usize,
         _ => 0,
     }
 }
@@ -3417,14 +3479,16 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // 54 wrappers + `bubblewrap` + dbus-run-session / runcon / xvfb-run.
+        // 58 wrappers + strace / scriptlive.
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 58, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 60, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
         assert!(prefixes.contains(&"runcon"));
         assert!(prefixes.contains(&"xvfb-run"));
+        assert!(prefixes.contains(&"strace"));
+        assert!(prefixes.contains(&"scriptlive"));
     }
 
     #[test]
@@ -3480,6 +3544,42 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | xvfb-run -a sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn strace_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | strace sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | strace -f bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn scriptlive_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | scriptlive typescript sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | scriptlive -c bash typescript")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
@@ -3544,6 +3644,7 @@ mod tests {
             ("runcon", "runcon unconfined_t rm -rf /"),
             ("runuser", "runuser -u root -- rm -rf /"),
             ("schedtool", "schedtool -B -e rm -rf /"),
+            ("scriptlive", "scriptlive typescript rm -rf /"),
             ("setarch", "setarch x86_64 rm -rf /"),
             ("setpriv", "setpriv --reuid 0 rm -rf /"),
             ("setsid", "setsid rm -rf /"),
@@ -3554,6 +3655,7 @@ mod tests {
                 "start-stop-daemon --start --exec /bin/rm -- -rf /",
             ),
             ("stdbuf", "stdbuf -o0 rm -rf /"),
+            ("strace", "strace -f rm -rf /"),
             ("su", "su -c 'rm -rf /'"),
             ("su-exec", "su-exec root rm -rf /"),
             ("sudo", "sudo rm -rf /"),
@@ -4151,6 +4253,26 @@ mod tests {
             stage_interpreter("proxychains3 -- sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(stage_interpreter("strace sh").as_deref(), Some("sh"));
+        assert_eq!(stage_interpreter("strace -f bash").as_deref(), Some("bash"));
+        assert_eq!(
+            stage_interpreter("strace -e trace=file sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("strace -p 1").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("scriptlive typescript sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("scriptlive -c bash typescript").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("scriptlive typescript").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("scriptlive -t timing -I typescript").as_deref(),
+            None
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -4187,6 +4309,10 @@ mod tests {
             "ls -l | proxychains sh",
             "ls -l | proxychains4 -q bash",
             "ls -l | proxychains3 -f /etc/proxychains.conf sh",
+            "ls -l | strace sh",
+            "ls -l | strace -f bash",
+            "ls -l | scriptlive typescript sh",
+            "ls -l | scriptlive -c bash typescript",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
@@ -4204,6 +4330,9 @@ mod tests {
             "ls -l | numactl -s",
             "ls -l | firejail --help",
             "ls -l | firejail --version",
+            "ls -l | strace -p 1",
+            "ls -l | scriptlive typescript",
+            "ls -l | scriptlive -t timing -I typescript",
         ] {
             assert_ne!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
