@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (PATH wave-39 user/session inventory leftovers stay out of STAGE)
+
+## 2026-09-30 (PATH wave-39 leftovers — user/session inventory)
+
+- **PATH leftovers** — `id` / `getent` / `whoami` / `groups` / `who` / `w` /
+  `last` / `lastlog` / `faillog` stay out of `STAGE_PREFIXES` until taught
+  fail-closed. Lockstep with jagent
+  `path_probe_user_session_inventory_leftovers_do_not_invent_a_child_peel`.
+  CLASSIFY/DISPATCHES remain set-eq at STAGE **71**.
+
+
 Updated: 2026-09-30 (align tip note self-hash after wave-38 / round-60 final)
 
 ## 2026-09-30 (point pending tip — wave-38 / round-60 final)
