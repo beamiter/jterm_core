@@ -2230,6 +2230,60 @@ pub fn classify_command(command: &str) -> CommandKind {
             ),
             "time" => skip_wrapper_options(&mut tokens, &["-f", "--format", "-o", "--output"]),
             "nohup" => skip_wrapper_options(&mut tokens, &[]),
+            "nice" => skip_wrapper_options(&mut tokens, &["-n", "--adjustment"]),
+            "timeout" => {
+                skip_wrapper_options(
+                    &mut tokens,
+                    &["-s", "--signal", "-k", "--kill-after"],
+                );
+                // Duration positional before PROGRAM (`timeout 5 cargo test`).
+                if tokens
+                    .peek()
+                    .is_some_and(|token| token.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                {
+                    tokens.next();
+                }
+            }
+            "stdbuf" => skip_wrapper_options(
+                &mut tokens,
+                &["-i", "--input", "-o", "--output", "-e", "--error"],
+            ),
+            "eatmydata" => skip_wrapper_options(&mut tokens, &[]),
+            "chronic" => skip_wrapper_options(&mut tokens, &[]),
+            "numactl" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-i",
+                    "--interleave",
+                    "-N",
+                    "--cpunodebind",
+                    "-C",
+                    "--physcpubind",
+                    "-m",
+                    "--membind",
+                    "-p",
+                    "--preferred",
+                ],
+            ),
+            "flock" => {
+                skip_wrapper_options(
+                    &mut tokens,
+                    &["-w", "--timeout", "-E", "--conflict-exit-code"],
+                );
+                // FILE positional before CMD (FD-only forms have no child).
+                if let Some(file) = tokens.peek() {
+                    if !file.starts_with('-') && !file.bytes().all(|b| b.is_ascii_digit()) {
+                        let mut lookahead = tokens.clone();
+                        lookahead.next();
+                        if lookahead.peek().is_some() {
+                            tokens.next();
+                            if tokens.peek().is_some_and(|token| token == "--") {
+                                tokens.next();
+                            }
+                        }
+                    }
+                }
+            }
             _ => break,
         }
         program = tokens.next().unwrap_or_default();
@@ -2429,6 +2483,25 @@ mod tests {
             classify_command("env -u OLD sudo -u root time -p cargo check"),
             CommandKind::BuildOrTest
         );
+        for command in [
+            "nice -n 5 cargo test",
+            "timeout 30 cargo test",
+            "timeout -k 5 30 cargo check",
+            "stdbuf -oL cargo test",
+            "eatmydata cargo test",
+            "chronic cargo test",
+            "numactl --cpunodebind=0 cargo test",
+            "numactl -C 0 -- cargo nextest run",
+            "flock /tmp/lock cargo test",
+            "flock -n /var/lock/x -- cargo check",
+            "nice timeout 10 flock /tmp/l cargo test",
+        ] {
+            assert_eq!(
+                classify_command(command),
+                CommandKind::BuildOrTest,
+                "{command} must see through scheduling/lock wrappers"
+            );
+        }
         for command in [
             "git push --dry-run",
             "git push origin main -n",

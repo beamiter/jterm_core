@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism: WatchSettled fail + Celebrate/Rest→Idle)
+Updated: 2026-09-29 (classify_command sees through nice/timeout/flock/…)
+
+## 2026-09-29 (wave): classify_command wrapper expansion
+
+`classify_command` now steps through `nice` / `timeout` / `stdbuf` /
+`eatmydata` / `chronic` / `numactl` / `flock` (including flock's lock-file
+positional and timeout's duration) so `flock /tmp cargo test` stays
+`BuildOrTest` for the organism work loop.
 
 ## 2026-09-29 (organism evolve): WatchSettled failure + idle settles
 
