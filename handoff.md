@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + rounds 191/240)
+
+## 2026-09-29 (pending tip — sticky 1801/FE07/MAX-7 + rounds 191/240)
+
+- Local HEAD `4ee0478` path-patch-only. CrossBlock MAX-7→MAX-6 cancel
+  `6a06b39` + thin ionice classify parity `b4f5ae6` sit under anvil
+  188–191 / forge 236–240 sticky 1801 + FE07 find + GuardRecovery UI sync.
+  STAGE **71** / between() **93** unchanged.
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 191/240)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 191/240)
