@@ -4131,6 +4131,54 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_aa_exec() {
+        assert_eq!(
+            classify_command("timeout 5 aa-exec cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 aa-exec -p unconfined cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 aa-exec --profile=unconfined -- cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("aa-exec timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 aa-exec cargo check"),
+            CommandKind::BuildOrTest
+        );
+    }
+
+    #[test]
+    fn classify_command_peels_timeout_nice_around_systemd_socket_activate() {
+        assert_eq!(
+            classify_command("timeout 5 systemd-socket-activate cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 systemd-socket-activate -l 2000 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 systemd-socket-activate -a -- cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("systemd-socket-activate timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 systemd-socket-activate cargo check"),
+            CommandKind::BuildOrTest
+        );
+    }
+
+    #[test]
     fn repeated_real_failures_escalate_then_success_celebrates() {
         let mut organism = NativeOrganism::default();
         organism.command_started(CommandKind::BuildOrTest);
