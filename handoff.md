@@ -4,7 +4,7 @@ Updated: 2026-09-29 (point pending tip at HEAD after wave-36 / round-57 final al
 
 ## 2026-09-29 (point pending tip — wave-36 / round-57 final align)
 
-- Pending tip note remains current at HEAD `6c32877` after STAGE 71 hold
+- Pending tip note remains current at HEAD `bb81317` after STAGE 71 hold
   beside wave-36 numactl/schedtool deepen and round-57 smoke.
 
 
