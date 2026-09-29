@@ -4,7 +4,7 @@ Updated: 2026-09-29 (align tip note self-hash after rounds 195/245 / round-56 fi
 
 ## 2026-09-29 (point pending tip — rounds 195/245 final align)
 
-- Pending tip note remains current at HEAD `42c2fec` after STAGE 71 hold
+- Pending tip note remains current at HEAD `e3bae32` after STAGE 71 hold
   beside sticky 1802/1801/MAX-8/Unknown→GuardRecovery.
 
 Updated: 2026-09-29 (point pending tip note at HEAD after rounds 195/245)
