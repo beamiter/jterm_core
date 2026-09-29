@@ -1,6 +1,31 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): FIND_OVERLAY_SCAN_* shared constants
+Updated: 2026-09-29 (wave): bubblewrap STAGE_PREFIXES alias
+
+## 2026-09-29 (wave): bubblewrap STAGE_PREFIXES alias
+
+Paired with jagent wave 17 (pending push/repin): `bubblewrap` joins
+[`STAGE_PREFIXES`] as an argv0 alias of `bwrap` (same two-arg bind /
+one-value meta arity). Debian/Fedora ship only `/usr/bin/bwrap`; the alias
+covers rare symlink/`exec -a` forms. Pipe regressions cover
+`| bubblewrap --ro-bind / / sh`. Prefix count is now 55.
+
+## 2026-09-29 (wave): linux32/linux64 PIPE confirmation
+
+Bare `linux32` / `linux64` (and the other setarch personality aliases) remain
+[`PIPE_INTERPRETERS`]: setarch(8) defaults the program to `/bin/sh`, so
+`| linux32` / `| linux64` must refuse as pipe-to-interpreter. They are **not**
+STAGE_PREFIXES (unlike `setarch` itself, which needs a personality operand).
+Regression now covers bare `| linux32` / `| linux64` in addition to
+`| linux32 /bin/bash`.
+
+## 2026-09-29 (wave): busybox applet-scan regression
+
+Hardened `busybox_skips_applet_to_expose_the_dispatched_command`: bare /
+`--help` stay the multiplexer interpreter, non-shell `busybox ls` skips to the
+applet (not judged as a shell), `env busybox ash` still reaches `ash`, and
+`| busybox ash` is refused as pipe-to-interpreter. Still **not** a
+[`STAGE_PREFIXES`] entry — jagent transparency contract from the wave-7 fix.
 
 ## 2026-09-29 (wave): FIND_OVERLAY_SCAN_* shared constants
 
@@ -12,12 +37,12 @@ the wider CROSS_BLOCK_* budgets.
 ## 2026-09-29 (wave): STAGE_PREFIXES parity with jagent dispatchers
 
 Scanned `jagent::safety::select_execution_wrappers_mode` against
-[`STAGE_PREFIXES`] (54 names). The only execution wrappers jagent strips that
-are not prefixes are `unshare` / `nsenter` (2) — intentional
-[`PIPE_INTERPRETERS`] entries because a bare form drops into a shell, so the
-pipe scan must stop on them rather than step through. Shell `builtin` is a
-prefix stripper in `select_shell_command_mode`, not a stage launcher.
-No new STAGE_PREFIXES this wave.
+[`STAGE_PREFIXES`] (55 names after the later `bubblewrap` alias). The only
+execution wrappers jagent strips that are not prefixes are `unshare` /
+`nsenter` (2) — intentional [`PIPE_INTERPRETERS`] entries because a bare form
+drops into a shell, so the pipe scan must stop on them rather than step
+through. Shell `builtin` is a prefix stripper in `select_shell_command_mode`,
+not a stage launcher. No new STAGE_PREFIXES in *this* wave (pre-alias).
 
 ## 2026-09-29 (wave): UnknownOutcome→Guard* vigil settle bridges
 

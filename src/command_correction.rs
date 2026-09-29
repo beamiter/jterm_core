@@ -1197,6 +1197,7 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
     "annotate-output",
+    "bubblewrap",
     "bwrap",
     "capsh",
     "cgexec",
@@ -1717,8 +1718,9 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
             matches!(option, "-f") as usize
         }
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
-        // listed separately. Flag-only forms return 0.
-        "bwrap" => {
+        // listed separately. Flag-only forms return 0. `bubblewrap` is a rare
+        // argv0 alias of `bwrap` (Debian ships only the latter).
+        "bwrap" | "bubblewrap" => {
             if matches!(
                 option,
                 "--setenv"
@@ -3394,6 +3396,7 @@ mod tests {
         // would report a gap that is really just an invalid command line.
         const DISPATCHES: &[(&str, &str)] = &[
             ("annotate-output", "annotate-output +%H:%M:%S rm -rf /"),
+            ("bubblewrap", "bubblewrap --ro-bind / / -- rm -rf /"),
             ("bwrap", "bwrap --ro-bind / / -- rm -rf /"),
             ("capsh", "capsh -- -c 'rm -rf /'"),
             ("cgexec", "cgexec -g cpu:group1 rm -rf /"),
@@ -3568,6 +3571,10 @@ mod tests {
             "script -qc sh /dev/null",
             "uname26 sh",
             "linux32 /bin/bash",
+            // Bare personality aliases default to /bin/sh (setarch(8)); they
+            // stay PIPE_INTERPRETERS, not STAGE_PREFIXES.
+            "linux32",
+            "linux64",
         ] {
             // The original already pipes, so no new syntax marker appears and
             // `adds_pipe_to_interpreter` is the only rule left standing.
@@ -3640,6 +3647,31 @@ mod tests {
         let programs = stage_programs("busybox ash -lc true");
         assert!(programs.contains("busybox"), "{programs:?}");
         assert!(programs.contains("ash"), "{programs:?}");
+
+        // Bare multiplexer stays the widening interpreter; option-only forms
+        // have no applet word, so the scan must not invent a child.
+        assert_eq!(stage_interpreter("busybox").as_deref(), Some("busybox"));
+        assert_eq!(
+            stage_interpreter("busybox --help").as_deref(),
+            Some("busybox")
+        );
+        // A non-shell applet is skipped (not judged as busybox-the-shell).
+        assert_eq!(stage_interpreter("busybox ls -l").as_deref(), None);
+        let ls_programs = stage_programs("busybox ls -l");
+        assert!(ls_programs.contains("busybox"), "{ls_programs:?}");
+        assert!(ls_programs.contains("ls"), "{ls_programs:?}");
+        // Prefix + multiplexer still reaches the applet interpreter.
+        assert_eq!(
+            stage_interpreter("env busybox ash -lc true").as_deref(),
+            Some("ash")
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox ash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
     }
 
     #[test]
@@ -3869,6 +3901,14 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("bubblewrap --ro-bind / / sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("bubblewrap --dev /dev --uid 0 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
             stage_interpreter("numactl --cpunodebind 0 sh").as_deref(),
             Some("sh")
         );
@@ -3992,6 +4032,8 @@ mod tests {
             "ls -l | watch -n 1 --exec sh",
             "ls -l | bwrap --ro-bind / / sh",
             "ls -l | bwrap --dev /dev --uid 0 sh",
+            "ls -l | bubblewrap --ro-bind / / sh",
+            "ls -l | bubblewrap --setenv FOO bar bash",
             "ls -l | numactl --cpunodebind=0 sh",
             "ls -l | flock /tmp/lock sh",
             "ls -l | eatmydata sh",
