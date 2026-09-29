@@ -1,12 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (align tip after round-47 cancel cohort)
+Updated: 2026-09-29 (repair tip align after round-47 cancel cohort)
 
 ## 2026-09-29 (align tip — round-47 cancel cohort)
 
-- Local HEAD  path-patch-only. Anvil  rounds 155–159 / forge
-   196–201 sticky VS/find/GlanceAside + CrossBlock cancel and ember
-   / frost  round-47 smoke sit beside. STAGE **71** /
+- Local HEAD `b6fff1f` path-patch-only. Anvil `dcf2ff2` rounds 155–159 / forge
+  `6bd0903` 196–201 sticky VS/find/GlanceAside + CrossBlock cancel and ember
+  `13bb735` / frost `7f3b327` round-47 smoke sit beside. STAGE **71** /
   between() **93** unchanged. Push/repin still pending.
 
 
