@@ -2800,6 +2800,104 @@ pub fn classify_command(command: &str) -> CommandKind {
                     }
                 }
             }
+            "systemd-cat" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-t",
+                    "--identifier",
+                    "-p",
+                    "--priority",
+                    "--stderr-priority",
+                    "--level-prefix",
+                ],
+            ),
+            "aa-exec" => skip_wrapper_options(
+                &mut tokens,
+                &["-p", "--profile", "-n", "--namespace"],
+            ),
+            "bwrap" | "bubblewrap" => {
+                // Two-arg bind/setenv forms plus common one-value meta. Stop
+                // on unknown dashes so a truncated peel does not mis-eat the
+                // child program word (organism fails closed to Other).
+                while let Some(option) = tokens.peek().cloned() {
+                    if option == "--" {
+                        tokens.next();
+                        break;
+                    }
+                    if !option.starts_with('-') {
+                        break;
+                    }
+                    let two_arg = matches!(
+                        option.as_str(),
+                        "--setenv"
+                            | "--bind"
+                            | "--bind-try"
+                            | "--dev-bind"
+                            | "--dev-bind-try"
+                            | "--ro-bind"
+                            | "--ro-bind-try"
+                            | "--bind-fd"
+                            | "--ro-bind-fd"
+                            | "--file"
+                            | "--bind-data"
+                            | "--ro-bind-data"
+                            | "--symlink"
+                            | "--chmod"
+                    );
+                    let one_arg = matches!(
+                        option.as_str(),
+                        "--args"
+                            | "--argv0"
+                            | "--userns"
+                            | "--userns2"
+                            | "--pidns"
+                            | "--uid"
+                            | "--gid"
+                            | "--hostname"
+                            | "--chdir"
+                            | "--unsetenv"
+                            | "--lock-file"
+                            | "--sync-fd"
+                            | "--remount-ro"
+                            | "--exec-label"
+                            | "--file-label"
+                            | "--proc"
+                            | "--dev"
+                            | "--tmpfs"
+                            | "--mqueue"
+                            | "--dir"
+                            | "--seccomp"
+                            | "--add-seccomp-fd"
+                            | "--block-fd"
+                            | "--userns-block-fd"
+                            | "--info-fd"
+                            | "--json-status-fd"
+                            | "--cap-add"
+                            | "--cap-drop"
+                            | "--perms"
+                            | "--size"
+                    );
+                    if !two_arg && !one_arg && option != "--unshare-user" && option != "--unshare-pid"
+                        && option != "--unshare-ipc"
+                        && option != "--unshare-net"
+                        && option != "--unshare-uts"
+                        && option != "--unshare-cgroup"
+                        && option != "--die-with-parent"
+                        && option != "--as-pid-1"
+                        && option != "--new-session"
+                    {
+                        // Unknown option: stop peeling; leave option+child.
+                        break;
+                    }
+                    tokens.next();
+                    if two_arg {
+                        tokens.next();
+                        tokens.next();
+                    } else if one_arg {
+                        tokens.next();
+                    }
+                }
+            }
             _ => break,
         }
         program = tokens.next().unwrap_or_default();
@@ -3059,6 +3157,16 @@ mod tests {
             "scriptlive typescript cargo test",
             "scriptlive -t timing -I typescript -- cargo check",
             "strace -f scriptlive typescript cargo test",
+            "systemd-cat cargo test",
+            "systemd-cat -t unit cargo check",
+            "systemd-cat --identifier=unit -- cargo nextest run",
+            "aa-exec cargo test",
+            "aa-exec -p unconfined cargo check",
+            "aa-exec --profile=unconfined -- cargo nextest run",
+            "bwrap --ro-bind / / -- cargo test",
+            "bubblewrap --ro-bind / / -- cargo check",
+            "bwrap --dev /dev --uid 0 -- cargo nextest run",
+            "systemd-cat -t x aa-exec -p unconfined cargo test",
         ] {
             assert_eq!(
                 classify_command(command),
@@ -4220,6 +4328,104 @@ mod tests {
         );
     }
 
+    /// Long-watch vigil is a display pose; a missing exit status still lands on
+    /// UnknownOutcome via the reducer and Full motion snaps (no bridge frames).
+    /// Pin `None` beside the WatchCommand/WatchAgent UnknownOutcome pins.
+    #[test]
+    fn watch_settled_never_bridges_to_unknown_outcome() {
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::UnknownOutcome),
+            None
+        );
+    }
+
+    /// Watch finishes resolve to Celebrate/Inspect/Sit/Rest (or Unknown snap) —
+    /// never skip straight into a repo vigil pose. Pin `None` so a Watch*→Guard*
+    /// bridge cannot land silently beside Celebrate→Guard*.
+    #[test]
+    fn watch_poses_never_bridge_to_repo_vigil_guards() {
+        for from in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
+    /// Repo vigil poses push or escalate among themselves — they do not celebrate.
+    /// Celebrations come from command-finish on error holds. Pin `None` so a
+    /// Guard*→Celebrate* bridge cannot appear beside Celebrate→Guard*.
+    #[test]
+    fn repo_vigil_guards_never_bridge_to_celebrate() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
+    /// Celebrate holds settle to Guard*/Idle/Rest — a new command mid-hold snaps
+    /// into Watch* without bridge frames. Pin `None` so Celebrate*→Watch* cannot
+    /// land silently beside Watch*→Celebrate*.
+    #[test]
+    fn celebrate_holds_never_bridge_to_watch_poses() {
+        for from in [Behavior::Celebrate, Behavior::CelebrateBig] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
+    /// Idle/Rest clear-vigil settle already animates to Idle; an open repo vigil
+    /// appearing from Idle or RestAfterPush snaps (no bridge). Pin `None` so
+    /// Idle/Rest→Guard* cannot appear beside UnknownOutcome→Guard*.
+    #[test]
+    fn idle_and_rest_never_bridge_to_repo_vigil_guards() {
+        for from in [Behavior::Idle, Behavior::RestAfterPush] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
     /// GlanceAside is a live presence cue, not a reducer Behavior source.
     /// Pin the common overwrite targets so a bridge cannot land silently.
     #[test]
@@ -4244,6 +4450,35 @@ mod tests {
                 VisualTransition::between(Behavior::GlanceAside, to),
                 None,
                 "GlanceAside→{to:?} must stay None"
+            );
+        }
+    }
+
+    /// GlanceAside is also never a bridge target — the live cue overlays without
+    /// a VisualTransition arc. Pin common sources so a *→GlanceAside bridge
+    /// cannot land silently beside the source-side None pin.
+    #[test]
+    fn glance_aside_never_bridges_as_a_transition_target() {
+        for from in [
+            Behavior::Idle,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            assert_eq!(
+                VisualTransition::between(from, Behavior::GlanceAside),
+                None,
+                "{from:?}→GlanceAside must stay None"
             );
         }
     }
