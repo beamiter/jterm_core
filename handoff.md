@@ -1,6 +1,23 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (organism: celebrate-hold relapse bridges)
+Updated: 2026-09-29 (util-linux/container-init stage prefixes + push/celebrate bridges)
+
+## 2026-09-29 (wave): util-linux and container-init STAGE_PREFIXES
+
+`setpriv` / `choom` / `prlimit` / `dumb-init` / `tini` / `watch` join
+[`STAGE_PREFIXES`] with detached meta arity so
+`| setpriv --reuid 0 sh`, `| choom -n 1000 sh`, `| prlimit --nofile=1024 sh`,
+`| dumb-init sh`, `| tini -- sh`, and `| watch -n 1 --exec sh` trip
+`AddsPipeToInterpreter`. jagent already stripped these wrappers; DISPATCHES
+transparency extended. **Pending push/repin** before family secondary pin.
+
+## 2026-09-29 (organism evolve): failure-vigil push + error-hold success
+
+`GuardFailure`/`GuardStuck`→`RestAfterPush` and
+`InspectError`/`SitNearError`→`Celebrate{,Big}` Full-motion bridges (4-frame
+bbox). Recovery/Cautious→Rest and WatchSettled→Celebrate already existed.
+Tests: `failure_vigil_push_has_full_motion_bridges`,
+`error_hold_success_has_full_motion_bridges`.
 
 ## 2026-09-29 (organism evolve): celebrate-hold relapse continuity
 
