@@ -3921,6 +3921,52 @@ mod tests {
         );
     }
 
+    /// Detached/attached app-id/reason/inhibit meta + terminal list/help
+    /// short flags for gnome-session-inhibit (jagent fail-closed parity).
+    #[test]
+    fn gnome_session_inhibit_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --app-id x --reason y sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter(
+                "gnome-session-inhibit --app-id=x --reason=y --inhibit=idle -- bash"
+            )
+            .as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --inhibit idle:suspend sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("gnome-session-inhibit --app-id").as_deref(), None);
+        assert_eq!(stage_interpreter("gnome-session-inhibit --reason").as_deref(), None);
+        assert_eq!(stage_interpreter("gnome-session-inhibit --inhibit").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit -l sh").as_deref(),
+            None,
+            "short -l is terminal like --list"
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit -h bash").as_deref(),
+            None,
+            "short -h is terminal like --help"
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --version sh").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --inhibit-only").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --inhibit-only cargo test").as_deref(),
+            None
+        );
+    }
+
     #[test]
     fn gnome_session_inhibit_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
