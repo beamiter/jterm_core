@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (family pin align: jagent `628811b`, pending core push/repin)
+Updated: 2026-09-29 (wave A: xargs -d/--delimiter arity; jagent `628811b`)
+
+## 2026-09-29 (wave A): xargs delimiter option arity
+
+`xargs -d` / `--delimiter` join the detached-value table so
+`| xargs -d , sh` no longer stops the stage scan on `,`. Regressions pin
+`stage_interpreter` and `AddsPipeToInterpreter` for both `-d` and
+`--delimiter`.
 
 ## 2026-09-29 (family pin align)
 
@@ -1083,8 +1090,7 @@ CPU-list is a positional dispatch operand (same path as `setarch`'s personality)
 (`-T`/`-P`/`-D`) takes detached values. Without this, a non-network
 `ls | head` → `ls | taskset ff sh` passed the local scan because jagent only
 answers the pipe-to-interpreter reason when network provenance is present.
-Leftover gap: `xargs -d` / `--delimiter` detached values are still not in
-option arity (`| xargs -d , sh` can stop on `,`).
+`xargs -d` / `--delimiter` detached values closed in wave A (2026-09-29).
 
 ## 2026-09-28 (wave 7 fix): busybox multiplexer without STAGE_PREFIXES
 

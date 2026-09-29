@@ -1469,6 +1469,8 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "--max-chars"
                 | "-a"
                 | "--arg-file"
+                | "-d"
+                | "--delimiter"
         ),
         // `-W` / `--wait` are flags; do not list them here.
         "systemd-run" => matches!(
@@ -3489,6 +3491,24 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | env -u SECRET sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        // `xargs -d , sh`: the delimiter is a detached meta value. Without
+        // arity the scan stops on `,` and the pipe-to-interpreter gate misses
+        // the shell (handoff wave-8 leftover).
+        assert_eq!(
+            stage_interpreter("xargs -d , sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("xargs --delimiter , bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | xargs -d , sh")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
