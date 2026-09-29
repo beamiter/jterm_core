@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through aa-exec deepen + rounds 160/202)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through aa-exec deepen + 160/202)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  aa-exec/socket-activate arity+classify+detached deepen, CrossBlock near-wrap
+  cancel, and anvil 158–160 / forge 200–202 celebrate survey. No STAGE peel.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after aa-exec deepen + rounds 160/202)
 
 ## 2026-09-29 (pending tip — aa-exec deepen + cancel + celebrate survey)
