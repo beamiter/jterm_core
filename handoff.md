@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): STAGE_PREFIXES len == 58 (dbus-run-session/runcon/xvfb-run)
+## 2026-09-29 (wave): WatchAgent→UnknownOutcome None pin
+
+`VisualTransition::between(WatchAgent, UnknownOutcome)` stays `None` by
+design (agent finishes never land on the unknown-hold pose), beside the
+existing WatchAgent→CelebrateBig None pin.
+
+Updated: 2026-09-29 (wave): WatchAgent→UnknownOutcome None pin
 
 ## 2026-09-29 (wave): dbus-run-session / runcon / xvfb-run STAGE_PREFIXES
 
