@@ -3598,7 +3598,9 @@ mod tests {
         // `script` / `capsh` are covered elsewhere (PIPE / already STAGE);
         // these must not quietly join STAGE_PREFIXES without a fail-closed
         // peel + jagent arm. `daemonize` / `setlock` / `s6-setuidgid`
-        // graduated this wave; leftovers are socket/logger/supervisor tools.
+        // graduated this wave; leftovers are socket/logger/supervisor tools
+        // plus the remaining s6 identity/env helpers (not peelable like
+        // s6-setuidgid).
         let prefixes = stage_prefixes_for_tests();
         for name in [
             "logger",
@@ -3618,6 +3620,10 @@ mod tests {
             "flatpak-spawn",
             "snap",
             "s6-sudo",
+            "s6-envdir",
+            "s6-envuidgid",
+            "s6-applyuidgid",
+            "s6-log",
             "multilog",
             "svlogd",
             "runsv",
@@ -3739,6 +3745,14 @@ mod tests {
             stage_interpreter("daemonize -E FOO=1 -- sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(
+            stage_interpreter("daemonize -a -v sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("daemonize --verbose -- bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("daemonize -p").as_deref(), None);
         assert_eq!(stage_interpreter("daemonize -h sh").as_deref(), None);
         assert_eq!(
@@ -3753,6 +3767,10 @@ mod tests {
         assert_eq!(
             stage_interpreter("s6-setuidgid --help sh").as_deref(),
             None
+        );
+        assert_eq!(
+            stage_interpreter("s6-setuidgid -- nobody sh").as_deref(),
+            Some("sh")
         );
     }
 
@@ -3901,6 +3919,13 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | daemonize -p /run/x.pid bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | daemonize -a -v sh")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
