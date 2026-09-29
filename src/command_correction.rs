@@ -1216,6 +1216,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "numactl",
     "pkexec",
     "prlimit",
+    "rlwrap",
     "run0",
     "runuser",
     "setarch",
@@ -1596,6 +1597,23 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         "flock" => matches!(
             option,
             "-w" | "--timeout" | "-E" | "--conflict-exit-code"
+        ) as usize,
+        // readline wrapper: one-value meta only. `-a` is optional-attached in
+        // jagent and must not consume the following program word here either.
+        "rlwrap" => matches!(
+            option,
+            "-f" | "--file"
+                | "-H"
+                | "--history-filename"
+                | "-s"
+                | "--histsize"
+                | "-S"
+                | "-p"
+                | "--prompt"
+                | "-P"
+                | "--password-prompt"
+                | "-z"
+                | "--filter"
         ) as usize,
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
         // listed separately. Flag-only forms return 0.
@@ -3289,6 +3307,7 @@ mod tests {
             ("numactl", "numactl --cpunodebind=0 rm -rf /"),
             ("pkexec", "pkexec rm -rf /"),
             ("prlimit", "prlimit --nofile=1024 rm -rf /"),
+            ("rlwrap", "rlwrap rm -rf /"),
             ("run0", "run0 rm -rf /"),
             ("runuser", "runuser -u root -- rm -rf /"),
             ("setarch", "setarch x86_64 rm -rf /"),
@@ -3746,6 +3765,12 @@ mod tests {
             stage_interpreter("chronic -e bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(stage_interpreter("rlwrap sh").as_deref(), Some("sh"));
+        assert_eq!(stage_interpreter("rlwrap -a bash").as_deref(), Some("bash"));
+        assert_eq!(
+            stage_interpreter("rlwrap -f /tmp/comp sh").as_deref(),
+            Some("sh")
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -3759,6 +3784,8 @@ mod tests {
             "ls -l | flock /tmp/lock sh",
             "ls -l | eatmydata sh",
             "ls -l | chronic -e sh",
+            "ls -l | rlwrap sh",
+            "ls -l | rlwrap -a bash",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),

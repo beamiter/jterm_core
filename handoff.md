@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (classify_command sees through nice/timeout/flock/…)
+Updated: 2026-09-29 (wave: rlwrap STAGE_PREFIXES)
+
+## 2026-09-29 (wave): rlwrap STAGE_PREFIXES
+
+Paired with jagent `9471b1b` (pending push/repin): `rlwrap` joins
+[`STAGE_PREFIXES`] with one-value arity for `-f/-H/-s/-S/-p/-P/-z` (and matching
+longs). `-a` stays flag-only so `| rlwrap -a bash` still sees `bash`. Pipe
+regressions cover `| rlwrap sh` / `| rlwrap -a bash`. Local `.cargo/config.toml`
+path-patches jagent for the DISPATCHES transparency test — do not commit that
+patch or change the published jagent rev.
 
 ## 2026-09-29 (wave): classify_command wrapper expansion
 
