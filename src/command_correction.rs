@@ -1505,6 +1505,8 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("aa-exec", Some("help" | "version" | "h")) => true,
         // Socket-activation test launcher: help/version terminate without daemon.
         ("systemd-socket-activate", Some("help" | "version" | "h")) => true,
+        // util-linux new-session wrapper: help/version terminate without PROGRAM.
+        ("setsid", Some("help" | "version" | "h" | "V")) => true,
         _ => false,
     }
 }
@@ -4370,6 +4372,83 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | busybox openvt -c 3 -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    /// util-linux setsid: session flags + help/version fail closed. Busybox
+    /// applet carriers peel before the STAGE name so pipe-to-bash still
+    /// resolves (parity with openvt / aa-exec deepenings). Bare / dangling
+    /// meta stay fail-closed like openvt arity completeness.
+    #[test]
+    fn setsid_stage_arity_edges() {
+        assert_eq!(stage_interpreter("setsid sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("setsid -f -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("setsid -fw sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("setsid --fork -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("setsid --wait sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox setsid sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox setsid -f -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("setsid").as_deref(), None);
+        assert_eq!(stage_interpreter("setsid -f").as_deref(), None);
+        assert_eq!(stage_interpreter("setsid --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("setsid -h bash").as_deref(), None);
+        assert_eq!(stage_interpreter("setsid --version sh").as_deref(), None);
+        assert_eq!(stage_interpreter("setsid -V bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox setsid --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox setsid -V bash").as_deref(),
+            None,
+            "busybox carrier does not invent a version-mode child"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | setsid sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | setsid -f -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox setsid bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox setsid -fw -- bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
