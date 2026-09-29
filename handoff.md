@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through wave-34)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through wave-34)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  wave-34 PATH block/mount leftovers out of STAGE, thin taskset/choom/prlimit
+  arity+classify deepen, and CrossBlock near-near-near-near-wrap cancel.
+  No STAGE peel this wave.
+
+
 Updated: 2026-09-29 (pending tip — wave-34 deepen)
 
 ## 2026-09-29 (pending tip — wave-34 deepen)
