@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 through wave-36 cohort)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 — wave-36 cohort)
+
+- CLASSIFY/DISPATCHES set-eq held at STAGE **71** through wave-36 network
+  inventory leftover pin + numactl/schedtool query/help fail-closed deepen and
+  timeout/nice classify peels. Membership len unchanged.
+
+
 Updated: 2026-09-29 (pending tip beside wave-36 deepen)
 
 ## 2026-09-29 (pending tip — wave-36 deepen)
