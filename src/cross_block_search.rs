@@ -256,6 +256,8 @@ mod tests {
         let scheduled = 0_u64;
         let live = scheduled.wrapping_add(1);
         assert!(!cross_block_search_continue_is_current(scheduled, live, true));
+        // Same wrapping schedule bump at the u64 boundary (MAX→0).
+        assert!(!cross_block_search_continue_is_current(u64::MAX, 0, true));
         // Finished last slice cleared the cursor before Break.
         assert!(!cross_block_search_continue_is_current(3, 3, false));
         // Stale generation without a resume is still not current.
@@ -267,6 +269,10 @@ mod tests {
         // Gen-0 finished walk (no resume) cancels the same way as any other
         // matching-generation empty cursor.
         assert!(!cross_block_search_continue_is_current(0, 0, false));
+        // Wrapping MAX→0 bump with a finished cursor cancels like any empty resume.
+        assert!(!cross_block_search_continue_is_current(u64::MAX, 0, false));
+        // Finished walk at the wrap generation itself (MAX,MAX,no resume).
+        assert!(!cross_block_search_continue_is_current(u64::MAX, u64::MAX, false));
         // Live wrapping ahead of scheduled (0 vs MAX) cancels even with a
         // resume still in hand — the reverse of the MAX→0 schedule bump.
         assert!(!cross_block_search_continue_is_current(0, u64::MAX, true));
