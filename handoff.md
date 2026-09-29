@@ -1,5 +1,17 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): FindScanBudget + Options/Scope + generic Report
+
+Lifted identical anvil/forge find types into [`cross_block_search`]:
+`FindScanBudget` / `ScanPrefix` / `utf8_prefix`, `CrossBlockSearchOptions` /
+`CrossBlockSearchScope`, and hit-generic `CrossBlockSearchReport<H>`.
+`CrossBlockHit` stays app-owned — anvil adds `exit_code` / `duration_ms` /
+`cwd` for palette chrome; forge does not — pinned by
+`cross_block_hit_schema_divergence_keeps_rows_app_owned`. GTK idle scheduling
+stays in the UIs. **Pending push/repin**.
+
+Updated: 2026-09-29 (wave): FindScanBudget + Options/Scope + generic Report
+
 ## 2026-09-29 (wave): strace / scriptlive STAGE_PREFIXES
 
 Added two `/usr/bin` launchers jagent wave 19 now strips. STAGE_PREFIXES
@@ -11,6 +23,13 @@ jagent. `classify_command` also see-throughs both. Supersedes the PATH-probe
 note below that left these open. Core/jagent tips still **pending push/repin**.
 
 Updated: 2026-09-29 (wave): strace / scriptlive STAGE_PREFIXES
+
+## 2026-09-29 (cleanup): PATH-probe / flock notes no longer claim strace open
+
+PATH-probe leftover and launcher-probe leftover already mark `strace` /
+`scriptlive` closed under STAGE 60 above. Dropped a stale mid-file `Updated:`
+that still pointed at the PATH-probe wave, and corrected the older flock-wave
+line that said `strace` stayed out.
 
 ## 2026-09-29 (wave): PATH probe script/scriptreplay/perf/gdb leftovers
 
@@ -53,8 +72,6 @@ the organism work loop. Pairs STAGE_PREFIXES wave (len 58).
 `VisualTransition::between(WatchAgent, UnknownOutcome)` stays `None` by
 design (agent finishes never land on the unknown-hold pose), beside the
 existing WatchAgent→CelebrateBig None pin.
-
-Updated: 2026-09-29 (wave): PATH probe script/scriptreplay/perf/gdb leftovers
 
 ## 2026-09-29 (wave): dbus-run-session / runcon / xvfb-run STAGE_PREFIXES
 
@@ -160,9 +177,10 @@ WatchAgent→CelebrateBig stays `None` (agent-driven passes never CelebrateBig).
 `stage_interpreter` treats util-linux `flock [options] FD` as having no child
 (matching jagent), so `| flock 9` / `| flock 9 sh` are not false
 pipe-to-interpreter hits. Regression coverage for `numactl --show` / `-s` and
-`firejail --help` / `--version` terminal forms. No new STAGE_PREFIXES:
-jagent wrappers already mirrored; `strace`/`perf` stay out (jagent does not
-strip them). jagent unchanged this wave (ionice/schedtool/cgexec already done).
+`firejail --help` / `--version` terminal forms. No new STAGE_PREFIXES
+in *this* wave: jagent wrappers already mirrored. (`strace` later joined
+STAGE 60 with `scriptlive`; `perf` stays out.) jagent unchanged this wave
+(ionice/schedtool/cgexec already done).
 
 ## 2026-09-29 (wave): WatchAgent/WatchSettled→RestAfterPush bridges
 
@@ -230,10 +248,10 @@ test — do not commit that patch or change the published jagent rev.
 Partial lift of the cross-block palette resume contract into
 [`cross_block_search`]: `CrossBlockSearchCursor` /
 `CrossBlockSearchMidRecord`, `cross_block_search_continue_is_current`, and the
-`CROSS_BLOCK_SCAN_*` / `CROSS_BLOCK_REGEX_SIZE_LIMIT` constants. GTK idle
-scheduling, `CrossBlockSearchReport`/`CrossBlockHit`, and `FindScanBudget`
-(shared with live Find) stay in anvil/forge — hit rows differ and the budget
-type is entangled with Find overlay limits. **Pending push/repin**.
+`CROSS_BLOCK_SCAN_*` / `CROSS_BLOCK_REGEX_SIZE_LIMIT` constants. Follow-up
+wave (above) lifts `FindScanBudget` / Options / Scope / generic Report;
+`CrossBlockHit` stays app-owned. GTK idle scheduling stays in the UIs.
+**Pending push/repin**.
 
 ## 2026-09-29 (wave): classify_command fakeroot/proot/firejail
 
