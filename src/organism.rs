@@ -3309,6 +3309,11 @@ pub fn classify_command(command: &str) -> CommandKind {
                 &mut tokens,
                 &["-n", "--adjust", "-p", "--pid"],
             ),
+            "uclampset" => skip_wrapper_options(
+                &mut tokens,
+                &["-m", "-M", "-p", "--pid"],
+            ),
+            "gamemoderun" => skip_wrapper_options(&mut tokens, &[]),
             "prlimit" => skip_wrapper_options(
                 &mut tokens,
                 &["-p", "--pid", "-o", "--output"],
@@ -3804,6 +3809,10 @@ mod tests {
             "ionice -c3 cargo test",
             "ionice -c 2 -n 5 -- cargo check",
             "choom -n 1000 cargo test",
+            "uclampset -m 512 cargo test",
+            "uclampset -m 0 -M 1024 -- cargo check",
+            "gamemoderun cargo test",
+            "gamemoderun -- cargo nextest run",
             "prlimit --nofile=1024 cargo check",
             "prlimit -p 1 -- cargo nextest run",
             "capsh -- cargo test",
@@ -5373,6 +5382,27 @@ mod tests {
                     VisualTransition::between(from, to),
                     None,
                     "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
+    /// Survey (between() 90): GuardFailure/Stuck/Cautious do not animate into
+    /// Celebrate* — a success finish reaches Celebrate through Watch*, and the
+    /// vigil→Watch snap is already intentional None. Pin so a silent
+    /// Guard*→Celebrate bridge cannot land beside Celebrate→Guard*.
+    #[test]
+    fn failure_stuck_cautious_never_bridge_to_celebrate_holds() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [Behavior::Celebrate, Behavior::CelebrateBig] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None (success finishes via Watch*)"
                 );
             }
         }

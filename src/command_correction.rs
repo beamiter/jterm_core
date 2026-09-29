@@ -1219,6 +1219,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "fakeroot",
     "firejail",
     "flock",
+    "gamemoderun",
     "gnome-session-inhibit",
     "gosu",
     "ionice",
@@ -1260,6 +1261,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "timeout",
     "tini",
     "torsocks",
+    "uclampset",
     "unbuffer",
     "watch",
     "xargs",
@@ -1494,6 +1496,8 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("daemonize", Some("help" | "version" | "h")) => true,
         ("setlock", Some("help" | "version")) => true,
         ("s6-setuidgid", Some("help" | "version")) => true,
+        ("uclampset", Some("help" | "version" | "h" | "V" | "system" | "s")) => true,
+        ("gamemoderun", Some("help" | "version" | "h")) => true,
         _ => false,
     }
 }
@@ -1650,6 +1654,14 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 | "--apparmor-profile"
         ) as usize,
         "choom" => matches!(option, "-n" | "--adjust" | "-p" | "--pid") as usize,
+        // util-linux util clamp: `-m`/`-M` take values; `-p`/`--pid` take a pid.
+        // `-s`/`--system` is flag-only (terminal via prefix_option_clears_child).
+        "uclampset" => matches!(
+            option,
+            "-m" | "-M" | "-p" | "--pid"
+        ) as usize,
+        // GameMode env launcher: argv is the child; no dashed meta values.
+        "gamemoderun" => 0,
         // Resource limits usually attach with `=`; only meta that takes a
         // following argv word belongs here.
         "prlimit" => matches!(option, "-p" | "--pid" | "-o" | "--output") as usize,
@@ -3573,10 +3585,10 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // Membership pin: len == 68 after gnome-session-inhibit (was 67 after
-        // wave-23 daemonize / setlock / s6-setuidgid).
+        // Membership pin: len == 70 after uclampset / gamemoderun (was 68 after
+        // gnome-session-inhibit).
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 68, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 70, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
@@ -3601,6 +3613,9 @@ mod tests {
         assert!(prefixes.contains(&"daemonize"));
         assert!(prefixes.contains(&"setlock"));
         assert!(prefixes.contains(&"s6-setuidgid"));
+        // Wave-25 scheduling / GameMode launchers.
+        assert!(prefixes.contains(&"uclampset"));
+        assert!(prefixes.contains(&"gamemoderun"));
     }
 
     /// STAGE names that jagent does **not** peel inside
@@ -3613,8 +3628,15 @@ mod tests {
     #[test]
     fn stage_prefix_jagent_transparency_surfaces_stay_partitioned() {
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 68, "{prefixes:?}");
-        for name in ["daemonize", "setlock", "s6-setuidgid", "gnome-session-inhibit"] {
+        assert_eq!(prefixes.len(), 70, "{prefixes:?}");
+        for name in [
+            "daemonize",
+            "setlock",
+            "s6-setuidgid",
+            "gnome-session-inhibit",
+            "uclampset",
+            "gamemoderun",
+        ] {
             assert!(
                 prefixes.contains(&name),
                 "{name} must remain STAGE (select_execution_wrappers_mode peels it)"
@@ -3694,10 +3716,6 @@ mod tests {
             "runsv",
             "runsvdir",
             "sv",
-            // util-linux scheduling twin of choom; teach fail-closed before STAGE.
-            "uclampset",
-            // GameMode env launcher — argv is the child, but not taught yet.
-            "gamemoderun",
         ] {
             assert!(
                 !prefixes.contains(&name),
@@ -4092,6 +4110,7 @@ mod tests {
             ("fakeroot", "fakeroot -- rm -rf /"),
             ("firejail", "firejail --noprofile rm -rf /"),
             ("flock", "flock /tmp/lock rm -rf /"),
+            ("gamemoderun", "gamemoderun -- rm -rf /"),
             ("gnome-session-inhibit", "gnome-session-inhibit --inhibit idle -- rm -rf /"),
             ("gosu", "gosu root rm -rf /"),
             ("ionice", "ionice -c3 rm -rf /"),
@@ -4139,6 +4158,7 @@ mod tests {
             ("timeout", "timeout 5 rm -rf /"),
             ("tini", "tini -- rm -rf /"),
             ("torsocks", "torsocks -i rm -rf /"),
+            ("uclampset", "uclampset -m 512 -- rm -rf /"),
             ("unbuffer", "unbuffer rm -rf /"),
             ("watch", "watch -n 1 --exec rm -rf /"),
             ("xargs", "xargs rm -rf /"),
@@ -4149,7 +4169,12 @@ mod tests {
             STAGE_PREFIXES.len(),
             "DISPATCHES must list exactly one form per STAGE_PREFIXES entry"
         );
-        assert_eq!(STAGE_PREFIXES.len(), 68, "keep DISPATCHES in lockstep with membership pin");
+        assert_eq!(STAGE_PREFIXES.len(), 70, "keep DISPATCHES in lockstep with membership pin");
+        assert_eq!(
+            DISPATCHES.len(),
+            70,
+            "DISPATCHES len must match membership pin (STAGE 70 / uclampset+gamemoderun)"
+        );
         for prefix in STAGE_PREFIXES {
             let form = DISPATCHES
                 .iter()
@@ -4200,6 +4225,7 @@ mod tests {
             ("fakeroot", "fakeroot -- cargo test"),
             ("firejail", "firejail --noprofile cargo test"),
             ("flock", "flock /tmp/lock cargo test"),
+            ("gamemoderun", "gamemoderun -- cargo test"),
             ("gnome-session-inhibit", "gnome-session-inhibit --inhibit idle -- cargo test"),
             ("gosu", "gosu root cargo test"),
             ("ionice", "ionice -c3 cargo test"),
@@ -4244,11 +4270,22 @@ mod tests {
             ("timeout", "timeout 5 cargo test"),
             ("tini", "tini -- cargo test"),
             ("torsocks", "torsocks -i cargo test"),
+            ("uclampset", "uclampset -m 512 -- cargo test"),
             ("unbuffer", "unbuffer cargo test"),
             ("watch", "watch --exec cargo test"),
             ("xargs", "xargs cargo test"),
             ("xvfb-run", "xvfb-run -a cargo test"),
         ];
+        assert_eq!(
+            CLASSIFY_FORMS.len(),
+            STAGE_PREFIXES.len(),
+            "CLASSIFY_FORMS must list exactly one form per STAGE_PREFIXES entry"
+        );
+        assert_eq!(
+            CLASSIFY_FORMS.len(),
+            70,
+            "CLASSIFY_FORMS len must match membership/DISPATCHES pin (STAGE 70)"
+        );
         for prefix in STAGE_PREFIXES {
             let form = CLASSIFY_FORMS
                 .iter()
@@ -4686,6 +4723,23 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("uclampset -m 512 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("uclampset -m 0 -M 1024 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("uclampset -s sh").as_deref(), None);
+        assert_eq!(stage_interpreter("uclampset --system bash").as_deref(), None);
+        assert_eq!(stage_interpreter("uclampset --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("gamemoderun sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("gamemoderun -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("gamemoderun --help sh").as_deref(), None);
+        assert_eq!(
             stage_interpreter("prlimit --nofile=1024 sh").as_deref(),
             Some("sh")
         );
@@ -5007,6 +5061,10 @@ mod tests {
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
+            "ls -l | uclampset -m 512 sh",
+            "ls -l | uclampset -m 0 -M 1024 -- bash",
+            "ls -l | gamemoderun sh",
+            "ls -l | gamemoderun -- bash",
             "ls -l | prlimit --nofile=1024 sh",
             "ls -l | dumb-init sh",
             "ls -l | tini -- sh",
