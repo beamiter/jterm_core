@@ -3755,6 +3755,18 @@ mod tests {
             "systemd-path",
             "systemd-escape",
             "systemd-detect-virt",
+            // Wave-30 PATH leftovers: ctl/notify/mount managers and VT/AppArmor
+            // peers beside STAGE systemd-*/openvt/aa-exec (jagent pin
+            // `path_probe_systemd_ctl_notify_leftovers_do_not_invent_a_child_peel`).
+            "systemctl",
+            "busctl",
+            "journalctl",
+            "timedatectl",
+            "resolvectl",
+            "systemd-notify",
+            "systemd-mount",
+            "chvt",
+            "aa-status",
         ] {
             assert!(
                 !prefixes.contains(&name),
