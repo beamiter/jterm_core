@@ -4289,12 +4289,22 @@ mod tests {
             classify_command("timeout 5 nice -n 5 chrt 1 cargo check"),
             CommandKind::BuildOrTest
         );
+        // timeout+nice double nest around ionice — parity with setsid/chrt nests.
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 ionice -c 3 cargo check"),
+            CommandKind::BuildOrTest
+        );
         // Busybox applet carriers remain stage_interpreter-only — classify
         // does not peel busybox itself (parity with taskset nest classify).
         assert_ne!(
             classify_command("busybox ionice -c 3 cargo test"),
             CommandKind::BuildOrTest,
             "busybox carrier stays stage_interpreter-only under classify"
+        );
+        assert_ne!(
+            classify_command("busybox chrt 1 cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox has no chrt applet; carrier stays stage_interpreter-only"
         );
     }
 
