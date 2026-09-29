@@ -1,5 +1,17 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): PATH probe script/scriptreplay/perf/gdb leftovers
+
+`command -v` after STAGE 58: `script` already [`PIPE_INTERPRETERS`] (bare
+form starts an interactive shell — not a STAGE false-neg). `scriptreplay`
+on PATH but **not** a child argv launcher (typescript replay only; no
+PROGRAM operand) — leave out. `ltrace` / `valgrind` / `rr` / `catchsegv`
+absent. `perf` / `gdb` / `strace` / `scriptlive` on PATH but complex CLIs
+(subcommand / inferior / attach grammar) — **not** STAGE_PREFIXES; prefer
+fail-closed / jagent-only if ever taught (do not STAGE valgrind/gdb).
+`run-parts` stays out (directory runner). Prior leftover note still holds.
+
+
 ## 2026-09-29 (wave): WatchCommand→UnknownOutcome + GlanceAside None pins
 
 `VisualTransition::between(WatchCommand, UnknownOutcome)` stays `None` by
@@ -31,7 +43,7 @@ the organism work loop. Pairs STAGE_PREFIXES wave (len 58).
 design (agent finishes never land on the unknown-hold pose), beside the
 existing WatchAgent→CelebrateBig None pin.
 
-Updated: 2026-09-29 (wave): launcher probe leftovers after STAGE 58
+Updated: 2026-09-29 (wave): PATH probe script/scriptreplay/perf/gdb leftovers
 
 ## 2026-09-29 (wave): dbus-run-session / runcon / xvfb-run STAGE_PREFIXES
 
