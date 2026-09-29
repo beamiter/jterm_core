@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): PATH-probe leftovers for s6-sudo / runit helpers
+
+## 2026-09-29 (wave): PATH-probe leftovers (s6-sudo / multilog / runit)
+
+`command -v daemonize setlock s6-setuidgid s6-sudo multilog setuidgid` is
+empty here. Peelable grammar still joined STAGE (len 67). Leftover pin keeps
+`s6-sudo` (unix-socket client), `multilog` / `svlogd` (stdin loggers), and
+`runsv` / `runsvdir` / `sv` (supervisors) out. `tcsh` stays
+PIPE_INTERPRETERS. Membership pin also asserts already-STAGE `firejail` /
+`chpst` / `softlimit` / `setuidgid`. Core/jagent tips still **pending
+push/repin**.
+
 Updated: 2026-09-29 (wave): daemonize/setlock/s6-setuidgid STAGE_PREFIXES
 
 ## 2026-09-29 (wave): daemonize / setlock / s6-setuidgid STAGE_PREFIXES
