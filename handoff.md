@@ -1,5 +1,19 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): daemonize/setlock/s6-setuidgid STAGE_PREFIXES
+
+## 2026-09-29 (wave): daemonize / setlock / s6-setuidgid STAGE_PREFIXES
+
+Added launchers jagent wave 23 now strips. STAGE_PREFIXES len 64 → **67**.
+`daemonize` peels cwd/stdio/pid/user/lock/env meta (child is the first
+non-option path). `setlock` peels flag-only `-nNxX` then a lockfile
+positional. `s6-setuidgid` skips the account positional like `setuidgid`.
+Pipe regressions + DISPATCHES / classify forms pin parity with path-patched
+jagent. Nested `daemonize setlock cargo` classify depth and arity edges
+(`--version` / `--help` terminal) landed on this tip. `firejail` / `chpst` /
+`softlimit` / `setuidgid` stay STAGE. Core/jagent tips still **pending
+push/repin**. VisualTransition 76 sits beside this STAGE 67 work.
+
 Updated: 2026-09-29 (wave): error/unknown→Rest + Watch*→Idle bridges (76)
 
 ## 2026-09-29 (wave): error/unknown→Rest + Watch*→Idle VisualTransition (76)
