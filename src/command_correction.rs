@@ -3672,6 +3672,19 @@ mod tests {
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
+        // End-of-options: `busybox -- sh` must still skip the multiplexer and
+        // judge the applet (not treat `--` as "no applet word").
+        assert_eq!(
+            stage_interpreter("busybox -- sh -c id").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox -- ash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
     }
 
     #[test]
