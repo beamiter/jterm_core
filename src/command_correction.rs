@@ -3767,6 +3767,31 @@ mod tests {
             "systemd-mount",
             "chvt",
             "aa-status",
+            // Wave-31 PATH leftovers: more *ctl managers, systemd setup/id/
+            // hwdb utilities, namespace listing, and AppArmor teardown peers
+            // beside STAGE systemd-*/aa-exec (jagent pin
+            // `path_probe_ctl_utility_leftovers_do_not_invent_a_child_peel`).
+            // `unshare`/`nsenter` stay PIPE_INTERPRETERS (already peeled) —
+            // CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "loginctl",
+            "hostnamectl",
+            "localectl",
+            "bootctl",
+            "networkctl",
+            "kernel-install",
+            "systemd-tmpfiles",
+            "systemd-sysusers",
+            "systemd-id128",
+            "systemd-hwdb",
+            "systemd-sysext",
+            "systemd-cryptenroll",
+            "systemd-machine-id-setup",
+            "systemd-umount",
+            "systemd-tty-ask-password-agent",
+            "lsns",
+            "aa-teardown",
+            "aa-remove-unknown",
+            "apparmor_status",
         ] {
             assert!(
                 !prefixes.contains(&name),
