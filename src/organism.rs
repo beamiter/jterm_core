@@ -5384,6 +5384,54 @@ mod tests {
         );
     }
 
+    /// Long-watch finish table: every reducer-reachable leave from WatchSettled
+    /// animates under Full motion (pass/fail/rest/idle). Unknown stays an
+    /// intentional snap (`watch_settled_never_bridges_to_unknown_outcome`).
+    /// Celebrate was previously only covered inside CelebrateBig's inbound list.
+    #[test]
+    fn watch_settled_finish_arcs_cover_pass_fail_rest_and_idle() {
+        let arcs = [
+            (
+                Behavior::Celebrate,
+                VisualTransition::WatchSettledToCelebrate,
+            ),
+            (
+                Behavior::CelebrateBig,
+                VisualTransition::WatchSettledToCelebrateBig,
+            ),
+            (
+                Behavior::InspectError,
+                VisualTransition::WatchSettledToInspectError,
+            ),
+            (
+                Behavior::SitNearError,
+                VisualTransition::WatchSettledToSitNearError,
+            ),
+            (
+                Behavior::RestAfterPush,
+                VisualTransition::WatchSettledToRestAfterPush,
+            ),
+            (Behavior::Idle, VisualTransition::WatchSettledToIdle),
+        ];
+        for (to, expected) in arcs {
+            assert_eq!(
+                VisualTransition::between(Behavior::WatchSettled, to),
+                Some(expected),
+                "WatchSettled→{to:?}"
+            );
+        }
+        assert_eq!(
+            arcs.len(),
+            6,
+            "WatchSettled finish-arc table is six Some bridges"
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchSettled, Behavior::UnknownOutcome),
+            None,
+            "missing-exit Unknown still snaps (no bridge frames)"
+        );
+    }
+
     #[test]
     fn watch_command_and_agent_finish_have_full_motion_bridges() {
         assert_eq!(
