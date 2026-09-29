@@ -4355,6 +4355,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn classify_command_peels_timeout_nice_around_softlimit_and_cgexec() {
+        assert_eq!(
+            classify_command("timeout 5 softlimit -m 1000000 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 softlimit -c 0 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("softlimit -n 64 timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 cgexec -g cpu:group1 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 cgexec --sticky -g *:box cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("cgexec -g cpu:g timeout 5 cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 softlimit -m 1000000 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 cgexec -g cpu:g cargo check"),
+            CommandKind::BuildOrTest
+        );
+        // Busybox has neither applet — classify does not peel busybox itself.
+        assert_ne!(
+            classify_command("busybox softlimit -m 1000000 cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+        assert_ne!(
+            classify_command("busybox cgexec -g cpu:g cargo test"),
+            CommandKind::BuildOrTest,
+            "busybox carrier stays stage_interpreter-only under classify"
+        );
+    }
+
 
     #[test]
     fn classify_command_peels_timeout_nice_around_setsid() {
