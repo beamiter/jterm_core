@@ -1507,6 +1507,11 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("systemd-socket-activate", Some("help" | "version" | "h")) => true,
         // util-linux new-session wrapper: help/version terminate without PROGRAM.
         ("setsid", Some("help" | "version" | "h" | "V")) => true,
+        // util-linux affinity / OOM / rlimit wrappers: help/version and pid-mode
+        // terminate without a child PROGRAM (thin STAGE 71 deepen).
+        ("taskset", Some("help" | "version" | "h" | "V" | "pid" | "p")) => true,
+        ("choom", Some("help" | "version" | "h" | "V" | "pid" | "p")) => true,
+        ("prlimit", Some("help" | "version" | "h" | "V" | "pid" | "p")) => true,
         _ => false,
     }
 }
@@ -4382,6 +4387,105 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | busybox openvt -c 3 -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    /// Thin STAGE 71 deepen: util-linux `taskset` busybox carriers + help/
+    /// version fail-closed; `choom`/`prlimit` nest arity (no busybox applets).
+    #[test]
+    fn taskset_choom_prlimit_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("taskset ff sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("taskset -c 0-3 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("busybox taskset ff sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox taskset -c 0-3 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("taskset").as_deref(), None);
+        assert_eq!(stage_interpreter("taskset ff").as_deref(), None);
+        assert_eq!(stage_interpreter("taskset --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("taskset -h bash").as_deref(), None);
+        assert_eq!(stage_interpreter("taskset --version sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox taskset --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox taskset -V bash").as_deref(),
+            None,
+            "busybox carrier does not invent a version-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("choom -n 1000 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("choom --adjust=0 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("choom").as_deref(), None);
+        assert_eq!(stage_interpreter("choom -n").as_deref(), None);
+        assert_eq!(stage_interpreter("choom --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("choom -h bash").as_deref(), None);
+        assert_eq!(stage_interpreter("choom --version sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("choom -p 1 sh").as_deref(),
+            None,
+            "pid mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("prlimit --nofile=1024 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("prlimit --core=0 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("prlimit --help sh").as_deref(), None);
+        assert_eq!(stage_interpreter("prlimit -h bash").as_deref(), None);
+        assert_eq!(stage_interpreter("prlimit --version sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("prlimit -p 1 sh").as_deref(),
+            None,
+            "pid mode never launches a child"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | taskset ff sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox taskset ff bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | choom -n 1000 sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | prlimit --nofile=1024 bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
