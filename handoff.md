@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (family pin align: jagent `628811b`, pending core push/repin)
+
+## 2026-09-29 (family pin align)
+
+- **jagent pin `6ed0b9f` → `628811b`** — picks up exec-child classification waves
+  4–8 (`docker`/`nerdctl`/`kubectl`/`lxc`/`incus`). Consumers that path-patch
+  this tree (anvil/forge/ember/frost) resolve the same revision. Organism vigil
+  commits `fbfcafa`/`99e24c0` remain local-only (**pending push/repin**); Cargo
+  manifests still name published `33093da` until a pusher publishes them.
+
 Updated: 2026-08-29 (shared multi-chat AI store; command-correction engine; workflow subsystem)
 
 This baseline centralizes bounded AI transport, strict Agent restoration,
