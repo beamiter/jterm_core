@@ -278,6 +278,31 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(0, u64::MAX, true));
         // Same reverse-wrap cancel without a resume still drops the idle slice.
         assert!(!cross_block_search_continue_is_current(0, u64::MAX, false));
+        // Near-wrap bump (MAX-1→MAX) cancels with a resume still in hand — the
+        // non-wrapping sibling of the MAX→0 schedule bump at the u64 boundary.
+        let near_wrap = u64::MAX.wrapping_sub(1);
+        assert!(cross_block_search_continue_is_current(
+            near_wrap, near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            near_wrap, u64::MAX, true
+        ));
+        // Same near-wrap bump with a finished cursor still drops the idle slice.
+        assert!(!cross_block_search_continue_is_current(
+            near_wrap, u64::MAX, false
+        ));
+        // Matching generation at MAX itself still keeps a live resume.
+        assert!(cross_block_search_continue_is_current(
+            u64::MAX, u64::MAX, true
+        ));
+        // Scheduled ahead at the near-wrap boundary (MAX vs MAX-1) cancels with
+        // a resume — speculative gen / rewound live beside the MAX-1→MAX bump.
+        assert!(!cross_block_search_continue_is_current(
+            u64::MAX, near_wrap, true
+        ));
+        assert!(!cross_block_search_continue_is_current(
+            u64::MAX, near_wrap, false
+        ));
     }
 
     #[test]
