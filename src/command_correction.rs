@@ -1197,10 +1197,12 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
     "capsh",
+    "choom",
     "chroot",
     "chrt",
     "command",
     "doas",
+    "dumb-init",
     "env",
     "exec",
     "gosu",
@@ -1208,9 +1210,11 @@ const STAGE_PREFIXES: &[&str] = &[
     "nice",
     "nohup",
     "pkexec",
+    "prlimit",
     "run0",
     "runuser",
     "setarch",
+    "setpriv",
     "setsid",
     "start-stop-daemon",
     "stdbuf",
@@ -1222,7 +1226,9 @@ const STAGE_PREFIXES: &[&str] = &[
     "taskset",
     "time",
     "timeout",
+    "tini",
     "unbuffer",
+    "watch",
     "xargs",
 ];
 
@@ -1515,6 +1521,37 @@ fn stage_option_takes_detached_value(prefix: &str, option: &str) -> bool {
                 | "--sched-deadline"
         ),
         "time" => matches!(option, "-o" | "--output" | "-f" | "--format"),
+        // util-linux wrappers already stripped by jagent; without arity the
+        // scan stops on the meta value (`--reuid 0`, `-n 1000`) and misses `sh`.
+        "setpriv" => matches!(
+            option,
+            "--ambient-caps"
+                | "--inh-caps"
+                | "--bounding-set"
+                | "--ruid"
+                | "--euid"
+                | "--rgid"
+                | "--egid"
+                | "--reuid"
+                | "--regid"
+                | "--groups"
+                | "--securebits"
+                | "--pdeathsig"
+                | "--selinux-label"
+                | "--apparmor-profile"
+        ),
+        "choom" => matches!(option, "-n" | "--adjust" | "-p" | "--pid"),
+        // Resource limits usually attach with `=`; only meta that takes a
+        // following argv word belongs here.
+        "prlimit" => matches!(option, "-p" | "--pid" | "-o" | "--output"),
+        // Container PID-1 wrappers: flag-only forms need no arity; tini's
+        // value-taking shorts/longs still skip the meta word.
+        "dumb-init" => false,
+        "tini" => matches!(
+            option,
+            "-p" | "--kill-after" | "-g" | "--group-add" | "-e" | "--env"
+        ),
+        "watch" => matches!(option, "-n" | "--interval" | "-q" | "--equexit"),
         _ => false,
     }
 }
@@ -3119,10 +3156,12 @@ mod tests {
         // would report a gap that is really just an invalid command line.
         const DISPATCHES: &[(&str, &str)] = &[
             ("capsh", "capsh -- -c 'rm -rf /'"),
+            ("choom", "choom -n 1000 rm -rf /"),
             ("chroot", "chroot / rm -rf /"),
             ("chrt", "chrt 1 rm -rf /"),
             ("command", "command rm -rf /"),
             ("doas", "doas rm -rf /"),
+            ("dumb-init", "dumb-init -- rm -rf /"),
             ("env", "env FOO=1 rm -rf /"),
             ("exec", "exec rm -rf /"),
             ("gosu", "gosu root rm -rf /"),
@@ -3130,9 +3169,11 @@ mod tests {
             ("nice", "nice -n 5 rm -rf /"),
             ("nohup", "nohup rm -rf /"),
             ("pkexec", "pkexec rm -rf /"),
+            ("prlimit", "prlimit --nofile=1024 rm -rf /"),
             ("run0", "run0 rm -rf /"),
             ("runuser", "runuser -u root -- rm -rf /"),
             ("setarch", "setarch x86_64 rm -rf /"),
+            ("setpriv", "setpriv --reuid 0 rm -rf /"),
             ("setsid", "setsid rm -rf /"),
             (
                 "start-stop-daemon",
@@ -3147,7 +3188,9 @@ mod tests {
             ("taskset", "taskset ff rm -rf /"),
             ("time", "time rm -rf /"),
             ("timeout", "timeout 5 rm -rf /"),
+            ("tini", "tini -- rm -rf /"),
             ("unbuffer", "unbuffer rm -rf /"),
+            ("watch", "watch -n 1 --exec rm -rf /"),
             ("xargs", "xargs rm -rf /"),
         ];
         for prefix in STAGE_PREFIXES {
@@ -3535,6 +3578,44 @@ mod tests {
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
+        // util-linux / container-init wrappers jagent already strips: without
+        // STAGE_PREFIXES the scan stops on the wrapper and the shell behind
+        // detached meta (`--reuid 0`, `-n 1000`) never reaches the gate.
+        assert_eq!(
+            stage_interpreter("setpriv --reuid 0 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("choom -n 1000 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("prlimit --nofile=1024 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(stage_interpreter("dumb-init -- sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("tini --kill-after 10 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("watch -n 1 --exec sh").as_deref(),
+            Some("sh")
+        );
+        for candidate in [
+            "ls -l | setpriv --reuid 0 sh",
+            "ls -l | choom -n 1000 sh",
+            "ls -l | prlimit --nofile=1024 sh",
+            "ls -l | dumb-init sh",
+            "ls -l | tini -- sh",
+            "ls -l | watch -n 1 --exec sh",
+        ] {
+            assert_eq!(
+                validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
+                Err(CorrectionRejection::AddsPipeToInterpreter),
+                "{candidate}"
+            );
+        }
         // And network provenance is jagent's question, not this scan's, so the
         // pipeline that actually matters is still refused.
         assert_eq!(
