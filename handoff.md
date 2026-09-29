@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): PATH wave-34 block/mount leftovers beside STAGE 71
+
+## 2026-09-29 (wave): PATH probe wave-34 block/mount leftovers stay out
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-34 `lsblk` /
+`blkid` / `losetup` / `blockdev` / `findmnt` / `wipefs` as intentional
+non-STAGE beside STAGE peelers and wave-30–33 ctl leftovers (jagent pin
+`path_probe_block_mount_leftovers_do_not_invent_a_child_peel`). Membership /
+DISPATCHES / CLASSIFY_FORMS stay **71** with set-eq. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 174/219 final align)
 
 ## 2026-09-29 (point pending tip — rounds 174/219 final align)
