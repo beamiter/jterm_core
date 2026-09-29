@@ -14,6 +14,14 @@ priority/who/mode/no-pager) landed earlier on this tip. Core tip still
 
 Updated: 2026-09-29 (wave): clear-vigil Idle VisualTransition bridges (70)
 
+## 2026-09-29 (wave): nested classify + systemd-cat/inhibit arity pins
+
+Dedicated `classify_command_peels_nested_strace_timeout_wrappers` and
+`systemd_cat_and_inhibit_stage_arity_edges` regressions (depth + terminal
+`--list`/`--help`). Pairs clear-Idle 70 wave. **Pending push/repin**.
+
+Updated: 2026-09-29 (wave): nested classify + systemd-cat/inhibit arity pins
+
 
 ## 2026-09-29 (wave): systemd-socket-activate STAGE_PREFIXES
 
