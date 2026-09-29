@@ -1,6 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): bubblewrap STAGE_PREFIXES alias
+Updated: 2026-09-29 (wave): busybox `--` applet end-of-options
+
+## 2026-09-29 (wave): busybox `--` applet end-of-options
+
+`busybox -- sh` / `| busybox -- ash` still skip the multiplexer and judge the
+applet (`--` is not a missing-applet signal). Extends the applet-scan
+regression from the prior busybox wave.
 
 ## 2026-09-29 (wave): bubblewrap STAGE_PREFIXES alias
 
