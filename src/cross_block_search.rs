@@ -317,6 +317,18 @@ mod tests {
         assert_eq!(utf8_prefix("ab界cd", usize::MAX), "ab界cd");
     }
 
+    /// Zero-byte caps and a 3-byte code point under a 1–2 byte budget must
+    /// yield empty prefixes, never a split `char`. Empty input stays empty.
+    #[test]
+    fn utf8_scan_prefix_zero_budget_and_partial_code_point_stay_empty() {
+        assert_eq!(utf8_prefix("", 0), "");
+        assert_eq!(utf8_prefix("abc", 0), "");
+        assert_eq!(utf8_prefix("界", 0), "");
+        assert_eq!(utf8_prefix("界", 1), "");
+        assert_eq!(utf8_prefix("界", 2), "");
+        assert_eq!(utf8_prefix("界", 3), "界");
+    }
+
     #[test]
     fn aggregate_scan_budget_reports_an_incomplete_utf8_safe_prefix() {
         let mut budget = FindScanBudget {
