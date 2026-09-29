@@ -3958,6 +3958,32 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_gnome_session_inhibit() {
+        assert_eq!(
+            classify_command("timeout 5 gnome-session-inhibit cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 gnome-session-inhibit --inhibit idle cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command(
+                "timeout 5 gnome-session-inhibit --app-id x --reason y --inhibit idle -- cargo nextest run"
+            ),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("gnome-session-inhibit timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 gnome-session-inhibit cargo check"),
+            CommandKind::BuildOrTest
+        );
+    }
+
+    #[test]
     fn repeated_real_failures_escalate_then_success_celebrates() {
         let mut organism = NativeOrganism::default();
         organism.command_started(CommandKind::BuildOrTest);
