@@ -1,12 +1,19 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): launcher probe leftovers after STAGE 58
+
+`run-parts` stays out (directory script runner, not child argv).
+`catchsegv` not on PATH (needs `glibc-tools`). `qemu-*-static` absent.
+`strace` / `scriptlive` remain open (complex CLIs) — not STAGE yet.
+`systemd-run` / `pkexec` already covered.
+
 ## 2026-09-29 (wave): WatchAgent→UnknownOutcome None pin
 
 `VisualTransition::between(WatchAgent, UnknownOutcome)` stays `None` by
 design (agent finishes never land on the unknown-hold pose), beside the
 existing WatchAgent→CelebrateBig None pin.
 
-Updated: 2026-09-29 (wave): WatchAgent→UnknownOutcome None pin
+Updated: 2026-09-29 (wave): launcher probe leftovers after STAGE 58
 
 ## 2026-09-29 (wave): dbus-run-session / runcon / xvfb-run STAGE_PREFIXES
 
