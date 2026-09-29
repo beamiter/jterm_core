@@ -3735,6 +3735,17 @@ mod tests {
             "ssh-agent",
             "gpg-agent",
             "systemd-ask-password",
+            // Wave-28 PATH leftovers: systemd inspectors/formatters beside
+            // STAGE systemd-inhibit/run/cat (jagent pin
+            // `path_probe_systemd_inspector_leftovers_do_not_invent_a_child_peel`).
+            // `cgexec`/`runuser`/`chrt`/`taskset` and both `*inhibit*` are
+            // already STAGE; `openvt` stays a deferred peelable candidate.
+            "systemd-cgls",
+            "systemd-cgtop",
+            "systemd-analyze",
+            "systemd-path",
+            "systemd-escape",
+            "systemd-detect-virt",
         ] {
             assert!(
                 !prefixes.contains(&name),
