@@ -2871,6 +2871,84 @@ pub fn classify_command(command: &str) -> CommandKind {
                 // PROGRAM after `su -- CMD` / `su -g root -- CMD`).
                 skip_wrapper_options(&mut tokens, &["-g", "--group", "-G"]);
             }
+            // util-linux / scheduling wrappers already in STAGE_PREFIXES.
+            "chroot" => {
+                skip_wrapper_options(
+                    &mut tokens,
+                    &["--groups", "--userspec", "--skip-chdir"],
+                );
+                skip_wrapper_positional(&mut tokens);
+            }
+            "chrt" => {
+                skip_wrapper_options(
+                    &mut tokens,
+                    &[
+                        "-T",
+                        "--sched-runtime",
+                        "-P",
+                        "--sched-period",
+                        "-D",
+                        "--sched-deadline",
+                    ],
+                );
+                // Priority is a bare number before PROGRAM (`chrt 1 cargo`).
+                if tokens
+                    .peek()
+                    .is_some_and(|token| token.chars().all(|c| c.is_ascii_digit()))
+                {
+                    let mut lookahead = tokens.clone();
+                    lookahead.next();
+                    if lookahead.peek().is_some() {
+                        tokens.next();
+                    }
+                }
+            }
+            "taskset" | "setarch" => {
+                // Mask / personality operand before PROGRAM.
+                skip_wrapper_options(&mut tokens, &["-B", "--base-offset"]);
+                skip_wrapper_positional(&mut tokens);
+            }
+            "setsid" => skip_wrapper_options(&mut tokens, &[]),
+            "setpriv" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "--ambient-caps",
+                    "--inh-caps",
+                    "--bounding-set",
+                    "--ruid",
+                    "--euid",
+                    "--rgid",
+                    "--egid",
+                    "--reuid",
+                    "--regid",
+                    "--groups",
+                    "--securebits",
+                    "--pdeathsig",
+                    "--selinux-label",
+                    "--apparmor-profile",
+                ],
+            ),
+            "ionice" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-c",
+                    "--class",
+                    "-n",
+                    "--classdata",
+                    "-p",
+                    "--pid",
+                    "-P",
+                    "--pgid",
+                ],
+            ),
+            "choom" => skip_wrapper_options(
+                &mut tokens,
+                &["-n", "--adjust", "-p", "--pid"],
+            ),
+            "prlimit" => skip_wrapper_options(
+                &mut tokens,
+                &["-p", "--pid", "-o", "--output"],
+            ),
             "bwrap" | "bubblewrap" => {
                 // Two-arg bind/setenv forms plus common one-value meta. Stop
                 // on unknown dashes so a truncated peel does not mis-eat the
@@ -3255,6 +3333,20 @@ mod tests {
             "su-exec nobody cargo test",
             "su -- cargo nextest run",
             "doas gosu root cargo test",
+            "chroot / cargo test",
+            "chroot --userspec=root:root / -- cargo check",
+            "chrt 1 cargo test",
+            "chrt -f 1 cargo check",
+            "taskset ff cargo test",
+            "taskset -c 0 -- cargo nextest run",
+            "setarch x86_64 cargo test",
+            "setsid cargo check",
+            "setpriv --reuid 0 -- cargo test",
+            "ionice -c3 cargo test",
+            "ionice -c 2 -n 5 -- cargo check",
+            "choom -n 1000 cargo test",
+            "prlimit --nofile=1024 cargo check",
+            "prlimit -p 1 -- cargo nextest run",
         ] {
             assert_eq!(
                 classify_command(command),
