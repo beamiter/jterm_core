@@ -4,7 +4,7 @@ Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / wave-37 fin
 
 ## 2026-09-30 (point pending tip — rounds 199/250)
 
-- Pending tip note remains current at HEAD `eb7bea1` after STAGE 71 hold
+- Pending tip note remains current at HEAD `8058d97` after STAGE 71 hold
   beside sticky 1803/1802/MAX-9/Unknown→GuardCautious.
 
 Updated: 2026-09-30 (pending tip through sticky 1803/1802/MAX-9 pins)
