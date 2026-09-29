@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave A: xargs -d/--delimiter arity; jagent `628811b`)
+Updated: 2026-09-29 (organism: error-hold heal settle bridges; wave A/C)
+
+## 2026-09-29 (organism evolve): error-hold heal settle continuity
+
+While InspectError/SitNearError still hold, sibling `sync_repo_work_state` can
+retarget the idle vigil to Recovery/Cautious/Stuck. Matching-tier settles were
+already bridged; the heal/escalate settles were not. Added
+`InspectError→{Recovery,Cautious,Stuck}`, `SitNearError→{Recovery,Cautious}`,
+and `GuardCautious→GuardRecovery` with the same 4-frame bbox contract.
+`error_hold_heal_settle_has_full_motion_bridges` drives SitNearError + heal →
+Recovery.
 
 ## 2026-09-29 (wave C): jsh-remote provenance header refresh
 
