@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip beside Idle/Rest Guard pins and round-44 smoke)
+
+## 2026-09-29 (pending tip — Idle/Rest Guard + round-44)
+
+- Local HEAD `4b6278a` still path-patch-only for ember/frost round-44 smoke
+  against jagent `90a3d65` after anvil `446f3fc` rounds 148–151 / forge `ad2a539`
+  188–191 Idle/Rest→Guard + hold→Watch + Failure→holds Full-motion beside
+  141–147 / 180–187 hold/ambient/Watch/CrossBlock/Retry/FVS/NBSP pins. STAGE
+  **71** / between() **93** unchanged. Push/repin cohort still pending.
+
+
 Updated: 2026-09-29 (hold/Guard→ambient + Watch* mode-switch Nones + CrossBlock wrap)
 
 ## 2026-09-29 (wave): hold/Guard→ambient + Watch* mode-switch Nones
