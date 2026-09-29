@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): PATH wave-33 device/sysctl leftovers beside STAGE 71
+
+## 2026-09-29 (wave): PATH probe wave-33 device/sysctl leftovers stay out
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-33 `alsactl` /
+`cupsctl` / `pccardctl` / `rtkitctl` / `zramctl` / `sysctl` as intentional
+non-STAGE beside STAGE peelers and wave-30/31/32 ctl leftovers (jagent pin
+`path_probe_device_sys_ctl_leftovers_do_not_invent_a_child_peel`). Membership /
+DISPATCHES / CLASSIFY_FORMS stay **71** with set-eq. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through aa-exec deepen + rounds 160/202)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through aa-exec deepen + 160/202)
