@@ -1527,6 +1527,10 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
             Some("show" | "hardware" | "help" | "version" | "s" | "H" | "h" | "V"),
         ) => true,
         ("schedtool", Some("h" | "r" | "help")) => true,
+        // softlimit/cgexec help/version terminate without PROGRAM (wave-38 thin
+        // STAGE 71 deepen — stops inventing a peel after `--help sh` / `-h sh`).
+        ("softlimit", Some("help" | "version")) => true,
+        ("cgexec", Some("help" | "h")) => true,
         _ => false,
     }
 }
@@ -4705,6 +4709,68 @@ mod tests {
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
     }
+
+    /// `softlimit` resource peels + `cgexec -g` cgroup peels: help/version
+    /// fail-closed so junk after `--help` / `-h` never invents a child
+    /// (thin STAGE 71 deepen). Busybox has neither applet.
+    #[test]
+    fn softlimit_and_cgexec_stage_arity_edges() {
+        assert_eq!(
+            stage_interpreter("softlimit -m 1000000 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("softlimit -d1000000 -s 8192 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("softlimit").as_deref(), None);
+        assert_eq!(stage_interpreter("softlimit -m 1000000").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("softlimit --help sh").as_deref(),
+            None,
+            "help mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("softlimit --version bash").as_deref(),
+            None,
+            "version mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("cgexec -g cpu:group1 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("cgexec --sticky -g *:box bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("cgexec").as_deref(), None);
+        assert_eq!(stage_interpreter("cgexec -g cpu:g").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("cgexec --help sh").as_deref(),
+            None,
+            "help mode never launches a child"
+        );
+        assert_eq!(
+            stage_interpreter("cgexec -h bash").as_deref(),
+            None,
+            "short help never launches a child"
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | softlimit -m 1000000 sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | cgexec -g cpu:g bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
 
     /// util-linux setsid: session flags + help/version fail closed. Busybox
     /// applet carriers peel before the STAGE name so pipe-to-bash still
