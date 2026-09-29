@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip note at HEAD after round-47 smoke)
+
+## 2026-09-29 (point pending tip — round-47 smoke)
+
+- Local HEAD `727ecda` still path-patch-only for ember/frost round-47 smoke
+  beside anvil 155–157 / forge 196–199 edges. STAGE **71** / between() **93**
+  unchanged. Push/repin cohort still pending.
+
+
 Updated: 2026-09-29 (align tip after round-47 edges beside round-47 smoke)
 
 ## 2026-09-29 (align tip — round-47 edges beside round-47 smoke)
