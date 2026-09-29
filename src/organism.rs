@@ -601,6 +601,46 @@ const UNKNOWN_TO_GUARD_CAUTIOUS_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ?.o ) [? ]\n /|_|\\",
     " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
 ];
+// Error-hold clear-vigil settle: Unknown→Idle already animates; Inspect/SitNear
+// must not snap when the hold ends with no open repo vigil.
+const INSPECT_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\  --> \n( o_o )     \n /|_|\\",
+    " /\\_/\\  <-  \n( o_o )     \n /|_|\\",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+const SIT_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ._. )  !  \n /|_|\\",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+// Repo vigil clear: Celebrate/Unknown→Idle already animate; Guard* must not
+// snap when sibling sync clears the open vigil under an idle Guard pose.
+const FAILURE_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( o.o )     \n /|_|\\",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+const STUCK_TO_IDLE_FRAMES: [&str; 4] = [
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+    " =\\_/=      \n( ._. )     \n /|_|\\",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+const RECOVERY_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.o )     \n /|_|\\",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
+const CAUTIOUS_TO_IDLE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
+    " /\\_/\\      \n( ?.o )     \n /|_|\\",
+    " /\\_/\\      \n( -.- )     \n > ^ <",
+    " /\\_/\\      \n( -.- )     \n >~^ <",
+];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
 // motion snaps on the reverse of the already-bridged recovery/escalation graph.
@@ -810,6 +850,12 @@ pub enum VisualTransition {
     UnknownOutcomeToGuardStuck,
     UnknownOutcomeToGuardRecovery,
     UnknownOutcomeToGuardCautious,
+    InspectErrorToIdle,
+    SitNearErrorToIdle,
+    GuardFailureToIdle,
+    GuardStuckToIdle,
+    GuardRecoveryToIdle,
+    GuardCautiousToIdle,
 }
 
 impl VisualTransition {
@@ -969,6 +1015,12 @@ impl VisualTransition {
             (Behavior::UnknownOutcome, Behavior::GuardCautious) => {
                 Some(Self::UnknownOutcomeToGuardCautious)
             }
+            (Behavior::InspectError, Behavior::Idle) => Some(Self::InspectErrorToIdle),
+            (Behavior::SitNearError, Behavior::Idle) => Some(Self::SitNearErrorToIdle),
+            (Behavior::GuardFailure, Behavior::Idle) => Some(Self::GuardFailureToIdle),
+            (Behavior::GuardStuck, Behavior::Idle) => Some(Self::GuardStuckToIdle),
+            (Behavior::GuardRecovery, Behavior::Idle) => Some(Self::GuardRecoveryToIdle),
+            (Behavior::GuardCautious, Behavior::Idle) => Some(Self::GuardCautiousToIdle),
             _ => None,
         }
     }
@@ -980,21 +1032,25 @@ impl VisualTransition {
             | Self::InspectErrorToGuardCautious
             | Self::InspectErrorToGuardStuck
             | Self::InspectErrorToCelebrate
-            | Self::InspectErrorToCelebrateBig => Behavior::InspectError,
+            | Self::InspectErrorToCelebrateBig
+            | Self::InspectErrorToIdle => Behavior::InspectError,
             Self::SitNearErrorToGuardFailure
             | Self::SitNearErrorToGuardStuck
             | Self::SitNearErrorToGuardRecovery
             | Self::SitNearErrorToGuardCautious
             | Self::SitNearErrorToCelebrate
-            | Self::SitNearErrorToCelebrateBig => Behavior::SitNearError,
+            | Self::SitNearErrorToCelebrateBig
+            | Self::SitNearErrorToIdle => Behavior::SitNearError,
             Self::GuardFailureToGuardStuck
             | Self::GuardFailureToGuardRecovery
             | Self::GuardFailureToGuardCautious
-            | Self::GuardFailureToRestAfterPush => Behavior::GuardFailure,
+            | Self::GuardFailureToRestAfterPush
+            | Self::GuardFailureToIdle => Behavior::GuardFailure,
             Self::GuardStuckToGuardFailure
             | Self::GuardStuckToGuardRecovery
             | Self::GuardStuckToGuardCautious
-            | Self::GuardStuckToRestAfterPush => Behavior::GuardStuck,
+            | Self::GuardStuckToRestAfterPush
+            | Self::GuardStuckToIdle => Behavior::GuardStuck,
             Self::WatchSettledToCelebrate
             | Self::WatchSettledToCelebrateBig
             | Self::WatchSettledToInspectError
@@ -1024,11 +1080,13 @@ impl VisualTransition {
             Self::GuardRecoveryToGuardFailure
             | Self::GuardRecoveryToGuardStuck
             | Self::GuardRecoveryToGuardCautious
-            | Self::GuardRecoveryToRestAfterPush => Behavior::GuardRecovery,
+            | Self::GuardRecoveryToRestAfterPush
+            | Self::GuardRecoveryToIdle => Behavior::GuardRecovery,
             Self::GuardCautiousToGuardFailure
             | Self::GuardCautiousToGuardStuck
             | Self::GuardCautiousToGuardRecovery
-            | Self::GuardCautiousToRestAfterPush => Behavior::GuardCautious,
+            | Self::GuardCautiousToRestAfterPush
+            | Self::GuardCautiousToIdle => Behavior::GuardCautious,
             Self::RestAfterPushToIdle => Behavior::RestAfterPush,
             Self::UnknownOutcomeToIdle
             | Self::UnknownOutcomeToInspectError
@@ -1107,7 +1165,13 @@ impl VisualTransition {
             Self::CelebrateToIdle
             | Self::CelebrateBigToIdle
             | Self::RestAfterPushToIdle
-            | Self::UnknownOutcomeToIdle => Behavior::Idle,
+            | Self::UnknownOutcomeToIdle
+            | Self::InspectErrorToIdle
+            | Self::SitNearErrorToIdle
+            | Self::GuardFailureToIdle
+            | Self::GuardStuckToIdle
+            | Self::GuardRecoveryToIdle
+            | Self::GuardCautiousToIdle => Behavior::Idle,
         }
     }
 
@@ -1188,6 +1252,12 @@ impl VisualTransition {
             Self::UnknownOutcomeToGuardStuck => UNKNOWN_TO_GUARD_STUCK_FRAMES[index],
             Self::UnknownOutcomeToGuardRecovery => UNKNOWN_TO_GUARD_RECOVERY_FRAMES[index],
             Self::UnknownOutcomeToGuardCautious => UNKNOWN_TO_GUARD_CAUTIOUS_FRAMES[index],
+            Self::InspectErrorToIdle => INSPECT_TO_IDLE_FRAMES[index],
+            Self::SitNearErrorToIdle => SIT_TO_IDLE_FRAMES[index],
+            Self::GuardFailureToIdle => FAILURE_TO_IDLE_FRAMES[index],
+            Self::GuardStuckToIdle => STUCK_TO_IDLE_FRAMES[index],
+            Self::GuardRecoveryToIdle => RECOVERY_TO_IDLE_FRAMES[index],
+            Self::GuardCautiousToIdle => CAUTIOUS_TO_IDLE_FRAMES[index],
         }
     }
 }
@@ -4342,6 +4412,12 @@ mod tests {
             VisualTransition::UnknownOutcomeToGuardStuck,
             VisualTransition::UnknownOutcomeToGuardRecovery,
             VisualTransition::UnknownOutcomeToGuardCautious,
+            VisualTransition::InspectErrorToIdle,
+            VisualTransition::SitNearErrorToIdle,
+            VisualTransition::GuardFailureToIdle,
+            VisualTransition::GuardStuckToIdle,
+            VisualTransition::GuardRecoveryToIdle,
+            VisualTransition::GuardCautiousToIdle,
         ];
         for transition in transitions {
             assert_eq!(
@@ -4867,6 +4943,130 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::GlanceAside, Behavior::SitNearError),
             None
+        );
+    }
+
+    /// Non-build error holds settle to clear-vigil Idle the same way Unknown
+    /// already does. Without these arcs Full motion snaps on hold expiry.
+    #[test]
+    fn error_hold_clear_idle_settles_have_full_motion_bridges() {
+        let mut inspect_hold = NativeOrganism::default();
+        let inspect = inspect_hold.command_finished(CommandKind::Other, Some(1), None);
+        assert_eq!(inspect.behavior, Behavior::InspectError);
+        assert_eq!(inspect_hold.repo_vigil(), RepoVigil::None);
+        let idle = inspect_hold.idle_reaction();
+        assert_eq!(idle.behavior, Behavior::Idle);
+        assert_eq!(
+            VisualTransition::between(inspect.behavior, idle.behavior),
+            Some(VisualTransition::InspectErrorToIdle)
+        );
+
+        let mut sit_hold = NativeOrganism::default();
+        sit_hold.command_finished(CommandKind::Other, Some(1), None);
+        sit_hold.command_finished(CommandKind::Other, Some(1), None);
+        let sit = sit_hold.command_finished(CommandKind::Other, Some(1), None);
+        assert_eq!(sit.behavior, Behavior::SitNearError);
+        assert_eq!(sit_hold.repo_vigil(), RepoVigil::None);
+        let idle = sit_hold.idle_reaction();
+        assert_eq!(idle.behavior, Behavior::Idle);
+        assert_eq!(
+            VisualTransition::between(sit.behavior, idle.behavior),
+            Some(VisualTransition::SitNearErrorToIdle)
+        );
+    }
+
+    /// Repo vigil poses settle to Idle when sibling sync clears the open
+    /// vigil. Celebrate/Unknown→Idle already animate; Guard* must not snap.
+    #[test]
+    fn repo_vigil_clear_idle_settles_have_full_motion_bridges() {
+        for (from, expected) in [
+            (
+                Behavior::GuardFailure,
+                VisualTransition::GuardFailureToIdle,
+            ),
+            (Behavior::GuardStuck, VisualTransition::GuardStuckToIdle),
+            (
+                Behavior::GuardRecovery,
+                VisualTransition::GuardRecoveryToIdle,
+            ),
+            (
+                Behavior::GuardCautious,
+                VisualTransition::GuardCautiousToIdle,
+            ),
+        ] {
+            assert_eq!(
+                VisualTransition::between(from, Behavior::Idle),
+                Some(expected),
+                "{from:?}→Idle"
+            );
+        }
+
+        let mut cleared = NativeOrganism::default();
+        cleared.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(cleared.repo_vigil(), RepoVigil::Failure);
+        assert_eq!(cleared.idle_reaction().behavior, Behavior::GuardFailure);
+        assert!(cleared.sync_repo_work_state(RepoWorkState::new(0, false, 0)));
+        assert_eq!(cleared.repo_vigil(), RepoVigil::None);
+        assert_eq!(cleared.idle_reaction().behavior, Behavior::Idle);
+        assert_eq!(
+            VisualTransition::between(Behavior::GuardFailure, Behavior::Idle),
+            Some(VisualTransition::GuardFailureToIdle)
+        );
+    }
+
+    #[test]
+    fn visual_transition_between_recognizes_seventy_intentional_arcs() {
+        // Recount pin: UI contract lists (anvil/forge semantic_bridges) must
+        // stay in lockstep with this Some count (was 64 before clear-Idle).
+        let mut count = 0usize;
+        for from in [
+            Behavior::Idle,
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::Celebrate,
+            Behavior::CelebrateBig,
+            Behavior::RestAfterPush,
+            Behavior::UnknownOutcome,
+            Behavior::GlanceAside,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+            Behavior::Sleep,
+            Behavior::Explore,
+            Behavior::Approach,
+        ] {
+            for to in [
+                Behavior::Idle,
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::Celebrate,
+                Behavior::CelebrateBig,
+                Behavior::RestAfterPush,
+                Behavior::UnknownOutcome,
+                Behavior::GlanceAside,
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+                Behavior::Sleep,
+                Behavior::Explore,
+                Behavior::Approach,
+            ] {
+                if VisualTransition::between(from, to).is_some() {
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            count, 70,
+            "between() Some count drifted; sync UI contract lists"
         );
     }
 
