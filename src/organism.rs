@@ -2653,6 +2653,53 @@ pub fn classify_command(command: &str) -> CommandKind {
             "proxychains" | "proxychains3" | "proxychains4" => {
                 skip_wrapper_options(&mut tokens, &["-f"])
             }
+            "dbus-run-session" => {
+                skip_wrapper_options(&mut tokens, &["--dbus-daemon", "--config-file"])
+            }
+            "runcon" => {
+                // Option form (`-t TYPE CMD`) vs CONTEXT form (`CONTEXT CMD`).
+                // Only the latter has a positional meta operand to skip.
+                let option_form = tokens.peek().is_some_and(|token| token.starts_with('-'));
+                skip_wrapper_options(
+                    &mut tokens,
+                    &[
+                        "-u",
+                        "--user",
+                        "-r",
+                        "--role",
+                        "-t",
+                        "--type",
+                        "-l",
+                        "--range",
+                    ],
+                );
+                if !option_form {
+                    if let Some(context) = tokens.peek() {
+                        if !context.starts_with('-') {
+                            let mut lookahead = tokens.clone();
+                            lookahead.next();
+                            if lookahead.peek().is_some() {
+                                tokens.next();
+                            }
+                        }
+                    }
+                }
+            }
+            "xvfb-run" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-e",
+                    "--error-file",
+                    "-f",
+                    "--auth-file",
+                    "-n",
+                    "--server-num",
+                    "-p",
+                    "--xauth-protocol",
+                    "-s",
+                    "--server-args",
+                ],
+            ),
             _ => break,
         }
         program = tokens.next().unwrap_or_default();
@@ -2896,6 +2943,16 @@ mod tests {
             "proxychains4 -q cargo check",
             "proxychains3 -f /etc/proxychains.conf cargo nextest run",
             "torsocks proxychains4 -q cargo test",
+            "dbus-run-session cargo test",
+            "dbus-run-session -- cargo check",
+            "dbus-run-session --config-file=/tmp/session.conf cargo nextest run",
+            "runcon unconfined_t cargo test",
+            "runcon -t unconfined_t cargo check",
+            "runcon --type=unconfined_t -- cargo nextest run",
+            "xvfb-run cargo test",
+            "xvfb-run -a cargo check",
+            "xvfb-run --auto-servernum -- cargo nextest run",
+            "dbus-run-session runcon unconfined_t xvfb-run -a cargo test",
         ] {
             assert_eq!(
                 classify_command(command),
