@@ -2,6 +2,12 @@
 
 Updated: 2026-09-29 (wave A: xargs -d/--delimiter arity; jagent `628811b`)
 
+## 2026-09-29 (wave C): jsh-remote provenance header refresh
+
+Vendored `scripts/jsh-remote.sh` body was already byte-identical to jsh; the
+provenance header now names the real tip commit `fd60561` (was stale
+`348b9a0`). `install-jsh.sh` remains on `b6928e5` with an identical body.
+
 ## 2026-09-29 (wave A): xargs delimiter option arity
 
 `xargs -d` / `--delimiter` join the detached-value table so
