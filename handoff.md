@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 35 probe: PATH host/hw inventory leftovers)
+
+## 2026-09-29 (wave 35 probe — PATH host/hw inventory leftovers)
+
+- **PATH probe** — host/hw inventory managers (`lsusb` / `lspci` / `lscpu` /
+  `lsmem` / `lsipc` / `lslocks` / `lslogins` / `dmidecode`) stay out of
+  `STAGE_PREFIXES` until taught fail-closed. Lockstep with jagent
+  `path_probe_host_inventory_leftovers_do_not_invent_a_child_peel`.
+  CLASSIFY/DISPATCHES remain **71**. **Pending push**.
+
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 183/230 final align)
 
 ## 2026-09-29 (point pending tip — rounds 183/230 final align)
