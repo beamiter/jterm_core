@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 187/235 + round-53)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 187/235)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  sticky FE07/FE06/MAX-6/GuardRecovery→Unknown beside anvil 184–187 / forge
+  231–235 and ember/frost round-53 smoke (wave-35 chrt/ionice deepen sits
+  under; no further peel this wave). GuardRecovery→Unknown remains inside
+  between() 93 (no semantic_bridges len bump).
+
 Updated: 2026-09-29 (pending tip — sticky FE07/FE06/MAX-6 + round-53 beside wave-35)
 
 ## 2026-09-29 (pending tip — sticky FE07/FE06/MAX-6 + round-53)
