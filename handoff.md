@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (bwrap two-arg stage option arity)
+Updated: 2026-09-29 (eatmydata/chronic/numactl/flock STAGE_PREFIXES)
+
+## 2026-09-29 (wave): eatmydata/chronic/numactl/flock STAGE_PREFIXES
+
+Paired with jagent `bde9376` (pending push/repin): these four join
+[`STAGE_PREFIXES`]. `flock` skips a lock-file positional; `numactl` consumes
+bind/mem policy meta. Pipe regressions cover `| flock FILE sh` /
+`| numactl --cpunodebind=0 sh` / `| eatmydata sh` / `| chronic -e sh`.
 
 ## 2026-09-29 (wave): bwrap STAGE_PREFIXES with two-arg bind arity
 

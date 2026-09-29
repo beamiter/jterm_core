@@ -1201,15 +1201,19 @@ const STAGE_PREFIXES: &[&str] = &[
     "choom",
     "chroot",
     "chrt",
+    "chronic",
     "command",
     "doas",
     "dumb-init",
+    "eatmydata",
     "env",
     "exec",
+    "flock",
     "gosu",
     "ionice",
     "nice",
     "nohup",
+    "numactl",
     "pkexec",
     "prlimit",
     "run0",
@@ -1361,7 +1365,8 @@ fn stage_interpreter(stage: &str) -> Option<String> {
             continue;
         }
         if (active_prefix.is_some_and(prefix_takes_positional_user)
-            || active_prefix.is_some_and(prefix_takes_positional_newroot))
+            || active_prefix.is_some_and(prefix_takes_positional_newroot)
+            || active_prefix.is_some_and(prefix_takes_positional_lockfile))
             && !PIPE_INTERPRETERS.contains(&name.as_str())
             && index + 1 < words.len()
         {
@@ -1390,6 +1395,12 @@ fn prefix_takes_positional_user(prefix: &str) -> bool {
 /// program to run (`chroot NEWROOT CMD`).
 fn prefix_takes_positional_newroot(prefix: &str) -> bool {
     prefix == "chroot"
+}
+
+/// Dispatchers whose first non-option operand is a lock file/path, not the
+/// program (`flock FILE CMD`).
+fn prefix_takes_positional_lockfile(prefix: &str) -> bool {
+    prefix == "flock"
 }
 
 /// Dispatchers whose first non-option operand names how to run the next word,
@@ -1561,6 +1572,31 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
             "-p" | "--kill-after" | "-g" | "--group-add" | "-e" | "--env"
         ) as usize,
         "watch" => matches!(option, "-n" | "--interval" | "-q" | "--equexit") as usize,
+        "eatmydata" => 0,
+        "chronic" => 0,
+        "numactl" => {
+            if matches!(
+                option,
+                "-i" | "--interleave"
+                    | "-N"
+                    | "--cpunodebind"
+                    | "-C"
+                    | "--physcpubind"
+                    | "-m"
+                    | "--membind"
+                    | "-p"
+                    | "--preferred"
+            ) {
+                1
+            } else {
+                0
+            }
+        }
+        // `-c` / `--command` leave the shell string visible; only meta values.
+        "flock" => matches!(
+            option,
+            "-w" | "--timeout" | "-E" | "--conflict-exit-code"
+        ) as usize,
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
         // listed separately. Flag-only forms return 0.
         "bwrap" => {
@@ -1709,12 +1745,13 @@ fn stage_programs(command: &str) -> HashSet<String> {
                         continue;
                     }
                     if (active_prefix.is_some_and(prefix_takes_positional_user)
-                        || active_prefix.is_some_and(prefix_takes_positional_newroot))
+                        || active_prefix.is_some_and(prefix_takes_positional_newroot)
+                        || active_prefix.is_some_and(prefix_takes_positional_lockfile))
                         && !STAGE_PREFIXES.contains(&name.as_str())
                         && !PIPE_INTERPRETERS.contains(&name.as_str())
                         && index + 1 < words.len()
                     {
-                        // Positional USER/NEWROOT before CMD — not a program.
+                        // Positional USER/NEWROOT/FILE before CMD — not a program.
                         index += 1;
                         active_prefix = None;
                         if separator_after {
@@ -3237,15 +3274,19 @@ mod tests {
             ("choom", "choom -n 1000 rm -rf /"),
             ("chroot", "chroot / rm -rf /"),
             ("chrt", "chrt 1 rm -rf /"),
+            ("chronic", "chronic rm -rf /"),
             ("command", "command rm -rf /"),
             ("doas", "doas rm -rf /"),
             ("dumb-init", "dumb-init -- rm -rf /"),
+            ("eatmydata", "eatmydata -- rm -rf /"),
             ("env", "env FOO=1 rm -rf /"),
             ("exec", "exec rm -rf /"),
+            ("flock", "flock /tmp/lock rm -rf /"),
             ("gosu", "gosu root rm -rf /"),
             ("ionice", "ionice -c3 rm -rf /"),
             ("nice", "nice -n 5 rm -rf /"),
             ("nohup", "nohup rm -rf /"),
+            ("numactl", "numactl --cpunodebind=0 rm -rf /"),
             ("pkexec", "pkexec rm -rf /"),
             ("prlimit", "prlimit --nofile=1024 rm -rf /"),
             ("run0", "run0 rm -rf /"),
@@ -3680,6 +3721,31 @@ mod tests {
             stage_interpreter("watch -n 1 --exec sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(
+            stage_interpreter("bwrap --ro-bind / / sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("bwrap --setenv FOO bar sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("numactl --cpunodebind 0 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("flock /tmp/lock sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("flock -w 1 /tmp/lock bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("eatmydata -- sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("chronic -e bash").as_deref(),
+            Some("bash")
+        );
         for candidate in [
             "ls -l | setpriv --reuid 0 sh",
             "ls -l | choom -n 1000 sh",
@@ -3689,6 +3755,10 @@ mod tests {
             "ls -l | watch -n 1 --exec sh",
             "ls -l | bwrap --ro-bind / / sh",
             "ls -l | bwrap --dev /dev --uid 0 sh",
+            "ls -l | numactl --cpunodebind=0 sh",
+            "ls -l | flock /tmp/lock sh",
+            "ls -l | eatmydata sh",
+            "ls -l | chronic -e sh",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
@@ -3696,14 +3766,6 @@ mod tests {
                 "{candidate}"
             );
         }
-        assert_eq!(
-            stage_interpreter("bwrap --ro-bind / / sh").as_deref(),
-            Some("sh")
-        );
-        assert_eq!(
-            stage_interpreter("bwrap --setenv FOO bar sh").as_deref(),
-            Some("sh")
-        );
         // And network provenance is jagent's question, not this scan's, so the
         // pipeline that actually matters is still refused.
         assert_eq!(
