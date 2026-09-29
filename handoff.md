@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 164/207 + round-48)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 164/207)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  anvil `f40fa66` 161–164 / forge `7302823` 203–207 sticky/find/Watch*/cancel
+  and ember `b651a6e` / frost `73064ed` round-48 smoke. No STAGE peel this wave.
+
+
 Updated: 2026-09-29 (pending tip — rounds 161–164 / 203–207 + round-48 smoke)
 
 ## 2026-09-29 (pending tip — sticky/find/Watch* + round-48 smoke)
