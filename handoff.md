@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (align tip after wave-38 / round-60 smoke)
+
+## 2026-09-30 (align tip — wave-38 leftovers/deepen + round-60)
+
+- Local HEAD path-patch-only after wave-38 process-table monitor leftovers +
+  softlimit/cgexec help fail-closed deepen beside jagent `08fd56d` and
+  ember/frost round-60 smoke. STAGE **71** / between() **93** held.
+
+
 Updated: 2026-09-30 (pending tip beside wave-38 deepen)
 
 ## 2026-09-30 (pending tip — wave-38 deepen)
