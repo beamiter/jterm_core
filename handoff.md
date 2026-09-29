@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave: xargs --process-slot-var / -J arity)
+Updated: 2026-09-29 (wave: shared output_notice + xargs slot-var arity)
+
+## 2026-09-29 (wave): shared finished-block output_notice
+
+New [`output_notice`] module owns the family's finished-card loss strings
+(`Earlier output not retained` / truncated / partly retained), known-set parse,
+and tooltips. Anvil keeps a bool on disk; forge keeps `Option<String>`; both
+display through this contract. Unit regression rejects forged history text.
 
 ## 2026-09-29 (wave): xargs process-slot-var and BSD -J arity
 

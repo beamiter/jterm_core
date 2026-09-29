@@ -34,6 +34,7 @@ pub mod notify;
 pub mod organism;
 pub mod organism_attention;
 pub mod organism_memory;
+pub mod output_notice;
 pub mod pane_layout;
 pub mod parser;
 pub mod process;
