@@ -3716,6 +3716,13 @@ mod tests {
             "runsv",
             "runsvdir",
             "sv",
+            // Wave-26 PATH leftovers: process matchers / MIME openers, not
+            // peelable child-argv launchers (jagent pin
+            // `path_probe_non_launcher_leftovers_do_not_invent_a_child_peel`).
+            "snice",
+            "skill",
+            "run-mailcap",
+            "xdg-open",
         ] {
             assert!(
                 !prefixes.contains(&name),
