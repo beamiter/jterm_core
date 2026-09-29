@@ -425,6 +425,20 @@ const SIT_TO_CELEBRATE_BIG_FRAMES: [&str; 4] = [
     "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
     "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
 ];
+// Celebrate hold still showing when a push lands: Recovery/Cautious/Failure/
+// Stuck→Rest already animate; Celebrate must not snap to RestAfterPush.
+const CELEBRATE_TO_REST_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n ( ^.^ )    \n  > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+];
+const CELEBRATE_BIG_TO_REST_FRAMES: [&str; 4] = [
+    "* /\\_/\\ *   \n<( ^o^ )>   \n* > ^ < *",
+    "  /\\_/\\     \n<( ^.^ )>   \n  > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n > ^ <",
+    " /\\_/\\      \n( ^.^ ) [ok]\n >~^ <",
+];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
 // motion snaps on the reverse of the already-bridged recovery/escalation graph.
@@ -608,6 +622,8 @@ pub enum VisualTransition {
     InspectErrorToCelebrateBig,
     SitNearErrorToCelebrate,
     SitNearErrorToCelebrateBig,
+    CelebrateToRestAfterPush,
+    CelebrateBigToRestAfterPush,
 }
 
 impl VisualTransition {
@@ -705,6 +721,12 @@ impl VisualTransition {
             (Behavior::SitNearError, Behavior::CelebrateBig) => {
                 Some(Self::SitNearErrorToCelebrateBig)
             }
+            (Behavior::Celebrate, Behavior::RestAfterPush) => {
+                Some(Self::CelebrateToRestAfterPush)
+            }
+            (Behavior::CelebrateBig, Behavior::RestAfterPush) => {
+                Some(Self::CelebrateBigToRestAfterPush)
+            }
             _ => None,
         }
     }
@@ -737,11 +759,13 @@ impl VisualTransition {
             Self::CelebrateToGuardRecovery
             | Self::CelebrateToGuardCautious
             | Self::CelebrateToGuardFailure
-            | Self::CelebrateToGuardStuck => Behavior::Celebrate,
+            | Self::CelebrateToGuardStuck
+            | Self::CelebrateToRestAfterPush => Behavior::Celebrate,
             Self::CelebrateBigToGuardRecovery
             | Self::CelebrateBigToGuardCautious
             | Self::CelebrateBigToGuardFailure
-            | Self::CelebrateBigToGuardStuck => Behavior::CelebrateBig,
+            | Self::CelebrateBigToGuardStuck
+            | Self::CelebrateBigToRestAfterPush => Behavior::CelebrateBig,
             Self::GuardRecoveryToGuardFailure
             | Self::GuardRecoveryToGuardStuck
             | Self::GuardRecoveryToGuardCautious
@@ -792,7 +816,9 @@ impl VisualTransition {
             Self::GuardRecoveryToRestAfterPush
             | Self::GuardCautiousToRestAfterPush
             | Self::GuardFailureToRestAfterPush
-            | Self::GuardStuckToRestAfterPush => Behavior::RestAfterPush,
+            | Self::GuardStuckToRestAfterPush
+            | Self::CelebrateToRestAfterPush
+            | Self::CelebrateBigToRestAfterPush => Behavior::RestAfterPush,
         }
     }
 
@@ -847,6 +873,8 @@ impl VisualTransition {
             Self::InspectErrorToCelebrateBig => INSPECT_TO_CELEBRATE_BIG_FRAMES[index],
             Self::SitNearErrorToCelebrate => SIT_TO_CELEBRATE_FRAMES[index],
             Self::SitNearErrorToCelebrateBig => SIT_TO_CELEBRATE_BIG_FRAMES[index],
+            Self::CelebrateToRestAfterPush => CELEBRATE_TO_REST_FRAMES[index],
+            Self::CelebrateBigToRestAfterPush => CELEBRATE_BIG_TO_REST_FRAMES[index],
         }
     }
 }
@@ -3180,6 +3208,8 @@ mod tests {
             VisualTransition::InspectErrorToCelebrateBig,
             VisualTransition::SitNearErrorToCelebrate,
             VisualTransition::SitNearErrorToCelebrateBig,
+            VisualTransition::CelebrateToRestAfterPush,
+            VisualTransition::CelebrateBigToRestAfterPush,
         ];
         for transition in transitions {
             assert_eq!(
@@ -3356,6 +3386,24 @@ mod tests {
         assert_eq!(
             VisualTransition::between(Behavior::SitNearError, Behavior::CelebrateBig),
             Some(VisualTransition::SitNearErrorToCelebrateBig)
+        );
+    }
+
+    #[test]
+    fn celebrate_hold_push_has_full_motion_bridges() {
+        let mut organism = NativeOrganism::default();
+        organism.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        let cele = organism.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(cele.behavior, Behavior::Celebrate);
+        let push = organism.command_finished(CommandKind::GitPush, Some(0), None);
+        assert_eq!(push.behavior, Behavior::RestAfterPush);
+        assert_eq!(
+            VisualTransition::between(cele.behavior, push.behavior),
+            Some(VisualTransition::CelebrateToRestAfterPush)
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::RestAfterPush),
+            Some(VisualTransition::CelebrateBigToRestAfterPush)
         );
     }
 

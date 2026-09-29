@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (util-linux/container-init stage prefixes + push/celebrate bridges)
+Updated: 2026-09-29 (organism: celebrate-hold push bridges)
+
+## 2026-09-29 (organism evolve): celebrate-hold push continuity
+
+Celebrate/CelebrateBig→RestAfterPush Full-motion bridges so a push during the
+celebrate hold does not snap. `celebrate_hold_push_has_full_motion_bridges`
+drives Celebrate + GitPush → RestAfterPush. Left open: `bwrap` still needs
+two-arg bind arity before it can join STAGE_PREFIXES safely.
 
 ## 2026-09-29 (wave): util-linux and container-init STAGE_PREFIXES
 
