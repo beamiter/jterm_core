@@ -1,13 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (pending tip — anvil/forge sticky/find/notice + round-41)
+Updated: 2026-09-29 (wave): Watch*→ambient None + WatchSettled finish inside 93
 
-## 2026-09-29 (pending tip — UI edges + round-41 smoke)
+## 2026-09-29 (wave): Watch*→ambient utility None (landed)
 
-- Local HEAD `786f924` still path-patch-only (wave-30 leftovers + WatchSettled
-  finish + CrossBlock wrap; STAGE **71** / between() **93**). Anvil/forge
-  `82450d0`/`96f7bb1` rounds 131–132 / 167–169 and ember-frost round-41 smoke
-  sit beside. **Pending push/repin** with jagent/jsh.
+`watch_poses_never_bridge_to_ambient_utility` pins WatchCommand/Agent/Settled
+→Explore/Sleep/Approach intentional None. WatchSettled finish six Somes stay
+inside between() **93**; UI `semantic_bridges` already named them. Local HEAD
+`8957dbb`. Anvil/forge Hangul/whitespace/Watch* Full-motion rounds 133–136 /
+170–174 sit beside. **Pending push/repin**.
 
 
 Updated: 2026-09-29 (wave): WatchSettled finish inside 93 + Watch*→ambient None
