@@ -5312,6 +5312,31 @@ mod tests {
         }
     }
 
+    /// Failure/Stuck/Cautious vigil still showing when a finish lands: Recovery
+    /// animates those overwrites, but the other three vigil poses have no
+    /// Inspect/Sit/Unknown story. Pin `None` so they cannot appear beside
+    /// GuardRecovery→Inspect.
+    #[test]
+    fn failure_stuck_cautious_never_bridge_to_error_or_unknown_holds() {
+        for from in [
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardCautious,
+        ] {
+            for to in [
+                Behavior::InspectError,
+                Behavior::SitNearError,
+                Behavior::UnknownOutcome,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
     /// GlanceAside is a live presence cue, not a reducer Behavior source.
     /// Pin the common overwrite targets so a bridge cannot land silently.
     #[test]
