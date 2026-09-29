@@ -107,4 +107,55 @@ mod tests {
         assert_eq!(known_output_notice(""), None);
         assert_eq!(output_notice_tooltip(""), None);
     }
+
+    /// Known-set restore must stay exact: padded / cased / truncated near-miss
+    /// strings cannot resurrect a finished-card notice from hostile or drifted
+    /// history bytes.
+    #[test]
+    fn known_set_rejects_near_miss_and_whitespace_padded_notice_strings() {
+        for base in [
+            EARLIER_OUTPUT_NOT_RETAINED,
+            OUTPUT_TEXT_TRUNCATED,
+            OUTPUT_PARTLY_RETAINED,
+        ] {
+            for candidate in [
+                format!(" {base}"),
+                format!("{base} "),
+                format!("\t{base}"),
+                format!("{base}\n"),
+                base.to_ascii_uppercase(),
+                base[..base.len().saturating_sub(1)].to_string(),
+                format!("{base}!"),
+            ] {
+                assert_eq!(
+                    FinishedOutputNotice::parse(&candidate),
+                    None,
+                    "near-miss {candidate:?} must stay outside the known set"
+                );
+                assert_eq!(known_output_notice(&candidate), None);
+                assert_eq!(output_notice_tooltip(&candidate), None);
+            }
+        }
+    }
+
+    /// The three family notices must keep distinct display strings and
+    /// tooltips so Truncated cannot silently render as Earlier (or share a
+    /// tooltip) after a restore-gate round-trip.
+    #[test]
+    fn family_notice_strings_and_tooltips_stay_pairwise_distinct() {
+        let variants = [
+            FinishedOutputNotice::EarlierNotRetained,
+            FinishedOutputNotice::TextTruncated,
+            FinishedOutputNotice::PartlyRetained,
+        ];
+        assert_eq!(variants.len(), 3, "finished-card known set is exactly three notices");
+        let mut texts: Vec<&str> = variants.iter().map(|n| n.as_str()).collect();
+        let mut tips: Vec<&str> = variants.iter().map(|n| n.tooltip()).collect();
+        texts.sort_unstable();
+        tips.sort_unstable();
+        texts.dedup();
+        tips.dedup();
+        assert_eq!(texts.len(), 3);
+        assert_eq!(tips.len(), 3);
+    }
 }
