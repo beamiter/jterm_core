@@ -4,6 +4,14 @@ Updated: 2026-09-29 (point pending tip at HEAD after wave-34 final align)
 
 ## 2026-09-29 (point pending tip at HEAD after wave-34 final align)
 
+- Pending tip note remains current at HEAD `99437d4` after STAGE 71 hold
+  beside wave-34 leftovers/deepen final align.
+
+
+Updated: 2026-09-29 (point pending tip at HEAD after wave-34 final align)
+
+## 2026-09-29 (point pending tip at HEAD after wave-34 final align)
+
 - Pending tip note remains current at HEAD `4d84468` after STAGE 71 hold
   beside wave-34 leftovers/deepen final align.
 
