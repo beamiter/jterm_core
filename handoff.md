@@ -4,7 +4,7 @@ Updated: 2026-09-29 (point pending tip at HEAD after wave-35 / round-54 final al
 
 ## 2026-09-29 (point pending tip — wave-35 / round-54 final align)
 
-- Pending tip note remains current at HEAD `8268d7a` after STAGE 71 hold
+- Pending tip note remains current at HEAD `db41aef` after STAGE 71 hold
   beside wave-35 chrt/ionice deepen and round-54 smoke.
 
 
