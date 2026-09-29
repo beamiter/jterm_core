@@ -1,5 +1,24 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after round-47 edges beside round-47 smoke)
+
+## 2026-09-29 (align tip — round-47 edges beside round-47 smoke)
+
+- Local HEAD still path-patch-only. Anvil `042fe04` rounds 155–157 / forge
+  `29fc73d` 196–199 sticky VS/FVS4 + find marks + GlanceAside ambient and
+  ember `13bb735` / frost `7f3b327` round-47 smoke sit beside prior tip cohort.
+  STAGE **71** / between() **93** unchanged. Push/repin still pending.
+
+
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through round-47)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through round-47)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  anvil 155–157 / forge 196–199 sticky VS/FVS4 + find marks + GlanceAside
+  ambient and ember/frost round-47 smoke. No STAGE peel this wave.
+
+
 Updated: 2026-09-29 (align tip after round-45 edges beside round-46 cohort)
 
 ## 2026-09-29 (align tip — round-45 edges beside round-46 cohort)
