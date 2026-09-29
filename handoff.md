@@ -1,10 +1,10 @@
 # Engineering handoff
 
-Updated: 2026-09-30 (align tip note self-hash after rounds 199/250)
+Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / wave-37 final)
 
 ## 2026-09-30 (point pending tip — rounds 199/250)
 
-- Pending tip note remains current at HEAD  after STAGE 71 hold
+- Pending tip note remains current at HEAD `877ae5d` after STAGE 71 hold
   beside sticky 1803/1802/MAX-9/Unknown→GuardCautious.
 
 Updated: 2026-09-30 (pending tip through sticky 1803/1802/MAX-9 pins)
