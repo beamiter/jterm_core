@@ -1,5 +1,20 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): clear-vigil Idle VisualTransition bridges (70)
+
+Survey of organism.rs snap comments: error-hold and Guard* clear-vigil
+settles still snapped while Unknown/Celebrate→Idle already animated. Added
+InspectError/SitNearError→Idle and GuardFailure/Stuck/Recovery/Cautious→Idle
+(64→**70** `between` Some arcs). Pin
+`visual_transition_between_recognizes_seventy_intentional_arcs` so anvil/forge
+semantic_bridges stay in lockstep. Nested `strace timeout rm` classify depth
+and systemd-cat/inhibit STAGE arity edges (`--list` terminal, detached
+priority/who/mode/no-pager) landed earlier on this tip. Core tip still
+**pending push/repin**.
+
+Updated: 2026-09-29 (wave): clear-vigil Idle VisualTransition bridges (70)
+
+
 ## 2026-09-29 (wave): systemd-socket-activate STAGE_PREFIXES
 
 Added `/usr/bin` launcher jagent wave 22 now strips. STAGE_PREFIXES len 63 →
