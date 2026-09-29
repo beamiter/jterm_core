@@ -1,5 +1,41 @@
 # Engineering handoff
 
+## 2026-09-29 (wave): systemd-cat / aa-exec STAGE_PREFIXES
+
+Added two `/usr/bin` launchers jagent wave 20 now strips. STAGE_PREFIXES
+len 60 → **62**. `systemd-cat` peels identifier/priority meta; bare /
+options-only forms stay childless (stdin→journal filter). `aa-exec` peels
+profile/namespace meta. Pipe regressions + DISPATCHES forms pin parity with
+path-patched jagent. `path_probe_leftovers_stay_out_of_stage_prefixes` pins
+intentional outs (`logger` / `setns` / `cgroupfs-mount` / `scriptreplay` /
+`run-parts` / `jexec`; `script` stays PIPE; `capsh` stays STAGE). Core/jagent
+tips still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): systemd-cat / aa-exec STAGE_PREFIXES
+
+## 2026-09-29 (wave): classify_command systemd-cat / aa-exec / bwrap
+
+`classify_command` now steps through `systemd-cat` / `aa-exec` and closes the
+parity gap for `bwrap` / `bubblewrap` (two-arg bind/setenv peel) so
+`bwrap --ro-bind / / -- cargo test` stays `BuildOrTest`. Recent jagent stage
+strips covered: strace, scriptlive, dbus-run-session, runcon, xvfb-run,
+bubblewrap.
+
+## 2026-09-29 (wave): Guard*/Watch*/Celebrate*/Glance Aside None pins
+
+Audit of intentional-None `VisualTransition::between` arcs that lacked pin
+tests. New regressions:
+
+- `WatchSettled→UnknownOutcome` (long-watch missing exit snaps; pairs
+  WatchCommand/WatchAgent UnknownOutcome pins)
+- `Watch*→Guard*` (finishes never skip into repo vigil)
+- `Guard*→Celebrate*` (vigil does not celebrate)
+- `Celebrate*→Watch*` (new command mid-hold snaps)
+- `Idle`/`RestAfterPush`→`Guard*` (open vigil appearing snaps)
+- `GlanceAside` as transition **target** (live cue only; source already pinned)
+
+Updated: 2026-09-29 (wave): Guard*/Watch*/Celebrate*/Glance Aside None pins
+
 ## 2026-09-29 (wave): FindScanBudget + Options/Scope + generic Report
 
 Lifted identical anvil/forge find types into [`cross_block_search`]:
@@ -41,6 +77,8 @@ absent. `perf` / `gdb` on PATH but complex CLIs (subcommand / inferior
 grammar) — **not** STAGE_PREFIXES; prefer fail-closed / jagent-only if ever
 taught (do not STAGE valgrind/gdb). `strace` / `scriptlive` closed in the
 STAGE 60 wave above. `run-parts` stays out (directory runner).
+`systemd-cat` / `aa-exec` closed in the STAGE 62 wave above; `logger` /
+`setns` / `cgroupfs-mount` remain intentional outs (pin test).
 
 ## 2026-09-29 (wave): WatchCommand→UnknownOutcome + GlanceAside None pins
 
