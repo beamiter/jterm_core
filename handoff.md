@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): PATH leftover non-STAGE pin beside STAGE 70
+
+## 2026-09-29 (wave): PATH probe leftovers stay out of STAGE (len 70)
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-26 `snice` /
+`skill` / `run-mailcap` / `xdg-open` as intentional non-STAGE (process
+matchers / MIME openers, not peelable child-argv launchers). Membership pin
+still asserts `len == 70`. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): Inspect→SitNear bridge + vigil→Watch None (91)
 
 ## 2026-09-29 (wave): InspectError→SitNearError VisualTransition (91)
