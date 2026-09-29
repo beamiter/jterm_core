@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after wave-34 deepen)
+
+## 2026-09-29 (point pending tip at HEAD after wave-34 deepen)
+
+- Pending tip note remains current at HEAD `1406fe6` after STAGE 71 hold
+  beside wave-34 leftovers + taskset/choom/prlimit deepen.
+
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through wave-34)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through wave-34)
