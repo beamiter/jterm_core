@@ -1,5 +1,23 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 195/245)
+
+## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 set-eq held through rounds 195/245)
+
+- CLASSIFY/DISPATCHES STAGE **71** set-eq and between() **93** held through
+  sticky 1802/1801 find/MAX-8/Unknown→GuardRecovery beside anvil 192–195 /
+  forge 241–245 (wave-36 numactl/schedtool deepen sits under; no further peel
+  this edge wave). Unknown↔GuardRecovery remains inside between() 93 (no
+  semantic_bridges len bump).
+
+Updated: 2026-09-29 (pending tip through sticky 1802/1801/MAX-8 pins)
+
+## 2026-09-29 (pending tip — sticky 1802/1801/MAX-8 + rounds 195/245)
+
+- Local HEAD path-patch-only after CrossBlock MAX-8→MAX-7 cancel pin beside
+  anvil/forge sticky Mongolian comma + 1801/ellipsis find + Unknown→GuardRecovery
+  Full-motion bridge. STAGE **71** / between() **93** held.
+
 Updated: 2026-09-29 (point pending tip at HEAD after wave-36 / round-57 final align)
 
 ## 2026-09-29 (point pending tip — wave-36 / round-57 final align)
