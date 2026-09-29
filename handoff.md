@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): gnome-session-inhibit STAGE arity edges
+
+## 2026-09-29 (wave): gnome-session-inhibit STAGE arity edges
+
+`gnome_session_inhibit_stage_arity_edges` pins detached/attached
+`--app-id`/`--reason`/`--inhibit` meta, missing-value fail-closed, and
+terminal `-l`/`-h`/`--version`/`--inhibit-only` (jagent parity). Pairs the
+existing pipe regression. **Pending push/repin**.
+
 Updated: 2026-09-29 (wave): STAGE 70 — uclampset / gamemoderun
 
 ## 2026-09-29 (wave): uclampset / gamemoderun STAGE_PREFIXES
