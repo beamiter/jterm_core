@@ -1,5 +1,26 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): setsid busybox deepen + STAGE 71 held
+
+## 2026-09-29 (wave): setsid STAGE arity / pipe deepen
+
+`setsid_stage_arity_edges` peels `busybox` applet carriers to sh/bash;
+help/version under busybox stay fail-closed (`prefix_option_clears_child`).
+Pipe regressions cover `| busybox setsid bash` / `| busybox setsid -fw -- bash`.
+
+## 2026-09-29 (wave): classify peels timeout/nice around setsid
+
+Mirror openvt/aa-exec nest pin: `timeout`/`nice` outside and inside `setsid`
+still classify the cargo child. STAGE membership stays **71**.
+
+## 2026-09-29 (wave): CLASSIFY/DISPATCHES STAGE 71 lockstep held through wave-33
+
+Wave-33 PATH leftovers stay out of STAGE; thin `setsid` STAGE peel deepens
+without graduating new names. Audit pins still assert DISPATCHES /
+CLASSIFY_FORMS set equality with STAGE_PREFIXES at **len == 71**.
+**Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): PATH wave-33 device/sysctl leftovers beside STAGE 71
 
 ## 2026-09-29 (wave): PATH probe wave-33 device/sysctl leftovers stay out
