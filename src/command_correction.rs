@@ -1196,6 +1196,7 @@ const PIPE_INTERPRETERS: &[&str] = &[
 /// whole candidate for network provenance, and introducing any of the nine
 /// elevation programs remains a hard refusal above.
 const STAGE_PREFIXES: &[&str] = &[
+    "annotate-output",
     "bwrap",
     "capsh",
     "cgexec",
@@ -1345,6 +1346,10 @@ fn stage_interpreter(stage: &str) -> Option<String> {
             index += 1;
             continue;
         }
+        if active_prefix.is_some_and(|prefix| prefix_skips_plus_format_token(prefix, word)) {
+            index += 1;
+            continue;
+        }
         let name = stage_word_name(word);
         // `busybox` alone is a deliberate widening over jagent (see
         // PIPE_INTERPRETERS). With an applet argv it is a multiplexer: skip it
@@ -1424,6 +1429,12 @@ fn prefix_takes_positional_lockfile(prefix: &str) -> bool {
 /// not the program itself (`setarch x86_64 CMD`, `taskset ff CMD`).
 fn prefix_takes_positional_dispatch_operand(prefix: &str) -> bool {
     matches!(prefix, "setarch" | "taskset")
+}
+
+/// `annotate-output` optionally takes a `+FORMAT` date stamp before PROGRAM.
+/// It is not a dashed option and must not be mistaken for the child.
+fn prefix_skips_plus_format_token(prefix: &str, word: &str) -> bool {
+    prefix == "annotate-output" && word.starts_with('+')
 }
 
 /// Whether later words still contain a program candidate (not an option,
@@ -1591,6 +1602,9 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         "watch" => matches!(option, "-n" | "--interval" | "-q" | "--equexit") as usize,
         "eatmydata" => 0,
         "chronic" => 0,
+        // Optional `+FORMAT` is a leading `+…` token (not a dashed option);
+        // `-h`/`--help` never reach arity because the stage stops earlier.
+        "annotate-output" => 0,
         "numactl" => {
             if matches!(
                 option,
@@ -1829,6 +1843,11 @@ fn stage_programs(command: &str) -> HashSet<String> {
                 if !is_assignment_word(word)
                     && !word.chars().all(|character| character.is_ascii_digit())
                 {
+                    if active_prefix.is_some_and(|prefix| prefix_skips_plus_format_token(prefix, word))
+                    {
+                        index += 1;
+                        continue;
+                    }
                     let name = stage_word_name(word);
                     if active_prefix.is_some_and(prefix_takes_positional_dispatch_operand)
                         && !dispatch_operand_skipped
@@ -3364,6 +3383,7 @@ mod tests {
         // `timeout` a duration, `capsh` a `--` — so probing `<prefix> rm` alone
         // would report a gap that is really just an invalid command line.
         const DISPATCHES: &[(&str, &str)] = &[
+            ("annotate-output", "annotate-output +%H:%M:%S rm -rf /"),
             ("bwrap", "bwrap --ro-bind / / -- rm -rf /"),
             ("capsh", "capsh -- -c 'rm -rf /'"),
             ("cgexec", "cgexec -g cpu:group1 rm -rf /"),
