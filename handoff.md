@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): CROSS_BLOCK_* vs FIND_OVERLAY_* constructor split
+Updated: 2026-09-29 (wave): STAGE_PREFIXES len == 58 (dbus-run-session/runcon/xvfb-run)
+
+## 2026-09-29 (wave): dbus-run-session / runcon / xvfb-run STAGE_PREFIXES
+
+Added three `/usr/bin` launchers jagent wave 18 now strips. STAGE_PREFIXES
+len 55 → 58. `runcon` joins `prefix_takes_positional_dispatch_operand` so
+`| runcon CONTEXT sh` judges `sh`. Pipe regressions + DISPATCHES forms pin
+parity with path-patched jagent. Core/jagent tips still **pending push/repin**.
 
 ## 2026-09-29 (wave): CROSS_BLOCK_* vs FIND_OVERLAY_* constructor split
 
