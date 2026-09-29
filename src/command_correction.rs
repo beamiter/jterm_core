@@ -4462,6 +4462,21 @@ mod tests {
             70,
             "CLASSIFY_FORMS len must match membership/DISPATCHES pin (STAGE 70)"
         );
+        // Set equality: len lockstep alone misses a duplicate+gap swap.
+        {
+            use std::collections::HashSet;
+            let stage: HashSet<&str> = STAGE_PREFIXES.iter().copied().collect();
+            let forms: HashSet<&str> = CLASSIFY_FORMS.iter().map(|(name, _)| *name).collect();
+            assert_eq!(
+                forms.len(),
+                CLASSIFY_FORMS.len(),
+                "CLASSIFY_FORMS must not duplicate STAGE names"
+            );
+            assert_eq!(
+                stage, forms,
+                "CLASSIFY_FORMS names must equal STAGE_PREFIXES exactly"
+            );
+        }
         for prefix in STAGE_PREFIXES {
             let form = CLASSIFY_FORMS
                 .iter()
