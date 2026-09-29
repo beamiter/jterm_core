@@ -242,6 +242,49 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(7, 7, false));
     }
 
+    /// Idle `pending_scan_continue` stores a SourceId only while a resume
+    /// cursor remains. A finished walk (no resume) must Break even when the
+    /// generation is still current, and a bumped generation must Break even
+    /// with a resume still in hand — both edges cancel the pending source.
+    #[test]
+    fn continue_idle_resume_edges_drop_stale_or_finished_walks() {
+        // Matching generation + resume: keep walking.
+        assert!(cross_block_search_continue_is_current(0, 0, true));
+        assert!(cross_block_search_continue_is_current(u64::MAX, u64::MAX, true));
+        // wrapping_add bump (dialog schedule_rebuild) invalidates the slice.
+        let scheduled = 0_u64;
+        let live = scheduled.wrapping_add(1);
+        assert!(!cross_block_search_continue_is_current(scheduled, live, true));
+        // Finished last slice cleared the cursor before Break.
+        assert!(!cross_block_search_continue_is_current(3, 3, false));
+        // Stale generation without a resume is still not current.
+        assert!(!cross_block_search_continue_is_current(1, 2, false));
+    }
+
+    #[test]
+    fn mid_record_cursor_roundtrips_through_budget_stopped_report() {
+        let mid = CrossBlockSearchMidRecord {
+            on_output: false,
+            next_line: 4,
+            occurrence: 11,
+        };
+        let resume = CrossBlockSearchCursor {
+            record_index: 2,
+            mid: Some(mid.clone()),
+        };
+        let report = CrossBlockSearchReport::budget_stopped(vec!["hit"], resume.clone());
+        assert!(report.scan_incomplete);
+        let restored = report.resume.expect("budget-stopped walks keep a cursor");
+        assert_eq!(restored.record_index, 2);
+        assert_eq!(restored.mid.as_ref(), Some(&mid));
+        // Metadata browse never sets mid; pattern mid must stay distinct.
+        let browse = CrossBlockSearchCursor {
+            record_index: 5,
+            mid: None,
+        };
+        assert_ne!(browse, restored);
+    }
+
     #[test]
     fn cross_block_budget_constants_match_the_family_contract() {
         assert_eq!(CROSS_BLOCK_SCAN_BYTE_LIMIT, 8 * 1024 * 1024);
