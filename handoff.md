@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — rounds 161–164 / 203–207 + round-48 smoke)
+
+## 2026-09-29 (pending tip — sticky/find/Watch* + round-48 smoke)
+
+- Local HEAD `81cccb6` path-patch-only. Anvil `f40fa66` rounds 161–164 / forge
+  `7302823` 203–207 sticky FE02/nirugu + Hangul find + Watch* Unknown +
+  near-wrap finished and ember `b651a6e` / frost `73064ed` round-48 smoke
+  (gap before 49) sit beside. STAGE **71** / between() **93** unchanged.
+  Push/repin still pending.
+
+
 Updated: 2026-09-29 (pending tip beside wave-33 deepen and round-49 smoke)
 
 ## 2026-09-29 (pending tip — wave-33 deepen + round-49)
