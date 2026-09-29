@@ -3930,6 +3930,7 @@ mod tests {
 
     /// Detached/attached app-id/reason/inhibit meta + terminal list/help
     /// short flags for gnome-session-inhibit (jagent fail-closed parity).
+    /// Busybox applet carriers peel before the STAGE name.
     #[test]
     fn gnome_session_inhibit_stage_arity_edges() {
         assert_eq!(
@@ -3946,6 +3947,14 @@ mod tests {
         assert_eq!(
             stage_interpreter("gnome-session-inhibit --inhibit idle:suspend sh").as_deref(),
             Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox gnome-session-inhibit --inhibit idle sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox gnome-session-inhibit -- bash").as_deref(),
+            Some("bash")
         );
         assert_eq!(stage_interpreter("gnome-session-inhibit --app-id").as_deref(), None);
         assert_eq!(stage_interpreter("gnome-session-inhibit --reason").as_deref(), None);
@@ -3972,10 +3981,21 @@ mod tests {
             stage_interpreter("gnome-session-inhibit --inhibit-only cargo test").as_deref(),
             None
         );
+        assert_eq!(
+            stage_interpreter("busybox gnome-session-inhibit -l sh").as_deref(),
+            None,
+            "busybox carrier does not invent a list-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox gnome-session-inhibit --inhibit-only bash").as_deref(),
+            None
+        );
     }
 
     /// Detached util clamp meta + terminal system/help for uclampset, and
     /// eatmydata-shaped `--` / help for gamemoderun (jagent fail-closed parity).
+    /// Busybox applet carriers peel before the STAGE name so pipe-to-bash still
+    /// resolves.
     #[test]
     fn uclampset_and_gamemoderun_stage_arity_edges() {
         assert_eq!(
@@ -3990,6 +4010,14 @@ mod tests {
             stage_interpreter("uclampset -m512 -M256 sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(
+            stage_interpreter("busybox uclampset -m 512 sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox uclampset -m 0 -M 1024 -- bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("uclampset -m").as_deref(), None);
         assert_eq!(stage_interpreter("uclampset -M").as_deref(), None);
         assert_eq!(stage_interpreter("uclampset -p").as_deref(), None);
@@ -4002,12 +4030,29 @@ mod tests {
         assert_eq!(stage_interpreter("uclampset --help sh").as_deref(), None);
         assert_eq!(stage_interpreter("uclampset -h bash").as_deref(), None);
         assert_eq!(stage_interpreter("uclampset -V sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox uclampset -s sh").as_deref(),
+            None,
+            "busybox carrier does not invent a system-mode child"
+        );
         assert_eq!(stage_interpreter("gamemoderun sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("gamemoderun -- bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(
+            stage_interpreter("busybox gamemoderun sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox gamemoderun -- bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("gamemoderun --help sh").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox gamemoderun --help sh").as_deref(),
+            None
+        );
         assert_eq!(
             validate_candidate(
                 Original("ls -l | head -20"),
@@ -4019,6 +4064,20 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | gamemoderun -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox uclampset -m 512 bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox gamemoderun bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
@@ -4037,6 +4096,20 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | gnome-session-inhibit --inhibit idle bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox gnome-session-inhibit bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox gnome-session-inhibit --inhibit idle bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
