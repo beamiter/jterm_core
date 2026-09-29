@@ -3913,6 +3913,19 @@ mod tests {
             "ps",
             "pmap",
             "slabtop",
+            // Wave-39 PATH leftovers: user/session inventory beside STAGE
+            // peelers and wave-30–38 leftovers (jagent pin
+            // `path_probe_user_session_inventory_leftovers_do_not_invent_a_child_peel`).
+            // CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "id",
+            "getent",
+            "whoami",
+            "groups",
+            "who",
+            "w",
+            "last",
+            "lastlog",
+            "faillog",
         ] {
             assert!(
                 !prefixes.contains(&name),
@@ -4714,6 +4727,7 @@ mod tests {
     /// fail-closed so junk after `--help` / `-h` never invents a child
     /// (thin STAGE 71 deepen). Busybox has neither applet.
     #[test]
+
     fn softlimit_and_cgexec_stage_arity_edges() {
         assert_eq!(
             stage_interpreter("softlimit -m 1000000 sh").as_deref(),
@@ -4770,7 +4784,6 @@ mod tests {
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
     }
-
 
     /// util-linux setsid: session flags + help/version fail closed. Busybox
     /// applet carriers peel before the STAGE name so pipe-to-bash still
