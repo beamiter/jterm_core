@@ -1,5 +1,27 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): aa-exec/socket-activate busybox deepen + STAGE 71 held
+
+## 2026-09-29 (wave): aa-exec / systemd-socket-activate busybox STAGE arity / pipe deepen
+
+`aa_exec_stage_arity_edges` / `systemd_socket_activate_stage_arity_edges` peel
+`busybox` applet carriers to sh/bash; help/version under busybox stay
+fail-closed (`prefix_option_clears_child`). Pipe regressions cover
+`| busybox aa-exec bash` / `| busybox systemd-socket-activate bash`.
+
+## 2026-09-29 (wave): classify peels timeout/nice around aa-exec / socket-activate
+
+Mirror openvt nest pin: `timeout`/`nice` outside and inside `aa-exec` /
+`systemd-socket-activate` still classify the cargo child. STAGE membership
+stays **71**.
+
+## 2026-09-29 (wave): CLASSIFY/DISPATCHES STAGE 71 lockstep held through wave-32
+
+Wave-32 PATH leftovers stay out of STAGE; thin STAGE peels deepen without
+graduating new names. Audit pins still assert DISPATCHES / CLASSIFY_FORMS set
+equality with STAGE_PREFIXES at **len == 71**. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): PATH wave-32 ctl/service leftovers beside STAGE 71
 
 ## 2026-09-29 (wave): PATH probe wave-32 ctl/service leftovers stay out
