@@ -1,10 +1,10 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (point pending tip at HEAD after rounds 191/240 final align)
+Updated: 2026-09-29 (align tip note self-hash after rounds 191/240 final)
 
 ## 2026-09-29 (point pending tip — rounds 191/240 final align)
 
-- Pending tip note remains current at HEAD `5f81dc6` after STAGE 71 hold
+- Pending tip note remains current at HEAD `5cf1628` after STAGE 71 hold
   beside sticky 1801/FE07/MAX-7/GuardRecovery UI sync.
 
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 held through rounds 191/240)
