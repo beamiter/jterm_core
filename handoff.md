@@ -1,5 +1,19 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): error/unknown→Rest + Watch*→Idle bridges (76)
+
+## 2026-09-29 (wave): error/unknown→Rest + Watch*→Idle VisualTransition (76)
+
+Survey leftover `between` Nones that still snapped on reducer-reachable
+arcs: Inspect/SitNear/Unknown holds when a push lands, and Watch* when a
+clean Other finish goes Idle. Those six bridges (70→**76**) plus
+`flock --` end-of-options in `stage_interpreter` sit on this tip beside
+daemonize/setlock/s6-setuidgid STAGE (len 67). Pin
+`visual_transition_between_recognizes_seventy_six_intentional_arcs`.
+Core tip still **pending push/repin**.
+
+Updated: 2026-09-29 (wave): error/unknown→Rest + Watch*→Idle bridges (76)
+
 ## 2026-09-29 (wave): clear-vigil Idle VisualTransition bridges (70)
 
 Survey of organism.rs snap comments: error-hold and Guard* clear-vigil
