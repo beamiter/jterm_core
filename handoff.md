@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after wave-35 / round-54 final align)
+
+## 2026-09-29 (point pending tip — wave-35 / round-54 final align)
+
+- Pending tip note remains current at HEAD `858ccf6` after STAGE 71 hold
+  beside wave-35 chrt/ionice deepen and round-54 smoke.
+
+
 Updated: 2026-09-29 (align tip after rounds 187/235 beside round-53 smoke and wave-35 deepen)
 
 ## 2026-09-29 (align tip — rounds 184–187 / 231–235 + round-53)
