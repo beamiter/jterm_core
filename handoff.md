@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave): torsocks/proxychains STAGE_PREFIXES
+Updated: 2026-09-29 (wave): classify_command torsocks/proxychains
+
+## 2026-09-29 (wave): classify_command torsocks/proxychains
+
+`classify_command` now steps through `torsocks` / `proxychains` /
+`proxychains3` / `proxychains4` (including torsocks auth/endpoint meta and
+proxychains `-f`) so `torsocks cargo test` stays `BuildOrTest` for the
+organism work loop.
 
 ## 2026-09-29 (wave): torsocks/proxychains STAGE_PREFIXES
 

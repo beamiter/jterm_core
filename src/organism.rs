@@ -2475,6 +2475,22 @@ pub fn classify_command(command: &str) -> CommandKind {
             ),
             "cgexec" => skip_wrapper_options(&mut tokens, &["-g"]),
             "schedtool" => skip_wrapper_options(&mut tokens, &["-a", "-p", "-n", "-M"]),
+            "torsocks" => skip_wrapper_options(
+                &mut tokens,
+                &[
+                    "-u",
+                    "--user",
+                    "-p",
+                    "--pass",
+                    "-a",
+                    "--address",
+                    "-P",
+                    "--port",
+                ],
+            ),
+            "proxychains" | "proxychains3" | "proxychains4" => {
+                skip_wrapper_options(&mut tokens, &["-f"])
+            }
             _ => break,
         }
         program = tokens.next().unwrap_or_default();
@@ -2707,6 +2723,14 @@ mod tests {
             "schedtool -B -e cargo test",
             "schedtool -a 0x1 -n 5 -e cargo nextest run",
             "cgexec -g cpu:g schedtool -B -e cargo test",
+            "torsocks cargo test",
+            "torsocks -i cargo check",
+            "torsocks --isolate -- cargo nextest run",
+            "torsocks -a 127.0.0.1 -P 9050 cargo test",
+            "proxychains cargo test",
+            "proxychains4 -q cargo check",
+            "proxychains3 -f /etc/proxychains.conf cargo nextest run",
+            "torsocks proxychains4 -q cargo test",
         ] {
             assert_eq!(
                 classify_command(command),
