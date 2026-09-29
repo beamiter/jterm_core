@@ -3163,6 +3163,10 @@ pub fn classify_command(command: &str) -> CommandKind {
                     "--level-prefix",
                 ],
             ),
+            "gnome-session-inhibit" => skip_wrapper_options(
+                &mut tokens,
+                &["--app-id", "--reason", "--inhibit"],
+            ),
             "systemd-inhibit" => skip_wrapper_options(
                 &mut tokens,
                 &["--what", "--who", "--why", "--mode"],
@@ -3759,6 +3763,9 @@ mod tests {
             "systemd-cat cargo test",
             "systemd-cat -t unit cargo check",
             "systemd-cat --identifier=unit -- cargo nextest run",
+            "gnome-session-inhibit cargo test",
+            "gnome-session-inhibit --inhibit idle cargo check",
+            "gnome-session-inhibit --app-id x --reason y --inhibit idle -- cargo nextest run",
             "systemd-inhibit cargo test",
             "systemd-inhibit --what=idle cargo check",
             "systemd-inhibit --what idle --who x -- cargo nextest run",
@@ -3903,6 +3910,40 @@ mod tests {
         );
         assert_eq!(
             classify_command("s6-setuidgid -- nobody cargo check"),
+            CommandKind::BuildOrTest
+        );
+    }
+
+    #[test]
+    fn classify_command_peels_timeout_nice_around_daemonize_setlock() {
+        assert_eq!(
+            classify_command("timeout 5 daemonize cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 setlock /tmp/x.lock cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 s6-setuidgid nobody cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 daemonize cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command(
+                "nice -n 10 timeout 5 setlock -n /tmp/x.lock s6-setuidgid nobody cargo test"
+            ),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("daemonize timeout 5 cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 daemonize setlock /tmp/x.lock cargo test"),
             CommandKind::BuildOrTest
         );
     }
@@ -5327,6 +5368,30 @@ mod tests {
                 Behavior::InspectError,
                 Behavior::SitNearError,
                 Behavior::UnknownOutcome,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "{from:?}→{to:?} must stay None"
+                );
+            }
+        }
+    }
+
+    /// Error / unknown holds settle to Idle/Rest/Celebrate/Guard — a new
+    /// command mid-hold snaps into Watch* without bridge frames. Pin `None`
+    /// so Inspect/SitNear/Unknown→Watch* cannot land beside Watch*→Inspect.
+    #[test]
+    fn error_and_unknown_holds_never_bridge_to_watch_poses() {
+        for from in [
+            Behavior::InspectError,
+            Behavior::SitNearError,
+            Behavior::UnknownOutcome,
+        ] {
+            for to in [
+                Behavior::WatchCommand,
+                Behavior::WatchAgent,
+                Behavior::WatchSettled,
             ] {
                 assert_eq!(
                     VisualTransition::between(from, to),
