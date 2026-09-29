@@ -260,6 +260,13 @@ mod tests {
         assert!(!cross_block_search_continue_is_current(3, 3, false));
         // Stale generation without a resume is still not current.
         assert!(!cross_block_search_continue_is_current(1, 2, false));
+        // Scheduled ahead of live (speculative gen / rewound live) must cancel
+        // even with a resume still in hand — close bumps generation first, and
+        // a slice captured after the bump must not walk against an older live.
+        assert!(!cross_block_search_continue_is_current(5, 4, true));
+        // Gen-0 finished walk (no resume) cancels the same way as any other
+        // matching-generation empty cursor.
+        assert!(!cross_block_search_continue_is_current(0, 0, false));
     }
 
     #[test]
