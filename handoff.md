@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip beside wave-36 deepen)
+
+## 2026-09-29 (pending tip — wave-36 deepen)
+
+- Pending tip through wave-36 network inventory leftovers + numactl/schedtool
+  query fail-closed deepen beside jagent tip. CLASSIFY/DISPATCHES **71** held.
+
+
 Updated: 2026-09-29 (wave 36 deepen: numactl/schedtool STAGE + CLASSIFY 71)
 
 ## 2026-09-29 (wave 36 deepen — numactl/schedtool query fail-closed + classify)
