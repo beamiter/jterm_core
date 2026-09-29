@@ -4380,7 +4380,8 @@ mod tests {
     /// util-linux setsid: session flags + help/version fail closed. Busybox
     /// applet carriers peel before the STAGE name so pipe-to-bash still
     /// resolves (parity with openvt / aa-exec deepenings). Bare / dangling
-    /// meta stay fail-closed like openvt arity completeness.
+    /// meta stay fail-closed like openvt arity completeness. `-c`/`--ctty`
+    /// and `-w`/`--wait` are flag-only peels beside `-f`/`--fork`.
     #[test]
     fn setsid_stage_arity_edges() {
         assert_eq!(stage_interpreter("setsid sh").as_deref(), Some("sh"));
@@ -4401,6 +4402,26 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("setsid -c sh").as_deref(),
+            Some("sh"),
+            "ctty flag peels like fork/wait"
+        );
+        assert_eq!(
+            stage_interpreter("setsid --ctty -- bash").as_deref(),
+            Some("bash"),
+            "long --ctty peels like short -c"
+        );
+        assert_eq!(
+            stage_interpreter("setsid -w bash").as_deref(),
+            Some("bash"),
+            "short -w wait peels like --wait"
+        );
+        assert_eq!(
+            stage_interpreter("setsid -cfw -- sh").as_deref(),
+            Some("sh"),
+            "combined ctty+fork+wait still peels the child"
+        );
+        assert_eq!(
             stage_interpreter("busybox setsid sh").as_deref(),
             Some("sh")
         );
@@ -4408,8 +4429,30 @@ mod tests {
             stage_interpreter("busybox setsid -f -- bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(
+            stage_interpreter("busybox setsid -c -- bash").as_deref(),
+            Some("bash"),
+            "busybox carrier peels ctty beside fork"
+        );
         assert_eq!(stage_interpreter("setsid").as_deref(), None);
         assert_eq!(stage_interpreter("setsid -f").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("setsid --fork").as_deref(),
+            None,
+            "dangling --fork stays fail-closed"
+        );
+        assert_eq!(
+            stage_interpreter("setsid --wait").as_deref(),
+            None,
+            "dangling --wait stays fail-closed"
+        );
+        assert_eq!(
+            stage_interpreter("setsid --ctty").as_deref(),
+            None,
+            "dangling --ctty stays fail-closed"
+        );
+        assert_eq!(stage_interpreter("setsid -c").as_deref(), None);
+        assert_eq!(stage_interpreter("setsid -w").as_deref(), None);
         assert_eq!(stage_interpreter("setsid --help sh").as_deref(), None);
         assert_eq!(stage_interpreter("setsid -h bash").as_deref(), None);
         assert_eq!(stage_interpreter("setsid --version sh").as_deref(), None);
@@ -4441,6 +4484,13 @@ mod tests {
         assert_eq!(
             validate_candidate(
                 Original("ls -l | head -20"),
+                Candidate("ls -l | setsid -c -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
                 Candidate("ls -l | busybox setsid bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
@@ -4449,6 +4499,13 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | busybox setsid -fw -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox setsid --ctty -- bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
