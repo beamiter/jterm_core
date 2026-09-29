@@ -542,7 +542,9 @@ const REST_TO_IDLE_FRAMES: [&str; 4] = [
 // UnknownOutcome hold: clear-vigil settle must not snap to Idle, and a first
 // open failure that overtakes the hold must not snap to InspectError.
 // Success / second-failure overwrites (Celebrate{,Big}, SitNearError) are the
-// same hold class. GlanceAside is live-only, so it is not a transition source.
+// same hold class. Settling while a repo vigil is still open must not snap to
+// GuardFailure/Stuck/Recovery/Cautious either. GlanceAside is live-only, so it
+// is not a transition source.
 const UNKNOWN_TO_IDLE_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ?.? )     \n > ^ <",
     " /\\_/\\      \n( ?.o )     \n > ^ <",
@@ -572,6 +574,32 @@ const UNKNOWN_TO_SIT_FRAMES: [&str; 4] = [
     " /\\_/\\      \n( ._. )     \n > ^ <",
     " /\\_/\\      \n( ._. )  !  \n /|_|\\",
     " /\\_/\\      \n( ._. )     \n /|_|\\",
+];
+// Unknown hold settle while a sibling still shows an open vigil: Idle is already
+// bridged for clear vigil; these four cover Failure/Stuck/Recovery/Cautious.
+const UNKNOWN_TO_GUARD_FAILURE_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( o.? )     \n /|_|\\",
+    " /\\_/\\      \n( o_o ) [! ]\n /|_|\\",
+    " /\\_/\\      \n( o.o ) [! ]\n /|_|\\",
+];
+const UNKNOWN_TO_GUARD_STUCK_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( ._. )     \n /|_|\\",
+    " =\\_/=      \n( ._. ) [!!]\n /|_|\\",
+    " =\\_/=      \n( -.- ) [!!]\n /|_|\\",
+];
+const UNKNOWN_TO_GUARD_RECOVERY_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( ?.o )     \n /|_|\\",
+    " /\\_/\\      \n( -.o ) [ok]\n /|_|\\",
+    " /\\_/\\      \n( -.- ) [ok]\n /|_|\\",
+];
+const UNKNOWN_TO_GUARD_CAUTIOUS_FRAMES: [&str; 4] = [
+    " /\\_/\\      \n( ?.? )     \n > ^ <",
+    " /\\_/\\      \n( ?.o )     \n /|_|\\",
+    " /\\_/\\      \n( ?.o ) [? ]\n /|_|\\",
+    " /\\_/\\      \n( ?.? ) [? ]\n /|_|\\",
 ];
 // Idle vigil relapse: a sibling reopens failures while this pane still shows
 // Recovery/Cautious (or Stuck downgrades to Failure). Without these arcs Full
@@ -778,6 +806,10 @@ pub enum VisualTransition {
     UnknownOutcomeToCelebrate,
     UnknownOutcomeToCelebrateBig,
     UnknownOutcomeToSitNearError,
+    UnknownOutcomeToGuardFailure,
+    UnknownOutcomeToGuardStuck,
+    UnknownOutcomeToGuardRecovery,
+    UnknownOutcomeToGuardCautious,
 }
 
 impl VisualTransition {
@@ -925,6 +957,18 @@ impl VisualTransition {
             (Behavior::UnknownOutcome, Behavior::SitNearError) => {
                 Some(Self::UnknownOutcomeToSitNearError)
             }
+            (Behavior::UnknownOutcome, Behavior::GuardFailure) => {
+                Some(Self::UnknownOutcomeToGuardFailure)
+            }
+            (Behavior::UnknownOutcome, Behavior::GuardStuck) => {
+                Some(Self::UnknownOutcomeToGuardStuck)
+            }
+            (Behavior::UnknownOutcome, Behavior::GuardRecovery) => {
+                Some(Self::UnknownOutcomeToGuardRecovery)
+            }
+            (Behavior::UnknownOutcome, Behavior::GuardCautious) => {
+                Some(Self::UnknownOutcomeToGuardCautious)
+            }
             _ => None,
         }
     }
@@ -990,7 +1034,11 @@ impl VisualTransition {
             | Self::UnknownOutcomeToInspectError
             | Self::UnknownOutcomeToCelebrate
             | Self::UnknownOutcomeToCelebrateBig
-            | Self::UnknownOutcomeToSitNearError => Behavior::UnknownOutcome,
+            | Self::UnknownOutcomeToSitNearError
+            | Self::UnknownOutcomeToGuardFailure
+            | Self::UnknownOutcomeToGuardStuck
+            | Self::UnknownOutcomeToGuardRecovery
+            | Self::UnknownOutcomeToGuardCautious => Behavior::UnknownOutcome,
         }
     }
 
@@ -1002,28 +1050,32 @@ impl VisualTransition {
             | Self::GuardRecoveryToGuardFailure
             | Self::GuardCautiousToGuardFailure
             | Self::CelebrateToGuardFailure
-            | Self::CelebrateBigToGuardFailure => Behavior::GuardFailure,
+            | Self::CelebrateBigToGuardFailure
+            | Self::UnknownOutcomeToGuardFailure => Behavior::GuardFailure,
             Self::SitNearErrorToGuardStuck
             | Self::InspectErrorToGuardStuck
             | Self::GuardFailureToGuardStuck
             | Self::GuardRecoveryToGuardStuck
             | Self::GuardCautiousToGuardStuck
             | Self::CelebrateToGuardStuck
-            | Self::CelebrateBigToGuardStuck => Behavior::GuardStuck,
+            | Self::CelebrateBigToGuardStuck
+            | Self::UnknownOutcomeToGuardStuck => Behavior::GuardStuck,
             Self::InspectErrorToGuardRecovery
             | Self::SitNearErrorToGuardRecovery
             | Self::GuardFailureToGuardRecovery
             | Self::GuardStuckToGuardRecovery
             | Self::GuardCautiousToGuardRecovery
             | Self::CelebrateToGuardRecovery
-            | Self::CelebrateBigToGuardRecovery => Behavior::GuardRecovery,
+            | Self::CelebrateBigToGuardRecovery
+            | Self::UnknownOutcomeToGuardRecovery => Behavior::GuardRecovery,
             Self::InspectErrorToGuardCautious
             | Self::SitNearErrorToGuardCautious
             | Self::GuardFailureToGuardCautious
             | Self::GuardStuckToGuardCautious
             | Self::GuardRecoveryToGuardCautious
             | Self::CelebrateToGuardCautious
-            | Self::CelebrateBigToGuardCautious => Behavior::GuardCautious,
+            | Self::CelebrateBigToGuardCautious
+            | Self::UnknownOutcomeToGuardCautious => Behavior::GuardCautious,
             Self::WatchSettledToCelebrate
             | Self::InspectErrorToCelebrate
             | Self::SitNearErrorToCelebrate
@@ -1132,6 +1184,10 @@ impl VisualTransition {
             Self::UnknownOutcomeToCelebrate => UNKNOWN_TO_CELEBRATE_FRAMES[index],
             Self::UnknownOutcomeToCelebrateBig => UNKNOWN_TO_CELEBRATE_BIG_FRAMES[index],
             Self::UnknownOutcomeToSitNearError => UNKNOWN_TO_SIT_FRAMES[index],
+            Self::UnknownOutcomeToGuardFailure => UNKNOWN_TO_GUARD_FAILURE_FRAMES[index],
+            Self::UnknownOutcomeToGuardStuck => UNKNOWN_TO_GUARD_STUCK_FRAMES[index],
+            Self::UnknownOutcomeToGuardRecovery => UNKNOWN_TO_GUARD_RECOVERY_FRAMES[index],
+            Self::UnknownOutcomeToGuardCautious => UNKNOWN_TO_GUARD_CAUTIOUS_FRAMES[index],
         }
     }
 }
@@ -3710,6 +3766,10 @@ mod tests {
             VisualTransition::UnknownOutcomeToCelebrate,
             VisualTransition::UnknownOutcomeToCelebrateBig,
             VisualTransition::UnknownOutcomeToSitNearError,
+            VisualTransition::UnknownOutcomeToGuardFailure,
+            VisualTransition::UnknownOutcomeToGuardStuck,
+            VisualTransition::UnknownOutcomeToGuardRecovery,
+            VisualTransition::UnknownOutcomeToGuardCautious,
         ];
         for transition in transitions {
             assert_eq!(
@@ -4055,6 +4115,63 @@ mod tests {
         assert_eq!(
             VisualTransition::between(held_sit.behavior, sit.behavior),
             Some(VisualTransition::UnknownOutcomeToSitNearError)
+        );
+    }
+
+    #[test]
+    fn unknown_outcome_vigil_settles_have_full_motion_bridges() {
+        // Unknown hold can settle into an open repo vigil when clear-vigil Idle
+        // is not the destination: Failure/Stuck from open failures, and
+        // Recovery/Cautious after a heal that still waits for push.
+        let mut failure = NativeOrganism::default();
+        failure.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(failure.repo_vigil(), RepoVigil::Failure);
+        let held = failure.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held.behavior, Behavior::UnknownOutcome);
+        let idle = failure.idle_reaction();
+        assert_eq!(idle.behavior, Behavior::GuardFailure);
+        assert_eq!(
+            VisualTransition::between(held.behavior, idle.behavior),
+            Some(VisualTransition::UnknownOutcomeToGuardFailure)
+        );
+
+        let mut stuck = NativeOrganism::default();
+        stuck.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        stuck.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        stuck.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        assert_eq!(stuck.repo_vigil(), RepoVigil::Stuck);
+        let held = stuck.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held.behavior, Behavior::UnknownOutcome);
+        let idle = stuck.idle_reaction();
+        assert_eq!(idle.behavior, Behavior::GuardStuck);
+        assert_eq!(
+            VisualTransition::between(held.behavior, idle.behavior),
+            Some(VisualTransition::UnknownOutcomeToGuardStuck)
+        );
+
+        let mut recovery = NativeOrganism::default();
+        recovery.command_finished(CommandKind::BuildOrTest, Some(1), None);
+        recovery.command_finished(CommandKind::BuildOrTest, Some(0), None);
+        assert_eq!(recovery.repo_vigil(), RepoVigil::Recovery);
+        let held = recovery.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held.behavior, Behavior::UnknownOutcome);
+        let idle = recovery.idle_reaction();
+        assert_eq!(idle.behavior, Behavior::GuardRecovery);
+        assert_eq!(
+            VisualTransition::between(held.behavior, idle.behavior),
+            Some(VisualTransition::UnknownOutcomeToGuardRecovery)
+        );
+
+        let mut cautious = NativeOrganism::default();
+        cautious.restore_repo_work_context(RepoWorkState::new(0, true, 3), 0, 0);
+        assert_eq!(cautious.repo_vigil(), RepoVigil::CautiousRecovery);
+        let held = cautious.command_finished(CommandKind::Other, None, None);
+        assert_eq!(held.behavior, Behavior::UnknownOutcome);
+        let idle = cautious.idle_reaction();
+        assert_eq!(idle.behavior, Behavior::GuardCautious);
+        assert_eq!(
+            VisualTransition::between(held.behavior, idle.behavior),
+            Some(VisualTransition::UnknownOutcomeToGuardCautious)
         );
     }
 
