@@ -3831,6 +3831,16 @@ mod tests {
             "rtkitctl",
             "zramctl",
             "sysctl",
+            // Wave-34 PATH leftovers: block/mount inventory managers beside
+            // STAGE peelers and wave-30–33 ctl leftovers (jagent pin
+            // `path_probe_block_mount_leftovers_do_not_invent_a_child_peel`).
+            // CLASSIFY/DISPATCHES remain lockstep at STAGE 71.
+            "lsblk",
+            "blkid",
+            "losetup",
+            "blockdev",
+            "findmnt",
+            "wipefs",
         ] {
             assert!(
                 !prefixes.contains(&name),
