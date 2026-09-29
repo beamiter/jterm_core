@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 37 probe: PATH process/IPC inventory leftovers)
+
+## 2026-09-30 (wave 37 probe — PATH process/IPC inventory leftovers)
+
+- **PATH probe** — process/IPC inventory managers (`lsof` / `fuser` / `vmstat` /
+  `perf` / `ipcs` / `ipcrm`) stay out of `STAGE_PREFIXES` until taught fail-closed.
+  Lockstep with jagent
+  `path_probe_process_ipc_inventory_leftovers_do_not_invent_a_child_peel`.
+  CLASSIFY/DISPATCHES remain **71**. **Pending push**.
+
 Updated: 2026-09-29 (align tip note self-hash after rounds 195/245 / round-56 final)
 
 ## 2026-09-29 (point pending tip — rounds 195/245 final align)
