@@ -4367,7 +4367,8 @@ mod tests {
 
     /// AppArmor aa-exec: profile/namespace meta + help/version fail closed.
     /// Busybox applet carriers peel before the STAGE name so pipe-to-bash still
-    /// resolves (parity with openvt / systemd-cat deepenings).
+    /// resolves (parity with openvt / systemd-cat deepenings). Bare / dangling
+    /// meta / `--version` stay fail-closed like openvt arity completeness.
     #[test]
     fn aa_exec_stage_arity_edges() {
         assert_eq!(stage_interpreter("aa-exec sh").as_deref(), Some("sh"));
@@ -4380,6 +4381,14 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("aa-exec -n apparmorfs bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("aa-exec --namespace=apparmorfs -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
             stage_interpreter("busybox aa-exec sh").as_deref(),
             Some("sh")
         );
@@ -4387,8 +4396,18 @@ mod tests {
             stage_interpreter("busybox aa-exec -p unconfined bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(
+            stage_interpreter("busybox aa-exec -n apparmorfs -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("aa-exec").as_deref(), None);
+        assert_eq!(stage_interpreter("aa-exec -p").as_deref(), None);
+        assert_eq!(stage_interpreter("aa-exec -p unconfined").as_deref(), None);
+        assert_eq!(stage_interpreter("aa-exec -n").as_deref(), None);
+        assert_eq!(stage_interpreter("aa-exec -n apparmorfs").as_deref(), None);
         assert_eq!(stage_interpreter("aa-exec --help sh").as_deref(), None);
         assert_eq!(stage_interpreter("aa-exec -h bash").as_deref(), None);
+        assert_eq!(stage_interpreter("aa-exec --version sh").as_deref(), None);
         assert_eq!(
             stage_interpreter("busybox aa-exec --help sh").as_deref(),
             None,
@@ -4398,10 +4417,16 @@ mod tests {
             stage_interpreter("busybox aa-exec -h bash").as_deref(),
             None
         );
+        assert_eq!(
+            stage_interpreter("busybox aa-exec --version sh").as_deref(),
+            None,
+            "busybox carrier does not invent a version-mode child"
+        );
     }
 
     /// systemd-socket-activate: listen/setenv/fdname meta + help/version fail
-    /// closed. Busybox applet carriers peel before the STAGE name.
+    /// closed. Busybox applet carriers peel before the STAGE name. Bare /
+    /// dangling meta stay fail-closed like openvt arity completeness.
     #[test]
     fn systemd_socket_activate_stage_arity_edges() {
         assert_eq!(
@@ -4417,12 +4442,52 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
+            stage_interpreter("systemd-socket-activate -E FOO=1 bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --setenv=FOO=1 -- sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --fdname=conn bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
             stage_interpreter("busybox systemd-socket-activate sh").as_deref(),
             Some("sh")
         );
         assert_eq!(
             stage_interpreter("busybox systemd-socket-activate -l 2000 bash").as_deref(),
             Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("busybox systemd-socket-activate -E FOO=1 -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate -l").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate -l 2000").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate -E").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --fdname").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("systemd-socket-activate --fdname conn").as_deref(),
+            None
         );
         assert_eq!(
             stage_interpreter("systemd-socket-activate --help sh").as_deref(),
@@ -4573,6 +4638,20 @@ mod tests {
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | systemd-socket-activate -E FOO=1 bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox systemd-socket-activate --fdname=conn -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
     }
 
     #[test]
@@ -4602,6 +4681,20 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | busybox aa-exec -p unconfined bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | aa-exec -n apparmorfs bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox aa-exec --namespace=apparmorfs -- bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
