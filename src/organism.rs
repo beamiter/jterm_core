@@ -4107,6 +4107,30 @@ mod tests {
     }
 
     #[test]
+    fn classify_command_peels_timeout_nice_around_openvt() {
+        assert_eq!(
+            classify_command("timeout 5 openvt cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("nice -n 5 openvt -f cargo check"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 openvt -c 3 -- cargo nextest run"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("openvt timeout 5 cargo test"),
+            CommandKind::BuildOrTest
+        );
+        assert_eq!(
+            classify_command("timeout 5 nice -n 5 openvt cargo check"),
+            CommandKind::BuildOrTest
+        );
+    }
+
+    #[test]
     fn repeated_real_failures_escalate_then_success_celebrates() {
         let mut organism = NativeOrganism::default();
         organism.command_started(CommandKind::BuildOrTest);
