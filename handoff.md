@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip at HEAD after rounds 174/219 final)
+
+## 2026-09-29 (point pending tip — rounds 174/219 final)
+
+- Local HEAD `7f8ab90` path-patch-only. Anvil rounds 171–174 / forge 215–219
+  sticky/find/CrossBlock/Celebrate→Unknown sit beside round-50 smoke. STAGE
+  **71** / between() **93** unchanged. Push/repin still pending.
+
+
 Updated: 2026-09-29 (align tip after rounds 174/219 + round-50 smoke)
 
 ## 2026-09-29 (align tip — rounds 171–174 / 215–219 + round-50)
