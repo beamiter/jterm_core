@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip — rounds 179–181 / 225–228 + MAX-5 cancel)
+
+## 2026-09-29 (pending tip — sticky FE06/MAX-5/Celebrate-Rest→Unknown verify)
+
+- Pending tip through sticky FE06/Manchu full-stop, CrossBlock MAX-5→MAX-4 cancel
+  (`902b60b`), and Celebrate/Rest→Unknown membership + Calm/Static snaps beside
+  anvil 179–181 / forge 225–228. STAGE **71** / between() **93** held
+  (Celebrate→Unknown and Rest→Unknown already inside the 93; no semantic_bridges
+  len bump).
+
 Updated: 2026-09-29 (point pending tip at HEAD after rounds 178/224 repair align)
 
 ## 2026-09-29 (point pending tip — rounds 178/224 repair align)
