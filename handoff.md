@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-30 (point pending tip note at HEAD after rounds 199/250)
+Updated: 2026-09-30 (align tip note self-hash after rounds 199/250)
 
 ## 2026-09-30 (point pending tip — rounds 199/250)
 
