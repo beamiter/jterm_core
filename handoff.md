@@ -1,5 +1,22 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave): PATH wave-31 ctl/utility leftovers beside STAGE 71
+
+## 2026-09-29 (wave): PATH probe wave-31 ctl/utility leftovers stay out
+
+`path_probe_leftovers_stay_out_of_stage_prefixes` names wave-31 `loginctl` /
+`hostnamectl` / `localectl` / `bootctl` / `networkctl` / `kernel-install` /
+`systemd-tmpfiles` / `systemd-sysusers` / `systemd-id128` / `systemd-hwdb` /
+`systemd-sysext` / `systemd-cryptenroll` / `systemd-machine-id-setup` /
+`systemd-umount` / `systemd-tty-ask-password-agent` / `lsns` / `aa-teardown` /
+`aa-remove-unknown` / `apparmor_status` as intentional non-STAGE beside STAGE
+`systemd-*` / `aa-exec` and wave-30 ctl/notify leftovers (jagent pin
+`path_probe_ctl_utility_leftovers_do_not_invent_a_child_peel`). `unshare` /
+`nsenter` remain PIPE_INTERPRETERS (already peeled) — not graduated into
+STAGE this wave. Membership / DISPATCHES / CLASSIFY_FORMS stay **71** with
+set-eq. **Pending push/repin**.
+
+
 Updated: 2026-09-29 (wave): Watch*→ambient None + WatchSettled finish inside 93
 
 ## 2026-09-29 (wave): Watch*→ambient utility None (landed)
