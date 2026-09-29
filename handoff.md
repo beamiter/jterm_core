@@ -1,5 +1,20 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (aa-exec detached long-opt deepen + celebrate survey tip)
+
+## 2026-09-29 (wave): aa-exec / socket-activate detached long-opt peel deepen
+
+`--profile` / `--namespace` / `--listen` / `--setenv` / `--fdname` detached
+value forms peel beside `=` attached forms already pinned. STAGE **71**.
+
+## 2026-09-29 (pending tip — deepen + CrossBlock cancel + celebrate survey)
+
+- Local HEAD path-patch-only. Anvil rounds 158–160 / forge 200–202 CrossBlock
+  near-wrap cancel + Failure/Stuck/Cautious→Celebrate Full-motion survey sit
+  beside aa-exec/socket-activate arity+classify deepen. STAGE **71** /
+  between() **93** unchanged. Push/repin cohort still pending.
+
+
 Updated: 2026-09-29 (repair tip align after round-47 cancel cohort)
 
 ## 2026-09-29 (align tip — round-47 cancel cohort)
