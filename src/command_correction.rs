@@ -4148,7 +4148,8 @@ mod tests {
     }
 
     /// kbd openvt: `-c`/`--console` detached meta, `-u`/`--user` clears child,
-    /// help/version fail closed. Pipe-to-sh still AddsPipeToInterpreter.
+    /// help/version fail closed. Busybox applet carriers peel before the STAGE
+    /// name so pipe-to-bash still resolves (parity with systemd-cat deepenings).
     #[test]
     fn openvt_stage_arity_edges() {
         assert_eq!(stage_interpreter("openvt sh").as_deref(), Some("sh"));
@@ -4168,6 +4169,14 @@ mod tests {
             stage_interpreter("openvt -sw sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(
+            stage_interpreter("busybox openvt sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("busybox openvt -c 3 -- bash").as_deref(),
+            Some("bash")
+        );
         assert_eq!(stage_interpreter("openvt").as_deref(), None);
         assert_eq!(stage_interpreter("openvt -f").as_deref(), None);
         assert_eq!(stage_interpreter("openvt -c").as_deref(), None);
@@ -4182,6 +4191,16 @@ mod tests {
             "user/login mode never invents an argv child"
         );
         assert_eq!(stage_interpreter("openvt --user bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("busybox openvt --help sh").as_deref(),
+            None,
+            "busybox carrier does not invent a help-mode child"
+        );
+        assert_eq!(
+            stage_interpreter("busybox openvt -u bash").as_deref(),
+            None,
+            "busybox carrier does not invent a user-mode child"
+        );
         // Help text spells `-C` but this binary rejects it; the lightweight
         // STAGE scan still steps the unknown short (jagent fail-closes `-C`).
         assert_eq!(
@@ -4199,6 +4218,20 @@ mod tests {
             validate_candidate(
                 Original("ls -l | head -20"),
                 Candidate("ls -l | openvt -c 3 -- bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox openvt bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | busybox openvt -c 3 -- bash")
             ),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
