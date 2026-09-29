@@ -5610,6 +5610,109 @@ mod tests {
         );
     }
 
+    /// CelebrateBig finish arcs: every reducer-reachable path that can land on
+    /// or leave CelebrateBig must animate under Full motion, matching Celebrate
+    /// except WatchAgent (quiet nod — never CelebrateBig). Fifteen Some bridges
+    /// plus the intentional WatchAgent / tier-overwrite Nones.
+    #[test]
+    fn celebrate_big_finish_arcs_mirror_celebrate_except_watch_agent() {
+        let inbound = [
+            (
+                Behavior::WatchSettled,
+                VisualTransition::WatchSettledToCelebrateBig,
+            ),
+            (
+                Behavior::WatchCommand,
+                VisualTransition::WatchCommandToCelebrateBig,
+            ),
+            (
+                Behavior::InspectError,
+                VisualTransition::InspectErrorToCelebrateBig,
+            ),
+            (
+                Behavior::SitNearError,
+                VisualTransition::SitNearErrorToCelebrateBig,
+            ),
+            (
+                Behavior::UnknownOutcome,
+                VisualTransition::UnknownOutcomeToCelebrateBig,
+            ),
+            (
+                Behavior::RestAfterPush,
+                VisualTransition::RestAfterPushToCelebrateBig,
+            ),
+        ];
+        for (from, expected) in inbound {
+            assert_eq!(
+                VisualTransition::between(from, Behavior::CelebrateBig),
+                Some(expected),
+                "{from:?}→CelebrateBig"
+            );
+        }
+
+        let outbound = [
+            (
+                Behavior::GuardRecovery,
+                VisualTransition::CelebrateBigToGuardRecovery,
+            ),
+            (
+                Behavior::GuardCautious,
+                VisualTransition::CelebrateBigToGuardCautious,
+            ),
+            (
+                Behavior::GuardFailure,
+                VisualTransition::CelebrateBigToGuardFailure,
+            ),
+            (
+                Behavior::GuardStuck,
+                VisualTransition::CelebrateBigToGuardStuck,
+            ),
+            (
+                Behavior::RestAfterPush,
+                VisualTransition::CelebrateBigToRestAfterPush,
+            ),
+            (Behavior::Idle, VisualTransition::CelebrateBigToIdle),
+            (
+                Behavior::InspectError,
+                VisualTransition::CelebrateBigToInspectError,
+            ),
+            (
+                Behavior::SitNearError,
+                VisualTransition::CelebrateBigToSitNearError,
+            ),
+            (
+                Behavior::UnknownOutcome,
+                VisualTransition::CelebrateBigToUnknownOutcome,
+            ),
+        ];
+        for (to, expected) in outbound {
+            assert_eq!(
+                VisualTransition::between(Behavior::CelebrateBig, to),
+                Some(expected),
+                "CelebrateBig→{to:?}"
+            );
+        }
+
+        assert_eq!(
+            inbound.len() + outbound.len(),
+            15,
+            "CelebrateBig finish-arc table is fifteen Some bridges"
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::WatchAgent, Behavior::CelebrateBig),
+            None,
+            "agent-driven passes stay Celebrate, never CelebrateBig"
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::Celebrate, Behavior::CelebrateBig),
+            None
+        );
+        assert_eq!(
+            VisualTransition::between(Behavior::CelebrateBig, Behavior::Celebrate),
+            None
+        );
+    }
+
     /// Ambient utility dispositions (Idle/Explore/Sleep/Approach) map to the
     /// same-named Behavior poses for display, but disposition *exchanges* are
     /// not VisualTransition arcs — ambient mind rescoring snaps. Typing is a
@@ -5641,6 +5744,30 @@ mod tests {
                 None,
                 "ambient/typing {from:?}→{to:?} must stay None"
             );
+        }
+        // Ambient utility poses also never invent bridges into repo vigil or
+        // Celebrate holds — open vigil / success finish land through Watch*
+        // (or Idle snap). Idle/Rest→Guard* is pinned elsewhere; pin the other
+        // ambient sources so Explore/Sleep/Approach cannot silently gain arcs.
+        for from in [
+            Behavior::Explore,
+            Behavior::Sleep,
+            Behavior::Approach,
+        ] {
+            for to in [
+                Behavior::GuardFailure,
+                Behavior::GuardStuck,
+                Behavior::GuardRecovery,
+                Behavior::GuardCautious,
+                Behavior::Celebrate,
+                Behavior::CelebrateBig,
+            ] {
+                assert_eq!(
+                    VisualTransition::between(from, to),
+                    None,
+                    "ambient {from:?}→{to:?} must stay None"
+                );
+            }
         }
     }
 
