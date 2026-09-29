@@ -1208,6 +1208,7 @@ const STAGE_PREFIXES: &[&str] = &[
     "chrt",
     "chronic",
     "command",
+    "daemonize",
     "dbus-run-session",
     "doas",
     "dumb-init",
@@ -1233,9 +1234,11 @@ const STAGE_PREFIXES: &[&str] = &[
     "run0",
     "runcon",
     "runuser",
+    "s6-setuidgid",
     "schedtool",
     "scriptlive",
     "setarch",
+    "setlock",
     "setpriv",
     "setsid",
     "setuidgid",
@@ -1348,6 +1351,10 @@ fn stage_interpreter(stage: &str) -> Option<String> {
         let Some(word) = words.get(index).copied() else {
             return None;
         };
+        if word == "--" {
+            index += 1;
+            continue;
+        }
         if word.starts_with('-') {
             index += 1;
             if let Some(prefix) = active_prefix {
@@ -1439,7 +1446,7 @@ fn stage_interpreter(stage: &str) -> Option<String> {
 fn prefix_takes_positional_user(prefix: &str) -> bool {
     matches!(
         prefix,
-        "gosu" | "run0" | "su" | "su-exec" | "runuser" | "setuidgid"
+        "gosu" | "run0" | "su" | "su-exec" | "runuser" | "setuidgid" | "s6-setuidgid"
     )
 }
 
@@ -1452,7 +1459,7 @@ fn prefix_takes_positional_newroot(prefix: &str) -> bool {
 /// Dispatchers whose first non-option operand is a lock/typescript file path,
 /// not the program (`flock FILE CMD`, `scriptlive typescript CMD`).
 fn prefix_takes_positional_lockfile(prefix: &str) -> bool {
-    matches!(prefix, "flock" | "scriptlive")
+    matches!(prefix, "flock" | "scriptlive" | "setlock")
 }
 
 /// Dispatchers whose first non-option operand names how to run the next word,
@@ -1480,6 +1487,8 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         ("systemd-inhibit", Some("list" | "help" | "version" | "h")) => true,
         ("systemd-cat", Some("help" | "version" | "h")) => true,
         ("firejail", Some("help" | "version")) => true,
+        ("daemonize", Some("help" | "version" | "h")) => true,
+        ("setlock", Some("help" | "version")) => true,
         _ => false,
     }
 }
@@ -1744,6 +1753,26 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
             option,
             "-u" | "-U" | "-e" | "-b" | "-n" | "-m" | "-d" | "-o" | "-p" | "-f" | "-c"
         ) as usize,
+        "daemonize" => matches!(
+            option,
+            "-c" | "--chdir"
+                | "-e"
+                | "--err"
+                | "--stderr"
+                | "-E"
+                | "--env"
+                | "-o"
+                | "--out"
+                | "--stdout"
+                | "-p"
+                | "--pidfile"
+                | "-u"
+                | "--user"
+                | "-l"
+                | "--lockfile"
+        ) as usize,
+        "setlock" => 0,
+        "s6-setuidgid" => 0,
         // fakeroot: like eatmydata/nohup — no meta values before PROGRAM.
         "fakeroot" => 0,
         // PRoot: root/bind/cwd/qemu/-S take a following path or command word.
@@ -1971,6 +2000,14 @@ fn stage_programs(command: &str) -> HashSet<String> {
             }
             let word = trimmed_word(raw);
             if !word.is_empty() && program_position {
+                if word == "--" {
+                    index += 1;
+                    if separator_after {
+                        program_position = true;
+                        active_prefix = None;
+                    }
+                    continue;
+                }
                 if word.starts_with('-') {
                     index += 1;
                     if let Some(prefix) = active_prefix {
@@ -3527,9 +3564,9 @@ mod tests {
     /// learns to step over must be taught to both.
     #[test]
     fn stage_prefixes_len_includes_bubblewrap_alias() {
-        // 63 wrappers + systemd-socket-activate.
+        // 64 wrappers + daemonize / setlock / s6-setuidgid.
         let prefixes = stage_prefixes_for_tests();
-        assert_eq!(prefixes.len(), 64, "{prefixes:?}");
+        assert_eq!(prefixes.len(), 67, "{prefixes:?}");
         assert!(prefixes.contains(&"bubblewrap"));
         assert!(prefixes.contains(&"bwrap"));
         assert!(prefixes.contains(&"dbus-run-session"));
@@ -3545,6 +3582,13 @@ mod tests {
         assert!(prefixes.contains(&"chrt"));
         assert!(prefixes.contains(&"schedtool"));
         assert!(prefixes.contains(&"setpriv"));
+        assert!(prefixes.contains(&"chpst"));
+        assert!(prefixes.contains(&"firejail"));
+        assert!(prefixes.contains(&"softlimit"));
+        assert!(prefixes.contains(&"setuidgid"));
+        assert!(prefixes.contains(&"daemonize"));
+        assert!(prefixes.contains(&"setlock"));
+        assert!(prefixes.contains(&"s6-setuidgid"));
     }
 
     #[test]
@@ -3552,7 +3596,8 @@ mod tests {
         // Intentional non-STAGE names from the 2026-09-29 PATH probe wave.
         // `script` / `capsh` are covered elsewhere (PIPE / already STAGE);
         // these must not quietly join STAGE_PREFIXES without a fail-closed
-        // peel + jagent arm. `systemd-socket-activate` graduated this wave.
+        // peel + jagent arm. `daemonize` / `setlock` / `s6-setuidgid`
+        // graduated this wave; leftovers are socket/logger/supervisor tools.
         let prefixes = stage_prefixes_for_tests();
         for name in [
             "logger",
@@ -3571,6 +3616,12 @@ mod tests {
             // flatpak-spawn absent from PATH here; snap run argv is too complex.
             "flatpak-spawn",
             "snap",
+            "s6-sudo",
+            "multilog",
+            "svlogd",
+            "runsv",
+            "runsvdir",
+            "sv",
         ] {
             assert!(
                 !prefixes.contains(&name),
@@ -3590,6 +3641,10 @@ mod tests {
         assert!(
             !PIPE_INTERPRETERS.contains(&"capsh"),
             "capsh must not also be PIPE_INTERPRETERS"
+        );
+        assert!(
+            PIPE_INTERPRETERS.contains(&"tcsh"),
+            "tcsh must stay PIPE_INTERPRETERS, not migrate to STAGE"
         );
     }
 
@@ -3802,6 +3857,53 @@ mod tests {
     }
 
     #[test]
+    fn daemonize_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | daemonize sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | daemonize -p /run/x.pid bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn setlock_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | setlock /tmp/x.lock sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | setlock -n /tmp/x.lock bash")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
+    fn s6_setuidgid_pipe_to_sh_is_adds_pipe_to_interpreter() {
+        assert_eq!(
+            validate_candidate(
+                Original("ls -l | head -20"),
+                Candidate("ls -l | s6-setuidgid nobody sh")
+            ),
+            Err(CorrectionRejection::AddsPipeToInterpreter)
+        );
+    }
+
+    #[test]
     fn dispatches_table_includes_bubblewrap_ro_bind_form() {
         // Mirrors the DISPATCHES row in every_stage_prefix_is_transparent_to_jagent_too.
         assert!(
@@ -3835,6 +3937,7 @@ mod tests {
             ("chronic", "chronic rm -rf /"),
             ("chpst", "chpst -u nobody rm -rf /"),
             ("command", "command rm -rf /"),
+            ("daemonize", "daemonize -p /run/x.pid rm -rf /"),
             ("dbus-run-session", "dbus-run-session -- rm -rf /"),
             ("doas", "doas rm -rf /"),
             ("dumb-init", "dumb-init -- rm -rf /"),
@@ -3860,9 +3963,11 @@ mod tests {
             ("run0", "run0 rm -rf /"),
             ("runcon", "runcon unconfined_t rm -rf /"),
             ("runuser", "runuser -u root -- rm -rf /"),
+            ("s6-setuidgid", "s6-setuidgid nobody rm -rf /"),
             ("schedtool", "schedtool -B -e rm -rf /"),
             ("scriptlive", "scriptlive typescript rm -rf /"),
             ("setarch", "setarch x86_64 rm -rf /"),
+            ("setlock", "setlock /tmp/x.lock rm -rf /"),
             ("setpriv", "setpriv --reuid 0 rm -rf /"),
             ("setsid", "setsid rm -rf /"),
             ("setuidgid", "setuidgid nobody rm -rf /"),
@@ -3933,6 +4038,7 @@ mod tests {
             ("chronic", "chronic cargo test"),
             ("chpst", "chpst -u nobody cargo test"),
             ("command", "command cargo test"),
+            ("daemonize", "daemonize -p /run/x.pid cargo test"),
             ("dbus-run-session", "dbus-run-session -- cargo test"),
             ("doas", "doas cargo test"),
             ("dumb-init", "dumb-init -- cargo test"),
@@ -3958,9 +4064,11 @@ mod tests {
             ("run0", "run0 cargo test"),
             ("runcon", "runcon unconfined_t cargo test"),
             ("runuser", "runuser -u root -- cargo test"),
+            ("s6-setuidgid", "s6-setuidgid nobody cargo test"),
             ("schedtool", "schedtool -B -e cargo test"),
             ("scriptlive", "scriptlive typescript cargo test"),
             ("setarch", "setarch x86_64 cargo test"),
+            ("setlock", "setlock /tmp/x.lock cargo test"),
             ("setpriv", "setpriv --reuid 0 cargo test"),
             ("setsid", "setsid cargo test"),
             ("setuidgid", "setuidgid nobody cargo test"),
@@ -4466,6 +4574,22 @@ mod tests {
             stage_interpreter("flock -w 1 /tmp/lock bash").as_deref(),
             Some("bash")
         );
+        assert_eq!(
+            stage_interpreter("flock -- /tmp/lock sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("flock /tmp/lock -- bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            stage_interpreter("flock -n -- /var/lock/x sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("flock -w -- /tmp/lock sh").as_deref(),
+            Some("sh")
+        );
         // FD-only form has no child — including when junk follows the FD, which
         // util-linux / jagent also refuse to treat as a dispatched program.
         assert_eq!(stage_interpreter("flock 9").as_deref(), None);
@@ -4500,6 +4624,26 @@ mod tests {
             stage_interpreter("setuidgid nobody sh").as_deref(),
             Some("sh")
         );
+        assert_eq!(
+            stage_interpreter("s6-setuidgid nobody sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("setlock /tmp/x.lock sh").as_deref(),
+            Some("sh")
+        );
+        assert_eq!(
+            stage_interpreter("setlock -n /tmp/x.lock bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("daemonize -- sh").as_deref(), Some("sh"));
+        assert_eq!(
+            stage_interpreter("daemonize -p /run/x.pid bash").as_deref(),
+            Some("bash")
+        );
+        assert_eq!(stage_interpreter("daemonize --help").as_deref(), None);
+        assert_eq!(stage_interpreter("daemonize --version").as_deref(), None);
+        assert_eq!(stage_interpreter("setlock --help").as_deref(), None);
         assert_eq!(
             stage_interpreter("envdir /var/service/x/env bash").as_deref(),
             Some("bash")
@@ -4686,6 +4830,8 @@ mod tests {
             "ls -l | bubblewrap --setenv FOO bar bash",
             "ls -l | numactl --cpunodebind=0 sh",
             "ls -l | flock /tmp/lock sh",
+            "ls -l | flock -- /tmp/lock sh",
+            "ls -l | flock /tmp/lock -- sh",
             "ls -l | eatmydata sh",
             "ls -l | chronic -e sh",
             "ls -l | rlwrap sh",
@@ -4719,6 +4865,11 @@ mod tests {
             "ls -l | systemd-inhibit --what=idle bash",
             "ls -l | aa-exec sh",
             "ls -l | aa-exec -p unconfined bash",
+            "ls -l | daemonize sh",
+            "ls -l | daemonize -p /run/x.pid bash",
+            "ls -l | setlock /tmp/x.lock sh",
+            "ls -l | setlock -n /tmp/x.lock bash",
+            "ls -l | s6-setuidgid nobody sh",
         ] {
             assert_eq!(
                 validate_candidate(Original("ls -l | head -20"), Candidate(candidate)),
@@ -4736,6 +4887,9 @@ mod tests {
             "ls -l | numactl -s",
             "ls -l | firejail --help",
             "ls -l | firejail --version",
+            "ls -l | daemonize --help",
+            "ls -l | daemonize --version",
+            "ls -l | setlock --help",
             "ls -l | strace -p 1",
             "ls -l | scriptlive typescript",
             "ls -l | scriptlive -t timing -I typescript",
