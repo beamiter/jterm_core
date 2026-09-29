@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip after wave-36 / round-57 smoke)
+
+## 2026-09-29 (align tip — wave-36 leftovers/deepen + round-57)
+
+- Local HEAD path-patch-only after wave-36 network inventory leftovers +
+  numactl/schedtool query fail-closed deepen beside jagent `1655e0b` and
+  ember/frost round-57 smoke (`00f351c` / `3610702`). STAGE **71** /
+  between() **93** held.
+
+
 Updated: 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 through wave-36 cohort)
 
 ## 2026-09-29 (CLASSIFY/DISPATCHES STAGE 71 — wave-36 cohort)
