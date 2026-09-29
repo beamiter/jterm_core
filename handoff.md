@@ -1,28 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (aa-exec detached long-opt deepen + celebrate survey tip)
+Updated: 2026-09-29 (point pending tip at HEAD after round-47 cancel repair)
 
-## 2026-09-29 (wave): aa-exec / socket-activate detached long-opt peel deepen
+## 2026-09-29 (point pending tip — round-47 cancel repair)
 
-`--profile` / `--namespace` / `--listen` / `--setenv` / `--fdname` detached
-value forms peel beside `=` attached forms already pinned. STAGE **71**.
-
-## 2026-09-29 (pending tip — deepen + CrossBlock cancel + celebrate survey)
-
-- Local HEAD path-patch-only. Anvil rounds 158–160 / forge 200–202 CrossBlock
-  near-wrap cancel + Failure/Stuck/Cautious→Celebrate Full-motion survey sit
-  beside aa-exec/socket-activate arity+classify deepen. STAGE **71** /
-  between() **93** unchanged. Push/repin cohort still pending.
-
-
-Updated: 2026-09-29 (repair tip align after round-47 cancel cohort)
-
-## 2026-09-29 (align tip — round-47 cancel cohort)
-
-- Local HEAD `b6fff1f` path-patch-only. Anvil `dcf2ff2` rounds 155–159 / forge
-  `6bd0903` 196–201 sticky VS/find/GlanceAside + CrossBlock cancel and ember
-  `13bb735` / frost `7f3b327` round-47 smoke sit beside. STAGE **71** /
-  between() **93** unchanged. Push/repin still pending.
+- Local HEAD `b557998` path-patch-only. Anvil `db42070` rounds 155–159 / forge
+  `acd144e` 196–201 + ember `13bb735` / frost `7f3b327` round-47 smoke sit
+  beside. STAGE **71** / between() **93** unchanged. Push/repin still pending.
 
 
 Updated: 2026-09-29 (aa-exec/socket-activate classify parity + CrossBlock cancel)
