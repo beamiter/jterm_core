@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 through wave-38 cohort)
+
+## 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 — wave-38 cohort)
+
+- CLASSIFY/DISPATCHES set-eq held at STAGE **71** through wave-38 process-table
+  monitor leftover pin + softlimit/cgexec help/version fail-closed deepen and
+  timeout/nice classify peels. Membership len unchanged.
+
+
 Updated: 2026-09-30 (wave 38 deepen: softlimit/cgexec STAGE + CLASSIFY 71)
 
 ## 2026-09-30 (wave 38 deepen — softlimit/cgexec help fail-closed + classify)
