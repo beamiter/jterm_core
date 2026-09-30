@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (pending tip beside wave-38 deepen)
+
+## 2026-09-30 (pending tip — wave-38 deepen)
+
+- Pending tip through wave-38 process-table monitor leftovers + softlimit/cgexec
+  help fail-closed deepen beside jagent tip. CLASSIFY/DISPATCHES **71** held.
+
+
 Updated: 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 through wave-38 cohort)
 
 ## 2026-09-30 (CLASSIFY/DISPATCHES STAGE 71 — wave-38 cohort)
