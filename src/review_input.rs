@@ -43,10 +43,14 @@ pub fn validate(text: &str) -> Result<&str, ReviewInputError> {
     if text.trim().is_empty() {
         return Err(ReviewInputError::Empty);
     }
-    if text.chars().any(char::is_control) {
-        return Err(ReviewInputError::ControlCharacter);
+    let mut visual_spoofing = false;
+    for ch in text.chars() {
+        if ch.is_control() {
+            return Err(ReviewInputError::ControlCharacter);
+        }
+        visual_spoofing |= is_visual_spoofing_character(ch);
     }
-    if contains_visual_spoofing(text) {
+    if visual_spoofing {
         return Err(ReviewInputError::VisualSpoof);
     }
     Ok(text)
