@@ -748,30 +748,146 @@ fn closest_command_word(command: &str, suggested: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Raw argument spans, excluding unquoted command separators and redirection
+/// operands. This is a lexical boundary scan, not a shell evaluator: expansions
+/// remain opaque. A redirect filename must never become an executed program.
+fn shell_word_spans(command: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = command.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut redirection_operand = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if quote.is_none()
+            && (byte.is_ascii_whitespace()
+                || matches!(byte, b'|' | b';' | b'&' | b'(' | b')' | b'<' | b'>'))
+        {
+            if let Some(start) = start.take() {
+                if !redirection_operand {
+                    spans.push(start..index);
+                }
+                redirection_operand = false;
+            }
+            if matches!(byte, b'<' | b'>') {
+                redirection_operand = true;
+            }
+            index += 1;
+            continue;
+        }
+        start.get_or_insert(index);
+        match (quote, byte) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (Some(b'\''), _) => {}
+            (_, b'\\') => index += 1,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            _ => {}
+        }
+        index += 1;
+    }
+    if let Some(start) = start {
+        if !redirection_operand {
+            spans.push(start..bytes.len());
+        }
+    }
+    spans
+}
+
+/// Decode only shell quoting/escapes, without expanding variables or running
+/// anything. Quoted whitespace is one argv value, and `s\\h` names `sh`.
+fn shell_word_value(word: &str) -> String {
+    let mut value = String::with_capacity(word.len());
+    let mut quote = None;
+    let mut chars = word.chars().peekable();
+    while let Some(character) = chars.next() {
+        match (quote, character) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => value.push(character),
+            (None, '\'' | '"') => quote = Some(character),
+            (_, '\\') => {
+                if quote.is_none()
+                    || chars
+                        .peek()
+                        .is_some_and(|next| matches!(next, '$' | '`' | '"' | '\\'))
+                {
+                    if let Some(next) = chars.next() {
+                        value.push(next);
+                    } else {
+                        value.push(character);
+                    }
+                } else {
+                    value.push(character);
+                }
+            }
+            _ => value.push(character),
+        }
+    }
+    value
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    shell_word_spans(command)
+        .into_iter()
+        .map(|span| shell_word_value(&command[span]))
+        .collect()
+}
+
+/// Trim only shell padding, never an escaped or quoted terminal space. Turning
+/// `file\\ ` into `file\\` changes the argument and leaves a continuation.
+fn trim_command_padding(command: &str) -> &str {
+    let command = command.trim_start();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut end = 0;
+    for (index, character) in command.char_indices() {
+        if escaped || quote.is_some() || !character.is_whitespace() {
+            end = index + character.len_utf8();
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, character) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => escaped = true,
+            (None, '\'' | '"') => quote = Some(character),
+            _ => {}
+        }
+    }
+    &command[..end]
+}
+
 fn replace_shell_word(command: &str, old: &str, new: &str) -> Option<String> {
-    if old.is_empty() || new.is_empty() || old == new {
+    // A deterministic name correction cannot introduce shell expansions or
+    // syntax, even when that syntax already appeared elsewhere in the line.
+    if old.is_empty() || new.is_empty() || old == new || !new.chars().all(is_shell_word_character) {
         return None;
     }
-    let mut matches = command.match_indices(old).filter_map(|(start, _)| {
-        let end = start + old.len();
-        let previous = command[..start].chars().next_back();
-        let next = command[end..].chars().next();
-        (!previous.is_some_and(is_shell_word_character)
-            && !next.is_some_and(is_shell_word_character))
-        .then_some(start)
+    let mut matches = shell_word_spans(command).into_iter().filter_map(|span| {
+        let raw = &command[span.clone()];
+        if raw == old {
+            Some(span)
+        } else if raw.len() >= 2
+            && matches!(raw.as_bytes()[0], b'\'' | b'"')
+            && raw.as_bytes().first() == raw.as_bytes().last()
+            && &raw[1..raw.len() - 1] == old
+        {
+            Some(span.start + 1..span.end - 1)
+        } else {
+            None
+        }
     });
-    let start = matches.next()?;
-    // When the same token appears more than once, guessing which occurrence
-    // failed can silently change an unrelated argument. Leave that case to the
-    // editable AI fallback instead of claiming a deterministic correction.
+    let span = matches.next()?;
+    // Ambiguous occurrences or embedded fragments are never a verified edit.
     if matches.next().is_some() {
         return None;
     }
-    let end = start + old.len();
     let mut replacement = String::with_capacity(command.len() + new.len());
-    replacement.push_str(&command[..start]);
+    replacement.push_str(&command[..span.start]);
     replacement.push_str(new);
-    replacement.push_str(&command[end..]);
+    replacement.push_str(&command[span.end..]);
     Some(replacement)
 }
 
@@ -956,18 +1072,6 @@ pub fn syntax_markers(command: &str) -> HashSet<&'static str> {
         .collect()
 }
 
-/// One command-line word with the punctuation a real command line carries
-/// trimmed off both ends, so `ls;` is `ls` and `'/bin/su'` is `bin/su`.
-///
-/// Interior characters are kept: a path spelling stays a path here and is
-/// reduced to its program name by [`stage_word_name`], which is a separate
-/// question from where the word sits.
-fn trimmed_word(word: &str) -> &str {
-    word.trim_matches(|character: char| {
-        !character.is_alphanumeric() && character != '_' && character != '-'
-    })
-}
-
 /// The one gate every candidate passes, whatever produced it.
 ///
 /// forge split this in two and ran deterministic candidates — target-output
@@ -995,11 +1099,11 @@ pub fn validate_candidate(
     if candidate.len() > MAX_CORRECTION_COMMAND_BYTES {
         return Err(CorrectionRejection::CommandTooLarge);
     }
-    let candidate = review_input::validate(candidate)
-        .map_err(CorrectionRejection::CommandUnsafe)?
-        .trim()
-        .to_string();
-    if candidate == original.trim() {
+    let candidate = trim_command_padding(
+        review_input::validate(candidate).map_err(CorrectionRejection::CommandUnsafe)?,
+    )
+    .to_string();
+    if candidate == trim_command_padding(original) {
         return Err(CorrectionRejection::CommandUnchanged);
     }
     let original_markers = syntax_markers(original);
@@ -1297,11 +1401,16 @@ fn piped_interpreters(command: &str) -> HashSet<String> {
 ///
 /// `||` splits too, deliberately: the right-hand side of a `||` also runs, and
 /// treating it as a stage only ever makes the candidate side stricter. Command
-/// substitutions are *not* modelled — a `|` inside `$( )` splits like any
-/// other. That is the safe direction for the candidate (more stages examined)
-/// and the conservative one for the original, whose stage word then keeps its
-/// trailing `)` and matches no interpreter.
+/// substitutions are *not* evaluated — a `|` inside `$( )` splits like any
+/// other. This is a bounded lexical guard, not a general shell parser or a
+/// guarantee that an accepted command is safe to execute.
 fn pipeline_stages(command: &str) -> Vec<&str> {
+    shell_stages(command, false)
+}
+
+/// Program-position scanning additionally splits compact control operators:
+/// `a;sudo b`, `a&&ssh h`, and grouped commands have no required whitespace.
+fn shell_stages(command: &str, all_controls: bool) -> Vec<&str> {
     let bytes = command.as_bytes();
     let mut stages = Vec::new();
     let mut start = 0;
@@ -1325,7 +1434,12 @@ fn pipeline_stages(command: &str) -> Vec<&str> {
             None => match byte {
                 b'\\' => index += 1,
                 b'\'' | b'"' => quote = Some(byte),
-                b'|' => {
+                b'|' | b';' | b'&' | b'(' | b')'
+                    if (byte == b'|' || all_controls)
+                        && !(byte == b'&'
+                            && index > 0
+                            && matches!(bytes[index - 1], b'<' | b'>')) =>
+                {
                     stages.push(&command[start..index]);
                     start = index + 1;
                 }
@@ -1347,7 +1461,8 @@ fn stage_interpreter(stage: &str) -> Option<String> {
     // afterwards — reducing first turns `PATH=/usr/bin sh` into the word
     // `bin`, which is not an assignment, not an interpreter, and stops the
     // scan one word short of the shell.
-    let words: Vec<&str> = stage.split_whitespace().collect();
+    let decoded_words = shell_words(stage);
+    let words: Vec<&str> = decoded_words.iter().map(String::as_str).collect();
     let mut index = 0;
     let mut active_prefix: Option<&str> = None;
     let mut dispatch_operand_skipped = false;
@@ -1369,6 +1484,13 @@ fn stage_interpreter(stage: &str) -> Option<String> {
                     stage_option_detached_value_count(prefix, word),
                 );
             }
+            continue;
+        }
+        // The first timeout operand is a duration, including fractional or
+        // unit-suffixed forms. Consume it once, not just digit-only spellings.
+        if active_prefix == Some("timeout") {
+            active_prefix = None;
+            index += 1;
             continue;
         }
         // util-linux `flock [options] FD` locks a descriptor and runs no child
@@ -1434,9 +1556,10 @@ fn stage_interpreter(stage: &str) -> Option<String> {
         }
         break word;
     };
-    // An expansion picks its program at run time, so nothing here can prove it
-    // is not a shell. Unknown means unsafe.
-    if program.contains('$') || program.contains('`') {
+    // An expansion picks its program at run time. A quoted command-string
+    // operand can also contain a nested interpreter invocation. This lexical
+    // guard does not evaluate either form; unknown remains unsafe.
+    if program.contains('$') || program.contains('`') || program.chars().any(char::is_whitespace) {
         return Some(UNRESOLVABLE_STAGE.to_string());
     }
     let name = stage_word_name(program);
@@ -2010,32 +2133,18 @@ fn is_assignment_word(word: &str) -> bool {
 /// dispatcher to a single terminal program: `sudo` is itself an answer here.
 fn stage_programs(command: &str) -> HashSet<String> {
     let mut programs = HashSet::new();
-    for stage in pipeline_stages(command) {
-        // `pipeline_stages` splits on `|` only, but `;`, `&&`, `||` and `&` all
-        // begin a new command too, so the word after one is a program position
-        // again. Missing that would read `ls; sudo cat x` as the single program
-        // `ls` and never see the elevation the candidate introduced.
-        let words: Vec<&str> = stage.split_whitespace().collect();
+    for stage in shell_stages(command, true) {
+        let decoded_words = shell_words(stage);
+        let words: Vec<&str> = decoded_words.iter().map(String::as_str).collect();
         let mut index = 0;
         let mut program_position = true;
         let mut active_prefix: Option<&str> = None;
         let mut dispatch_operand_skipped = false;
         while index < words.len() {
-            let raw = words[index];
-            let separator_before = raw.starts_with([';', '&']);
-            let separator_after = raw.ends_with([';', '&']);
-            if separator_before {
-                program_position = true;
-                active_prefix = None;
-            }
-            let word = trimmed_word(raw);
+            let word = words[index];
             if !word.is_empty() && program_position {
                 if word == "--" {
                     index += 1;
-                    if separator_after {
-                        program_position = true;
-                        active_prefix = None;
-                    }
                     continue;
                 }
                 if word.starts_with('-') {
@@ -2047,10 +2156,11 @@ fn stage_programs(command: &str) -> HashSet<String> {
                             stage_option_detached_value_count(prefix, word),
                         );
                     }
-                    if separator_after {
-                        program_position = true;
-                        active_prefix = None;
-                    }
+                    continue;
+                }
+                if active_prefix == Some("timeout") {
+                    active_prefix = None;
+                    index += 1;
                     continue;
                 }
                 // What merely describes the run is not a program, so keep
@@ -2086,10 +2196,6 @@ fn stage_programs(command: &str) -> HashSet<String> {
                         // Positional USER/NEWROOT/FILE before CMD — not a program.
                         index += 1;
                         active_prefix = None;
-                        if separator_after {
-                            program_position = true;
-                            active_prefix = None;
-                        }
                         continue;
                     }
                     // Multiplexer: record busybox and keep scanning for the
@@ -2098,9 +2204,6 @@ fn stage_programs(command: &str) -> HashSet<String> {
                         programs.insert(name);
                         program_position = true;
                         active_prefix = None;
-                        if separator_after {
-                            program_position = true;
-                        }
                         index += 1;
                         continue;
                     }
@@ -2116,27 +2219,15 @@ fn stage_programs(command: &str) -> HashSet<String> {
                     programs.insert(name);
                 }
             }
-            if separator_after {
-                program_position = true;
-                active_prefix = None;
-            }
             index += 1;
         }
     }
     programs
 }
 
-/// One stage word reduced to the program name it would execute: quotes and a
-/// leading backslash stripped, directories dropped, case folded. This is what
-/// makes `| /bin/sh`, `| "sh"` and `| SH` the same answer as `| sh`.
+/// A decoded shell word reduced to its path-stripped, case-folded name.
 fn stage_word_name(word: &str) -> String {
-    let unquoted = word.replace(['\'', '"'], "");
-    let unescaped = unquoted.strip_prefix('\\').unwrap_or(&unquoted);
-    unescaped
-        .rsplit('/')
-        .next()
-        .unwrap_or(unescaped)
-        .to_ascii_lowercase()
+    word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase()
 }
 
 /// Re-validate a draft the user edited on the card before it reaches the PTY.
@@ -2152,7 +2243,7 @@ pub fn validate_edited_command(draft: &str) -> Result<String, CorrectionRejectio
         return Err(CorrectionRejection::CommandTooLarge);
     }
     review_input::validate(draft)
-        .map(|command| command.trim().to_string())
+        .map(|command| trim_command_padding(command).to_string())
         .map_err(CorrectionRejection::CommandUnsafe)
 }
 
@@ -7901,6 +7992,277 @@ mod tests {
                 }
                 Ok(_) | Err(_) => break,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lexical_regressions {
+    use super::*;
+
+    #[test]
+    fn compact_separators_cannot_hide_new_privilege_or_remote_programs() {
+        for separator in [";", "&&", "||", "&", "|"] {
+            let original = format!("echo ok{separator}gti status");
+            for (program, expected) in [
+                (
+                    "sudo git status",
+                    CorrectionRejection::AddsPrivilegeEscalation,
+                ),
+                ("ssh fake.invalid", CorrectionRejection::AddsRemoteExecution),
+            ] {
+                let candidate = format!("echo ok{separator}{program}");
+                let reply = serde_json::json!({"action": "suggest", "command": candidate, "message": "Fixture correction."}).to_string();
+                assert_eq!(
+                    parse_ai_reply(Original(&original), &reply),
+                    Err(expected),
+                    "{candidate}"
+                );
+            }
+        }
+        assert_eq!(
+            validate_candidate(Original("echo 'ok;sudo'"), Candidate("echo ok;sudo id")),
+            Err(CorrectionRejection::AddsPrivilegeEscalation)
+        );
+        assert!(
+            validate_candidate(Original("echo 'ok;sudo'"), Candidate("echo 'okay;sudo'")).is_ok()
+        );
+    }
+
+    #[test]
+    fn quoted_metadata_and_escaped_program_names_cannot_hide_interpreters() {
+        for candidate in [
+            "cat input | env -u 'one two' sh",
+            "cat input | env '-u' \"one two\" sh",
+            r"cat input | env -u one\ two sh",
+            r"cat input | s\h",
+            r"cat input | s\u\do id",
+            "cat input | (sh)",
+        ] {
+            assert!(
+                validate_candidate(Original("cat input | head"), Candidate(candidate)).is_err(),
+                "{candidate}"
+            );
+        }
+        assert!(validate_candidate(
+            Original("cat input | head"),
+            Candidate("cat input | env -u 'one two' tail")
+        )
+        .is_ok());
+        // A literal backslash inside single quotes is not a shell escape.
+        assert_eq!(stage_interpreter(r"'s\h'"), None);
+        assert_eq!(
+            shell_words("env -u 'one two' sh"),
+            ["env", "-u", "one two", "sh"]
+        );
+        assert_eq!(
+            shell_words(r#"echo "one\ two" s\h"#),
+            ["echo", r"one\ two", "sh"]
+        );
+    }
+
+    #[test]
+    fn escaped_terminal_space_survives_candidate_draft_and_acceptance() {
+        let command = "git add filename\\ ";
+        assert_eq!(validate_edited_command(command).as_deref(), Ok(command));
+        assert_eq!(
+            validate_candidate(Original("gti add filename\\ "), Candidate(command)).as_deref(),
+            Ok(command)
+        );
+        let candidate = CorrectionCandidate::for_tests(
+            Original("gti add filename\\ "),
+            Candidate(command),
+            "Fixture correction.",
+            CorrectionEvidence::ExecutablePath,
+        )
+        .unwrap();
+        let mut proposal = CorrectionProposal::new(candidate);
+        assert_eq!(proposal.accept().unwrap().command, command);
+        assert!(proposal.run_allowed());
+        *proposal.draft_mut() = "git add filename\\".to_string();
+        assert!(!proposal.run_allowed());
+        assert!(!proposal.accept().unwrap().run_directly);
+        // Only the escaped space belongs to the word; later plain padding can go.
+        assert_eq!(
+            validate_edited_command("git add filename\\   ").as_deref(),
+            Ok(command)
+        );
+        assert_eq!(
+            validate_edited_command("  git add filename\\\\   ").as_deref(),
+            Ok("git add filename\\\\")
+        );
+    }
+
+    #[test]
+    fn deterministic_replacement_requires_a_complete_literal_word() {
+        for original in [
+            "git 'prefix staus suffix'",
+            "git '$staus'",
+            "git ${staus}",
+            "git staus*",
+            "git staus=foo",
+            r"git prefix\ staus",
+        ] {
+            assert!(
+                replace_shell_word(original, "staus", "status").is_none(),
+                "{original}"
+            );
+        }
+        for (original, expected) in [
+            ("git 'staus'", "git 'status'"),
+            ("git \"staus\"", "git \"status\""),
+            ("echo ok;git staus", "echo ok;git status"),
+            ("git staus -- 文件", "git status -- 文件"),
+        ] {
+            assert_eq!(
+                replace_shell_word(original, "staus", "status").as_deref(),
+                Some(expected)
+            );
+        }
+        for name in [
+            "stat*",
+            "stat?",
+            "sta[tus]",
+            "$STATUS",
+            "status;id",
+            "status id",
+            "stat\\us",
+            "stat'us",
+        ] {
+            assert!(
+                replace_shell_word("git staus", "staus", name).is_none(),
+                "{name}"
+            );
+        }
+        assert!(replace_shell_word("git staus 'staus'", "staus", "status").is_none());
+    }
+
+    #[test]
+    fn target_output_cannot_rewrite_an_embedded_argument_or_add_a_glob() {
+        let policy = CorrectionPolicy::new(
+            LocalEvidence::Unavailable,
+            ContextSharing::Withheld,
+            "pure-correction-fixture",
+        );
+        for (command, output) in [
+            (
+                "git 'prefix staus suffix'",
+                "unknown subcommand 'staus'\nDid you mean 'status'?",
+            ),
+            ("gti status", "gti: command not found\nDid you mean 'gi*'?"),
+        ] {
+            let request = should_start(
+                true,
+                CompletionFacts {
+                    command: command.to_string(),
+                    exit_code: Some(1),
+                    output,
+                    cwd: None,
+                    remote: true,
+                    agent_issued: false,
+                    trusted_completion: true,
+                },
+            )
+            .unwrap();
+            assert!(
+                deterministic_candidate(
+                    &policy,
+                    &request,
+                    &AiCancellationToken::new(),
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_none(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_command_string_is_conservatively_unresolved_when_piped() {
+        assert!(validate_candidate(
+            Original("cat input | head"),
+            Candidate("cat input | flock lock -c 'sh -s'")
+        )
+        .is_err());
+    }
+    #[test]
+    fn adjacent_redirections_preserve_program_positions_without_promoting_filenames() {
+        for (original, candidate, expected) in [
+            (
+                "gti >stdout",
+                "sudo>stdout git status",
+                CorrectionRejection::AddsPrivilegeEscalation,
+            ),
+            (
+                "gti >stdout",
+                "ssh>stdout fake.invalid",
+                CorrectionRejection::AddsRemoteExecution,
+            ),
+            (
+                "cat input | head </dev/null",
+                "cat input | sh</dev/null",
+                CorrectionRejection::AddsPipeToInterpreter,
+            ),
+            (
+                ">sudo gti",
+                "sudo>stdout git status",
+                CorrectionRejection::AddsPrivilegeEscalation,
+            ),
+            (
+                "2>sudo gti",
+                "sudo 2>stdout git status",
+                CorrectionRejection::AddsPrivilegeEscalation,
+            ),
+            (
+                "echo >&sudo",
+                "sudo >&stdout git status",
+                CorrectionRejection::AddsPrivilegeEscalation,
+            ),
+            (
+                r"echo \;sudo",
+                "echo okay;sudo id",
+                CorrectionRejection::AddsPrivilegeEscalation,
+            ),
+            (
+                "\"'sudo'\" id",
+                "sudo id",
+                CorrectionRejection::AddsPrivilegeEscalation,
+            ),
+        ] {
+            assert_eq!(
+                validate_candidate(Original(original), Candidate(candidate)),
+                Err(expected),
+                "{original} -> {candidate}"
+            );
+        }
+        assert_eq!(
+            replace_shell_word("git staus>stdout", "staus", "status").as_deref(),
+            Some("git status>stdout")
+        );
+        assert!(replace_shell_word("gti>staus", "staus", "status").is_none());
+        assert!(validate_candidate(
+            Original("2>stderr sudo gti"),
+            Candidate("2>stderr sudo git")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn timeout_consumes_exactly_one_duration_operand() {
+        for duration in ["5", "0.5", "1s", "2m", "0.1h"] {
+            for program in ["sh", "sudo id", "ssh fake.invalid"] {
+                let candidate = format!("cat input | timeout {duration} {program}");
+                assert!(
+                    validate_candidate(Original("cat input | head"), Candidate(&candidate))
+                        .is_err(),
+                    "{candidate}"
+                );
+            }
+            assert!(validate_candidate(
+                Original("cat input | head"),
+                Candidate(&format!("cat input | timeout {duration} tail"))
+            )
+            .is_ok());
         }
     }
 }

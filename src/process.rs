@@ -514,13 +514,14 @@ pub fn process_comm(pid: i32) -> Option<String> {
 }
 
 /// The process working directory via `/proc/<pid>/cwd`, when readable.
+/// Non-UTF-8 paths return `None`; a lossy spelling could name another directory.
 pub fn process_cwd(pid: i32) -> Option<String> {
     if pid <= 0 {
         return None;
     }
     std::fs::read_link(format!("/proc/{pid}/cwd"))
         .ok()
-        .map(|path| path.to_string_lossy().into_owned())
+        .and_then(|path| path.into_os_string().into_string().ok())
 }
 
 /// Fields of `/proc/<pid>/stat` the terminals inspect.
@@ -1905,6 +1906,67 @@ fn blocking_reap(pid: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cwd_preserves_utf8_and_refuses_lossy_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+        const CHILD_MODE: &str = "JTERM_PROCESS_CWD_REGRESSION_CHILD";
+        if let Some(mode) = std::env::var_os(CHILD_MODE) {
+            let actual = process_cwd(std::process::id() as i32);
+            if mode == "utf8" {
+                assert_eq!(
+                    actual,
+                    std::env::current_dir()
+                        .unwrap()
+                        .into_os_string()
+                        .into_string()
+                        .ok()
+                );
+                assert!(actual.as_ref().unwrap().contains("cwd-目录"));
+            } else {
+                assert_eq!(mode, "nonutf8");
+                assert_eq!(
+                    actual, None,
+                    "a non-UTF8 cwd must not name its lossy replacement"
+                );
+            }
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("jterm-process-cwd-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let utf8 = base.join("cwd-目录");
+        let nonutf8 = base.join(std::ffi::OsString::from_vec(b"cwd-\xff".to_vec()));
+        std::fs::create_dir(&utf8).unwrap();
+        std::fs::create_dir(&nonutf8).unwrap();
+        let lossy = PathBuf::from(nonutf8.to_string_lossy().into_owned());
+        assert_ne!(lossy, nonutf8);
+        std::fs::create_dir(&lossy).unwrap();
+        let mut successes = Vec::new();
+        for (mode, cwd) in [("utf8", &utf8), ("nonutf8", &nonutf8)] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("process_cwd_preserves_utf8_and_refuses_lossy_paths")
+                .arg("--nocapture")
+                .env(CHILD_MODE, mode)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            successes.push((
+                mode,
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        std::fs::remove_dir(&utf8).unwrap();
+        std::fs::remove_dir(&nonutf8).unwrap();
+        std::fs::remove_dir(&lossy).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+        for (mode, success, stdout, stderr) in successes {
+            assert!(success, "{mode} child failed: {stdout}\n{stderr}");
+        }
+    }
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
