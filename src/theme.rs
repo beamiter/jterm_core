@@ -1077,7 +1077,7 @@ impl Theme {
     /// 解析 `"#RRGGBB"` 或 `"RRGGBB"`（忽略大小写/前导 #）为 `[r,g,b]`。
     pub fn hex_to_rgb(s: &str) -> Option<[u8; 3]> {
         let h = s.trim().trim_start_matches('#');
-        if h.len() != 6 {
+        if h.len() != 6 || !h.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
         let r = u8::from_str_radix(&h[0..2], 16).ok()?;
@@ -1437,6 +1437,22 @@ mod tests {
 #[cfg(test)]
 mod extra_tests {
     use super::*;
+
+    #[test]
+    fn hex_colors_reject_non_ascii_and_invalid_input_without_mutation() {
+        for valid in ["#aAbBcC", "AABBCC", "  #aabbcc  "] {
+            assert_eq!(Theme::hex_to_rgb(valid), Some([0xAA, 0xBB, 0xCC]));
+        }
+        let mut theme = Theme::default();
+        let before = theme.editable_color_hexes();
+        for invalid in [
+            "一二", "🦀aa", "a🦀a", "é1234", "#一二", "12345", "1234567", "gg0000", "",
+        ] {
+            assert_eq!(Theme::hex_to_rgb(invalid), None, "{invalid:?}");
+            assert!(!theme.set_editable_color(0, invalid), "{invalid:?}");
+            assert_eq!(theme.editable_color_hexes(), before);
+        }
+    }
 
     #[test]
     fn custom_theme_names_are_safe_single_path_components() {

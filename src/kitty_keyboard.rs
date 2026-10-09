@@ -160,6 +160,14 @@ pub enum KittyKey {
     /// lowercase, unshifted — which is what the protocol reports regardless of
     /// the modifiers held.
     Unicode(char),
+    /// A layout maps the pressed key to a different character than its base
+    /// form (for example Shift+1 produces `!`). Preserve that exact toolkit
+    /// character solely to recognize the key's legacy commit; CSI-u still
+    /// reports `base`. Use [`unicode_key`] when recording toolkit events.
+    UnicodeWithText {
+        base: char,
+        text: char,
+    },
     Escape,
     Enter,
     Tab,
@@ -170,6 +178,21 @@ pub enum KittyKey {
     /// modifier parameters) is what the protocol specifies for them under the
     /// disambiguate flag, so the encoder leaves them alone.
     Functional,
+}
+
+/// Record a text key's base form together with the toolkit's actual keyval.
+/// Ordinary letter case changes retain the historical [`KittyKey::Unicode`]
+/// representation. Other layout-specific mappings need their exact character
+/// so commit rewriting never has to guess a keyboard layout or accept arbitrary
+/// composed/pasted text as the recorded key.
+pub fn unicode_key(base: char, text: Option<char>) -> KittyKey {
+    if let Some(text) = text.filter(|ch| !ch.is_control()) {
+        let mut lower = text.to_lowercase();
+        if (lower.next(), lower.next()) != (Some(base), None) {
+            return KittyKey::UnicodeWithText { base, text };
+        }
+    }
+    KittyKey::Unicode(base)
 }
 
 /// Modifier state of a key event. Lock modifiers are deliberately absent: the
@@ -227,6 +250,7 @@ pub fn encode_key(key: KittyKey, mods: Modifiers, flags: u8) -> Option<Vec<u8>> 
         KittyKey::Backspace if mods.any() => 127,
         KittyKey::Space if mods.non_shift() => 32,
         KittyKey::Unicode(ch) if mods.non_shift() => u32::from(ch),
+        KittyKey::UnicodeWithText { base, .. } if mods.non_shift() => u32::from(base),
         _ => return None,
     };
     Some(csi_u(code, mods))
@@ -245,7 +269,12 @@ pub fn encode_key(key: KittyKey, mods: Modifiers, flags: u8) -> Option<Vec<u8>> 
 /// only the bytes VTE emitted *for that key* are replaced.
 pub fn rewrite_commit(key: KittyKey, mods: Modifiers, legacy: &[u8], flags: u8) -> Option<Vec<u8>> {
     let encoded = encode_key(key, mods, flags)?;
-    legacy_form_matches(key, legacy).then_some(encoded)
+    // VTE emits Alt+Escape as one ESC ESC commit. The joiner correctly leaves
+    // it intact, but it still needs the same CSI-u rewrite as a plain Escape.
+    // Require the recorded Alt modifier so an unrelated pair of escapes is
+    // not collapsed into a single key event.
+    let alt_escape = key == KittyKey::Escape && mods.alt && legacy == b"\x1b\x1b";
+    (legacy_form_matches(key, legacy) || alt_escape).then_some(encoded)
 }
 
 /// Whether `legacy` is a form the VTE emits for `key` — including the forms it
@@ -283,6 +312,13 @@ fn legacy_form_matches(key: KittyKey, legacy: &[u8]) -> bool {
                 || (legacy.first() == Some(&0x1b)
                     && legacy.len() > 1
                     && (is_c0(&legacy[1..]) || same_text(&legacy[1..])))
+        }
+        KittyKey::UnicodeWithText { base, text } => {
+            let mut buf = [0u8; 4];
+            let text = text.encode_utf8(&mut buf).as_bytes();
+            legacy_form_matches(KittyKey::Unicode(base), legacy)
+                || legacy == text
+                || legacy.strip_prefix(b"\x1b") == Some(text)
         }
         KittyKey::Functional => false,
     }
@@ -569,6 +605,42 @@ mod tests {
     }
 
     #[test]
+    fn layout_specific_shifted_text_matches_exactly_and_reports_the_base_key() {
+        let alt_shift = mods(true, true, false);
+        // The host supplies the active layout's keyval. No US-specific table
+        // is involved: these include digit, punctuation and non-Latin bases.
+        for (base, text) in [('1', '!'), ('2', '"'), (';', ':'), ('ж', '№')] {
+            let key = unicode_key(base, Some(text));
+            assert_eq!(key, KittyKey::UnicodeWithText { base, text });
+            let legacy = format!("\x1b{text}");
+            assert_eq!(
+                rewrite_commit(key, alt_shift, legacy.as_bytes(), DISAMBIGUATE),
+                encode_key(KittyKey::Unicode(base), alt_shift, DISAMBIGUATE)
+            );
+            assert_eq!(rewrite_commit(key, alt_shift, legacy.as_bytes(), 0), None);
+            assert_eq!(
+                rewrite_commit(
+                    key,
+                    mods(true, false, false),
+                    text.to_string().as_bytes(),
+                    1
+                ),
+                None
+            );
+            for unrelated in ["中", "unrelated paste", "\x1b?", "\x1b!more"] {
+                assert_eq!(
+                    rewrite_commit(key, alt_shift, unrelated.as_bytes(), 1),
+                    None
+                );
+            }
+        }
+        assert_eq!(unicode_key('a', Some('A')), KittyKey::Unicode('a'));
+        assert_eq!(unicode_key('ж', Some('Ж')), KittyKey::Unicode('ж'));
+        assert_eq!(unicode_key('a', None), KittyKey::Unicode('a'));
+        assert_eq!(unicode_key('a', Some('\n')), KittyKey::Unicode('a'));
+    }
+
+    #[test]
     fn commits_are_rewritten_only_when_they_are_the_keys_own_legacy_bytes() {
         // Shift+Enter: VTE commits "\r" — replaced.
         assert_eq!(
@@ -789,6 +861,43 @@ mod tests {
             JoinStep::Emit(Cow::Borrowed(&b"\x1b"[..]))
         );
         assert!(!joiner.is_holding());
+    }
+
+    #[test]
+    fn alt_escape_single_commit_is_disambiguated_only_for_its_recorded_key() {
+        let alt_esc = Some((KittyKey::Escape, mods(false, true, false)));
+        assert_eq!(
+            host_writes(alt_esc, &[b"\x1b\x1b"], DISAMBIGUATE),
+            [b"\x1b[27;3u".to_vec()]
+        );
+        assert_eq!(
+            host_writes(alt_esc, &[b"\x1b\x1b"], 0),
+            [b"\x1b\x1b".to_vec()]
+        );
+        assert_eq!(
+            rewrite_commit(KittyKey::Escape, mods(true, true, true), b"\x1b\x1b", 1).as_deref(),
+            Some(&b"\x1b[27;8u"[..])
+        );
+        for key in [KittyKey::Escape, KittyKey::Enter, KittyKey::Functional] {
+            assert_eq!(
+                rewrite_commit(key, Modifiers::default(), b"\x1b\x1b", 1),
+                None
+            );
+        }
+        assert_eq!(
+            rewrite_commit(KittyKey::Enter, mods(false, true, false), b"\x1b\x1b", 1),
+            None
+        );
+        assert_eq!(
+            rewrite_commit(
+                KittyKey::Escape,
+                mods(false, true, false),
+                b"\x1b\x1btext",
+                1
+            ),
+            None
+        );
+        assert_eq!(host_writes(None, &[b"\x1b\x1b"], 1), [b"\x1b\x1b".to_vec()]);
     }
 
     #[test]
