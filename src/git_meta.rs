@@ -50,6 +50,9 @@ const UNTRUSTED_GIT_ENVIRONMENT: &[&str] = &[
 ];
 /// Keep first paint responsive on slow disks, remote mounts, and large repos.
 const UI_WAIT_BUDGET: Duration = Duration::from_millis(12);
+/// Background callers may wait for the bounded probe plus a small queue grace.
+/// A busy queue still returns Timeout; no caller waits indefinitely for it.
+const FRESH_WAIT_BUDGET: Duration = GIT_STATUS_TIMEOUT.saturating_add(Duration::from_millis(100));
 
 #[cfg(not(unix))]
 static PORTABLE_READER_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -77,7 +80,17 @@ pub struct RepoMeta {
 }
 
 type ProbeResult = Option<RepoMeta>;
-type ReplySender = mpsc::SyncSender<ProbeResult>;
+/// A background read did not receive a definitive result for its own request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreshReadError {
+    /// Admission, worker startup, transport, or the underlying probe failed.
+    Unavailable,
+    /// The bounded background wait elapsed. The shared probe may still finish.
+    Timeout,
+}
+
+type ProbeCompletion = Result<ProbeResult, FreshReadError>;
+type ReplySender = mpsc::SyncSender<ProbeCompletion>;
 
 /// One worker serializes probes and prevents a process storm when several panes
 /// finish output together. Requests for the same cwd share one in-flight probe.
@@ -111,14 +124,25 @@ impl GitMetaService {
         self.cache.lock().ok()?.get(path).cloned()
     }
 
-    fn request(&self, path: &Path) -> Option<mpsc::Receiver<ProbeResult>> {
+    fn request(&self, path: &Path) -> Option<mpsc::Receiver<ProbeCompletion>> {
+        self.request_with_policy(path, true)
+    }
+
+    fn request_with_policy(
+        &self,
+        path: &Path,
+        join_existing: bool,
+    ) -> Option<mpsc::Receiver<ProbeCompletion>> {
         let path = path.to_path_buf();
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
 
         {
             let mut pending = self.pending.lock().ok()?;
             if let Some(waiters) = pending.get_mut(&path) {
-                if waiters.len() >= MAX_WAITERS_PER_PATH {
+                // A fresh caller cannot adopt an older probe that may predate
+                // the change it is reporting. Reject busy admission instead of
+                // starting another process or claiming that old answer is fresh.
+                if !join_existing || waiters.len() >= MAX_WAITERS_PER_PATH {
                     return None;
                 }
                 waiters.push(reply_tx);
@@ -147,8 +171,17 @@ fn worker_loop(
     cache: &Mutex<HashMap<PathBuf, ProbeResult>>,
     pending: &Mutex<HashMap<PathBuf, Vec<ReplySender>>>,
 ) {
+    worker_loop_with_probe(request_rx, cache, pending, read_uncached)
+}
+
+fn worker_loop_with_probe(
+    request_rx: mpsc::Receiver<PathBuf>,
+    cache: &Mutex<HashMap<PathBuf, ProbeResult>>,
+    pending: &Mutex<HashMap<PathBuf, Vec<ReplySender>>>,
+    mut probe: impl FnMut(&Path) -> ProbeCompletion,
+) {
     for path in request_rx {
-        let result = read_uncached(&path);
+        let result = probe(&path);
 
         if let Ok(mut cache) = cache.lock() {
             if !cache.contains_key(&path) && cache.len() >= MAX_GIT_CACHE_ENTRIES {
@@ -156,7 +189,9 @@ fn worker_loop(
                     cache.remove(&evicted);
                 }
             }
-            cache.insert(path.clone(), result.clone());
+            // Preserve the original frame-budgeted read/cache behavior on
+            // failure, while fresh waiters retain the explicit failure tag.
+            cache.insert(path.clone(), result.clone().unwrap_or_default());
         }
 
         let waiters = pending
@@ -192,14 +227,60 @@ pub fn read(cwd: &Path) -> Option<RepoMeta> {
     };
 
     match reply.recv_timeout(UI_WAIT_BUDGET) {
-        Ok(fresh) => fresh,
+        Ok(fresh) => fresh.unwrap_or_default(),
         Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => stale,
     }
 }
 
-fn read_uncached(cwd: &Path) -> ProbeResult {
-    let output = run_git_status(cwd)?;
+/// Obtain a definitive result for a newly admitted probe on a background thread.
+///
+/// Unlike [`read`], this never substitutes a stale cache entry. Waiting is
+/// bounded to the existing probe timeout plus 100ms of queue grace. A busy
+/// path, full queue, failed probe, or timeout must not be cached as a fresh
+/// empty repository. Invalid or missing directories return `Ok(None)`;
+/// ambiguous Git failures (including an ordinary non-repository directory)
+/// conservatively return `Unavailable` rather than claim definitive absence.
+/// Timed-out waiters do not cancel a shared probe needed by other callers.
+pub fn read_fresh(cwd: &Path) -> Result<Option<RepoMeta>, FreshReadError> {
+    let bytes = cwd.as_os_str().as_encoded_bytes();
+    if bytes.len() > MAX_GIT_CWD_BYTES || bytes.contains(&0) {
+        return Ok(None);
+    }
+    let service = service().ok_or(FreshReadError::Unavailable)?;
+    let reply = service
+        .request_with_policy(cwd, false)
+        .ok_or(FreshReadError::Unavailable)?;
+    wait_for_fresh(reply, FRESH_WAIT_BUDGET)
+}
+
+fn wait_for_fresh(reply: mpsc::Receiver<ProbeCompletion>, budget: Duration) -> ProbeCompletion {
+    match reply.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(FreshReadError::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(FreshReadError::Unavailable),
+    }
+}
+
+fn read_uncached(cwd: &Path) -> ProbeCompletion {
+    // Filesystem work stays on the existing shared worker. In particular,
+    // read_fresh's caller cannot get stuck in a remote is_dir before its wait.
+    match std::fs::metadata(cwd) {
+        Ok(metadata) if !metadata.is_dir() => return Ok(None),
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(_) => return Err(FreshReadError::Unavailable),
+    }
+    let output = run_git_status(cwd).ok_or(FreshReadError::Unavailable)?;
     parse_porcelain_v2(&output)
+        .map(Some)
+        .ok_or(FreshReadError::Unavailable)
 }
 
 /// Parse stable porcelain-v2 branch headers and worktree records.
@@ -853,5 +934,136 @@ mod tests {
             behind: Some(0),
         };
         assert_eq!(format_strip(&meta), "main");
+    }
+}
+
+#[cfg(test)]
+mod fresh_read_contract_tests {
+    use super::*;
+    fn service(capacity: usize) -> (GitMetaService, mpsc::Receiver<PathBuf>) {
+        let (request_tx, requests) = mpsc::sync_channel(capacity);
+        (
+            GitMetaService {
+                request_tx,
+                cache: Arc::new(Mutex::new(HashMap::new())),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+            },
+            requests,
+        )
+    }
+    fn meta() -> RepoMeta {
+        RepoMeta {
+            branch: "new".into(),
+            dirty: true,
+            ahead: None,
+            behind: None,
+        }
+    }
+    #[test]
+    fn fresh_admission_cannot_adopt_an_older_in_flight_probe() {
+        let (service, requests) = service(1);
+        let path = Path::new("/fixture/repo");
+        let _first = service.request(path).unwrap();
+        assert!(service.request_with_policy(path, false).is_none());
+        assert!(
+            service.request(path).is_some(),
+            "ordinary reads still coalesce"
+        );
+        assert_eq!(requests.try_iter().count(), 1);
+        assert_eq!(service.pending.lock().unwrap().get(path).unwrap().len(), 2);
+    }
+    #[test]
+    fn fresh_admission_keeps_queue_and_waiter_bounds() {
+        let (service, _requests) = service(1);
+        assert!(service
+            .request_with_policy(Path::new("/fixture/a"), false)
+            .is_some());
+        assert!(service
+            .request_with_policy(Path::new("/fixture/b"), false)
+            .is_none());
+        assert_eq!(service.pending.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn fresh_wait_distinguishes_completed_absence_value_failure_and_timeout() {
+        for outcome in [
+            Ok(None),
+            Ok(Some(meta())),
+            Err(FreshReadError::Unavailable),
+            Err(FreshReadError::Timeout),
+        ] {
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(outcome.clone()).unwrap();
+            assert_eq!(wait_for_fresh(rx, Duration::ZERO), outcome);
+        }
+        let (_tx, rx) = mpsc::sync_channel(1);
+        assert_eq!(
+            wait_for_fresh(rx, Duration::ZERO),
+            Err(FreshReadError::Timeout)
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(tx);
+        assert_eq!(
+            wait_for_fresh(rx, Duration::ZERO),
+            Err(FreshReadError::Unavailable)
+        );
+        assert!(FRESH_WAIT_BUDGET > GIT_STATUS_TIMEOUT);
+        assert!(FRESH_WAIT_BUDGET <= Duration::from_secs(1));
+        assert_eq!(UI_WAIT_BUDGET, Duration::from_millis(12));
+    }
+    #[test]
+    fn fake_probe_completion_clears_admission_and_preserves_its_result_tag() {
+        for outcome in [Ok(None), Ok(Some(meta())), Err(FreshReadError::Unavailable)] {
+            let (service, requests) = service(1);
+            let path = Path::new("/fixture/repo");
+            let reply = service.request_with_policy(path, false).unwrap();
+            let GitMetaService {
+                request_tx,
+                cache,
+                pending,
+            } = service;
+            drop(request_tx);
+            worker_loop_with_probe(requests, &cache, &pending, |seen| {
+                assert_eq!(seen, path);
+                outcome.clone()
+            });
+            assert_eq!(wait_for_fresh(reply, Duration::ZERO), outcome);
+            assert!(pending.lock().unwrap().is_empty());
+            assert_eq!(
+                cache.lock().unwrap().get(path).cloned(),
+                Some(outcome.unwrap_or_default())
+            );
+        }
+    }
+    #[test]
+    fn rejected_fresh_keys_return_without_starting_a_service() {
+        assert_eq!(read_fresh(Path::new("bad\0cwd")), Ok(None));
+        assert_eq!(
+            read_fresh(Path::new(&"x".repeat(MAX_GIT_CWD_BYTES + 1))),
+            Ok(None)
+        );
+    }
+    #[test]
+    fn timed_out_fresh_waiter_keeps_the_existing_probe_reserved_until_completion() {
+        let (service, requests) = service(2);
+        let path = Path::new("/fixture/slow");
+        let reply = service.request_with_policy(path, false).unwrap();
+        assert_eq!(
+            wait_for_fresh(reply, Duration::ZERO),
+            Err(FreshReadError::Timeout)
+        );
+        assert!(service.request_with_policy(path, false).is_none());
+        assert_eq!(service.pending.lock().unwrap().get(path).unwrap().len(), 1);
+        let queued = requests.try_recv().unwrap();
+        assert!(
+            requests.try_recv().is_err(),
+            "timeout must not launch a replacement probe"
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(queued).unwrap();
+        drop(tx);
+        worker_loop_with_probe(rx, &service.cache, &service.pending, |_| Ok(Some(meta())));
+        assert!(service.pending.lock().unwrap().is_empty());
+        assert_eq!(service.cached(path), Some(Some(meta())));
+        assert!(service.request_with_policy(path, false).is_some());
     }
 }

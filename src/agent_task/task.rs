@@ -1135,18 +1135,33 @@ impl TaskManager {
                 .map_or(TaskStatus::Failed, |task| task.status);
             return Err(TaskError::TerminalRetryUnavailable { task_id, status });
         }
-        let runtime_kind = self
+        let previous = self
             .get(task_id)
-            .expect("retry eligibility checked the task")
-            .runtime_kind;
+            .expect("retry eligibility checked the task");
+        let runtime_kind = previous.runtime_kind;
+        let invalidated_validation_session = previous.validation.terminal_session_id.clone();
 
         let task = self.task_mut(task_id)?;
+        if task.validation != TaskValidationState::default() {
+            task.validation = TaskValidationState {
+                attempt: task.validation.attempt,
+                status_detail: Some(
+                    "Terminal retry started; the previous validation result is stale".to_string(),
+                ),
+                ..TaskValidationState::default()
+            };
+        }
         task.terminal_session_id = Some(new_session_id.clone());
         task.exit_code = None;
         task.status = TaskStatus::Working;
         task.status_detail = None;
         task.updated_at_ms = unix_time_ms();
         debug_assert_eq!(task.runtime_kind, runtime_kind);
+        if let Some(session_id) = invalidated_validation_session {
+            if self.tasks_by_validation_session.get(&session_id) == Some(&task_id) {
+                self.tasks_by_validation_session.remove(&session_id);
+            }
+        }
         self.tasks_by_terminal_session.remove(expected_old_session);
         self.exited_terminal_sessions.remove(expected_old_session);
         self.tasks_by_terminal_session
@@ -1330,11 +1345,12 @@ impl TaskManager {
         if status == TaskStatus::Completed {
             return Err(TaskError::CompletionRequiresValidation(task_id));
         }
-        let (current, validation_status, validation_session_id) = self
+        let (current, runtime_kind, validation_status, validation_session_id) = self
             .get(task_id)
             .map(|task| {
                 (
                     task.status,
+                    task.runtime_kind,
                     task.validation.status,
                     task.validation.terminal_session_id.clone(),
                 )
@@ -1353,7 +1369,12 @@ impl TaskManager {
                 session_id: validation_session_id.unwrap_or_default(),
             });
         }
-        let invalidate_validation = status.is_running()
+        // Created is retryable only before native authority has been consumed.
+        // The dedicated pre-spawn rollback resets runtime_kind atomically.
+        if status == TaskStatus::Created && runtime_kind == TaskRuntimeKind::Native {
+            return Err(TaskError::NativeRuntimeAlreadySelected(task_id));
+        }
+        let invalidate_validation = (status == TaskStatus::Created || status.is_running())
             && !matches!(
                 validation_status,
                 TaskValidationStatus::NotRun | TaskValidationStatus::Running
@@ -3306,5 +3327,251 @@ mod tests {
                 status: TaskStatus::ReadyForReview,
             }) if task_id == id
         ));
+    }
+
+    #[test]
+    fn resetting_to_created_invalidates_previous_validation() {
+        let mut manager = TaskManager::new();
+        let id = manager
+            .create(new_task("reset validation boundary"))
+            .unwrap();
+        manager
+            .update_status(id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        manager
+            .bind_validation_session(id, "validation-before-reset".into())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-before-reset", Some(0));
+
+        // This is a defensive public-API sequence. Current UI startup resets
+        // only move Created/Starting tasks back to Created.
+        manager
+            .update_status(id, TaskStatus::Created, None)
+            .unwrap();
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.validation.status, TaskValidationStatus::NotRun);
+        assert_eq!(task.validation.attempt, 1);
+        assert!(manager
+            .task_for_terminal_session("validation-before-reset")
+            .is_none());
+        manager
+            .bind_terminal_session(id, "terminal-after-reset".into())
+            .unwrap();
+        manager.handle_terminal_session_exit("terminal-after-reset", Some(0));
+        assert!(matches!(
+            manager.complete_after_validation(id),
+            Err(TaskError::CannotCompleteAfterValidation {
+                validation_status: TaskValidationStatus::NotRun,
+                ..
+            })
+        ));
+        assert_eq!(manager.next_validation_attempt(id), Ok(2));
+    }
+
+    #[test]
+    fn terminal_retry_invalidates_validation_only_after_binding_succeeds() {
+        for (validation_exit, close_validation) in [
+            (Some(0), false),
+            (Some(17), false),
+            (None, false),
+            (None, true),
+        ] {
+            for fallback in [false, true] {
+                let mut manager = TaskManager::new();
+                let id = manager
+                    .create(new_task("retry validation boundary"))
+                    .unwrap();
+                if fallback {
+                    let stream = manager.start_agent_event_stream(id).unwrap();
+                    manager
+                        .finish_agent_event_stream_after_stop(
+                            &stream,
+                            AgentSessionOutcome::Failed,
+                            None,
+                        )
+                        .unwrap();
+                    manager
+                        .bind_native_terminal_fallback_session(id, "terminal-before-retry".into())
+                        .unwrap();
+                } else {
+                    manager
+                        .bind_terminal_session(id, "terminal-before-retry".into())
+                        .unwrap();
+                }
+                manager.handle_terminal_session_exit("terminal-before-retry", Some(0));
+                manager
+                    .bind_validation_session(id, "validation-before-retry".into())
+                    .unwrap();
+                if close_validation {
+                    manager.handle_terminal_session_closed("validation-before-retry");
+                } else {
+                    manager
+                        .handle_terminal_session_exit("validation-before-retry", validation_exit);
+                }
+                // No current UI does this; the public status API permits it.
+                manager.update_status(id, TaskStatus::Failed, None).unwrap();
+                let before = manager.get(id).unwrap().clone();
+                assert!(matches!(
+                    manager.bind_terminal_retry_session(
+                        id,
+                        "wrong-old",
+                        "terminal-after-retry".into()
+                    ),
+                    Err(TaskError::TerminalRetryUnavailable { .. })
+                ));
+                assert_eq!(manager.get(id), Some(&before));
+                assert_eq!(
+                    manager.terminal_role_for_session("validation-before-retry"),
+                    Some(TaskTerminalRole::Validation)
+                );
+                assert!(matches!(
+                    manager.bind_terminal_retry_session(
+                        id,
+                        "terminal-before-retry",
+                        "validation-before-retry".into()
+                    ),
+                    Err(TaskError::TerminalSessionAlreadyBound { .. })
+                ));
+                assert_eq!(manager.get(id), Some(&before));
+
+                manager
+                    .bind_terminal_retry_session(
+                        id,
+                        "terminal-before-retry",
+                        "terminal-after-retry".into(),
+                    )
+                    .unwrap();
+                let task = manager.get(id).unwrap();
+                assert_eq!(task.validation.status, TaskValidationStatus::NotRun);
+                assert_eq!(task.validation.attempt, 1);
+                assert!(task.validation.terminal_session_id.is_none());
+                assert!(manager
+                    .task_for_terminal_session("validation-before-retry")
+                    .is_none());
+                assert_eq!(
+                    manager.handle_terminal_session_exit("validation-before-retry", Some(0)),
+                    None
+                );
+                manager.handle_terminal_session_exit("terminal-after-retry", Some(0));
+                assert!(matches!(
+                    manager.complete_after_validation(id),
+                    Err(TaskError::CannotCompleteAfterValidation { .. })
+                ));
+                assert_eq!(manager.next_validation_attempt(id), Ok(2));
+                assert_eq!(
+                    manager.get(id).unwrap().runtime_kind,
+                    if fallback {
+                        TaskRuntimeKind::TerminalFallback
+                    } else {
+                        TaskRuntimeKind::Terminal
+                    }
+                );
+                manager
+                    .bind_validation_session(id, "validation-after-retry".into())
+                    .unwrap();
+                manager.handle_terminal_session_exit("validation-after-retry", Some(0));
+                manager.complete_after_validation(id).unwrap();
+                assert_eq!(manager.get(id).unwrap().status, TaskStatus::Completed);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_status_reset_cannot_restore_consumed_native_authority() {
+        let mut manager = TaskManager::new();
+        let id = manager
+            .create(new_task("one-shot native reset boundary"))
+            .unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        manager
+            .finish_agent_event_stream_after_stop(&stream, AgentSessionOutcome::Clean, None)
+            .unwrap();
+        manager
+            .bind_validation_session(id, "validation-before-native-reset".into())
+            .unwrap();
+        manager.handle_terminal_session_exit("validation-before-native-reset", Some(0));
+        let before = manager.get(id).unwrap().clone();
+        assert_eq!(
+            manager.update_status(id, TaskStatus::Created, None),
+            Err(TaskError::NativeRuntimeAlreadySelected(id))
+        );
+        assert_eq!(manager.get(id), Some(&before));
+        assert!(matches!(
+            manager.start_agent_event_stream(id),
+            Err(AgentEventError::NativeStartRequiresCreated { .. })
+        ));
+        assert!(!manager.has_active_agent_event_stream(id));
+        assert!(manager.native_terminal_fallback_eligible(id).is_ok());
+    }
+
+    #[test]
+    fn exhausted_event_sequence_rejects_atomically_and_allows_stopped_cleanup() {
+        let mut manager = TaskManager::new();
+        let id = manager
+            .create(new_task("sequence exhaustion boundary"))
+            .unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        // Reaching this counter value normally would require u64::MAX events.
+        manager
+            .native_event_streams
+            .get_mut(&id)
+            .unwrap()
+            .next_sequence = u64::MAX;
+        let before = manager.get(id).unwrap().clone();
+        assert_eq!(
+            manager.apply_agent_event(stream.event(
+                u64::MAX,
+                turn_started(AgentTurnId::new()),
+                None
+            )),
+            Err(AgentEventError::SequenceExhausted(id))
+        );
+        assert_eq!(manager.get(id), Some(&before));
+        let active = manager.native_event_streams.get(&id).unwrap();
+        assert_eq!(active.next_sequence, u64::MAX);
+        assert!(active.active_turn.is_none());
+        assert_eq!(
+            manager.finish_agent_event_stream_after_stop(
+                &stream,
+                AgentSessionOutcome::Failed,
+                None
+            ),
+            Ok(TaskStatus::Failed)
+        );
+        assert!(!manager.has_active_agent_event_stream(id));
+    }
+
+    #[test]
+    fn startup_reset_and_pre_spawn_rollback_keep_unassigned_tasks_retryable() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("retryable startup reset")).unwrap();
+        for status in [TaskStatus::Created, TaskStatus::Starting] {
+            manager.update_status(id, status, None).unwrap();
+            manager
+                .update_status(id, TaskStatus::Created, Some("startup failed".into()))
+                .unwrap();
+            assert_eq!(
+                manager.get(id).unwrap().runtime_kind,
+                TaskRuntimeKind::Unassigned
+            );
+        }
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        manager
+            .rollback_agent_event_stream_before_spawn(&stream, "worker was never created".into())
+            .unwrap();
+        manager
+            .update_status(id, TaskStatus::Created, None)
+            .unwrap();
+        manager
+            .bind_terminal_session(id, "terminal-after-pre-spawn-rollback".into())
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
+        assert_eq!(
+            manager.get(id).unwrap().runtime_kind,
+            TaskRuntimeKind::Terminal
+        );
     }
 }
