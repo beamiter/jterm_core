@@ -1352,9 +1352,7 @@ fn stage_interpreter(stage: &str) -> Option<String> {
     let mut active_prefix: Option<&str> = None;
     let mut dispatch_operand_skipped = false;
     let program = loop {
-        let Some(word) = words.get(index).copied() else {
-            return None;
-        };
+        let word = words.get(index).copied()?;
         if word == "--" {
             index += 1;
             continue;
@@ -1488,9 +1486,10 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         .map(|long| long.split_once('=').map_or(long, |(name, _)| name))
         .or_else(|| option.strip_prefix('-').filter(|flags| flags.len() == 1));
     match (prefix, spelling) {
-        ("gnome-session-inhibit", Some("list" | "inhibit-only" | "help" | "version" | "h" | "l")) => {
-            true
-        }
+        (
+            "gnome-session-inhibit",
+            Some("list" | "inhibit-only" | "help" | "version" | "h" | "l"),
+        ) => true,
         ("systemd-inhibit", Some("list" | "help" | "version" | "h")) => true,
         ("systemd-cat", Some("help" | "version" | "h")) => true,
         ("firejail", Some("help" | "version")) => true,
@@ -1522,10 +1521,7 @@ fn prefix_option_clears_child(prefix: &str, option: &str) -> bool {
         // numactl query/help modes and schedtool help/reset terminate without
         // PROGRAM (wave-36 thin STAGE 71 deepen — stops inventing a peel after
         // `--show sh` / `-h sh`).
-        (
-            "numactl",
-            Some("show" | "hardware" | "help" | "version" | "s" | "H" | "h" | "V"),
-        ) => true,
+        ("numactl", Some("show" | "hardware" | "help" | "version" | "s" | "H" | "h" | "V")) => true,
         ("schedtool", Some("h" | "r" | "help")) => true,
         // softlimit/cgexec help/version terminate without PROGRAM (wave-38 thin
         // STAGE 71 deepen — stops inventing a peel after `--help sh` / `-h sh`).
@@ -1569,9 +1565,7 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         "runuser" | "gosu" | "pkexec" | "run0" => {
             matches!(option, "-u" | "--user" | "-g" | "--group" | "--userspec") as usize
         }
-        "chroot" => {
-            matches!(option, "--groups" | "--userspec" | "--skip-chdir") as usize
-        }
+        "chroot" => matches!(option, "--groups" | "--userspec" | "--skip-chdir") as usize,
         // `sudo -s` / `sudo -i` are flags; do not list bare `-s` / `-i` here.
         "sudo" | "sudoedit" | "doas" => matches!(
             option,
@@ -1604,9 +1598,10 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
             option,
             "-c" | "--class" | "-n" | "--classdata" | "-p" | "--pid" | "-P" | "--pgid"
         ) as usize,
-        "stdbuf" => {
-            matches!(option, "-i" | "--input" | "-o" | "--output" | "-e" | "--error") as usize
-        }
+        "stdbuf" => matches!(
+            option,
+            "-i" | "--input" | "-o" | "--output" | "-e" | "--error"
+        ) as usize,
         "xargs" => matches!(
             option,
             "-n" | "--max-args"
@@ -1648,13 +1643,19 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
                 | "-d"
                 | "--description"
         ) as usize,
-        "capsh" => {
-            matches!(option, "--gid" | "--groups" | "--user" | "--uid" | "--caps") as usize
-        }
+        "capsh" => matches!(option, "--gid" | "--groups" | "--user" | "--uid" | "--caps") as usize,
         // `--exec` / `--startas` name the program — do not consume them as meta.
         "start-stop-daemon" => matches!(
             option,
-            "-p" | "--pidfile" | "-c" | "--chuid" | "-u" | "--user" | "-n" | "--name" | "-d" | "--chdir"
+            "-p" | "--pidfile"
+                | "-c"
+                | "--chuid"
+                | "-u"
+                | "--user"
+                | "-n"
+                | "--name"
+                | "-d"
+                | "--chdir"
         ) as usize,
         "setarch" => matches!(option, "-B" | "--base-offset") as usize,
         // `-c` / `--cpu-list` select list syntax; the list itself is the
@@ -1666,11 +1667,7 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         // schedulers take a detached meta value.
         "chrt" => matches!(
             option,
-            "-T" | "--sched-runtime"
-                | "-P"
-                | "--sched-period"
-                | "-D"
-                | "--sched-deadline"
+            "-T" | "--sched-runtime" | "-P" | "--sched-period" | "-D" | "--sched-deadline"
         ) as usize,
         "time" => matches!(option, "-o" | "--output" | "-f" | "--format") as usize,
         // util-linux wrappers already stripped by jagent; without arity the
@@ -1695,10 +1692,7 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         "choom" => matches!(option, "-n" | "--adjust" | "-p" | "--pid") as usize,
         // util-linux util clamp: `-m`/`-M` take values; `-p`/`--pid` take a pid.
         // `-s`/`--system` is flag-only (terminal via prefix_option_clears_child).
-        "uclampset" => matches!(
-            option,
-            "-m" | "-M" | "-p" | "--pid"
-        ) as usize,
+        "uclampset" => matches!(option, "-m" | "-M" | "-p" | "--pid") as usize,
         // GameMode env launcher: argv is the child; no dashed meta values.
         "gamemoderun" => 0,
         // Resource limits usually attach with `=`; only meta that takes a
@@ -1732,32 +1726,18 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         // Journal stdout wrapper: identifier/priority meta before COMMAND.
         "systemd-cat" => matches!(
             option,
-            "-t" | "--identifier"
-                | "-p"
-                | "--priority"
-                | "--stderr-priority"
-                | "--level-prefix"
+            "-t" | "--identifier" | "-p" | "--priority" | "--stderr-priority" | "--level-prefix"
         ) as usize,
         // Inhibit-lock launcher: what/who/why/mode meta before COMMAND.
         // `--list` is flag-only (terminal in jagent); no detached value.
-        "gnome-session-inhibit" => matches!(
-            option,
-            "--app-id" | "--reason" | "--inhibit"
-        ) as usize,
-        "systemd-inhibit" => matches!(
-            option,
-            "--what" | "--who" | "--why" | "--mode"
-        ) as usize,
+        "gnome-session-inhibit" => matches!(option, "--app-id" | "--reason" | "--inhibit") as usize,
+        "systemd-inhibit" => matches!(option, "--what" | "--who" | "--why" | "--mode") as usize,
         // Socket-activation test launcher: listen/setenv/fdname take values.
-        "systemd-socket-activate" => matches!(
-            option,
-            "-l" | "--listen" | "-E" | "--setenv" | "--fdname"
-        ) as usize,
+        "systemd-socket-activate" => {
+            matches!(option, "-l" | "--listen" | "-E" | "--setenv" | "--fdname") as usize
+        }
         // AppArmor confine-and-exec: profile/namespace before PROGRAM.
-        "aa-exec" => matches!(
-            option,
-            "-p" | "--profile" | "-n" | "--namespace"
-        ) as usize,
+        "aa-exec" => matches!(option, "-p" | "--profile" | "-n" | "--namespace") as usize,
         "eatmydata" => 0,
         "chronic" => 0,
         // Optional `+FORMAT` is a leading `+…` token (not a dashed option);
@@ -1782,10 +1762,7 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
             }
         }
         // `-c` / `--command` leave the shell string visible; only meta values.
-        "flock" => matches!(
-            option,
-            "-w" | "--timeout" | "-E" | "--conflict-exit-code"
-        ) as usize,
+        "flock" => matches!(option, "-w" | "--timeout" | "-E" | "--conflict-exit-code") as usize,
         // readline wrapper: one-value meta only. `-a` is optional-attached in
         // jagent and must not consume the following program word here either.
         "rlwrap" => matches!(
@@ -1838,15 +1815,7 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
         // PRoot: root/bind/cwd/qemu/-S take a following path or command word.
         "proot" => matches!(
             option,
-            "-r" | "--rootfs"
-                | "-b"
-                | "--bind"
-                | "-w"
-                | "--pwd"
-                | "--cwd"
-                | "-q"
-                | "--qemu"
-                | "-S"
+            "-r" | "--rootfs" | "-b" | "--bind" | "-w" | "--pwd" | "--cwd" | "-q" | "--qemu" | "-S"
         ) as usize,
         // firejail: one-value sandbox meta; bare `--private` is flag-only
         // (optional attached `=` already returns 0 above).
@@ -1881,9 +1850,7 @@ fn stage_option_detached_value_count(prefix: &str, option: &str) -> usize {
             "-u" | "--user" | "-p" | "--pass" | "-a" | "--address" | "-P" | "--port"
         ) as usize,
         // proxychains: optional config-file path before PROGRAM.
-        "proxychains" | "proxychains3" | "proxychains4" => {
-            matches!(option, "-f") as usize
-        }
+        "proxychains" | "proxychains3" | "proxychains4" => matches!(option, "-f") as usize,
         // bubblewrap: bind/setenv take SRC DST (two words). One-value meta is
         // listed separately. Flag-only forms return 0. `bubblewrap` is a rare
         // argv0 alias of `bwrap` (Debian ships only the latter).
@@ -2093,7 +2060,8 @@ fn stage_programs(command: &str) -> HashSet<String> {
                 if !is_assignment_word(word)
                     && !word.chars().all(|character| character.is_ascii_digit())
                 {
-                    if active_prefix.is_some_and(|prefix| prefix_skips_plus_format_token(prefix, word))
+                    if active_prefix
+                        .is_some_and(|prefix| prefix_skips_plus_format_token(prefix, word))
                     {
                         index += 1;
                         continue;
@@ -2126,9 +2094,7 @@ fn stage_programs(command: &str) -> HashSet<String> {
                     }
                     // Multiplexer: record busybox and keep scanning for the
                     // applet when one follows; bare busybox stays the program.
-                    if name == "busybox"
-                        && remaining_words_include_program(&words[index + 1..])
-                    {
+                    if name == "busybox" && remaining_words_include_program(&words[index + 1..]) {
                         programs.insert(name);
                         program_position = true;
                         active_prefix = None;
@@ -3724,7 +3690,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn path_probe_leftovers_stay_out_of_stage_prefixes() {
         // Intentional non-STAGE names from the 2026-09-29 PATH probe wave.
@@ -4019,10 +3984,7 @@ mod tests {
     #[test]
     fn strace_pipe_to_sh_is_adds_pipe_to_interpreter() {
         assert_eq!(
-            validate_candidate(
-                Original("ls -l | head -20"),
-                Candidate("ls -l | strace sh")
-            ),
+            validate_candidate(Original("ls -l | head -20"), Candidate("ls -l | strace sh")),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
         assert_eq!(
@@ -4097,10 +4059,7 @@ mod tests {
             None,
             "busybox carrier does not invent a version-mode child"
         );
-        assert_eq!(
-            stage_interpreter("s6-setuidgid --help sh").as_deref(),
-            None
-        );
+        assert_eq!(stage_interpreter("s6-setuidgid --help sh").as_deref(), None);
         assert_eq!(
             stage_interpreter("s6-setuidgid -- nobody sh").as_deref(),
             Some("sh")
@@ -4188,18 +4147,14 @@ mod tests {
             stage_interpreter("busybox systemd-cat -- bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(
-            stage_interpreter("systemd-cat --help sh").as_deref(),
-            None
-        );
+        assert_eq!(stage_interpreter("systemd-cat --help sh").as_deref(), None);
         assert_eq!(
             stage_interpreter("busybox systemd-cat --help sh").as_deref(),
             None,
             "busybox carrier does not invent a help-mode child"
         );
         assert_eq!(
-            stage_interpreter("systemd-inhibit --who burner --why burn --mode block sh")
-                .as_deref(),
+            stage_interpreter("systemd-inhibit --who burner --why burn --mode block sh").as_deref(),
             Some("sh")
         );
         assert_eq!(
@@ -4243,10 +4198,8 @@ mod tests {
             Some("sh")
         );
         assert_eq!(
-            stage_interpreter(
-                "gnome-session-inhibit --app-id=x --reason=y --inhibit=idle -- bash"
-            )
-            .as_deref(),
+            stage_interpreter("gnome-session-inhibit --app-id=x --reason=y --inhibit=idle -- bash")
+                .as_deref(),
             Some("bash")
         );
         assert_eq!(
@@ -4261,9 +4214,18 @@ mod tests {
             stage_interpreter("busybox gnome-session-inhibit -- bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(stage_interpreter("gnome-session-inhibit --app-id").as_deref(), None);
-        assert_eq!(stage_interpreter("gnome-session-inhibit --reason").as_deref(), None);
-        assert_eq!(stage_interpreter("gnome-session-inhibit --inhibit").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --app-id").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --reason").as_deref(),
+            None
+        );
+        assert_eq!(
+            stage_interpreter("gnome-session-inhibit --inhibit").as_deref(),
+            None
+        );
         assert_eq!(
             stage_interpreter("gnome-session-inhibit -l sh").as_deref(),
             None,
@@ -4331,7 +4293,10 @@ mod tests {
             None,
             "system mode never launches a child"
         );
-        assert_eq!(stage_interpreter("uclampset --system bash").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("uclampset --system bash").as_deref(),
+            None
+        );
         assert_eq!(stage_interpreter("uclampset --help sh").as_deref(), None);
         assert_eq!(stage_interpreter("uclampset -h bash").as_deref(), None);
         assert_eq!(stage_interpreter("uclampset -V sh").as_deref(), None);
@@ -4398,18 +4363,12 @@ mod tests {
             stage_interpreter("openvt -f -- bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(
-            stage_interpreter("openvt -c 3 sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("openvt -c 3 sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("openvt --console=5 -- bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(
-            stage_interpreter("openvt -sw sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("openvt -sw sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("busybox openvt sh").as_deref(),
             Some("sh")
@@ -4444,15 +4403,9 @@ mod tests {
         );
         // Help text spells `-C` but this binary rejects it; the lightweight
         // STAGE scan still steps the unknown short (jagent fail-closes `-C`).
+        assert_eq!(stage_interpreter("openvt -C 3 sh").as_deref(), Some("sh"));
         assert_eq!(
-            stage_interpreter("openvt -C 3 sh").as_deref(),
-            Some("sh")
-        );
-        assert_eq!(
-            validate_candidate(
-                Original("ls -l | head -20"),
-                Candidate("ls -l | openvt sh")
-            ),
+            validate_candidate(Original("ls -l | head -20"), Candidate("ls -l | openvt sh")),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
         assert_eq!(
@@ -4482,10 +4435,7 @@ mod tests {
     /// version fail-closed; `choom`/`prlimit` nest arity (no busybox applets).
     #[test]
     fn taskset_choom_prlimit_stage_arity_edges() {
-        assert_eq!(
-            stage_interpreter("taskset ff sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("taskset ff sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("taskset -c 0-3 bash").as_deref(),
             Some("bash")
@@ -4513,10 +4463,7 @@ mod tests {
             None,
             "busybox carrier does not invent a version-mode child"
         );
-        assert_eq!(
-            stage_interpreter("choom -n 1000 sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("choom -n 1000 sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("choom --adjust=0 -- bash").as_deref(),
             Some("bash")
@@ -4584,14 +4531,8 @@ mod tests {
     #[test]
     fn chrt_and_ionice_stage_arity_edges() {
         assert_eq!(stage_interpreter("chrt 1 sh").as_deref(), Some("sh"));
-        assert_eq!(
-            stage_interpreter("chrt -r 1 bash").as_deref(),
-            Some("bash")
-        );
-        assert_eq!(
-            stage_interpreter("chrt -f 1 -- sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("chrt -r 1 bash").as_deref(), Some("bash"));
+        assert_eq!(stage_interpreter("chrt -f 1 -- sh").as_deref(), Some("sh"));
         assert_eq!(stage_interpreter("chrt").as_deref(), None);
         assert_eq!(stage_interpreter("chrt 1").as_deref(), None);
         assert_eq!(stage_interpreter("chrt --help sh").as_deref(), None);
@@ -4601,10 +4542,7 @@ mod tests {
             None,
             "pid mode never launches a child"
         );
-        assert_eq!(
-            stage_interpreter("ionice -c 3 sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("ionice -c 3 sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("ionice -c2 -n5 bash").as_deref(),
             Some("bash")
@@ -4632,10 +4570,7 @@ mod tests {
             "busybox carrier does not invent a help-mode child"
         );
         assert_eq!(
-            validate_candidate(
-                Original("ls -l | head -20"),
-                Candidate("ls -l | chrt 1 sh")
-            ),
+            validate_candidate(Original("ls -l | head -20"), Candidate("ls -l | chrt 1 sh")),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
         assert_eq!(
@@ -4672,22 +4607,19 @@ mod tests {
             Some("sh")
         );
         assert_eq!(stage_interpreter("numactl").as_deref(), None);
-        assert_eq!(stage_interpreter("numactl --cpunodebind=0").as_deref(), None);
+        assert_eq!(
+            stage_interpreter("numactl --cpunodebind=0").as_deref(),
+            None
+        );
         assert_eq!(
             stage_interpreter("numactl --show sh").as_deref(),
             None,
             "query mode never launches a child"
         );
         assert_eq!(stage_interpreter("numactl -s bash").as_deref(), None);
-        assert_eq!(
-            stage_interpreter("numactl --hardware sh").as_deref(),
-            None
-        );
+        assert_eq!(stage_interpreter("numactl --hardware sh").as_deref(), None);
         assert_eq!(stage_interpreter("numactl --help bash").as_deref(), None);
-        assert_eq!(
-            stage_interpreter("numactl --version sh").as_deref(),
-            None
-        );
+        assert_eq!(stage_interpreter("numactl --version sh").as_deref(), None);
         assert_eq!(
             stage_interpreter("schedtool -B -e sh").as_deref(),
             Some("sh")
@@ -4885,7 +4817,6 @@ mod tests {
         );
     }
 
-
     /// util-linux setsid: session flags + help/version fail closed. Busybox
     /// applet carriers peel before the STAGE name so pipe-to-bash still
     /// resolves (parity with openvt / aa-exec deepenings). Bare / dangling
@@ -4898,18 +4829,12 @@ mod tests {
             stage_interpreter("setsid -f -- bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(
-            stage_interpreter("setsid -fw sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("setsid -fw sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("setsid --fork -- bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(
-            stage_interpreter("setsid --wait sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("setsid --wait sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("setsid -c sh").as_deref(),
             Some("sh"),
@@ -4977,10 +4902,7 @@ mod tests {
             "busybox carrier does not invent a version-mode child"
         );
         assert_eq!(
-            validate_candidate(
-                Original("ls -l | head -20"),
-                Candidate("ls -l | setsid sh")
-            ),
+            validate_candidate(Original("ls -l | head -20"), Candidate("ls -l | setsid sh")),
             Err(CorrectionRejection::AddsPipeToInterpreter)
         );
         assert_eq!(
@@ -5480,7 +5402,10 @@ mod tests {
             ("firejail", "firejail --noprofile rm -rf /"),
             ("flock", "flock /tmp/lock rm -rf /"),
             ("gamemoderun", "gamemoderun -- rm -rf /"),
-            ("gnome-session-inhibit", "gnome-session-inhibit --inhibit idle -- rm -rf /"),
+            (
+                "gnome-session-inhibit",
+                "gnome-session-inhibit --inhibit idle -- rm -rf /",
+            ),
             ("gosu", "gosu root rm -rf /"),
             ("ionice", "ionice -c3 rm -rf /"),
             ("nice", "nice -n 5 rm -rf /"),
@@ -5491,7 +5416,10 @@ mod tests {
             ("prlimit", "prlimit --nofile=1024 rm -rf /"),
             ("proxychains", "proxychains rm -rf /"),
             ("proxychains3", "proxychains3 rm -rf /"),
-            ("proxychains4", "proxychains4 -q -f /etc/proxychains.conf rm -rf /"),
+            (
+                "proxychains4",
+                "proxychains4 -q -f /etc/proxychains.conf rm -rf /",
+            ),
             ("proot", "proot -r /tmp/root -- rm -rf /"),
             ("rlwrap", "rlwrap rm -rf /"),
             ("run0", "run0 rm -rf /"),
@@ -5539,7 +5467,11 @@ mod tests {
             STAGE_PREFIXES.len(),
             "DISPATCHES must list exactly one form per STAGE_PREFIXES entry"
         );
-        assert_eq!(STAGE_PREFIXES.len(), 71, "keep DISPATCHES in lockstep with membership pin");
+        assert_eq!(
+            STAGE_PREFIXES.len(),
+            71,
+            "keep DISPATCHES in lockstep with membership pin"
+        );
         assert_eq!(
             DISPATCHES.len(),
             71,
@@ -5611,7 +5543,10 @@ mod tests {
             ("firejail", "firejail --noprofile cargo test"),
             ("flock", "flock /tmp/lock cargo test"),
             ("gamemoderun", "gamemoderun -- cargo test"),
-            ("gnome-session-inhibit", "gnome-session-inhibit --inhibit idle -- cargo test"),
+            (
+                "gnome-session-inhibit",
+                "gnome-session-inhibit --inhibit idle -- cargo test",
+            ),
             ("gosu", "gosu root cargo test"),
             ("ionice", "ionice -c3 cargo test"),
             ("nice", "nice -n 5 cargo test"),
@@ -5622,7 +5557,10 @@ mod tests {
             ("prlimit", "prlimit --nofile=1024 cargo test"),
             ("proxychains", "proxychains cargo test"),
             ("proxychains3", "proxychains3 cargo test"),
-            ("proxychains4", "proxychains4 -q -f /etc/proxychains.conf cargo test"),
+            (
+                "proxychains4",
+                "proxychains4 -q -f /etc/proxychains.conf cargo test",
+            ),
             ("proot", "proot -r /tmp/root -- cargo test"),
             ("rlwrap", "rlwrap cargo test"),
             ("run0", "run0 cargo test"),
@@ -5637,7 +5575,10 @@ mod tests {
             ("setsid", "setsid cargo test"),
             ("setuidgid", "setuidgid nobody cargo test"),
             ("softlimit", "softlimit -m 1000000 cargo test"),
-            ("start-stop-daemon", "start-stop-daemon --start -- cargo test"),
+            (
+                "start-stop-daemon",
+                "start-stop-daemon --start -- cargo test",
+            ),
             ("stdbuf", "stdbuf -o0 cargo test"),
             ("strace", "strace -f cargo test"),
             ("su", "su -- cargo test"),
@@ -5645,7 +5586,10 @@ mod tests {
             ("sudo", "sudo cargo test"),
             ("sudoedit", "sudoedit -- cargo test"),
             ("systemd-cat", "systemd-cat -t unit -- cargo test"),
-            ("systemd-inhibit", "systemd-inhibit --what=idle -- cargo test"),
+            (
+                "systemd-inhibit",
+                "systemd-inhibit --what=idle -- cargo test",
+            ),
             ("systemd-run", "systemd-run cargo test"),
             (
                 "systemd-socket-activate",
@@ -5871,10 +5815,7 @@ mod tests {
 
     #[test]
     fn busybox_skips_applet_to_expose_the_dispatched_command() {
-        assert_eq!(
-            stage_interpreter("busybox sh -c id").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("busybox sh -c id").as_deref(), Some("sh"));
         let programs = stage_programs("busybox ash -lc true");
         assert!(programs.contains("busybox"), "{programs:?}");
         assert!(programs.contains("ash"), "{programs:?}");
@@ -6041,10 +5982,7 @@ mod tests {
             stage_interpreter("sudo -u root bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(
-            stage_interpreter("env -u SECRET sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("env -u SECRET sh").as_deref(), Some("sh"));
         // Flag-only sudo `-s` must not swallow the following word.
         assert_eq!(stage_interpreter("sudo -s").as_deref(), None);
         // Not every dispatcher-shaped word needs arity: the personality and
@@ -6080,10 +6018,7 @@ mod tests {
         // `xargs -d , sh`: the delimiter is a detached meta value. Without
         // arity the scan stops on `,` and the pipe-to-interpreter gate misses
         // the shell (handoff wave-8 leftover).
-        assert_eq!(
-            stage_interpreter("xargs -d , sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("xargs -d , sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("xargs --delimiter , bash").as_deref(),
             Some("bash")
@@ -6101,10 +6036,7 @@ mod tests {
             stage_interpreter("xargs --process-slot-var SLOT sh").as_deref(),
             Some("sh")
         );
-        assert_eq!(
-            stage_interpreter("xargs -J % sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("xargs -J % sh").as_deref(), Some("sh"));
         assert_eq!(
             validate_candidate(
                 Original("ls -l | head -20"),
@@ -6119,10 +6051,7 @@ mod tests {
             stage_interpreter("setpriv --reuid 0 sh").as_deref(),
             Some("sh")
         );
-        assert_eq!(
-            stage_interpreter("choom -n 1000 sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("choom -n 1000 sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("prlimit --nofile=1024 sh").as_deref(),
             Some("sh")
@@ -6279,10 +6208,7 @@ mod tests {
             stage_interpreter("schedtool -a 0x1 -n 5 -e bash").as_deref(),
             Some("bash")
         );
-        assert_eq!(
-            stage_interpreter("torsocks sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("torsocks sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("torsocks --isolate bash").as_deref(),
             Some("bash")
@@ -6291,10 +6217,7 @@ mod tests {
             stage_interpreter("torsocks -a 127.0.0.1 -P 9050 sh").as_deref(),
             Some("sh")
         );
-        assert_eq!(
-            stage_interpreter("proxychains sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("proxychains sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("proxychains4 -q -f /etc/proxychains.conf bash").as_deref(),
             Some("bash")
@@ -6323,10 +6246,7 @@ mod tests {
             stage_interpreter("scriptlive -t timing -I typescript").as_deref(),
             None
         );
-        assert_eq!(
-            stage_interpreter("systemd-cat sh").as_deref(),
-            Some("sh")
-        );
+        assert_eq!(stage_interpreter("systemd-cat sh").as_deref(), Some("sh"));
         assert_eq!(
             stage_interpreter("systemd-cat -t unit bash").as_deref(),
             Some("bash")
@@ -6410,8 +6330,7 @@ mod tests {
         );
         // Detached who/why/mode + flag-only --no-pager must peel cleanly.
         assert_eq!(
-            stage_interpreter("systemd-inhibit --who burner --why burn --mode block sh")
-                .as_deref(),
+            stage_interpreter("systemd-inhibit --who burner --why burn --mode block sh").as_deref(),
             Some("sh")
         );
         assert_eq!(

@@ -4454,7 +4454,7 @@ mod tests {
                     day,
                     Some(repo),
                     CommandKind::BuildOrTest,
-                    Some(i32::from(index.is_multiple_of(3))),
+                    Some(i32::from(index % 3 == 0)),
                     LifeState::default(),
                 )
                 .with_activity_bucket((index % CIRCADIAN_BUCKET_COUNT) as u8)

@@ -510,12 +510,27 @@ impl fmt::Display for AgentEventError {
 impl std::error::Error for AgentEventError {}
 
 pub fn next_agent_event_epoch() -> Result<AgentEventEpoch, AgentEventError> {
-    NEXT_AGENT_EVENT_EPOCH
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            (current != 0 && current != u64::MAX).then_some(current + 1)
-        })
-        .map(AgentEventEpoch)
-        .map_err(|_| AgentEventError::EpochExhausted)
+    allocate_from(&NEXT_AGENT_EVENT_EPOCH)
+}
+
+/// A compare-exchange loop retains the Rust 1.86 MSRV without relying on the
+/// renamed atomic update helper. Reject sentinels before evaluating addition.
+fn allocate_from(counter: &AtomicU64) -> Result<AgentEventEpoch, AgentEventError> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == 0 || current == u64::MAX {
+            return Err(AgentEventError::EpochExhausted);
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(epoch) => return Ok(AgentEventEpoch(epoch)),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 pub fn status_after_event(
@@ -659,4 +674,87 @@ pub fn bounded_event_detail(detail: Option<String>) -> Option<String> {
     }
     let trimmed = bounded.trim_matches(' ');
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[cfg(test)]
+mod epoch_allocation_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn exhausted_sentinels_never_mutate_or_overflow() {
+        for value in [0, u64::MAX] {
+            let counter = AtomicU64::new(value);
+            for _ in 0..3 {
+                assert!(matches!(
+                    allocate_from(&counter),
+                    Err(AgentEventError::EpochExhausted)
+                ));
+                assert_eq!(counter.load(Ordering::Relaxed), value);
+            }
+        }
+    }
+
+    #[test]
+    fn last_epoch_returns_old_value_then_stays_exhausted() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_from(&counter).unwrap(),
+            AgentEventEpoch(u64::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(matches!(
+            allocate_from(&counter),
+            Err(AgentEventError::EpochExhausted)
+        ));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_allocations_are_unique_and_contiguous() {
+        let counter = Arc::new(AtomicU64::new(1));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..128)
+                        .map(|_| allocate_from(&counter).unwrap().0)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut epochs: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        epochs.sort_unstable();
+        assert_eq!(epochs, (1..=1024).collect::<Vec<_>>());
+        assert_eq!(counter.load(Ordering::Relaxed), 1025);
+    }
+
+    #[test]
+    fn concurrent_exhaustion_never_wraps_or_duplicates() {
+        let counter = Arc::new(AtomicU64::new(u64::MAX - 32));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    (0..8)
+                        .filter_map(|_| match allocate_from(&counter) {
+                            Ok(epoch) => Some(epoch.0),
+                            Err(AgentEventError::EpochExhausted) => None,
+                            Err(other) => panic!("unexpected allocation error: {other}"),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut epochs: Vec<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        epochs.sort_unstable();
+        assert_eq!(epochs, ((u64::MAX - 32)..u64::MAX).collect::<Vec<_>>());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 }

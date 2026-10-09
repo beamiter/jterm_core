@@ -100,7 +100,10 @@ mod tests {
             assert_eq!(FinishedOutputNotice::parse(text), Some(notice));
             assert_eq!(known_output_notice(text), Some(text));
             assert_eq!(output_notice_tooltip(text), Some(notice.tooltip()));
-            assert!(!notice.tooltip().is_empty(), "{notice:?} tooltip must stay non-empty");
+            assert!(
+                !notice.tooltip().is_empty(),
+                "{notice:?} tooltip must stay non-empty"
+            );
         }
         assert_eq!(FinishedOutputNotice::parse(""), None);
         assert_eq!(FinishedOutputNotice::parse(" "), None);
@@ -148,7 +151,11 @@ mod tests {
             FinishedOutputNotice::TextTruncated,
             FinishedOutputNotice::PartlyRetained,
         ];
-        assert_eq!(variants.len(), 3, "finished-card known set is exactly three notices");
+        assert_eq!(
+            variants.len(),
+            3,
+            "finished-card known set is exactly three notices"
+        );
         let mut texts: Vec<&str> = variants.iter().map(|n| n.as_str()).collect();
         let mut tips: Vec<&str> = variants.iter().map(|n| n.tooltip()).collect();
         texts.sort_unstable();

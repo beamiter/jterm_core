@@ -1167,9 +1167,7 @@ impl VisualTransition {
             (Behavior::SitNearError, Behavior::UnknownOutcome) => {
                 Some(Self::SitNearErrorToUnknownOutcome)
             }
-            (Behavior::Celebrate, Behavior::RestAfterPush) => {
-                Some(Self::CelebrateToRestAfterPush)
-            }
+            (Behavior::Celebrate, Behavior::RestAfterPush) => Some(Self::CelebrateToRestAfterPush),
             (Behavior::CelebrateBig, Behavior::RestAfterPush) => {
                 Some(Self::CelebrateBigToRestAfterPush)
             }
@@ -2856,10 +2854,7 @@ pub fn classify_command(command: &str) -> CommandKind {
             "nohup" => skip_wrapper_options(&mut tokens, &[]),
             "nice" => skip_wrapper_options(&mut tokens, &["-n", "--adjustment"]),
             "timeout" => {
-                skip_wrapper_options(
-                    &mut tokens,
-                    &["-s", "--signal", "-k", "--kill-after"],
-                );
+                skip_wrapper_options(&mut tokens, &["-s", "--signal", "-k", "--kill-after"]);
                 // Duration positional before PROGRAM (`timeout 5 cargo test`).
                 if tokens
                     .peek()
@@ -2876,10 +2871,7 @@ pub fn classify_command(command: &str) -> CommandKind {
             "chronic" => skip_wrapper_options(&mut tokens, &[]),
             "annotate-output" => {
                 // Optional +FORMAT date stamp before PROGRAM (devscripts).
-                if tokens
-                    .peek()
-                    .is_some_and(|token| token.starts_with('+'))
-                {
+                if tokens.peek().is_some_and(|token| token.starts_with('+')) {
                     tokens.next();
                 }
                 skip_wrapper_options(&mut tokens, &[]);
@@ -2996,16 +2988,7 @@ pub fn classify_command(command: &str) -> CommandKind {
             "proot" => skip_wrapper_options(
                 &mut tokens,
                 &[
-                    "-r",
-                    "--rootfs",
-                    "-b",
-                    "--bind",
-                    "-w",
-                    "--pwd",
-                    "--cwd",
-                    "-q",
-                    "--qemu",
-                    "-S",
+                    "-r", "--rootfs", "-b", "--bind", "-w", "--pwd", "--cwd", "-q", "--qemu", "-S",
                 ],
             ),
             "firejail" => skip_wrapper_options(
@@ -3058,14 +3041,7 @@ pub fn classify_command(command: &str) -> CommandKind {
                 skip_wrapper_options(
                     &mut tokens,
                     &[
-                        "-u",
-                        "--user",
-                        "-r",
-                        "--role",
-                        "-t",
-                        "--type",
-                        "-l",
-                        "--range",
+                        "-u", "--user", "-r", "--role", "-t", "--type", "-l", "--range",
                     ],
                 );
                 if !option_form {
@@ -3206,22 +3182,19 @@ pub fn classify_command(command: &str) -> CommandKind {
                     "--level-prefix",
                 ],
             ),
-            "gnome-session-inhibit" => skip_wrapper_options(
-                &mut tokens,
-                &["--app-id", "--reason", "--inhibit"],
-            ),
-            "systemd-inhibit" => skip_wrapper_options(
-                &mut tokens,
-                &["--what", "--who", "--why", "--mode"],
-            ),
+            "gnome-session-inhibit" => {
+                skip_wrapper_options(&mut tokens, &["--app-id", "--reason", "--inhibit"])
+            }
+            "systemd-inhibit" => {
+                skip_wrapper_options(&mut tokens, &["--what", "--who", "--why", "--mode"])
+            }
             "systemd-socket-activate" => skip_wrapper_options(
                 &mut tokens,
                 &["-l", "--listen", "-E", "--setenv", "--fdname"],
             ),
-            "aa-exec" => skip_wrapper_options(
-                &mut tokens,
-                &["-p", "--profile", "-n", "--namespace"],
-            ),
+            "aa-exec" => {
+                skip_wrapper_options(&mut tokens, &["-p", "--profile", "-n", "--namespace"])
+            }
             // Privilege dispatchers already in STAGE_PREFIXES; peel so the
             // organism work loop still sees cargo/git behind them.
             "doas" | "sudoedit" => skip_wrapper_options(
@@ -3280,10 +3253,7 @@ pub fn classify_command(command: &str) -> CommandKind {
             }
             // util-linux / scheduling wrappers already in STAGE_PREFIXES.
             "chroot" => {
-                skip_wrapper_options(
-                    &mut tokens,
-                    &["--groups", "--userspec", "--skip-chdir"],
-                );
+                skip_wrapper_options(&mut tokens, &["--groups", "--userspec", "--skip-chdir"]);
                 skip_wrapper_positional(&mut tokens);
             }
             "chrt" => {
@@ -3350,19 +3320,10 @@ pub fn classify_command(command: &str) -> CommandKind {
                     "--pgid",
                 ],
             ),
-            "choom" => skip_wrapper_options(
-                &mut tokens,
-                &["-n", "--adjust", "-p", "--pid"],
-            ),
-            "uclampset" => skip_wrapper_options(
-                &mut tokens,
-                &["-m", "-M", "-p", "--pid"],
-            ),
+            "choom" => skip_wrapper_options(&mut tokens, &["-n", "--adjust", "-p", "--pid"]),
+            "uclampset" => skip_wrapper_options(&mut tokens, &["-m", "-M", "-p", "--pid"]),
             "gamemoderun" => skip_wrapper_options(&mut tokens, &[]),
-            "prlimit" => skip_wrapper_options(
-                &mut tokens,
-                &["-p", "--pid", "-o", "--output"],
-            ),
+            "prlimit" => skip_wrapper_options(&mut tokens, &["-p", "--pid", "-o", "--output"]),
             // Remaining STAGE_PREFIXES already peeled above this arm.
             "capsh" => skip_wrapper_options(
                 &mut tokens,
@@ -3405,10 +3366,7 @@ pub fn classify_command(command: &str) -> CommandKind {
                 ],
             ),
             "unbuffer" => skip_wrapper_options(&mut tokens, &[]),
-            "watch" => skip_wrapper_options(
-                &mut tokens,
-                &["-n", "--interval", "-q", "--equexit"],
-            ),
+            "watch" => skip_wrapper_options(&mut tokens, &["-n", "--interval", "-q", "--equexit"]),
             "xargs" => skip_wrapper_options(
                 &mut tokens,
                 &[
@@ -3500,7 +3458,10 @@ pub fn classify_command(command: &str) -> CommandKind {
                             | "--perms"
                             | "--size"
                     );
-                    if !two_arg && !one_arg && option != "--unshare-user" && option != "--unshare-pid"
+                    if !two_arg
+                        && !one_arg
+                        && option != "--unshare-user"
+                        && option != "--unshare-pid"
                         && option != "--unshare-ipc"
                         && option != "--unshare-net"
                         && option != "--unshare-uts"
@@ -3957,9 +3918,7 @@ mod tests {
             CommandKind::Other
         );
         assert_eq!(
-            classify_command(
-                "daemonize -a setlock -n /tmp/x.lock s6-setuidgid nobody cargo test"
-            ),
+            classify_command("daemonize -a setlock -n /tmp/x.lock s6-setuidgid nobody cargo test"),
             CommandKind::BuildOrTest
         );
         assert_eq!(
@@ -4469,7 +4428,6 @@ mod tests {
             "busybox carrier stays stage_interpreter-only under classify"
         );
     }
-
 
     #[test]
     fn classify_command_peels_timeout_nice_around_setsid() {
@@ -5948,11 +5906,7 @@ mod tests {
             Behavior::WatchAgent,
             Behavior::WatchSettled,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     VisualTransition::between(from, to),
                     None,
@@ -6018,11 +5972,7 @@ mod tests {
             Behavior::UnknownOutcome,
             Behavior::RestAfterPush,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     VisualTransition::between(from, to),
                     None,
@@ -6044,11 +5994,7 @@ mod tests {
             Behavior::GuardRecovery,
             Behavior::GuardCautious,
         ] {
-            for to in [
-                Behavior::Explore,
-                Behavior::Sleep,
-                Behavior::Approach,
-            ] {
+            for to in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
                 assert_eq!(
                     VisualTransition::between(from, to),
                     None,
@@ -6264,7 +6210,6 @@ mod tests {
         }
     }
 
-
     /// Inspect→SitNear animates (second open failure overwrite). The reverse
     /// escalation does not happen in the reducer — pin SitNear→Inspect None.
     /// Celebrate↔CelebrateBig likewise has no finish-overwrite story (tier is
@@ -6435,11 +6380,7 @@ mod tests {
         // Celebrate holds — open vigil / success finish land through Watch*
         // (or Idle snap). Idle/Rest→Guard* is pinned elsewhere; pin the other
         // ambient sources so Explore/Sleep/Approach cannot silently gain arcs.
-        for from in [
-            Behavior::Explore,
-            Behavior::Sleep,
-            Behavior::Approach,
-        ] {
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
             for to in [
                 Behavior::GuardFailure,
                 Behavior::GuardStuck,
@@ -6458,11 +6399,7 @@ mod tests {
         // Same ambient sources never invent bridges into error / unknown holds
         // or RestAfterPush — those arrive from finish/push reducers, not from
         // Explore/Sleep/Approach disposition. between() stays 93.
-        for from in [
-            Behavior::Explore,
-            Behavior::Sleep,
-            Behavior::Approach,
-        ] {
+        for from in [Behavior::Explore, Behavior::Sleep, Behavior::Approach] {
             for to in [
                 Behavior::InspectError,
                 Behavior::SitNearError,
@@ -6583,10 +6520,7 @@ mod tests {
     #[test]
     fn repo_vigil_clear_idle_settles_have_full_motion_bridges() {
         for (from, expected) in [
-            (
-                Behavior::GuardFailure,
-                VisualTransition::GuardFailureToIdle,
-            ),
+            (Behavior::GuardFailure, VisualTransition::GuardFailureToIdle),
             (Behavior::GuardStuck, VisualTransition::GuardStuckToIdle),
             (
                 Behavior::GuardRecovery,
