@@ -140,8 +140,9 @@ pub enum ParserEvent {
     /// graphics query (`ESC _ G a=q … ESC \`) is answered by the caller or
     /// not at all.
     ApcSequence(Vec<u8>),
-    /// CSI private-mode set/reset — DEC private mode change. Emitted in addition to
-    /// pass-through so block_view can track reporting modes.
+    /// CSI private-mode set/reset — permitted DEC private mode change. Emitted
+    /// alongside pass-through so block_view can track reporting modes. Modes
+    /// disabled by ParserConfig produce neither bytes nor activation events.
     DecsetMode { mode: u32, set: bool },
     /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
     /// The query is consumed and never reaches the live VTE, so the caller is
@@ -328,6 +329,9 @@ enum State {
         introducer: CsiIntroducer,
         buf: Vec<u8>,
     },
+    /// An overlong CSI is opaque until its final byte or a fresh escape.
+    /// Passing the prefix to VTE would bypass our private-mode filtering.
+    CsiDiscard,
     /// Inside OSC (ESC ]): collecting bytes until ST (BEL or ESC \)
     Osc { buf: Vec<u8> },
     /// Just saw ESC while in OSC — next byte should be '\' for ST
@@ -426,6 +430,52 @@ impl Default for ParserConfig {
             focus_reporting: true,
         }
     }
+}
+
+/// A complete ordinary DEC private-mode list. Only normalize syntax VTE also
+/// treats as numeric parameters; intermediates and malformed lists retain
+/// their original pass-through behavior.
+fn private_modes(params: &[u8]) -> Option<Vec<u32>> {
+    // VTE executes C0 controls inside CSI and ignores DEL without changing
+    // numeric parameters. They cannot hide a filtered mode from this parser.
+    let filtered;
+    let params = if params.iter().any(|byte| *byte < 0x20 || *byte == 0x7f) {
+        filtered = params
+            .iter()
+            .copied()
+            .filter(|byte| *byte >= 0x20 && *byte != 0x7f)
+            .collect::<Vec<_>>();
+        filtered.as_slice()
+    } else {
+        params
+    };
+    params
+        .strip_prefix(b"?")?
+        .split(|byte| *byte == b';')
+        .map(|token| {
+            if !token.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            // Omitted values default to zero; an overlarge unknown mode
+            // must not hide a later reporting/alt-screen token from filtering.
+            Some(token.iter().fold(0_u32, |value, digit| {
+                value
+                    .saturating_mul(10)
+                    .saturating_add(u32::from(*digit - b'0'))
+            }))
+        })
+        .collect()
+}
+
+fn is_alt_screen_mode(mode: u32) -> bool {
+    matches!(mode, 47 | 1047 | 1049)
+}
+
+fn is_mouse_mode(mode: u32) -> bool {
+    matches!(
+        mode,
+        9 | 1000 | 1001 | 1002 | 1003 | 1005 | 1006 | 1015 | 1016
+    )
 }
 
 fn alt_screen_mode(params: &[u8]) -> Option<u32> {
@@ -735,10 +785,28 @@ impl Parser {
 
             let b = data[i];
             i += 1;
+            // CAN and SUB abort every pending escape/control string. They
+            // must never become part of an OSC lifecycle mark or consume the
+            // display text after the cancelled sequence. CSI prefixes already
+            // destined for VTE are preserved together with the cancellation.
+            if matches!(b, 0x18 | 0x1a) {
+                match std::mem::take(&mut self.state) {
+                    State::Csi { introducer, buf } => {
+                        introducer.append_to(&mut self.passthrough);
+                        self.passthrough.extend_from_slice(&buf);
+                        self.passthrough.push(b);
+                    }
+                    State::Esc => self.passthrough.extend_from_slice(&[0x1b, b]),
+                    _ => {}
+                }
+                continue;
+            }
             match &mut self.state {
                 State::Ground => unreachable!("handled by fast-path above"),
 
                 State::Esc => match b {
+                    // A second ESC abandons the first incomplete escape.
+                    0x1b => {}
                     b'[' => {
                         // Do NOT emit "ESC[" yet. Buffer the whole CSI in state so a
                         // read boundary falling mid-sequence cannot split it across
@@ -775,21 +843,86 @@ impl Parser {
                 },
 
                 State::Csi { introducer, buf } => {
-                    if (0x40..=0x7e).contains(&b) {
+                    if b == 0x1b {
+                        introducer.append_to(&mut self.passthrough);
+                        self.passthrough.extend_from_slice(buf);
+                        self.state = State::Esc;
+                    } else if (0x40..=0x7e).contains(&b) {
                         // Final byte of CSI sequence
                         let introducer = *introducer;
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
+                        // A compound DECSET can contain an alt-screen switch
+                        // or a disabled reporting mode beside ordinary modes.
+                        // Split only these intercepted lists, in wire order:
+                        // host-owned alt transitions consume their token while
+                        // VTE still receives every permitted companion token.
+                        if matches!(b, b'h' | b'l') {
+                            if let Some(modes) = private_modes(&params) {
+                                if modes.iter().any(|mode| {
+                                    is_alt_screen_mode(*mode)
+                                        || (!self.config.mouse_reporting && is_mouse_mode(*mode))
+                                        || (!self.config.focus_reporting && *mode == 1004)
+                                }) {
+                                    // Embedded C0 controls execute before the
+                                    // final byte applies modes, even when the
+                                    // surrounding mode sequence is intercepted.
+                                    self.passthrough
+                                        .extend(params.iter().copied().filter(|byte| *byte < 0x20));
+                                    flush!();
+                                    for mode in modes {
+                                        if is_alt_screen_mode(mode) {
+                                            flush!();
+                                            events.push(if b == b'h' {
+                                                ParserEvent::AltScreenEnter(mode)
+                                            } else {
+                                                ParserEvent::AltScreenLeave(mode)
+                                            });
+                                        } else {
+                                            flush!();
+                                            if (!self.config.mouse_reporting && is_mouse_mode(mode))
+                                                || (!self.config.focus_reporting && mode == 1004)
+                                            {
+                                                // Hosts synthesize wheel/focus reports
+                                                // from these events. Suppress both the
+                                                // wire bytes and semantic activation.
+                                                continue;
+                                            }
+                                            let token = mode.to_string();
+                                            self.update_dec_private_modes(
+                                                token.as_bytes(),
+                                                b == b'h',
+                                            );
+                                            events.push(ParserEvent::DecsetMode {
+                                                mode,
+                                                set: b == b'h',
+                                            });
+                                            // Normalize C1 to ESC[ here too. A UTF-8
+                                            // C2 introducer may have passed through
+                                            // in the preceding feed; ESC safely
+                                            // starts a fresh control sequence.
+                                            self.passthrough.extend_from_slice(b"\x1b[?");
+                                            self.passthrough.extend_from_slice(token.as_bytes());
+                                            self.passthrough.push(b);
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let alt_mode = alt_screen_mode(&params);
-                        if (b == b'h' || b == b'l')
-                            && params.first() == Some(&b'?')
-                            && alt_mode.is_none()
-                        {
-                            for mode in self.update_dec_private_modes(&params[1..], b == b'h') {
-                                events.push(ParserEvent::DecsetMode {
-                                    mode,
-                                    set: b == b'h',
-                                });
+                        if (b == b'h' || b == b'l') && alt_mode.is_none() {
+                            if let Some(modes) = private_modes(&params) {
+                                for mode in modes {
+                                    self.update_dec_private_modes(
+                                        mode.to_string().as_bytes(),
+                                        b == b'h',
+                                    );
+                                    events.push(ParserEvent::DecsetMode {
+                                        mode,
+                                        set: b == b'h',
+                                    });
+                                }
                             }
                         }
                         let erase_display = b == b'J' && is_erase_display(&params);
@@ -919,17 +1052,19 @@ impl Parser {
                         }
                     } else {
                         buf.push(b);
-                        // Guard against an unterminated CSI growing without bound
-                        // (malformed stream). Dump what we have and recover.
+                        // Bound malformed CSI without feeding an unfiltered
+                        // prefix into VTE or exposing its suffix as display text.
                         if buf.len() > 4096 {
-                            let introducer = *introducer;
-                            let params = std::mem::take(buf);
-                            self.state = State::Ground;
-                            introducer.append_to(&mut self.passthrough);
-                            self.passthrough.extend_from_slice(&params);
+                            self.state = State::CsiDiscard;
                         }
                     }
                 }
+
+                State::CsiDiscard => match b {
+                    0x1b => self.state = State::Esc,
+                    0x40..=0x7e => self.state = State::Ground,
+                    _ => {}
+                },
 
                 State::Osc { buf } => match b {
                     0x07 => {
@@ -3269,7 +3404,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_reporting_dropped_when_disabled_but_event_emitted() {
+    fn mouse_reporting_disabled_suppresses_wire_and_semantic_activation() {
         let mut p = Parser::with_config(ParserConfig {
             mouse_reporting: false,
             focus_reporting: true,
@@ -3277,13 +3412,8 @@ mod tests {
         let mut events = Vec::new();
         p.feed(b"\x1b[?1000h", &mut events);
         assert!(collect_bytes(&events).is_empty());
-        assert!(events.iter().any(|e| matches!(
-            e,
-            ParserEvent::DecsetMode {
-                mode: 1000,
-                set: true
-            }
-        )));
+        assert!(events.is_empty());
+        assert_eq!(p.mouse_mode(), MouseMode::None);
     }
 
     #[test]
@@ -3335,5 +3465,242 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| !matches!(event, ParserEvent::RemoteSessionId(_))));
+    }
+
+    #[test]
+    fn compound_private_modes_dispatch_alt_screen_in_stream_order() {
+        let stream = b"before\x1b[?2004;1049;1006hframe\x1b[?1006;1049;2004lafter";
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(stream, &mut events);
+        assert_eq!(
+            events,
+            vec![
+                ParserEvent::Bytes(b"before".to_vec()),
+                ParserEvent::DecsetMode {
+                    mode: 2004,
+                    set: true
+                },
+                ParserEvent::Bytes(b"\x1b[?2004h".to_vec()),
+                ParserEvent::AltScreenEnter(1049),
+                ParserEvent::DecsetMode {
+                    mode: 1006,
+                    set: true
+                },
+                ParserEvent::Bytes(b"\x1b[?1006hframe".to_vec()),
+                ParserEvent::DecsetMode {
+                    mode: 1006,
+                    set: false
+                },
+                ParserEvent::Bytes(b"\x1b[?1006l".to_vec()),
+                ParserEvent::AltScreenLeave(1049),
+                ParserEvent::DecsetMode {
+                    mode: 2004,
+                    set: false
+                },
+                ParserEvent::Bytes(b"\x1b[?2004lafter".to_vec()),
+            ]
+        );
+        assert!(!parser.bracketed_paste());
+        for introducer in [b"\x1b[".as_slice(), b"\x9b", b"\xc2\x9b"] {
+            for mode in [47, 1047, 1049] {
+                let mut bytes = introducer.to_vec();
+                bytes.extend_from_slice(format!("?0{mode};2004h").as_bytes());
+                for split in 0..=bytes.len() {
+                    let mut parser = Parser::new();
+                    let mut events = Vec::new();
+                    parser.feed(&bytes[..split], &mut events);
+                    parser.feed(&bytes[split..], &mut events);
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, ParserEvent::AltScreenEnter(_)))
+                            .count(),
+                        1,
+                        "mode={mode}, split={split}"
+                    );
+                    assert!(events.contains(&ParserEvent::AltScreenEnter(mode)));
+                    assert!(parser.bracketed_paste());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compound_private_modes_honor_mouse_and_focus_filters() {
+        for final_byte in ['h', 'l'] {
+            let mut parser = Parser::with_config(ParserConfig {
+                mouse_reporting: false,
+                focus_reporting: false,
+            });
+            let mut events = Vec::new();
+            parser.feed(
+                format!("\x1b[?01000;1004;2004;1006{final_byte}").as_bytes(),
+                &mut events,
+            );
+            assert_eq!(
+                collect_bytes(&events),
+                format!("\x1b[?2004{final_byte}").as_bytes()
+            );
+            assert!(events.contains(&ParserEvent::DecsetMode {
+                mode: 2004,
+                set: final_byte == 'h'
+            }));
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                ParserEvent::DecsetMode {
+                    mode: 1000 | 1004 | 1006,
+                    ..
+                }
+            )));
+            assert_eq!(parser.mouse_mode(), MouseMode::None);
+            assert!(!parser.focus_events());
+        }
+    }
+
+    #[test]
+    fn a_fresh_escape_interrupts_an_incomplete_csi_or_escape() {
+        for prefix in [b"\x1b[12".as_slice(), b"\x1b"] {
+            let mut stream = prefix.to_vec();
+            stream.extend_from_slice(b"\x1bc\x1b]133;A\x07ready");
+            for split in 0..=stream.len() {
+                let mut parser = Parser::new();
+                let mut events = Vec::new();
+                parser.feed(b"\x1b[?2004h", &mut events);
+                events.clear();
+                parser.feed(&stream[..split], &mut events);
+                parser.feed(&stream[split..], &mut events);
+                assert!(
+                    events.contains(&ParserEvent::HardReset),
+                    "prefix={prefix:?}, split={split}"
+                );
+                assert!(events.contains(&ParserEvent::PromptStart));
+                assert!(!parser.bracketed_paste());
+            }
+        }
+    }
+
+    #[test]
+    fn can_and_sub_cancel_control_strings_and_csi_semantics() {
+        for cancel in [0x18, 0x1a] {
+            for prefix in [
+                b"\x1b]133;A".as_slice(),
+                b"\x1b_Gi=1",
+                b"\x1bP$qm",
+                b"\x1b^hidden",
+                b"\x1bXhidden",
+                b"\x1b[?2004",
+            ] {
+                let mut stream = prefix.to_vec();
+                stream.push(cancel);
+                stream.extend_from_slice(b"visible\x1b]133;B\x07");
+                for split in 0..=stream.len() {
+                    let mut parser = Parser::new();
+                    let mut events = Vec::new();
+                    parser.feed(&stream[..split], &mut events);
+                    parser.feed(&stream[split..], &mut events);
+                    assert!(
+                        events.contains(&ParserEvent::PromptEnd),
+                        "prefix={prefix:?}, cancel={cancel}, split={split}"
+                    );
+                    assert!(!events.iter().any(|event| matches!(
+                        event,
+                        ParserEvent::PromptStart
+                            | ParserEvent::ApcSequence(_)
+                            | ParserEvent::DecsetMode { .. }
+                    )));
+                    assert!(collect_bytes(&events).ends_with(b"visible"));
+                    assert!(!parser.bracketed_paste());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_csi_is_discarded_without_bypassing_mode_filtering() {
+        let mut stream = b"\x1b[?1000;".to_vec();
+        stream.extend(std::iter::repeat_n(b'0', 5000));
+        stream.extend_from_slice(b"hvisible");
+        for split in [0, 1, 4096, 4097, 4500, stream.len()] {
+            let mut parser = Parser::with_config(ParserConfig {
+                mouse_reporting: false,
+                focus_reporting: false,
+            });
+            let mut events = Vec::new();
+            parser.feed(&stream[..split], &mut events);
+            parser.feed(&stream[split..], &mut events);
+            assert_eq!(collect_bytes(&events), b"visible", "split={split}");
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, ParserEvent::DecsetMode { .. })));
+        }
+        for suffix in [b"\x18visible".as_slice(), b"\x1bcvisible"] {
+            let mut parser = Parser::new();
+            let mut events = Vec::new();
+            parser.feed(&stream[..4500], &mut events);
+            parser.feed(suffix, &mut events);
+            assert!(collect_bytes(&events).ends_with(b"visible"));
+            assert!(collect_bytes(&events).len() <= b"\x1bcvisible".len());
+        }
+    }
+
+    #[test]
+    fn omitted_or_overflowed_modes_cannot_hide_later_filtered_modes() {
+        let mut parser = Parser::with_config(ParserConfig {
+            mouse_reporting: false,
+            focus_reporting: false,
+        });
+        let mut events = Vec::new();
+        parser.feed(
+            b"\x1b[?;9999999999999999999999;1000;1004;1006h",
+            &mut events,
+        );
+        assert_eq!(collect_bytes(&events), b"\x1b[?0h\x1b[?4294967295h");
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ParserEvent::DecsetMode {
+                mode: 1000 | 1004 | 1006,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn embedded_c0_and_del_cannot_bypass_reporting_filters() {
+        let mut parser = Parser::with_config(ParserConfig {
+            mouse_reporting: false,
+            focus_reporting: false,
+        });
+        let mut events = Vec::new();
+        parser.feed(b"before\x1b[\r?10\x7f00;10\n04hafter", &mut events);
+        assert_eq!(collect_bytes(&events), b"before\r\nafter");
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, ParserEvent::Bytes(_))));
+        assert_eq!(parser.mouse_mode(), MouseMode::None);
+        assert!(!parser.focus_events());
+    }
+
+    #[test]
+    fn csi_c0_controls_preserve_bell_and_numeric_modes_in_both_configurations() {
+        for enabled in [false, true] {
+            let mut parser = Parser::with_config(ParserConfig {
+                mouse_reporting: enabled,
+                focus_reporting: enabled,
+            });
+            let mut events = Vec::new();
+            let input = b"\x1b[?1000\x00h\x1b[?1000\x07;1006h\x1b[?1004\x7fh";
+            parser.feed(input, &mut events);
+            assert_eq!(parser.mouse_mode() == MouseMode::Normal, enabled);
+            assert_eq!(parser.focus_events(), enabled);
+            if enabled {
+                assert_eq!(collect_bytes(&events), input);
+            } else {
+                assert_eq!(collect_bytes(&events), b"\x00\x07");
+                assert!(events
+                    .iter()
+                    .all(|event| matches!(event, ParserEvent::Bytes(_))));
+            }
+        }
     }
 }

@@ -221,10 +221,12 @@ fn marker_len_at_end(data: &[u8]) -> Option<usize> {
     [
         PASTE_START,
         PASTE_END,
-        C1_PASTE_START,
-        C1_PASTE_END,
+        // UTF-8 encodings end in the raw C1 spelling. Match the whole
+        // encoding first so removal cannot leave an orphaned C2 byte.
         C1_PASTE_START_UTF8,
         C1_PASTE_END_UTF8,
+        C1_PASTE_START,
+        C1_PASTE_END,
     ]
     .into_iter()
     .find(|marker| data.ends_with(marker))
@@ -249,24 +251,6 @@ fn marker_len_at_end_str(text: &str) -> Option<usize> {
     .map(<[u8]>::len)
 }
 
-/// Length of a paste-bracket marker at the head of `data`, in either the 7-bit
-/// `ESC [ 2 0 0 ~` or 8-bit `9B 2 0 0 ~` spelling.
-fn marker_len(data: &[u8]) -> Option<usize> {
-    for marker in [
-        PASTE_START,
-        PASTE_END,
-        C1_PASTE_START,
-        C1_PASTE_END,
-        C1_PASTE_START_UTF8,
-        C1_PASTE_END_UTF8,
-    ] {
-        if data.starts_with(marker) {
-            return Some(marker.len());
-        }
-    }
-    None
-}
-
 /// Length of an opening paste-bracket marker at the head of `data`.
 fn opening_marker_len(data: &[u8]) -> Option<usize> {
     for marker in [PASTE_START, C1_PASTE_START, C1_PASTE_START_UTF8] {
@@ -279,7 +263,7 @@ fn opening_marker_len(data: &[u8]) -> Option<usize> {
 
 /// Length of a closing paste-bracket marker at the head of `data`.
 fn closing_marker_len(data: &[u8]) -> Option<usize> {
-    for marker in [PASTE_END, C1_PASTE_END, C1_PASTE_END_UTF8] {
+    for marker in [PASTE_END, C1_PASTE_END_UTF8, C1_PASTE_END] {
         if data.starts_with(marker) {
             return Some(marker.len());
         }
@@ -535,25 +519,37 @@ impl InputGuard {
             return Cow::Borrowed(data);
         }
 
-        let opens = data.starts_with(PASTE_START) || data.starts_with(C1_PASTE_START);
-        // A terminator flush against the end of the chunk closes a frame this
-        // app opened; anywhere else it is a body byte and must go.
-        let closes = self.in_frame || opens;
-        let trailing_close = closes && ends_with_terminator(data);
-
+        // Prompt replacement deliberately sends Ctrl+U before the paste
+        // opener. Keep that editor action outside the frame rather than
+        // treating both legitimate brackets as body injection and then
+        // reframing Ctrl+U as pasted command text.
+        let prefix_len = usize::from(
+            !self.in_frame
+                && data.first() == Some(&KILL_LINE)
+                && opening_marker_len(&data[1..]).is_some(),
+        );
+        let opener_len = opening_marker_len(&data[prefix_len..]);
+        let opens = opener_len.is_some();
         let framed = self.in_frame || opens;
+        // The encoder appends an explicit submit CR *after* its closing
+        // marker. Recognize that one trailing Enter only when immediately
+        // preceded by a real terminator; embedded terminators still go.
+        let submit_len = usize::from(
+            framed
+                && matches!(data.last(), Some(b'\r' | b'\n'))
+                && ends_with_terminator(&data[..data.len() - 1]),
+        );
+        let frame_end = data.len() - submit_len;
+        let trailing_close = framed && ends_with_terminator(&data[..frame_end]);
+
         let mut out: Vec<u8> = Vec::new();
         let mut changed = false;
 
-        let body_end = match terminator_len_at_end(data) {
-            Some(len) if trailing_close => data.len() - len,
+        let body_end = match terminator_len_at_end(&data[..frame_end]) {
+            Some(len) if trailing_close => frame_end - len,
             _ => data.len(),
         };
-        let body_start = if opens {
-            marker_len(data).unwrap_or(0)
-        } else {
-            0
-        };
+        let body_start = opener_len.map_or(0, |len| prefix_len + len);
 
         // Same tail-check rule as `defang`, and for the same reason: removing a
         // marker splices its neighbours together and those halves can spell a
@@ -658,7 +654,7 @@ fn ends_with_terminator(data: &[u8]) -> bool {
 }
 
 fn terminator_len_at_end(data: &[u8]) -> Option<usize> {
-    [PASTE_END, C1_PASTE_END, C1_PASTE_END_UTF8]
+    [PASTE_END, C1_PASTE_END_UTF8, C1_PASTE_END]
         .into_iter()
         .find(|marker| data.ends_with(marker))
         .map(<[u8]>::len)
@@ -1143,6 +1139,122 @@ mod tests {
             &paste.bytes[..]
         );
         assert!(!guard.in_frame());
+    }
+
+    #[test]
+    fn guard_preserves_prompt_clear_outside_a_multiline_paste() {
+        let (modes, policy) = guard_policy();
+        // The public prompt encoder may prepend Ctrl+U to its paste frame;
+        // the final PTY guard must preserve the editor action outside it.
+        for command in ["printf safe", "printf one\nprintf two"] {
+            let paste = encode_prompt_insert(command, modes, policy, true);
+            let mut guard = InputGuard::new();
+            let admitted = guard.filter(&paste.bytes, modes, policy);
+            assert_eq!(&*admitted, paste.bytes.as_slice());
+            assert_eq!(admitted[0], KILL_LINE);
+            assert!(!guard.in_frame());
+            assert!(!admitted_input(&admitted, false).submits_line);
+        }
+    }
+
+    #[test]
+    fn guard_preserves_the_encoders_explicit_submit_after_the_frame() {
+        let (modes, boundary_policy) = guard_policy();
+        let submit_policy = PastePolicy {
+            submit: true,
+            ..boundary_policy
+        };
+        for clear_first in [false, true] {
+            let paste = encode_prompt_insert("printf safe", modes, submit_policy, clear_first);
+            let mut guard = InputGuard::new();
+            let admitted = guard.filter(&paste.bytes, modes, boundary_policy);
+            assert_eq!(&*admitted, paste.bytes.as_slice());
+            assert!(!guard.in_frame());
+            assert!(admitted_input(&admitted, false).submits_line);
+        }
+        // The same terminator is legitimate when a prior write opened the frame.
+        let mut guard = InputGuard::new();
+        let _ = guard.filter(PASTE_START, modes, boundary_policy);
+        assert_eq!(
+            &*guard.filter(b"safe\x1b[201~\r", modes, boundary_policy),
+            b"safe\x1b[201~\r"
+        );
+        assert!(!guard.in_frame());
+    }
+
+    #[test]
+    fn prefixed_submitted_frames_still_remove_embedded_terminators() {
+        let (modes, policy) = guard_policy();
+        for prefix in [b"".as_slice(), &[KILL_LINE]] {
+            let mut payload = prefix.to_vec();
+            payload.extend_from_slice(b"\x1b[200~safe\x1b[201~\rhidden\x1b[201~\r");
+            let mut guard = InputGuard::new();
+            let actual = guard.filter(&payload, modes, policy);
+            let mut expected = prefix.to_vec();
+            expected.extend_from_slice(b"\x1b[200~safe\rhidden\x1b[201~\r");
+            assert_eq!(&*actual, expected.as_slice());
+            assert!(!guard.in_frame());
+            assert!(admitted_input(&actual, false).submits_line);
+            assert!(!admitted_input(&actual, false).input_after_submission);
+        }
+    }
+
+    #[test]
+    fn guarded_clear_and_submit_work_with_every_paste_marker_encoding() {
+        let (modes, policy) = guard_policy();
+        for (start, end) in [
+            (PASTE_START, PASTE_END),
+            (C1_PASTE_START, C1_PASTE_END),
+            (C1_PASTE_START_UTF8, C1_PASTE_END_UTF8),
+        ] {
+            for clear_first in [false, true] {
+                for submit in [false, true] {
+                    for split in [false, true] {
+                        let mut opening = Vec::new();
+                        if clear_first {
+                            opening.push(KILL_LINE);
+                        }
+                        opening.extend_from_slice(start);
+                        let mut closing = b"printf one\nprintf two".to_vec();
+                        closing.extend_from_slice(end);
+                        if submit {
+                            closing.push(b'\r');
+                        }
+                        let expected = [opening.as_slice(), closing.as_slice()].concat();
+                        let mut guard = InputGuard::new();
+                        let actual = if split {
+                            let first = guard.filter(&opening, modes, policy).into_owned();
+                            assert!(guard.in_frame());
+                            let second = guard.filter(&closing, modes, policy).into_owned();
+                            [first, second].concat()
+                        } else {
+                            guard.filter(&expected, modes, policy).into_owned()
+                        };
+                        assert_eq!(actual, expected);
+                        assert!(!guard.in_frame());
+                        let admitted = admitted_input(&actual, false);
+                        assert_eq!(admitted.submits_line, submit);
+                        assert!(!admitted.input_after_submission);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guard_removes_whole_utf8_c1_markers_without_leaving_a_leading_byte() {
+        let (modes, policy) = guard_policy();
+        for marker in [C1_PASTE_START_UTF8, C1_PASTE_END_UTF8] {
+            let mut payload = PASTE_START.to_vec();
+            payload.extend_from_slice(b"before");
+            payload.extend_from_slice(marker);
+            payload.extend_from_slice(b"after");
+            payload.extend_from_slice(PASTE_END);
+            let mut guard = InputGuard::new();
+            let actual = guard.filter(&payload, modes, policy);
+            assert_eq!(&*actual, b"\x1b[200~beforeafter\x1b[201~");
+            assert!(std::str::from_utf8(&actual).is_ok());
+        }
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

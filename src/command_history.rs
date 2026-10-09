@@ -257,7 +257,7 @@ fn open_history_directory(path: &Path) -> io::Result<File> {
 
 fn open_history_for_append(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).append(true);
     harden_open_options(&mut options);
     let file = options.open(path)?;
     validate_history_file(&file, "command-history file")?;
@@ -841,7 +841,7 @@ pub fn append(
     // Keep one physical JSONL record in one write_all call. The flock below is
     // the cross-process consistency boundary; combining the newline also keeps
     // readers safe if a future caller writes without sharing this process.
-    let encoded = encode_record(&record)?;
+    let mut encoded = encode_record(&record)?;
 
     if let Some(parent) = path
         .parent()
@@ -861,6 +861,18 @@ pub fn append(
 
     let lock = HistoryFileLock::acquire(path, LOCK_TIMEOUT)?;
     let mut file = open_history_for_append(path)?;
+    // A crash or failed write can leave the last JSONL record unterminated.
+    // Do not concatenate the new record onto that fragment: even a successful
+    // append would then be unreadable. Inspect the same locked descriptor and
+    // preserve the fragment, separating it from the new record in one write.
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            encoded.insert(0, b'\n');
+        }
+    }
     file.write_all(&encoded)?;
     // The writer runs off the UI thread, so make an acknowledged append mean
     // that both the record and a newly created directory entry reached stable
@@ -1145,6 +1157,65 @@ mod tests {
         fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
             self.inner.seek(position)
         }
+    }
+
+    #[test]
+    fn append_separates_a_crash_tail_and_preserves_the_next_command() {
+        let path = temp_path("append-crash-tail");
+        let mut original = encode_record(&CommandHistoryRecord {
+            command: "before crash".into(),
+            cwd: None,
+            exit_code: 0,
+            end_time_ms: Some(1),
+        })
+        .unwrap();
+        original.extend_from_slice(b"{\"command\":\"partially written");
+        write_test_history(&path, &original);
+
+        append(&path, 100, "after crash", None, 0, Some(2)).unwrap();
+
+        let records = read_recent(&path, 10).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after crash", "before crash"]
+        );
+        assert!(
+            fs::read(&path).unwrap().starts_with(&original),
+            "recovery must preserve the original crash evidence"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn append_preserves_a_complete_record_missing_only_its_newline() {
+        let path = temp_path("append-missing-newline");
+        let mut original = encode_record(&CommandHistoryRecord {
+            command: "complete before crash".into(),
+            cwd: Some("/tmp/project".into()),
+            exit_code: 7,
+            end_time_ms: Some(1),
+        })
+        .unwrap();
+        assert_eq!(original.pop(), Some(b'\n'));
+        write_test_history(&path, &original);
+
+        append(&path, 100, "next command", None, 0, Some(2)).unwrap();
+
+        let records = read_recent(&path, 10).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["next command", "complete before crash"]
+        );
+        assert_eq!(records[1].exit_code, 7);
+        assert_eq!(records[1].cwd.as_deref(), Some("/tmp/project"));
+        assert!(fs::read(&path).unwrap().starts_with(&original));
+        cleanup(&path);
     }
 
     #[test]
