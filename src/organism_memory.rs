@@ -1208,11 +1208,12 @@ impl OrganismMemory {
     /// when the event was retained for shutdown/later retry. If the bounded
     /// event queue itself rejects the update, return only a throw-away preview
     /// insight so refresh can never resurrect an event absent from disk.
+    /// Invalid repository keys are rejected before any preview or admission.
     pub fn apply_and_enqueue(
         &mut self,
         event: MemoryEvent,
     ) -> (MemoryInsight, io::Result<()>, bool) {
-        let outcome = enqueue_event(self.path.clone(), event.clone());
+        let outcome = enqueue_event(self.path.clone(), &event);
         self.apply_enqueue_outcome(event, outcome)
     }
 
@@ -1223,6 +1224,9 @@ impl OrganismMemory {
     ) -> (MemoryInsight, io::Result<()>, bool) {
         match outcome {
             EventEnqueue::Retained(result) => (self.apply_local(&event), result, true),
+            EventEnqueue::Rejected(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                (MemoryInsight::default(), Err(error), false)
+            }
             EventEnqueue::Rejected(error) => {
                 let mut preview = self.memory.clone();
                 (apply_event(&mut preview, &event), Err(error), false)
@@ -2070,14 +2074,27 @@ enum EventEnqueue {
     Rejected(io::Error),
 }
 
-fn enqueue_event(path: PathBuf, event: MemoryEvent) -> EventEnqueue {
+fn enqueue_event(path: PathBuf, event: &MemoryEvent) -> EventEnqueue {
     enqueue_event_with_scheduler(path, event, schedule_queued_events)
 }
 
-fn enqueue_event_with_scheduler<F>(path: PathBuf, event: MemoryEvent, schedule: F) -> EventEnqueue
+fn enqueue_event_with_scheduler<F>(path: PathBuf, event: &MemoryEvent, schedule: F) -> EventEnqueue
 where
     F: FnOnce(PathBuf) -> io::Result<()>,
 {
+    // A public event constructor accepts a caller-owned repo key. Reject it
+    // before cloning or admission, otherwise one invalid event stays queued
+    // forever and makes every later transaction for this path fail validation.
+    if event
+        .repo
+        .as_deref()
+        .is_some_and(|repo| !valid_repo_id(repo))
+    {
+        return EventEnqueue::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ASCII organism memory event has an invalid repository identifier",
+        ));
+    }
     let queues = event_queues();
     {
         let mut queues = queues
@@ -2092,7 +2109,7 @@ where
             ));
         }
         if !already_retained {
-            queue.push_back(event);
+            queue.push_back(event.clone());
         }
     }
 
@@ -2155,7 +2172,12 @@ fn schedule_queued_events(path: PathBuf) -> io::Result<()> {
 /// close-request handler on the UI thread, where a deadline that does not
 /// bound anything is the same defect as no deadline.
 pub fn flush_pending(timeout: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ASCII organism memory flush timeout is too large",
+        )
+    })?;
     let paths: Vec<_> = event_queues()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2672,6 +2694,14 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn unrepresentable_flush_timeout_is_rejected_without_panicking() {
+        assert_eq!(
+            flush_pending(Duration::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -5582,6 +5612,68 @@ mod tests {
     }
 
     #[test]
+    fn invalid_repo_events_are_rejected_before_queue_or_local_mutation() {
+        let root = TestDir::new("invalid-admission");
+        let path = root.memory_path();
+        let mut memory = OrganismMemory::load(path.clone()).unwrap();
+        for repo in [
+            String::new(),
+            "relative/repo".to_owned(),
+            "/work/line\nbreak".to_owned(),
+            "/work/\u{202e}spoof".to_owned(),
+            format!("/{}", "x".repeat(MAX_REPO_BYTES)),
+        ] {
+            let event = MemoryEvent::at_ms_for_repo(
+                123_000,
+                CommandKind::BuildOrTest,
+                Some(1),
+                Some(repo),
+                LifeState::default(),
+                None,
+            );
+            let mut scheduled = false;
+            let outcome = enqueue_event_with_scheduler(path.clone(), &event, |_| {
+                scheduled = true;
+                Ok(())
+            });
+            let (_, result, retained) = memory.apply_enqueue_outcome(event, outcome);
+            // Remove our fixture even when proving the baseline's bad admission.
+            let queued = event_queues().lock().unwrap().remove(&path);
+            assert!(!scheduled, "invalid input reached the durability lane");
+            assert!(queued.is_none());
+            assert!(!retained);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert!(memory.session_events.is_empty());
+            assert!(memory.memory.days.is_empty());
+            memory.memory.validate().unwrap();
+            assert!(!path.exists());
+        }
+
+        // A valid key at the exact byte ceiling still reaches the lane and
+        // survives a durable round-trip after every rejected attempt.
+        let valid = MemoryEvent::at_ms_for_repo(
+            124_000,
+            CommandKind::BuildOrTest,
+            Some(0),
+            Some(format!("/{}", "x".repeat(MAX_REPO_BYTES - 1))),
+            LifeState::default(),
+            None,
+        );
+        let outcome = enqueue_event_with_scheduler(path.clone(), &valid, |_| Ok(()));
+        let (_, result, retained) = memory.apply_enqueue_outcome(valid.clone(), outcome);
+        result.unwrap();
+        assert!(retained);
+        transact_batch(&path, std::slice::from_ref(&valid)).unwrap();
+        record_acknowledged_events(&path, std::slice::from_ref(&valid));
+        event_queues().lock().unwrap().remove(&path);
+        memory.refresh().unwrap();
+        assert!(memory.session_events.is_empty());
+        assert_eq!(memory.memory.days.len(), 1);
+        assert_eq!(memory.memory.days[0].build_successes, 1);
+        memory.memory.validate().unwrap();
+    }
+
+    #[test]
     fn admitted_event_stays_retained_when_a_worker_wins_before_schedule_error() {
         let root = TestDir::new("queue-admission-race");
         let path = root.memory_path();
@@ -5589,7 +5681,7 @@ mod tests {
         let admitted = event(60_000, 322, &repo, CommandKind::BuildOrTest, Some(1));
         let admitted_id = admitted.id.clone();
 
-        let outcome = enqueue_event_with_scheduler(path.clone(), admitted, |scheduled_path| {
+        let outcome = enqueue_event_with_scheduler(path.clone(), &admitted, |scheduled_path| {
             // Taking the same mutex proves enqueue released it before calling
             // the scheduler. Removing the event models a running worker that
             // durably acknowledged it before scheduling reported an error.

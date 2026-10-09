@@ -274,7 +274,13 @@ impl Replay {
             if index > 0 && !continued {
                 out.push_str("\r\n");
             }
-            let end = visible_len(&self.tables, row);
+            // Blanks before a soft wrap are inside the logical line. Keep
+            // them so the next row autowraps instead of becoming a hard break.
+            let end = if row.wrapped {
+                row.cells.len()
+            } else {
+                visible_len(&self.tables, row)
+            };
             prev_wrapped_len = row.wrapped.then_some(end);
             let mut skip_until = 0;
             for (col, &cell) in row.cells[..end].iter().enumerate() {
@@ -389,26 +395,32 @@ fn row_is_visible(tables: &Tables, row: &Row) -> bool {
 /// Whether a captured stream moves the cursor vertically or edits the screen
 /// in ways a line-oriented strip cannot reproduce: absolute or vertical cursor
 /// motion (`CUP`, `HVP`, `VPA`, `CUU`, `CUD`, `CPL`, `CNL`), scroll regions
-/// (`DECSTBM`), reverse index, line insertion/deletion, scrolling (`SU`/`SD`),
-/// cursor restore (`DECRC`, `CSI u`), a full reset (`RIS`) or an erase beyond
-/// the current line (`ED`, `DECSED`). CSI introduced by the UTF-8 encoded C1
-/// control U+009B counts like `ESC [`. False positives only cost time — the
+/// (`DECSTBM`), index/next line/reverse index (`IND`/`NEL`/`RI`), line
+/// insertion/deletion, scrolling (`SU`/`SD`), cursor restore (`DECRC`, `CSI u`),
+/// screen alignment (`DECALN`), a full reset (`RIS`) or an erase beyond the
+/// current line (`ED`, `DECSED`). UTF-8 encoded C1 controls count like their
+/// ESC forms, including U+009B for CSI. False positives only cost time — the
 /// screen replay of plain line output equals the plain strip — so the scan
 /// errs on the side of `true`.
 pub fn stream_needs_screen_replay(bytes: &[u8]) -> bool {
     let mut i = 0;
-    while let Some(offset) = memchr::memchr2(0x1b, 0x9b, &bytes[i..]) {
+    while let Some(offset) = memchr::memchr2(0x1b, 0xc2, &bytes[i..]) {
         let at = i + offset;
-        let body = if bytes[at] == 0x9b {
-            // U+009B is `C2 9B` in UTF-8; a lone 0x9B is a continuation byte.
-            if at == 0 || bytes[at - 1] != 0xc2 {
-                i = at + 1;
-                continue;
+        let body = if bytes[at] == 0xc2 {
+            // Only UTF-8 encoded C1 controls count, never a lone continuation
+            // byte or the same low byte inside another Unicode character.
+            match bytes.get(at + 1) {
+                Some(0x84 | 0x85 | 0x8d) => return true,
+                Some(0x9b) => at + 2,
+                _ => {
+                    i = at + 1;
+                    continue;
+                }
             }
-            at + 1
         } else {
             match bytes.get(at + 1) {
-                Some(b'M' | b'8' | b'c') => return true,
+                Some(b'D' | b'E' | b'M' | b'8' | b'c') => return true,
+                Some(b'#') if bytes.get(at + 2) == Some(&b'8') => return true,
                 Some(b'[') => at + 2,
                 _ => {
                     i = at + 1;

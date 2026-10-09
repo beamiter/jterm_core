@@ -471,6 +471,46 @@ fn to_ansi_keeps_soft_wraps_so_the_card_can_reflow() {
 }
 
 #[test]
+fn to_ansi_preserves_spaces_inside_soft_wrapped_lines() {
+    for (cols, bytes, expected) in [
+        (4, b"ab  c".as_slice(), "ab  c"),
+        (4, b"    c", "    c"),
+        (4, b"ab  c\r\nx", "ab  c\nx"),
+        (5, "ab  中".as_bytes(), "ab  中"),
+        // The wrapped row also survives being frozen into history.
+        (4, b"ab  c\r\nx\r\ny\r\nz", "ab  c\nx\ny\nz"),
+    ] {
+        let out = replay(cols, 3, bytes);
+        assert_eq!(out.to_plain(), expected);
+        let ansi = out.to_ansi();
+        let again = replay(cols, 3, ansi.as_bytes());
+        assert_eq!(again.to_plain(), expected, "ansi={ansi:?}");
+        assert_eq!(again.row_count(), out.row_count());
+        assert_eq!(plain(40, 3, ansi.as_bytes()), expected);
+        // Streaming boundaries must not alter the preserved spaces or wrap.
+        for split in 0..=bytes.len() {
+            let mut streamed = ScreenReplay::new(cols, 3);
+            streamed.feed(&bytes[..split]);
+            streamed.feed(&bytes[split..]);
+            assert_eq!(streamed.finish().to_ansi(), ansi, "split={split}");
+        }
+    }
+}
+
+#[test]
+fn to_ansi_still_trims_spaces_before_hard_line_breaks() {
+    for bytes in [b"ab  \r\nc".as_slice(), b"ab \r\nc", b"ab\r\nc"] {
+        let out = replay(4, 3, bytes);
+        assert_eq!(out.to_plain(), "ab\nc");
+        assert_eq!(out.to_ansi(), "ab\r\nc");
+        assert_eq!(plain(4, 3, out.to_ansi().as_bytes()), "ab\nc");
+    }
+    let out = replay(4, 3, b"    \r\nc");
+    assert_eq!(out.to_ansi(), "\r\nc");
+    assert_eq!(out.to_plain(), "\nc");
+}
+
+#[test]
 fn blank_history_rows_are_charged_and_evicted() {
     // Mass scrolling makes history rows that show nothing. They still cost
     // memory, so they must count against the budget and be evicted.
@@ -527,6 +567,40 @@ fn needs_screen_replay_detects_vertical_motion_only() {
     assert!(!stream_needs_screen_replay(b"\x1b[?1049h\x1b[?2K"));
     assert!(!stream_needs_screen_replay("\u{29b}x".as_bytes()));
     assert!(!stream_needs_screen_replay(b"\x9b1;1H"));
+}
+
+#[test]
+fn needs_screen_replay_detects_index_controls_and_screen_alignment() {
+    for bytes in [
+        "a\x1bDb", "a\x1bEb", "a\u{84}b", "a\u{85}b", "a\u{8d}b", "a\x1b#8b",
+    ] {
+        assert!(stream_needs_screen_replay(bytes.as_bytes()), "{bytes:?}");
+    }
+    // These controls change ordinary text, so callers must not use their
+    // horizontal-only stripper just because no vertical CSI was present.
+    assert_eq!(plain(4, 3, b"a\x1bDb"), "a\n b");
+    assert_eq!(plain(4, 3, b"a\x1bEb"), "a\nb");
+    assert_eq!(plain(4, 3, "a\u{8d}b".as_bytes()), " b\na");
+    assert_eq!(plain(4, 3, b"a\x1b#8b"), "bEEE\nEEEE\nEEEE");
+    // Preserve the cheap path for ordinary styling, unrelated Unicode and
+    // non-screen controls, including C1 CSI SGR and incomplete introducers.
+    for bytes in [
+        "é plain\r\n\x1b[31mred\x1b[m",
+        "\u{9b}31mred\u{9b}m",
+        "\u{284}\u{285}\u{28d}\u{29b}",
+        "\x1b]8;;https://example.test\x07link\x1b]8;;\x07",
+        "\x1b#7",
+    ] {
+        assert!(!stream_needs_screen_replay(bytes.as_bytes()), "{bytes:?}");
+    }
+    for bytes in [
+        b"\x84\x85\x8d\x9b".as_slice(),
+        b"\xc2",
+        b"\xc2\x9b",
+        b"\x1b#",
+    ] {
+        assert!(!stream_needs_screen_replay(bytes), "{bytes:?}");
+    }
 }
 
 #[test]

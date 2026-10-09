@@ -2790,11 +2790,17 @@ pub fn classify_command(command: &str) -> CommandKind {
     const MAX_WRAPPER_DEPTH: usize = 8;
 
     let mut raw_tokens = command.split_whitespace();
-    let bounded_tokens = raw_tokens
+    let Some(bounded_tokens) = raw_tokens
         .by_ref()
         .take(MAX_CLASSIFIER_TOKENS)
         .map(normalize_token)
-        .collect::<Vec<_>>();
+        .collect::<Option<Vec<_>>>()
+    else {
+        // A shortened token can hide a dry-run flag or change the program
+        // identity. Keep the allocation ceiling without interpreting a prefix
+        // as the complete command.
+        return CommandKind::Other;
+    };
     // Classification stays bounded, but a truncated push can hide a trailing
     // `--dry-run`. Such a command must fail closed instead of publishing the
     // recovery intention on incomplete evidence.
@@ -3114,6 +3120,9 @@ pub fn classify_command(command: &str) -> CommandKind {
                     if option == "--" {
                         tokens.next();
                         break;
+                    }
+                    if option == "-" {
+                        return CommandKind::Other;
                     }
                     if !option.starts_with('-') {
                         break;
@@ -3621,12 +3630,12 @@ fn git_push_is_dry_run(args: &[String]) -> bool {
     false
 }
 
-fn normalize_token(token: &str) -> String {
-    token
+fn normalize_token(token: &str) -> Option<String> {
+    let mut characters = token
         .trim_matches(|character| matches!(character, '\'' | '"'))
-        .chars()
-        .take(96)
-        .collect()
+        .chars();
+    let normalized = characters.by_ref().take(96).collect();
+    characters.next().is_none().then_some(normalized)
 }
 
 fn is_environment_assignment(token: &str) -> bool {
@@ -3642,6 +3651,30 @@ fn is_environment_assignment(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scriptlive_bare_dash_fails_closed_without_panicking() {
+        for command in [
+            "scriptlive -",
+            "scriptlive - cargo test",
+            "scriptlive - git push",
+        ] {
+            assert_eq!(classify_command(command), CommandKind::Other);
+        }
+    }
+
+    #[test]
+    fn truncated_tokens_cannot_hide_a_push_dry_run() {
+        let command = format!("git push -{}n", "v".repeat(95));
+        assert_eq!(classify_command(&command), CommandKind::Other);
+        // A token at the supported boundary is still fully understood.
+        let command = format!("git push -{}n", "v".repeat(94));
+        assert_eq!(classify_command(&command), CommandKind::Other);
+        let command = format!("git push origin {}", "x".repeat(97));
+        assert_eq!(classify_command(&command), CommandKind::Other);
+        let command = format!("git push origin {}", "x".repeat(96));
+        assert_eq!(classify_command(&command), CommandKind::GitPush);
+    }
 
     #[test]
     fn classifies_common_real_commands_without_treating_every_success_as_a_build() {
