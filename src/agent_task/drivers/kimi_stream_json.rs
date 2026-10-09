@@ -5,7 +5,7 @@
 //! PTY launcher. This MVP mirrors Claude's print/stream-json path: no private
 //! home, no cgroup containment (a private process group only), one prompt
 //! turn per session. Kimi reports failures on stderr with a non-zero exit, so
-//! the shared worker in [`super::print_stream`] folds the last stderr lines
+//! the shared worker in `super::print_stream` folds the last stderr lines
 //! into the failure detail.
 
 use super::print_stream::{

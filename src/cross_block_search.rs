@@ -119,8 +119,8 @@ pub struct ScanPrefix<'a> {
 
 /// Byte + wall-clock budget for one Find overlay or cross-block palette slice.
 ///
-/// Live overlay uses [`Self::new`] ([`FIND_OVERLAY_SCAN_*`]); palette walks use
-/// [`Self::for_cross_block`] ([`CROSS_BLOCK_SCAN_*`]). Fields are public so UI
+/// Live overlay uses [`Self::new`] (`FIND_OVERLAY_SCAN_*`); palette walks use
+/// [`Self::for_cross_block`] (`CROSS_BLOCK_SCAN_*`). Fields are public so UI
 /// tests can install tight synthetic caps without a separate test constructor.
 #[derive(Clone, Debug)]
 pub struct FindScanBudget {
@@ -130,7 +130,7 @@ pub struct FindScanBudget {
 }
 
 impl FindScanBudget {
-    /// Live Find overlay: tighter shared [`FIND_OVERLAY_SCAN_*`] caps.
+    /// Live Find overlay: tighter shared `FIND_OVERLAY_SCAN_*` caps.
     pub fn new() -> Self {
         Self {
             remaining_bytes: FIND_OVERLAY_SCAN_BYTE_LIMIT,
@@ -139,7 +139,7 @@ impl FindScanBudget {
         }
     }
 
-    /// Palette cross-block walks: wider shared [`CROSS_BLOCK_SCAN_*`] caps.
+    /// Palette cross-block walks: wider shared `CROSS_BLOCK_SCAN_*` caps.
     pub fn for_cross_block() -> Self {
         Self {
             remaining_bytes: CROSS_BLOCK_SCAN_BYTE_LIMIT,
@@ -200,7 +200,7 @@ pub fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
 }
 
 /// Outcome of a cross-block palette scan. `H` is the frontend hit row type
-/// ([`CrossBlockHit`] differs across anvil/forge — see module docs).
+/// (`CrossBlockHit` differs across anvil/forge — see module docs).
 ///
 /// `scan_incomplete` is true when the byte/time budget stopped the walk before
 /// every eligible record was examined — distinct from hitting `max_hits`, which

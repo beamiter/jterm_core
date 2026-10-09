@@ -4,7 +4,7 @@
 //! no cgroup containment (a private process group only), and one print-mode
 //! turn per session. Failures should fall back to the opaque PTY launcher.
 //! Process ownership and the lifecycle contract live in
-//! [`super::print_stream`].
+//! `super::print_stream`.
 
 use super::print_stream::{
     bounded_detail, parse_json_record, PrintProviderSpec, PrintSignal, PrintStreamDriver,
