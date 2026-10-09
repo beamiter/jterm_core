@@ -154,6 +154,29 @@ v2 is selected only for a peer that has already advertised v2 support.
   keeping their clear-text credential hop local while preserving normal proxy
   behavior for HTTPS.
 
+## Offline organism settings contract
+
+`organism_daily::PreviewPose::ALL` supplies eight labeled examples for settings.
+Each pose has an `explanation()` and a `context()` for the existing
+`organism::sprite_frame_with_context` renderer. These are visual examples, not
+synthetic command events. `behavior_explanation` also describes every live
+`Behavior` without inspecting terminal contents.
+
+An explicit settings interaction can use `GentleInteraction`: call `request`
+once, then `apply` on each render with the underlying selected context and a
+monotonic session-relative `Duration`. An admitted request briefly shows the
+existing Approach pose. Only Idle, Explore, Approach, and Sleep are eligible;
+commands, reactions, unknown outcomes, repo vigils, and transitions cancel it.
+Repeated requests do not extend the two-second response or bypass its
+eight-second attention cooldown. `cancel` on close, disable, or pose selection
+change discards the visual response while retaining the cooldown.
+
+Hosts own Full/Calm/Static frame cadence, mapped-widget timer lifetimes, and
+immediate settings application. The live terminal overlay stays non-interactive
+and does not take focus. Preview and interaction state is session-local and
+does not change the life simulation, persistent growth, or repo memory. This
+contract adds no command capture, network, model call, or telemetry.
+
 ## Security and reliability invariants
 
 1. Untrusted terminal data is size-bounded before allocation or parsing.
