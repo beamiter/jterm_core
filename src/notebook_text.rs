@@ -193,42 +193,68 @@ pub fn render_text_to_pango(text: &str) -> String {
     out
 }
 
-/// Apply inline-format rules. Conservative: only matches the simplest
-/// form. Nested or overlapping markers fall through unchanged.
+/// Apply only flat inline spans. Generated tags never re-enter the marker
+/// parser, and a code span's contents always stay literal. Nested or
+/// overlapping formatting remains visible as text rather than emitting
+/// crossing XML tags that make Pango reject the entire label.
 fn render_inline(s: &str) -> String {
-    let escaped = escape_pango(s);
-    // Backtick spans first so subsequent ** / * passes don't see their
-    // interior. We do these as separate scans rather than one big regex
-    // to avoid the regex dep and to keep failure modes obvious.
-    let with_code = wrap_marker(&escaped, "`", "<tt>", "</tt>");
-    let with_bold = wrap_marker(&with_code, "**", "<b>", "</b>");
-    wrap_marker(&with_bold, "*", "<i>", "</i>")
-}
-
-fn wrap_marker(s: &str, marker: &str, open: &str, close: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
-    loop {
-        let Some(start) = rest.find(marker) else {
-            out.push_str(rest);
+    while let Some(start) = rest.find(['`', '*']) {
+        out.push_str(&escape_pango(&rest[..start]));
+        rest = &rest[start..];
+        let byte = rest.as_bytes()[0];
+        let run = rest
+            .bytes()
+            .take_while(|candidate| *candidate == byte)
+            .count();
+        if (byte == b'`' && run != 1) || (byte == b'*' && run > 2) {
+            out.push_str(&rest[..run]);
+            rest = &rest[run..];
+            continue;
+        }
+        let marker = &rest[..run];
+        let after = &rest[run..];
+        let Some(end) = closing_inline_marker(after, marker) else {
+            out.push_str(&escape_pango(rest));
             return out;
         };
-        out.push_str(&rest[..start]);
-        let after = &rest[start + marker.len()..];
-        match after.find(marker) {
-            Some(end) => {
-                out.push_str(open);
-                out.push_str(&after[..end]);
-                out.push_str(close);
-                rest = &after[end + marker.len()..];
-            }
-            None => {
-                // No closing marker — leave the original alone.
-                out.push_str(&rest[start..]);
-                return out;
-            }
+        let body = &after[..end];
+        let consumed = run + end + run;
+        if byte != b'`' && body.contains(['`', '*']) {
+            out.push_str(&escape_pango(&rest[..consumed]));
+        } else {
+            let (open, close) = match marker {
+                "`" => ("<tt>", "</tt>"),
+                "**" => ("<b>", "</b>"),
+                _ => ("<i>", "</i>"),
+            };
+            out.push_str(open);
+            out.push_str(&escape_pango(body));
+            out.push_str(close);
         }
+        rest = &rest[consumed..];
     }
+    out.push_str(&escape_pango(rest));
+    out
+}
+
+/// A delimiter must be a whole run: one `*` cannot close in the middle of
+/// `**`, and unsupported longer runs remain literal.
+fn closing_inline_marker(s: &str, marker: &str) -> Option<usize> {
+    let byte = marker.as_bytes()[0];
+    let mut offset = 0;
+    while let Some(relative) = s[offset..].find(marker) {
+        let start = offset + relative;
+        let end = start + marker.len();
+        if (start == 0 || s.as_bytes()[start - 1] != byte)
+            && s.as_bytes().get(end).is_none_or(|next| *next != byte)
+        {
+            return Some(start);
+        }
+        offset = end;
+    }
+    None
 }
 
 fn escape_pango(s: &str) -> String {
@@ -340,6 +366,64 @@ mod tests {
             escape_pango("safe\u{00a0}\u{2003}\u{202e}\u{200b}\u{00ad}\u{fe0f}\u{e0020}\0\ttext"),
             "safe��������\ttext"
         );
+    }
+
+    #[test]
+    fn inline_code_keeps_formatting_markers_literal() {
+        assert_eq!(
+            render_inline("`**bold** and *italic* <&>`"),
+            "<tt>**bold** and *italic* &lt;&amp;&gt;</tt>"
+        );
+        assert_eq!(
+            render_inline("中文 `<&🙂>` **粗体** *é*"),
+            "中文 <tt>&lt;&amp;🙂&gt;</tt> <b>粗体</b> <i>é</i>"
+        );
+    }
+
+    #[test]
+    fn nested_and_overlapping_markers_stay_literal() {
+        for input in [
+            "*foo **bar* baz**",
+            "**a *b** c*",
+            "*a `b* c`",
+            "***text***",
+        ] {
+            assert_eq!(render_inline(input), input);
+        }
+        assert_eq!(
+            render_inline("**one** *two* `three`"),
+            "<b>one</b> <i>two</i> <tt>three</tt>"
+        );
+    }
+
+    #[test]
+    fn marker_combinations_never_cross_generated_tags() {
+        fn check(markup: &str) {
+            let mut tags = Vec::new();
+            let mut rest = markup;
+            while let Some(start) = rest.find('<') {
+                rest = &rest[start..];
+                let end = rest.find('>').unwrap();
+                let tag = &rest[1..end];
+                if let Some(close) = tag.strip_prefix('/') {
+                    assert_eq!(tags.pop(), Some(close), "{markup}");
+                } else {
+                    assert!(matches!(tag, "b" | "i" | "tt"), "{markup}");
+                    tags.push(tag);
+                }
+                rest = &rest[end + 1..];
+            }
+            assert!(tags.is_empty(), "{markup}");
+        }
+        for value in 0..5usize.pow(6) {
+            let mut n = value;
+            let mut input = String::new();
+            for _ in 0..6 {
+                input.push(['*', '`', 'a', '<', '&'][n % 5]);
+                n /= 5;
+            }
+            check(&render_inline(&input));
+        }
     }
 
     #[test]

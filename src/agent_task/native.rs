@@ -931,8 +931,10 @@ pub fn pty_task_brief_relative() -> String {
 /// the brief is written to a fresh `O_EXCL` 0600 temporary file relative to
 /// that descriptor and renamed over the old name (never written through an
 /// existing inode, which could be a hard link). The directory also gets a
-/// self-ignoring `.gitignore` (`*`) so `git add -A` in the task worktree never
-/// stages the brief. That is used instead of `info/exclude` because a linked
+/// self-ignoring `.gitignore` (`*`). Before writing evidence, trusted Git must
+/// confirm that the brief is ignored and untracked; an existing ignore file
+/// or tracked brief that fails this check is preserved. This is used instead
+/// of `info/exclude` because a linked
 /// worktree has no private exclude file: `git rev-parse --git-path
 /// info/exclude` resolves to the shared common directory, i.e. the user's
 /// primary checkout.
@@ -1035,11 +1037,27 @@ fn write_brief_beneath(worktree: &Path, dir_name: &str, body: &[u8]) -> io::Resu
         Err(error) => return Err(error),
     }
 
+    // Check through the same pinned worktree that owns `directory`. Do not
+    // use --no-index: an ignored spelling can still name a tracked file, and
+    // replacing it would both destroy repository content and put the shared
+    // evidence into the next commit. Fail before creating an evidence file.
+    super::worktree::require_ignored_untracked_file(
+        &root.proc_path(),
+        &Path::new(dir_name).join(PTY_TASK_BRIEF_FILE),
+    )
+    .map_err(io::Error::other)?;
+
     let target = c_name(PTY_TASK_BRIEF_FILE)?;
-    let temporary = c_name(&format!(
-        ".{PTY_TASK_BRIEF_FILE}.{}.tmp",
-        Uuid::new_v4().simple()
-    ))?;
+    let temporary_name = format!(".{PTY_TASK_BRIEF_FILE}.{}.tmp", Uuid::new_v4().simple());
+    // Existing rules may ignore only the final name. The fresh temporary
+    // entry also contains evidence, so it must never be eligible for an
+    // ordinary `git add -A` while the atomic replacement is in progress.
+    super::worktree::require_ignored_untracked_file(
+        &root.proc_path(),
+        &Path::new(dir_name).join(&temporary_name),
+    )
+    .map_err(io::Error::other)?;
+    let temporary = c_name(&temporary_name)?;
     let written = create_exclusive_at(directory.as_raw_fd(), &temporary)
         .and_then(|mut file| file.write_all(body));
     // SAFETY: both names are relative to the same pinned directory; renameat
@@ -1349,6 +1367,111 @@ mod tests {
         write_pty_task_brief(&task, brief_policy()).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         let _ = std::fs::remove_dir_all(outside);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn brief_collision_fixture() -> (PathBuf, AgentTask) {
+        // Set up only our temporary Git fixture directly. The writer under
+        // test still goes through its production trusted-Git boundary.
+        let root = private_test_directory("brief-collision");
+        let repository = root.join("repository");
+        let worktree = root.join("worktree");
+        std::fs::create_dir(&repository).unwrap();
+        checked_git(&repository, &["init", "--quiet"]);
+        std::fs::write(repository.join("tracked.txt"), b"FAKE fixture content\n").unwrap();
+        checked_git(&repository, &["add", "--", "tracked.txt"]);
+        checked_git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Agent Task Tests",
+                "-c",
+                "user.email=agent-task@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+        checked_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "app/brief-collision",
+                "--",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mut task = task();
+        task.repo_root = repository;
+        task.worktree_path = worktree;
+        (root, task)
+    }
+
+    #[test]
+    fn pty_brief_refuses_existing_non_ignoring_namespace_without_changes() {
+        let (root, task) = brief_collision_fixture();
+        let dir = task.worktree_path.join(pty_task_brief_dir_name());
+        std::fs::create_dir(&dir).unwrap();
+        let ignore = dir.join(".gitignore");
+        let original_ignore = b"# Repository-owned rules\n*.log\n";
+        std::fs::write(&ignore, original_ignore).unwrap();
+        let brief = dir.join(PTY_TASK_BRIEF_FILE);
+        std::fs::write(&brief, b"original repository content").unwrap();
+        assert!(matches!(
+            write_pty_task_brief(&task, brief_policy()),
+            Err(NativePromptError::Io(_))
+        ));
+        assert_eq!(std::fs::read(&ignore).unwrap(), original_ignore);
+        assert_eq!(
+            std::fs::read(&brief).unwrap(),
+            b"original repository content"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        // Ignoring only the final file is insufficient: the atomic staging
+        // file would briefly expose exactly the same terminal evidence.
+        std::fs::write(&ignore, b"task-brief.md\n").unwrap();
+        assert!(matches!(
+            write_pty_task_brief(&task, brief_policy()),
+            Err(NativePromptError::Io(_))
+        ));
+        assert_eq!(std::fs::read(&ignore).unwrap(), b"task-brief.md\n");
+        assert_eq!(
+            std::fs::read(&brief).unwrap(),
+            b"original repository content"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pty_brief_refuses_tracked_target_even_when_its_name_is_ignored() {
+        let (root, task) = brief_collision_fixture();
+        let dir = task.worktree_path.join(pty_task_brief_dir_name());
+        std::fs::create_dir(&dir).unwrap();
+        let ignore = dir.join(".gitignore");
+        std::fs::write(&ignore, b"*\n").unwrap();
+        let brief = dir.join(PTY_TASK_BRIEF_FILE);
+        std::fs::write(&brief, b"tracked repository content").unwrap();
+        checked_git(
+            &task.worktree_path,
+            &["add", "--force", "--", &pty_task_brief_relative()],
+        );
+        assert!(matches!(
+            write_pty_task_brief(&task, brief_policy()),
+            Err(NativePromptError::Io(_))
+        ));
+        assert_eq!(std::fs::read(&ignore).unwrap(), b"*\n");
+        assert_eq!(
+            std::fs::read(&brief).unwrap(),
+            b"tracked repository content"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert!(git_status(&task.worktree_path).contains("task-brief.md"));
         let _ = std::fs::remove_dir_all(root);
     }
 

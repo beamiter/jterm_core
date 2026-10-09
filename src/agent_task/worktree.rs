@@ -1318,6 +1318,61 @@ fn git_command_os<const N: usize>(git: &Path, cwd: &Path, args: [OsString; N]) -
     command
 }
 
+/// Require a private task artifact to be ignored without overriding Git's
+/// index. A tracked path must never be replaced by terminal evidence even if
+/// a new ignore rule would match it. The caller keeps `access_path` pinned
+/// through this read and its later descriptor-relative write.
+pub(super) fn require_ignored_untracked_file(
+    access_path: &Path,
+    relative_path: &Path,
+) -> Result<(), WorktreeError> {
+    let git = trusted_git_path().map_err(WorktreeError::GitUnavailable)?;
+    let command = task_brief_check_command(&git, access_path, relative_path);
+    let output = run_command_with_timeout(
+        command,
+        "git check-ignore task brief",
+        16 * 1024,
+        MAX_GIT_STDERR_BYTES,
+        GIT_COMMAND_TIMEOUT,
+        None,
+    )
+    .map_err(|detail| WorktreeError::GitCommand {
+        operation: "git check-ignore task brief".into(),
+        detail,
+    })?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => Err(WorktreeError::UnsafePath(
+            "task brief is tracked or is not ignored by Git".into(),
+        )),
+        _ => Err(WorktreeError::GitCommand {
+            operation: "git check-ignore task brief".into(),
+            detail: format!(
+                "{}: {}",
+                output.status,
+                bounded_diagnostic(output.stderr.bytes, MAX_GIT_STDERR_BYTES)
+            ),
+        }),
+    }
+}
+
+fn task_brief_check_command(git: &Path, access_path: &Path, relative_path: &Path) -> Command {
+    let mut command = git_command_os(
+        git,
+        access_path,
+        [
+            OsString::from("check-ignore"),
+            OsString::from("--quiet"),
+            OsString::from("--"),
+            relative_path.as_os_str().to_owned(),
+        ],
+    );
+    // check-ignore already takes literal pathnames, not pathspecs. Git
+    // rejects the injected literal pathspec magic for this command.
+    command.env_remove("GIT_LITERAL_PATHSPECS");
+    command
+}
+
 fn worktree_add_command(
     git: &Path,
     repository: &Path,
@@ -1804,6 +1859,33 @@ mod tests {
         let captured = read_bounded(Cursor::new(vec![b'x'; READ_CHUNK_BYTES * 2]), 17).unwrap();
         assert_eq!(captured.bytes.len(), 17);
         assert!(captured.truncated);
+    }
+
+    #[test]
+    fn task_brief_check_uses_index_aware_literal_paths_and_pinned_cwd() {
+        let command = task_brief_check_command(
+            Path::new("/usr/bin/git"),
+            Path::new("/proc/self/fd/17"),
+            Path::new(".jterm/task-brief.md"),
+        );
+        assert_eq!(
+            command.get_current_dir(),
+            Some(Path::new("/proc/self/fd/17"))
+        );
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert!(arguments.ends_with(&[
+            "check-ignore".into(),
+            "--quiet".into(),
+            "--".into(),
+            ".jterm/task-brief.md".into(),
+        ]));
+        assert!(!arguments.iter().any(|arg| arg == "--no-index"));
+        assert!(command.get_envs().all(|(name, value)| {
+            name != OsStr::new("GIT_LITERAL_PATHSPECS") || value.is_none()
+        }));
     }
 
     #[test]

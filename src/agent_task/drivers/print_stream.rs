@@ -709,6 +709,18 @@ impl PrintWorker {
         cancellation: &AgentCancellation,
     ) -> CodexAppServerExitReport {
         let label = self.spec.label;
+        // Start and Stop can both reach the runtime before this worker gets
+        // scheduled. Honour that cancellation before executing provider code,
+        // just as the Codex worker does at its pre-spawn boundary.
+        if cancellation.is_cancelled() {
+            return self.finish(
+                CodexAppServerProcessExit::default(),
+                AgentSessionOutcome::Cancelled,
+                CodexAppServerExitCause::Cancelled,
+                None,
+                String::new(),
+            );
+        }
         let mut child = match self.spawn(argv, worktree_path) {
             Ok(child) => child,
             Err(detail) => {
@@ -947,7 +959,23 @@ impl PrintWorker {
         mut detail: Option<String>,
         stderr_tail: String,
     ) -> CodexAppServerExitReport {
-        if outcome == AgentSessionOutcome::Clean {
+        let stopped = !process.spawned || (process.reaped && process.containment_verified_empty);
+        if !stopped {
+            // SessionEnded releases the reducer's active-stream gate. Neither
+            // a failed wait nor a still-populated process group proves that
+            // task work has stopped, even when cancellation was requested.
+            // Keep that gate closed; the runtime retains the failed cleanup
+            // evidence instead of authorizing archival or validation.
+            outcome = AgentSessionOutcome::Failed;
+            cause = CodexAppServerExitCause::IoFailed;
+            if detail.is_none() {
+                detail = Some(format!(
+                    "{} process cleanup could not be confirmed",
+                    self.spec.label
+                ));
+            }
+        }
+        if stopped && outcome == AgentSessionOutcome::Clean {
             self.ensure_started(None);
             self.emit_critical(
                 AgentEventKind::TurnCompleted {
@@ -963,17 +991,19 @@ impl PrintWorker {
             cause = CodexAppServerExitCause::EventDeliveryFailed;
             detail = Some(bounded_detail(&failure));
         }
-        if let Err(error) = self
-            .sink
-            .try_emit(AgentEventKind::SessionEnded { outcome }, detail.clone())
-        {
-            critical_event_delivery_failed = true;
-            outcome = AgentSessionOutcome::Failed;
-            cause = CodexAppServerExitCause::EventDeliveryFailed;
-            detail = Some(bounded_detail(&format!(
-                "{} lifecycle event could not be delivered: {error}",
-                self.spec.label
-            )));
+        if stopped {
+            if let Err(error) = self
+                .sink
+                .try_emit(AgentEventKind::SessionEnded { outcome }, detail.clone())
+            {
+                critical_event_delivery_failed = true;
+                outcome = AgentSessionOutcome::Failed;
+                cause = CodexAppServerExitCause::EventDeliveryFailed;
+                detail = Some(bounded_detail(&format!(
+                    "{} lifecycle event could not be delivered: {error}",
+                    self.spec.label
+                )));
+            }
         }
         {
             let mut view = self.view.lock();
@@ -1027,6 +1057,97 @@ fn process_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_SPEC: PrintProviderSpec = PrintProviderSpec {
+        provider: AgentProvider::Claude,
+        label: "test provider",
+        thread_suffix: "test-print",
+        env_remove: &[],
+        session_id_first: false,
+        argv: |argv, _| Ok(argv.to_vec()),
+        parse: |_| PrintSignal::Ignored,
+    };
+
+    fn test_worker(
+        stream: crate::agent_task::AgentEventStream,
+    ) -> (PrintWorker, AgentEventReceiver) {
+        let (sender, receiver) = agent_event_channel();
+        let worker = PrintWorker {
+            spec: &TEST_SPEC,
+            sink: AgentEventSink::new(stream, sender),
+            view: Arc::new(Mutex::new(CodexAppServerViewSnapshot::default())),
+            turn_id: AgentTurnId::new(),
+            session_started: false,
+            fatal: None,
+            cause: None,
+            critical_failure: None,
+        };
+        (worker, receiver)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_before_worker_runs_never_spawns_a_provider() {
+        use super::test_support::*;
+        let dir = TempDir::new("cancel-before-spawn");
+        for argv in [
+            vec!["/bin/sh".to_string(), "-c".into(), "exit 0".into()],
+            vec![dir.0.join("missing-provider").display().to_string()],
+        ] {
+            let (_, _, stream) = native_task(AgentProvider::Claude, &dir.0);
+            let (worker, _events) = test_worker(stream);
+            let (_commands, receiver) = bounded(COMMAND_CAPACITY);
+            let cancellation = AgentCancellation::new();
+            cancellation.cancel();
+            let report = worker.run(&argv, &dir.0, receiver, &cancellation);
+            assert_eq!(report.outcome, AgentSessionOutcome::Cancelled);
+            assert_eq!(report.cause, CodexAppServerExitCause::Cancelled);
+            assert!(
+                !report.process.spawned,
+                "pre-cancelled work executed a provider"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unverified_process_cleanup_keeps_the_task_stream_active() {
+        use super::test_support::*;
+        for (reaped, empty, requested_outcome) in [
+            (false, false, AgentSessionOutcome::Failed),
+            (true, false, AgentSessionOutcome::Failed),
+            (true, false, AgentSessionOutcome::Cancelled),
+            (true, false, AgentSessionOutcome::Clean),
+        ] {
+            let dir = TempDir::new("unverified-cleanup");
+            let (mut manager, task_id, stream) = native_task(AgentProvider::Claude, &dir.0);
+            let (mut worker, events) = test_worker(stream);
+            worker.ensure_started(None);
+            let report = worker.finish(
+                CodexAppServerProcessExit {
+                    spawned: true,
+                    provider_released: true,
+                    reaped,
+                    containment_verified_empty: empty,
+                    ..CodexAppServerProcessExit::default()
+                },
+                requested_outcome,
+                CodexAppServerExitCause::IoFailed,
+                Some("process cleanup could not be confirmed".into()),
+                String::new(),
+            );
+            while let Ok(event) = events.try_recv() {
+                assert!(!matches!(
+                    event.kind(),
+                    AgentEventKind::SessionEnded { .. } | AgentEventKind::TurnCompleted { .. }
+                ));
+                manager.apply_agent_event(event).unwrap();
+            }
+            assert_eq!(report.outcome, AgentSessionOutcome::Failed);
+            assert!(manager.has_active_agent_event_stream(task_id));
+            assert!(manager.archive(task_id).is_err());
+        }
+    }
 
     #[test]
     fn json_record_keeps_ignored_lines_and_checks_the_raw_byte_limit() {

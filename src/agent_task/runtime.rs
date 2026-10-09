@@ -55,6 +55,33 @@ struct RunningCodexAgent {
     finish_requested: bool,
 }
 
+impl RunningCodexAgent {
+    fn record_exit_report(
+        &mut self,
+        exit: CodexAppServerExitReport,
+        report: &mut AgentRuntimePollReport,
+    ) {
+        if self.exit_report.is_some() {
+            return;
+        }
+        if exit.process.spawned && !(exit.process.reaped && exit.process.containment_verified_empty)
+        {
+            let detail = bounded_runtime_detail(format!(
+                "Native Agent cleanup could not be confirmed; task actions remain locked: {}",
+                exit.detail
+                    .as_deref()
+                    .unwrap_or("provider stop evidence is incomplete")
+            ));
+            self.forced_failure.get_or_insert_with(|| detail.clone());
+            report.issues.push(AgentRuntimeIssue {
+                task_id: self.stream.task_id(),
+                detail,
+            });
+        }
+        self.exit_report = Some(exit);
+    }
+}
+
 enum NativeRunningDriver {
     Codex(CodexAppServerDriver),
     Claude(ClaudeStreamJsonDriver),
@@ -900,7 +927,9 @@ impl AgentRuntimeManager {
                         }
                     }
                     if runtime.worker_joined && runtime.exit_report.is_none() {
-                        runtime.exit_report = runtime.driver.take_exit_report();
+                        if let Some(exit) = runtime.driver.take_exit_report() {
+                            runtime.record_exit_report(exit, &mut report);
+                        }
                     }
                     if runtime.exit_report.as_ref().is_some_and(|exit| {
                         !exit.process.spawned
@@ -1153,9 +1182,9 @@ impl AgentRuntimeManager {
     /// A loaded thread parked at an idle review point needs only low-frequency
     /// lifecycle polling until the user sends another turn or finishes it.
     pub fn needs_fast_poll(&self) -> bool {
-        self.running
-            .values()
-            .any(|runtime| runtime.driver.phase() != CodexAppServerPhase::Ready)
+        self.running.values().any(|runtime| {
+            !runtime.worker_joined && runtime.driver.phase() != CodexAppServerPhase::Ready
+        })
     }
 
     pub fn has_any_activity(&self) -> bool {
@@ -1444,6 +1473,88 @@ mod tests {
             })
             .unwrap();
         (tasks, task_id)
+    }
+
+    #[test]
+    fn unconfirmed_cleanup_is_reported_once_and_stays_locked_without_fast_polling() {
+        use crate::agent_task::CodexAppServerProcessExit;
+
+        let (mut tasks, task_id) = task_manager();
+        let stream = tasks.start_agent_event_stream(task_id).unwrap();
+        let task = tasks.get(task_id).unwrap();
+        // This deliberately missing directory makes the fake print worker
+        // finish without running any provider or consulting credentials.
+        let mut driver = ClaudeStreamJsonDriver::new(
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            task.worktree_path.clone(),
+        );
+        driver
+            .start(AgentStartRequest {
+                provider: AgentProvider::Claude,
+                stream: stream.clone(),
+                worktree_path: task.worktree_path.clone(),
+                source_context: None,
+                initial_prompt: Some(AgentPrompt::new("fixture")),
+                resume_from: None,
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !driver.worker_is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        driver.join_finished_worker().unwrap();
+        while matches!(driver.try_next_event(), Ok(Some(_))) {}
+        let _ = driver.take_exit_report();
+        let mut running = RunningCodexAgent {
+            driver: NativeRunningDriver::Claude(driver),
+            retained_workspace: None,
+            stream,
+            worker_joined: true,
+            forced_failure: None,
+            exit_report: None,
+            pending_prompt: None,
+            finish_requested: false,
+        };
+        let exit = CodexAppServerExitReport {
+            outcome: AgentSessionOutcome::Failed,
+            cause: CodexAppServerExitCause::IoFailed,
+            detail: Some("fixture group is still populated".into()),
+            process: CodexAppServerProcessExit {
+                spawned: true,
+                reaped: true,
+                containment_verified_empty: false,
+                ..CodexAppServerProcessExit::default()
+            },
+            critical_event_delivery_failed: false,
+            stderr_tail: String::new(),
+        };
+        let mut report = AgentRuntimePollReport::default();
+        running.record_exit_report(exit.clone(), &mut report);
+        running.record_exit_report(exit.clone(), &mut report);
+        assert_eq!(report.issues.len(), 1);
+        assert!(report.issues[0]
+            .detail
+            .contains("task actions remain locked"));
+        assert!(report.issues[0].detail.contains("still populated"));
+        let mut runtime = AgentRuntimeManager::new();
+        runtime.running.insert(task_id, running);
+        assert!(runtime.has_any_activity());
+        assert!(!runtime.needs_fast_poll());
+        for _ in 0..2 {
+            let report = runtime.poll(&mut tasks, TEST_POLICY);
+            assert!(report.issues.is_empty());
+            assert!(report.completions.is_empty());
+            assert_eq!(runtime.running[&task_id].exit_report.as_ref(), Some(&exit));
+            assert!(tasks.has_active_agent_event_stream(task_id));
+            assert!(tasks.next_validation_attempt(task_id).is_err());
+            assert!(tasks.archive(task_id).is_err());
+        }
+        runtime.running.get_mut(&task_id).unwrap().worker_joined = false;
+        assert!(
+            runtime.needs_fast_poll(),
+            "unjoined active workers still need fast polling"
+        );
     }
 
     #[test]
