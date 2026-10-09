@@ -1605,6 +1605,57 @@ impl ChildLifecycle {
             return None;
         }
 
+        // Natural exits need group cleanup too. Observe without consuming the
+        // status so the zombie pins its numeric PID/PGID through the last
+        // signal. Reaping first would leave HUP-resistant background jobs
+        // alive and make any later group signal vulnerable to PID reuse.
+        if !state.cleanup_complete {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: this lifecycle is the exclusive wait owner, and the
+            // state mutex serializes this observation with teardown/signals.
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.process.pid() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if observed < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    // An external reaper released the identity. Unknown is a
+                    // failure status, and no signal may use this PID again.
+                    state.exit_code = Some(1);
+                    state.reaped = true;
+                    return Some(1);
+                }
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    log::warn!("failed to observe child {}: {error}", self.process.pid());
+                }
+                return None;
+            }
+            // SAFETY: successful waitid initialized info; zero means no exit.
+            if unsafe { info.si_pid() } != self.process.pid() {
+                return None;
+            }
+            // The unreaped direct child reserves this group number. If it
+            // never created a private group, kill(-pid) simply returns ESRCH;
+            // it cannot address our own or an unrelated process group.
+            let killed = unsafe { libc::kill(-self.process.pid(), libc::SIGKILL) };
+            if killed < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    // Keep the ownership anchor and retry on a later poll.
+                    log::warn!(
+                        "failed to clean exited child {} group: {error}",
+                        self.process.pid()
+                    );
+                    return None;
+                }
+            }
+        }
+
         let mut status: c_int = 0;
         // SAFETY: `status` is a live c_int for the duration of the call.
         let waited = unsafe { libc::waitpid(self.process.pid(), &mut status, libc::WNOHANG) };
@@ -2516,6 +2567,66 @@ mod lifecycle_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::zombie_processes)] // ChildLifecycle exclusively owns waitpid.
+    fn natural_leader_exit_cleans_same_group_descendants_before_reaping() {
+        use std::os::unix::process::CommandExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "jterm-natural-exit-descendants-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let marker = root.join("descendant-survived");
+        let mut command = Command::new("/bin/sh");
+        // The background job shares the non-interactive shell's group and
+        // ignores its hangup. Bound the fixture so a failing test cannot leave
+        // a long-running orphan. A separate session is not owned by this test.
+        command
+            .args([
+                "-c",
+                "(trap '' HUP TERM; sleep 0.6; printf survived > \"$1\") & exit 23",
+                "natural-exit-test",
+            ])
+            .arg(&marker);
+        // SAFETY: setsid is async-signal-safe in the freshly forked child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().expect("spawn natural-exit fixture");
+        let pid = child.id() as i32;
+        let lifecycle = ChildLifecycle::new(pid, ReapOwner::Ours).unwrap();
+        assert!(wait_for(Duration::from_secs(2), || lifecycle
+            .poll_reap()
+            .is_some()));
+        assert_eq!(
+            lifecycle.exit_code(),
+            Some(23),
+            "preserve the real leader exit"
+        );
+        assert!(!lifecycle.terminate(EscalationPolicy::SESSION_DRAIN));
+        assert!(is_fully_reaped(pid));
+        drop(lifecycle);
+        std::thread::sleep(Duration::from_millis(850));
+        let survived = marker.exists();
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            !survived,
+            "natural leader exit left a same-group descendant running"
+        );
+    }
+
     // -- hoisted from anvil ------------------------------------------------
 
     #[test]
@@ -2606,6 +2717,26 @@ mod lifecycle_tests {
         // The cached status is what makes every later drop path safe.
         assert_eq!(lifecycle.exit_code(), Some(23));
         assert_eq!(lifecycle.poll_reap(), Some(23));
+    }
+
+    #[test]
+    fn an_externally_reaped_child_fails_closed_without_later_signals() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 23"])
+            .spawn()
+            .expect("spawn externally reaped child");
+        let lifecycle =
+            ChildLifecycle::new(child.id() as i32, ReapOwner::Ours).expect("reference child");
+        assert_eq!(child.wait().unwrap().code(), Some(23));
+        assert_eq!(lifecycle.poll_reap(), Some(1), "ECHILD has unknown status");
+        assert_eq!(lifecycle.exit_code(), Some(1));
+        assert!(!lifecycle.terminate(EscalationPolicy::SESSION_DRAIN));
+        assert_eq!(
+            lifecycle.signal(libc::SIGKILL).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        lifecycle.force_kill_and_reap();
+        assert_eq!(lifecycle.exit_code(), Some(1));
     }
 
     // -- new surface --------------------------------------------------------
