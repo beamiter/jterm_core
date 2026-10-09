@@ -775,7 +775,7 @@ mod tests {
         );
         let mut restored = AgentSession::restore(pending).unwrap();
         assert_eq!(restored.approve(id).unwrap().command, "printf reviewed");
-        session.approve(id).unwrap();
+        assert_eq!(session.approve(id).unwrap().command, "printf reviewed");
         let executing = session.snapshot().unwrap();
         assert_eq!(
             executing.state(),
@@ -801,7 +801,7 @@ mod tests {
             else {
                 panic!("expected proposal");
             };
-            session.approve(id).unwrap();
+            assert_eq!(session.approve(id).unwrap().command, "\\".repeat(8192));
             session.observe(id, 0, &output).unwrap();
             let snapshot = session.snapshot().unwrap();
             saw_compaction |= snapshot.transcript_truncated();
@@ -849,7 +849,7 @@ mod tests {
             };
             let mut pending = check(&session, AgentState::AwaitingApproval { proposal_id: id });
             assert_eq!(pending.approve(id).unwrap().command, command);
-            session.approve(id).unwrap();
+            assert_eq!(session.approve(id).unwrap().command, command);
             let recovered = check(
                 &session,
                 AgentState::AwaitingObservation { proposal_id: id },
