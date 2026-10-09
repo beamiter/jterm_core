@@ -473,7 +473,11 @@ fn valid_observed_port(port: &str) -> bool {
 }
 
 fn parse_observed_destination(destination: &str) -> Option<(Option<String>, String)> {
-    if destination.is_empty() || destination.starts_with('-') || destination.len() > 512 {
+    if destination.is_empty()
+        || destination.starts_with('-')
+        || destination.len() > 512
+        || destination.starts_with("ssh://")
+    {
         return None;
     }
     let (user, host) = match destination.rsplit_once('@') {
@@ -620,7 +624,11 @@ fn observed_jsh_remote_target(argv: &[String]) -> ObservedSshTarget {
 /// launcher. Terminal output and OSC 133 command strings are untrusted text
 /// and must not be passed here as proof that the user launched SSH.
 ///
-/// Only an interactive login with no remote command is accepted. Connection
+/// Only an interactive login with no remote command and a `[user@]host`
+/// destination is accepted. SSH URI destinations are not replayed: their user
+/// and port participate in option precedence and cannot be safely split as a
+/// plain host. This only disables automatic Files following; the original SSH
+/// command still runs normally. Connection
 /// options needed by a second non-interactive probe are retained; TTY,
 /// forwarding, logging, and presentation flags are deliberately dropped.
 /// Options that can execute a local command or load code are rejected. An
@@ -648,11 +656,13 @@ fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
 
     let mut destination: Option<String> = None;
     let mut user: Option<String> = None;
+    // A first `-o User=...` stays in its original form, including OpenSSH's
+    // quoting grammar. Later -l / user@host must not override that authority.
+    let mut user_option_seen = false;
     let mut ssh_args = Vec::new();
     let mut end_options = false;
     let mut index = 1usize;
     let mut port_seen = false;
-    let mut address_family_seen = false;
 
     while index < argv.len() {
         let argument = &argv[index];
@@ -697,10 +707,8 @@ fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
 
                 match flag {
                     '4' | '6' => {
-                        if !address_family_seen {
-                            ssh_args.push(format!("-{flag}"));
-                            address_family_seen = true;
-                        }
+                        // Unlike user/port, -4 and -6 override prior values.
+                        ssh_args.push(format!("-{flag}"));
                     }
                     // These affect reachability or authentication and are safe
                     // to preserve as structured argv.
@@ -709,7 +717,7 @@ fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
                         ssh_args.push(operand.as_ref().expect("operand option").clone());
                     }
                     'l' => {
-                        if user.is_none() {
+                        if user.is_none() && !user_option_seen {
                             user = operand;
                         }
                     }
@@ -734,6 +742,15 @@ fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
                         let (key, value) = option
                             .split_once('=')
                             .map_or((option, None), |(key, value)| (key, Some(value)));
+                        if key.eq_ignore_ascii_case("user") {
+                            if user.is_some() {
+                                // This option lost to an earlier -l or user@host.
+                                // Moving it before the destination would otherwise
+                                // make Files connect to a different account.
+                                break;
+                            }
+                            user_option_seen = true;
+                        }
                         if key.eq_ignore_ascii_case("controlpath")
                             && value.is_none_or(|path| !valid_observed_control_path(path))
                         {
@@ -780,7 +797,7 @@ fn observed_plain_ssh_target(argv: &[String]) -> ObservedSshTarget {
         let Some((destination_user, host)) = parse_observed_destination(argument) else {
             return ObservedSshTarget::Unsupported("the SSH destination is invalid");
         };
-        if user.is_none() {
+        if user.is_none() && !user_option_seen {
             user = destination_user;
         }
         destination = Some(host);
@@ -1426,5 +1443,103 @@ ssh_args = ["-p", "2222"]
         );
         let argv = container.deployed_argv_with_script(Path::new("/c/jsh-remote.sh"));
         assert!(!argv.iter().any(|a| a == "-p"), "{argv:?}");
+    }
+}
+
+#[cfg(test)]
+mod authority_regressions {
+    use super::{observed_ssh_target, ObservedSshTarget};
+
+    fn observe(args: &[&str]) -> ObservedSshTarget {
+        observed_ssh_target(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn observed_user_authority_keeps_the_first_explicit_source() {
+        for args in [
+            &["ssh", "alice@box", "-oUser=bob"] as &[&str],
+            &["ssh", "-lalice", "-o", "User=bob", "box"],
+            &["ssh", "-l", "alice", "box", "-ouSeR=\"bob\""],
+        ] {
+            let ObservedSshTarget::Target(target) = observe(args) else {
+                panic!("expected a target for {args:?}");
+            };
+            assert_eq!(target.user.as_deref(), Some("alice"), "{args:?}");
+            assert!(
+                target.ssh_args.is_empty(),
+                "{args:?}: {:?}",
+                target.ssh_args
+            );
+            assert_eq!(target.plain_argv(), ["ssh", "-t", "--", "alice@box", "jsh"]);
+        }
+    }
+
+    #[test]
+    fn observed_user_option_stays_authoritative_without_reparsing_its_value() {
+        for option in ["User=bob", "User=\"bob\"", "User= bob", "User=bob #comment"] {
+            for args in [
+                vec!["ssh", "-o", option, "-lalice", "box"],
+                vec!["ssh", "-o", option, "alice@box"],
+            ] {
+                let ObservedSshTarget::Target(target) = observe(&args) else {
+                    panic!("expected a target for {args:?}");
+                };
+                assert!(
+                    target.user.is_none(),
+                    "an overridden user must not name the Files account: {args:?}"
+                );
+                assert_eq!(target.ssh_args, ["-o", option], "{args:?}");
+                assert_eq!(
+                    target.plain_argv(),
+                    ["ssh", "-t", "-o", option, "--", "box", "jsh"]
+                );
+            }
+        }
+        // The launcher places all pass-through options before its destination.
+        let ObservedSshTarget::Target(target) = observe(&[
+            "/bin/sh",
+            "/cache/jsh-remote.sh",
+            "--persist",
+            "alice@box",
+            "--",
+            "-oUser=bob",
+        ]) else {
+            panic!("expected a launcher target");
+        };
+        assert!(target.user.is_none());
+        assert_eq!(target.ssh_args, ["-o", "User=bob"]);
+    }
+
+    #[test]
+    fn observed_address_family_keeps_last_wins_flag_order() {
+        for args in [
+            &["ssh", "-4", "-6", "box"] as &[&str],
+            &["ssh", "-46", "box"],
+            &["ssh", "-4", "box", "-6"],
+        ] {
+            let ObservedSshTarget::Target(target) = observe(args) else {
+                panic!("expected a target for {args:?}");
+            };
+            assert_eq!(target.ssh_args, ["-4", "-6"], "{args:?}");
+        }
+        let ObservedSshTarget::Target(target) = observe(&["ssh", "-64", "box"]) else {
+            panic!("expected a target");
+        };
+        assert_eq!(target.ssh_args, ["-6", "-4"]);
+    }
+
+    #[test]
+    fn observed_uri_destinations_fail_closed_instead_of_changing_account_or_port() {
+        for args in [
+            &["ssh", "-lbob", "ssh://alice@box:2222"] as &[&str],
+            &["ssh", "ssh://alice@box:2222", "-p2223"],
+            &["ssh", "ssh://box:2222"],
+            &["ssh", "ssh://alice@[::1]:2222"],
+        ] {
+            assert!(
+                matches!(observe(args), ObservedSshTarget::Unsupported(_)),
+                "{args:?}"
+            );
+        }
     }
 }
