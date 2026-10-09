@@ -1388,6 +1388,23 @@ fn drain_nonblocking(
     }
 }
 
+/// A buffered reply is still in flight until it is delivered. Recheck after
+/// pipe reads and callbacks as well as between polls, so cancellation or an
+/// elapsed deadline cannot be converted into a late successful completion.
+fn check_transport_active(
+    cancellation: &AiCancellationToken,
+    deadline: Instant,
+    timeout_message: &str,
+) -> Result<(), AiError> {
+    if cancellation.is_cancelled() {
+        return Err(AiError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(AiError::Transport(timeout_message.into()));
+    }
+    Ok(())
+}
+
 fn wait_with_bounded_output(
     child: crate::supervised::SupervisedChild,
     cancellation: &AiCancellationToken,
@@ -1429,14 +1446,8 @@ fn wait_with_bounded_output_limits(
     let mut stdout_eof = false;
     let mut stderr_eof = false;
     loop {
-        if cancellation.is_cancelled() {
-            if status.is_none() {
-                if let Err(error) = child.reap_after_group_kill() {
-                    log::warn!("Failed to fully reap cancelled AI request: {error}");
-                }
-            }
-            return Err(AiError::Cancelled);
-        }
+        // On error, the owned SupervisedChild synchronously kills and reaps.
+        check_transport_active(cancellation, deadline, "curl request timed out")?;
         let drained = (|| {
             if !stdout_eof {
                 stdout_eof = drain_nonblocking(
@@ -1457,6 +1468,7 @@ fn wait_with_bounded_output_limits(
             Ok::<(), AiError>(())
         })();
         drained?;
+        check_transport_active(cancellation, deadline, "curl request timed out")?;
         if status.is_none() {
             match child.root_has_exited() {
                 Ok(true) => {
@@ -1472,6 +1484,7 @@ fn wait_with_bounded_output_limits(
             }
         }
         if let Some(status) = status.filter(|_| stdout_eof && stderr_eof) {
+            check_transport_active(cancellation, deadline, "curl request timed out")?;
             return Ok(Output {
                 status,
                 stdout: stdout_bytes,
@@ -1482,12 +1495,6 @@ fn wait_with_bounded_output_limits(
             return Err(AiError::Transport(
                 "curl exited while a detached descendant kept an output pipe open".into(),
             ));
-        }
-        if Instant::now() >= deadline {
-            if status.is_none() {
-                let _ = child.reap_after_group_kill();
-            }
-            return Err(AiError::Transport("curl request timed out".into()));
         }
         thread::sleep(CURL_WAIT_POLL_INTERVAL);
     }
@@ -1658,9 +1665,12 @@ struct StreamFold {
 fn fold_stream_events(
     fold: &mut StreamFold,
     events: Vec<StreamEvent>,
+    cancellation: &AiCancellationToken,
+    deadline: Instant,
     on_delta: &mut dyn FnMut(&str),
-) {
+) -> Result<(), AiError> {
     for event in events {
+        check_transport_active(cancellation, deadline, "curl stream timed out")?;
         match event {
             StreamEvent::TextDelta(delta) => {
                 fold.text.push_str(&delta);
@@ -1685,6 +1695,9 @@ fn fold_stream_events(
             }
         }
     }
+    // The last delta may itself cancel, or its callback may outlive the
+    // deadline. Neither case may fall through to a successful EOF below.
+    check_transport_active(cancellation, deadline, "curl stream timed out")
 }
 
 /// Read a spawned child's stdout incrementally, feeding jagent's stream
@@ -1723,12 +1736,7 @@ fn stream_child_stdout(
     let mut exited_at = None;
     let mut buffer = [0_u8; 8 * 1024];
     loop {
-        if cancellation.is_cancelled() {
-            if status.is_none() {
-                let _ = child.reap_after_group_kill();
-            }
-            return Err(AiError::Cancelled);
-        }
+        check_transport_active(cancellation, deadline, "curl stream timed out")?;
         if !stdout_eof {
             loop {
                 match stdout.read(&mut buffer) {
@@ -1749,7 +1757,7 @@ fn stream_child_stdout(
                             error_prefix.extend_from_slice(&chunk[..chunk.len().min(room)]);
                         }
                         let events = parser.push(chunk);
-                        fold_stream_events(&mut fold, events, on_delta);
+                        fold_stream_events(&mut fold, events, cancellation, deadline, on_delta)?;
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -1784,7 +1792,7 @@ fn stream_child_stdout(
         if stdout_eof && stderr_eof {
             if let Some(status) = status {
                 let final_events = parser.finish();
-                fold_stream_events(&mut fold, final_events, on_delta);
+                fold_stream_events(&mut fold, final_events, cancellation, deadline, on_delta)?;
                 return Ok((fold, error_prefix, status, stderr_bytes));
             }
         }
@@ -1792,12 +1800,6 @@ fn stream_child_stdout(
             return Err(AiError::Transport(
                 "curl exited while a detached descendant kept an output pipe open".into(),
             ));
-        }
-        if Instant::now() >= deadline {
-            if status.is_none() {
-                let _ = child.reap_after_group_kill();
-            }
-            return Err(AiError::Transport("curl stream timed out".into()));
         }
         thread::sleep(CURL_WAIT_POLL_INTERVAL);
     }
@@ -3262,6 +3264,96 @@ mod tests {
         // The error-body prefix mirrors the head of raw stdout.
         assert!(String::from_utf8_lossy(&prefix).starts_with("{\"message\""));
         assert_child_reaped(pid);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn streaming_cancelled_delta_stops_the_current_batch_and_never_succeeds() {
+        for body in [
+            concat!(
+                "{\"message\":{\"content\":\"first\"},\"done\":false}\n",
+                "{\"message\":{\"content\":\"late\"},\"done\":false}\n",
+                "{\"message\":{\"content\":\"\"},\"done\":true}\n",
+            ),
+            // Cancellation from the last callback must also defeat success,
+            // including when parser.finish() receives an unterminated line.
+            "{\"message\":{\"content\":\"first\"},\"done\":true}\n",
+            "{\"message\":{\"content\":\"first\"},\"done\":true}",
+        ] {
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", &format!("printf '%s' '{body}'")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = spawn_supervised(&mut command);
+            let pid = child.id() as i32;
+            // The entire response is buffered and EOF is ready before cancellation.
+            // This exercises the fast-completion path deterministically.
+            wait_until_supervised_root_exits(&mut child);
+            let token = AiCancellationToken::new();
+            let mut deltas = Vec::new();
+            let result = stream_child_stdout(
+                child,
+                jagent::Provider::Ollama,
+                &token,
+                Instant::now() + Duration::from_secs(5),
+                &mut |delta| {
+                    deltas.push(delta.to_string());
+                    token.cancel();
+                },
+            );
+            assert_eq!(
+                deltas,
+                vec!["first"],
+                "delivered a delta after cancellation"
+            );
+            assert!(
+                matches!(result, Err(AiError::Cancelled)),
+                "result: {result:?}"
+            );
+            assert_child_reaped(pid);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expired_transport_deadline_never_delivers_buffered_output() {
+        for streaming in [false, true] {
+            let mut command = std::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "printf '%s\\n' '{\"message\":{\"content\":\"late\"},\"done\":true}'",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = spawn_supervised(&mut command);
+            let pid = child.id() as i32;
+            wait_until_supervised_root_exits(&mut child);
+            let token = AiCancellationToken::new();
+            let deadline = Instant::now() - Duration::from_millis(1);
+            let mut delivered = false;
+            let result = if streaming {
+                stream_child_stdout(
+                    child,
+                    jagent::Provider::Ollama,
+                    &token,
+                    deadline,
+                    &mut |_| delivered = true,
+                )
+                .map(|_| ())
+            } else {
+                wait_with_bounded_output(child, &token, deadline).map(|_| ())
+            };
+            assert!(!delivered, "expired streaming request delivered a delta");
+            assert!(
+                matches!(result, Err(AiError::Transport(ref message)) if message.contains("timed out")),
+                "result: {result:?}"
+            );
+            assert_child_reaped(pid);
+        }
     }
 
     #[cfg(unix)]
