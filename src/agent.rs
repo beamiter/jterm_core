@@ -261,8 +261,21 @@ impl AgentSession {
         self.inner.build_user_prompt_with(protocol)
     }
 
+    /// Capture a restart-safe snapshot within the family's encoded byte cap.
+    /// Only the saved history suffix may be shortened; the live session and
+    /// its active approval/execution binding are unchanged.
     pub fn snapshot(&self) -> Option<AgentSessionSnapshot> {
-        self.inner.snapshot()
+        let snapshot = self.inner.snapshot()?;
+        match bound_live_snapshot(snapshot) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                // This cannot occur for the pinned live turn bounds, but a
+                // future schema must fail visibly instead of saving a broken
+                // approval binding or panicking during autosave.
+                log::warn!("agent: could not prepare a resumable snapshot: {error}");
+                None
+            }
+        }
     }
 
     fn validate_live_outcome(
@@ -282,6 +295,104 @@ impl AgentSession {
         self.inner.reject(*id)?;
         Err(invalid_command_error(reason))
     }
+}
+
+/// Count JSON bytes without constructing an expanded, potentially oversized
+/// encoded transcript. The same measure governs live snapshots and restore.
+fn encoded_json_size(
+    value: &(impl serde::Serialize + ?Sized),
+) -> Result<usize, AgentSnapshotError> {
+    #[derive(Default)]
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("snapshot byte count overflowed"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter::default();
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|error| AgentSnapshotError::Encode(error.to_string()))?;
+    Ok(counter.0)
+}
+
+fn bound_live_snapshot(
+    snapshot: AgentSessionSnapshot,
+) -> Result<AgentSessionSnapshot, AgentSnapshotError> {
+    let transcript = snapshot.transcript();
+    let mut encoded_bytes = encoded_json_size(transcript)?;
+    if encoded_bytes <= MAX_STORED_TRANSCRIPT_BYTES {
+        return Ok(snapshot);
+    }
+    let mut first = 0;
+    while encoded_bytes > MAX_STORED_TRANSCRIPT_BYTES {
+        // Match jagent's retention unit: an observation must never be left
+        // behind when its immediately preceding proposal is removed.
+        let remove_count = match &transcript[first..] {
+            [Turn::AssistantProposed { id, .. }, Turn::Observation { proposal_id, .. }, ..]
+                if id == proposal_id =>
+            {
+                2
+            }
+            _ => 1,
+        };
+        if transcript.len() - first <= remove_count {
+            return Err(AgentSnapshotError::Invalid(
+                "active snapshot unit exceeds its encoded byte limit",
+            ));
+        }
+        for turn in &transcript[first..first + remove_count] {
+            // At least one retained turn remains, so each removed turn also
+            // removes exactly one comma from the enclosing JSON array.
+            encoded_bytes = encoded_json_size(turn)?
+                .checked_add(1)
+                .and_then(|removed| encoded_bytes.checked_sub(removed))
+                .ok_or(AgentSnapshotError::Invalid(
+                    "snapshot byte count is inconsistent",
+                ))?;
+        }
+        first += remove_count;
+    }
+
+    // Serialize a borrowed, typed suffix; do not introduce an ordinary
+    // Vec<Turn>/Value decoder beside jagent's allocation-aware wire boundary.
+    // Every header is copied unchanged, including the active proposal id and
+    // monotonically increasing counter. Only discarded history is disclosed.
+    #[derive(serde::Serialize)]
+    struct SnapshotSuffix<'a> {
+        version: u32,
+        transcript: &'a [Turn],
+        transcript_truncated: bool,
+        state: AgentState,
+        turns_used: u32,
+        max_turns: u32,
+        next_proposal_id: u64,
+    }
+    let suffix = SnapshotSuffix {
+        version: snapshot.version(),
+        transcript: &transcript[first..],
+        transcript_truncated: true,
+        state: snapshot.state(),
+        turns_used: snapshot.turns_used(),
+        max_turns: snapshot.max_turns(),
+        next_proposal_id: snapshot.next_proposal_id(),
+    };
+    if encoded_json_size(&suffix)? > MAX_AGENT_SNAPSHOT_JSON_BYTES {
+        return Err(AgentSnapshotError::TooLarge {
+            limit: MAX_AGENT_SNAPSHOT_JSON_BYTES,
+        });
+    }
+    let encoded = serde_json::to_string(&suffix)
+        .map_err(|error| AgentSnapshotError::Encode(error.to_string()))?;
+    let bounded = AgentSessionSnapshot::from_json(&encoded)?;
+    validate_snapshot(&bounded)?;
+    Ok(bounded)
 }
 
 /// The family's own ceilings on a persisted snapshot, applied before jagent's
@@ -325,9 +436,7 @@ fn validate_snapshot(snapshot: &AgentSessionSnapshot) -> Result<(), AgentSnapsho
             "transcript exceeds its entry limit",
         ));
     }
-    let transcript_bytes = serde_json::to_vec(transcript)
-        .map_err(|error| AgentSnapshotError::Encode(error.to_string()))?
-        .len();
+    let transcript_bytes = encoded_json_size(transcript)?;
     if transcript_bytes > MAX_STORED_TRANSCRIPT_BYTES {
         return Err(AgentSnapshotError::Invalid(
             "transcript exceeds its byte limit",
@@ -603,6 +712,273 @@ pub fn claim_session_file(path: &std::path::Path) -> SessionClaim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn escaped_live_session(character: char) -> AgentSession {
+        let mut session = AgentSession::new(100);
+        for _ in 0..4 {
+            session
+                .submit_user(character.to_string().repeat(MAX_MESSAGE_BYTES))
+                .unwrap();
+            session
+                .accept_model_reply(r#"{"action":"say","message":"ready"}"#)
+                .unwrap();
+        }
+        session
+    }
+
+    #[test]
+    fn live_snapshots_bound_json_escaping_without_changing_the_session() {
+        for character in ['\\', '"', '\0'] {
+            let session = escaped_live_session(character);
+            let live_transcript = session.transcript().to_vec();
+            let epoch = session.epoch();
+            let cancellation = session.cancellation_token();
+            let snapshot = session
+                .snapshot()
+                .expect("valid live activity must remain resumable");
+            let json = snapshot.to_json().unwrap();
+            assert!(json.len() <= MAX_AGENT_SNAPSHOT_JSON_BYTES);
+            assert!(
+                serde_json::to_vec(snapshot.transcript()).unwrap().len()
+                    <= MAX_STORED_TRANSCRIPT_BYTES
+            );
+            assert!(snapshot.transcript_truncated());
+            assert_eq!(snapshot.state(), session.state());
+            let restored =
+                AgentSession::restore(AgentSessionSnapshot::from_json(&json).unwrap()).unwrap();
+            assert_eq!(restored.state(), session.state());
+            assert_eq!(session.transcript(), live_transcript);
+            assert_eq!(session.epoch(), epoch);
+            assert!(!cancellation.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn encoded_snapshot_compaction_preserves_current_approval_and_interrupted_execution() {
+        let mut session = escaped_live_session('\\');
+        session.submit_user("run the reviewed command").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"printf reviewed"}"#)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        let pending = session.snapshot().unwrap();
+        assert!(pending.transcript_truncated());
+        assert_eq!(
+            pending.state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
+        assert_eq!(
+            pending.next_proposal_id(),
+            session.inner.snapshot().unwrap().next_proposal_id()
+        );
+        let mut restored = AgentSession::restore(pending).unwrap();
+        assert_eq!(restored.approve(id).unwrap().command, "printf reviewed");
+        session.approve(id).unwrap();
+        let executing = session.snapshot().unwrap();
+        assert_eq!(
+            executing.state(),
+            AgentState::AwaitingObservation { proposal_id: id }
+        );
+        let recovered = AgentSession::restore(executing).unwrap();
+        assert_eq!(recovered.state(), AgentState::Ready);
+        assert!(
+            matches!(recovered.transcript().last(), Some(Turn::ProtocolError(message)) if message.contains("unknown result"))
+        );
+        assert!(AgentSession::restore(recovered.snapshot().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn encoded_snapshot_compaction_never_orphans_an_observation() {
+        let mut session = AgentSession::new(100);
+        session.submit_user("inspect").unwrap();
+        let response = serde_json::json!({"action":"run", "command":"\\".repeat(8192)}).to_string();
+        let output = "\0".repeat(MAX_OBSERVATION_BYTES);
+        let mut saw_compaction = false;
+        for _ in 0..12 {
+            let ModelOutcome::Proposal { id, .. } = session.accept_model_reply(&response).unwrap()
+            else {
+                panic!("expected proposal");
+            };
+            session.approve(id).unwrap();
+            session.observe(id, 0, &output).unwrap();
+            let snapshot = session.snapshot().unwrap();
+            saw_compaction |= snapshot.transcript_truncated();
+            for (index, turn) in snapshot.transcript().iter().enumerate() {
+                if let Turn::Observation { proposal_id, .. } = turn {
+                    assert!(index > 0);
+                    assert!(
+                        matches!(&snapshot.transcript()[index - 1], Turn::AssistantProposed { id, status: ProposalStatus::Approved, .. } if id == proposal_id)
+                    );
+                }
+            }
+            AgentSession::restore(snapshot).unwrap();
+        }
+        assert!(saw_compaction);
+    }
+
+    #[test]
+    fn maximal_live_fields_round_trip_across_every_resumable_state() {
+        let user = "\0".repeat(MAX_MESSAGE_BYTES);
+        let command = "\\".repeat(MAX_COMMAND_BYTES);
+        let output = "\0".repeat(MAX_OBSERVATION_BYTES);
+        let run = serde_json::json!({"action":"run", "command":command}).to_string();
+        let check = |session: &AgentSession, expected: AgentState| {
+            let before = session.inner.snapshot().unwrap();
+            let snapshot = session.snapshot().unwrap();
+            assert_eq!(snapshot.state(), expected);
+            assert_eq!(snapshot.turns_used(), before.turns_used());
+            assert_eq!(snapshot.max_turns(), before.max_turns());
+            assert_eq!(snapshot.next_proposal_id(), before.next_proposal_id());
+            assert_eq!(snapshot.transcript().last(), before.transcript().last());
+            assert!(
+                serde_json::to_vec(snapshot.transcript()).unwrap().len()
+                    <= MAX_STORED_TRANSCRIPT_BYTES
+            );
+            let wire = snapshot.to_json().unwrap();
+            AgentSession::restore(AgentSessionSnapshot::from_json(&wire).unwrap()).unwrap()
+        };
+        for max_turns in [1, 100] {
+            let mut session = AgentSession::new(max_turns);
+            session.submit_user(user.clone()).unwrap();
+            check(&session, AgentState::AwaitingModel);
+            let ModelOutcome::Proposal { id, .. } = session.accept_model_reply(&run).unwrap()
+            else {
+                panic!("expected proposal");
+            };
+            let mut pending = check(&session, AgentState::AwaitingApproval { proposal_id: id });
+            assert_eq!(pending.approve(id).unwrap().command, command);
+            session.approve(id).unwrap();
+            let recovered = check(
+                &session,
+                AgentState::AwaitingObservation { proposal_id: id },
+            );
+            assert!(!matches!(
+                recovered.state(),
+                AgentState::AwaitingObservation { .. }
+            ));
+            session.observe(id, 7, &output).unwrap();
+            check(
+                &session,
+                if max_turns == 1 {
+                    AgentState::TurnLimitReached
+                } else {
+                    AgentState::AwaitingModel
+                },
+            );
+            if max_turns > 1 {
+                let done =
+                    serde_json::json!({"action":"done", "message":"\\".repeat(MAX_MESSAGE_BYTES)})
+                        .to_string();
+                session.accept_model_reply(&done).unwrap();
+                check(&session, AgentState::Completed);
+                session.continue_after_completion().unwrap();
+                check(&session, AgentState::Ready);
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_snapshot_compaction_preserves_thought_action_boundaries() {
+        for action in ["say", "run"] {
+            for (following_user_bytes, keep_thought) in [(12_000, true), (12_500, false)] {
+                let mut session = AgentSession::new(100);
+                session.submit_user("\0".repeat(MAX_MESSAGE_BYTES)).unwrap();
+                let field = if action == "run" {
+                    "command"
+                } else {
+                    "message"
+                };
+                let first_action = serde_json::json!({
+                    "action": action,
+                    "thought": "\0".repeat(MAX_THOUGHT_BYTES),
+                    field: "\\".repeat(MAX_MESSAGE_BYTES),
+                });
+                if let ModelOutcome::Proposal { id, command, .. } = session
+                    .accept_model_reply(&first_action.to_string())
+                    .unwrap()
+                {
+                    // Return control to the user without removing the action
+                    // adjacent to the first thought.
+                    session.edit_for_manual_review(id, command).unwrap();
+                }
+                session
+                    .submit_user("\0".repeat(following_user_bytes))
+                    .unwrap();
+                let ModelOutcome::Proposal { id, .. } = session.accept_model_reply(
+                    r#"{"action":"run","thought":"current thought","command":"printf current"}"#,
+                ).unwrap() else { panic!("expected current proposal"); };
+                let snapshot = session.snapshot().unwrap();
+                assert!(snapshot.transcript_truncated());
+                assert_eq!(
+                    matches!(
+                        snapshot.transcript().first(),
+                        Some(Turn::AssistantThought(_))
+                    ),
+                    keep_thought,
+                    "action={action}, following_user_bytes={following_user_bytes}",
+                );
+                if !keep_thought {
+                    assert!(matches!(
+                        snapshot.transcript().first(),
+                        Some(Turn::AssistantSay(_) | Turn::AssistantProposed { .. })
+                    ));
+                }
+                // Prefix compaction may keep a thought with its own action or
+                // drop that thought and begin at its action. It may never
+                // retain a thought detached from the immediately next action.
+                for (index, turn) in snapshot.transcript().iter().enumerate() {
+                    if matches!(turn, Turn::AssistantThought(_)) {
+                        assert!(matches!(
+                            snapshot.transcript().get(index + 1),
+                            Some(Turn::AssistantSay(_) | Turn::AssistantProposed { .. })
+                        ));
+                    }
+                }
+                assert_eq!(
+                    snapshot.state(),
+                    AgentState::AwaitingApproval { proposal_id: id }
+                );
+                let mut restored = AgentSession::restore(snapshot).unwrap();
+                assert_eq!(restored.approve(id).unwrap().command, "printf current");
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_size_preflight_matches_wire_and_preserves_small_snapshots() {
+        let turns = [
+            Turn::User("quote\" slash\\ nul\0 unicode雪\n".to_owned()),
+            Turn::AssistantSay("ready".to_owned()),
+        ];
+        assert_eq!(
+            encoded_json_size(&turns).unwrap(),
+            serde_json::to_vec(&turns).unwrap().len()
+        );
+        let mut session = AgentSession::new(10);
+        session.submit_user("inspect").unwrap();
+        let original = session.inner.snapshot().unwrap().to_json().unwrap();
+        let bounded = session.snapshot().unwrap().to_json().unwrap();
+        assert_eq!(bounded, original);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn escaped_live_snapshot_persists_and_claims_once_without_quarantine() {
+        let directory = TestDir::new("encoded-live-budget");
+        let path = directory.0.join("agent_session.json");
+        let session = escaped_live_session('\\');
+        write_snapshot_file(&path, &session.snapshot().unwrap()).unwrap();
+        let SessionClaim::Restored(restored) = try_claim_session_file(&path).unwrap() else {
+            panic!("a saved live session must restore instead of being quarantined");
+        };
+        assert_eq!(restored.state(), AgentState::Ready);
+        assert!(matches!(
+            try_claim_session_file(&path).unwrap(),
+            SessionClaim::Vacant
+        ));
+    }
 
     // Compatibility regressions deliberately exercise these deprecated
     // wrappers through three narrowly allowed adapters. Production code and

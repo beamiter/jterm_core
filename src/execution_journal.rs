@@ -353,7 +353,7 @@ fn recognized_v1_start_id(line: &[u8]) -> Option<Cow<'_, str>> {
 
 enum JournalMessage {
     Output(BoundOutput),
-    Flush(Sender<()>),
+    Flush(Sender<bool>),
 }
 
 struct HistoryRequest {
@@ -416,10 +416,16 @@ fn writer() -> Option<&'static Sender<JournalMessage>> {
             match std::thread::Builder::new()
                 .name("jsh-execution-journal".to_owned())
                 .spawn(move || {
+                    // A drained queue alone cannot prove persistence. Once an
+                    // accepted event fails, no later barrier may claim that
+                    // every preceding output reached disk, even if later
+                    // events append successfully.
+                    let mut all_outputs_persisted = true;
                     while let Ok(message) = rx.recv() {
                         match message {
                             JournalMessage::Output(output) => {
                                 if let Err(error) = append_event(output) {
+                                    all_outputs_persisted = false;
                                     // Journal diagnostics can describe a
                                     // command or captured output. The terminal
                                     // log needs only the stable error class.
@@ -430,7 +436,7 @@ fn writer() -> Option<&'static Sender<JournalMessage>> {
                                 }
                             }
                             JournalMessage::Flush(acknowledge) => {
-                                let _ = acknowledge.send(());
+                                let _ = acknowledge.send(all_outputs_persisted);
                             }
                         }
                     }
@@ -530,11 +536,10 @@ pub fn submit(completed: CompletedExecution) -> Result<(), SubmitError> {
 
 /// Wait briefly for every output accepted before this call to reach disk.
 /// Used during orderly application shutdown; normal terminal frames never
-/// block on the journal.
+/// block on the journal. Returns false on timeout, worker disconnection, or
+/// any preceding append failure. Disabling new output capture does not skip
+/// the barrier for work already accepted by the writer.
 pub fn flush(timeout: std::time::Duration) -> bool {
-    if !output_capture_enabled() {
-        return true;
-    }
     let Some(Some(writer)) = WRITER.get() else {
         return true;
     };
@@ -548,7 +553,7 @@ pub fn flush(timeout: std::time::Duration) -> bool {
     }
     ack_rx
         .recv_timeout(timeout.saturating_sub(started.elapsed()))
-        .is_ok()
+        .unwrap_or(false)
 }
 
 /// Whether a terminal output producer has a journal consumer to serve.
@@ -1397,7 +1402,7 @@ fn inspect_bound_output_snapshot(
     let mut line = Vec::new();
     let mut event_lines = 0usize;
     let mut active_lifecycle = false;
-    let mut lifecycle_finished = false;
+    let mut lifecycle_finish = None;
     let mut finish_conflicted = false;
     let mut output_seen = false;
     let mut output_conflicted = false;
@@ -1427,7 +1432,7 @@ fn inspect_bound_output_snapshot(
         let decoded = serde_json::from_slice::<PersistedEvent>(&line).ok();
         if recognized_v1_start_id(&line).as_deref() == Some(lifecycle.id.as_str()) {
             active_lifecycle = false;
-            lifecycle_finished = false;
+            lifecycle_finish = None;
             finish_conflicted = false;
             output_seen = false;
             output_conflicted = false;
@@ -1446,8 +1451,10 @@ fn inspect_bound_output_snapshot(
             Some(PersistedEvent::Finish {
                 jsh_execution_version,
                 id,
+                exit_code,
+                duration_ms,
                 cwd_after,
-                ..
+                ended_at_ms,
             }) if jsh_execution_version == EXECUTION_JOURNAL_VERSION
                 && id == lifecycle.id
                 && is_valid_jsh_execution_id(&id)
@@ -1460,7 +1467,14 @@ fn inspect_bound_output_snapshot(
                 // not close an empty Output slot; it only means the physical
                 // tail can no longer prove that an existing Output is the one
                 // this writer appended.
-                lifecycle_finished = true;
+                let finish = (exit_code, duration_ms, cwd_after, ended_at_ms);
+                match lifecycle_finish.as_ref() {
+                    None => lifecycle_finish = Some(finish),
+                    Some(existing) if existing == &finish => {}
+                    // Match the history fold before jsh compacts this pair
+                    // into its equivalent durable Finish conflict tombstone.
+                    Some(_) => finish_conflicted = true,
+                }
             }
             Some(PersistedEvent::Output {
                 jsh_execution_version,
@@ -1531,7 +1545,7 @@ fn inspect_bound_output_snapshot(
             // committed is provably this one. A Finish anywhere in the
             // generation breaks that proof: before the Output it means another
             // writer was interleaved, after it means the tail is not ours.
-            if terminal_exact && matching_outputs == 1 && !lifecycle_finished {
+            if terminal_exact && matching_outputs == 1 && lifecycle_finish.is_none() {
                 BoundOutputSnapshot::ExactTerminal
             } else {
                 BoundOutputSnapshot::Rejected
@@ -2290,6 +2304,181 @@ mod tests {
         event.extend_from_slice(suffix);
         assert_eq!(event.len(), raw_bytes);
         event
+    }
+
+    fn run_flush_probe(test_name: &str, mode: &str) {
+        let directory = TestDir::new(mode);
+        let path = directory.0.join("executions.jsonl");
+        write_temporary_journal(&path, lifecycle_start_line(&lifecycle("jsh-flush")));
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("JTERM_JOURNAL_FLUSH_PROBE", mode)
+            .env("JSH_EXECUTION_JOURNAL", "1")
+            .env("JSH_EXECUTION_JOURNAL_PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "flush probe failed: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    fn submit_flush_probe(id: &str) {
+        submit(CompletedExecution {
+            lifecycle: lifecycle(id),
+            output: "captured".to_owned(),
+            output_available: true,
+            truncated: false,
+            total_bytes: 8,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn worker_flush_reports_failed_output_and_keeps_processing() {
+        if std::env::var("JTERM_JOURNAL_FLUSH_PROBE").as_deref() != Ok("rejected") {
+            run_flush_probe(
+                "execution_journal::tests::worker_flush_reports_failed_output_and_keeps_processing",
+                "rejected",
+            );
+            return;
+        }
+        // The queue accepts this output, but no matching Start authorizes it.
+        submit_flush_probe("jsh-stale");
+        assert!(
+            !flush(Duration::from_secs(2)),
+            "a failed append is not a successful flush"
+        );
+        // A failed event must neither stop subsequent writes nor get forgotten
+        // when a later barrier promises all accepted events reached disk.
+        submit_flush_probe("jsh-flush");
+        assert!(!flush(Duration::from_secs(2)));
+        assert!(!flush(Duration::from_secs(2)));
+        let (path, _) = journal_path().unwrap();
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        assert_eq!(records[0].output.as_ref().unwrap().text, "captured");
+    }
+
+    #[test]
+    fn worker_flush_confirms_successful_output() {
+        if std::env::var("JTERM_JOURNAL_FLUSH_PROBE").as_deref() != Ok("success") {
+            run_flush_probe(
+                "execution_journal::tests::worker_flush_confirms_successful_output",
+                "success",
+            );
+            return;
+        }
+        assert!(
+            flush(Duration::from_secs(2)),
+            "an unused worker has nothing to flush"
+        );
+        submit_flush_probe("jsh-flush");
+        assert!(flush(Duration::from_secs(2)));
+        let (path, _) = journal_path().unwrap();
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        assert_eq!(records[0].output.as_ref().unwrap().text, "captured");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_flush_drains_accepted_output_after_capture_is_disabled() {
+        if std::env::var("JTERM_JOURNAL_FLUSH_PROBE").as_deref() != Ok("disabled") {
+            run_flush_probe(
+                "execution_journal::tests::worker_flush_drains_accepted_output_after_capture_is_disabled",
+                "disabled",
+            );
+            return;
+        }
+        let (path, _) = journal_path().unwrap();
+        let directory = path.parent().unwrap();
+        let lock = JournalFileLock::acquire(
+            directory,
+            &directory.join(JOURNAL_LOCK_FILE_NAME),
+            JournalLockMode::Exclusive,
+            false,
+        )
+        .unwrap();
+        submit_flush_probe("jsh-flush");
+        // Isolated subprocess: no other test can observe this environment edit.
+        std::env::set_var("JSH_EXECUTION_JOURNAL", "0");
+        assert!(
+            !flush(Duration::from_millis(20)),
+            "disabling new capture must not acknowledge an already queued write"
+        );
+        drop(lock);
+        assert!(flush(Duration::from_secs(2)));
+        let records = read_session_history_file(&path, "wanted").unwrap();
+        assert_eq!(records[0].output.as_ref().unwrap().text, "captured");
+    }
+
+    #[test]
+    fn bound_output_rejects_uncompacted_finish_conflicts() {
+        let directory = TestDir::new("uncompacted-finish-conflicts");
+        let path = directory.0.join("executions.jsonl");
+        let lifecycle = lifecycle("jsh-finish-conflict");
+        let finish = serde_json::json!({
+            "jsh_execution_version": 1, "event": "finish", "id": lifecycle.id,
+            "exit_code": 0, "duration_ms": 2, "cwd_after": "/tmp", "ended_at_ms": 3,
+        });
+        let (output, encoded) = encoded_bound_output(lifecycle.clone(), "captured");
+        for (field, value) in [
+            ("exit_code", serde_json::json!(9)),
+            ("duration_ms", serde_json::json!(8)),
+            ("cwd_after", serde_json::json!("/other")),
+            ("ended_at_ms", serde_json::json!(9)),
+        ] {
+            let mut conflicting = finish.clone();
+            conflicting[field] = value;
+            let mut bytes = lifecycle_start_line(&lifecycle);
+            // A later repetition cannot repair the poisoned slot.
+            for event in [&finish, &conflicting, &finish] {
+                bytes.extend_from_slice(&serde_json::to_vec(event).unwrap());
+                bytes.push(b'\n');
+            }
+            write_temporary_journal(&path, &bytes);
+            let records = read_session_history_file(&path, "wanted").unwrap();
+            assert_eq!(records[0].exit_code, None);
+            let no_write = FaultingAppendIo::new(AppendFaultStage::DataSync);
+            let result = append_encoded_event_to_path_with_line_limit_and_io_inner(
+                &path,
+                &encoded,
+                MAX_JOURNAL_EVENT_LINES,
+                &no_write,
+                Some(&output),
+            );
+            assert!(
+                result.is_err(),
+                "uncompacted {field} conflict must close the output slot"
+            );
+            assert_eq!(no_write.write_calls.get(), 0);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn bound_output_keeps_identical_finishes_idempotent_and_resets_conflict() {
+        let directory = TestDir::new("finish-duplicates-and-reset");
+        let path = directory.0.join("executions.jsonl");
+        let lifecycle = lifecycle("jsh-finish-reset");
+        let finish = b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-finish-reset\",\"exit_code\":0,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n";
+        for reset in [false, true] {
+            let mut bytes = lifecycle_start_line(&lifecycle);
+            bytes.extend_from_slice(finish);
+            if reset {
+                bytes.extend_from_slice(b"{\"jsh_execution_version\":1,\"event\":\"finish\",\"id\":\"jsh-finish-reset\",\"exit_code\":9,\"duration_ms\":2,\"cwd_after\":\"/tmp\",\"ended_at_ms\":3}\n");
+                bytes.extend_from_slice(&lifecycle_start_line(&lifecycle));
+            }
+            bytes.extend_from_slice(finish);
+            bytes.extend_from_slice(finish);
+            write_temporary_journal(&path, bytes);
+            let (output, encoded) = encoded_bound_output(lifecycle.clone(), "captured");
+            append_bound_output_to_path(&path, &encoded, &output).unwrap();
+            let records = read_session_history_file(&path, "wanted").unwrap();
+            assert_eq!(records[0].exit_code, Some(0));
+            assert_eq!(records[0].output.as_ref().unwrap().text, "captured");
+        }
     }
 
     #[test]
