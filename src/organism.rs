@@ -2418,6 +2418,16 @@ impl NativeOrganism {
         self.agent_driven = agent_driven;
     }
 
+    /// Retire an unfinished command's transient attribution without inferring
+    /// an outcome. Disabling a host observer may prevent its eventual finish
+    /// from being observed; that command's assist and ownership must not carry
+    /// into the next one. Life, repository work, and pending arrivals stay put.
+    pub fn discard_active_command(&mut self) {
+        self.active_kind = None;
+        self.assisted = false;
+        self.agent_driven = false;
+    }
+
     /// The Agent's approved command ended without its authoritative end
     /// marker. React with restrained caution, never with celebration.
     pub fn agent_execution_lost(&mut self) -> Reaction {
@@ -4913,6 +4923,63 @@ mod tests {
         organism.note_repo_arrival(RepoArrival::Home);
         let home = organism.command_started(CommandKind::BuildOrTest);
         assert_eq!(home.speech, Some("回来了。"));
+    }
+
+    #[test]
+    fn discarded_command_cannot_lend_its_assist_to_the_next_success() {
+        let mut organism = NativeOrganism::default();
+        organism.note_assisted_command();
+        organism.set_agent_command(true);
+        organism.command_started(CommandKind::BuildOrTest);
+        let before = organism.state();
+
+        organism.discard_active_command();
+        assert!(organism.active_kind.is_none());
+        assert!(!organism.assisted);
+        assert!(!organism.agent_driven);
+        assert_eq!(format!("{:?}", organism.state()), format!("{before:?}"));
+
+        let mut control = NativeOrganism::from_persisted_state(before);
+        organism.command_started(CommandKind::Other);
+        control.command_started(CommandKind::Other);
+        let actual = organism.command_finished(CommandKind::Other, Some(0), None);
+        let expected = control.command_finished(CommandKind::Other, Some(0), None);
+        assert_eq!(actual.behavior, Behavior::Idle);
+        assert_eq!(actual.description, "command finished cleanly");
+        assert_eq!(actual.behavior, expected.behavior);
+        assert_eq!(actual.tone, expected.tone);
+        assert_eq!(actual.speech, expected.speech);
+        assert_eq!(
+            format!("{:?}", organism.state()),
+            format!("{:?}", control.state())
+        );
+    }
+
+    #[test]
+    fn discarding_a_command_is_idempotent_and_preserves_completed_context() {
+        let mut organism = NativeOrganism::default();
+        organism.restore_repo_work_context(RepoWorkState::new(2, false, 3), 7, 8);
+        organism.rough_streak = 4;
+        organism.note_repo_arrival(RepoArrival::Home);
+        organism.note_assisted_command();
+        organism.set_agent_command(true);
+        // Agent starts intentionally leave the human's repo arrival pending.
+        organism.command_started(CommandKind::BuildOrTest);
+        let before = organism.state();
+        let work = organism.repo_work_state();
+
+        for _ in 0..2 {
+            organism.discard_active_command();
+            assert!(organism.active_kind.is_none());
+            assert!(!organism.assisted);
+            assert!(!organism.agent_driven);
+            assert_eq!(organism.repo_work_state(), work);
+            assert_eq!(organism.successes_today, 7);
+            assert_eq!(organism.failures_today, 8);
+            assert_eq!(organism.rough_streak, 4);
+            assert_eq!(organism.pending_arrival, Some(RepoArrival::Home));
+            assert_eq!(format!("{:?}", organism.state()), format!("{before:?}"));
+        }
     }
 
     #[test]
