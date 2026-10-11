@@ -172,15 +172,20 @@ impl GentleInteraction {
             self.cancel();
             return context;
         }
-        if self
-            .active_at
-            .is_some_and(|start| now.saturating_sub(start) < Self::HOLD)
-        {
+        if self.active_deadline(now).is_none() {
+            self.cancel();
+        }
+        self.presentation(now, context)
+    }
+
+    /// Read an existing greeting without requesting, cancelling or observing.
+    /// Hosts still apply native changes through their mutable reducer path.
+    pub fn presentation(&self, now: Duration, context: RenderContext) -> RenderContext {
+        if Self::eligible(context) && self.active_deadline(now).is_some() {
             PreviewPose::Greeting
                 .context()
                 .with_growth_stage(context.growth_stage)
         } else {
-            self.cancel();
             context
         }
     }
@@ -191,12 +196,31 @@ impl GentleInteraction {
         self.active_at = None;
     }
 
-    fn eligible(context: RenderContext) -> bool {
+    /// Whether the authoritative base pose permits a greeting.
+    pub fn eligible(context: RenderContext) -> bool {
         context.transition.is_none()
             && matches!(
                 context.behavior,
                 Behavior::Idle | Behavior::Explore | Behavior::Approach | Behavior::Sleep
             )
+    }
+
+    /// Check admission without spending cooldown or queuing a greeting.
+    pub fn can_request(&self, now: Duration, context: RenderContext) -> bool {
+        Self::eligible(context)
+            && self
+                .attention
+                .can_offer(AttentionCue::Greeting, now.max(self.observed_at))
+    }
+
+    /// Original absolute hold deadline while feedback is still active.
+    /// The deadline saturates at `Duration::MAX`; callers that require a
+    /// representable full hold must check the deadline before requesting it.
+    pub fn active_deadline(&self, now: Duration) -> Option<Duration> {
+        let now = now.max(self.observed_at);
+        self.active_at
+            .filter(|start| now.saturating_sub(*start) < Self::HOLD)
+            .map(|start| start.saturating_add(Self::HOLD))
     }
 
     fn observe(&mut self, now: Duration) -> Duration {
@@ -398,5 +422,32 @@ mod tests {
         assert_eq!(display.body_language, BodyLanguage::default());
         assert_eq!(display.watch_rhythm, WatchRhythm::Steady);
         assert_eq!(interaction.apply(seconds(2), original), original);
+    }
+
+    #[test]
+    fn read_only_queries_match_real_admission_and_preserve_original_hold() {
+        let idle = PreviewPose::Calm.context();
+        let mut interaction = GentleInteraction::default();
+        for now in [0, 1, 2, 7, 8, 1, 10, 16] {
+            let before = format!("{interaction:?}");
+            let expected = interaction.can_request(seconds(now), idle);
+            assert_eq!(interaction.can_request(seconds(now), idle), expected);
+            assert_eq!(format!("{interaction:?}"), before);
+            assert_eq!(interaction.request(seconds(now), idle), expected);
+        }
+        assert_eq!(interaction.active_deadline(seconds(16)), Some(seconds(18)));
+        assert_eq!(interaction.active_deadline(seconds(1)), Some(seconds(18)));
+        let before = format!("{interaction:?}");
+        assert_eq!(
+            interaction.presentation(seconds(17), idle).behavior,
+            Behavior::Approach
+        );
+        assert_eq!(interaction.presentation(seconds(18), idle), idle);
+        assert_eq!(format!("{interaction:?}"), before);
+        assert!(!interaction.can_request(seconds(17), PreviewPose::Working.context()));
+        assert_eq!(interaction.active_deadline(seconds(17)), Some(seconds(18)));
+        interaction.cancel();
+        assert_eq!(interaction.active_deadline(seconds(17)), None);
+        assert!(!interaction.can_request(seconds(17), idle));
     }
 }

@@ -35,6 +35,7 @@ pub mod notify;
 pub mod organism;
 pub mod organism_attention;
 pub mod organism_daily;
+pub mod organism_live;
 pub mod organism_memory;
 pub mod output_notice;
 pub mod pane_layout;

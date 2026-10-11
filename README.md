@@ -177,6 +177,43 @@ and does not take focus. Preview and interaction state is session-local and
 does not change the life simulation, persistent growth, or repo memory. This
 contract adds no command capture, network, model call, or telemetry.
 
+### One live attention model per window
+
+`organism_live::LiveAttention<Owner>` owns live hover dwell, physical-entry
+consumption, Pointer/Explicit provenance, and cross-pane greeting admission.
+It reuses `GentleInteraction` for the original two-second hold and eight-second
+cooldown; adapters must not retain separate greeting start/cooldown ledgers.
+The window coordinator binds a stable owner token with `set_owner`. Other
+callbacks are owner-scoped, and stale owners/tickets cannot mutate the model.
+
+Hosts inject session-relative `Duration`, the authoritative base
+`RenderContext`, and native hard-eligibility/hover-target/pointer facts.
+`Reconcile` refreshes facts and may accept an already-due candidate; it never
+creates a physical entry. A genuine `PointerEntered` with the pre-issued
+`entry_offer` ticket begins the 600ms dwell. Bind the same offer to
+native Enter and Exit callbacks so an entire crossing can be queued before a
+view rebuild. Once entered, use the retained entry ticket for Exit. Cancellation
+retires unused offers but retains the consumed visit until a real matching Exit.
+Old callbacks never become a new visit, and refused visits do not replay later.
+
+`advance` processes events; immutable `snapshot` supports native view and
+subscription passes without accepting a candidate. Its `candidate_visible`
+controls passive feedback, while `candidate` retains even an overdue deadline
+so the next mutable reconciliation can consume it. The returned `active` carries
+its source and original absolute hold deadline; retain that same snapshot across
+painting and use `wake_after` for endpoint cleanup, including zero. Native hosts
+own their timer handles/minimum delay and must pair candidate callbacks with the
+core ticket before taking or clearing a native timer slot.
+
+Pointer departure or loss of the hover target cancels Pointer feedback only.
+Explicit greetings can survive without a pointer or glyph, while hard native
+ineligibility and work/transition contexts cancel all feedback. Full/Calm cadence
+changes preserve existing deadlines; Static is a hard cancellation. Cancellation,
+owner loss, and disable/re-enable retain cooldown for this window-controller
+lifetime. No state is persisted after the window/application is destroyed.
+Toolkit geometry, focus, input routing and animation cadence remain native;
+preview sequencing, life ticks and output rhythm are separate contracts.
+
 ## Security and reliability invariants
 
 1. Untrusted terminal data is size-bounded before allocation or parsing.

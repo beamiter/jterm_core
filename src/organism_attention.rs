@@ -161,16 +161,7 @@ impl AttentionArbiter {
         let now = self.observed_at.map_or(now, |previous| previous.max(now));
         self.observed_at = Some(now);
 
-        if self.admitted_at[cue.index()]
-            .is_some_and(|previous| now.saturating_sub(previous) < self.policy.cooldown(cue))
-        {
-            return false;
-        }
-
-        if self.active.is_some_and(|active| {
-            now.saturating_sub(active.admitted_at) < self.policy.focus_window(active.cue)
-                && active.cue.rank() >= cue.rank()
-        }) {
+        if !self.can_offer(cue, now) {
             return false;
         }
 
@@ -180,6 +171,18 @@ impl AttentionArbiter {
         });
         self.admitted_at[cue.index()] = Some(now);
         true
+    }
+
+    /// Check admission without spending attention or retaining an intent.
+    /// A stale timestamp is clamped just as in [`Self::offer`].
+    pub fn can_offer(&self, cue: AttentionCue, now: Duration) -> bool {
+        let now = self.observed_at.map_or(now, |previous| previous.max(now));
+        !self.admitted_at[cue.index()]
+            .is_some_and(|previous| now.saturating_sub(previous) < self.policy.cooldown(cue))
+            && !self.active.is_some_and(|active| {
+                now.saturating_sub(active.admitted_at) < self.policy.focus_window(active.cue)
+                    && active.cue.rank() >= cue.rank()
+            })
     }
 }
 
@@ -288,5 +291,23 @@ mod tests {
         assert!(!arbiter.offer(AttentionCue::Insight, seconds(2)));
         assert!(!arbiter.offer(AttentionCue::Greeting, seconds(2)));
         assert!(arbiter.offer(AttentionCue::FailureVigil, seconds(2)));
+    }
+
+    #[test]
+    fn admission_query_matches_offer_without_spending_attention() {
+        let mut arbiter = AttentionArbiter::new(AttentionPolicy::uniform(seconds(2), seconds(8)));
+        for now in [0, 0, 1, 7, 8, 9, 2, 16, 16, 24] {
+            for cue in [
+                AttentionCue::Greeting,
+                AttentionCue::Push,
+                AttentionCue::FailureVigil,
+            ] {
+                let before = format!("{arbiter:?}");
+                let expected = arbiter.can_offer(cue, seconds(now));
+                assert_eq!(arbiter.can_offer(cue, seconds(now)), expected);
+                assert_eq!(format!("{arbiter:?}"), before);
+                assert_eq!(arbiter.offer(cue, seconds(now)), expected);
+            }
+        }
     }
 }
