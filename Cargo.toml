@@ -31,6 +31,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 # The workflow library is authored in TOML or YAML; both formats deserialize
 # through the same serde derive so they cannot disagree about a field's type.
-serde_yaml_ng = "0.10"
+serde_norway = "=0.9.42"
 toml = "1.1"
 unicode-width = "0.2"

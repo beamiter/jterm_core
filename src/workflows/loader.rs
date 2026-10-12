@@ -197,7 +197,7 @@ pub fn load_one(path: &Path) -> Result<Workflow, String> {
     let mut workflow: Workflow = match workflow_extension(path).as_deref() {
         Some("toml") => toml::from_str(&text).map_err(|error| format!("parse TOML: {error}"))?,
         Some("yaml") | Some("yml") => {
-            serde_yaml_ng::from_str(&text).map_err(|error| format!("parse YAML: {error}"))?
+            serde_norway::from_str(&text).map_err(|error| format!("parse YAML: {error}"))?
         }
         _ => return Err("unsupported workflow extension".to_string()),
     };
@@ -502,6 +502,92 @@ default = "api"
         assert_eq!(loaded.shell.as_deref(), Some("fish"));
         assert_eq!(loaded.args[0].default.as_deref(), Some("api"));
         assert_eq!(loaded.source_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn yaml_scalar_strings_preserve_their_source_spelling() {
+        let dir = TestDir::new("yaml-scalar-spelling");
+        for scalar in [
+            "3000", "true", "0xFF", "0o755", "0644", "null", "~", "1e999",
+        ] {
+            let path = dir.write(
+                "scalar.yaml",
+                &format!(
+                "name: X\ncommand: echo {{value}}\nargs:\n - name: value\n   default: {scalar}\n"
+            ),
+            );
+            let loaded = load_one(&path).unwrap();
+            let expected = if matches!(scalar, "null" | "~") {
+                None
+            } else {
+                Some(scalar)
+            };
+            assert_eq!(loaded.args[0].default.as_deref(), expected, "{scalar}");
+            let path = dir.write(
+                "description.yaml",
+                &format!("name: X\ncommand: echo x\ndescription: {scalar}\n"),
+            );
+            assert_eq!(load_one(&path).unwrap().description, scalar);
+        }
+    }
+
+    #[test]
+    fn yaml_duplicate_known_fields_reject_instead_of_last_wins() {
+        let dir = TestDir::new("yaml-duplicates");
+        for text in [
+            "name: X\nname: Y\ncommand: echo x\n",
+            "name: X\ncommand: echo x\nargs: [{name: x, name: y}]\n",
+        ] {
+            let path = dir.write("duplicate.yaml", text);
+            assert!(load_one(&path).unwrap_err().contains("duplicate field"));
+        }
+        let path = dir.write(
+            "future.yaml",
+            "name: X\ncommand: echo x\nfuture: 1\nfuture: 2\n",
+        );
+        assert_eq!(load_one(&path).unwrap().name, "X");
+    }
+
+    #[test]
+    fn yaml_aliases_and_tags_do_not_rewrite_command_text() {
+        let dir = TestDir::new("yaml-alias-tags");
+        let path = dir.write("alias.yaml", "name: X\ncommand: &command echo ${HOME}\ndescription: *command\ntags: [!custom 0xFF, !!str null]\n");
+        let loaded = load_one(&path).unwrap();
+        assert_eq!(loaded.command, "echo ${HOME}");
+        assert_eq!(loaded.description, "echo ${HOME}");
+        assert_eq!(loaded.tags, ["0xFF", "null"]);
+        let path = dir.write("include.yaml", "name: X\ncommand: !include /not/a/file\n");
+        assert_eq!(load_one(&path).unwrap().command, "/not/a/file");
+    }
+
+    #[test]
+    fn yaml_merge_keys_do_not_supply_missing_workflow_fields() {
+        let dir = TestDir::new("yaml-no-implicit-merge");
+        let path = dir.write(
+            "merge.yaml",
+            "base: &base {name: X, command: echo x}\n<<: *base\n",
+        );
+        assert!(load_one(&path).unwrap_err().contains("missing field"));
+    }
+
+    #[test]
+    fn yaml_multiple_documents_and_recursive_known_aliases_reject() {
+        let dir = TestDir::new("yaml-reject-stream");
+        for text in [
+            "name: X\ncommand: echo x\n---\nname: Y\ncommand: echo y\n",
+            "name: X\ncommand: echo x\ntags: &tags [*tags]\n",
+        ] {
+            let path = dir.write("bad.yaml", text);
+            assert!(load_one(&path).unwrap_err().contains("parse YAML"));
+        }
+    }
+
+    #[test]
+    fn yaml_nested_unknown_fields_remain_ignored_within_file_budget() {
+        let dir = TestDir::new("yaml-unknown-depth");
+        let text = format!("name: X\ncommand: echo x\nsteps: [{{run: x, env: {{A: [1, true, null]}}}}]\nfuture: {}0{}\n", "[".repeat(64), "]".repeat(64));
+        let path = dir.write("future.yaml", &text);
+        assert_eq!(load_one(&path).unwrap().command, "echo x");
     }
 
     #[test]
