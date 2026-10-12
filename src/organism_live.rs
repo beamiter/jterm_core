@@ -19,11 +19,30 @@ use crate::organism_daily::GentleInteraction;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LiveAttentionTicket(u64);
 
+/// What the host can positively establish about current command activity.
+/// This is evidence supplied by the host, never inferred from a painted pose,
+/// missing command record, quiet output, or foreground-process lookup failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LiveActivityKnowledge {
+    /// Positive current idle-prompt evidence with no dirty/pending uncertainty.
+    KnownIdle,
+    /// Missing or ambiguous evidence, including draft/submission uncertainty.
+    /// A requested UI greeting may be safe without proving the shell is idle.
+    #[default]
+    Unknown,
+    /// Positive evidence that a command is running. Uncertain submission,
+    /// edited input, or an open/active Agent panel alone is not this evidence.
+    Busy,
+}
+
 /// Native facts for the current owner. Never feed back a painted greeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveAttentionInput {
     pub base_context: RenderContext,
-    /// Enabled, visible/mapped, non-Static, locally settled and input-safe.
+    /// Explicit knowledge, independent of native geometry and hard gates.
+    /// Unknown permits only a requested greeting; it never establishes idle.
+    pub activity: LiveActivityKnowledge,
+    /// Enabled, visible/mapped, non-Static, locally available and input-safe.
     /// The host also checks focus, remote/alternate-screen and held buttons.
     pub hard_eligible: bool,
     /// An actual hover target exists. A body without a glyph may still allow
@@ -66,7 +85,10 @@ pub enum LiveAttentionError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveAttentionRejection {
     Unavailable,
+    /// A protected work/reaction context or positively known running command.
     BusyContext,
+    /// A pointer greeting requires positive idle evidence, not merely !busy.
+    UnknownCommandState,
     Cooldown,
     PointerUnavailable,
     EntryConsumed,
@@ -144,7 +166,7 @@ pub struct LiveAttention<Owner> {
     entry_offer: Option<LiveAttentionTicket>,
     next_ticket: Option<u64>,
     last_hard_eligible: bool,
-    last_hover_available: bool,
+    last_passive_available: bool,
     observed_at: Duration,
 }
 
@@ -159,7 +181,7 @@ impl<Owner> Default for LiveAttention<Owner> {
             entry_offer: Some(LiveAttentionTicket(0)),
             next_ticket: Some(1),
             last_hard_eligible: false,
-            last_hover_available: false,
+            last_passive_available: false,
             observed_at: Duration::ZERO,
         }
     }
@@ -194,7 +216,7 @@ impl<Owner: Eq + Clone> LiveAttention<Owner> {
         self.entry = None;
         self.retire_offer();
         self.last_hard_eligible = false;
-        self.last_hover_available = false;
+        self.last_passive_available = false;
         self.owner = owner;
         true
     }
@@ -255,17 +277,23 @@ impl<Owner: Eq + Clone> LiveAttention<Owner> {
 
         self.observed_at = self.observed_at.max(now);
         let now = self.observed_at;
-        let hard_eligible = self.admission_block(input).is_none();
+        let hard_eligible = self
+            .source_block(input, LiveAttentionSource::Explicit)
+            .is_none();
+        let passive_available = input.hover_available
+            && self
+                .source_block(input, LiveAttentionSource::Pointer)
+                .is_none();
         if (self.last_hard_eligible && !hard_eligible)
-            || (self.last_hover_available && !input.hover_available)
+            || (self.last_passive_available && !passive_available)
         {
             self.retire_offer();
         }
         self.last_hard_eligible = hard_eligible;
-        self.last_hover_available = input.hover_available;
+        self.last_passive_available = passive_available;
         if !hard_eligible {
             self.clear_feedback();
-        } else if !input.hover_available || !input.pointer_inside {
+        } else if !passive_available || !input.pointer_inside {
             self.clear_hover();
         }
         // Expiration and semantic cancellation use the same original hold.
@@ -324,19 +352,22 @@ impl<Owner: Eq + Clone> LiveAttention<Owner> {
             return Err(LiveAttentionError::StaleOwner);
         }
         let now = now.max(self.observed_at);
-        let hard_eligible = self.admission_block(input).is_none();
-        let pointer_available = input.hover_available && input.pointer_inside;
+        let pointer_available = input.hover_available
+            && input.pointer_inside
+            && self
+                .source_block(input, LiveAttentionSource::Pointer)
+                .is_none();
         let candidate = self.candidate;
         let candidate_visible = candidate.is_some_and(|candidate| {
             now < candidate.deadline
-                && hard_eligible
                 && pointer_available
                 && self.interaction.can_request(now, input.base_context)
         });
         let active = self
             .source
             .filter(|source| {
-                hard_eligible && (*source == LiveAttentionSource::Explicit || pointer_available)
+                self.source_block(input, *source).is_none()
+                    && (*source == LiveAttentionSource::Explicit || pointer_available)
             })
             .zip(self.interaction.active_deadline(now))
             .map(|(source, deadline)| LiveAttentionActive { source, deadline });
@@ -357,11 +388,21 @@ impl<Owner: Eq + Clone> LiveAttention<Owner> {
         })
     }
 
-    fn admission_block(&self, input: LiveAttentionInput) -> Option<LiveAttentionRejection> {
+    fn source_block(
+        &self,
+        input: LiveAttentionInput,
+        source: LiveAttentionSource,
+    ) -> Option<LiveAttentionRejection> {
         if !input.hard_eligible {
             Some(LiveAttentionRejection::Unavailable)
-        } else if !GentleInteraction::eligible(input.base_context) {
+        } else if input.activity == LiveActivityKnowledge::Busy
+            || !GentleInteraction::eligible(input.base_context)
+        {
             Some(LiveAttentionRejection::BusyContext)
+        } else if source == LiveAttentionSource::Pointer
+            && input.activity == LiveActivityKnowledge::Unknown
+        {
+            Some(LiveAttentionRejection::UnknownCommandState)
         } else {
             None
         }
@@ -379,7 +420,7 @@ impl<Owner: Eq + Clone> LiveAttention<Owner> {
         }
         self.retire_offer();
         self.entry = Some(ticket);
-        if let Some(reason) = self.admission_block(input) {
+        if let Some(reason) = self.source_block(input, LiveAttentionSource::Pointer) {
             return LiveAttentionOutcome::Rejected(reason);
         }
         if !input.hover_available || !input.pointer_inside {
@@ -405,7 +446,7 @@ impl<Owner: Eq + Clone> LiveAttention<Owner> {
         source: LiveAttentionSource,
     ) -> LiveAttentionOutcome {
         use LiveAttentionRejection as Rejection;
-        if let Some(reason) = self.admission_block(input) {
+        if let Some(reason) = self.source_block(input, source) {
             return LiveAttentionOutcome::Rejected(reason);
         }
         if source == LiveAttentionSource::Pointer
@@ -447,3 +488,7 @@ impl<Owner: Eq + Clone> LiveAttention<Owner> {
 #[cfg(test)]
 #[path = "organism_live/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "organism_live/activity_tests.rs"]
+mod activity_tests;

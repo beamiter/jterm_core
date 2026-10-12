@@ -187,7 +187,27 @@ The window coordinator binds a stable owner token with `set_owner`. Other
 callbacks are owner-scoped, and stale owners/tickets cannot mutate the model.
 
 Hosts inject session-relative `Duration`, the authoritative base
-`RenderContext`, and native hard-eligibility/hover-target/pointer facts.
+`RenderContext`, required `LiveActivityKnowledge`, and native hard-eligibility/
+hover-target/pointer facts. `KnownIdle` needs positive current prompt evidence
+without dirty/pending uncertainty; a missing Running record is insufficient.
+`Unknown` (the knowledge enum's default) suppresses automatic Pointer greetings
+but permits Explicit requests through the existing native/context/cooldown gates.
+Draft, submitted-but-unconfirmed input and ambiguous Agent activity remain
+Unknown; they must not be relabeled Busy or clean idle to fit the presentation.
+`Busy` requires positive running-command evidence and suppresses both sources.
+This does not introduce a submitted-input ledger or infer shell events.
+
+Loss of actual Pointer eligibility cancels its candidates/holds and retires
+unused entry offers. A change to Unknown does not independently retire an offer
+if Pointer permission was already unavailable. Losing any remaining Explicit
+permission, such as becoming Busy while native hard gates are met, still retires
+that offer.
+Explicit holds survive a change to Unknown at their original deadline. Busy
+cancels both. Consumed entries and window cooldown survive either cancellation,
+and restored knowledge never creates a new visit. The native hard gate remains
+independent: unknown alternate-screen safety, for example, still vetoes a VTE
+request. Activity knowledge is not a rendering behavior and Unknown must not be
+mapped to the completed-command reaction `Behavior::UnknownOutcome`.
 `Reconcile` refreshes facts and may accept an already-due candidate; it never
 creates a physical entry. A genuine `PointerEntered` with the pre-issued
 `entry_offer` ticket begins the 600ms dwell. Bind the same offer to

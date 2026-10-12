@@ -9,6 +9,7 @@ fn ms(value: u64) -> Duration {
 fn input() -> LiveAttentionInput {
     LiveAttentionInput {
         base_context: PreviewPose::Calm.context(),
+        activity: LiveActivityKnowledge::KnownIdle,
         hard_eligible: true,
         hover_available: true,
         pointer_inside: true,
