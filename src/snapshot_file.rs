@@ -546,6 +546,21 @@ pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
 /// [`ensure_private_directory`] first when the application owns that directory
 /// and explicitly wants to tighten a legacy installation.
 pub fn write_atomic_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_atomic_private_detailed(path, contents).into_result()
+}
+
+/// Private-path validation with publication-aware durability reporting.
+pub fn write_atomic_private_detailed(
+    path: &Path,
+    contents: &[u8],
+) -> crate::atomic_file::AtomicWriteOutcome {
+    if let Err(error) = validate_write_parent(path) {
+        return crate::atomic_file::AtomicWriteOutcome::NotPublished(error);
+    }
+    crate::atomic_file::write_atomic_detailed(path, contents)
+}
+
+fn validate_write_parent(path: &Path) -> io::Result<()> {
     if path.file_name().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -567,7 +582,7 @@ pub fn write_atomic_private(path: &Path, contents: &[u8]) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    crate::atomic_file::write_atomic(path, contents)
+    Ok(())
 }
 
 #[cfg(test)]

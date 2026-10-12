@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::organism::{CommandKind, LifeState, RepoWorkState};
@@ -603,8 +603,8 @@ struct DiskMemory {
     #[serde(default)]
     growth_days: MigratingGrowthDayLedger,
     /// Bounded durable idempotence tokens. They contain no command data or PID
-    /// and outlive observation compaction long enough to cover every
-    /// in-process pending/retry window.
+    /// and protect recent repeated observations. Published in-process batches
+    /// are retired separately, even if their directory durability is pending.
     #[serde(default)]
     recent_event_ids: Vec<String>,
     days: Vec<DailyStats>,
@@ -1856,7 +1856,8 @@ impl MemoryWrite {
     /// retry. Runs on whichever thread the app chose.
     ///
     /// Neither an `Err` nor a dropped `MemoryWrite` loses an update on its
-    /// own: core releases events only after a transaction succeeds, so the next
+    /// own: core releases semantic events after publication; a post-publication
+    /// error retains a separate durability receipt instead. Before publication the next
     /// command — or [`flush_pending`] at shutdown — asks again with the same
     /// events. What repeated drops cost is admission. The per-path queue is
     /// bounded, and once it holds `256` events `OrganismMemory::apply_and_enqueue`
@@ -1890,8 +1891,8 @@ impl std::fmt::Debug for MemoryWrite {
 ///
 /// 1. Run [`MemoryWrite::run`] exactly once per accepted write, or return
 ///    `Err`. Accepting a write and never running it does not lose that update
-///    — core keeps the events until a transaction succeeds — but it does hold
-///    a queue slot, and a lane that keeps doing it fills the 256-event bound
+///    — core retains unapplied events or a pending publication receipt — but
+///    unapplied events do hold queue slots, and a lane that keeps doing it fills the 256-event bound
 ///    and then the organism stops recording.
 /// 2. Return `Ok(())` only for *accepted*, not *completed*. Core does not wait.
 /// 3. Report saturation as [`io::ErrorKind::WouldBlock`]. [`flush_pending`]
@@ -1906,7 +1907,7 @@ impl std::fmt::Debug for MemoryWrite {
 ///    [`MemoryWrite::path`]. Superseding a pending write with a newer one for
 ///    the same key is correct: each job drains the whole queue.
 /// 6. Survive a panicking job without poisoning the lane; core's queues use
-///    poison-tolerant locks and the events stay retained.
+///    poison-tolerant locks and pending work stays retained.
 pub trait MemoryScheduler: Send + Sync + 'static {
     /// Accept `write` onto the app's durability lane.
     fn schedule(&self, write: MemoryWrite) -> io::Result<()>;
@@ -2116,52 +2117,160 @@ where
     EventEnqueue::Retained(schedule(path))
 }
 
+// Worker-only gates: producers never take these locks. Weak registry entries
+// are pruned on the next lookup after their last active worker has ended.
+fn path_worker_gate(path: &Path) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(gate) = gates.get(path).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(path.to_path_buf(), Arc::downgrade(&gate));
+    gate
+}
+
+// At most one original-directory receipt per path. Only workers under that
+// path's gate change this map; flush only snapshots its keys. No global queue
+// or receipt-map lock is held during I/O.
+type RetryDurability = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+// Private seam: production retries capture the owned directory receipt; tests
+// inject memory-only barriers through the same queue/acknowledgment path.
+enum MemoryPublication {
+    NotPublished(io::Error),
+    PublishedDurabilityPending {
+        error: io::Error,
+        retry: RetryDurability,
+    },
+    Durable,
+}
+
+impl From<crate::atomic_file::AtomicWriteOutcome> for MemoryPublication {
+    fn from(outcome: crate::atomic_file::AtomicWriteOutcome) -> Self {
+        match outcome {
+            crate::atomic_file::AtomicWriteOutcome::NotPublished(error) => {
+                Self::NotPublished(error)
+            }
+            crate::atomic_file::AtomicWriteOutcome::Durable => Self::Durable,
+            crate::atomic_file::AtomicWriteOutcome::PublishedDurabilityPending {
+                error,
+                receipt,
+            } => Self::PublishedDurabilityPending {
+                error,
+                retry: Arc::new(move || receipt.sync()),
+            },
+        }
+    }
+}
+
+fn pending_durability() -> &'static Mutex<HashMap<PathBuf, RetryDurability>> {
+    static RECEIPTS: OnceLock<Mutex<HashMap<PathBuf, RetryDurability>>> = OnceLock::new();
+    RECEIPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn run_queued_events(path: &Path) -> io::Result<()> {
+    run_queued_events_with(path, |path, events| {
+        transact_batch_detailed(path, events).into()
+    })
+}
+
+fn run_queued_events_with(
+    path: &Path,
+    transact: impl FnOnce(&Path, &[MemoryEvent]) -> MemoryPublication,
+) -> io::Result<()> {
+    let gate = path_worker_gate(path);
+    let _worker = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let receipt = pending_durability()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(path)
+        .cloned();
+    if let Some(receipt) = receipt {
+        receipt()?;
+        pending_durability()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(path);
+    }
+    let mut events: Vec<_> = event_queues()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(path)
+        .map(|events| events.iter().cloned().collect())
+        .unwrap_or_default();
+    if events.is_empty() {
+        return Ok(());
+    }
+    events.sort_by(|left, right| {
+        left.at_ms
+            .cmp(&right.at_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let result = match transact(path, &events) {
+        MemoryPublication::NotPublished(error) => return Err(error),
+        MemoryPublication::Durable => Ok(()),
+        MemoryPublication::PublishedDurabilityPending { error, retry } => {
+            pending_durability()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(path.to_path_buf(), retry);
+            Err(error)
+        }
+    };
+    // Publication is acknowledged even if its durability barrier failed. The
+    // retained receipt reports/retries that error without replaying the delta.
+    record_acknowledged_events(path, &events);
+    let completed: HashSet<_> = events.iter().map(|event| event.id.as_str()).collect();
+    let mut queues = event_queues().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(queue) = queues.get_mut(path) {
+        queue.retain(|event| !completed.contains(event.id.as_str()));
+        if queue.is_empty() {
+            queues.remove(path);
+        }
+    }
+    result
+}
+
 fn schedule_queued_events(path: PathBuf) -> io::Result<()> {
     let queued_path = path.clone();
     schedule(MemoryWrite {
         kind: MEMORY_WRITE_KIND,
         path,
         operation: MEMORY_WRITE_OPERATION,
-        job: Box::new(move || {
-            let events: Vec<_> = {
-                let queues = event_queues()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                queues
-                    .get(&queued_path)
-                    .map(|events| events.iter().cloned().collect())
-                    .unwrap_or_default()
-            };
-            if events.is_empty() {
-                return Ok(());
-            }
-            let mut events = events;
-            events.sort_by(|left, right| {
-                left.at_ms
-                    .cmp(&right.at_ms)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            transact_batch(&queued_path, &events)?;
-            record_acknowledged_events(&queued_path, &events);
-            let completed: HashSet<_> = events.iter().map(|event| event.id.as_str()).collect();
-            let mut queues = event_queues()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(queue) = queues.get_mut(&queued_path) {
-                queue.retain(|event| !completed.contains(event.id.as_str()));
-                if queue.is_empty() {
-                    queues.remove(&queued_path);
-                }
-            }
-            Ok(())
-        }),
+        job: Box::new(move || run_queued_events(&queued_path)),
     })
 }
 
-/// Re-publish every retained memory queue before the app's persistence worker
-/// enters its bounded shutdown drain. Failed transactions deliberately keep
-/// their events here, so a recovered mount/permission state gets one last
-/// durable attempt even when no later command arrived to schedule it.
+fn pending_paths() -> Vec<PathBuf> {
+    // Separate short snapshots: never nest the global map locks. Receipt
+    // publication precedes queue retirement, so work cannot disappear between
+    // these two snapshots (new producer work also schedules itself).
+    let mut paths: HashSet<_> = event_queues()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(_, events)| !events.is_empty())
+        .map(|(path, _)| path.clone())
+        .collect();
+    paths.extend(
+        pending_durability()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned(),
+    );
+    paths.into_iter().collect()
+}
+
+/// Retry pending directory durability and retained semantic events before the
+/// app's persistence worker enters its bounded shutdown drain. Pre-publication failures keep semantic
+/// events; post-publication failures keep the original directory receipt.
+/// Both get another durable attempt even if no later command arrived.
 ///
 /// `timeout` bounds this call, not the transaction. A registered lane returns
 /// as soon as it accepts (rule 2 of [`MemoryScheduler`]), and core's own
@@ -2178,13 +2287,7 @@ pub fn flush_pending(timeout: Duration) -> io::Result<()> {
             "ASCII organism memory flush timeout is too large",
         )
     })?;
-    let paths: Vec<_> = event_queues()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .filter(|(_, events)| !events.is_empty())
-        .map(|(path, _)| path.clone())
-        .collect();
+    let paths = pending_paths();
     let mut first_error = None;
     for path in paths {
         loop {
@@ -2321,7 +2424,23 @@ fn transact(path: &Path, event: &MemoryEvent) -> io::Result<()> {
     transact_batch(path, std::slice::from_ref(event))
 }
 
+#[cfg(test)]
 fn transact_batch(path: &Path, events: &[MemoryEvent]) -> io::Result<()> {
+    transact_batch_detailed(path, events).into_result()
+}
+
+fn transact_batch_detailed(
+    path: &Path,
+    events: &[MemoryEvent],
+) -> crate::atomic_file::AtomicWriteOutcome {
+    transact_batch_impl(path, events)
+        .unwrap_or_else(crate::atomic_file::AtomicWriteOutcome::NotPublished)
+}
+
+fn transact_batch_impl(
+    path: &Path,
+    events: &[MemoryEvent],
+) -> io::Result<crate::atomic_file::AtomicWriteOutcome> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2340,7 +2459,9 @@ fn transact_batch(path: &Path, events: &[MemoryEvent]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_MEMORY_BYTES {
         return Err(invalid("ASCII organism memory exceeds its 512 KiB limit"));
     }
-    crate::snapshot_file::write_atomic_private(path, &bytes)
+    Ok(crate::snapshot_file::write_atomic_private_detailed(
+        path, &bytes,
+    ))
 }
 
 struct MemoryTransactionLock {
@@ -6067,3 +6188,7 @@ mod tests {
         assert!(status.success());
     }
 }
+
+#[cfg(test)]
+#[path = "organism_memory_durability_tests.rs"]
+mod durability_tests;

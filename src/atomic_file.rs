@@ -294,11 +294,70 @@ fn sync_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Result of replacement, separating visible publication from its durability.
+/// Errors carry no file contents. A pending receipt must not be treated as a
+/// request to publish the same semantic update again.
+#[must_use = "publication and durability must be handled separately"]
+pub enum AtomicWriteOutcome {
+    NotPublished(io::Error),
+    PublishedDurabilityPending {
+        error: io::Error,
+        receipt: DurabilityReceipt,
+    },
+    Durable,
+}
+
+impl AtomicWriteOutcome {
+    /// Compatibility conversion. Callers needing publication knowledge must
+    /// retain the detailed result instead of discarding its receipt here.
+    pub fn into_result(self) -> io::Result<()> {
+        match self {
+            Self::Durable => Ok(()),
+            Self::NotPublished(error) | Self::PublishedDurabilityPending { error, .. } => {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Owns the original validated parent descriptor, never a path to reopen.
+/// One receipt can be retried repeatedly without retaining event contents.
+pub struct DurabilityReceipt {
+    #[cfg(unix)]
+    directory: File,
+}
+
+impl DurabilityReceipt {
+    pub fn sync(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.directory.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+}
+
 /// Write `contents` durably and atomically replace `path`.
 ///
 /// Temporary files are mode `0600` on Unix and are removed after every error
 /// that occurs before the rename.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_atomic_detailed(path, contents).into_result()
+}
+
+/// Replace a file while retaining post-publication durability failures.
+/// Pre-publication errors leave the semantic update unapplied. On Unix the
+/// pending receipt keeps the exact directory used by renameat alive. Non-Unix
+/// behavior keeps the legacy guarantee: file data is synced before rename,
+/// without a portable parent-directory barrier.
+pub fn write_atomic_detailed(path: &Path, contents: &[u8]) -> AtomicWriteOutcome {
+    write_atomic_detailed_impl(path, contents).unwrap_or_else(AtomicWriteOutcome::NotPublished)
+}
+
+fn write_atomic_detailed_impl(path: &Path, contents: &[u8]) -> io::Result<AtomicWriteOutcome> {
     let parent = destination_parent(path)?;
     create_parent_directories(parent)?;
     // Retain the validated directory descriptor through the replacement. This
@@ -323,7 +382,14 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         cleanup.commit();
 
         // Persist the replacement directory entry, not just the new file data.
-        parent_directory.sync_all()
+        drop(cleanup);
+        let receipt = DurabilityReceipt {
+            directory: parent_directory,
+        };
+        Ok(match receipt.sync() {
+            Ok(()) => AtomicWriteOutcome::Durable,
+            Err(error) => AtomicWriteOutcome::PublishedDurabilityPending { error, receipt },
+        })
     }
     #[cfg(not(unix))]
     {
@@ -336,7 +402,8 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 
         std::fs::rename(&temp_path, path)?;
         cleanup.commit();
-        sync_parent(parent)
+        sync_parent(parent)?;
+        Ok(AtomicWriteOutcome::Durable)
     }
 }
 
