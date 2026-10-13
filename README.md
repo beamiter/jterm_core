@@ -150,6 +150,11 @@ v2 is selected only for a peer that has already advertised v2 support.
   keystrokes cannot erase earlier activity and a frame at the end of a typing
   interval cannot miss it. Physiology consumes at most one second per tick;
   input timing remains session-local and stores no key or command contents.
+  `InputActivity::tick_life` integrates input and rest boundaries in time order
+  using a fixed-size stack buffer. Hosts provide the quiet or forced-rest
+  threshold; crossing that threshold never credits the preceding awake time
+  as rest. Disabling the final companion resets the window's time baseline,
+  while other enabled panes keep their shared clock advancing.
   `organism::agent_state_pulse` maps jagent's shared presentation activity to
   the companion's existing reactions, including transport-busy precedence.
 - Provider-neutral AI requests, bounded conversations, secret redaction, and

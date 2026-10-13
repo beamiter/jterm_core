@@ -51,6 +51,55 @@ impl InputActivity {
         }
     }
 
+    /// Advance physiology chronologically through input and rest boundaries.
+    /// Only the final second is consumed; an empty or reversed interval is a
+    /// no-op. `rest_from` selects the quiet/forced-rest boundary, or no rest.
+    pub fn tick_life(
+        &mut self,
+        state: &mut LifeState,
+        start: Duration,
+        end: Duration,
+        rest_from: Option<Duration>,
+        phase: CircadianPhase,
+    ) -> f32 {
+        if end <= start {
+            return 0.0;
+        }
+        let start = start.max(end.saturating_sub(MAX_TICK));
+        self.prune(start);
+        // At most three retained windows, two endpoints, and one rest
+        // boundary. Stack storage avoids allocating on each animation tick.
+        let mut cuts = [Duration::ZERO; 9];
+        cuts[0] = start;
+        cuts[1] = end;
+        let mut count = 2;
+        for boundary in self
+            .windows
+            .iter()
+            .flat_map(|(from, until)| [*from, *until])
+            .chain(rest_from)
+        {
+            if boundary > start && boundary < end {
+                cuts[count] = boundary;
+                count += 1;
+            }
+        }
+        cuts[..count].sort_unstable();
+        for pair in cuts[..count].windows(2) {
+            let (from, until) = (pair[0], pair[1]);
+            if from == until {
+                continue;
+            }
+            let active = self
+                .windows
+                .iter()
+                .any(|(input, end)| *input <= from && *end >= until);
+            let resting = rest_from.is_some_and(|threshold| from >= threshold);
+            state.tick((until - from).as_secs_f32(), active, resting, phase);
+        }
+        (end - start).as_secs_f32()
+    }
+
     /// Measure the union intersecting the final second of [start, end].
     /// A reversed interval is ignored, including its pruning side effects.
     pub fn active_during(&mut self, start: Duration, end: Duration) -> Duration {
@@ -151,32 +200,9 @@ impl WindowLife {
         // prefix as rest. Overflow means the threshold is unreachable.
         let rest_from = (!any_running)
             .then(|| self.last_activity.checked_add(Duration::from_secs(60)))
-            .flatten()
-            .map_or(now, |threshold| threshold.clamp(start, now));
-        self.tick_interval(start, rest_from, false, phase);
-        self.tick_interval(rest_from, now, true, phase);
-        elapsed.as_secs_f32()
-    }
-
-    fn tick_interval(
-        &mut self,
-        start: Duration,
-        now: Duration,
-        resting: bool,
-        phase: CircadianPhase,
-    ) {
-        let elapsed = now.saturating_sub(start);
-        // Account for input over the consumed interval, not only its endpoint.
-        // A 900ms dormant tick therefore cannot miss the 900ms input window.
-        let active = self.input_activity.active_during(start, now);
-        let inactive = elapsed.saturating_sub(active);
-        if !active.is_zero() {
-            self.state.tick(active.as_secs_f32(), true, resting, phase);
-        }
-        if !inactive.is_zero() {
-            self.state
-                .tick(inactive.as_secs_f32(), false, resting, phase);
-        }
+            .flatten();
+        self.input_activity
+            .tick_life(&mut self.state, start, now, rest_from, phase)
     }
 }
 
@@ -234,6 +260,119 @@ mod tests {
             activity.active_during(Duration::MAX - MAX_TICK, Duration::MAX),
             Duration::ZERO
         );
+    }
+
+    fn assert_same_state(actual: LifeState, expected: LifeState) {
+        let values = |state: LifeState| {
+            [
+                state.energy,
+                state.mood,
+                state.curiosity,
+                state.boredom,
+                state.stress,
+                state.social_need,
+                state.attachment,
+                state.confidence,
+            ]
+        };
+        for (actual, expected) in values(actual).into_iter().zip(values(expected)) {
+            assert!(
+                (actual - expected).abs() < 0.000001,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn life_tick_orders_late_input_and_rest_boundaries_chronologically() {
+        let mut input = InputActivity::default();
+        input.note_input(Duration::from_millis(700));
+        let phase = CircadianPhase::Unlearned;
+        let mut state = LifeState::default();
+        let mut expected = state;
+        expected.tick(0.4, false, false, phase);
+        expected.tick(0.3, false, true, phase);
+        expected.tick(0.3, true, true, phase);
+        assert_eq!(
+            input.tick_life(
+                &mut state,
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Some(Duration::from_millis(400)),
+                phase
+            ),
+            1.0
+        );
+        assert_same_state(state, expected);
+    }
+
+    #[test]
+    fn life_tick_preserves_forced_micro_rest_after_the_awake_prefix() {
+        let mut input = InputActivity::default();
+        input.note_input(Duration::from_millis(700));
+        let phase = CircadianPhase::Unlearned;
+        let mut state = LifeState {
+            energy: 0.1505,
+            ..LifeState::default()
+        };
+        let mut expected = state;
+        expected.tick(0.7, false, false, phase);
+        expected.tick(0.3, true, false, phase);
+        input.tick_life(
+            &mut state,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            None,
+            phase,
+        );
+        assert_same_state(state, expected);
+        assert!((state.energy - 0.1581).abs() < 0.000001);
+    }
+
+    #[test]
+    fn life_tick_caps_time_and_empty_or_reversed_intervals_do_not_mutate() {
+        let mut input = InputActivity::default();
+        input.note_input(Duration::from_millis(1500));
+        let phase = CircadianPhase::Unlearned;
+        let mut state = LifeState::default();
+        let before = state;
+        let windows = input.windows.clone();
+        assert_eq!(
+            input.tick_life(
+                &mut state,
+                Duration::from_secs(3),
+                Duration::from_secs(2),
+                Some(Duration::ZERO),
+                phase
+            ),
+            0.0
+        );
+        assert_eq!(
+            input.tick_life(
+                &mut state,
+                Duration::from_secs(3),
+                Duration::from_secs(3),
+                None,
+                phase
+            ),
+            0.0
+        );
+        assert_eq!(input.windows, windows);
+        assert_same_state(state, before);
+        let mut expected = before;
+        expected.tick(0.5, false, true, phase);
+        expected.tick(0.5, true, true, phase);
+        assert_eq!(
+            input.tick_life(
+                &mut state,
+                Duration::ZERO,
+                Duration::from_secs(2),
+                Some(Duration::ZERO),
+                phase
+            ),
+            1.0
+        );
+        assert_same_state(state, expected);
     }
 
     fn assert_energy_delta(start_ms: u64, end_ms: u64, running: bool, expected: f32) {
