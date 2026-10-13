@@ -13,6 +13,7 @@ pub mod block_contract;
 pub mod bottom_bar;
 pub mod bounded_json;
 pub mod char_width;
+pub mod chat_mode;
 pub mod child_env;
 pub mod click_cursor;
 pub mod command_correction;

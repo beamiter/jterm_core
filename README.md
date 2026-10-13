@@ -31,6 +31,13 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 ## Shared surfaces
 
+- Optional native Chat-mode surface selection: a ready shell prompt docks the
+  existing live terminal as a multiline composer, running commands retain
+  native stdin, alternate-screen applications take over the pane, and missing
+  shell boundaries fall back safely within the same PTY. This pure contract
+  receives no input/output text and requires no AI service; native frontends
+  keep rendering, input, history, and configuration ownership. See the
+  [Chat-mode contract and verification checklist](docs/chat-mode.md).
 - OSC/CSI/DCS/APC parsing, Kitty graphics framing, character widths, themes,
   the family keybinding grammar, and the four-way completed-block outcome
   contract (background, success, failure, or unknown status). Completion
