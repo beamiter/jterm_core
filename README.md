@@ -188,6 +188,21 @@ and does not take focus. Preview and interaction state is session-local and
 does not change the life simulation, persistent growth, or repo memory. This
 contract adds no command capture, network, model call, or telemetry.
 
+### Quiet completion after sustained work
+
+A confirmed successful ordinary command lasting at least 60 seconds receives
+one quiet `Celebrate` reaction, without speech or an extra physiology reward.
+Short commands and missing durations keep their previous idle result; failures,
+unknown outcomes, build/test recovery, push, and accepted-correction semantics
+are unchanged. Only the supplied authoritative completion duration is used.
+No output text, apparent silence, or timer can manufacture a success.
+
+`Reaction::hold_duration()` is the common presentation-hold policy for native
+hosts. The quiet acknowledgment lasts 1.8 seconds at most before ordinary
+settling; new work and input retain priority. Hosts continue to own motion,
+visibility, event deduplication, and finite timers. The reaction adds no queued
+notification, background animation, persistence, or network work.
+
 ### One live attention model per window
 
 `organism_live::LiveAttention<Owner>` owns live hover dwell, physical-entry

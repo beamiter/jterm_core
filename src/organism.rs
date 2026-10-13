@@ -5,6 +5,7 @@
 //! not inspect output contents, execute commands, or perform network I/O.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
@@ -2147,6 +2148,44 @@ pub struct Reaction {
     pub speech: Option<&'static str>,
 }
 
+impl Reaction {
+    /// Maximum native presentation hold for a completed-command reaction.
+    /// This is shared semantic policy, not an animation or scheduling request:
+    /// input, new work, disabled/hidden hosts, and reduced-motion preferences
+    /// retain their native priority. Hosts must not queue expired reactions.
+    pub const fn hold_duration(&self) -> Duration {
+        let millis = match self.behavior {
+            Behavior::Idle => 1_500,
+            Behavior::Celebrate if matches!(self.tone, Tone::Quiet) => 1_800,
+            Behavior::Celebrate => 2_500,
+            Behavior::InspectError => 5_000,
+            Behavior::SitNearError => 10_000,
+            Behavior::CelebrateBig => 7_000,
+            Behavior::RestAfterPush => 5_000,
+            Behavior::UnknownOutcome => 4_500,
+            // Live-only today; preserve the same bounded fallback if a host
+            // ever wraps the cross-pane glance in a Reaction.
+            Behavior::GlanceAside => 1_400,
+            Behavior::WatchCommand
+            | Behavior::Sleep
+            | Behavior::Explore
+            | Behavior::Approach
+            | Behavior::WatchAgent
+            | Behavior::WatchSettled
+            | Behavior::GuardFailure
+            | Behavior::GuardStuck
+            | Behavior::GuardRecovery
+            | Behavior::GuardCautious => 2_500,
+        };
+        Duration::from_millis(millis)
+    }
+}
+
+// Match the existing long-command vigil boundary. Only an authoritative
+// completion duration counts; silence, a local clock, or output volume cannot
+// turn an ordinary success into a sustained-work acknowledgment.
+const SUSTAINED_COMMAND_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct LifeState {
     pub energy: f32,
@@ -2792,8 +2831,17 @@ impl NativeOrganism {
                         speech: None,
                     }
                 } else {
+                    // A successful long wait deserves a quiet acknowledgment
+                    // even when it was not a recognized build or test. Reuse
+                    // the small success pose without speech, stronger life
+                    // rewards, or changing the repository's work intention.
+                    let sustained = duration_ms.is_some_and(|ms| ms >= SUSTAINED_COMMAND_MS);
                     Reaction {
-                        behavior: Behavior::Idle,
+                        behavior: if sustained {
+                            Behavior::Celebrate
+                        } else {
+                            Behavior::Idle
+                        },
                         tone: Tone::Quiet,
                         description: format!("command finished cleanly{duration}"),
                         speech: None,
@@ -7304,5 +7352,170 @@ mod tests {
         let reaction = organism.command_finished(CommandKind::BuildOrTest, Some(0), Some(100));
         assert_eq!(reaction.behavior, Behavior::CelebrateBig);
         assert_eq!(reaction.speech, Some("终于。"));
+    }
+
+    #[test]
+    fn sustained_success_has_one_quiet_completion_pose_at_the_boundary() {
+        for (duration, expected) in [
+            (None, Behavior::Idle),
+            (Some(0), Behavior::Idle),
+            (Some(59_999), Behavior::Idle),
+            (Some(60_000), Behavior::Celebrate),
+            (Some(60_001), Behavior::Celebrate),
+            (Some(u64::MAX), Behavior::Celebrate),
+        ] {
+            let mut organism = NativeOrganism::default();
+            organism.command_started(CommandKind::Other);
+            let reaction = organism.command_finished(CommandKind::Other, Some(0), duration);
+            assert_eq!(reaction.behavior, expected, "{duration:?}");
+            assert_eq!(reaction.tone, Tone::Quiet);
+            assert_eq!(reaction.speech, None);
+            assert!(reaction.description.starts_with("command finished cleanly"));
+            assert_eq!(
+                reaction.hold_duration(),
+                Duration::from_millis(if expected == Behavior::Celebrate {
+                    1800
+                } else {
+                    1500
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_completion_requires_confirmed_success() {
+        for exit in [None, Some(1), Some(130), Some(-1)] {
+            let mut organism = NativeOrganism::default();
+            organism.command_started(CommandKind::Other);
+            let reaction = organism.command_finished(CommandKind::Other, exit, Some(60_000));
+            assert_eq!(
+                reaction.behavior,
+                if exit.is_none() {
+                    Behavior::UnknownOutcome
+                } else {
+                    Behavior::InspectError
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_success_does_not_invent_progress_or_amplify_life_rewards() {
+        let finish = |duration| {
+            let mut organism = NativeOrganism::default();
+            organism.command_started(CommandKind::Other);
+            organism.command_finished(CommandKind::Other, Some(0), duration);
+            organism
+        };
+        let short = finish(Some(10));
+        let long = finish(Some(60_000));
+        assert_eq!(short.state().values(), long.state().values());
+        assert_eq!(short.repo_work_state(), long.repo_work_state());
+        assert_eq!(long.idle_reaction().behavior, Behavior::Idle);
+    }
+
+    #[test]
+    fn sustained_success_preserves_unresolved_and_recovered_repo_work() {
+        for work in [
+            RepoWorkState::new(1, false, 0),
+            RepoWorkState::new(3, false, 0),
+            RepoWorkState::new(0, true, 1),
+            RepoWorkState::new(0, true, 3),
+        ] {
+            let mut organism = NativeOrganism::default();
+            organism.sync_repo_work_state(work);
+            let idle = organism.idle_reaction().behavior;
+            organism.command_started(CommandKind::Other);
+            let reaction = organism.command_finished(CommandKind::Other, Some(0), Some(60_000));
+            assert_eq!(reaction.behavior, Behavior::Celebrate);
+            assert_eq!(reaction.tone, Tone::Quiet);
+            assert_eq!(organism.repo_work_state(), work);
+            assert_eq!(organism.idle_reaction().behavior, idle);
+        }
+    }
+
+    #[test]
+    fn sustained_success_retains_build_push_and_correction_semantics() {
+        let mut build = NativeOrganism::default();
+        build.command_started(CommandKind::BuildOrTest);
+        let passed = build.command_finished(CommandKind::Other, Some(0), Some(60_000));
+        assert_eq!(
+            (passed.behavior, passed.tone),
+            (Behavior::Celebrate, Tone::Success)
+        );
+        assert_eq!(passed.speech, Some("过了。"));
+        let mut push = NativeOrganism::default();
+        push.command_started(CommandKind::GitPush);
+        let pushed = push.command_finished(CommandKind::Other, Some(0), Some(60_000));
+        assert_eq!(pushed.behavior, Behavior::RestAfterPush);
+        let mut corrected = NativeOrganism::default();
+        corrected.note_assisted_command();
+        corrected.command_started(CommandKind::Other);
+        let accepted = corrected.command_finished(CommandKind::Other, Some(0), Some(60_000));
+        assert_eq!(accepted.tone, Tone::Success);
+        assert!(accepted.description.starts_with("corrected command worked"));
+    }
+
+    #[test]
+    fn sustained_agent_success_is_quiet_and_new_work_supersedes_it() {
+        let mut organism = NativeOrganism::default();
+        organism.set_agent_command(true);
+        organism.command_started(CommandKind::Other);
+        let finished = organism.command_finished(CommandKind::Other, Some(0), Some(60_000));
+        assert_eq!(
+            (finished.behavior, finished.tone),
+            (Behavior::Celebrate, Tone::Quiet)
+        );
+        assert_eq!(finished.speech, None);
+        let next = organism.command_started(CommandKind::Other);
+        assert_eq!(next.behavior, Behavior::WatchCommand);
+        assert_eq!(next.speech, None);
+        let unknown = organism.command_finished(CommandKind::Other, None, Some(60_000));
+        assert_eq!(unknown.behavior, Behavior::UnknownOutcome);
+    }
+
+    #[test]
+    fn reaction_holds_are_the_shared_bounded_presentation_contract() {
+        for (behavior, millis) in [
+            (Behavior::Idle, 1500),
+            (Behavior::Celebrate, 2500),
+            (Behavior::InspectError, 5000),
+            (Behavior::SitNearError, 10000),
+            (Behavior::CelebrateBig, 7000),
+            (Behavior::RestAfterPush, 5000),
+            (Behavior::UnknownOutcome, 4500),
+            (Behavior::GlanceAside, 1400),
+            (Behavior::WatchCommand, 2500),
+            (Behavior::Sleep, 2500),
+            (Behavior::Explore, 2500),
+            (Behavior::Approach, 2500),
+            (Behavior::WatchAgent, 2500),
+            (Behavior::WatchSettled, 2500),
+            (Behavior::GuardFailure, 2500),
+            (Behavior::GuardStuck, 2500),
+            (Behavior::GuardRecovery, 2500),
+            (Behavior::GuardCautious, 2500),
+        ] {
+            for tone in [
+                Tone::Quiet,
+                Tone::Active,
+                Tone::Success,
+                Tone::Error,
+                Tone::Warning,
+            ] {
+                let reaction = Reaction {
+                    behavior,
+                    tone,
+                    description: String::new(),
+                    speech: None,
+                };
+                let expected = if behavior == Behavior::Celebrate && tone == Tone::Quiet {
+                    1800
+                } else {
+                    millis
+                };
+                assert_eq!(reaction.hold_duration(), Duration::from_millis(expected));
+            }
+        }
     }
 }
