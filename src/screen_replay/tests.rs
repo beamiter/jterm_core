@@ -546,7 +546,8 @@ fn needs_screen_replay_keeps_simple_output_fast_and_detects_screen_operations() 
     assert!(!stream_needs_screen_replay(
         b"plain\r\n\x1b[31mred\x1b[0m\r\n"
     ));
-    assert!(!stream_needs_screen_replay(b"50%\r\x1b[K60%\x1b[2G\x1b[1C"));
+    assert!(!stream_needs_screen_replay(b"50%\r\x1b[K60%"));
+    assert!(stream_needs_screen_replay(b"50%\r\x1b[K60%\x1b[2G\x1b[1C"));
     assert!(!stream_needs_screen_replay(
         b"\x1b[?25l\x1b[>1u\x1b[?u\x1b]8;;x\x07"
     ));
@@ -610,8 +611,51 @@ fn horizontal_edits_and_tab_movement_replay_captured_bytes_at_every_split() {
 }
 
 #[test]
+fn horizontal_cursor_motion_preserves_padding_and_pty_width_at_every_split() {
+    for (cols, raw, expected) in [
+        (80, "a\x1b[3Cx", "a   x"),
+        (80, "\x1b[4Gx", "   x"),
+        (80, "\x1b[4`x", "   x"),
+        (80, "abc\x1b[2Dx", "axc"),
+        // Cursor advances are clamped to the actual PTY width, not an
+        // unbounded padding allocation or the finished card's later width.
+        (4, "a\x1b[999999999Cx", "a  x"),
+        (4, "\x1b[999999999Gx", "   x"),
+        (4, "\x1b[999999999`x", "   x"),
+        (4, "abc\x1b[999999999Dx", "xbc"),
+    ] {
+        for raw in [raw.to_string(), raw.replace("\x1b[", "\u{9b}")] {
+            assert!(stream_needs_screen_replay(raw.as_bytes()), "{raw:?}");
+            for split in 0..=raw.len() {
+                let (prefix, suffix) = raw.as_bytes().split_at(split);
+                let mut parser = crate::parser::Parser::new();
+                let mut events = Vec::new();
+                parser.feed(prefix, &mut events);
+                parser.feed(suffix, &mut events);
+                let captured: Vec<u8> = events
+                    .into_iter()
+                    .flat_map(|event| match event {
+                        crate::parser::ParserEvent::Bytes(bytes) => bytes,
+                        other => panic!("unexpected capture event: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(captured, raw.as_bytes(), "capture split={split}");
+                let mut replay = ScreenReplay::new(cols, 3);
+                replay.feed(prefix);
+                replay.feed(suffix);
+                assert_eq!(
+                    replay.finish().to_plain(),
+                    expected,
+                    "{raw:?}, split={split}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn horizontal_edit_probe_ignores_private_intermediate_and_incomplete_lookalikes() {
-    for final_byte in ['@', 'P', 'X', 'I', 'Z'] {
+    for final_byte in ['@', 'P', 'X', 'I', 'Z', 'C', 'D', 'G', '`'] {
         for sequence in [
             format!("\x1b[?2{final_byte}"),
             format!("\x1b[>2{final_byte}"),

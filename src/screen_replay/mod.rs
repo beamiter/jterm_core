@@ -394,7 +394,8 @@ fn row_is_visible(tables: &Tables, row: &Row) -> bool {
 
 /// Whether a captured stream moves the cursor vertically or edits the screen
 /// in ways a line-oriented strip cannot reproduce: absolute or vertical cursor
-/// motion (`CUP`, `HVP`, `VPA`, `CUU`, `CUD`, `CPL`, `CNL`), scroll regions
+/// motion (`CUP`, `HVP`, `VPA`, `CUU`, `CUD`, `CPL`, `CNL`), explicit horizontal
+/// motion (`CUF`, `CUB`, `CHA`, `HPA`), scroll regions
 /// (`DECSTBM`), index/next line/reverse index (`IND`/`NEL`/`RI`), line
 /// insertion/deletion, character edits (`ICH`/`DCH`/`ECH`), tab movement
 /// (`CHT`/`CBT`), scrolling (`SU`/`SD`), cursor restore (`DECRC`, `CSI u`),
@@ -467,8 +468,11 @@ fn csi_needs_screen_replay(bytes: &[u8], body: usize) -> CsiScan {
             fin,
             b'@' | b'A'
                 | b'B'
+                | b'C'
+                | b'D'
                 | b'E'
                 | b'F'
+                | b'G'
                 | b'H'
                 | b'I'
                 | b'f'
@@ -481,6 +485,7 @@ fn csi_needs_screen_replay(bytes: &[u8], body: usize) -> CsiScan {
                 | b'T'
                 | b'X'
                 | b'Z'
+                | b'`'
                 | b'r'
                 | b'u'
         )
