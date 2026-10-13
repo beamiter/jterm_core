@@ -408,11 +408,10 @@ pub struct Parser {
     /// `?2004` — shell asked for paste content to be bracketed with `\e[200~`
     /// / `\e[201~`. The caller wraps its own `Paste` write when this is on.
     bracketed_paste: bool,
-    /// Which mouse mode is currently active (highest-priority "h" wins).
-    mouse_mode: MouseMode,
-    /// Active mouse encoding flags. SGR/Urxvt/Utf8 are toggled independently; a
-    /// later "h" replaces the encoding choice.
-    mouse_encoding: MouseEncoding,
+    /// Independent tracking flags; effective priority matches the live VTE.
+    mouse_tracking: u8,
+    /// Independent encoding flags; SGR outranks urxvt, then UTF-8.
+    mouse_encoding: u8,
     /// `?1004` — shell asked for `\e[I` / `\e[O` on focus enter/leave.
     focus_events: bool,
 }
@@ -558,8 +557,8 @@ impl Parser {
             ground_utf8_tail: GroundUtf8Tail::default(),
             config,
             bracketed_paste: false,
-            mouse_mode: MouseMode::None,
-            mouse_encoding: MouseEncoding::Default,
+            mouse_tracking: 0,
+            mouse_encoding: 0,
             focus_events: false,
         }
     }
@@ -574,13 +573,31 @@ impl Parser {
     /// Currently active mouse-tracking mode, or `None` when reporting is off.
     #[allow(dead_code)]
     pub fn mouse_mode(&self) -> MouseMode {
-        self.mouse_mode
+        if self.mouse_tracking & 8 != 0 {
+            MouseMode::AnyEvent
+        } else if self.mouse_tracking & 4 != 0 {
+            MouseMode::ButtonEvent
+        } else if self.mouse_tracking & 2 != 0 {
+            MouseMode::Normal
+        } else if self.mouse_tracking & 1 != 0 {
+            MouseMode::X10
+        } else {
+            MouseMode::None
+        }
     }
 
     /// Wire encoding the next mouse report should use.
     #[allow(dead_code)]
     pub fn mouse_encoding(&self) -> MouseEncoding {
-        self.mouse_encoding
+        if self.mouse_encoding & 4 != 0 {
+            MouseEncoding::Sgr
+        } else if self.mouse_encoding & 2 != 0 {
+            MouseEncoding::Urxvt
+        } else if self.mouse_encoding & 1 != 0 {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Default
+        }
     }
 
     /// True while `?1004` is enabled — callers should emit `\e[I` on focus-in,
@@ -604,59 +621,28 @@ impl Parser {
                 None => continue,
             };
             modes.push(n);
-            match n {
-                2004 => self.bracketed_paste = enable,
-                9 => {
-                    self.mouse_mode = if enable {
-                        MouseMode::X10
-                    } else {
-                        MouseMode::None
-                    }
+            let (flags, bit) = match n {
+                2004 => {
+                    self.bracketed_paste = enable;
+                    continue;
                 }
-                1000 => {
-                    self.mouse_mode = if enable {
-                        MouseMode::Normal
-                    } else {
-                        MouseMode::None
-                    }
+                1004 => {
+                    self.focus_events = enable;
+                    continue;
                 }
-                1002 => {
-                    self.mouse_mode = if enable {
-                        MouseMode::ButtonEvent
-                    } else {
-                        MouseMode::None
-                    }
-                }
-                1003 => {
-                    self.mouse_mode = if enable {
-                        MouseMode::AnyEvent
-                    } else {
-                        MouseMode::None
-                    }
-                }
-                1004 => self.focus_events = enable,
-                1005 => {
-                    self.mouse_encoding = if enable {
-                        MouseEncoding::Utf8
-                    } else {
-                        MouseEncoding::Default
-                    }
-                }
-                1006 => {
-                    self.mouse_encoding = if enable {
-                        MouseEncoding::Sgr
-                    } else {
-                        MouseEncoding::Default
-                    }
-                }
-                1015 => {
-                    self.mouse_encoding = if enable {
-                        MouseEncoding::Urxvt
-                    } else {
-                        MouseEncoding::Default
-                    }
-                }
-                _ => {}
+                9 => (&mut self.mouse_tracking, 1),
+                1000 => (&mut self.mouse_tracking, 2),
+                1002 => (&mut self.mouse_tracking, 4),
+                1003 => (&mut self.mouse_tracking, 8),
+                1005 => (&mut self.mouse_encoding, 1),
+                1015 => (&mut self.mouse_encoding, 2),
+                1006 => (&mut self.mouse_encoding, 4),
+                _ => continue,
+            };
+            if enable {
+                *flags |= bit;
+            } else {
+                *flags &= !bit;
             }
         }
         modes
@@ -678,8 +664,8 @@ impl Parser {
                 flush!();
                 self.ground_utf8_tail.clear();
                 self.bracketed_paste = false;
-                self.mouse_mode = MouseMode::None;
-                self.mouse_encoding = MouseEncoding::Default;
+                self.mouse_tracking = 0;
+                self.mouse_encoding = 0;
                 self.focus_events = false;
                 events.push(ParserEvent::HardReset);
                 // RIS itself is an immediate feed boundary. Keeping it in a
@@ -2270,6 +2256,76 @@ mod tests {
         assert!(events.is_empty());
         parser.feed(b"\x1b\\", &mut events);
         assert_eq!(collect_bytes(&events), b"\x1bPqA\x07B\x1b\\");
+    }
+
+    #[test]
+    fn mouse_modes_keep_independent_flags_and_priority_across_order_and_reset() {
+        let modes = [9, 1000, 1002, 1003, 1005, 1015, 1006];
+        for mask in 0_u8..128 {
+            for reverse in [false, true] {
+                let mut parser = Parser::new();
+                let mut events = Vec::new();
+                for index in 0..modes.len() {
+                    let index = if reverse {
+                        modes.len() - 1 - index
+                    } else {
+                        index
+                    };
+                    if mask & (1 << index) != 0 {
+                        parser.feed(format!("\x1b[?{}h", modes[index]).as_bytes(), &mut events);
+                    }
+                }
+                let expected_tracking = |bits: u8| {
+                    if bits & 8 != 0 {
+                        MouseMode::AnyEvent
+                    } else if bits & 4 != 0 {
+                        MouseMode::ButtonEvent
+                    } else if bits & 2 != 0 {
+                        MouseMode::Normal
+                    } else if bits & 1 != 0 {
+                        MouseMode::X10
+                    } else {
+                        MouseMode::None
+                    }
+                };
+                let expected_encoding = |bits: u8| {
+                    if bits & 64 != 0 {
+                        MouseEncoding::Sgr
+                    } else if bits & 32 != 0 {
+                        MouseEncoding::Urxvt
+                    } else if bits & 16 != 0 {
+                        MouseEncoding::Utf8
+                    } else {
+                        MouseEncoding::Default
+                    }
+                };
+                assert_eq!(parser.mouse_mode(), expected_tracking(mask));
+                assert_eq!(parser.mouse_encoding(), expected_encoding(mask));
+                // Turning off each enabled or already-disabled flag must
+                // preserve every other mode, including the next fallback.
+                let mut remaining = mask;
+                for (index, mode) in modes.into_iter().enumerate() {
+                    parser.feed(format!("\x1b[?{mode}l").as_bytes(), &mut events);
+                    remaining &= !(1 << index);
+                    assert_eq!(parser.mouse_mode(), expected_tracking(remaining));
+                    assert_eq!(parser.mouse_encoding(), expected_encoding(remaining));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compound_mouse_modes_and_ris_preserve_passthrough_and_reset_all_flags() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        let wire = b"\x1b[?1006;1005;1015;1003;1000;9h\x1b[?1002l";
+        parser.feed(wire, &mut events);
+        assert_eq!(collect_bytes(&events), wire);
+        assert_eq!(parser.mouse_mode(), MouseMode::AnyEvent);
+        assert_eq!(parser.mouse_encoding(), MouseEncoding::Sgr);
+        parser.feed(b"\x1bc\x1b[?1006l\x1b[?1003l", &mut events);
+        assert_eq!(parser.mouse_mode(), MouseMode::None);
+        assert_eq!(parser.mouse_encoding(), MouseEncoding::Default);
     }
 
     #[test]
