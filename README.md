@@ -348,6 +348,10 @@ The runner patches both shared crates to the sibling source trees in temporary
 package directories. It copies manifests and lockfiles there, reuses each
 project's target cache, and runs Cargo offline. Original release pins and
 lockfiles are not rewritten, even when Cargo resolves the local API changes.
+Native test binaries run from their original checkout, so filesystem and Git
+fixtures see real directory entries and repository metadata; temporary
+manifests remain available until the tests finish. Environment-provided native
+test runners are retained in the launch chain.
 Native frontend checks still need their documented system dependencies.
 After the shared revisions are published, update consumer pins and lockfiles
 before merging the coordinated changes; this runner is a development check,

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,27 @@ def mirror(source: Path, destination: Path) -> None:
             shutil.copyfile(entry, target)
         else:
             target.symlink_to(entry, target_is_directory=entry.is_dir())
+
+
+def native_test_runner(root: Path, original: Path, environment: dict) -> None:
+    """Keep filesystem/Git tests in the real checkout, with the mirror alive."""
+    version = subprocess.check_output(["rustc", "-vV"], text=True)
+    host = next(
+        line.removeprefix("host: ")
+        for line in version.splitlines()
+        if line.startswith("host: ")
+    )
+    key = "CARGO_TARGET_" + host.upper().replace("-", "_") + "_RUNNER"
+    runner = root / "test-runner.py"
+    runner.write_text(
+        "import os, shlex, sys\n"
+        "os.chdir(sys.argv[1])\n"
+        "command = shlex.split(os.environ.get('JTERM_FAMILY_TEST_RUNNER', '')) + sys.argv[2:]\n"
+        "os.execvp(command[0], command)\n"
+    )
+    # Preserve an explicitly supplied native runner (e.g. a debugger or wrapper).
+    environment["JTERM_FAMILY_TEST_RUNNER"] = environment.get(key, "")
+    environment[key] = shlex.join([sys.executable, str(runner), str(original)])
 
 
 def main() -> int:
@@ -81,6 +103,8 @@ def main() -> int:
             # Keep the existing cache unless the caller selected another one.
             environment.setdefault("CARGO_TARGET_DIR", str(family / project / "target"))
             environment["CARGO_TARGET_DIR"] = str(Path(environment["CARGO_TARGET_DIR"]).resolve())
+            if cargo_args[0] == "test":
+                native_test_runner(root, family / project, environment)
             command = ["cargo", *patches, "--offline", *cargo_args]
             result = subprocess.run(command, cwd=root / project, env=environment)
             if result.returncode:
