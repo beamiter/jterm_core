@@ -2043,6 +2043,23 @@ pub enum AgentPulse {
     Gone,
 }
 
+/// Map the shared Agent activity to an ambient pulse. Transport work takes
+/// precedence while a request is in flight; idle sessions stay silent.
+pub fn agent_state_pulse(state: crate::agent::AgentState, busy: bool) -> Option<AgentPulse> {
+    use crate::agent::AgentActivity;
+    let activity = if busy {
+        Some(AgentActivity::Working)
+    } else {
+        state.activity()
+    };
+    activity.map(|activity| match activity {
+        AgentActivity::Working => AgentPulse::Working,
+        AgentActivity::AskingReview => AgentPulse::AskingReview,
+        AgentActivity::Finished => AgentPulse::Finished,
+        AgentActivity::Gone => AgentPulse::Gone,
+    })
+}
+
 /// Fold one Agent lifecycle phase into the shared life state. The Agent
 /// occupying the human's attention slowly feeds the organism's social need,
 /// which is what finally gives the Approach disposition a genuine niche:
@@ -3661,6 +3678,31 @@ fn is_environment_assignment(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_state_pulse_preserves_idle_and_transport_precedence() {
+        use crate::agent::AgentState;
+        let proposal_id = serde_json::from_str::<crate::agent::ProposalId>("1").unwrap();
+        let cases = [
+            (AgentState::Ready, None),
+            (AgentState::AwaitingModel, Some(AgentPulse::Working)),
+            (
+                AgentState::AwaitingObservation { proposal_id },
+                Some(AgentPulse::Working),
+            ),
+            (
+                AgentState::AwaitingApproval { proposal_id },
+                Some(AgentPulse::AskingReview),
+            ),
+            (AgentState::Completed, Some(AgentPulse::Finished)),
+            (AgentState::TurnLimitReached, Some(AgentPulse::Finished)),
+            (AgentState::Cancelled, Some(AgentPulse::Gone)),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(agent_state_pulse(state, false), expected);
+            assert_eq!(agent_state_pulse(state, true), Some(AgentPulse::Working));
+        }
+    }
 
     #[test]
     fn scriptlive_bare_dash_fails_closed_without_panicking() {

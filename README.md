@@ -146,6 +146,12 @@ v2 is selected only for a peer that has already advertised v2 support.
   knowledge of the app's other writes, so it is a floor rather than a lane.
   `flush_pending(timeout)` belongs in the shutdown drain ahead of the app's own
   persistence shutdown; its deadline bounds the caller, not the transaction.
+  `organism_clock` accounts for the union of recent input intervals, so repeated
+  keystrokes cannot erase earlier activity and a frame at the end of a typing
+  interval cannot miss it. Physiology consumes at most one second per tick;
+  input timing remains session-local and stores no key or command contents.
+  `organism::agent_state_pulse` maps jagent's shared presentation activity to
+  the companion's existing reactions, including transport-busy precedence.
 - Provider-neutral AI requests, bounded conversations, secret redaction, and
   the review-first `jagent` session surface. Request construction reports any
   omitted history, while system instructions are rejected rather than sampled
@@ -322,6 +328,25 @@ When changing a shared API, validate all four terminal consumers and jsh in a
 coordinated change. Git dependencies should be pinned to an audited revision;
 do not make a consumer depend on a new local API until that revision is
 available to a clean checkout.
+
+For coordinated changes before publishing new dependency revisions, keep the
+seven repositories as siblings and use the local-source runner:
+
+```sh
+python3 scripts/family-cargo.py jagent test --lib
+python3 scripts/family-cargo.py jterm_core test --lib organism
+python3 scripts/family-cargo.py jsh test --lib
+python3 scripts/family-cargo.py all check --all-targets
+```
+
+The runner patches both shared crates to the sibling source trees in temporary
+package directories. It copies manifests and lockfiles there, reuses each
+project's target cache, and runs Cargo offline. Original release pins and
+lockfiles are not rewritten, even when Cargo resolves the local API changes.
+Native frontend checks still need their documented system dependencies.
+After the shared revisions are published, update consumer pins and lockfiles
+before merging the coordinated changes; this runner is a development check,
+not a substitute for reproducible release dependencies.
 
 ## License
 

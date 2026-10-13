@@ -25,10 +25,10 @@ pub use jagent::safety::{
     is_dangerous, validate_command_text, CommandTextError, MAX_COMMAND_BYTES,
 };
 pub use jagent::session::{
-    parse_action, sample_observation, AgentSessionSnapshot, AgentSnapshotError, AgentState,
-    ApprovedCommand, CancellationToken, CommandExecutionFailure, CommandExecutionOutcome,
-    ModelOutcome, ParseError, ParsedAction, ProposalId, ProposalStatus, SessionError, Turn,
-    MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    parse_action, sample_observation, AgentActivity, AgentSessionSnapshot, AgentSnapshotError,
+    AgentState, ApprovedCommand, CancellationToken, CommandExecutionFailure,
+    CommandExecutionOutcome, ModelOutcome, ParseError, ParsedAction, ProposalId, ProposalStatus,
+    SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
 pub use jagent::tools::AgentProtocol;
 use std::sync::atomic::{AtomicU64, Ordering};
