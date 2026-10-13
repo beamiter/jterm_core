@@ -542,7 +542,7 @@ fn a_wide_character_on_a_one_column_screen_does_not_panic() {
 }
 
 #[test]
-fn needs_screen_replay_detects_vertical_motion_only() {
+fn needs_screen_replay_keeps_simple_output_fast_and_detects_screen_operations() {
     assert!(!stream_needs_screen_replay(
         b"plain\r\n\x1b[31mred\x1b[0m\r\n"
     ));
@@ -567,6 +567,69 @@ fn needs_screen_replay_detects_vertical_motion_only() {
     assert!(!stream_needs_screen_replay(b"\x1b[?1049h\x1b[?2K"));
     assert!(!stream_needs_screen_replay("\u{29b}x".as_bytes()));
     assert!(!stream_needs_screen_replay(b"\x9b1;1H"));
+}
+
+#[test]
+fn horizontal_edits_and_tab_movement_replay_captured_bytes_at_every_split() {
+    for (raw, expected) in [
+        ("abcdef\r\x1b[2@X", "X abcdef"),
+        ("abcdef\r\x1b[2P", "cdef"),
+        ("abcdef\r\x1b[2X", "  cdef"),
+        ("a\x1b[Ix", "a\tx"),
+        ("abc\x1b[Zx", "xbc"),
+    ] {
+        for raw in [raw.to_string(), raw.replace("\x1b[", "\u{9b}")] {
+            assert!(stream_needs_screen_replay(raw.as_bytes()), "{raw:?}");
+            for split in 0..=raw.len() {
+                let (prefix, suffix) = raw.as_bytes().split_at(split);
+                // These are real capture bytes: the live parser forwards
+                // every byte rather than consuming a semantic-only event.
+                let mut parser = crate::parser::Parser::new();
+                let mut events = Vec::new();
+                parser.feed(prefix, &mut events);
+                parser.feed(suffix, &mut events);
+                let captured: Vec<u8> = events
+                    .into_iter()
+                    .flat_map(|event| match event {
+                        crate::parser::ParserEvent::Bytes(bytes) => bytes,
+                        other => panic!("unexpected capture event: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(captured, raw.as_bytes(), "capture split={split}");
+                let mut replay = ScreenReplay::new(80, 24);
+                replay.feed(prefix);
+                replay.feed(suffix);
+                assert_eq!(
+                    replay.finish().to_plain(),
+                    expected,
+                    "{raw:?}, split={split}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn horizontal_edit_probe_ignores_private_intermediate_and_incomplete_lookalikes() {
+    for final_byte in ['@', 'P', 'X', 'I', 'Z'] {
+        for sequence in [
+            format!("\x1b[?2{final_byte}"),
+            format!("\x1b[>2{final_byte}"),
+            format!("\x1b[2 {final_byte}"),
+            format!("\u{9b}?2{final_byte}"),
+        ] {
+            assert!(
+                !stream_needs_screen_replay(sequence.as_bytes()),
+                "{sequence:?}"
+            );
+        }
+    }
+    for sequence in ["plain\r\n", "\x1b[31mred\x1b[m", "\x1b[2", "\u{9b}2"] {
+        assert!(
+            !stream_needs_screen_replay(sequence.as_bytes()),
+            "{sequence:?}"
+        );
+    }
 }
 
 #[test]

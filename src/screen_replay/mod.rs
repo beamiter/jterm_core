@@ -396,7 +396,8 @@ fn row_is_visible(tables: &Tables, row: &Row) -> bool {
 /// in ways a line-oriented strip cannot reproduce: absolute or vertical cursor
 /// motion (`CUP`, `HVP`, `VPA`, `CUU`, `CUD`, `CPL`, `CNL`), scroll regions
 /// (`DECSTBM`), index/next line/reverse index (`IND`/`NEL`/`RI`), line
-/// insertion/deletion, scrolling (`SU`/`SD`), cursor restore (`DECRC`, `CSI u`),
+/// insertion/deletion, character edits (`ICH`/`DCH`/`ECH`), tab movement
+/// (`CHT`/`CBT`), scrolling (`SU`/`SD`), cursor restore (`DECRC`, `CSI u`),
 /// screen alignment (`DECALN`), a full reset (`RIS`) or an erase beyond the
 /// current line (`ED`, `DECSED`). UTF-8 encoded C1 controls count like their
 /// ESC forms, including U+009B for CSI. False positives only cost time — the
@@ -464,17 +465,22 @@ fn csi_needs_screen_replay(bytes: &[u8], body: usize) -> CsiScan {
         && !intermediate
         && matches!(
             fin,
-            b'A' | b'B'
+            b'@' | b'A'
+                | b'B'
                 | b'E'
                 | b'F'
                 | b'H'
+                | b'I'
                 | b'f'
                 | b'd'
                 | b'J'
                 | b'L'
                 | b'M'
+                | b'P'
                 | b'S'
                 | b'T'
+                | b'X'
+                | b'Z'
                 | b'r'
                 | b'u'
         )
