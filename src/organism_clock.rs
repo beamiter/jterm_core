@@ -146,10 +146,28 @@ impl WindowLife {
         if elapsed.is_zero() {
             return 0.0;
         }
-        let resting = !any_running && self.idle_for(now) >= Duration::from_secs(60);
+        let start = now.saturating_sub(elapsed);
+        // A tick crossing the quiet threshold must not credit its awake
+        // prefix as rest. Overflow means the threshold is unreachable.
+        let rest_from = (!any_running)
+            .then(|| self.last_activity.checked_add(Duration::from_secs(60)))
+            .flatten()
+            .map_or(now, |threshold| threshold.clamp(start, now));
+        self.tick_interval(start, rest_from, false, phase);
+        self.tick_interval(rest_from, now, true, phase);
+        elapsed.as_secs_f32()
+    }
+
+    fn tick_interval(
+        &mut self,
+        start: Duration,
+        now: Duration,
+        resting: bool,
+        phase: CircadianPhase,
+    ) {
+        let elapsed = now.saturating_sub(start);
         // Account for input over the consumed interval, not only its endpoint.
         // A 900ms dormant tick therefore cannot miss the 900ms input window.
-        let start = now.saturating_sub(elapsed);
         let active = self.input_activity.active_during(start, now);
         let inactive = elapsed.saturating_sub(active);
         if !active.is_zero() {
@@ -159,7 +177,6 @@ impl WindowLife {
             self.state
                 .tick(inactive.as_secs_f32(), false, resting, phase);
         }
-        elapsed.as_secs_f32()
     }
 }
 
@@ -217,6 +234,50 @@ mod tests {
             activity.active_during(Duration::MAX - MAX_TICK, Duration::MAX),
             Duration::ZERO
         );
+    }
+
+    fn assert_energy_delta(start_ms: u64, end_ms: u64, running: bool, expected: f32) {
+        let mut life = clock();
+        life.advance(
+            Duration::from_millis(start_ms),
+            true,
+            false,
+            CircadianPhase::Unlearned,
+        );
+        let before = life.state().energy;
+        life.advance(
+            Duration::from_millis(end_ms),
+            true,
+            running,
+            CircadianPhase::Unlearned,
+        );
+        assert!((life.state().energy - before - expected).abs() < 0.000001);
+    }
+
+    #[test]
+    fn quiet_threshold_credits_only_the_resting_tail() {
+        assert_energy_delta(59_500, 60_400, false, -0.002 * 0.5 + 0.030 * 0.4);
+        // Ending exactly at the threshold has no resting tail.
+        assert_energy_delta(59_500, 60_000, false, -0.002 * 0.5);
+    }
+
+    #[test]
+    fn quiet_threshold_preserves_fully_awake_resting_and_running_ticks() {
+        assert_energy_delta(58_500, 59_400, false, -0.002 * 0.9);
+        assert_energy_delta(60_000, 60_900, false, 0.030 * 0.9);
+        assert_energy_delta(59_500, 60_400, true, -0.002 * 0.9);
+        // A long gap still consumes only its final second.
+        assert_energy_delta(59_500, 600_000, false, 0.030);
+    }
+
+    #[test]
+    fn unrepresentable_quiet_threshold_never_manufactures_rest() {
+        let start = Duration::MAX - Duration::from_secs(30);
+        let mut life = WindowLife::new_at(start);
+        life.advance(start, true, false, CircadianPhase::Unlearned);
+        let before = life.state().energy;
+        life.advance(Duration::MAX, true, false, CircadianPhase::Unlearned);
+        assert!((life.state().energy - before + 0.002).abs() < 0.000001);
     }
 
     fn clock() -> WindowLife {
