@@ -52,6 +52,7 @@ pub fn app_display() -> String {
 }
 
 pub mod context;
+pub mod dashboard;
 pub mod driver;
 pub mod drivers;
 pub mod event;
@@ -70,6 +71,11 @@ pub mod worktree;
 // are explicitly allowed to stay.
 #[allow(unused_imports)]
 pub use context::{ContextError, SemanticCommandContext};
+#[allow(unused_imports)]
+pub use dashboard::{
+    DashboardActivity, DashboardCounts, DashboardFilter, DashboardGroup, DashboardRow,
+    DashboardSnapshot, DashboardView,
+};
 #[allow(unused_imports)]
 pub use driver::{
     AgentCancellation, AgentCommand, AgentDriver, AgentDriverError, AgentEventQueueLimits,
