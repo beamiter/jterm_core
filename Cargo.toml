@@ -10,6 +10,10 @@ license = "MIT"
 keywords = ["terminal", "pty", "parser", "jterm"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+# Opt-in shared fixture data for adapter dev-dependencies; no runtime reducer.
+session-parity-tests = []
+
 [dependencies]
 # Pin the policy engine so a branch move cannot silently change the contract.
 jagent = { git = "https://github.com/beamiter/jagent.git", rev = "d5492320686879c8b92106d2e31e4293ff125a5a" }

@@ -55,3 +55,6 @@ pub mod theme;
 pub mod vendored_script;
 pub mod wheel;
 pub mod workflows;
+
+#[cfg(feature = "session-parity-tests")]
+pub mod session_parity;

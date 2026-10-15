@@ -1,0 +1,462 @@
+[
+  {
+    "id": "draft_history_utf8",
+    "steps": [
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": "$ "
+        }
+      },
+      {
+        "pty": "printf 'café 界'",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": "$ printf 'café 界'"
+        }
+      },
+      {
+        "pty": "\r\u001b[2K$ printf previous",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": "$ printf previous"
+        }
+      },
+      {
+        "pty": "\r\u001b[2K$ printf 'café 界'",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": "$ printf 'café 界'"
+        }
+      }
+    ]
+  },
+  {
+    "id": "exact_success",
+    "steps": [
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007printf café",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\r\n\u001b]133;C;id=exact_success;session_id=parity-session;seq=1;started_at_ms=1700000000000;cmdline_url=printf%20caf%C3%A9\u0007",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "exact_success",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "result café\r\n",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "exact_success",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;D;0;id=exact_success\u0007",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [
+            {
+              "id": "exact_success",
+              "command": "printf café",
+              "exit_code": 0
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007",
+        "expected": {
+          "surface": "prompt",
+          "completed": [
+            {
+              "id": "exact_success",
+              "command": "printf café",
+              "exit_code": 0
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      }
+    ]
+  },
+  {
+    "id": "exact_nonzero",
+    "steps": [
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007exit 7",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\r\n\u001b]133;C;id=exact_nonzero;session_id=parity-session;seq=1;started_at_ms=1700000000000;cmdline_url=exit%207\u0007",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "exact_nonzero",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "result café\r\n",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "exact_nonzero",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;D;7;id=exact_nonzero\u0007",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [
+            {
+              "id": "exact_nonzero",
+              "command": "exit 7",
+              "exit_code": 7
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007",
+        "expected": {
+          "surface": "prompt",
+          "completed": [
+            {
+              "id": "exact_nonzero",
+              "command": "exit 7",
+              "exit_code": 7
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      }
+    ]
+  },
+  {
+    "id": "unknown_exit",
+    "steps": [
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007printf unknown",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\r\n\u001b]133;C;id=unknown_exit;session_id=parity-session;seq=1;started_at_ms=1700000000000;cmdline_url=printf%20unknown\u0007",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "unknown_exit",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "result café\r\n",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "unknown_exit",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;D;id=unknown_exit\u0007",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [
+            {
+              "id": "unknown_exit",
+              "command": "printf unknown",
+              "exit_code": null
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007",
+        "expected": {
+          "surface": "prompt",
+          "completed": [
+            {
+              "id": "unknown_exit",
+              "command": "printf unknown",
+              "exit_code": null
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      }
+    ]
+  },
+  {
+    "id": "interrupt",
+    "steps": [
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007sleep 60",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\r\n\u001b]133;C;id=interrupt;session_id=parity-session;seq=1;started_at_ms=1700000000000;cmdline_url=sleep%2060\u0007",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "interrupt",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "^C\r\n",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "interrupt",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;D;130;id=interrupt\u0007",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [
+            {
+              "id": "interrupt",
+              "command": "sleep 60",
+              "exit_code": 130
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007",
+        "expected": {
+          "surface": "prompt",
+          "completed": [
+            {
+              "id": "interrupt",
+              "command": "sleep 60",
+              "exit_code": 130
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      }
+    ]
+  },
+  {
+    "id": "alternate_screen",
+    "steps": [
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007less file",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\r\n\u001b]133;C;id=alternate_screen;session_id=parity-session;seq=1;started_at_ms=1700000000000;cmdline_url=less%20file\u0007",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "alternate_screen",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b[?1049hfull screen 界",
+        "expected": {
+          "surface": "fullscreen",
+          "completed": [],
+          "running_id": "alternate_screen",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b[?1049l",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "alternate_screen",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;D;0;id=alternate_screen\u0007",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [
+            {
+              "id": "alternate_screen",
+              "command": "less file",
+              "exit_code": 0
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007",
+        "expected": {
+          "surface": "prompt",
+          "completed": [
+            {
+              "id": "alternate_screen",
+              "command": "less file",
+              "exit_code": 0
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      }
+    ]
+  },
+  {
+    "id": "no_integration",
+    "steps": [
+      {
+        "pty": "login banner\r\n$ printf café",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\r\nordinary output\r\n$ ",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      }
+    ]
+  },
+  {
+    "id": "identity_dedup",
+    "steps": [
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007printf identity",
+        "expected": {
+          "surface": "prompt",
+          "completed": [],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\r\n\u001b]133;C;id=identity_dedup;session_id=parity-session;seq=1;started_at_ms=1700000000000;cmdline_url=printf%20identity\u0007",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "identity_dedup",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;D;9;id=unrelated\u0007",
+        "expected": {
+          "surface": "running",
+          "completed": [],
+          "running_id": "identity_dedup",
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "identity\r\n\u001b]133;D;0;id=identity_dedup\u0007",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [
+            {
+              "id": "identity_dedup",
+              "command": "printf identity",
+              "exit_code": 0
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;D;0;id=identity_dedup\u0007",
+        "expected": {
+          "surface": "passthrough",
+          "completed": [
+            {
+              "id": "identity_dedup",
+              "command": "printf identity",
+              "exit_code": 0
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      },
+      {
+        "pty": "\u001b]133;A\u0007$ \u001b]133;B\u0007",
+        "expected": {
+          "surface": "prompt",
+          "completed": [
+            {
+              "id": "identity_dedup",
+              "command": "printf identity",
+              "exit_code": 0
+            }
+          ],
+          "running_id": null,
+          "draft_text": null
+        }
+      }
+    ]
+  }
+]
