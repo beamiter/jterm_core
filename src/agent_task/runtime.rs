@@ -1868,7 +1868,7 @@ mod applied_turn_report_tests {
             .apply_event(
                 &mut tasks,
                 stream.event(
-                    0 + 1,
+                    1,
                     AgentEventKind::SessionStarted {
                         provider_session_id: None,
                         resumed: false,
@@ -1937,7 +1937,7 @@ mod applied_turn_report_tests {
             .apply_event(
                 &mut tasks,
                 stream.event(
-                    0 + 1,
+                    1,
                     AgentEventKind::TurnCompleted {
                         turn_id: AgentTurnId::new()
                     },
@@ -1958,7 +1958,7 @@ mod applied_turn_report_tests {
             .apply_event(
                 &mut tasks,
                 stream.event(
-                    0 + 1,
+                    1,
                     AgentEventKind::SessionStarted {
                         provider_session_id: None,
                         resumed: false,
