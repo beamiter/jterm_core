@@ -346,12 +346,27 @@ pub struct AgentRuntimeIssue {
     pub detail: String,
 }
 
+/// Lightweight turn boundary from an event accepted by TaskManager. Unlike
+/// the asynchronous presentation snapshot, this identity is aligned with the
+/// reducer's applied status. No prompt, output, provider ID or error is copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedAgentTurn {
+    pub task_id: TaskId,
+    pub epoch: super::AgentEventEpoch,
+    pub turn_id: super::AgentTurnId,
+    pub completed: bool,
+    pub status: TaskStatus,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentRuntimePollReport {
     pub preparations_finished: usize,
     pub preparations_started: usize,
     pub events_drained: usize,
     pub events_applied: usize,
+    /// Ordered accepted TurnStarted/TurnCompleted boundaries only. At most
+    /// NATIVE_AGENT_EVENTS_PER_FRAME entries; token events allocate nothing.
+    pub applied_turns: Vec<AppliedAgentTurn>,
     pub workers_finished: usize,
     pub budget_exhausted: bool,
     pub issues: Vec<AgentRuntimeIssue>,
@@ -359,6 +374,32 @@ pub struct AgentRuntimePollReport {
 }
 
 impl AgentRuntimePollReport {
+    fn apply_event(
+        &mut self,
+        tasks: &mut TaskManager,
+        event: AgentEvent,
+    ) -> Result<TaskStatus, AgentEventError> {
+        let boundary = match event.kind() {
+            super::AgentEventKind::TurnStarted { turn_id } => Some((*turn_id, false)),
+            super::AgentEventKind::TurnCompleted { turn_id } => Some((*turn_id, true)),
+            _ => None,
+        };
+        let task_id = event.stream().task_id();
+        let epoch = event.stream().epoch();
+        let status = tasks.apply_agent_event(event)?;
+        self.events_applied += 1;
+        if let Some((turn_id, completed)) = boundary {
+            self.applied_turns.push(AppliedAgentTurn {
+                task_id,
+                epoch,
+                turn_id,
+                completed,
+                status,
+            });
+        }
+        Ok(status)
+    }
+
     pub fn made_progress(&self) -> bool {
         self.preparations_finished > 0
             || self.preparations_started > 0
@@ -868,9 +909,8 @@ impl AgentRuntimeManager {
                                 super::AgentEventKind::TurnStarted { turn_id } => Some(*turn_id),
                                 _ => None,
                             };
-                            match task_manager.apply_agent_event(event) {
+                            match report.apply_event(task_manager, event) {
                                 Ok(_) => {
-                                    report.events_applied += 1;
                                     if started_turn.is_some()
                                         && runtime.pending_prompt == started_turn
                                     {
@@ -1794,5 +1834,190 @@ mod tests {
         assert_eq!(report.issues.len(), 1);
         assert_eq!(tasks.get(task_id), Some(&before));
         assert!(!runtime.has_any_activity());
+    }
+}
+
+#[cfg(test)]
+mod applied_turn_report_tests {
+    use super::*;
+    use crate::agent_task::{AgentEventKind, AgentTurnId, NewTask};
+
+    fn fixture() -> (TaskManager, AgentEventStream) {
+        let mut tasks = TaskManager::new();
+        let id = tasks
+            .create(NewTask {
+                title: "synthetic report fixture".into(),
+                provider: AgentProvider::Codex,
+                repo_root: "/fixture".into(),
+                worktree_path: "/fixture/task".into(),
+                branch: "fixture/report".into(),
+                base_commit: "a".repeat(40),
+                source_context: None,
+            })
+            .unwrap();
+        let stream = tasks.start_agent_event_stream(id).unwrap();
+        (tasks, stream)
+    }
+
+    #[test]
+    fn one_drain_reports_only_accepted_turn_boundaries_in_order() {
+        let (mut tasks, stream) = fixture();
+        let turn = AgentTurnId::new();
+        let mut report = AgentRuntimePollReport::default();
+        report
+            .apply_event(
+                &mut tasks,
+                stream.event(
+                    0 + 1,
+                    AgentEventKind::SessionStarted {
+                        provider_session_id: None,
+                        resumed: false,
+                    },
+                    None,
+                ),
+            )
+            .unwrap();
+        report
+            .apply_event(
+                &mut tasks,
+                stream.event(1 + 1, AgentEventKind::TurnStarted { turn_id: turn }, None),
+            )
+            .unwrap();
+        for sequence in 2..63 {
+            report
+                .apply_event(
+                    &mut tasks,
+                    stream.event(sequence + 1, AgentEventKind::TextDelta, None),
+                )
+                .unwrap();
+        }
+        report
+            .apply_event(
+                &mut tasks,
+                stream.event(
+                    63 + 1,
+                    AgentEventKind::TurnCompleted { turn_id: turn },
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(report.events_applied, NATIVE_AGENT_EVENTS_PER_FRAME);
+        assert_eq!(report.applied_turns.len(), 2);
+        assert_eq!(
+            report.applied_turns[0],
+            AppliedAgentTurn {
+                task_id: stream.task_id(),
+                epoch: stream.epoch(),
+                turn_id: turn,
+                completed: false,
+                status: TaskStatus::Working
+            }
+        );
+        assert_eq!(
+            report.applied_turns[1],
+            AppliedAgentTurn {
+                task_id: stream.task_id(),
+                epoch: stream.epoch(),
+                turn_id: turn,
+                completed: true,
+                status: TaskStatus::ReadyForReview
+            }
+        );
+        assert_eq!(
+            tasks.get(stream.task_id()).unwrap().status,
+            TaskStatus::ReadyForReview
+        );
+    }
+
+    #[test]
+    fn rejected_turn_does_not_enter_semantic_report() {
+        let (mut tasks, stream) = fixture();
+        let mut report = AgentRuntimePollReport::default();
+        assert!(report
+            .apply_event(
+                &mut tasks,
+                stream.event(
+                    0 + 1,
+                    AgentEventKind::TurnCompleted {
+                        turn_id: AgentTurnId::new()
+                    },
+                    None
+                )
+            )
+            .is_err());
+        assert!(report.applied_turns.is_empty());
+        assert_eq!(report.events_applied, 0);
+    }
+
+    #[test]
+    fn boundary_after_full_drain_is_reported_only_in_next_frame() {
+        let (mut tasks, stream) = fixture();
+        let turn = AgentTurnId::new();
+        let mut first = AgentRuntimePollReport::default();
+        first
+            .apply_event(
+                &mut tasks,
+                stream.event(
+                    0 + 1,
+                    AgentEventKind::SessionStarted {
+                        provider_session_id: None,
+                        resumed: false,
+                    },
+                    None,
+                ),
+            )
+            .unwrap();
+        first
+            .apply_event(
+                &mut tasks,
+                stream.event(1 + 1, AgentEventKind::TurnStarted { turn_id: turn }, None),
+            )
+            .unwrap();
+        for sequence in 2..64 {
+            first
+                .apply_event(
+                    &mut tasks,
+                    stream.event(sequence + 1, AgentEventKind::TextDelta, None),
+                )
+                .unwrap();
+        }
+        assert_eq!(first.events_applied, NATIVE_AGENT_EVENTS_PER_FRAME);
+        assert_eq!(first.applied_turns.len(), 1);
+        assert!(!first.applied_turns[0].completed);
+        let mut second = AgentRuntimePollReport::default();
+        second
+            .apply_event(
+                &mut tasks,
+                stream.event(
+                    64 + 1,
+                    AgentEventKind::TurnCompleted { turn_id: turn },
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(second.applied_turns.len(), 1);
+        assert!(second.applied_turns[0].completed);
+        assert_eq!(
+            second.applied_turns[0].turn_id,
+            first.applied_turns[0].turn_id
+        );
+        assert!(second
+            .apply_event(
+                &mut tasks,
+                stream.event(
+                    64 + 1,
+                    AgentEventKind::TurnCompleted { turn_id: turn },
+                    None
+                )
+            )
+            .is_err());
+        assert_eq!(second.applied_turns.len(), 1);
+    }
+
+    #[test]
+    fn default_report_has_no_boundary_allocation() {
+        let report = AgentRuntimePollReport::default();
+        assert_eq!(report.applied_turns.capacity(), 0);
+        assert!(!report.made_progress());
     }
 }

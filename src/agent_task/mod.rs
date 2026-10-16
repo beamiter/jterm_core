@@ -111,7 +111,7 @@ pub use native::{
 #[allow(unused_imports)]
 pub use runtime::{
     AgentRuntimeCompletion, AgentRuntimeError, AgentRuntimeIssue, AgentRuntimeManager,
-    AgentRuntimePollReport,
+    AgentRuntimePollReport, AppliedAgentTurn,
 };
 #[allow(unused_imports)]
 pub use task::{
