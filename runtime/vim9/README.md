@@ -1,0 +1,209 @@
+# Vim9 native editor runtime
+
+`bridge.vim` runs inside an actual Vim 9 editor. The terminal frontend renders
+Vim's PTY output and sends normal keyboard input to the PTY. This runtime
+provides a separate native Vim channel for metadata and explicit IDE actions.
+Vim continues to own editing, undo, registers, mappings, macros, windows,
+completion and plugins; there is no second copy of the document in this bridge.
+
+## Requirements and loading
+
+Use Vim 9.0 or later with `+vim9script`, `+channel`, `+job`, `+timers` and
+`+quickfix`. The real-editor integration suite has been run on Vim 9.1.0016
+with distribution backports. The runtime avoids newer Vim9 classes and newer
+channel-server APIs. It is sourced after ordinary Vim startup, using `-S`, so
+the user's vimrc and plugins are loaded normally. It does not install a vimrc,
+change the user's mappings, disable swap recovery, or force the `hidden` option.
+
+The host starts its loopback listener before launching Vim and supplies these
+environment values only to the new editor process:
+
+| Name | Meaning |
+| --- | --- |
+| `JTERM_VIM9_ADDR` | The host's ephemeral `127.0.0.1:port` address |
+| `JTERM_VIM9_TOKEN` | A random secret for this single editor session |
+| `JTERM_VIM9_ROOT` | Absolute project root for builds and project search |
+
+The runtime immediately removes `JTERM_VIM9_TOKEN` from Vim's environment, so
+build tools started by the runtime do not inherit that credential. The token
+is retained only in a script-local variable until authentication succeeds;
+that copy is then cleared. Address and project-root environment values remain.
+
+If the environment is absent, sourcing the script is a no-op. Loading it twice
+does not register duplicate callbacks. A lost bridge leaves the editor alive.
+
+## Wire protocol
+
+Protocol version 1 is UTF-8 JSON with one object per newline. The native Vim
+channel uses `mode: 'nl'`; `json_decode()` and `json_encode()` handle object
+encoding. It deliberately does not use Vim's `mode: 'json'`, whose built-in
+array protocol also recognizes executable `ex`, `expr`, `normal` and `call`
+messages outside a user callback.
+
+Vim sends the first message:
+
+```json
+{"event":"hello","protocol":1,"token":"session secret","version":901,"vim9":true,"pid":12345,"seq":1}
+```
+
+After validating that hello, the host sends:
+
+```json
+{"action":"auth","protocol":1,"token":"session secret"}
+```
+
+The runtime validates both token type/value and protocol type/value. It rejects
+editing requests until that exchange completes and closes the channel on an
+incorrect authentication message. Authentication success publishes the first
+state; it does not need a separate response with an artificial request id.
+
+Subsequent requests have a positive integer `id` and one action. For example:
+
+```json
+{"id":1,"action":"open","path":"/project/src/main.rs","line":20,"column":5}
+{"id":2,"action":"save"}
+```
+
+The runtime replies with `event: "response"`, the matching `id`, Boolean `ok`,
+and an `error` string when applicable. Exceptions are reported through this
+response rather than suppressed or inserted into the user's command line.
+Async search failures use `{"event":"error","error":"..."}`. Successful
+build/search responses acknowledge job startup; their completion is published
+in subsequent state. Events include an increasing `seq` and `protocol: 1`.
+
+### Actions
+
+| Action | Arguments | Behavior |
+| --- | --- | --- |
+| `open` | `path`; optional `line`, `column` | Open a real Vim buffer; explicit positions use one-based line and byte column |
+| `buffer` | Positive integer `buffer` | Select an existing buffer id |
+| `save` | None | Native `:update`, including the user's write hooks |
+| `save_all` | None | Native `:wall`, including ordinary Vim write errors |
+| `build` | Optional/empty `command` | Start an async shell job; an empty command uses expanded `makeprg` |
+| `cancel_build` | None | Request termination of the running build job |
+| `search` | Nonempty, single-line `query` | Async literal project search using `rg` |
+| `definition` | None | `:LspGotoDefinition`, or native tags/tagfunc |
+| `hover` | None | `:LspHover` |
+| `references` | None | `:LspShowReferences` |
+| `rename` | Nonempty `name` | `:LspRename name`; whitespace/command separators are rejected |
+| `format` | None | `:LspFormat` |
+| `next_diagnostic` | None | Native `:cnext` |
+| `previous_diagnostic` | None | Native `:cprevious` |
+| `snapshot` | None | Force a current state publication |
+| `quit` | None | Native `:qall` without `!`; acknowledge from `VimLeavePre` once Vim accepts exit |
+
+Requests are limited to 64 KiB. Unknown actions, invalid types, invalid buffer
+ids and nonpositive positions receive an error. Filenames are passed through
+`fnameescape()`; filenames containing newlines are not supported. A file that
+already has a buffer is matched by its exact absolute name, avoiding Vim's
+pattern-based buffer lookup fallback.
+
+GUI file/buffer navigation remembers and restores each buffer's native
+`winsaveview()` cursor and scroll position. New-file `BufRead`/`BufEnter` hooks
+retain their own positioning unless coordinates were explicitly requested.
+Ordinary Vim commands continue to follow the user's settings, including
+`startofline`. No action forces away modified data. Actions that change editor
+state refuse a pending operator, command-line prompt, mapping or completion;
+they never synthesize Escape to clear what the user is entering.
+
+### Published state
+
+`event: "state"` includes `mode`, current absolute `file`, project `root`,
+current Vim `cwd`, `line`, byte `column`, Boolean `modified`, `changedtick`,
+`filetype`, `encoding`, `capabilities`, `buffers`, `diagnostics`, `build` and
+`search`. Additional fields are forward-compatible.
+
+Buffers contain `id`, absolute `name`, Boolean `modified` and Boolean `current`.
+The runtime constructs these fields explicitly; it never serializes complete
+buffer/window dictionaries or their plugin variables, which may contain
+Funcrefs, channels, cyclic objects or private plugin state.
+
+Diagnostics contain `filename`, `line`, byte `column`, `text` and `kind`
+(`error`, `warning`, `info`, `hint`). Sources include Vim's quickfix list, the
+current window's location list, and current-buffer diagnostics exposed by the
+supported Vim9 LSP plugin. Duplicate entries are removed. LSP's default UTF-16
+columns are converted to Vim byte positions. For a visual-column quickfix item
+in a displayed buffer, Vim's `virtcol2col()` performs the conversion. If that
+buffer has no rendering window, navigation falls back to the correct line's
+first byte rather than guessing a byte position from a visual column.
+
+At most 256 buffers and 256 diagnostics are published. Boolean
+`buffers_truncated` and `diagnostics_truncated` indicate omitted data;
+`buffers_omitted` and `diagnostics_omitted` supply counts. Payloads are trimmed
+below 900,000 bytes to leave room within the host's 1 MiB frame limit. Snapshots
+are coalesced at 40 ms, with a 750 ms reconciliation for changes such as direct
+plugin calls to `setqflist()`. Diagnostic work is cached by quickfix/location
+list id and changedtick, buffer identity/change tick, and LSP update events.
+
+## Builds and search
+
+Builds use Vim's `job_start()` with its configured shell and shell command flag.
+The command is either the explicit user-entered build command or `makeprg`;
+this is the sole action that deliberately accepts shell syntax. It runs from
+the project root and does not implicitly save buffers. A second build is
+rejected while one is running. Stdout and stderr are collected asynchronously;
+the job is finished only after both exit and channel-close callbacks arrive,
+so the final output is included in quickfix parsing.
+
+Build output is bounded to 10,000 lines of 2,048 characters each; `build.output`
+contains the last 80 stored lines and `build.truncated` counts later omitted
+lines. State also includes `build.running`, `command`, nullable `exit_code` and
+`cancelled`. Parsing uses Vim's `errorformat` captured at build start. An
+errorformat directory-stack entry anchors relative filenames to the build's
+root even if the user changes Vim's directory while the job is running.
+
+Search uses an argv list, `--fixed-strings` and a `--` argument boundary. Shell
+characters and leading dashes in a query stay literal. It honors rg ignore
+files, includes hidden files, and excludes `.git`. Results are limited to 256
+matching lines, with omitted counts reflected in state and truncation flags.
+A new search replaces a running one. Successful search, including no matches,
+replaces the current quickfix list. An rg failure publishes a visible error
+and preserves the previous quickfix list. A later build or search can replace
+the previous result list; full underlying Vim buffer data is unaffected.
+
+## Optional Vim9 language features
+
+The supported adapter is [Yegappan's Vim9 LSP](https://github.com/yegappan/lsp).
+Its public commands are listed in the action table. The user installs and
+configures that plugin and its language servers in their normal Vim setup;
+this bridge does not download them. Their registered commands determine the
+advertised `definition`, `hover`, `references`, `rename` and `format`
+capabilities. A native Vim tags file or configured `tagfunc` can also supply
+`definition` without this plugin. A registered command is not proof that a
+particular language server supports every action; its normal Vim errors and
+messages still apply.
+
+The adapter observes `User LspDiagsUpdated`, `LspAttached` and `LspDetached` and
+uses `lsp#diag#GetDiagsForBuf()` when available. Other Vim plugins still load
+and work normally in the editor; native buttons for other command vocabularies
+need an explicit adapter rather than guessed commands.
+
+## Real-editor tests
+
+From the core repository:
+
+```sh
+VIM9_TEST_VIM=/absolute/path/to/vim python runtime/vim9/test_bridge.py
+```
+
+`VIM9_TEST_VIM` is optional when `vim` is on PATH. These Python-standard-library
+tests create isolated files, actual PTYs and private loopback sockets, then
+drive native Vim and the shipped script. They verify authentication and bad
+requests, actual edits/undo/save, user vimrc mappings, escaped paths, remembered
+views, dirty-buffer/exit protection, preservation of pending input, Save All,
+async build/cancel/output, working-directory correctness, secret cleanup,
+literal rg search, result caps and asynchronous errors. Provider-routing tests
+use user-defined native Vim commands; they do not claim to test an external
+language server. The suite is skipped if no Vim executable is available.
+
+These tests do not validate frontend font rendering, desktop IME integration,
+mouse input or all user plugins; those are frontend/desktop verification tasks.
+
+## Primary references
+
+- [Official Vim channel/job documentation](https://github.com/vim/vim/blob/master/runtime/doc/channel.txt): NL framing, callbacks, async jobs and channel lifetime.
+- [Official Vim9 documentation](https://github.com/vim/vim/blob/master/runtime/doc/vim9.txt): compiled `def` functions and coexistence with legacy user scripts.
+- [Official Vim builtin documentation](https://github.com/vim/vim/blob/master/runtime/doc/builtin.txt): buffer snapshots, quickfix, state checks, filename escaping and view preservation.
+- [Official Vim autocommand documentation](https://github.com/vim/vim/blob/master/runtime/doc/autocmd.txt): mode/text/quickfix events and pending-state behavior.
+- [Official Vim startup documentation](https://github.com/vim/vim/blob/master/runtime/doc/starting.txt): normal vimrc/plugin loading and the `-S` startup hook.
+- [Vim9 LSP public documentation](https://github.com/yegappan/lsp/blob/main/doc/lsp.txt): supported semantic commands, diagnostics and user events.

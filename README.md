@@ -31,6 +31,12 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 ## Shared surfaces
 
+- A real Vim 9 IDE bridge for all four native workbenches. `vim9::Vim9Session`
+  prepares a dedicated editor process, transports typed editor actions over
+  an authenticated loopback channel, and publishes buffers, mode, cursor,
+  quickfix diagnostics and asynchronous build state. A bundled `vim9script`
+  runtime preserves the user's vimrc and plugins; PTY input and editing remain
+  owned by Vim. See [the Vim9 IDE guide](docs/vim9-ide.md).
 - Split-pane navigation uses actual pane rectangles across the family: nearest
   adjacent edge, perpendicular overlap, then center alignment and stable
   identity. Unallocated panes are skipped and directions do not wrap at an
