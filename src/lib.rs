@@ -41,6 +41,7 @@ pub mod organism_live;
 pub mod organism_memory;
 pub mod organism_motion;
 pub mod organism_watch;
+pub mod output_compare;
 pub mod output_notice;
 pub mod pane_layout;
 pub mod parser;
