@@ -450,20 +450,30 @@ pub fn split_node_rect(
 /// The pane physically adjacent to `active` in `direction` (tmux-style spatial
 /// navigation across nesting), given every leaf's laid-out rectangle. Nearest
 /// along the direction wins; ties break toward the larger perpendicular
-/// overlap. No wrap at the edges.
+/// overlap, then the closest center and stable session identity. No wrap at
+/// the edges. Unallocated or non-finite rectangles cannot receive focus.
 pub fn directional_focus_target(
     rects: &[PaneRect],
     active: usize,
     direction: PaneDirection,
 ) -> Option<usize> {
-    let cur = rects.iter().find(|p| p.session == active)?;
+    let cur = rects
+        .iter()
+        .find(|p| p.session == active && focus_rect_is_valid(p.rect))?;
     let c = cur.rect;
-    let eps = 1.0;
     rects
         .iter()
-        .filter(|p| p.session != active)
+        .filter(|p| p.session != active && focus_rect_is_valid(p.rect))
         .filter_map(|p| {
             let r = p.rect;
+            // Keep subpixel / normalized layouts directional too: a fixed
+            // one-pixel tolerance can exceed an entire small pane. GTK uses
+            // physical allocations while other hosts may use logical units.
+            let axis_extent = match direction.axis() {
+                Axis::Vertical => c.width.min(r.width),
+                Axis::Horizontal => c.height.min(r.height),
+            };
+            let eps = 1.0_f32.min(axis_extent * 0.01);
             // Candidate must sit on `direction`'s side and overlap the
             // focused pane along the perpendicular axis.
             let (on_side, gap, perp_overlap) = match direction {
@@ -488,11 +498,42 @@ pub fn directional_focus_target(
                     (r.x + r.width).min(c.x + c.width) - r.x.max(c.x),
                 ),
             };
-            (on_side && perp_overlap > 0.0).then_some((p.session, gap.max(0.0), perp_overlap))
+            // f64 keeps center distances finite even near f32's range limit.
+            let perpendicular_center_distance = match direction.axis() {
+                Axis::Vertical => ((r.y as f64 + r.height as f64 / 2.0)
+                    - (c.y as f64 + c.height as f64 / 2.0))
+                    .abs(),
+                Axis::Horizontal => ((r.x as f64 + r.width as f64 / 2.0)
+                    - (c.x as f64 + c.width as f64 / 2.0))
+                    .abs(),
+            };
+            (on_side && gap.is_finite() && perp_overlap > 0.0).then_some((
+                p.session,
+                gap.max(0.0),
+                perp_overlap,
+                perpendicular_center_distance,
+            ))
         })
-        // Nearest along the direction; ties broken by the larger overlap.
-        .min_by(|a, b| a.1.total_cmp(&b.1).then(b.2.total_cmp(&a.2)))
-        .map(|(session, _, _)| session)
+        .min_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then(b.2.total_cmp(&a.2))
+                .then(a.3.total_cmp(&b.3))
+                .then(a.0.cmp(&b.0))
+        })
+        .map(|(session, _, _, _)| session)
+}
+
+fn focus_rect_is_valid(rect: Rect) -> bool {
+    rect.x.is_finite()
+        && rect.y.is_finite()
+        && rect.width.is_finite()
+        && rect.height.is_finite()
+        && rect.width > 0.0
+        && rect.height > 0.0
+        && (rect.x + rect.width).is_finite()
+        && (rect.y + rect.height).is_finite()
+        && rect.x + rect.width > rect.x
+        && rect.y + rect.height > rect.y
 }
 
 #[cfg(test)]
@@ -778,6 +819,142 @@ mod tests {
         assert_eq!(
             directional_focus_target(&rects, 2, PaneDirection::Down),
             None
+        );
+    }
+
+    fn pane(session: usize, x: f32, y: f32, width: f32, height: f32) -> PaneRect {
+        PaneRect {
+            session,
+            rect: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+        }
+    }
+
+    #[test]
+    fn directional_focus_does_not_jump_to_a_tall_side_pane() {
+        // The right pane's center is above the active bottom-left pane's
+        // center, but Up must cross the horizontal split on the left.
+        let rects = [
+            pane(0, -800.0, 406.0, 400.0, 400.0),
+            pane(1, -800.0, 0.0, 400.0, 400.0),
+            pane(2, -394.0, 0.0, 400.0, 806.0),
+        ];
+        assert_eq!(
+            directional_focus_target(&rects, 0, PaneDirection::Up),
+            Some(1)
+        );
+        assert_eq!(
+            directional_focus_target(&rects, 0, PaneDirection::Right),
+            Some(2)
+        );
+        assert_eq!(directional_focus_target(&rects, 2, PaneDirection::Up), None);
+        assert_eq!(
+            directional_focus_target(&rects, 2, PaneDirection::Down),
+            None
+        );
+    }
+
+    #[test]
+    fn directional_focus_has_the_same_edges_in_normalized_and_hidpi_geometry() {
+        for scale in [0.001, 1.0, 2.5, 4096.0] {
+            let rects = [
+                pane(0, 0.0, 0.0, 0.4 * scale, 0.4 * scale),
+                pane(1, 0.4 * scale, 0.0, 0.6 * scale, 0.4 * scale),
+                pane(2, 0.0, 0.4 * scale, 0.4 * scale, 0.6 * scale),
+                pane(3, 0.4 * scale, 0.4 * scale, 0.6 * scale, 0.6 * scale),
+            ];
+            for (active, direction, expected) in [
+                (0, PaneDirection::Left, None),
+                (0, PaneDirection::Up, None),
+                (0, PaneDirection::Right, Some(1)),
+                (0, PaneDirection::Down, Some(2)),
+                (3, PaneDirection::Left, Some(2)),
+                (3, PaneDirection::Up, Some(1)),
+                (3, PaneDirection::Right, None),
+                (3, PaneDirection::Down, None),
+            ] {
+                assert_eq!(
+                    directional_focus_target(&rects, active, direction),
+                    expected,
+                    "scale={scale} active={active} direction={direction:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directional_focus_skips_unallocated_nonfinite_and_overflowed_rectangles() {
+        let active = pane(0, 0.0, 0.0, 100.0, 100.0);
+        let target = pane(1, 106.0, 0.0, 100.0, 100.0);
+        let invalid = [
+            pane(2, 100.0, 0.0, 0.0, 100.0),
+            pane(2, 100.0, 0.0, 100.0, 0.0),
+            pane(2, 100.0, 0.0, -1.0, 100.0),
+            pane(2, f32::NAN, 0.0, 100.0, 100.0),
+            pane(2, 100.0, f32::NEG_INFINITY, 100.0, 100.0),
+            pane(2, 100.0, 0.0, f32::INFINITY, 100.0),
+            pane(2, 100.0, 0.0, 100.0, f32::NAN),
+            pane(2, f32::MAX, 0.0, f32::MAX, 100.0),
+            pane(2, 100.0, f32::MAX, 100.0, f32::MAX),
+            pane(2, 100.0, 0.0, f32::MIN_POSITIVE, 100.0),
+        ];
+        for bad in invalid {
+            assert_eq!(
+                directional_focus_target(&[active, bad, target], 0, PaneDirection::Right),
+                Some(1),
+                "invalid candidate {bad:?}"
+            );
+            assert_eq!(
+                directional_focus_target(&[bad, target], 2, PaneDirection::Right),
+                None,
+                "invalid active pane {bad:?}"
+            );
+        }
+        assert_eq!(
+            directional_focus_target(&[target], 99, PaneDirection::Left),
+            None
+        );
+    }
+
+    #[test]
+    fn directional_focus_breaks_equal_geometry_ties_by_stable_identity() {
+        let active = pane(9, -500.0, 106.0, 1000.0, 100.0);
+        let left = pane(7, -500.0, 0.0, 497.0, 100.0);
+        let right = pane(2, 3.0, 0.0, 497.0, 100.0);
+        for rects in [
+            [active, left, right],
+            [right, active, left],
+            [left, right, active],
+        ] {
+            assert_eq!(
+                directional_focus_target(&rects, 9, PaneDirection::Up),
+                Some(2)
+            );
+        }
+    }
+
+    #[test]
+    fn directional_focus_prefers_nearer_edges_then_overlap_then_alignment() {
+        let active = pane(0, 0.0, 0.0, 100.0, 100.0);
+        let near = pane(1, 106.0, 0.0, 100.0, 20.0);
+        let far = pane(2, 212.0, 0.0, 100.0, 100.0);
+        assert_eq!(
+            directional_focus_target(&[active, far, near], 0, PaneDirection::Right),
+            Some(1)
+        );
+        let overlapping = pane(3, 106.0, 30.0, 100.0, 70.0);
+        assert_eq!(
+            directional_focus_target(&[active, near, overlapping], 0, PaneDirection::Right),
+            Some(3)
+        );
+        let aligned = pane(4, 106.0, 40.0, 100.0, 20.0);
+        assert_eq!(
+            directional_focus_target(&[active, near, aligned], 0, PaneDirection::Right),
+            Some(4)
         );
     }
 }

@@ -31,6 +31,12 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 ## Shared surfaces
 
+- Split-pane navigation uses actual pane rectangles across the family: nearest
+  adjacent edge, perpendicular overlap, then center alignment and stable
+  identity. Unallocated panes are skipped and directions do not wrap at an
+  outer edge. Block search keeps cooperative 8 ms palette / 4 ms live Find
+  slices while retaining its existing byte budgets and resume cursors. See
+  [block workspace responsiveness](docs/block-workspace.md).
 - Optional native Chat-mode surface selection: a ready shell prompt docks the
   existing live terminal as a multiline composer, running commands retain
   native stdin, alternate-screen applications take over the pane, and missing

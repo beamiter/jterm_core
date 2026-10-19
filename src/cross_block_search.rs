@@ -13,8 +13,10 @@ use std::time::{Duration, Instant};
 /// Wider than the live Find overlay: palette search is user-initiated and may
 /// walk retained history, but must still fail visibly when the walk stops early.
 pub const CROSS_BLOCK_SCAN_BYTE_LIMIT: usize = 8 * 1024 * 1024;
-/// Per-idle-slice wall-clock cap for one cross-block palette walk.
-pub const CROSS_BLOCK_SCAN_TIME_LIMIT: Duration = Duration::from_millis(48);
+/// Cooperative per-idle-slice target for one cross-block palette walk.
+/// Checked between scan units, so a single regex operation can overrun it.
+/// Keep room for input and rendering instead of occupying several frames.
+pub const CROSS_BLOCK_SCAN_TIME_LIMIT: Duration = Duration::from_millis(8);
 /// Regex compile size cap shared by anvil/forge cross-block pattern scans.
 pub const CROSS_BLOCK_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -22,8 +24,8 @@ pub const CROSS_BLOCK_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 /// [`CROSS_BLOCK_SCAN_BYTE_LIMIT`] because overlay scans run on every keystroke
 /// against the active block, not a user-initiated palette walk.
 pub const FIND_OVERLAY_SCAN_BYTE_LIMIT: usize = 4 * 1024 * 1024;
-/// Live Find overlay wall-clock cap for one surface scan slice.
-pub const FIND_OVERLAY_SCAN_TIME_LIMIT: Duration = Duration::from_millis(12);
+/// Cooperative live Find overlay target, checked between scan units.
+pub const FIND_OVERLAY_SCAN_TIME_LIMIT: Duration = Duration::from_millis(4);
 
 /// Mid-record resume point for a pattern scan that stopped inside one record's
 /// command or output lines. Metadata browse never sets this.
@@ -761,10 +763,10 @@ mod tests {
     #[test]
     fn cross_block_budget_constants_match_the_family_contract() {
         assert_eq!(CROSS_BLOCK_SCAN_BYTE_LIMIT, 8 * 1024 * 1024);
-        assert_eq!(CROSS_BLOCK_SCAN_TIME_LIMIT, Duration::from_millis(48));
+        assert_eq!(CROSS_BLOCK_SCAN_TIME_LIMIT, Duration::from_millis(8));
         assert_eq!(CROSS_BLOCK_REGEX_SIZE_LIMIT, 2 * 1024 * 1024);
         assert_eq!(FIND_OVERLAY_SCAN_BYTE_LIMIT, 4 * 1024 * 1024);
-        assert_eq!(FIND_OVERLAY_SCAN_TIME_LIMIT, Duration::from_millis(12));
+        assert_eq!(FIND_OVERLAY_SCAN_TIME_LIMIT, Duration::from_millis(4));
         // Palette walks (`FindScanBudget::for_cross_block`) must keep the wider
         // CROSS_BLOCK_* caps; live overlay (`FindScanBudget::new`) stays on the
         // tighter FIND_OVERLAY_* pair — never interchange the two.
