@@ -180,6 +180,10 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 ## Offline organism settings contract
 
+The [ASCII organism presentation guide](docs/ascii-organism.md) describes the
+shared body animation, live explanations, and the native host integration
+contract. The same renderer drives Anvil, Ember, Forge and Frost.
+
 `organism_daily::PreviewPose::ALL` supplies eight labeled examples for settings.
 Each pose has an `explanation()` and a `context()` for the existing
 `organism::sprite_frame_with_context` renderer. These are visual examples, not

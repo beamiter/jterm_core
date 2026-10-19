@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::organism::{Behavior, BodyLanguage, RenderContext};
+use crate::organism::{Behavior, BodyLanguage, LifeState, RenderContext, WatchRhythm};
 use crate::organism_attention::{AttentionArbiter, AttentionCue, AttentionPolicy};
 
 /// Representative poses for a settings gallery, never synthetic work events.
@@ -111,6 +111,91 @@ pub const fn behavior_explanation(behavior: Behavior) -> &'static str {
         Behavior::GuardStuck => "Quietly keeping several unresolved failures company.",
         Behavior::GuardRecovery => "The build recovered; keeping it company before push.",
         Behavior::GuardCautious => "Recovered after repeated changes between failure and success.",
+    }
+}
+
+/// Compact, shared headings for a live readout. These name the creature's
+/// observed pose; they are not a second source of command state.
+pub const fn behavior_label(behavior: Behavior) -> &'static str {
+    match behavior {
+        Behavior::Idle => "Keeping company",
+        Behavior::WatchCommand => "Watching command",
+        Behavior::InspectError => "Inspecting failure",
+        Behavior::SitNearError => "Beside a failure",
+        Behavior::Celebrate => "A small celebration",
+        Behavior::CelebrateBig => "Celebrating recovery",
+        Behavior::RestAfterPush => "Resting after push",
+        Behavior::UnknownOutcome => "Outcome unknown",
+        Behavior::GlanceAside => "Looking at another pane",
+        Behavior::Sleep => "Resting",
+        Behavior::Explore => "Exploring",
+        Behavior::Approach => "Coming closer",
+        Behavior::WatchAgent => "Watching Shell Agent",
+        Behavior::WatchSettled => "Settled in for work",
+        Behavior::GuardFailure => "Keeping watch on a failure",
+        Behavior::GuardStuck => "Keeping watch on repeated failures",
+        Behavior::GuardRecovery => "Recovered; awaiting push",
+        Behavior::GuardCautious => "Keeping a cautious watch",
+    }
+}
+
+/// Describe exactly the context used for painting. Body language may enrich
+/// idle explanations, but must never replace a command, failure, unknown
+/// outcome or repo vigil with an inferred emotional story. Quiet output is
+/// explicitly not a completion or a stalled-command diagnosis.
+pub const fn context_explanation(context: RenderContext) -> &'static str {
+    match context.behavior {
+        Behavior::Idle if context.body_language.drowsy => "Dozing while its energy recovers.",
+        Behavior::Idle if context.body_language.tense => {
+            "Keeping you company with its ears lowered."
+        }
+        Behavior::Idle if context.walking => "Stretching its legs during a quiet moment.",
+        Behavior::Idle if context.body_language.listless => {
+            "A little restless; occasionally yawning between commands."
+        }
+        Behavior::WatchCommand | Behavior::WatchAgent | Behavior::WatchSettled => {
+            match context.watch_rhythm {
+                WatchRhythm::Busy => "Following an active stream of command output.",
+                WatchRhythm::Waiting => {
+                    "Keeping watch while output is quiet; the command has not finished."
+                }
+                WatchRhythm::Resumed => "Perking up as command output resumes.",
+                WatchRhythm::Steady => behavior_explanation(context.behavior),
+            }
+        }
+        _ => behavior_explanation(context.behavior),
+    }
+}
+
+/// A qualitative, allocation-free description of the simulated creature.
+/// It never describes the human's mood, health or productivity. Event status
+/// remains a separate readout, and this presentation does not feed back into
+/// physiology, attention, memory, or the command reducer.
+pub fn life_description(state: LifeState) -> &'static str {
+    // Corrupt/non-finite measurements cannot manufacture an extreme trait.
+    let level = |value: f32| {
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
+    };
+    if level(state.energy) < 0.25 {
+        "Low energy; ready for a rest"
+    } else if level(state.stress) > 0.60 {
+        "A little tense; settling down"
+    } else if level(state.boredom) > 0.85 {
+        "Restless and ready to explore"
+    } else if level(state.social_need) > 0.70 {
+        "In the mood for company"
+    } else if level(state.mood) > 0.75 && level(state.confidence) > 0.65 {
+        "Content and confident"
+    } else if level(state.curiosity) > 0.70 {
+        "Curious and attentive"
+    } else if level(state.attachment) > 0.70 {
+        "At home in your company"
+    } else {
+        "Comfortably keeping company"
     }
 }
 
@@ -238,6 +323,64 @@ mod tests {
 
     fn seconds(value: u64) -> Duration {
         Duration::from_secs(value)
+    }
+
+    #[test]
+    fn live_explanations_never_turn_body_language_or_quiet_output_into_an_outcome() {
+        let language = BodyLanguage {
+            drowsy: true,
+            tense: true,
+            listless: true,
+        };
+        for behavior in [
+            Behavior::InspectError,
+            Behavior::UnknownOutcome,
+            Behavior::GuardFailure,
+            Behavior::GuardStuck,
+            Behavior::GuardRecovery,
+            Behavior::GuardCautious,
+        ] {
+            let context = RenderContext::new(behavior, language, true)
+                .with_watch_rhythm(WatchRhythm::Waiting);
+            assert_eq!(context_explanation(context), behavior_explanation(behavior));
+            assert!(!behavior_label(behavior).is_empty());
+        }
+        for behavior in [
+            Behavior::WatchCommand,
+            Behavior::WatchAgent,
+            Behavior::WatchSettled,
+        ] {
+            let context = RenderContext::new(behavior, language, false)
+                .with_watch_rhythm(WatchRhythm::Waiting);
+            assert!(context_explanation(context).contains("has not finished"));
+            assert_ne!(
+                context_explanation(context),
+                behavior_explanation(Behavior::Sleep)
+            );
+        }
+    }
+
+    #[test]
+    fn life_readout_is_bounded_and_does_not_mutate_the_simulation() {
+        let state = LifeState {
+            energy: 0.1,
+            stress: 0.9,
+            boredom: 0.99,
+            ..LifeState::default()
+        };
+        assert_eq!(life_description(state), "Low energy; ready for a rest");
+        assert_eq!(state.energy, 0.1);
+        let invalid = LifeState {
+            energy: f32::NAN,
+            mood: f32::INFINITY,
+            confidence: f32::NEG_INFINITY,
+            stress: f32::NAN,
+            curiosity: f32::NAN,
+            boredom: f32::NAN,
+            social_need: f32::NAN,
+            attachment: f32::NAN,
+        };
+        assert_eq!(life_description(invalid), "Comfortably keeping company");
     }
 
     #[test]

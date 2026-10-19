@@ -7,6 +7,9 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
+#[path = "organism_animation.rs"]
+mod animation;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
     BuildOrTest,
@@ -1608,16 +1611,16 @@ impl RenderContext {
 }
 
 /// Pick the live-body sprite for this animation frame, on the same
-/// half-second beat the sticky header uses; rare flourishes (tail flick,
-/// yawn) sit on their own longer cadences. Output-activity pulses advance
-/// `frame` faster, so a busy command visibly quickens the tail.
+/// half-second beat the sticky header uses. The full body adds short, weighted
+/// micro-actions between longer resting poses; frame zero remains canonical
+/// for Calm/Static hosts. Sampling never advances life or an event timer.
 pub fn sprite_frame(
     behavior: Behavior,
     language: BodyLanguage,
     walking: bool,
     frame: u64,
 ) -> &'static str {
-    base_sprite_frame(behavior, language, walking, WatchRhythm::Steady, frame / 5)
+    live_sprite_frame(RenderContext::new(behavior, language, walking), frame)
 }
 
 /// Render all composable appearance inputs. The returned `Cow` stays borrowed
@@ -1627,7 +1630,14 @@ pub fn sprite_frame_with_context(context: RenderContext, frame: u64) -> Cow<'sta
     let sprite = if let Some(transition) = context.transition {
         transition.sprite_frame(frame)
     } else {
-        let cadence = render_cadence(context);
+        live_sprite_frame(context, frame)
+    };
+    apply_sprite_growth(sprite, context.growth_stage)
+}
+
+fn live_sprite_frame(context: RenderContext, frame: u64) -> &'static str {
+    let cadence = render_cadence(context);
+    animation::sprite(context, frame, cadence).unwrap_or_else(|| {
         base_sprite_frame(
             context.behavior,
             context.body_language,
@@ -1635,8 +1645,7 @@ pub fn sprite_frame_with_context(context: RenderContext, frame: u64) -> Cow<'sta
             context.watch_rhythm,
             frame / cadence,
         )
-    };
-    apply_sprite_growth(sprite, context.growth_stage)
+    })
 }
 
 fn render_cadence(context: RenderContext) -> u64 {
@@ -1714,15 +1723,20 @@ fn base_sprite_frame(
 }
 
 fn apply_sprite_growth(sprite: &'static str, growth_stage: VisualGrowthStage) -> Cow<'static, str> {
+    if growth_stage == VisualGrowthStage::Adult {
+        return Cow::Borrowed(sprite);
+    }
+    // All growth substitutions are equal-width ASCII. Copy the frame once,
+    // then edit its bytes in place: chained String::replace used to allocate
+    // up to eleven temporary strings for every juvenile animation sample.
+    let mut evolved = sprite.as_bytes().to_vec();
     match growth_stage {
-        VisualGrowthStage::Adult => Cow::Borrowed(sprite),
         VisualGrowthStage::Juvenile => {
             // Rounded ears, larger open eyes, and a short tail. Replacements
             // are ASCII and exactly width-preserving.
-            let mut evolved = sprite
-                .replace("/\\_/\\", "(\\_/)")
-                .replace("=\\_/=", "(\\_/)");
             for (from, to) in [
+                ("/\\_/\\", "(\\_/)"),
+                ("=\\_/=", "(\\_/)"),
                 (" o.o ", " O.O "),
                 (" o_o ", " O_O "),
                 (" -.o ", " -.O "),
@@ -1732,19 +1746,35 @@ fn apply_sprite_growth(sprite: &'static str, growth_stage: VisualGrowthStage) ->
                 (" >o< ", " >O< "),
                 (">~^ <", "> ^ <"),
             ] {
-                evolved = evolved.replace(from, to);
+                replace_ascii_in_place(&mut evolved, from.as_bytes(), to.as_bytes());
             }
-            Cow::Owned(evolved)
         }
         VisualGrowthStage::Seasoned => {
             // The right ear has a small notch and neutral open eyes settle to
             // a half-lidded gaze. Its animation cadence is slowed separately.
-            let evolved = sprite
-                .replace("/\\_/\\", "/\\_/|")
-                .replace("=\\_/=", "=\\_/|")
-                .replace(" o.o ", " -.o ")
-                .replace(" O.O ", " -.O ");
-            Cow::Owned(evolved)
+            for (from, to) in [
+                ("/\\_/\\", "/\\_/|"),
+                ("=\\_/=", "=\\_/|"),
+                (" o.o ", " -.o "),
+                (" O.O ", " -.O "),
+            ] {
+                replace_ascii_in_place(&mut evolved, from.as_bytes(), to.as_bytes());
+            }
+        }
+        VisualGrowthStage::Adult => unreachable!("adult frame returned borrowed above"),
+    }
+    Cow::Owned(String::from_utf8(evolved).expect("growth frames are fixed ASCII"))
+}
+
+fn replace_ascii_in_place(bytes: &mut [u8], from: &[u8], to: &[u8]) {
+    debug_assert!(!from.is_empty() && from.len() == to.len());
+    let mut at = 0;
+    while at + from.len() <= bytes.len() {
+        if &bytes[at..at + from.len()] == from {
+            bytes[at..at + to.len()].copy_from_slice(to);
+            at += from.len();
+        } else {
+            at += 1;
         }
     }
 }
