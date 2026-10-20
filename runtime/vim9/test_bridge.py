@@ -32,7 +32,9 @@ VIM = os.environ.get("VIM9_TEST_VIM") or shutil.which("vim")
 
 
 class Editor:
-    def __init__(self, root: Path, *, authenticate: bool = True, plugin: bool = False, failing_rg: bool = False):
+    def __init__(self, root: Path, *, authenticate: bool = True, plugin: bool = False,
+                 failing_rg: bool = False, rg_script: str | None = None,
+                 extra_env: dict[str, str] | None = None):
         self.root = root
         self.file = root / "main.txt"
         self.file.write_text("original line\nsecond line\n", encoding="utf-8")
@@ -67,11 +69,14 @@ class Editor:
             JTERM_VIM9_TOKEN=self.token,
             JTERM_VIM9_ROOT=str(root),
         )
-        if failing_rg:
+        if extra_env:
+            env.update(extra_env)
+        if failing_rg or rg_script is not None:
             test_tools = root / "test-tools"
             test_tools.mkdir()
             fake_rg = test_tools / "rg"
-            fake_rg.write_text("#!/bin/sh\nprintf 'test search process failure\\n' >&2\nexit 2\n")
+            fake_rg.write_text(rg_script if rg_script is not None else
+                               "#!/bin/sh\nprintf 'test search process failure\\n' >&2\nexit 2\n")
             fake_rg.chmod(0o700)
             env["PATH"] = str(test_tools) + os.pathsep + env.get("PATH", "")
         self.master, slave = pty.openpty()
@@ -414,6 +419,60 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(state["buffers"]), 1)
         self.assertIsNone(e.process.poll(), "Closing the last buffer must keep Vim alive")
 
+    def test_native_navigation_shares_vims_jumplist_and_exact_positions(self):
+        e = self.editor()
+        e.ex("clearjumps")
+        self.assertEqual(e.snapshot()["navigation"], {"can_go_back": False, "can_go_forward": False})
+        e.request("navigate_back", ok=False)
+        e.request("navigate_forward", ok=False)
+        e.request("goto", line=2, column=5)
+        self.assertTrue(e.snapshot()["navigation"]["can_go_back"])
+        e.request("navigate_back")
+        state = e.snapshot()
+        self.assertEqual((state["line"], state["column"]), (1, 1))
+        self.assertTrue(state["navigation"]["can_go_forward"])
+        e.request("navigate_forward")
+        state = e.snapshot()
+        self.assertEqual((state["line"], state["column"]), (2, 5))
+        # Result clicks in an already-open file must add their origin, too.
+        e.request("open", path=str(e.file), line=1, column=3)
+        e.request("navigate_back")
+        state = e.snapshot()
+        self.assertEqual((state["line"], state["column"]), (2, 5))
+        e.request("open", path=str(e.other), line=1, column=4)
+        e.request("navigate_back")
+        state = e.snapshot()
+        self.assertEqual((state["file"], state["line"], state["column"]), (str(e.file), 2, 5))
+        # A physical Vim Ctrl-I consumes the same forward history as the GUI.
+        e.keys(b"\x09")
+        e.state_where(lambda s: s["file"] == str(e.other) and s["column"] == 4)
+        e.keys(b"\x0f")
+        e.state_where(lambda s: s["file"] == str(e.file) and s["column"] == 5)
+        e.request("navigate_forward")
+        self.assertEqual(e.snapshot()["file"], str(e.other))
+
+    def test_navigation_obeys_window_history_and_unsaved_buffer_checks(self):
+        e = self.editor()
+        e.ex("clearjumps")
+        e.request("goto", line=2, column=5)
+        e.request("split", vertical=True)
+        e.ex("clearjumps")
+        self.assertFalse(e.snapshot()["navigation"]["can_go_back"])
+        e.ex("wincmd p")
+        self.assertTrue(e.snapshot()["navigation"]["can_go_back"])
+        e.ex("only")
+        e.request("open", path=str(e.other))
+        e.keys(b"iKEEP \x1b")
+        e.state_where(lambda s: s["modified"] and s["mode"] == "n")
+        e.request("navigate_back", ok=False)
+        state = e.snapshot()
+        self.assertEqual(state["file"], str(e.other))
+        self.assertTrue(state["modified"])
+        e.request("save")
+        self.assertTrue(e.other.read_text().startswith("KEEP "))
+        e.request("navigate_back")
+        self.assertEqual(e.snapshot()["file"], str(e.file))
+
     def test_save_and_build_uses_saved_contents_and_write_errors_prevent_launch(self):
         e = self.editor()
         e.keys(b"inew source \x1b")
@@ -450,6 +509,7 @@ class BridgeTests(unittest.TestCase):
             ("goto", {"line": 2}), ("split", {"vertical": True}),
             ("close_buffer", {"buffer": current_id}), ("next_buffer", {}),
             ("save_and_build", {"command": "touch SHOULD_NOT_BUILD"}),
+            ("navigate_back", {}), ("navigate_forward", {}),
         ]:
             e.request(action, ok=False, **params)
         e.keys("w")
@@ -589,6 +649,104 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("test search process failure", failure["error"])
         state = e.state_where(lambda s: not s["search"]["running"] and s["search"]["exit_code"] == 2)
         self.assertEqual(state["search"]["count"], 0)
+
+    @unittest.skipUnless(shutil.which("rg"), "Install ripgrep for project search integration")
+    def test_search_options_case_word_regex_and_literal_file_glob(self):
+        e = self.editor()
+        target = self.root / "search target.rs"
+        target.write_text("Needle\nneedle\nneedlework\nneedle_2\nfoo.42\nfooX42\n", encoding="utf-8")
+        (self.root / "other-source.txt").write_text("needle\n", encoding="utf-8")
+        base = {"case": "smart", "regex": False, "whole_word": False, "glob": "*.rs"}
+        for query, changes, expected in [
+            ("needle", {}, 4), ("needle", {"case": "sensitive"}, 3),
+            ("NEEDLE", {"case": "ignore"}, 4), ("Needle", {}, 1),
+            ("needle", {"whole_word": True}, 2),
+            ("foo.42", {}, 1), ("foo.42", {"regex": True}, 2),
+            ("needle", {"glob": "search target.rs"}, 4),
+        ]:
+            with self.subTest(query=query, changes=changes):
+                options = base | changes
+                e.request("search_with_options", query=query, options=options)
+                state = e.state_where(lambda s: s["search"]["query"] == query
+                                      and s["search"]["options"] == options and not s["search"]["running"])
+                self.assertEqual(state["search"]["count"], expected)
+                self.assertEqual(state["quickfix"]["source"], "search")
+                self.assertEqual(state["quickfix"]["count"], expected)
+                self.assertTrue(all(d["filename"] == str(target) for d in state["diagnostics"]))
+        # Glob shell characters remain one literal argument.
+        malicious = "*.rs;$(touch GLOB_PWNED)"
+        e.request("search_with_options", query="needle", options=base | {"glob": malicious})
+        e.state_where(lambda s: s["search"]["options"]["glob"] == malicious and not s["search"]["running"])
+        self.assertFalse((self.root / "GLOB_PWNED").exists())
+
+    @unittest.skipUnless(shutil.which("rg"), "Install ripgrep for project search integration")
+    def test_search_errors_keep_quickfix_source_and_its_omission_count(self):
+        e = self.editor()
+        (self.root / "many.txt").write_text("bounded-result\n" * 300)
+        e.request("search", query="bounded-result")
+        state = e.state_where(lambda s: s["search"]["query"] == "bounded-result" and not s["search"]["running"])
+        self.assertEqual(state["diagnostics_omitted"], 44)
+        original = state["quickfix"].copy()
+        e.request("search_with_options", query="[", options={"regex": True})
+        state = e.state_where(lambda s: s["search"]["query"] == "[" and not s["search"]["running"])
+        self.assertEqual(state["search"]["exit_code"], 2)
+        self.assertEqual(state["quickfix"], original)
+        self.assertEqual(state["diagnostics_omitted"], 44)
+        for options in [{"case": "invalid"}, {"regex": "yes"}, {"whole_word": 1},
+                        {"glob": ["*.rs"]}, {"glob": "a\nb"}, []]:
+            e.request("search_with_options", query="valid", options=options, ok=False)
+        self.assertEqual(e.snapshot()["quickfix"], original)
+        e.request("build", command="printf 'main.txt:2:4:build problem\\n'")
+        state = e.state_where(lambda s: s["build"]["exit_code"] == 0 and not s["build"]["running"])
+        self.assertEqual(state["quickfix"]["source"], "build")
+        self.assertEqual(state["quickfix"]["count"], 1)
+        self.assertEqual(state["diagnostics_omitted"], 0)
+        # A user's Vim list remains explicitly identified as ordinary quickfix.
+        e.ex("call setqflist([], ' ', {'title': 'User list', 'items': []})")
+        self.assertEqual(e.snapshot()["quickfix"]["source"], "quickfix")
+
+    def test_cancel_search_preserves_results_and_discards_late_callbacks(self):
+        # Make job cancellation and replacement deterministic without a huge
+        # filesystem scan. These real subprocesses still use Vim's job API.
+        script = (
+            "#!/usr/bin/python3\nimport json, signal, sys, time\n"
+            "query = sys.argv[-2]\n"
+            "if query == 'slow':\n"
+            "    signal.signal(signal.SIGTERM, lambda *_: None)\n"
+            "    time.sleep(0.5)\n"
+            "print(json.dumps({'type': 'match', 'data': {'path': {'text': 'main.txt'}, "
+            "'line_number': 1, 'lines': {'text': query}, 'submatches': [{'start': 0}]}}), flush=True)\n"
+        )
+        e = self.editor(rg_script=script)
+        e.request("search", query="kept")
+        state = e.state_where(lambda s: s["search"]["query"] == "kept" and not s["search"]["running"])
+        original = state["quickfix"].copy()
+        e.request("search", query="slow")
+        e.state_where(lambda s: s["search"]["query"] == "slow" and s["search"]["running"])
+        e.request("cancel_search")
+        state = e.snapshot()
+        self.assertFalse(state["search"]["running"])
+        self.assertTrue(state["search"]["cancelled"])
+        self.assertEqual(state["quickfix"], original)
+        e.request("search", query="new")
+        e.state_where(lambda s: s["search"]["query"] == "new" and not s["search"]["running"])
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            e.pump(0.05)
+        state = e.snapshot()
+        self.assertFalse(state["search"]["cancelled"])
+        self.assertEqual(state["quickfix"]["title"], "Search: new")
+        self.assertEqual([d["text"] for d in state["diagnostics"]], ["new"])
+
+    @unittest.skipUnless(shutil.which("rg"), "Install ripgrep for project search integration")
+    def test_search_explicit_options_ignore_rg_global_configuration(self):
+        config = self.root / "ripgrep-config"
+        config.write_text("--glob=!*.rs\n--case-sensitive\n")
+        e = self.editor(extra_env={"RIPGREP_CONFIG_PATH": str(config)})
+        (self.root / "source.rs").write_text("Needle\n")
+        e.request("search_with_options", query="needle", options={"glob": "*.rs", "case": "ignore"})
+        state = e.state_where(lambda s: s["search"]["query"] == "needle" and not s["search"]["running"])
+        self.assertEqual(state["search"]["count"], 1)
 
     def test_provider_capabilities_and_actual_vim_commands(self):
         e = self.editor(plugin=True)

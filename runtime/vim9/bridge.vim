@@ -58,6 +58,8 @@ var searchExit = 0
 var searchRows: list<dict<any>> = []
 var searchDropped = 0
 var searchErrors: list<string> = []
+var searchCancelled = false
+var searchOptions: dict<any> = {case: 'smart', regex: false, whole_word: false, glob: ''}
 var deferredSave: dict<any> = {}
 var deferredSaveTimer = -1
 var deferredSaveBuffer = 0
@@ -79,9 +81,11 @@ enddef
 def Capabilities(): list<string>
   var result = ['open', 'save', 'save_all', 'buffer', 'build', 'cancel_build',
     'goto', 'close_buffer', 'close_current_buffer', 'next_buffer', 'previous_buffer', 'split', 'save_and_build',
+    'navigate_back', 'navigate_forward', 'cancel_search',
     'snapshot', 'next_diagnostic', 'previous_diagnostic', 'quit']
   if executable('rg')
     add(result, 'search')
+    add(result, 'search_with_options')
   endif
   if exists(':LspGotoDefinition') == 2 || !empty(tagfiles()) || !empty(&tagfunc)
     add(result, 'definition')
@@ -199,6 +203,25 @@ def Diagnostics(): dict<any>
   return diagnosticsCache
 enddef
 
+def Navigation(): dict<bool>
+  # Vim owns this bounded, per-window history, including plugin and keyboard
+  # jumps. The native controls never maintain a second stale cursor stack.
+  var [jumps, current] = getjumplist()
+  var back = false
+  var forward = false
+  for index in range(len(jumps))
+    var entry: dict<any> = jumps[index]
+    if get(entry, 'lnum', 0) <= 0
+        || (get(entry, 'bufnr', 0) == bufnr() && entry.lnum == line('.')
+          && get(entry, 'col', 0) == col('.') - 1)
+      continue
+    endif
+    back = back || index < current
+    forward = forward || index > current
+  endfor
+  return {can_go_back: back, can_go_forward: forward}
+enddef
+
 def State(): dict<any>
   var infos = getbufinfo({buflisted: 1})
   var buffers: list<dict<any>> = []
@@ -212,9 +235,21 @@ def State(): dict<any>
       current: info.bufnr == bufnr()})
   endfor
   var diagnostics = Diagnostics()
-  var context: any = get(getqflist({context: 0}), 'context', {})
-  var searchOmitted = type(context) == v:t_dict && get(context, 'source', '') ==# 'search'
-    ? searchDropped : 0
+  var quickfix = getqflist({context: 0, title: 0, idx: 0, size: 0})
+  var context: any = get(quickfix, 'context', {})
+  var source = 'quickfix'
+  var searchOmitted = 0
+  var owned: any = type(context) == v:t_dict ? get(context, 'jterm_vim9', false) : false
+  if type(owned) == v:t_bool && owned
+    var origin: any = get(context, 'source', '')
+    if type(origin) == v:t_string && index(['search', 'build'], origin) >= 0
+      source = origin
+    endif
+    var omitted: any = get(context, 'omitted', 0)
+    if source ==# 'search' && type(omitted) == v:t_number
+      searchOmitted = max([0, omitted])
+    endif
+  endif
   var state: dict<any> = {event: 'state', mode: mode(1), file: expand('%:p'),
     root: projectRoot, cwd: getcwd(), line: line('.'), column: col('.'),
     line_count: line('$'), window_count: winnr('$'), waiting_for_input: !empty(deferredSave),
@@ -225,12 +260,16 @@ def State(): dict<any>
     diagnostics: copy(diagnostics.items),
     diagnostics_truncated: diagnostics.total > len(diagnostics.items) || searchOmitted > 0,
     diagnostics_omitted: diagnostics.total - len(diagnostics.items) + searchOmitted,
+    navigation: Navigation(),
+    quickfix: {source: source, title: strcharpart(get(quickfix, 'title', ''), 0, 2048),
+      index: get(quickfix, 'idx', 0), count: get(quickfix, 'size', 0)},
     capabilities: Capabilities(),
     build: {running: buildRunning, command: buildCommand, exit_code: buildExit,
       cancelled: buildCancelled, output: copy(buildTail),
       truncated: len(buildLines) + buildDropped - len(buildTail)},
     search: {running: searchRunning, query: searchQuery, count: len(searchRows),
-      truncated: searchDropped, exit_code: searchExit, errors: searchErrors}}
+      truncated: searchDropped, exit_code: searchExit, errors: searchErrors,
+      options: searchOptions, cancelled: searchCancelled}}
   # Leave headroom inside the host's 1 MiB framing limit even for pathological
   # path names or error messages that require substantial JSON escaping.
   while strlen(json_encode(state)) > 900000
@@ -361,7 +400,7 @@ enddef
 
 def DeferSaveIfNeeded(request: dict<any>, id: number): bool
   var action = RequiredString(request, 'action', 64)
-  if !empty(deferredSave) && index(['snapshot', 'cancel_build'], action) < 0
+  if !empty(deferredSave) && index(['snapshot', 'cancel_build', 'cancel_search'], action) < 0
     throw 'A save is waiting for Vim to finish input; wait for it before another IDE action'
   endif
   if index(['save', 'save_all', 'save_and_build'], action) < 0
@@ -413,9 +452,16 @@ def FinishBuild(generation: number)
   buildRunning = false
   # Seed Vim's errorformat directory stack so paths emitted by the build stay
   # relative to its cwd even if the user changed Vim's cwd while it was running.
-  setqflist([], ' ', {title: 'Build: ' .. buildCommand,
-    lines: ['JTERM_DIRECTORY ' .. projectRoot] + buildLines,
-    efm: '%DJTERM_DIRECTORY %f,' .. buildErrorFormat,
+  var directoryLine = 'JTERM_DIRECTORY ' .. projectRoot
+  var parsed = getqflist({lines: [directoryLine] + buildLines,
+    efm: '%DJTERM_DIRECTORY %f,' .. buildErrorFormat}).items
+  # Vim retains directory markers as invalid quickfix rows even with %-D.
+  # Remove only our seed after parsing; preserve the user's remaining output.
+  if !empty(parsed) && !get(parsed[0], 'valid', 0)
+      && get(parsed[0], 'text', '') ==# directoryLine
+    remove(parsed, 0)
+  endif
+  setqflist([], ' ', {title: 'Build: ' .. buildCommand, items: parsed,
     context: {jterm_vim9: true, source: 'build'}})
   Changed()
 enddef
@@ -503,9 +549,9 @@ def FinishSearch(generation: number)
     return
   endif
   searchRunning = false
-  if searchExit <= 1
+  if searchExit >= 0 && searchExit <= 1
     setqflist([], ' ', {title: 'Search: ' .. searchQuery, items: searchRows,
-      context: {jterm_vim9: true, source: 'search'}})
+      context: {jterm_vim9: true, source: 'search', omitted: searchDropped}})
   else
     Send({event: 'error', error: 'Project search failed (exit ' .. searchExit .. '): '
       .. (empty(searchErrors) ? 'ripgrep returned an error' : join(searchErrors, ' '))})
@@ -568,8 +614,43 @@ def SearchExited(generation: number, _: job, status: number)
   endif
 enddef
 
+def SearchOptions(request: dict<any>): dict<any>
+  var options: any = get(request, 'options', {})
+  if type(options) != v:t_dict
+    throw 'Project search options must be an object'
+  endif
+  var caseMode: any = get(options, 'case', 'smart')
+  var regex: any = get(options, 'regex', false)
+  var wholeWord: any = get(options, 'whole_word', false)
+  var glob: any = get(options, 'glob', '')
+  if type(caseMode) != v:t_string || index(['smart', 'sensitive', 'ignore'], caseMode) < 0
+    throw 'Project search case must be smart, sensitive or ignore'
+  endif
+  if type(regex) != v:t_bool || type(wholeWord) != v:t_bool
+    throw 'Project search regex and whole_word options must be Boolean'
+  endif
+  if type(glob) != v:t_string || strlen(glob) > 4096 || glob =~# '[\r\n]'
+    throw 'Project search expects a single-line file glob of at most 4096 bytes'
+  endif
+  return {case: caseMode, regex: regex, whole_word: wholeWord, glob: glob}
+enddef
+
+def CancelSearch()
+  if searchRunning
+    # Invalidate callbacks before stopping the process. Neither a late success
+    # nor partially collected rows can replace the previously visible list.
+    searchGeneration += 1
+    searchCancelled = true
+    searchRunning = false
+    searchExit = 130
+    job_stop(searchJob)
+    Changed()
+  endif
+enddef
+
 def StartSearch(request: dict<any>)
   var query = RequiredString(request, 'query', 4096)
+  var options = SearchOptions(request)
   if !executable('rg')
     throw 'Project search requires ripgrep (rg) on PATH'
   endif
@@ -585,15 +666,29 @@ def StartSearch(request: dict<any>)
   searchRoot = projectRoot
   searchRows = []
   searchErrors = []
+  searchOptions = options
+  searchCancelled = false
   searchDropped = 0
   searchExit = 0
   searchClosed = false
   searchExited = false
   searchRunning = true
-  # A literal query and argv boundaries protect leading '-', quotes, spaces
-  # and shell syntax.  rg still honors the project's ignore files.
-  searchJob = job_start(['rg', '--json', '--line-number', '--column', '--color', 'never',
-    '--fixed-strings', '--smart-case', '--hidden', '--glob', '!.git', '--', query, '.'],
+  # Every option and query has its own argv boundary. A user ripgrep config
+  # must not change the selected semantics, output framing or spawn a pre-tool.
+  # Project ignore files still apply, with .git always excluded.
+  var args = ['rg', '--no-config', '--json', '--line-number', '--column', '--color', 'never', '--hidden']
+  if !options.regex
+    add(args, '--fixed-strings')
+  endif
+  add(args, get({smart: '--smart-case', sensitive: '--case-sensitive', ignore: '--ignore-case'}, options.case))
+  if options.whole_word
+    add(args, '--word-regexp')
+  endif
+  if !empty(options.glob)
+    extend(args, ['--glob', options.glob])
+  endif
+  extend(args, ['--glob', '!.git', '--', query, '.'])
+  searchJob = job_start(args,
     {cwd: searchRoot, in_io: 'null', out_mode: 'nl', err_mode: 'nl', noblock: true,
       out_cb: (ch: channel, msg: string) => SearchOutput(generation, ch, msg),
       err_cb: (ch: channel, msg: string) => SearchError(generation, ch, msg),
@@ -645,8 +740,10 @@ def Dispatch(request: dict<any>, id: number)
       buildCancelled = true
       job_stop(buildJob)
     endif
-  elseif action ==# 'search'
+  elseif action ==# 'search' || action ==# 'search_with_options'
     StartSearch(request)
+  elseif action ==# 'cancel_search'
+    CancelSearch()
   else
     SafeToChange()
     if action ==# 'open'
@@ -669,6 +766,12 @@ def Dispatch(request: dict<any>, id: number)
           break
         endif
       endfor
+      # :buffer records cross-file jumps itself. An explicit location in the
+      # already-current file also needs its origin on Vim's own jumplist.
+      if existing == bufnr() && hasPosition
+          && ((lineNumber > 0 && lineNumber != line('.')) || column != col('.'))
+        normal! m'
+      endif
       if existing > 0
         var previous = bufnr()
         execute 'buffer ' .. existing
@@ -696,7 +799,19 @@ def Dispatch(request: dict<any>, id: number)
       var column = PositiveNumber(request, 'column')
       # Keep this in the current buffer, including unnamed/modified buffers.
       # Vim clamps out-of-range positions and keeps its byte-column convention.
-      cursor(lineNumber, column)
+      if lineNumber != line('.') || column != col('.')
+        normal! m'
+        cursor(lineNumber, column)
+      endif
+    elseif action ==# 'navigate_back' || action ==# 'navigate_forward'
+      var navigation = Navigation()
+      var backward = action ==# 'navigate_back'
+      if !(backward ? navigation.can_go_back : navigation.can_go_forward)
+        throw backward ? 'No earlier position in this Vim window' : 'No later position in this Vim window'
+      endif
+      # Ctrl-I is a tab byte, which :normal trims as leading whitespace.
+      # An explicit count preserves it as a command rather than an empty Ex.
+      execute backward ? "normal! 1\<C-O>" : "normal! 1\<C-I>"
     elseif action ==# 'next_buffer' || action ==# 'previous_buffer'
       var previous = bufnr()
       if action ==# 'next_buffer'

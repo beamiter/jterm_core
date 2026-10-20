@@ -63,6 +63,7 @@ not in a normal terminal tab or a native text field):
 | `F8` / `Shift+F8` | Next / previous quickfix problem |
 | `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` | Previous / next buffer |
 | `Ctrl+Shift+W` | Close the current buffer, refusing unsaved changes |
+| `Alt+Left` / `Alt+Right` | Back / forward through the current Vim window's jump history |
 
 Quick Open uses an asynchronous `rg --files` index shared by all frontends.
 It includes hidden files, respects `.gitignore` and `.ignore`, excludes `.git`,
@@ -82,6 +83,14 @@ buffer. Keyboard close resolves the current buffer inside Vim after earlier
 navigation commands; a buffer tab's close button targets that specific tab.
 Ordinary `Ctrl+P`, `Ctrl+G`, `Ctrl+O` and `Ctrl+W` remain Vim keys.
 
+The native Back and Forward controls share Vim's real per-window jumplist
+with `Ctrl+O` / `Ctrl+I`, including file, definition and quickfix jumps. Native
+Go to line and result clicks inside the current file record their origin as
+well. Buttons reflect whether earlier/later positions are available; a split
+has its own Vim history. Navigation uses ordinary modified-buffer checks and
+refuses a pending operator or command line. Alt-arrow shortcuts only apply
+while the editor owns input; native search and path fields retain their keys.
+
 If Save arrives while Vim is decoding an Escape or mapping prefix, the bridge
 waits for Vim's `SafeState` event for up to two seconds and shows a waiting
 status. It preserves the input already typed and never inserts Escape on the
@@ -90,10 +99,33 @@ The queued save stays bound to its original buffer; changing that buffer or
 exceeding the timeout produces an error and requires another explicit save.
 Other native editing actions cannot overtake a waiting save.
 
-Project search uses `rg` for literal text matches and populates quickfix results.
-Install ripgrep for this action. Search text is passed as an argv argument
-rather than shell code; ripgrep's normal ignore rules apply. The workbench
-shows search progress, errors, the retained result count and omitted matches.
+Project search uses `rg` and populates quickfix results. Its defaults remain
+literal text and Smart case: lowercase queries ignore case, while a query
+containing uppercase matches case. The native search options offer:
+
+| Option | Meaning |
+| --- | --- |
+| Smart / Match / Ignore case | Choose automatic, case-sensitive or case-insensitive matching |
+| Regex | Interpret the query using ripgrep's regular-expression syntax |
+| Whole word | Require word boundaries around a match |
+| File glob | One optional glob, such as `*.rs`, `src/**` or `!*.lock` |
+| Stop search | Cancel the running search and keep the previous result list |
+
+A glob is one value; spaces and commas are preserved, and shell expansion is
+not performed. Changing options does not start a job until Search is invoked.
+Queries and globs must be single-line strings of at most 4096 UTF-8 bytes.
+The workbench shows the options used by the last job, its progress, errors,
+retained matching-line count and omitted matching lines. Install ripgrep for
+this action. Query and glob values are passed as argv arguments; project ignore
+files apply and `.git` remains excluded. `RIPGREP_CONFIG_PATH` is disabled for
+these managed searches so a global rg configuration cannot override the
+selected options or change the result format.
+
+A cancelled search retains the previous quickfix list. Its late subprocess
+callbacks cannot publish partial results or overwrite a later search. An
+invalid regular expression is shown as a search error and also retains the
+previous list; a successful search with zero matches clears it.
+
 Build runs the command explicitly entered in the workbench asynchronously using
 Vim's shell configuration and parses output with Vim's `errorformat`. An empty
 build field uses Vim's `makeprg`. Build never saves buffers implicitly. For
@@ -110,7 +142,13 @@ buffer reports an error; this is Vim's ordinary save-all behavior. The plain
 Build action continues to leave in-memory edits unsaved.
 
 Quickfix is the common problem/result surface: a later build or search replaces
-the current list according to the runtime workflow. At most 256 buffers and
+the current list according to the runtime workflow. The native panel identifies
+the current quickfix list's source, title and position separately from the last
+search status. Its diagnostics can additionally include Vim location-list and
+LSP entries. Each search list owns its omitted count, so starting, failing or
+cancelling a different search does not change the retained list's count.
+Build directory metadata is removed after parsing, without appearing as a
+spurious quickfix item. At most 256 buffers and
 256 diagnostic entries are sent to native controls. Project search retains
 at most 256 matches in quickfix and reports omissions. Build captures at most
 10,000 output lines for quickfix parsing and independently keeps the latest
@@ -190,7 +228,11 @@ filename, edit, refuse an unsaved quit, save, parse a failed build, jump,
 cycle buffers, split, save-and-build, close a buffer and quit.
 The Python suite also exercises immediate Escape/save sequencing, bounded
 deferred-save expiry without replay, and consecutive navigation/current-close
-requests without a native snapshot barrier.
+requests without a native snapshot barrier. Its navigation/search regressions
+exercise native and keyboard jumplist interoperability, per-window history,
+unsaved-buffer refusal, every case mode, regex, whole words, literal globs,
+global-rg-config isolation, cancellation with late output, invalid regexes and
+the identity/omission counts of retained quickfix lists.
 Run it with `VIM9_TEST_VIM=/absolute/path/to/vim cargo test --lib
 vim9::tests::real_vim9_round_trip -- --ignored` in an environment with a PTY
 and loopback sockets. See the runtime README for the Python suite's Vim

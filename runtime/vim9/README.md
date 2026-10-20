@@ -79,6 +79,7 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | `buffer` | Positive integer `buffer` | Select an existing buffer id |
 | `goto` | Positive integer `line`; optional `column` | Move in the current buffer, including unnamed/modified buffers; one-based byte column |
 | `next_buffer` / `previous_buffer` | None | Cycle listed buffers with native modified-buffer checks and remembered views |
+| `navigate_back` / `navigate_forward` | None | Traverse the current Vim window's real jumplist, sharing history with `Ctrl+O` / `Ctrl+I` |
 | `close_buffer` | Positive integer `buffer` | Unlist a saved buffer with `:bdelete`; always refuse modified buffers, including hidden ones |
 | `close_current_buffer` | None | Resolve the current buffer inside Vim after earlier commands, then apply the same protected close |
 | `split` | Boolean `vertical` | Native `:vsplit` or `:split` of the current buffer |
@@ -87,7 +88,9 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | `build` | Optional/empty `command` | Start an async shell job; an empty command uses expanded `makeprg` |
 | `save_and_build` | Optional/empty `command` | Validate the command, `:wall`, and start a build only after successful writes and no remaining modified buffers |
 | `cancel_build` | None | Request termination of the running build job |
-| `search` | Nonempty, single-line `query` | Async literal project search using `rg` |
+| `search` | Nonempty, single-line `query` | Async literal project search using `rg`, with Smart case by default |
+| `search_with_options` | `query`; `options` object | Async search with `case` (`smart`, `sensitive`, `ignore`), Boolean `regex`/`whole_word`, and one optional string `glob` |
+| `cancel_search` | None | Cancel the current search; retain the preceding quickfix list and invalidate late callbacks |
 | `definition` | None | `:LspGotoDefinition`, or native tags/tagfunc |
 | `hover` | None | `:LspHover` |
 | `references` | None | `:LspShowReferences` |
@@ -108,7 +111,11 @@ GUI file/buffer navigation remembers and restores each buffer's native
 `winsaveview()` cursor and scroll position. New-file `BufRead`/`BufEnter` hooks
 retain their own positioning unless coordinates were explicitly requested.
 Ordinary Vim commands continue to follow the user's settings, including
-`startofline`. No action forces away modified data. Actions that change editor
+`startofline`. Native `goto` and explicitly positioned `open` in the current
+file add their origin with Vim's `m'` command; file changes already record a
+jump through Vim's buffer commands. Back/forward use unmapped normal commands
+on that same window's jumplist. An explicit count before Ctrl-I prevents Ex
+from trimming its Tab byte as whitespace. No action forces away modified data. Actions that change editor
 state refuse a pending operator, command-line prompt, mapping or completion;
 they never synthesize Escape to clear what the user is entering. A narrow
 exception handles `save`, `save_all` and `save_and_build` arriving during
@@ -117,7 +124,7 @@ runtime queues one save until `SafeState` or `SafeStateAgain`, with a two-second
 deadline and the originating current buffer recorded. Pending operators,
 counts/finds, command lines and completion are rejected immediately. Other
 native actions are rejected while a save waits, except state requests and
-build cancellation. A changed current buffer, timeout or disconnect clears
+build/search cancellation. A changed current buffer, timeout or disconnect clears
 the queued save; it is never replayed later. Build validation occurs before
 queuing a save-and-build and again before its writes execute.
 
@@ -128,7 +135,14 @@ current Vim `cwd`, `line`, byte `column`, Boolean `modified`, `changedtick`,
 `filetype`, effective `encoding`, `line_count`, current-tab `window_count`,
 Boolean `waiting_for_input` for a deferred save,
 `capabilities`, `buffers`, `diagnostics`, `build` and
-`search`. Additional fields are forward-compatible.
+`search`, `navigation` and `quickfix`. Additional fields are forward-compatible.
+
+`navigation` contains Boolean `can_go_back` and `can_go_forward` from the
+current window's bounded native jumplist. `quickfix` contains `source`
+(`search`, `build` or `quickfix`), `title`, one-based `index` and `count` of the
+actual current quickfix list. This metadata does not label every item in the
+combined diagnostics, which can additionally include location-list and LSP
+results. A user-created quickfix list has source `quickfix`.
 
 Buffers contain `id`, absolute `name`, Boolean `modified` and Boolean `current`.
 The runtime constructs these fields explicitly; it never serializes complete
@@ -173,15 +187,31 @@ native tail. State also includes `build.running`, `command`, nullable `exit_code
 `cancelled`. Parsing uses Vim's `errorformat` captured at build start. An
 errorformat directory-stack entry anchors relative filenames to the build's
 root even if the user changes Vim's directory while the job is running.
+The injected directory seed is removed from the parsed items before publishing
+the list; it is not a build problem and must not inflate the displayed count.
 
-Search uses an argv list, `--fixed-strings` and a `--` argument boundary. Shell
-characters and leading dashes in a query stay literal. It honors rg ignore
-files, includes hidden files, and excludes `.git`. Results are limited to 256
-matching lines, with omitted counts reflected in state and truncation flags.
-A new search replaces a running one. Successful search, including no matches,
-replaces the current quickfix list. An rg failure publishes a visible error
-and preserves the previous quickfix list. A later build or search can replace
-the previous result list; full underlying Vim buffer data is unaffected.
+Search uses an argv list and a `--` argument boundary. The compatible default
+is `--fixed-strings --smart-case`. Options are strictly validated before an
+existing search is replaced: `regex` omits `--fixed-strings`, `whole_word` adds
+`--word-regexp`, `case` selects an explicit case flag, and `glob` supplies one
+`--glob` argument. Queries and globs are bounded to 4096 UTF-8 bytes and one
+line. No shell interpretation or comma/space splitting occurs. Searches use
+`--no-config` so `RIPGREP_CONFIG_PATH` cannot change the selected behavior or
+JSON framing. They still honor project ignore files, include hidden files,
+and exclude `.git` after any user glob.
+
+Results are limited to 256 matching lines. Their omitted count is stored in
+that quickfix list's context, so a newer failed or cancelled job cannot alter
+the retained list's truncation indicator. Search state includes the actual
+`options` and Boolean `cancelled`, alongside the existing query/count/errors.
+Cancellation publishes exit code 130, stops the running job and invalidates
+its generation before late output or exit callbacks can publish a list. It
+keeps the previous quickfix list; partially collected rows are not published.
+A new search resets cancelled state and replaces a running job. Successful
+search, including no matches, replaces the current quickfix list. An rg error
+(including invalid regex syntax) publishes a visible error and preserves the
+previous list. A later completed build or search can replace that list; full
+underlying Vim buffer data is unaffected.
 
 ## Optional Vim9 language features
 

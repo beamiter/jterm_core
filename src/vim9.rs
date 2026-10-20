@@ -113,6 +113,48 @@ pub struct Vim9Search {
     /// A job that could not be started publishes -1.
     pub exit_code: i32,
     pub errors: Vec<String>,
+    pub options: Vim9SearchOptions,
+    /// Cancellation retains the previous quickfix list, not partial matches.
+    pub cancelled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Vim9SearchCase {
+    /// Ignore case unless the query includes an uppercase character.
+    #[default]
+    Smart,
+    Sensitive,
+    Ignore,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9SearchOptions {
+    pub case: Vim9SearchCase,
+    pub regex: bool,
+    pub whole_word: bool,
+    /// One optional ripgrep glob, passed as a single literal argv value.
+    pub glob: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9Navigation {
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+}
+
+/// Identity of Vim's current quickfix list. The combined diagnostics may also
+/// contain entries from a window location list or language server.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9Quickfix {
+    pub source: String,
+    pub title: String,
+    /// One-based position in the actual quickfix list, zero when it is empty.
+    pub index: usize,
+    pub count: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -136,6 +178,8 @@ pub struct Vim9Snapshot {
     pub diagnostics: Vec<Vim9Diagnostic>,
     pub build: Vim9Build,
     pub search: Vim9Search,
+    pub navigation: Vim9Navigation,
+    pub quickfix: Vim9Quickfix,
     /// Available optional semantic commands; for example `definition`.
     pub capabilities: Vec<String>,
     pub error: Option<String>,
@@ -174,6 +218,9 @@ pub enum Vim9Command {
     CloseCurrentBuffer,
     NextBuffer,
     PreviousBuffer,
+    /// Traverse the current Vim window's native jumplist without mappings.
+    NavigateBack,
+    NavigateForward,
     Split {
         vertical: bool,
     },
@@ -188,6 +235,11 @@ pub enum Vim9Command {
     Search {
         query: String,
     },
+    SearchWithOptions {
+        query: String,
+        options: Vim9SearchOptions,
+    },
+    CancelSearch,
     Definition,
     Hover,
     References,
@@ -222,8 +274,19 @@ impl Vim9Command {
             {
                 return Err(invalid("Enter a positive line and optional byte column"));
             }
-            Self::Search { query } if query.is_empty() => {
-                return Err(invalid("Enter a search query"))
+            Self::Search { query } | Self::SearchWithOptions { query, .. }
+                if query.is_empty() || query.len() > 4096 || query.contains(['\n', '\r', '\0']) =>
+            {
+                return Err(invalid(
+                    "Enter a single-line search query of at most 4096 bytes",
+                ));
+            }
+            Self::SearchWithOptions { options, .. }
+                if options.glob.len() > 4096 || options.glob.contains(['\n', '\r', '\0']) =>
+            {
+                return Err(invalid(
+                    "Enter a single-line file glob of at most 4096 bytes",
+                ));
             }
             Self::Rename { name } if name.is_empty() || name.contains(['\n', '\r', '\0']) => {
                 return Err(invalid("Enter a single-line symbol name"));
@@ -901,6 +964,9 @@ mod tests {
             (Vim9Command::CloseCurrentBuffer, "close_current_buffer"),
             (Vim9Command::NextBuffer, "next_buffer"),
             (Vim9Command::PreviousBuffer, "previous_buffer"),
+            (Vim9Command::NavigateBack, "navigate_back"),
+            (Vim9Command::NavigateForward, "navigate_forward"),
+            (Vim9Command::CancelSearch, "cancel_search"),
             (Vim9Command::Split { vertical: true }, "split"),
             (
                 Vim9Command::SaveAndBuild {
@@ -913,6 +979,85 @@ mod tests {
             assert_eq!(value["action"], action);
             assert_eq!(value["id"], 42);
         }
+    }
+
+    #[test]
+    fn search_options_preserve_literals_and_validate_before_transport() {
+        let options = Vim9SearchOptions {
+            case: Vim9SearchCase::Ignore,
+            regex: true,
+            whole_word: true,
+            glob: "a file*.rs;$(touch NEVER)".into(),
+        };
+        let query = "--Needle|内容";
+        let value: Value = serde_json::from_slice(
+            &Vim9Command::SearchWithOptions {
+                query: query.into(),
+                options: options.clone(),
+            }
+            .frame(8)
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["action"], "search_with_options");
+        assert_eq!(value["query"], query);
+        assert_eq!(value["options"]["glob"], options.glob);
+        assert_eq!(value["options"]["case"], "ignore");
+        assert_eq!(value["options"]["regex"], true);
+        assert_eq!(value["options"]["whole_word"], true);
+        for query in [
+            "".into(),
+            "two\nlines".into(),
+            "zero\0byte".into(),
+            "x".repeat(4097),
+        ] {
+            assert!(Vim9Command::Search {
+                query: query.clone()
+            }
+            .frame(1)
+            .is_err());
+            assert!(Vim9Command::SearchWithOptions {
+                query,
+                options: options.clone()
+            }
+            .frame(1)
+            .is_err());
+        }
+        for glob in ["two\rrows".into(), "zero\0byte".into(), "x".repeat(4097)] {
+            assert!(Vim9Command::SearchWithOptions {
+                query: "valid".into(),
+                options: Vim9SearchOptions {
+                    glob,
+                    ..Vim9SearchOptions::default()
+                },
+            }
+            .frame(1)
+            .is_err());
+        }
+        let defaults: Vim9SearchOptions = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(defaults.case, Vim9SearchCase::Smart);
+        assert!(!defaults.regex && !defaults.whole_word && defaults.glob.is_empty());
+    }
+
+    #[test]
+    fn navigation_and_result_metadata_decode_with_old_snapshot_defaults() {
+        let legacy: Vim9Snapshot = serde_json::from_value(json!({"file":"legacy.txt"})).unwrap();
+        assert!(!legacy.navigation.can_go_back);
+        assert!(!legacy.navigation.can_go_forward);
+        assert_eq!(legacy.search.options.case, Vim9SearchCase::Smart);
+        assert!(!legacy.search.cancelled);
+        let snapshot: Vim9Snapshot = serde_json::from_value(json!({
+            "navigation":{"can_go_back":true,"can_go_forward":false},
+            "quickfix":{"source":"build","title":"Build: cargo check","index":2,"count":4},
+            "search":{"cancelled":true,"options":{"case":"sensitive","regex":true,"whole_word":true,"glob":"*.rs"}}
+        })).unwrap();
+        assert!(snapshot.navigation.can_go_back);
+        assert!(!snapshot.navigation.can_go_forward);
+        assert_eq!(snapshot.quickfix.source, "build");
+        assert_eq!((snapshot.quickfix.index, snapshot.quickfix.count), (2, 4));
+        assert!(snapshot.search.cancelled);
+        assert_eq!(snapshot.search.options.case, Vim9SearchCase::Sensitive);
+        assert!(snapshot.search.options.regex && snapshot.search.options.whole_word);
     }
 
     #[test]
