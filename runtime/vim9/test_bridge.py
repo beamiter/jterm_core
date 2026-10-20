@@ -187,6 +187,14 @@ class Editor:
     def state_where(self, predicate, timeout: float = 6.0):
         return self.wait(lambda m: m.get("event") == "state" and predicate(m), timeout)
 
+    def ex(self, command: str):
+        # Observe the command-line transition before Enter: a complete option
+        # command can finish inside one coalesced tick without changing state.
+        self.keys(":" + command)
+        self.state_where(lambda s: s["mode"].startswith("c"))
+        self.keys("\r")
+        self.state_where(lambda s: s["mode"] == "n")
+
     def close(self):
         if self.process.poll() is None:
             try:
@@ -341,6 +349,190 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(e.other.read_text().startswith("second other"))
         self.assertFalse(any(b["modified"] for b in e.snapshot()["buffers"]))
 
+    def test_native_goto_and_splits_keep_the_actual_modified_buffer(self):
+        e = self.editor()
+        e.keys(b"iunsaved \x1b")
+        e.state_where(lambda s: s["modified"] and s["mode"] == "n")
+        e.request("goto", line=2, column=4)
+        state = e.snapshot()
+        self.assertEqual((state["line"], state["column"], state["line_count"]), (2, 4, 2))
+        self.assertTrue(state["modified"])
+        self.assertEqual(state["encoding"], "utf-8")
+        for params in [{}, {"line": 0}, {"line": "2"}, {"line": 1, "column": 0}]:
+            e.request("goto", ok=False, **params)
+        self.assertEqual(e.snapshot()["line"], 2)
+        e.request("split", vertical=True)
+        self.assertEqual(e.snapshot()["window_count"], 2)
+        e.request("split", vertical=False)
+        state = e.snapshot()
+        self.assertEqual(state["window_count"], 3)
+        self.assertTrue(state["modified"])
+        self.assertEqual(len(state["buffers"]), 1)
+        e.request("split", ok=False, vertical="yes")
+        self.assertEqual(e.snapshot()["window_count"], 3)
+        e.request("save")
+        self.assertTrue(e.file.read_text().startswith("unsaved original"))
+        e.keys(":enew\r")
+        e.state_where(lambda s: s["file"] == "")
+        e.keys(b"iunnamed\rsecond\x1b")
+        e.state_where(lambda s: s["file"] == "" and s["modified"] and s["mode"] == "n")
+        e.request("goto", line=1, column=3)
+        state = e.snapshot()
+        self.assertEqual((state["file"], state["line"], state["column"]), ("", 1, 3))
+        self.assertTrue(state["modified"])
+
+    def test_buffer_cycle_restores_views_and_close_refuses_hidden_dirty_data(self):
+        e = self.editor()
+        e.request("goto", line=2, column=5)
+        original_id = next(b["id"] for b in e.snapshot()["buffers"] if b["current"])
+        e.request("open", path=str(e.other))
+        e.request("previous_buffer")
+        state = e.snapshot()
+        self.assertEqual((state["file"], state["line"], state["column"]), (str(e.file), 2, 5))
+        e.request("next_buffer")
+        self.assertEqual(e.snapshot()["file"], str(e.other))
+        e.request("previous_buffer")
+        e.keys(b"iKEEP \x1b")
+        e.state_where(lambda s: s["modified"] and s["mode"] == "n")
+        e.request("next_buffer", ok=False)
+        self.assertEqual(e.snapshot()["file"], str(e.file))
+        e.ex("set hidden")
+        e.request("next_buffer")
+        refused = e.request("close_buffer", ok=False, buffer=original_id)
+        self.assertIn("Unsaved changes", refused["error"])
+        self.assertTrue(any(b["id"] == original_id and b["modified"] for b in e.snapshot()["buffers"]))
+        e.request("save_all")
+        e.request("close_buffer", buffer=original_id)
+        self.assertNotIn(original_id, [b["id"] for b in e.snapshot()["buffers"]])
+        self.assertIn("KEEP ", e.file.read_text())
+        e.request("close_buffer", ok=False, buffer=original_id)
+        e.request("close_buffer", ok=False, buffer=0)
+        current_id = next(b["id"] for b in e.snapshot()["buffers"] if b["current"])
+        e.request("close_buffer", buffer=current_id)
+        state = e.snapshot()
+        self.assertEqual(state["file"], "")
+        self.assertEqual(len(state["buffers"]), 1)
+        self.assertIsNone(e.process.poll(), "Closing the last buffer must keep Vim alive")
+
+    def test_save_and_build_uses_saved_contents_and_write_errors_prevent_launch(self):
+        e = self.editor()
+        e.keys(b"inew source \x1b")
+        e.state_where(lambda s: s["modified"] and s["mode"] == "n")
+        # Plain Build deliberately continues to see the on-disk version.
+        e.request("build", command="cat main.txt > before.txt")
+        e.state_where(lambda s: not s["build"]["running"] and s["build"]["exit_code"] == 0)
+        self.assertEqual((self.root / "before.txt").read_text(), "original line\nsecond line\n")
+        e.request("save_and_build", command="cat main.txt > after.txt")
+        e.state_where(lambda s: not s["build"]["running"] and s["build"]["command"] == "cat main.txt > after.txt")
+        self.assertTrue((self.root / "after.txt").read_text().startswith("new source original"))
+        self.assertFalse(e.snapshot()["modified"])
+        e.keys(b"ifailed save \x1b")
+        e.state_where(lambda s: s["modified"] and s["mode"] == "n")
+        e.ex("set readonly")
+        e.request("save_and_build", ok=False, command="touch SHOULD_NOT_BUILD")
+        self.assertTrue(e.snapshot()["modified"])
+        self.assertFalse((self.root / "SHOULD_NOT_BUILD").exists())
+        e.ex("set noreadonly")
+        # Validation fails before writing when the command itself is invalid.
+        before = e.file.read_text()
+        e.request("save_and_build", ok=False, command=["invalid"])
+        self.assertEqual(e.file.read_text(), before)
+        e.ex("autocmd BufWritePre * throw 'write hook rejected'")
+        e.request("save_and_build", ok=False, command="touch SHOULD_NOT_BUILD")
+        self.assertFalse((self.root / "SHOULD_NOT_BUILD").exists())
+
+    def test_new_actions_preserve_pending_vim_operator(self):
+        e = self.editor()
+        current_id = e.snapshot()["buffers"][0]["id"]
+        e.keys("d")
+        e.state_where(lambda s: s["mode"].startswith("no"))
+        for action, params in [
+            ("goto", {"line": 2}), ("split", {"vertical": True}),
+            ("close_buffer", {"buffer": current_id}), ("next_buffer", {}),
+            ("save_and_build", {"command": "touch SHOULD_NOT_BUILD"}),
+        ]:
+            e.request(action, ok=False, **params)
+        e.keys("w")
+        e.state_where(lambda s: s["modified"] and s["mode"] == "n")
+        e.request("save")
+        self.assertTrue(e.file.read_text().startswith("line\n"))
+        self.assertFalse((self.root / "SHOULD_NOT_BUILD").exists())
+
+    def test_current_close_follows_runtime_navigation_without_a_snapshot_barrier(self):
+        e = self.editor()
+        first_id = e.snapshot()["buffers"][0]["id"]
+        e.request("open", path=str(e.other))
+        other_id = next(b["id"] for b in e.snapshot()["buffers"] if b["current"])
+        e.request("previous_buffer")
+        # Send both commands together, without allowing a frontend snapshot to
+        # catch up. Closing must target the buffer selected by next_buffer.
+        first_request = e.next_id
+        e.next_id += 2
+        e.connection.sendall((json.dumps({"id": first_request, "action": "next_buffer"}) + "\n"
+            + json.dumps({"id": first_request + 1, "action": "close_current_buffer"}) + "\n").encode())
+        for request_id in [first_request, first_request + 1]:
+            reply = e.wait(lambda m: m.get("event") == "response" and m.get("id") == request_id)
+            self.assertTrue(reply["ok"], reply)
+        state = e.snapshot()
+        self.assertNotIn(other_id, [b["id"] for b in state["buffers"]])
+        self.assertIn(first_id, [b["id"] for b in state["buffers"]])
+        self.assertEqual(state["file"], str(e.file))
+        e.keys(b"iKEEP \x1b")
+        e.state_where(lambda s: s["mode"] == "n" and s["modified"])
+        e.request("close_current_buffer", ok=False)
+        self.assertTrue(e.snapshot()["modified"])
+
+    def prepare_ambiguous_escape(self, e: Editor, timeout_ms: int):
+        e.ex(f"set timeout timeoutlen={timeout_ms} ttimeout ttimeoutlen={timeout_ms}")
+        e.ex("inoremap <Esc>z <Esc>")
+        # Observe Vim's real state through its normal plugin/timer mechanism,
+        # so the regression proves that Save arrives during prefix decoding.
+        e.ex("call timer_start(10, {-> writefile([mode(1), state('moaSw')], 'busy.marker')}, {'repeat': -1})")
+        e.keys(b"iDEFERRED ")
+        e.state_where(lambda s: s["mode"] == "i" and s["modified"])
+        e.keys(b"\x1b")
+        marker = self.root / "busy.marker"
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if marker.exists() and "m" in marker.read_text():
+                return
+            e.pump(0.01)
+        self.fail("Vim did not enter an ambiguous Escape mapping state")
+
+    def test_immediate_save_waits_for_safe_state_and_keeps_prior_typed_text(self):
+        e = self.editor()
+        self.prepare_ambiguous_escape(e, 700)
+        request_id = e.next_id
+        e.next_id += 1
+        e.send({"id": request_id, "action": "save_and_build", "command": "cat main.txt > saved-build.txt"})
+        e.state_where(lambda s: s["waiting_for_input"])
+        self.assertEqual(e.file.read_text(), "original line\nsecond line\n")
+        # Native navigation must not overtake a deferred save.
+        e.request("open", ok=False, path=str(e.other))
+        reply = e.wait(lambda m: m.get("event") == "response" and m.get("id") == request_id)
+        self.assertTrue(reply["ok"], reply)
+        state = e.state_where(lambda s: not s["waiting_for_input"] and s["build"]["exit_code"] == 0)
+        self.assertFalse(state["modified"])
+        self.assertEqual(e.file.read_text(), "DEFERRED original line\nsecond line\n")
+        self.assertEqual((self.root / "saved-build.txt").read_text(), e.file.read_text())
+
+    def test_deferred_save_expires_without_late_replay(self):
+        e = self.editor()
+        self.prepare_ambiguous_escape(e, 5000)
+        request_id = e.next_id
+        e.next_id += 1
+        e.send({"id": request_id, "action": "save"})
+        e.state_where(lambda s: s["waiting_for_input"])
+        reply = e.wait(lambda m: m.get("event") == "response" and m.get("id") == request_id)
+        self.assertFalse(reply["ok"])
+        self.assertIn("save again", reply["error"])
+        e.keys("z")  # Complete the mapping after the request has expired.
+        e.state_where(lambda s: s["mode"] == "n" and not s["waiting_for_input"])
+        self.assertEqual(e.file.read_text(), "original line\nsecond line\n")
+        self.assertTrue(e.snapshot()["modified"])
+        e.request("save")
+        self.assertTrue(e.file.read_text().startswith("DEFERRED original"))
+
     def test_async_build_diagnostics_and_secret_is_not_inherited(self):
         e = self.editor()
         command = 'if [ -n "$JTERM_VIM9_TOKEN" ]; then exit 99; fi; printf "%s\\n" "main.txt:2:3:compiler error"; exit 2'
@@ -357,6 +549,15 @@ class BridgeTests(unittest.TestCase):
         e.request("cancel_build")
         state = e.state_where(lambda s: not s["build"]["running"] and s["build"]["cancelled"])
         self.assertIsNotNone(state["build"]["exit_code"])
+
+    def test_large_build_keeps_the_latest_output_after_quickfix_capture_is_full(self):
+        e = self.editor()
+        e.request("build", command="i=0; while [ \"$i\" -lt 10012 ]; do printf 'output-%s\\n' \"$i\"; i=$((i+1)); done")
+        state = e.state_where(lambda s: not s["build"]["running"] and s["build"]["exit_code"] == 0, timeout=15)
+        self.assertEqual(len(state["build"]["output"]), 80)
+        self.assertEqual(state["build"]["output"][0], "output-9932")
+        self.assertEqual(state["build"]["output"][-1], "output-10011")
+        self.assertEqual(state["build"]["truncated"], 9932)
 
     @unittest.skipUnless(shutil.which("rg"), "Install ripgrep for project search integration")
     def test_async_literal_search_and_no_shell_interpretation(self):

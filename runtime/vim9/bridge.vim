@@ -44,6 +44,7 @@ var buildCancelled = false
 var buildCommand = ''
 var buildExit: any = v:null
 var buildLines: list<string> = []
+var buildTail: list<string> = []
 var buildDropped = 0
 var buildErrorFormat = ''
 var searchJob: job
@@ -57,6 +58,9 @@ var searchExit = 0
 var searchRows: list<dict<any>> = []
 var searchDropped = 0
 var searchErrors: list<string> = []
+var deferredSave: dict<any> = {}
+var deferredSaveTimer = -1
+var deferredSaveBuffer = 0
 
 def Send(payload: dict<any>)
   if ch_status(bridge) !=# 'open'
@@ -74,6 +78,7 @@ enddef
 
 def Capabilities(): list<string>
   var result = ['open', 'save', 'save_all', 'buffer', 'build', 'cancel_build',
+    'goto', 'close_buffer', 'close_current_buffer', 'next_buffer', 'previous_buffer', 'split', 'save_and_build',
     'snapshot', 'next_diagnostic', 'previous_diagnostic', 'quit']
   if executable('rg')
     add(result, 'search')
@@ -210,10 +215,11 @@ def State(): dict<any>
   var context: any = get(getqflist({context: 0}), 'context', {})
   var searchOmitted = type(context) == v:t_dict && get(context, 'source', '') ==# 'search'
     ? searchDropped : 0
-  var first = max([0, len(buildLines) - 80])
   var state: dict<any> = {event: 'state', mode: mode(1), file: expand('%:p'),
     root: projectRoot, cwd: getcwd(), line: line('.'), column: col('.'),
-    modified: &modified, changedtick: b:changedtick, filetype: &filetype, encoding: &fileencoding,
+    line_count: line('$'), window_count: winnr('$'), waiting_for_input: !empty(deferredSave),
+    modified: &modified, changedtick: b:changedtick, filetype: &filetype,
+    encoding: empty(&fileencoding) ? &encoding : &fileencoding,
     buffers: buffers, buffers_truncated: len(infos) > len(buffers),
     buffers_omitted: len(infos) - len(buffers),
     diagnostics: copy(diagnostics.items),
@@ -221,7 +227,8 @@ def State(): dict<any>
     diagnostics_omitted: diagnostics.total - len(diagnostics.items) + searchOmitted,
     capabilities: Capabilities(),
     build: {running: buildRunning, command: buildCommand, exit_code: buildExit,
-      cancelled: buildCancelled, output: buildLines[first :], truncated: buildDropped},
+      cancelled: buildCancelled, output: copy(buildTail),
+      truncated: len(buildLines) + buildDropped - len(buildTail)},
     search: {running: searchRunning, query: searchQuery, count: len(searchRows),
       truncated: searchDropped, exit_code: searchExit, errors: searchErrors}}
   # Leave headroom inside the host's 1 MiB framing limit even for pathological
@@ -236,6 +243,7 @@ def State(): dict<any>
       state.buffers_truncated = true
       state.buffers_omitted += 1
     else
+      state.build.truncated += len(state.build.output)
       state.build.output = []
       break
     endif
@@ -308,6 +316,80 @@ def SafeToChange()
   endif
 enddef
 
+def ClearDeferredSave()
+  deferredSave = {}
+  deferredSaveBuffer = 0
+  if deferredSaveTimer >= 0
+    timer_stop(deferredSaveTimer)
+    deferredSaveTimer = -1
+  endif
+  augroup JTermVim9DeferredSave
+    autocmd!
+  augroup END
+enddef
+
+def ExpireDeferredSave(_: number)
+  var request = deferredSave
+  ClearDeferredSave()
+  if !empty(request)
+    Reply(request.id, false, 'Vim is still finishing input; finish the command and save again')
+    Changed()
+  endif
+enddef
+
+def ResumeDeferredSave()
+  if empty(deferredSave) || !authenticated || shuttingDown
+    return
+  endif
+  var currentMode = mode(1)
+  if currentMode =~# '^no' || currentMode =~# '^[cr!t]' || !empty(state('moaSw'))
+    return
+  endif
+  var request = deferredSave
+  var buffer = deferredSaveBuffer
+  ClearDeferredSave()
+  try
+    if bufnr() != buffer
+      throw 'The current buffer changed while waiting to save; save again in the intended buffer'
+    endif
+    Dispatch(request, request.id)
+  catch
+    Reply(request.id, false, v:exception)
+  endtry
+  Changed()
+enddef
+
+def DeferSaveIfNeeded(request: dict<any>, id: number): bool
+  var action = RequiredString(request, 'action', 64)
+  if !empty(deferredSave) && index(['snapshot', 'cancel_build'], action) < 0
+    throw 'A save is waiting for Vim to finish input; wait for it before another IDE action'
+  endif
+  if index(['save', 'save_all', 'save_and_build'], action) < 0
+    return false
+  endif
+  var currentMode = mode(1)
+  var busy = state('moaSw')
+  # Escape/keycode/mapping decoding can be briefly busy after the native GUI
+  # has received a Save key. Pending operators, counts/finds, command lines
+  # and completion still fail immediately; no synthetic Escape is inserted.
+  if empty(busy) || currentMode =~# '^no' || currentMode =~# '^[cr!t]' || busy =~# '[oaS]'
+    return false
+  endif
+  if action ==# 'save_and_build'
+    BuildCommand(request)
+  endif
+  deferredSave = copy(request)
+  deferredSave.id = id
+  deferredSaveBuffer = bufnr()
+  deferredSaveTimer = timer_start(2000, ExpireDeferredSave)
+  augroup JTermVim9DeferredSave
+    autocmd!
+    autocmd SafeState,SafeStateAgain * ResumeDeferredSave()
+  augroup END
+  Changed()
+  return true
+enddef
+
 def RequiredString(request: dict<any>, key: string, limit: number = 16384): string
   var value: any = get(request, key, '')
   if type(value) != v:t_string || empty(value) || strlen(value) > limit
@@ -342,8 +424,13 @@ def BuildOutput(generation: number, _: channel, message: string)
   if generation != buildGeneration
     return
   endif
+  var text = strcharpart(message, 0, 2048)
+  add(buildTail, text)
+  if len(buildTail) > 80
+    remove(buildTail, 0)
+  endif
   if len(buildLines) < 10000
-    add(buildLines, strcharpart(message, 0, 2048))
+    add(buildLines, text)
   else
     buildDropped += 1
   endif
@@ -365,7 +452,7 @@ def BuildExited(generation: number, _: job, status: number)
   endif
 enddef
 
-def StartBuild(request: dict<any>)
+def BuildCommand(request: dict<any>): string
   if buildRunning
     throw 'A build is already running; cancel it before starting another'
   endif
@@ -377,10 +464,16 @@ def StartBuild(request: dict<any>)
   if empty(trim(command))
     throw 'Configure makeprg in Vim or enter a build command'
   endif
+  return command
+enddef
+
+def StartBuild(request: dict<any>)
+  var command = BuildCommand(request)
   buildGeneration += 1
   const generation = buildGeneration
   buildCommand = command
   buildLines = []
+  buildTail = []
   buildDropped = 0
   buildExit = v:null
   buildClosed = false
@@ -598,10 +691,58 @@ def Dispatch(request: dict<any>, id: number)
       if number != previous
         RestoreView(number)
       endif
+    elseif action ==# 'goto'
+      var lineNumber = PositiveNumber(request, 'line', 0)
+      var column = PositiveNumber(request, 'column')
+      # Keep this in the current buffer, including unnamed/modified buffers.
+      # Vim clamps out-of-range positions and keeps its byte-column convention.
+      cursor(lineNumber, column)
+    elseif action ==# 'next_buffer' || action ==# 'previous_buffer'
+      var previous = bufnr()
+      if action ==# 'next_buffer'
+        bnext
+      else
+        bprevious
+      endif
+      if bufnr() != previous
+        RestoreView(bufnr())
+      endif
+    elseif action ==# 'close_buffer' || action ==# 'close_current_buffer'
+      # UI snapshots can lag queued navigation. Keyboard close must resolve
+      # the target here; an explicit tab close retains its requested identity.
+      var number = action ==# 'close_current_buffer' ? bufnr() : PositiveNumber(request, 'buffer', 0)
+      if !bufexists(number) || !buflisted(number)
+        throw 'The requested Vim buffer is no longer open'
+      endif
+      # Refuse modified buffers even when the user's hidden option is enabled.
+      # Native close never means discard, and must not silently save either.
+      if getbufvar(number, '&modified')
+        throw 'Unsaved changes: save this buffer before closing it'
+      endif
+      execute 'bdelete ' .. number
+    elseif action ==# 'split'
+      var vertical: any = get(request, 'vertical', v:null)
+      if type(vertical) != v:t_bool
+        throw 'split requires a Boolean vertical value'
+      endif
+      if vertical
+        vsplit
+      else
+        split
+      endif
     elseif action ==# 'save'
       update
     elseif action ==# 'save_all'
       wall
+    elseif action ==# 'save_and_build'
+      # Validate before any write. :wall errors (including readonly/unnamed
+      # buffers and failing write hooks) prevent StartBuild from being reached.
+      var command = BuildCommand(request)
+      wall
+      if !empty(filter(getbufinfo({buflisted: 1}), (_, info) => info.changed != 0))
+        throw 'Some buffers remain modified; save them before building'
+      endif
+      StartBuild({command: command})
     elseif action ==# 'next_diagnostic'
       cnext
     elseif action ==# 'previous_diagnostic'
@@ -650,7 +791,9 @@ def Receive(_: channel, message: string)
       EmitState(true)
       return
     endif
-    Dispatch(request, id)
+    if !DeferSaveIfNeeded(request, id)
+      Dispatch(request, id)
+    endif
   catch
     pendingQuit = 0
     Reply(id, false, v:exception)
@@ -659,6 +802,7 @@ enddef
 
 def Disconnected(_: channel)
   authenticated = false
+  ClearDeferredSave()
   if flushTimer >= 0
     timer_stop(flushTimer)
     flushTimer = -1
@@ -670,6 +814,7 @@ def Disconnected(_: channel)
 enddef
 
 def Leaving()
+  ClearDeferredSave()
   if pendingQuit > 0
     Reply(pendingQuit, true)
   endif

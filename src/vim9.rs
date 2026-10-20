@@ -19,6 +19,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+#[path = "vim9_project.rs"]
+mod project;
+pub use project::{Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot};
+
 const PROTOCOL: u64 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_COMMAND: usize = 64 * 1024;
@@ -94,6 +98,8 @@ pub struct Vim9Build {
     pub exit_code: Option<i32>,
     /// A bounded tail for the native build-output surface.
     pub output: Vec<String>,
+    pub cancelled: bool,
+    pub truncated: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -116,8 +122,15 @@ pub struct Vim9Snapshot {
     pub mode: String,
     pub file: String,
     pub root: String,
+    pub cwd: String,
+    pub filetype: String,
+    pub encoding: String,
     pub line: u64,
     pub column: u64,
+    pub line_count: u64,
+    pub window_count: usize,
+    /// A save is awaiting Vim's SafeState event after partial input decoding.
+    pub waiting_for_input: bool,
     pub modified: bool,
     pub buffers: Vec<Vim9Buffer>,
     pub diagnostics: Vec<Vim9Diagnostic>,
@@ -149,7 +162,26 @@ pub enum Vim9Command {
     Buffer {
         buffer: i64,
     },
+    Goto {
+        line: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<u64>,
+    },
+    CloseBuffer {
+        buffer: i64,
+    },
+    /// Resolve the current buffer in Vim after preceding queued navigation.
+    CloseCurrentBuffer,
+    NextBuffer,
+    PreviousBuffer,
+    Split {
+        vertical: bool,
+    },
     Build {
+        command: String,
+    },
+    /// Save all modified buffers, then build only if every write succeeds.
+    SaveAndBuild {
         command: String,
     },
     CancelBuild,
@@ -180,8 +212,15 @@ impl Vim9Command {
                     ));
                 }
             }
-            Self::Buffer { buffer } if *buffer <= 0 => {
+            Self::Buffer { buffer } | Self::CloseBuffer { buffer } if *buffer <= 0 => {
                 return Err(invalid("Invalid Vim buffer id"))
+            }
+            Self::Goto { line, column }
+                if *line == 0
+                    || *line > i32::MAX as u64
+                    || column.is_some_and(|value| value == 0 || value > i32::MAX as u64) =>
+            {
+                return Err(invalid("Enter a positive line and optional byte column"));
             }
             Self::Search { query } if query.is_empty() => {
                 return Err(invalid("Enter a search query"))
@@ -652,6 +691,10 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             snapshot.diagnostics.truncate(MAX_ITEMS);
             snapshot.search.errors.truncate(8);
             if snapshot.build.output.len() > 80 {
+                snapshot.build.truncated = snapshot
+                    .build
+                    .truncated
+                    .saturating_add(snapshot.build.output.len() - 80);
                 snapshot
                     .build
                     .output
@@ -825,6 +868,68 @@ mod tests {
         }
         .frame(1)
         .is_err());
+    }
+
+    #[test]
+    fn navigation_actions_validate_positions_and_buffer_identity() {
+        for command in [
+            Vim9Command::Goto {
+                line: 0,
+                column: None,
+            },
+            Vim9Command::Goto {
+                line: 1,
+                column: Some(0),
+            },
+            Vim9Command::Goto {
+                line: u64::MAX,
+                column: None,
+            },
+            Vim9Command::CloseBuffer { buffer: -1 },
+        ] {
+            assert!(command.frame(1).is_err());
+        }
+        for (command, action) in [
+            (
+                Vim9Command::Goto {
+                    line: 24,
+                    column: Some(3),
+                },
+                "goto",
+            ),
+            (Vim9Command::CloseBuffer { buffer: 3 }, "close_buffer"),
+            (Vim9Command::CloseCurrentBuffer, "close_current_buffer"),
+            (Vim9Command::NextBuffer, "next_buffer"),
+            (Vim9Command::PreviousBuffer, "previous_buffer"),
+            (Vim9Command::Split { vertical: true }, "split"),
+            (
+                Vim9Command::SaveAndBuild {
+                    command: "cargo check".into(),
+                },
+                "save_and_build",
+            ),
+        ] {
+            let value: Value = serde_json::from_slice(&command.frame(42).unwrap()).unwrap();
+            assert_eq!(value["action"], action);
+            assert_eq!(value["id"], 42);
+        }
+    }
+
+    #[test]
+    fn editor_metadata_and_build_outcome_survive_the_protocol_boundary() {
+        let shared = Mutex::new(Shared {
+            snapshot: Vim9Snapshot::default(),
+            pending: HashSet::new(),
+        });
+        apply_event(json!({"event":"state", "cwd":"/project/src", "filetype":"rust", "encoding":"utf-8", "line_count":500, "window_count":2, "build":{"running":false, "cancelled":true, "truncated":23}}), &shared).unwrap();
+        let snapshot = &shared.lock().snapshot;
+        assert_eq!(snapshot.cwd, "/project/src");
+        assert_eq!(snapshot.filetype, "rust");
+        assert_eq!(snapshot.encoding, "utf-8");
+        assert_eq!(snapshot.line_count, 500);
+        assert_eq!(snapshot.window_count, 2);
+        assert!(snapshot.build.cancelled);
+        assert_eq!(snapshot.build.truncated, 23);
     }
 
     #[test]
@@ -1083,6 +1188,54 @@ mod tests {
         assert_eq!(snapshot.build.output, ["native.txt:2:1:typed bridge check"]);
         assert_eq!(snapshot.diagnostics.len(), 1);
         assert_eq!(snapshot.diagnostics[0].line, 2);
+        editor
+            .send(Vim9Command::Goto {
+                line: 1,
+                column: Some(3),
+            })
+            .unwrap();
+        wait_for(|| editor.snapshot().pending == 0 && editor.snapshot().line == 1);
+        assert_eq!(editor.snapshot().column, 3);
+        assert_eq!(editor.snapshot().line_count, 2);
+        assert_eq!(editor.snapshot().encoding, "utf-8");
+        editor.send(Vim9Command::PreviousBuffer).unwrap();
+        wait_for(|| {
+            editor.snapshot().pending == 0 && editor.snapshot().file == first.to_str().unwrap()
+        });
+        editor.send(Vim9Command::NextBuffer).unwrap();
+        wait_for(|| {
+            editor.snapshot().pending == 0 && editor.snapshot().file == second.to_str().unwrap()
+        });
+        assert_eq!(editor.snapshot().column, 3);
+        editor.send(Vim9Command::Split { vertical: true }).unwrap();
+        wait_for(|| editor.snapshot().pending == 0 && editor.snapshot().window_count == 2);
+        master.write_all(b"iY\x1b").unwrap();
+        wait_for(|| editor.snapshot().modified && editor.snapshot().mode == "n");
+        editor
+            .send(Vim9Command::SaveAndBuild {
+                command: "printf 'saved build\\n'".into(),
+            })
+            .unwrap();
+        wait_for(|| editor.snapshot().pending == 0 && editor.snapshot().build.exit_code == Some(0));
+        assert_eq!(fs::read_to_string(&second).unwrap(), "thYree\nfXour\n");
+        let current = editor
+            .snapshot()
+            .buffers
+            .into_iter()
+            .find(|buffer| buffer.current)
+            .unwrap()
+            .id;
+        editor
+            .send(Vim9Command::CloseBuffer { buffer: current })
+            .unwrap();
+        wait_for(|| {
+            editor.snapshot().pending == 0
+                && !editor
+                    .snapshot()
+                    .buffers
+                    .iter()
+                    .any(|buffer| buffer.id == current)
+        });
         editor.send(Vim9Command::Quit).unwrap();
         wait_for(|| child.0.try_wait().unwrap().is_some());
     }

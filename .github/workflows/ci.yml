@@ -56,6 +56,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           shared-key: test-${{ matrix.rust }}
-      - name: Install signed release test prerequisites
-        run: sudo apt-get update && sudo apt-get install -y curl minisign
+      - name: Install test prerequisites
+        run: sudo apt-get update && sudo apt-get install -y curl minisign vim-nox ripgrep
       - run: cargo test --locked --all-targets
+      - name: Real Vim9 editor and project workflow
+        run: |
+          python3 runtime/vim9/test_bridge.py
+          cargo test --locked --lib vim9::tests::real_vim9_round_trip -- --ignored

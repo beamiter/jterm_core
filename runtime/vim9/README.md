@@ -77,9 +77,15 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | --- | --- | --- |
 | `open` | `path`; optional `line`, `column` | Open a real Vim buffer; explicit positions use one-based line and byte column |
 | `buffer` | Positive integer `buffer` | Select an existing buffer id |
+| `goto` | Positive integer `line`; optional `column` | Move in the current buffer, including unnamed/modified buffers; one-based byte column |
+| `next_buffer` / `previous_buffer` | None | Cycle listed buffers with native modified-buffer checks and remembered views |
+| `close_buffer` | Positive integer `buffer` | Unlist a saved buffer with `:bdelete`; always refuse modified buffers, including hidden ones |
+| `close_current_buffer` | None | Resolve the current buffer inside Vim after earlier commands, then apply the same protected close |
+| `split` | Boolean `vertical` | Native `:vsplit` or `:split` of the current buffer |
 | `save` | None | Native `:update`, including the user's write hooks |
 | `save_all` | None | Native `:wall`, including ordinary Vim write errors |
 | `build` | Optional/empty `command` | Start an async shell job; an empty command uses expanded `makeprg` |
+| `save_and_build` | Optional/empty `command` | Validate the command, `:wall`, and start a build only after successful writes and no remaining modified buffers |
 | `cancel_build` | None | Request termination of the running build job |
 | `search` | Nonempty, single-line `query` | Async literal project search using `rg` |
 | `definition` | None | `:LspGotoDefinition`, or native tags/tagfunc |
@@ -104,13 +110,24 @@ retain their own positioning unless coordinates were explicitly requested.
 Ordinary Vim commands continue to follow the user's settings, including
 `startofline`. No action forces away modified data. Actions that change editor
 state refuse a pending operator, command-line prompt, mapping or completion;
-they never synthesize Escape to clear what the user is entering.
+they never synthesize Escape to clear what the user is entering. A narrow
+exception handles `save`, `save_all` and `save_and_build` arriving during
+transient Escape/keycode/mapping decoding (`state()` flags `m` or `w`): the
+runtime queues one save until `SafeState` or `SafeStateAgain`, with a two-second
+deadline and the originating current buffer recorded. Pending operators,
+counts/finds, command lines and completion are rejected immediately. Other
+native actions are rejected while a save waits, except state requests and
+build cancellation. A changed current buffer, timeout or disconnect clears
+the queued save; it is never replayed later. Build validation occurs before
+queuing a save-and-build and again before its writes execute.
 
 ### Published state
 
 `event: "state"` includes `mode`, current absolute `file`, project `root`,
 current Vim `cwd`, `line`, byte `column`, Boolean `modified`, `changedtick`,
-`filetype`, `encoding`, `capabilities`, `buffers`, `diagnostics`, `build` and
+`filetype`, effective `encoding`, `line_count`, current-tab `window_count`,
+Boolean `waiting_for_input` for a deferred save,
+`capabilities`, `buffers`, `diagnostics`, `build` and
 `search`. Additional fields are forward-compatible.
 
 Buffers contain `id`, absolute `name`, Boolean `modified` and Boolean `current`.
@@ -143,11 +160,16 @@ this is the sole action that deliberately accepts shell syntax. It runs from
 the project root and does not implicitly save buffers. A second build is
 rejected while one is running. Stdout and stderr are collected asynchronously;
 the job is finished only after both exit and channel-close callbacks arrive,
-so the final output is included in quickfix parsing.
+so the final output is included in quickfix parsing. The explicit
+`save_and_build` action first validates the command and running-job state,
+then calls `:wall`. A readonly/unnamed buffer, a failing write hook or remaining
+modified buffers prevent the build. Some earlier buffers may have been saved
+before `:wall` reports a later error, following ordinary Vim behavior.
 
-Build output is bounded to 10,000 lines of 2,048 characters each; `build.output`
-contains the last 80 stored lines and `build.truncated` counts later omitted
-lines. State also includes `build.running`, `command`, nullable `exit_code` and
+Quickfix input is bounded to 10,000 lines of 2,048 characters each;
+`build.output` independently keeps the latest 80 output lines, including after
+that capture fills. `build.truncated` counts all output lines omitted from the
+native tail. State also includes `build.running`, `command`, nullable `exit_code` and
 `cancelled`. Parsing uses Vim's `errorformat` captured at build start. An
 errorformat directory-stack entry anchors relative filenames to the build's
 root even if the user changes Vim's directory while the job is running.
@@ -190,7 +212,9 @@ VIM9_TEST_VIM=/absolute/path/to/vim python runtime/vim9/test_bridge.py
 tests create isolated files, actual PTYs and private loopback sockets, then
 drive native Vim and the shipped script. They verify authentication and bad
 requests, actual edits/undo/save, user vimrc mappings, escaped paths, remembered
-views, dirty-buffer/exit protection, preservation of pending input, Save All,
+views, dirty-buffer/exit protection, preservation of pending input, immediate
+Escape/save sequencing, deferred-save timeout without replay, consecutive
+navigation/current-close requests, Save All,
 async build/cancel/output, working-directory correctness, secret cleanup,
 literal rg search, result caps and asynchronous errors. Provider-routing tests
 use user-defined native Vim commands; they do not claim to test an external

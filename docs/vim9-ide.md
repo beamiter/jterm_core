@@ -2,7 +2,8 @@
 
 Anvil, Forge, Ember and Frost share an editor bridge around a **real Vim 9
 process**. Anvil and Forge host the editor in a dedicated GTK/VTE workbench;
-Ember and Frost use their existing native GPU terminal grid in an editor tab.
+Ember uses its native GPU terminal grid in an editor tab, while Frost opens a
+dedicated Iced/WGPU editor window using its terminal grid.
 The workbench supplies project navigation, buffer tabs, code actions, project
 search, build controls, quickfix navigation and editor state.
 
@@ -36,9 +37,9 @@ Normal terminal startup remains available without `--ide`. Opening an IDE from
 an existing terminal creates a dedicated editor; it does not commandeer the
 foreground shell. Editor bridge credentials and direct editor commands are
 ephemeral and must not be saved as restorable shell sessions.
-Anvil and Forge open a separate workbench process, so closing the terminal
-window that launched it does not terminate the editor. Ember and Frost create
-an editor tab in their existing terminal application.
+Anvil, Forge and Frost open a separate workbench process, so closing the terminal
+window that launched it does not terminate the editor. Ember creates
+an editor tab in its existing terminal application.
 
 ## Edit, navigate, search and build
 
@@ -48,6 +49,46 @@ opens its real filename and line/column. Save, Save All, buffer changes and
 diagnostic navigation retain Vim's ordinary errors and modified-buffer checks.
 Vim commands such as `:vsplit`, `:tabnew`, `:undolist` and your existing mappings
 continue to work in the editor.
+
+The four workbenches share these editor shortcuts (active in the IDE editor,
+not in a normal terminal tab or a native text field):
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+Shift+P` | Quick Open: fuzzy-match project-relative filenames |
+| `Ctrl+Shift+G` | Go to a one-based `line` or `line:byte-column` in the current buffer |
+| `Ctrl+S` / `Ctrl+Shift+S` | Save / Save all |
+| `Ctrl+Shift+F` | Focus project search |
+| `Ctrl+Shift+B` | Focus the build command; enter or confirm to run |
+| `F8` / `Shift+F8` | Next / previous quickfix problem |
+| `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` | Previous / next buffer |
+| `Ctrl+Shift+W` | Close the current buffer, refusing unsaved changes |
+
+Quick Open uses an asynchronous `rg --files` index shared by all frontends.
+It includes hidden files, respects `.gitignore` and `.ignore`, excludes `.git`,
+and does not follow directory symlinks. Type part of a filename or path, move
+with the arrow keys, and press Enter to open the selected result; Escape
+returns to Vim. Refresh after creating files outside the workbench. Scanning
+is bounded to 20,000 files, 16 MiB of retained path text and 15 seconds;
+partial results and failures are reported. No recursive I/O runs in a render
+callback, snapshots share immutable file lists, and ranking is recalculated
+only when the query or index changes. Install ripgrep for Quick Open.
+
+Native split controls create real Vim horizontal/vertical windows sharing
+Vim's buffers and undo. Buffer navigation restores remembered cursor/scroll
+positions. Closing a buffer never forces a write or discards changes, even
+when `hidden` is set; closing the last saved buffer leaves an unnamed Vim
+buffer. Keyboard close resolves the current buffer inside Vim after earlier
+navigation commands; a buffer tab's close button targets that specific tab.
+Ordinary `Ctrl+P`, `Ctrl+G`, `Ctrl+O` and `Ctrl+W` remain Vim keys.
+
+If Save arrives while Vim is decoding an Escape or mapping prefix, the bridge
+waits for Vim's `SafeState` event for up to two seconds and shows a waiting
+status. It preserves the input already typed and never inserts Escape on the
+user's behalf. A pending operator, command line or completion is still refused.
+The queued save stays bound to its original buffer; changing that buffer or
+exceeding the timeout produces an error and requires another explicit save.
+Other native editing actions cannot overtake a waiting save.
 
 Project search uses `rg` for literal text matches and populates quickfix results.
 Install ripgrep for this action. Search text is passed as an argv argument
@@ -62,12 +103,21 @@ when a tool's output format differs. The editor remains usable while the job
 runs; its running state and exit code are shown, and Stop Build requests
 cancellation. No project build is run automatically just by opening a folder.
 
+The separate **Save all + Build** action explicitly saves first. Invalid
+commands, an existing build, write errors or remaining modified buffers prevent
+the new build from starting. `:wall` can still save some buffers before a later
+buffer reports an error; this is Vim's ordinary save-all behavior. The plain
+Build action continues to leave in-memory edits unsaved.
+
 Quickfix is the common problem/result surface: a later build or search replaces
 the current list according to the runtime workflow. At most 256 buffers and
 256 diagnostic entries are sent to native controls. Project search retains
 at most 256 matches in quickfix and reports omissions. Build captures at most
-10,000 output lines for quickfix parsing and shows an 80-line output tail in
-the native workbench. Other Vim buffers and quickfix lists remain owned by
+10,000 output lines for quickfix parsing and independently keeps the latest
+80 output lines for the native workbench, including when quickfix capture is
+full. The omitted-line count describes output not present in that native tail;
+cancelled builds are shown distinctly from successful completion.
+Other Vim buffers and quickfix lists remain owned by
 Vim. Project directory navigation is one level at a time and bounded
 to 1024 directory entries. The workbench does not recursively scan a whole
 repository on the render path.
@@ -120,6 +170,14 @@ to 1 MiB, and outstanding requests to 64. Commands are never replayed into a
 replacement editor after disconnection. Errors are visible in the snapshot;
 `clear_error()` dismisses them.
 
+For a native Quick Open picker, create `Vim9ProjectIndex::start(editor.root())`
+when the picker is first requested. `snapshot()` cheaply clones an immutable
+`Arc<Vec<Vim9ProjectFile>>`; call `snapshot.matches(query, result_limit)` only
+when the query or that Arc changes. Display scanning, truncation and errors,
+and send the selected file's absolute `path` using `Vim9Command::Open`.
+Dropping the last index handle cancels its worker without joining the UI
+thread. Replacing the handle refreshes the project index.
+
 ## Verification
 
 `cargo test vim9::tests` exercises real loopback connections, authentication,
@@ -128,7 +186,11 @@ disconnection. The runtime directory includes an integration test that starts
 an actual PTY Vim process and drives its native channel and editing behavior.
 The ignored `vim9::tests::real_vim9_round_trip` test additionally checks the
 complete typed Rust controller against real Vim: launch, open a special
-filename, edit, refuse an unsaved quit, save, parse a failed build and quit.
+filename, edit, refuse an unsaved quit, save, parse a failed build, jump,
+cycle buffers, split, save-and-build, close a buffer and quit.
+The Python suite also exercises immediate Escape/save sequencing, bounded
+deferred-save expiry without replay, and consecutive navigation/current-close
+requests without a native snapshot barrier.
 Run it with `VIM9_TEST_VIM=/absolute/path/to/vim cargo test --lib
 vim9::tests::real_vim9_round_trip -- --ignored` in an environment with a PTY
 and loopback sockets. See the runtime README for the Python suite's Vim
