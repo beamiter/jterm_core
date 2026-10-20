@@ -178,7 +178,7 @@ pub struct Vim9Snapshot {
     pub column: u64,
     pub line_count: u64,
     pub window_count: usize,
-    /// A save is awaiting Vim's SafeState event after partial input decoding.
+    /// A save awaits Vim's SafeState event after queued or partially decoded input.
     pub waiting_for_input: bool,
     pub modified: bool,
     pub buffers: Vec<Vim9Buffer>,
@@ -458,6 +458,14 @@ impl Vim9Session {
     /// buffer list, diagnostics, search results or build output.
     pub fn render_snapshot(&self) -> Option<Arc<Vim9RenderFrame>> {
         self.0.shared.lock().snapshot.render.clone()
+    }
+
+    /// Whether a command accepted by `send()` is queued or awaiting its reply.
+    /// This does not clone editor metadata or wait for unrelated requests.
+    /// Unknown IDs and disconnected sessions return false; a completed command
+    /// may have failed, so this is an ordering check rather than a success flag.
+    pub fn command_pending(&self, id: u64) -> bool {
+        self.0.shared.lock().pending.contains(&id)
     }
 
     pub fn clear_error(&self) {
@@ -1253,6 +1261,10 @@ mod tests {
         assert!(session.snapshot().modified);
         let id = session.send(Vim9Command::Save).unwrap();
         assert_eq!(session.snapshot().pending, 1);
+        assert!(session.command_pending(id));
+        assert!(!session.command_pending(id + 1));
+        let other_id = session.send(Vim9Command::Snapshot).unwrap();
+        assert!(session.command_pending(other_id));
         let mut request = String::new();
         reader.read_line(&mut request).unwrap();
         let command: Value = serde_json::from_str(&request).unwrap();
@@ -1264,11 +1276,14 @@ mod tests {
             json!({"event":"response","id":id,"ok":false,"error":"E45: readonly"})
         )
         .unwrap();
-        wait_for(|| session.snapshot().pending == 0);
+        wait_for(|| !session.command_pending(id));
+        assert!(session.command_pending(other_id));
+        assert_eq!(session.snapshot().pending, 1);
         assert_eq!(session.snapshot().error.as_deref(), Some("E45: readonly"));
         drop(reader);
         drop(stream);
         wait_for(|| !session.snapshot().connected);
+        assert!(!session.command_pending(other_id));
         assert!(session.send(Vim9Command::Save).is_err());
     }
 

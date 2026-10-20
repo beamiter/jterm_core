@@ -744,6 +744,106 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(e.file.read_text(), "DEFERRED original line\nsecond line\n")
         self.assertEqual((self.root / "saved-build.txt").read_text(), e.file.read_text())
 
+    def test_save_waits_for_already_written_pty_input_without_consuming_it(self):
+        for action in ("save", "save_all", "save_and_build"):
+            with self.subTest(action=action):
+                root = self.root / action
+                root.mkdir()
+                e = Editor(root)
+                self.editors.append(e)
+                e.keys("iBEFORE ")
+                e.state_where(lambda s: s["mode"] == "i" and s["modified"])
+                # Suspend only this owned child so both channels are ready on
+                # resume. PTY write completion precedes the semantic request;
+                # it does not mean Vim has consumed the text or Escape yet.
+                os.kill(e.process.pid, signal.SIGSTOP)
+                try:
+                    _, status = os.waitpid(e.process.pid, os.WUNTRACED)
+                    self.assertTrue(os.WIFSTOPPED(status))
+                    pending = "排队 e\u0301 \x1b[DZ\x1b".encode()
+                    self.assertEqual(os.write(e.master, pending), len(pending))
+                    request_id = e.next_id
+                    e.next_id += 1
+                    params = {"command": "cat main.txt > saved-build.txt"} if action == "save_and_build" else {}
+                    e.send({"id": request_id, "action": action, **params})
+                finally:
+                    os.kill(e.process.pid, signal.SIGCONT)
+                reply = e.wait(lambda m: m.get("event") == "response" and m.get("id") == request_id)
+                self.assertTrue(reply["ok"], reply)
+                state = e.state_where(lambda s: s["mode"] == "n" and not s["waiting_for_input"]
+                                      and (action != "save_and_build" or s["build"]["exit_code"] == 0))
+                self.assertFalse(state["modified"])
+                self.assertEqual(e.file.read_text(), "BEFORE 排队 e\u0301Z original line\nsecond line\n")
+                if action == "save_and_build":
+                    self.assertEqual((root / "saved-build.txt").read_text(), e.file.read_text())
+
+    def test_save_input_peek_cannot_reenter_open_and_write_the_wrong_buffer(self):
+        e = self.editor()
+        e.ex("set hidden")
+        e.request("open", path=str(e.other))
+        e.keys(b"iOTHER UNSAVED \x1b")
+        e.state_where(lambda s: s["mode"] == "n" and s["modified"])
+        e.request("open", path=str(e.file))
+        e.keys(b"iORIGIN UNSAVED \x1b")
+        e.state_where(lambda s: s["mode"] == "n" and s["modified"])
+        # getchar(1) processes queued channel callbacks. Both requests are
+        # delivered together to exercise reentry before the outer Save has
+        # decided whether to wait for typeahead. Both buffers are modified,
+        # so writing the newly opened buffer cannot pass unnoticed.
+        os.kill(e.process.pid, signal.SIGSTOP)
+        try:
+            _, status = os.waitpid(e.process.pid, os.WUNTRACED)
+            self.assertTrue(os.WIFSTOPPED(status))
+            save_id = e.next_id
+            open_id = save_id + 1
+            e.next_id += 2
+            requests = [{"id": save_id, "action": "save"},
+                        {"id": open_id, "action": "open", "path": str(e.other)}]
+            e.connection.sendall(("\n".join(json.dumps(r) for r in requests) + "\n").encode())
+        finally:
+            os.kill(e.process.pid, signal.SIGCONT)
+        saved = e.wait(lambda m: m.get("event") == "response" and m.get("id") == save_id)
+        opened = e.wait(lambda m: m.get("event") == "response" and m.get("id") == open_id)
+        self.assertTrue(saved["ok"], saved)
+        self.assertEqual(e.file.read_text(), "ORIGIN UNSAVED original line\nsecond line\n")
+        self.assertEqual(e.other.read_text(), "other file\n")
+        if not opened["ok"]:
+            self.assertIn("A save is waiting", opened["error"])
+            self.assertEqual(e.snapshot()["file"], str(e.file))
+        else:
+            self.assertLess(saved["seq"], opened["seq"])
+            self.assertEqual(e.snapshot()["file"], str(e.other))
+
+    def test_save_still_refuses_incomplete_count_and_find_without_typeahead(self):
+        e = self.editor()
+        e.keys(b"iUNSAVED \x1b")
+        e.state_where(lambda s: s["mode"] == "n" and s["modified"])
+        # S can also mean an incomplete Normal command, with no delivered
+        # argument to finish it. This remains an immediate refusal, not a
+        # queued save that might run after an unrelated future keystroke.
+        e.ex("call timer_start(10, {-> writefile([state('moaSw')], 'partial.marker')}, {'repeat': -1})")
+        marker = self.root / "partial.marker"
+        for prefix in ("2", "f"):
+            with self.subTest(prefix=prefix):
+                column = e.snapshot()["column"]
+                marker.unlink(missing_ok=True)
+                e.keys(prefix)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if marker.exists() and "S" in marker.read_text():
+                        break
+                    e.pump(0.01)
+                else:
+                    self.fail("Vim did not enter the incomplete Normal command")
+                reply = e.request("save", ok=False)
+                self.assertIn("Vim is busy", reply["error"])
+                self.assertFalse(e.snapshot()["waiting_for_input"])
+                e.keys("l")
+                e.state_where(lambda s: s["column"] != column and s["mode"] == "n")
+                self.assertEqual(e.file.read_text(), "original line\nsecond line\n")
+        e.request("save")
+        self.assertTrue(e.file.read_text().startswith("UNSAVED original"))
+
     def test_deferred_save_expires_without_late_replay(self):
         e = self.editor()
         self.prepare_ambiguous_escape(e, 5000)

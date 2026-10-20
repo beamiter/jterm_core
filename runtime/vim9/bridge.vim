@@ -64,6 +64,7 @@ var searchOptions: dict<any> = {case: 'smart', regex: false, whole_word: false, 
 var deferredSave: dict<any> = {}
 var deferredSaveTimer = -1
 var deferredSaveBuffer = 0
+var checkingSaveInput = false
 var renderEnabled = false
 var renderTimer = -1
 var renderRevision = 0
@@ -962,12 +963,30 @@ def ExpireDeferredSave(_: number)
   endif
 enddef
 
+def SaveInputPending(): bool
+  # getchar(1) can invoke queued channel callbacks before peeking. Preserve
+  # this save's ordering while those callbacks run, including SafeStateAgain.
+  var pending = false
+  checkingSaveInput = true
+  try
+    pending = !empty(getchar(1))
+  finally
+    checkingSaveInput = false
+  endtry
+  return pending
+enddef
+
 def ResumeDeferredSave()
-  if empty(deferredSave) || !authenticated || shuttingDown
+  if empty(deferredSave) || !authenticated || shuttingDown || checkingSaveInput
     return
   endif
   var currentMode = mode(1)
   if currentMode =~# '^no' || currentMode =~# '^[cr!t]' || !empty(state('moaSw'))
+      || SaveInputPending()
+    return
+  endif
+  # A callback invoked by the peek may have disconnected the bridge.
+  if empty(deferredSave) || !authenticated || shuttingDown
     return
   endif
   var request = deferredSave
@@ -986,7 +1005,8 @@ enddef
 
 def DeferSaveIfNeeded(request: dict<any>, id: number): bool
   var action = RequiredString(request, 'action', 64)
-  if !empty(deferredSave) && index(['snapshot', 'cancel_build', 'cancel_search'], action) < 0
+  if (!empty(deferredSave) || checkingSaveInput)
+      && index(['snapshot', 'cancel_build', 'cancel_search'], action) < 0
     throw 'A save is waiting for Vim to finish input; wait for it before another IDE action'
   endif
   if index(['save', 'save_all', 'save_and_build'], action) < 0
@@ -994,10 +1014,23 @@ def DeferSaveIfNeeded(request: dict<any>, id: number): bool
   endif
   var currentMode = mode(1)
   var busy = state('moaSw')
-  # Escape/keycode/mapping decoding can be briefly busy after the native GUI
-  # has received a Save key. Pending operators, counts/finds, command lines
-  # and completion still fail immediately; no synthetic Escape is inserted.
-  if empty(busy) || currentMode =~# '^no' || currentMode =~# '^[cr!t]' || busy =~# '[oaS]'
+  # A completed host PTY write can still be waiting in Vim's input stream.
+  # Peek without consuming text, keycodes or Escape, and let SafeState resume
+  # after Vim handles it. S also occurs while queued Escape is being decoded;
+  # only reject S with no typeahead (an unfinished count/find awaiting a key).
+  # Operators, command lines and completion remain immediate refusals.
+  if currentMode =~# '^no' || currentMode =~# '^[cr!t]' || busy =~# '[oa]'
+    return false
+  endif
+  var buffer = bufnr()
+  var pendingInput = SaveInputPending()
+  if !authenticated || shuttingDown
+    throw 'Vim disconnected while checking input for this save'
+  endif
+  if bufnr() != buffer
+    throw 'The current buffer changed while checking input; save again in the intended buffer'
+  endif
+  if !pendingInput && (empty(busy) || busy =~# 'S')
     return false
   endif
   if action ==# 'save_and_build'
@@ -1005,7 +1038,7 @@ def DeferSaveIfNeeded(request: dict<any>, id: number): bool
   endif
   deferredSave = copy(request)
   deferredSave.id = id
-  deferredSaveBuffer = bufnr()
+  deferredSaveBuffer = buffer
   deferredSaveTimer = timer_start(2000, ExpireDeferredSave)
   augroup JTermVim9DeferredSave
     autocmd!

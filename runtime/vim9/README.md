@@ -177,15 +177,25 @@ on that same window's jumplist. An explicit count before Ctrl-I prevents Ex
 from trimming its Tab byte as whitespace. No action forces away modified data. Actions that change editor
 state refuse a pending operator, command-line prompt, mapping or completion;
 they never synthesize Escape to clear what the user is entering. A narrow
-exception handles `save`, `save_all` and `save_and_build` arriving during
-transient Escape/keycode/mapping decoding (`state()` flags `m` or `w`): the
-runtime queues one save until `SafeState` or `SafeStateAgain`, with a two-second
-deadline and the originating current buffer recorded. Pending operators,
-counts/finds, command lines and completion are rejected immediately. Other
-native actions are rejected while a save waits, except state requests and
-build/search cancellation. A changed current buffer, timeout or disconnect clears
+exception handles `save`, `save_all` and `save_and_build` arriving with queued
+input or transient Escape/keycode/mapping decoding: non-consuming `getchar(1)`
+checks input availability, and the runtime queues one save until `SafeState` or
+`SafeStateAgain`. It checks again before resuming, with a two-second deadline
+and the originating current buffer recorded. Pending operators, command lines,
+completion and incomplete counts/finds awaiting another key are rejected
+immediately. Other native actions are rejected while a save waits or checks
+input, except state requests and build/search cancellation. A changed current
+buffer, timeout or disconnect clears
 the queued save; it is never replayed later. Build validation occurs before
 queuing a save-and-build and again before its writes execute.
+
+Hosts must complete preceding queued PTY writes before sending a semantic save;
+the runtime can only inspect input already delivered to Vim. Hosts can use
+`Vim9Session::command_pending(id)` to hold later input until that specific
+request leaves the pending set, without waiting for unrelated snapshot/render
+requests. Pending IDs are registered before enqueue and cleared by responses
+or disconnection. A false result indicates ordering completion, not successful
+execution; failures and connection state still need normal UI handling.
 
 ### Published state
 
