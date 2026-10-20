@@ -31,6 +31,10 @@ pub use render::{
     Vim9RenderWindow,
 };
 
+#[path = "vim9_entry.rs"]
+mod entry;
+pub use entry::{explicit_ide_target, Vim9EntryRequest, Vim9EntryTrigger};
+
 const PROTOCOL: u64 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_COMMAND: usize = 64 * 1024;
@@ -332,6 +336,7 @@ struct Request {
 }
 
 struct Shared {
+    entry_id: Option<uuid::Uuid>,
     snapshot: Vim9Snapshot,
     pending: HashSet<u64>,
     // Kept independently of the UI snapshot: metadata may temporarily hide a
@@ -342,6 +347,7 @@ struct Shared {
 }
 
 struct SessionInner {
+    entry_id: uuid::Uuid,
     launch: Vim9Launch,
     requests: Sender<Request>,
     shared: Arc<Mutex<Shared>>,
@@ -354,6 +360,7 @@ impl Drop for SessionInner {
         // Never join a socket worker on a UI thread. Its poll and socket
         // timeouts are bounded, and it does not hold an owning session Arc.
         self.stop.store(true, Ordering::Release);
+        set_disconnected(&self.shared, None);
     }
 }
 
@@ -376,11 +383,12 @@ impl Vim9Session {
     /// Prepare a Vim9 workbench for a directory or file, including a new file
     /// in an existing directory. The caller must launch the returned command
     /// in a dedicated PTY, never inject it into an existing shell's input.
-    pub fn start(target: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn start(request: Vim9EntryRequest) -> io::Result<Self> {
+        let (entry_id, target) = request.into_parts();
         let program = find_vim()?;
-        let (root, file) = project_target(target.as_ref())?;
+        let (root, file) = project_target(&target)?;
         let runtime = RUNTIME.path()?;
-        Self::prepare(root, file, program, runtime)
+        Self::prepare(root, file, program, runtime, entry_id)
     }
 
     fn prepare(
@@ -388,6 +396,7 @@ impl Vim9Session {
         file: Option<PathBuf>,
         program: String,
         runtime: PathBuf,
+        entry_id: uuid::Uuid,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
@@ -418,6 +427,7 @@ impl Vim9Session {
             launch.env.clear();
         }
         let shared = Arc::new(Mutex::new(Shared {
+            entry_id: Some(entry_id),
             snapshot: Vim9Snapshot {
                 root: path_text(&root)?,
                 ..Default::default()
@@ -437,12 +447,33 @@ impl Vim9Session {
                 bridge_worker(listener, token, rx, worker_shared, worker_stop);
             })?;
         Ok(Self(Arc::new(SessionInner {
+            entry_id,
             launch,
             requests: tx,
             shared,
             stop,
             next_id: AtomicU64::new(1),
         })))
+    }
+
+    /// The non-secret identity of this explicit entry, distinct on re-entry.
+    pub fn entry_id(&self) -> uuid::Uuid {
+        self.0.entry_id
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.0.shared.lock().entry_id == Some(self.0.entry_id)
+    }
+
+    pub fn accepts_entry(&self, entry_id: uuid::Uuid) -> bool {
+        self.0.shared.lock().entry_id == Some(entry_id)
+    }
+
+    /// Revoke all clones and already queued frames on actual exit. A refused
+    /// modified-buffer quit must not call this method.
+    pub fn revoke(&self) {
+        self.0.stop.store(true, Ordering::Release);
+        set_disconnected(&self.0.shared, None);
     }
 
     pub fn root(&self) -> &Path {
@@ -485,7 +516,7 @@ impl Vim9Session {
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         let bytes = command.frame(id)?;
         let mut shared = self.0.shared.lock();
-        if !shared.snapshot.connected {
+        if shared.entry_id != Some(self.0.entry_id) || !shared.snapshot.connected {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "Vim9 bridge is not connected",
@@ -635,7 +666,14 @@ pub fn list_project_directory(path: &Path) -> io::Result<Vec<ProjectEntry>> {
 
 fn set_disconnected(shared: &Mutex<Shared>, error: Option<String>) {
     let mut shared = shared.lock();
-    shared.snapshot.connected = false;
+    shared.entry_id = None;
+    let root = std::mem::take(&mut shared.snapshot.root);
+    let prior_error = shared.snapshot.error.take();
+    shared.snapshot = Vim9Snapshot {
+        root,
+        error: prior_error,
+        ..Default::default()
+    };
     shared.snapshot.render = None;
     shared.render_baseline = None;
     shared.render_resync = false;
@@ -774,6 +812,9 @@ fn connection(
                     stream.write_all(&reply)?;
                     authenticated = true;
                     let mut state = shared.lock();
+                    if state.entry_id.is_none() {
+                        return Ok(false);
+                    }
                     state.snapshot.connected = true;
                     state.snapshot.error = None;
                 } else {
@@ -793,6 +834,10 @@ fn connection(
 }
 
 fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
+    let mut shared = shared.lock();
+    if shared.entry_id.is_none() {
+        return Ok(());
+    }
     match value.get("event").and_then(Value::as_str) {
         Some("state") => {
             let mut snapshot: Vim9Snapshot =
@@ -820,7 +865,6 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             });
             snapshot.capabilities.sort();
             snapshot.capabilities.dedup();
-            let mut shared = shared.lock();
             snapshot.connected = true;
             snapshot.pending = shared.pending.len();
             snapshot.error = shared.snapshot.error.take();
@@ -845,7 +889,6 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             if !frame.valid() {
                 return Err(invalid("Invalid native Vim buffer paint frame"));
             }
-            let mut shared = shared.lock();
             if frame.revision > shared.render_revision {
                 shared.render_revision = frame.revision;
                 let frame = Arc::new(frame);
@@ -855,7 +898,6 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             }
         }
         Some("render_delta") => {
-            let mut shared = shared.lock();
             let observed_revision = value.get("revision").and_then(Value::as_u64);
             // Duplicates and delayed old data cannot resurrect an old buffer,
             // even after metadata or compatibility mode hid its native paint.
@@ -889,7 +931,6 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             }
         }
         Some("render_disabled") => {
-            let mut shared = shared.lock();
             shared.snapshot.render = None;
             shared.render_baseline = None;
             shared.render_resync = false;
@@ -899,7 +940,6 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
                 .get("id")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid("Editor response has no request id"))?;
-            let mut shared = shared.lock();
             if shared.pending.remove(&id) {
                 shared.snapshot.pending = shared.pending.len();
                 if value.get("ok").and_then(Value::as_bool) == Some(false) {
@@ -914,7 +954,7 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             }
         }
         Some("error") => {
-            shared.lock().snapshot.error = Some(
+            shared.snapshot.error = Some(
                 value
                     .get("error")
                     .and_then(Value::as_str)
@@ -954,8 +994,60 @@ mod tests {
             None,
             "/usr/bin/vim".into(),
             scratch.0.join("bridge.vim"),
+            uuid::Uuid::new_v4(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn explicit_exit_rejects_late_events_and_reentry_gets_fresh_identity() {
+        let scratch = Scratch::new();
+        let first = session(&scratch);
+        let first_id = first.entry_id();
+        let alias = first.clone();
+        apply_event(
+            json!({"event":"state","file":"explicit.rs","mode":"n"}),
+            &first.0.shared,
+        )
+        .unwrap();
+        assert!(first.is_active());
+        assert_eq!(first.snapshot().file, "explicit.rs");
+        first.revoke();
+        assert!(!alias.is_active());
+        assert!(!first.accepts_entry(first_id));
+        assert!(!first.snapshot().connected);
+        assert!(first.snapshot().file.is_empty());
+        for event in [
+            json!({"event":"state","file":"late.rs","connected":true,"entry_id":first_id}),
+            json!({"event":"render","revision":999}),
+            json!({"event":"render_delta","revision":1000}),
+            json!({"event":"error","error":"late"}),
+        ] {
+            apply_event(event, &first.0.shared).unwrap();
+        }
+        assert_eq!(first.snapshot().file, "");
+        assert!(first.render_snapshot().is_none());
+        assert!(first.send(Vim9Command::Save).is_err());
+        let next = session(&scratch);
+        assert_ne!(next.entry_id(), first_id);
+        assert!(!next.accepts_entry(first_id));
+        apply_event(json!({"event":"state","file":"new.rs"}), &next.0.shared).unwrap();
+        assert_eq!(next.snapshot().file, "new.rs");
+        assert!(first.snapshot().file.is_empty());
+    }
+
+    #[test]
+    fn metadata_json_cannot_grant_an_inactive_session() {
+        let scratch = Scratch::new();
+        let session = session(&scratch);
+        let id = session.entry_id();
+        session.revoke();
+        for event in ["cwd", "title", "hello", "foreground", "restore", "state"] {
+            apply_event(json!({"event":event,"cwd":"/tmp/vim","title":"Vim9", "file":"forged", "connected":true,"entry_id":id}), &session.0.shared).unwrap();
+            assert!(!session.is_active());
+            assert!(!session.snapshot().connected);
+            assert!(session.snapshot().file.is_empty());
+        }
     }
 
     fn attach(
@@ -1022,6 +1114,7 @@ mod tests {
     #[test]
     fn native_render_frames_keep_rgb_identity_and_arc_ownership() {
         let shared = Mutex::new(Shared {
+            entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot {
                 connected: true,
                 ..Default::default()
@@ -1082,6 +1175,7 @@ mod tests {
     #[test]
     fn native_delta_gap_recovers_without_disconnect_or_replaying_old_paint() {
         let shared = Mutex::new(Shared {
+            entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot {
                 connected: true,
                 ..Default::default()
@@ -1220,6 +1314,7 @@ mod tests {
     #[test]
     fn native_render_rejects_invalid_geometry_colors_and_embedded_control_text() {
         let shared = Mutex::new(Shared {
+            entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
             render_baseline: None,
@@ -1407,6 +1502,7 @@ mod tests {
     #[test]
     fn editor_metadata_and_build_outcome_survive_the_protocol_boundary() {
         let shared = Mutex::new(Shared {
+            entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
             render_baseline: None,
@@ -1524,6 +1620,7 @@ mod tests {
     #[test]
     fn snapshots_cap_items_and_only_publish_supported_semantic_actions() {
         let shared = Mutex::new(Shared {
+            entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
             render_baseline: None,
@@ -1585,8 +1682,14 @@ mod tests {
         .unwrap();
         let runtime = RUNTIME.materialize(&scratch.0.join("runtime")).unwrap();
         let program = std::env::var("VIM9_TEST_VIM").unwrap_or_else(|_| find_vim().unwrap());
-        let editor =
-            Vim9Session::prepare(scratch.0.clone(), Some(first.clone()), program, runtime).unwrap();
+        let editor = Vim9Session::prepare(
+            scratch.0.clone(),
+            Some(first.clone()),
+            program,
+            runtime,
+            uuid::Uuid::new_v4(),
+        )
+        .unwrap();
         let mut master = -1;
         let mut slave = -1;
         let size = libc::winsize {
