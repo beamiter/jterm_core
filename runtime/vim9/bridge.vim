@@ -1,6 +1,7 @@
 vim9script
 # Real Vim owns editing, undo, mappings, plugins, buffers and windows.  This
-# optional runtime publishes metadata and accepts a small, explicit action set.
+# optional runtime publishes metadata and GUI buffer paint data, and accepts
+# a small, explicit action set. It never reconstructs text from PTY output.
 # Protocol and installation details are documented beside this file.
 
 if exists('g:jterm_vim9_bridge_loaded')
@@ -63,6 +64,15 @@ var searchOptions: dict<any> = {case: 'smart', regex: false, whole_word: false, 
 var deferredSave: dict<any> = {}
 var deferredSaveTimer = -1
 var deferredSaveBuffer = 0
+var renderEnabled = false
+var renderTimer = -1
+var renderRevision = 0
+var previousRender = ''
+var renderBaseKey = ''
+var renderBase: list<dict<any>> = []
+var renderStyles: dict<dict<any>> = {}
+var renderThemeKey = ''
+var renderNormal: dict<any> = {}
 
 def Send(payload: dict<any>)
   if ch_status(bridge) !=# 'open'
@@ -82,7 +92,7 @@ def Capabilities(): list<string>
   var result = ['open', 'save', 'save_all', 'buffer', 'build', 'cancel_build',
     'goto', 'close_buffer', 'close_current_buffer', 'next_buffer', 'previous_buffer', 'split', 'save_and_build',
     'navigate_back', 'navigate_forward', 'cancel_search',
-    'snapshot', 'next_diagnostic', 'previous_diagnostic', 'quit']
+    'snapshot', 'set_render', 'next_diagnostic', 'previous_diagnostic', 'quit']
   if executable('rg')
     add(result, 'search')
     add(result, 'search_with_options')
@@ -97,6 +107,579 @@ def Capabilities(): list<string>
     endif
   endfor
   return result
+enddef
+
+# Native buffer rendering uses Vim's buffer bytes, syntax engine and GUI
+# highlight attributes. No text or color is recovered from the PTY screen.
+# Unsupported display features publish an explicit fallback instead of lying
+# about Vim's visible editing state. The first renderer deliberately keeps
+# Vim's exact cell geometry so existing mouse/IME input remains authoritative.
+def RenderColor(id: number, part: string): any
+  var value = tolower(synIDattr(id, part .. '#', 'gui'))
+  if value ==# 'fg' || value ==# 'foreground'
+    return get(renderNormal, 'foreground', v:null)
+  elseif value ==# 'bg' || value ==# 'background'
+    return get(renderNormal, 'background', v:null)
+  endif
+  if value !~# '^#[0-9a-f]\{6}$'
+    value = get(v:colornames, value, '')
+  endif
+  return value =~# '^#[0-9a-fA-F]\{6}$' ? str2nr(strpart(value, 1), 16) : v:null
+enddef
+
+def RenderStyle(id: number): dict<any>
+  var resolved = synIDtrans(id)
+  var key = string(resolved)
+  if has_key(renderStyles, key)
+    return renderStyles[key]
+  endif
+  var style: dict<any> = {foreground: RenderColor(resolved, 'fg'),
+    background: RenderColor(resolved, 'bg'), special: RenderColor(resolved, 'sp')}
+  for attribute in ['bold', 'italic', 'underline', 'undercurl', 'strikethrough', 'reverse']
+    style[attribute] = synIDattr(resolved, attribute, 'gui') ==# '1'
+  endfor
+  renderStyles[key] = style
+  return style
+enddef
+
+def MergeRenderStyle(base: dict<any>, overlay: dict<any>): dict<any>
+  var result = copy(base)
+  for name in ['foreground', 'background', 'special']
+    if type(get(overlay, name, v:null)) == v:t_number
+      result[name] = overlay[name]
+    endif
+  endfor
+  for name in ['bold', 'italic', 'underline', 'undercurl', 'strikethrough', 'reverse']
+    result[name] = get(base, name, false) || get(overlay, name, false)
+  endfor
+  return result
+enddef
+
+def RefreshRenderTheme()
+  if !renderEnabled
+    return
+  endif
+  # :highlight may run without ColorScheme. The low-rate reconciliation and
+  # command-mode transitions also catch those changes, including linked groups.
+  var key = string([&background, hlget(), v:colornames])
+  if key !=# renderThemeKey
+    renderThemeKey = key
+    renderBaseKey = ''
+    renderStyles = {}
+    renderNormal = {}
+    renderNormal = copy(RenderStyle(hlID('Normal')))
+    if type(renderNormal.foreground) != v:t_number
+      renderNormal.foreground = &background ==# 'light' ? 0x24292f : 0xd8dee9
+    endif
+    if type(renderNormal.background) != v:t_number
+      renderNormal.background = &background ==# 'light' ? 0xffffff : 0x20242c
+    endif
+  endif
+enddef
+
+def RenderFallback(): string
+  if winnr('$') != 1
+    return 'Vim split windows use the compatibility view'
+  elseif &buftype !=# ''
+    return 'This special Vim buffer uses the compatibility view'
+  elseif mode(1) !~# '^[nivVR\x16]'
+    return 'Vim command, prompt or terminal input uses the compatibility view'
+  elseif pumvisible() || !empty(filter(popup_list(), (_, id) => get(popup_getpos(id), 'visible', 0)))
+    return 'Vim completion and popup windows use the compatibility view'
+  elseif &diff || &rightleft || &arabic || &spell || &list || &conceallevel > 0 || &cursorcolumn
+    return 'This Vim display option needs the compatibility view'
+  elseif get(winsaveview(), 'coladd', 0) > 0
+      || (index(['v', 'V', "\<C-V>"], mode(1)) >= 0 && getpos('v')[3] > 0)
+    return 'Vim virtual-space cursor and selections use the compatibility view'
+  elseif &foldcolumn != 0
+    return 'Vim fold columns use the compatibility view'
+  elseif !empty(getmatches())
+    return 'Vim match decorations use the compatibility view'
+  elseif &hlsearch && v:hlsearch && @/ =~# '\\[_%zn]'
+    return 'Multiline and positional Vim searches use the compatibility view'
+  endif
+  return ''
+enddef
+
+def RenderSigns(first: number, last: number): dict<any>
+  var result: dict<any> = {}
+  var placed = get(sign_getplaced(bufnr(), {group: '*'}), 0, {signs: []}).signs
+  for sign in placed
+    if sign.lnum < first || sign.lnum > last
+      continue
+    endif
+    var definition = get(sign_getdefined(sign.name), 0, {})
+    var key = string(sign.lnum)
+    if !has_key(result, key) || sign.priority > result[key].priority
+      result[key] = extend(copy(definition), {priority: sign.priority})
+    elseif sign.priority == result[key].priority
+      # Vim combines equal-priority text and line-highlight signs.
+      extend(result[key], definition, 'keep')
+    endif
+  endfor
+  return result
+enddef
+
+def RenderSearchRanges(text: string): list<list<number>>
+  var ranges: list<list<number>> = []
+  if !&hlsearch || !v:hlsearch || empty(@/)
+    return ranges
+  endif
+  # matchstrpos() uses the same Vim regex engine. Explicit \c/\C inside the
+  # pattern retain their usual precedence over the search option defaults.
+  var pattern = (&ignorecase && !(&smartcase && @/ =~# '\u') ? '\c' : '\C') .. @/
+  var offset = 0
+  while offset <= strlen(text) && len(ranges) < 512
+    var found = matchstrpos(text, pattern, offset)
+    if found[1] < 0
+      break
+    endif
+    if found[1] == found[2]
+      throw 'Zero-width Vim search highlights use the compatibility view'
+    endif
+    add(ranges, [found[1], max([found[1] + 1, found[2]])])
+    offset = found[2] > found[1] ? found[2] : found[1] + 1
+  endwhile
+  return ranges
+enddef
+
+def AddRenderRun(runs: list<dict<any>>, glyph: dict<any>, style: dict<any>)
+  var run = copy(glyph)
+  run.style = style
+  # ASCII shaping may be batched. A non-ASCII grapheme always keeps its own
+  # Vim-owned display advance, preventing fallback fonts from moving neighbors.
+  var ascii = strlen(run.text) == strchars(run.text) && run.text =~# '^[\x20-\x7e]*$'
+  if !empty(runs) && ascii
+    var previous = runs[-1]
+    if previous.row == run.row && previous.column + previous.cells == run.column
+        && previous.line == run.line && previous.byte_end == run.byte_start
+        && previous.style == style && strlen(previous.text) == strchars(previous.text)
+        && previous.text =~# '^[\x20-\x7e]*$'
+      previous.text ..= run.text
+      previous.cells += run.cells
+      previous.byte_end = run.byte_end
+      return
+    endif
+  endif
+  remove(run, 'virtual_column')
+  if has_key(run, 'override_style')
+    remove(run, 'override_style')
+  endif
+  if has_key(run, 'plain')
+    remove(run, 'plain')
+  endif
+  add(runs, run)
+enddef
+
+def RenderSelectionSegments(glyph: dict<any>, visual: string, anchor: list<number>, current: list<number>, block: list<number>): list<dict<any>>
+  if empty(visual) || visual ==# 'V' || !glyph.plain || glyph.cells <= 1
+    return [glyph]
+  endif
+  var cuts = [0, glyph.cells]
+  if visual ==# "\<C-V>"
+    for column in block
+      add(cuts, max([0, min([glyph.cells, column - glyph.virtual_column])]))
+    endfor
+  else
+    for position in [anchor, current]
+      if position[1] == glyph.line
+        var column = position[2] - 1 - glyph.byte_start
+        add(cuts, max([0, min([glyph.cells, column])]))
+        add(cuts, max([0, min([glyph.cells, column + 1])]))
+      endif
+    endfor
+  endif
+  cuts = uniq(sort(cuts, 'n'))
+  var result: list<dict<any>> = []
+  for index in range(len(cuts) - 1)
+    var start = cuts[index]
+    var count = cuts[index + 1] - start
+    if count > 0
+      var part = copy(glyph)
+      part.text = strpart(glyph.text, start, count)
+      part.column += start
+      part.virtual_column += start
+      part.cells = count
+      part.byte_start += start
+      part.byte_end = part.byte_start + count
+      add(result, part)
+    endif
+  endfor
+  return result
+enddef
+
+def RenderSelected(glyph: dict<any>, visual: string, anchor: list<number>, current: list<number>, block: list<number>): bool
+  if empty(visual) || glyph.line == 0
+    return false
+  endif
+  var lowLine = min([anchor[1], current[1]])
+  var highLine = max([anchor[1], current[1]])
+  if glyph.line < lowLine || glyph.line > highLine
+    return false
+  endif
+  if visual ==# 'V'
+    return true
+  elseif visual ==# "\<C-V>"
+    return glyph.virtual_column < block[1]
+      && glyph.virtual_column + glyph.cells > block[0]
+  endif
+  var forward = anchor[1] < current[1] || (anchor[1] == current[1] && anchor[2] <= current[2])
+  var first = forward ? anchor : current
+  var last = forward ? current : anchor
+  if (glyph.line == first[1] && glyph.byte_end <= first[2] - 1)
+      || (glyph.line == last[1] && glyph.byte_start > last[2] - 1)
+    return false
+  endif
+  if &selection ==# 'exclusive' && glyph.line == current[1]
+      && glyph.byte_start <= current[2] - 1 && glyph.byte_end > current[2] - 1
+    return false
+  endif
+  return true
+enddef
+
+def RenderFrame(): dict<any>
+  var info = getwininfo(win_getid())[0]
+  var view = {row: info.winrow - 1, column: info.wincol - 1,
+    rows: info.height, columns: info.width}
+  var frame: dict<any> = {event: 'render', supported: true, fallback_reason: '',
+    rows: &lines, columns: &columns, window: win_getid(), buffer: bufnr(),
+    changedtick: b:changedtick, mode: mode(1), view: view,
+    default_style: renderNormal, cursor: {row: 0, column: 0, width: 1, visible: false}, runs: []}
+  var reason = RenderFallback()
+  if !empty(reason)
+    frame.supported = false
+    frame.fallback_reason = reason
+    return frame
+  endif
+  var savedView = winsaveview()
+  var first = line('w0')
+  var last = line('w$')
+  if view.rows > 200 || view.columns > 400 || last - first > 200
+    frame.supported = false
+    frame.fallback_reason = 'This viewport exceeds the bounded native paint budget'
+    return frame
+  endif
+  var textWidth = view.columns - info.textoff
+  if textWidth < 1
+    frame.supported = false
+    frame.fallback_reason = 'This Vim window has no visible text columns'
+    return frame
+  endif
+  var numberWidth = (&number || &relativenumber)
+    ? max([&numberwidth, strlen(string(line('$'))) + 1]) : 0
+  var signWidth = info.textoff - numberWidth
+  var signs = RenderSigns(first, last)
+  if !empty(signs) && (signWidth > 2 || signWidth < 0)
+    frame.supported = false
+    frame.fallback_reason = 'Multiple Vim sign columns use the compatibility view'
+    return frame
+  endif
+  for sign in values(signs)
+    var signText = get(sign, 'text', '')
+    if !empty(get(sign, 'icon', '')) || strdisplaywidth(signText) > 2
+        || signText =~# '[\x00-\x1f\x7f]'
+      frame.supported = false
+      frame.fallback_reason = 'This image or complex Vim sign uses the compatibility view'
+      return frame
+    endif
+  endfor
+  # Opening/closing a fold does not change b:changedtick. Check its display
+  # state independently of the buffer/syntax cache on every paint attempt.
+  for lineNumber in range(first, last)
+    if foldclosed(lineNumber) >= 0
+      frame.supported = false
+      frame.fallback_reason = 'Closed Vim folds use the compatibility view'
+      return frame
+    endif
+  endfor
+  var properties = prop_list(first, {end_lnum: last})
+  if len(properties) > 2048
+    frame.supported = false
+    frame.fallback_reason = 'This property list exceeds the bounded native paint budget'
+    return frame
+  endif
+  for property in properties
+    if has_key(property, 'text') || property.col <= 0
+      frame.supported = false
+      frame.fallback_reason = 'Vim virtual text uses the compatibility view'
+      return frame
+    endif
+    var propertyType = get(property, 'type', '')
+    var typeBuffer = get(property, 'type_bufnr', 0)
+    property.definition = empty(propertyType) ? {}
+      : (typeBuffer > 0 ? prop_type_get(propertyType, {bufnr: typeBuffer}) : prop_type_get(propertyType))
+  endfor
+  var baseKey = string([bufnr(), b:changedtick, first, last, savedView.leftcol,
+    view, info.textoff, &tabstop, &vartabstop, &wrap, &syntax, &synmaxcol,
+    &number, &relativenumber, &numberwidth, &ambiwidth, renderThemeKey,
+    &hlsearch, v:hlsearch, @/, &ignorecase, &smartcase, properties])
+  if baseKey !=# renderBaseKey
+    renderBase = []
+    for lineNumber in range(first, last)
+      var text = getline(lineNumber)
+      if foldclosed(lineNumber) >= 0
+        reason = 'Closed Vim folds use the compatibility view'
+        break
+      elseif strlen(text) > 16384 || strchars(text) > 4096
+        reason = 'This long line exceeds the bounded native paint budget'
+        break
+      elseif &wrap && strdisplaywidth(text) > textWidth
+        reason = 'Wrapped Vim continuation rows use the compatibility view'
+        break
+      elseif text =~# '[\x00-\x08\x0a-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
+        reason = 'Control and bidirectional text use the compatibility view'
+        break
+      endif
+      var row = view.row + lineNumber - first
+      var searchRanges = RenderSearchRanges(text)
+      var lineProperties = filter(copy(properties), (_, item) => item.lnum == lineNumber)
+      if len(lineProperties) > 128
+        reason = 'This line exceeds the native property paint budget'
+        break
+      endif
+      var byteColumn = 0
+      var virtualColumn = 0
+      var asciiLine = strlen(text) == strchars(text)
+      for charIndex in range(strchars(text, true))
+        var cluster = asciiLine ? strpart(text, charIndex, 1) : strcharpart(text, charIndex, 1, true)
+        var plain = strlen(cluster) == 1 && cluster !=# "\t"
+        var cells = plain ? 1 : strdisplaywidth(cluster, virtualColumn)
+        var nextByte = byteColumn + strlen(cluster)
+        var start = virtualColumn - savedView.leftcol
+        var finish = start + cells
+        if finish > 0 && start < textWidth
+          if cells <= 0 || ((start < 0 || finish > textWidth) && cluster !=# "\t")
+            reason = 'A clipped or zero-width Vim glyph uses the compatibility view'
+            break
+          endif
+          var visibleStart = max([0, start])
+          var visibleEnd = min([textWidth, finish])
+          var style = RenderStyle(synID(lineNumber, byteColumn + 1, true))
+          var propertyStyle: dict<any> = {}
+          var propertyPriority = -2147483648
+          var propertyOverride = false
+          var propertyCombine = true
+          for property in lineProperties
+            var definition = property.definition
+            var priority = get(definition, 'priority', 0)
+            if byteColumn < property.col - 1 + property.length && nextByte > property.col - 1
+                && priority > propertyPriority && !empty(get(definition, 'highlight', ''))
+              propertyStyle = RenderStyle(hlID(definition.highlight))
+              propertyPriority = priority
+              propertyOverride = !!get(definition, 'override', false)
+              propertyCombine = !!get(definition, 'combine', true)
+            endif
+          endfor
+          if !empty(propertyStyle)
+            style = propertyCombine ? MergeRenderStyle(style, propertyStyle) : copy(propertyStyle)
+          endif
+          for matchRange in searchRanges
+            if byteColumn < matchRange[1] && nextByte > matchRange[0]
+              style = MergeRenderStyle(style, RenderStyle(hlID('Search')))
+              break
+            endif
+          endfor
+          var previous = empty(renderBase) ? {} : renderBase[-1]
+          if plain && !empty(previous) && previous.plain && previous.row == row
+              && previous.byte_end == byteColumn && previous.style == style
+              && previous.column + previous.cells == view.column + info.textoff + visibleStart
+              && previous.override_style == (propertyOverride ? propertyStyle : {})
+            previous.text ..= cluster
+            previous.cells += 1
+            previous.byte_end = nextByte
+          else
+            add(renderBase, {row: row, column: view.column + info.textoff + visibleStart,
+              text: cluster ==# "\t" ? repeat(' ', visibleEnd - visibleStart) : cluster,
+              cells: visibleEnd - visibleStart, line: lineNumber,
+              byte_start: byteColumn, byte_end: nextByte,
+              virtual_column: virtualColumn, plain: plain,
+              style: style, override_style: propertyOverride ? propertyStyle : {}})
+          endif
+        endif
+        byteColumn = nextByte
+        virtualColumn += cells
+        if virtualColumn >= savedView.leftcol + textWidth
+          break
+        endif
+      endfor
+      if !empty(reason)
+        break
+      endif
+    endfor
+    if empty(reason)
+      renderBaseKey = baseKey
+    endif
+  endif
+  if !empty(reason)
+    renderBaseKey = ''
+    frame.supported = false
+    frame.fallback_reason = reason
+    return frame
+  endif
+  var visual = mode(1)
+  if index(['v', 'V', "\<C-V>"], visual) < 0
+    visual = ''
+  endif
+  var anchor = getpos('v')
+  var current = getpos('.')
+  var block = [0, 0]
+  if visual ==# "\<C-V>"
+    var a = virtcol('v', true)
+    var c = virtcol('.', true)
+    block = [min([a[0], c[0]]) - 1, max([a[1], c[1]])]
+    if &selection ==# 'exclusive' && c[0] > a[0]
+      block[1] = c[0] - 1
+    endif
+  endif
+  var visualStyle = RenderStyle(hlID('Visual'))
+  var cursorLineStyle = RenderStyle(hlID('CursorLine'))
+  var rowStyles: dict<dict<any>> = {}
+  for lineNumber in range(first, last)
+    var sign = get(signs, string(lineNumber), {})
+    var lineStyle: dict<any> = {}
+    if !empty(get(sign, 'linehl', ''))
+      lineStyle = RenderStyle(hlID(sign.linehl))
+    endif
+    var lineCursor = &cursorline && lineNumber == line('.') && &cursorlineopt =~# '\<\(screenline\|line\)\>'
+    if lineCursor
+      lineStyle = get(sign, 'priority', 0) >= 100
+        ? MergeRenderStyle(cursorLineStyle, lineStyle) : MergeRenderStyle(lineStyle, cursorLineStyle)
+    endif
+    if !empty(lineStyle)
+      rowStyles[string(lineNumber)] = lineStyle
+      add(frame.runs, {row: view.row + lineNumber - first, column: view.column + info.textoff,
+        cells: textWidth, text: repeat(' ', textWidth), line: lineNumber,
+        byte_start: 0, byte_end: 0, style: MergeRenderStyle(renderNormal, lineStyle)})
+    endif
+  endfor
+  for baseGlyph in renderBase
+    if visual ==# "\<C-V>" && strpart(getline(baseGlyph.line), baseGlyph.byte_start, baseGlyph.byte_end - baseGlyph.byte_start) ==# "\t"
+      frame.supported = false
+      frame.fallback_reason = 'Block selections through Vim tabs use the compatibility view'
+      frame.runs = []
+      return frame
+    endif
+    for glyph in empty(visual) ? [baseGlyph] : RenderSelectionSegments(baseGlyph, visual, anchor, current, block)
+      var style = MergeRenderStyle(renderNormal, glyph.style)
+      if has_key(rowStyles, string(glyph.line))
+        style = MergeRenderStyle(style, rowStyles[string(glyph.line)])
+      endif
+      if !empty(visual) && RenderSelected(glyph, visual, anchor, current, block)
+        style = MergeRenderStyle(style, visualStyle)
+      endif
+      if !empty(glyph.override_style)
+        style = MergeRenderStyle(style, glyph.override_style)
+      endif
+      AddRenderRun(frame.runs, glyph, style)
+    endfor
+  endfor
+  # Vim selects one display cell for the newline, including an empty buffer
+  # line. Painting only existing glyphs would silently erase that selection.
+  if visual ==# 'V' || visual ==# 'v'
+    var lowLine = min([anchor[1], current[1]])
+    var highLine = max([anchor[1], current[1]])
+    for lineNumber in range(max([first, lowLine]), min([last, highLine]))
+      var text = getline(lineNumber)
+      var endColumn = strdisplaywidth(text) - savedView.leftcol
+      if endColumn >= 0 && endColumn < textWidth
+          && (visual ==# 'V' || lineNumber < highLine
+            || max([anchor[2], current[2]]) > strlen(text))
+        var endStyle = MergeRenderStyle(renderNormal, visualStyle)
+        add(frame.runs, {row: view.row + lineNumber - first,
+          column: view.column + info.textoff + endColumn,
+          text: ' ', cells: 1, line: lineNumber,
+          byte_start: strlen(text), byte_end: strlen(text), style: endStyle})
+      endif
+    endfor
+  endif
+  for lineNumber in range(first, last)
+    var sign = get(signs, string(lineNumber), {})
+    var signText = get(sign, 'text', '')
+    var signHighlight = &cursorline && lineNumber == line('.') && !empty(get(sign, 'culhl', ''))
+      ? sign.culhl : get(sign, 'texthl', '')
+    if signWidth > 0
+      var columnStyle = MergeRenderStyle(renderNormal,
+        RenderStyle(hlID(&cursorline && lineNumber == line('.') ? 'CursorLineSign' : 'SignColumn')))
+      var label = signText .. repeat(' ', max([0, signWidth - strdisplaywidth(signText)]))
+      add(frame.runs, {row: view.row + lineNumber - first, column: view.column,
+        text: label, cells: signWidth, line: 0, byte_start: 0, byte_end: 0,
+        style: empty(signHighlight) ? columnStyle : MergeRenderStyle(columnStyle, RenderStyle(hlID(signHighlight)))})
+    endif
+    if &number || &relativenumber
+      var number = &relativenumber && (lineNumber != line('.') || !&number)
+        ? abs(lineNumber - line('.')) : lineNumber
+      var label = printf('%*d ', max([1, numberWidth - 1]), number)
+      var style = MergeRenderStyle(renderNormal,
+        RenderStyle(hlID(lineNumber == line('.') ? 'CursorLineNr' : 'LineNr')))
+      if !empty(get(sign, 'numhl', ''))
+        style = MergeRenderStyle(style, RenderStyle(hlID(sign.numhl)))
+      endif
+      if &signcolumn ==# 'number' && !empty(signText)
+        label = repeat(' ', max([0, numberWidth - strdisplaywidth(signText) - 1])) .. signText .. ' '
+        if !empty(signHighlight)
+          style = MergeRenderStyle(style, RenderStyle(hlID(signHighlight)))
+        endif
+      endif
+      add(frame.runs, {row: view.row + lineNumber - first, column: view.column + max([0, signWidth]),
+        text: label, cells: strdisplaywidth(label), line: 0, byte_start: 0, byte_end: 0,
+        style: style})
+    endif
+  endfor
+  for row in range(view.row + last - first + 1, view.row + view.rows - 1)
+    add(frame.runs, {row: row, column: view.column, text: '~', cells: 1,
+      line: 0, byte_start: 0, byte_end: 0,
+      style: MergeRenderStyle(renderNormal, RenderStyle(hlID('EndOfBuffer')))})
+  endfor
+  var position = screenpos(win_getid(), line('.'), col('.'))
+  if get(position, 'row', 0) > 0 && get(position, 'curscol', 0) > 0
+    frame.cursor = {row: position.row - 1, column: position.curscol - 1,
+      width: max([1, position.endcol - position.curscol + 1]), visible: true}
+  endif
+  return frame
+enddef
+
+def EmitRender(force: bool = false)
+  if !renderEnabled || !authenticated || shuttingDown || ch_status(bridge) !=# 'open'
+    return
+  endif
+  try
+    var frame = RenderFrame()
+    var encoded = json_encode(frame)
+    if strlen(encoded) > 900000
+      frame.supported = false
+      frame.fallback_reason = 'Native paint data exceeds the bounded frame budget'
+      frame.runs = []
+      encoded = json_encode(frame)
+    endif
+    if force || encoded !=# previousRender
+      previousRender = encoded
+      renderRevision += 1
+      frame.revision = renderRevision
+      Send(frame)
+    endif
+  catch
+    # Rendering must never break actual editing or disconnect metadata/actions.
+    renderBaseKey = ''
+    renderRevision += 1
+    Send({event: 'render', revision: renderRevision, supported: false,
+      rows: &lines, columns: &columns, fallback_reason: 'Native paint unavailable: ' .. strcharpart(v:exception, 0, 512)})
+  endtry
+enddef
+
+def FlushRender(_: number)
+  renderTimer = -1
+  EmitRender()
+enddef
+
+def RenderChanged()
+  if renderEnabled && authenticated && !shuttingDown && renderTimer < 0
+    renderTimer = timer_start(16, FlushRender)
+  endif
+enddef
+
+def RenderThemeChanged()
+  RefreshRenderTheme()
+  RenderChanged()
 enddef
 
 def Kind(value: string): string
@@ -313,6 +896,7 @@ def Flush(_: number)
 enddef
 
 def Changed()
+  RenderChanged()
   if authenticated && !shuttingDown && flushTimer < 0
     flushTimer = timer_start(40, Flush)
   endif
@@ -322,6 +906,8 @@ def Poll(_: number)
   # setqflist() itself has no QuickFixCmdPost event.  This bounded, low-rate
   # reconciliation also observes plugin capabilities loaded after VimEnter.
   EmitState()
+  RefreshRenderTheme()
+  EmitRender()
 enddef
 
 def LspDiagnosticsChanged()
@@ -731,8 +1317,32 @@ enddef
 
 def Dispatch(request: dict<any>, id: number)
   var action = RequiredString(request, 'action', 64)
-  if action ==# 'snapshot'
+  if action ==# 'set_render'
+    var enabled: any = get(request, 'enabled', v:null)
+    if type(enabled) != v:t_bool
+      throw 'set_render requires a Boolean enabled value'
+    endif
+    renderEnabled = enabled
+    if renderEnabled
+      # Terminal Vim may retain GUI color names instead of resolving fg# to
+      # hex. Use Vim's own customizable name table; never a terminal palette.
+      runtime! colors/lists/default.vim
+      RefreshRenderTheme()
+      EmitRender(true)
+    else
+      previousRender = ''
+      renderBaseKey = ''
+      renderBase = []
+      if renderTimer >= 0
+        timer_stop(renderTimer)
+        renderTimer = -1
+      endif
+      Send({event: 'render_disabled'})
+    endif
+  elseif action ==# 'snapshot'
     EmitState(true)
+    RefreshRenderTheme()
+    EmitRender()
   elseif action ==# 'build'
     StartBuild(request)
   elseif action ==# 'cancel_build'
@@ -926,6 +1536,10 @@ def Disconnected(_: channel)
     timer_stop(pollTimer)
     pollTimer = -1
   endif
+  if renderTimer >= 0
+    timer_stop(renderTimer)
+    renderTimer = -1
+  endif
 enddef
 
 def Leaving()
@@ -949,6 +1563,8 @@ augroup JTermVim9Bridge
   autocmd BufLeave * RememberView()
   autocmd BufWipeout * ForgetView(str2nr(expand('<abuf>')))
   autocmd TextChanged,TextChangedI,TextChangedP,CursorMoved,CursorMovedI,ModeChanged * Changed()
+  autocmd ModeChanged,ColorScheme * RenderThemeChanged()
+  autocmd WinScrolled,VimResized,OptionSet * RenderChanged()
   autocmd QuickFixCmdPost * Changed()
   autocmd User LspDiagsUpdated,LspAttached,LspDetached LspDiagnosticsChanged()
   autocmd VimLeavePre * Leaving()

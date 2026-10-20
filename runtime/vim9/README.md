@@ -1,8 +1,10 @@
 # Vim9 native editor runtime
 
-`bridge.vim` runs inside an actual Vim 9 editor. The terminal frontend renders
-Vim's PTY output and sends normal keyboard input to the PTY. This runtime
-provides a separate native Vim channel for metadata and explicit IDE actions.
+`bridge.vim` runs inside an actual Vim 9 editor. The frontend sends normal
+keyboard input to the PTY. Its separate authenticated native Vim channel
+provides metadata, explicit IDE actions and opt-in GUI buffer paint frames.
+Supported buffer text is rendered from those frames with GUI colors; PTY
+output remains the live compatibility surface for unsupported Vim displays.
 Vim continues to own editing, undo, registers, mappings, macros, windows,
 completion and plugins; there is no second copy of the document in this bridge.
 
@@ -98,7 +100,8 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | `format` | None | `:LspFormat` |
 | `next_diagnostic` | None | Native `:cnext` |
 | `previous_diagnostic` | None | Native `:cprevious` |
-| `snapshot` | None | Force a current state publication |
+| `set_render` | Boolean `enabled` | Subscribe/unsubscribe to native GUI buffer paint frames after the session is connected |
+| `snapshot` | None | Force a current metadata state and reconcile the subscribed native paint frame |
 | `quit` | None | Native `:qall` without `!`; acknowledge from `VimLeavePre` once Vim accepts exit |
 
 Requests are limited to 64 KiB. Unknown actions, invalid types, invalid buffer
@@ -106,6 +109,62 @@ ids and nonpositive positions receive an error. Filenames are passed through
 `fnameescape()`; filenames containing newlines are not supported. A file that
 already has a buffer is matched by its exact absolute name, avoiding Vim's
 pattern-based buffer lookup fallback.
+
+### Native GUI buffer frames
+
+The protocol is backwards compatible: no `render` events are produced before
+an authenticated host sends `{"id":3,"action":"set_render","enabled":true}`.
+In Rust, wait for `snapshot().connected`, send `Vim9Command::SetRender`, then use
+`render_snapshot()` to cheaply read `Option<Arc<Vim9RenderFrame>>`. The same Arc
+is available as `snapshot().render`. Turning the subscription off publishes
+`render_disabled`; disconnect clears the retained frame as well.
+
+Each `render` event has the following fields, in addition to `event`, `seq`
+and `protocol`:
+
+| Field | Meaning |
+| --- | --- |
+| `revision` | Increasing native paint revision; older revisions cannot replace newer retained frames |
+| `supported`, `fallback_reason` | Whether the host can draw this state; otherwise show the actual Vim compatibility view immediately |
+| `buffer`, `window`, `changedtick`, `mode` | Vim-owned identities and editing state; metadata transitions cannot keep another buffer's native frame |
+| `rows`, `columns` | PTY screen dimensions used to produce this paint frame |
+| `view` | `{row,column,rows,columns}` for the exact single-window opaque paint rectangle, including number gutters; command/status rows are outside |
+| `cursor` | `{row,column,width,visible}`, using Vim's real screen position and wide-character width |
+| `default_style` | GUI Normal style, with explicit light/dark RGB fallback only when Normal has no GUI color |
+| `runs` | Bounded native glyph runs with `row`, `column`, `text`, `cells`, `style`, `line`, `byte_start`, `byte_end` |
+
+Screen row/column positions are **zero-based**. A run's `line` is a one-based
+buffer line, or zero for gutter/end-of-buffer decoration. Byte ranges are
+zero-based, half-open UTF-8 offsets into the original buffer line. Tab text is
+expanded to spaces while its byte range continues to refer to the original
+tab. Non-ASCII graphemes, including a base character and combining marks, stay
+in individual runs; adjacent ASCII with the same style may be combined for
+GUI shaping. Hosts must respect `cells` and cannot independently reflow text
+while continuing to use Vim's input coordinates.
+
+Styles contain nullable packed `0xRRGGBB` `foreground`, `background` and
+`special`, plus Boolean `bold`, `italic`, `underline`, `undercurl`,
+`strikethrough` and `reverse`. Highlight links are resolved in Vim and values
+come from `synIDattr(..., 'gui')`. Vim's own `v:colornames` table resolves named
+GUI colors. `ctermfg`, `ctermbg`, terminal escape sequences and terminal
+palettes are not consulted. Visual selection and supported Search/text-property
+highlights are already composed into the run style.
+
+Native paint is driven by a separate 16 ms input/view coalescer. Buffer glyphs
+and syntax styles are reused when buffer contents and view inputs are
+unchanged; direct `:highlight` changes, property changes and linked groups are
+reconciled too. Neither the 40 ms metadata coalescer nor 750 ms idle poll is the
+primary typing paint path. A supported frame is bounded to 200 rows, 400
+columns, 4,096 characters/16 KiB per source line, 2,048 visible text properties
+and 900,000 JSON bytes. Unsupported or oversized frames contain a reason and
+no misleading partial native document. The receiver enforces its 1 MiB frame
+limit and validates geometry, RGB values and run text before retaining an Arc.
+
+See [the native buffer display guide](../../docs/vim9-ide.md#native-buffer-display)
+for the precise supported feature set and compatibility cases. The protocol
+does not claim a full external-UI replacement for every Vim plugin/display
+feature, and the bridge never changes wrap, conceal or other editing options
+to conceal an unsupported case.
 
 GUI file/buffer navigation remembers and restores each buffer's native
 `winsaveview()` cursor and scroll position. New-file `BufRead`/`BufEnter` hooks

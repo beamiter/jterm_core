@@ -1,8 +1,9 @@
 //! A native Vim 9 editor session shared by the four terminal workbenches.
 //!
 //! The frontend owns a real PTY; Vim owns all text, undo, modes and buffers.
-//! This module only transports a small typed command vocabulary and published
-//! editor state. It never interprets terminal output as an editor command.
+//! This module transports a small typed command vocabulary, editor state and
+//! opt-in buffer-origin GUI paint frames. It never reconstructs the document,
+//! GUI colors or editor commands from terminal output.
 
 use std::collections::HashSet;
 use std::fs;
@@ -22,6 +23,12 @@ use serde_json::{json, Value};
 #[path = "vim9_project.rs"]
 mod project;
 pub use project::{Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot};
+
+#[path = "vim9_render.rs"]
+mod render;
+pub use render::{
+    Vim9RenderCursor, Vim9RenderFrame, Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle,
+};
 
 const PROTOCOL: u64 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
@@ -186,6 +193,11 @@ pub struct Vim9Snapshot {
     pub pending: usize,
     pub buffers_truncated: bool,
     pub diagnostics_truncated: bool,
+    /// Independently published native buffer paint data. Cloning a metadata
+    /// snapshot does not copy the visible text. Only authenticated render
+    /// events may populate this field, never a metadata JSON property.
+    #[serde(skip)]
+    pub render: Option<Arc<Vim9RenderFrame>>,
 }
 
 /// Only these operations can cross the host/editor boundary. In particular
@@ -249,6 +261,11 @@ pub enum Vim9Command {
     Format,
     NextDiagnostic,
     PreviousDiagnostic,
+    /// Subscribe to buffer-origin GUI paint frames, independently of PTY
+    /// output. Existing hosts remain unchanged until they explicitly opt in.
+    SetRender {
+        enabled: bool,
+    },
     Snapshot,
     Quit,
 }
@@ -437,6 +454,12 @@ impl Vim9Session {
         self.0.shared.lock().snapshot.clone()
     }
 
+    /// Cheap access for a frame-rate native paint loop; does not clone the
+    /// buffer list, diagnostics, search results or build output.
+    pub fn render_snapshot(&self) -> Option<Arc<Vim9RenderFrame>> {
+        self.0.shared.lock().snapshot.render.clone()
+    }
+
     pub fn clear_error(&self) {
         self.0.shared.lock().snapshot.error = None;
     }
@@ -596,6 +619,7 @@ pub fn list_project_directory(path: &Path) -> io::Result<Vec<ProjectEntry>> {
 fn set_disconnected(shared: &Mutex<Shared>, error: Option<String>) {
     let mut shared = shared.lock();
     shared.snapshot.connected = false;
+    shared.snapshot.render = None;
     shared.snapshot.pending = 0;
     shared.pending.clear();
     if let Some(error) = error {
@@ -775,11 +799,38 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             snapshot.connected = true;
             snapshot.pending = shared.pending.len();
             snapshot.error = shared.snapshot.error.take();
+            snapshot.render = shared.snapshot.render.take();
+            if snapshot.render.as_ref().is_some_and(|frame| {
+                frame.mode != snapshot.mode
+                    || snapshot
+                        .buffers
+                        .iter()
+                        .find(|buffer| buffer.current)
+                        .is_some_and(|buffer| buffer.id != frame.buffer)
+            }) {
+                snapshot.render = None;
+            }
             if snapshot.root.is_empty() {
                 snapshot.root.clone_from(&shared.snapshot.root);
             }
             shared.snapshot = snapshot;
         }
+        Some("render") => {
+            let frame: Vim9RenderFrame = serde_json::from_value(value).map_err(io::Error::other)?;
+            if !frame.valid() {
+                return Err(invalid("Invalid native Vim buffer paint frame"));
+            }
+            let mut shared = shared.lock();
+            if shared
+                .snapshot
+                .render
+                .as_ref()
+                .is_none_or(|previous| frame.revision > previous.revision)
+            {
+                shared.snapshot.render = Some(Arc::new(frame));
+            }
+        }
+        Some("render_disabled") => shared.lock().snapshot.render = None,
         Some("response") => {
             let id = value
                 .get("id")
@@ -903,6 +954,92 @@ mod tests {
                 "a;$(touch NO)|b"
             ]
         );
+    }
+
+    #[test]
+    fn native_render_frames_keep_rgb_identity_and_arc_ownership() {
+        let shared = Mutex::new(Shared {
+            snapshot: Vim9Snapshot {
+                connected: true,
+                ..Default::default()
+            },
+            pending: HashSet::new(),
+        });
+        let frame = json!({
+            "event":"render", "revision":2, "supported":true, "mode":"n",
+            "rows":30, "columns":120, "window":1000, "buffer":1,
+            "view":{"row":0,"column":0,"rows":29,"columns":120},
+            "default_style":{"foreground":0x12ab34,"background":0x253647},
+            "runs":[{"row":0,"column":0,"text":"界","cells":2,"line":1,
+                "byte_start":0,"byte_end":3,"style":{"foreground":0x12ab34,"undercurl":true,"special":0xedab19}}]
+        });
+        apply_event(frame.clone(), &shared).unwrap();
+        let native = shared.lock().snapshot.render.clone().unwrap();
+        assert_eq!(native.runs[0].style.foreground, Some(0x12ab34));
+        assert_eq!(native.runs[0].cells, 2);
+        apply_event(
+            json!({"event":"state","mode":"n","buffers":[{"id":1,"current":true}]}),
+            &shared,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &native,
+            shared.lock().snapshot.render.as_ref().unwrap()
+        ));
+        let mut stale = frame.clone();
+        stale["revision"] = 1.into();
+        stale["runs"][0]["text"] = "old".into();
+        apply_event(stale, &shared).unwrap();
+        assert_eq!(
+            shared.lock().snapshot.render.as_ref().unwrap().runs[0].text,
+            "界"
+        );
+        apply_event(
+            json!({"event":"state","mode":"n","buffers":[{"id":2,"current":true}]}),
+            &shared,
+        )
+        .unwrap();
+        assert!(
+            shared.lock().snapshot.render.is_none(),
+            "never paint another buffer's text"
+        );
+        apply_event(frame, &shared).unwrap();
+        set_disconnected(&shared, None);
+        assert!(shared.lock().snapshot.render.is_none());
+        let bytes = Vim9Command::SetRender { enabled: true }.frame(8).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["action"],
+            "set_render"
+        );
+    }
+
+    #[test]
+    fn native_render_rejects_invalid_geometry_colors_and_embedded_control_text() {
+        let shared = Mutex::new(Shared {
+            snapshot: Vim9Snapshot::default(),
+            pending: HashSet::new(),
+        });
+        let frame = json!({"event":"render","revision":1,"supported":true,
+            "rows":30,"columns":120,"window":1000,"buffer":1,
+            "view":{"row":0,"column":0,"rows":29,"columns":120},
+            "runs":[{"row":0,"column":119,"text":"x","cells":1,"line":1,
+                "byte_start":0,"byte_end":1,"style":{"foreground":0x123456}}]});
+        for (name, value) in [
+            ("column", json!(120)),
+            ("cells", json!(usize::MAX)),
+            ("text", json!("\u{1b}[31m")),
+        ] {
+            let mut malformed = frame.clone();
+            malformed["runs"][0][name] = value;
+            assert!(apply_event(malformed, &shared).is_err(), "{name}");
+        }
+        let mut invalid_color = frame.clone();
+        invalid_color["runs"][0]["style"]["foreground"] = json!(0x1000000);
+        assert!(apply_event(invalid_color, &shared).is_err());
+        assert!(shared.lock().snapshot.render.is_none());
+        apply_event(frame, &shared).unwrap();
+        apply_event(json!({"event":"render_disabled"}), &shared).unwrap();
+        assert!(shared.lock().snapshot.render.is_none());
     }
 
     #[test]
@@ -1287,6 +1424,13 @@ mod tests {
         assert!(editor.snapshot().connected);
         assert!(!editor.snapshot().modified);
         assert!(!editor.snapshot().buffers_truncated);
+        editor
+            .send(Vim9Command::SetRender { enabled: true })
+            .unwrap();
+        wait_for(|| editor.render_snapshot().is_some());
+        let first_frame = editor.render_snapshot().unwrap();
+        assert!(first_frame.supported, "{}", first_frame.fallback_reason);
+        assert!(first_frame.runs.iter().any(|run| run.text == "one"));
         let id = editor
             .send(Vim9Command::Open {
                 path: second.to_str().unwrap().into(),
@@ -1300,6 +1444,17 @@ mod tests {
         assert!(id > 0);
         assert_eq!(editor.snapshot().line, 2);
         assert_eq!(editor.snapshot().column, 2);
+        wait_for(|| {
+            editor
+                .render_snapshot()
+                .is_some_and(|frame| frame.buffer != first_frame.buffer)
+        });
+        assert!(editor
+            .render_snapshot()
+            .unwrap()
+            .runs
+            .iter()
+            .any(|run| run.text == "four"));
 
         master.write_all(b"iX\x1b").unwrap();
         wait_for(|| {

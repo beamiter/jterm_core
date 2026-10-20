@@ -96,6 +96,7 @@ class Editor:
         self.wire = b""
         self.screen = bytearray()
         self.state: dict = {}
+        self.render: dict = {}
         self.next_id = 1
         self.connection: socket.socket | None = None
         try:
@@ -145,6 +146,8 @@ class Editor:
                 message = json.loads(raw)
                 if message.get("event") == "state":
                     self.state = message
+                elif message.get("event") == "render":
+                    self.render = message
                 self.messages.append(message)
 
     def wait(self, predicate, timeout: float = 6.0):
@@ -200,6 +203,11 @@ class Editor:
         self.keys("\r")
         self.state_where(lambda s: s["mode"] == "n")
 
+    def gui_frame(self):
+        self.messages = collections.deque(m for m in self.messages if m.get("event") != "render")
+        self.request("set_render", enabled=True)
+        return self.wait(lambda m: m.get("event") == "render")
+
     def close(self):
         if self.process.poll() is None:
             try:
@@ -239,6 +247,166 @@ class BridgeTests(unittest.TestCase):
         for editor in self.editors:
             editor.close()
         self.directory.cleanup()
+
+    def test_gui_colors_links_and_named_colors_ignore_terminal_palette(self):
+        e = self.editor()
+        self.assertFalse(e.render)
+        e.request("set_render", ok=False, enabled="yes")
+        e.ex("set notermguicolors")
+        e.ex("syntax match BridgeGui /original/")
+        e.ex("highlight BridgePaint ctermfg=1 ctermbg=2 guifg=#12ab34 guibg=#253647 guisp=#edab19 gui=bold,italic,undercurl,strikethrough")
+        e.ex("highlight! link BridgeGui BridgePaint")
+        frame = e.gui_frame()
+        self.assertTrue(frame["supported"], frame["fallback_reason"])
+        style = next(r["style"] for r in frame["runs"] if r["text"] == "original")
+        self.assertEqual(style["foreground"], 0x12ab34)
+        self.assertEqual(style["background"], 0x253647)
+        self.assertEqual(style["special"], 0xedab19)
+        self.assertTrue(all(style[k] for k in ("bold", "italic", "undercurl", "strikethrough")))
+        # A plain :highlight command has no ColorScheme event.
+        e.ex("highlight BridgePaint guifg=DodgerBlue guibg=DarkSlateGray")
+        frame = e.gui_frame()
+        style = next(r["style"] for r in frame["runs"] if r["text"] == "original")
+        self.assertEqual(style["foreground"], 0x1e90ff)
+        self.assertEqual(style["background"], 0x2f4f4f)
+        e.request("set_render", enabled=False)
+        e.wait(lambda m: m.get("event") == "render_disabled")
+
+    def test_gui_unicode_tabs_and_cursor_keep_vims_byte_geometry(self):
+        e = self.editor()
+        e.ex("set tabstop=4 number")
+        text = "a\t界e\u0301z"
+        e.ex("call setline(1, " + json.dumps(text, ensure_ascii=False) + ")")
+        e.request("goto", line=1, column=3)
+        frame = e.gui_frame()
+        self.assertTrue(frame["supported"], frame["fallback_reason"])
+        runs = [r for r in frame["runs"] if r["line"] == 1]
+        wide = next(r for r in runs if r["text"] == "界")
+        combining = next(r for r in runs if r["text"] == "e\u0301")
+        self.assertEqual((wide["byte_start"], wide["byte_end"], wide["cells"]), (2, 5, 2))
+        self.assertEqual((combining["byte_start"], combining["byte_end"], combining["cells"]), (5, 8, 1))
+        self.assertEqual(combining["column"], wide["column"] + 2)
+        self.assertEqual(frame["cursor"]["column"], wide["column"])
+        self.assertEqual(frame["cursor"]["width"], 2)
+        self.assertTrue(any(r["line"] == 0 and r["text"].strip() == "1" for r in frame["runs"]))
+        revision = frame["revision"]
+        e.keys("iX")
+        inserted = e.wait(lambda m: m.get("event") == "render" and m["revision"] > revision
+                          and m.get("supported") and any("X" in r["text"] for r in m["runs"]))
+        self.assertTrue(inserted["mode"].startswith("i"))
+        e.keys(b"\x1bu")
+        e.state_where(lambda s: s["mode"] == "n")
+        frame = e.gui_frame()
+        self.assertFalse(any("X" in r["text"] for r in frame["runs"] if r["line"] == 1))
+        e.ex("set virtualedit=all")
+        e.keys("$10l")
+        e.state_where(lambda s: s["mode"] == "n")
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("virtual-space", frame["fallback_reason"])
+
+    def test_gui_visual_selection_includes_empty_lines_and_newlines(self):
+        e = self.editor()
+        e.ex("call setline(1, ['ab', '', 'cd'])")
+        e.ex("highlight Visual gui=NONE guifg=#ffffff guibg=#654321")
+        e.request("goto", line=1, column=1)
+        e.gui_frame()
+        e.keys("Vj")
+        e.state_where(lambda s: s["mode"] == "V")
+        frame = e.gui_frame()
+        self.assertTrue(frame["supported"], frame["fallback_reason"])
+        selected = [r for r in frame["runs"] if r["style"]["background"] == 0x654321]
+        self.assertTrue(any(r["line"] == 1 and r["byte_start"] == 2 and r["text"] == " " for r in selected))
+        self.assertTrue(any(r["line"] == 2 and r["byte_start"] == 0 and r["text"] == " " for r in selected))
+        self.assertFalse(any(r["line"] == 3 for r in selected))
+
+    def test_gui_search_and_diagnostic_properties_use_gui_decorations(self):
+        e = self.editor()
+        e.ex("highlight Search guibg=#246813 guifg=#ffffff")
+        e.ex("let @/ = 'line'")
+        e.ex("set hlsearch")
+        frame = e.gui_frame()
+        self.assertTrue(frame["supported"], frame["fallback_reason"])
+        self.assertEqual(len([r for r in frame["runs"] if r["text"] == "line" and r["style"]["background"] == 0x246813]), 2)
+        e.ex("nohlsearch")
+        e.ex("highlight BridgeDiagnostic gui=undercurl guisp=#fe1234")
+        e.ex("call prop_type_add('BridgeDiagnostic', {'highlight':'BridgeDiagnostic'})")
+        e.ex("call prop_add(1, 1, {'type':'BridgeDiagnostic', 'length':8})")
+        frame = e.gui_frame()
+        self.assertTrue(frame["supported"], frame["fallback_reason"])
+        run = next(r for r in frame["runs"] if r["line"] == 1 and r["byte_start"] == 0)
+        self.assertEqual(run["text"], "original")
+        self.assertTrue(run["style"]["undercurl"])
+        self.assertEqual(run["style"]["special"], 0xfe1234)
+        e.ex("let @/ = '$'")
+        e.ex("set hlsearch")
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("Zero-width", frame["fallback_reason"])
+
+    def test_gui_diagnostic_sign_and_property_share_native_view(self):
+        e = self.editor()
+        e.ex("set number signcolumn=auto")
+        e.ex("highlight BridgeError guifg=#fa1234 guisp=#fa1234 gui=undercurl")
+        e.ex("highlight BridgeLine guibg=#123456")
+        e.ex("highlight BridgeNumber guifg=#abcdef")
+        e.ex("call prop_type_add('BridgeError', {'highlight':'BridgeError'})")
+        e.ex("call prop_add(1, 1, {'type':'BridgeError', 'length':8})")
+        e.ex("call sign_define('BridgeWarning', {'text':'W!', 'texthl':'WarningMsg'})")
+        e.ex("call sign_define('BridgeError', {'text':'E!', 'texthl':'BridgeError', 'linehl':'BridgeLine', 'numhl':'BridgeNumber'})")
+        e.ex("call sign_place(1, 'diagnostics', 'BridgeWarning', bufnr(), {'lnum':1, 'priority':10})")
+        e.ex("call sign_place(2, 'diagnostics', 'BridgeError', bufnr(), {'lnum':1, 'priority':20})")
+        frame = e.gui_frame()
+        self.assertTrue(frame["supported"], frame["fallback_reason"])
+        sign = next(r for r in frame["runs"] if r["line"] == 0 and r["text"] == "E!")
+        self.assertEqual(sign["style"]["foreground"], 0xfa1234)
+        self.assertEqual(sign["cells"], 2)
+        number = next(r for r in frame["runs"] if r["line"] == 0 and r["text"].strip() == "1")
+        self.assertEqual(number["column"], sign["column"] + 2)
+        self.assertEqual(number["style"]["foreground"], 0xabcdef)
+        code = next(r for r in frame["runs"] if r["line"] == 1 and r["text"] == "original")
+        self.assertEqual(code["style"]["special"], 0xfa1234)
+        self.assertEqual(code["style"]["background"], 0x123456)
+        # A sign outside this view must not disable buffer rendering.
+        e.ex("call append(2, repeat(['more'], 70))")
+        e.ex("call sign_define('BridgeFar', {'text':'F!', 'icon':'/nonexistent/icon.png'})")
+        e.ex("call sign_place(3, 'diagnostics', 'BridgeFar', bufnr(), {'lnum':65, 'priority':20})")
+        self.assertTrue(e.gui_frame()["supported"])
+
+    def test_gui_fallback_clears_unsupported_states_and_hidden_popups_recover(self):
+        e = self.editor()
+        e.gui_frame()
+        e.keys(":")
+        fallback = e.wait(lambda m: m.get("event") == "render" and not m.get("supported", False))
+        self.assertIn("command", fallback["fallback_reason"])
+        e.keys(b"\x1b")
+        e.state_where(lambda s: s["mode"] == "n")
+        e.ex("let g:bridge_popup = popup_create('hello', {'line':2, 'col':4})")
+        self.assertFalse(e.gui_frame()["supported"])
+        e.ex("call popup_hide(g:bridge_popup)")
+        self.assertTrue(e.gui_frame()["supported"])
+        e.request("split", vertical=True)
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("split", frame["fallback_reason"])
+
+    def test_gui_wrap_fold_and_large_lines_fallback_without_mutating_options(self):
+        e = self.editor()
+        e.ex("set wrap")
+        e.ex("call setline(1, repeat('x', 140))")
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("Wrapped", frame["fallback_reason"])
+        e.ex("set nowrap")
+        self.assertTrue(e.gui_frame()["supported"])
+        e.ex("1,2fold")
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("fold", frame["fallback_reason"])
+        e.ex("normal! zR")
+        self.assertTrue(e.gui_frame()["supported"])
+        e.ex("call setline(1, repeat('x', 20000))")
+        self.assertIn("long line", e.gui_frame()["fallback_reason"])
 
     def test_authentication_and_explicit_dispatch(self):
         e = self.editor(authenticate=False)

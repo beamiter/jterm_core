@@ -1,16 +1,57 @@
 # Native Vim9 workbenches
 
 Anvil, Forge, Ember and Frost share an editor bridge around a **real Vim 9
-process**. Anvil and Forge host the editor in a dedicated GTK/VTE workbench;
-Ember uses its native GPU terminal grid in an editor tab, while Frost opens a
-dedicated Iced/WGPU editor window using its terminal grid.
+process**. Anvil and Forge host a dedicated GTK workbench, Ember uses an editor
+tab, and Frost opens an Iced/WGPU editor window. Each can subscribe to native
+GUI buffer paint frames independently of Vim's PTY compatibility display.
 The workbench supplies project navigation, buffer tabs, code actions, project
 search, build controls, quickfix navigation and editor state.
 
 Vim owns the text, modes, undo tree, registers, macros, splits, completion and
 plugins. Native controls send typed actions; they do not type Ex commands into
-an arbitrary shell or emulate Vim editing. The center editor is Vim's terminal
-UI rendered by the frontend, rather than a replacement text widget.
+an arbitrary shell or emulate Vim editing. For supported buffer views, the
+center editor draws buffer-origin text with Vim's **GUI** highlight colors and
+attributes through native GUI text rendering. PTY input remains connected to
+real Vim; the GUI does not maintain another editable document.
+
+## Native buffer display
+
+The core publishes an immutable `Vim9RenderFrame` over the authenticated editor
+channel after the host opts in with `Vim9Command::SetRender { enabled: true }`.
+The renderer receives UTF-8 text, Vim display positions, GUI `guifg`/`guibg`/
+`guisp`, bold, italic, underline, undercurl, strike and reverse attributes.
+These colors do not come from ANSI output, terminal cell colors or `ctermfg`.
+This also works with `notermguicolors`: hexadecimal and named GUI colors,
+including linked highlight groups, retain their GUI values.
+
+Supported single-window code views include ordinary editing, normal/insert/
+replace modes, character and line selections, tabs, CJK/wide characters,
+base-plus-combining text, number/relative-number gutters, CursorLine, single-line
+search highlights and non-virtual diagnostic text-property highlights. A
+standard single sign column renders the highest-priority visible sign text,
+GUI sign color, line/number highlights and equal-priority combinations. A
+non-ASCII grapheme keeps its own Vim display advance so font fallback cannot
+shift later glyphs or the input cursor. The host paints only the published
+window rectangle; command and status rows outside it remain Vim-owned.
+
+This is an incremental GUI buffer renderer, not a complete external Vim UI
+protocol. Split/special buffers, actual wrapped continuation rows, closed
+folds, visible popups/completion, multiple/image sign columns, fold columns, virtual text, matchadd
+decorations, multiline/positional/zero-width search, virtual-space cursors,
+list/conceal/spell/right-to-left display and block selections through tabs currently publish an explicit
+compatibility reason. Complex zero-width/bidirectional text and clipped wide
+glyphs also fall back. Vim's editing options and text are not changed to make a
+frame renderable. A host must show the live Vim compatibility surface whenever
+the frame is unsupported, disconnected, stale or has mismatched geometry.
+
+Input-driven paints are coalesced on a separate 16 ms timer, independently of
+the 40 ms metadata timer. Visible glyph/syntax data is cached by buffer tick,
+viewport, theme, search and property state. Idle reconciliation catches direct
+`:highlight` changes and plugins; identical paint frames are not republished.
+`render_snapshot()` clones only an `Arc`, without copying buffer lists,
+diagnostics or build output on each GUI frame. Paint work and wire frames are
+bounded; oversized views/lines fall back to Vim. These timing choices are not
+an end-to-end latency or frame-rate guarantee.
 
 ## Launch
 
