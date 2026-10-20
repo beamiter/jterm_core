@@ -28,6 +28,7 @@ pub use project::{Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot};
 mod render;
 pub use render::{
     Vim9RenderCursor, Vim9RenderFrame, Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle,
+    Vim9RenderWindow,
 };
 
 const PROTOCOL: u64 = 1;
@@ -333,6 +334,11 @@ struct Request {
 struct Shared {
     snapshot: Vim9Snapshot,
     pending: HashSet<u64>,
+    // Kept independently of the UI snapshot: metadata may temporarily hide a
+    // frame on a mode change without invalidating the ordered wire baseline.
+    render_baseline: Option<Arc<Vim9RenderFrame>>,
+    render_revision: u64,
+    render_resync: bool,
 }
 
 struct SessionInner {
@@ -417,6 +423,9 @@ impl Vim9Session {
                 ..Default::default()
             },
             pending: HashSet::new(),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded(MAX_PENDING);
@@ -628,6 +637,8 @@ fn set_disconnected(shared: &Mutex<Shared>, error: Option<String>) {
     let mut shared = shared.lock();
     shared.snapshot.connected = false;
     shared.snapshot.render = None;
+    shared.render_baseline = None;
+    shared.render_resync = false;
     shared.snapshot.pending = 0;
     shared.pending.clear();
     if let Some(error) = error {
@@ -708,6 +719,12 @@ fn connection(
                 return Ok(false);
             }
             if authenticated {
+                // Internal, read-only protocol recovery. ID zero cannot
+                // acknowledge a user command and is never written to the PTY.
+                let resync = std::mem::take(&mut shared.lock().render_resync);
+                if resync {
+                    stream.write_all(b"{\"action\":\"render_resync\",\"id\":0}\n")?;
+                }
                 // A fixed budget prevents a producer from starving state reads.
                 for request in requests.try_iter().take(8) {
                     if shared.lock().pending.contains(&request.id) {
@@ -750,7 +767,7 @@ fn connection(
                         return Ok(false);
                     }
                     let mut reply = serde_json::to_vec(
-                        &json!({"action":"auth","token":token,"protocol":PROTOCOL}),
+                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":2}),
                     )
                     .map_err(io::Error::other)?;
                     reply.push(b'\n');
@@ -829,16 +846,54 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
                 return Err(invalid("Invalid native Vim buffer paint frame"));
             }
             let mut shared = shared.lock();
-            if shared
-                .snapshot
-                .render
-                .as_ref()
-                .is_none_or(|previous| frame.revision > previous.revision)
-            {
-                shared.snapshot.render = Some(Arc::new(frame));
+            if frame.revision > shared.render_revision {
+                shared.render_revision = frame.revision;
+                let frame = Arc::new(frame);
+                shared.render_baseline = Some(frame.clone());
+                shared.snapshot.render = Some(frame);
+                shared.render_resync = false;
             }
         }
-        Some("render_disabled") => shared.lock().snapshot.render = None,
+        Some("render_delta") => {
+            let mut shared = shared.lock();
+            let observed_revision = value.get("revision").and_then(Value::as_u64);
+            // Duplicates and delayed old data cannot resurrect an old buffer,
+            // even after metadata or compatibility mode hid its native paint.
+            if observed_revision.is_some_and(|revision| revision <= shared.render_revision) {
+                return Ok(());
+            }
+            let frame = serde_json::from_value::<render::RenderDelta>(value)
+                .ok()
+                .and_then(|delta| {
+                    shared
+                        .render_baseline
+                        .as_ref()
+                        .and_then(|previous| delta.apply(previous))
+                });
+            if let Some(frame) = frame {
+                shared.render_revision = frame.revision;
+                let frame = Arc::new(frame);
+                shared.render_baseline = Some(frame.clone());
+                shared.snapshot.render = Some(frame);
+            } else {
+                // Reject atomically; continue ordinary Vim input, metadata and
+                // saving while a complete native paint frame is requested.
+                // Remember the observed revision even without its baseline so
+                // a delayed older keyframe cannot restore stale paint first.
+                if let Some(revision) = observed_revision {
+                    shared.render_revision = shared.render_revision.max(revision);
+                }
+                shared.render_baseline = None;
+                shared.snapshot.render = None;
+                shared.render_resync = true;
+            }
+        }
+        Some("render_disabled") => {
+            let mut shared = shared.lock();
+            shared.snapshot.render = None;
+            shared.render_baseline = None;
+            shared.render_resync = false;
+        }
         Some("response") => {
             let id = value
                 .get("id")
@@ -972,6 +1027,9 @@ mod tests {
                 ..Default::default()
             },
             pending: HashSet::new(),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
         });
         let frame = json!({
             "event":"render", "revision":2, "supported":true, "mode":"n",
@@ -1022,10 +1080,151 @@ mod tests {
     }
 
     #[test]
+    fn native_delta_gap_recovers_without_disconnect_or_replaying_old_paint() {
+        let shared = Mutex::new(Shared {
+            snapshot: Vim9Snapshot {
+                connected: true,
+                ..Default::default()
+            },
+            pending: HashSet::new(),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
+        });
+        let full = json!({"event":"render","revision":1,"supported":true,
+            "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",
+            "view":{"row":0,"column":0,"rows":2,"columns":20},
+            "runs":[{"row":0,"column":0,"text":"old","cells":3}]});
+        apply_event(full.clone(), &shared).unwrap();
+        let original = shared.lock().snapshot.render.clone().unwrap();
+        let mut delta = full.clone();
+        delta.as_object_mut().unwrap().remove("runs");
+        delta["event"] = json!("render_delta");
+        delta["revision"] = json!(2);
+        delta["base_revision"] = json!(1);
+        delta["row_updates"] = json!([{"row":0,"runs":[]}]);
+        // Metadata can hide paint while the reliable transport baseline stays.
+        apply_event(json!({"event":"state","mode":"i"}), &shared).unwrap();
+        assert!(shared.lock().snapshot.render.is_none());
+        delta["mode"] = json!("i");
+        apply_event(delta.clone(), &shared).unwrap();
+        assert!(shared
+            .lock()
+            .snapshot
+            .render
+            .as_ref()
+            .unwrap()
+            .runs
+            .is_empty());
+        assert_eq!(original.runs[0].text, "old");
+        delta["revision"] = json!(4);
+        delta["base_revision"] = json!(3);
+        apply_event(delta.clone(), &shared).unwrap();
+        {
+            let state = shared.lock();
+            assert!(state.snapshot.render.is_none());
+            assert!(state.render_resync);
+            assert!(state.snapshot.connected);
+            assert!(state.snapshot.error.is_none());
+        }
+        let mut delayed = full.clone();
+        delayed["revision"] = json!(3);
+        apply_event(delayed, &shared).unwrap();
+        {
+            let state = shared.lock();
+            assert!(
+                state.snapshot.render.is_none(),
+                "a keyframe older than the failed delta cannot restore paint"
+            );
+            assert!(state.render_baseline.is_none());
+            assert_eq!(state.render_revision, 4);
+            assert!(state.render_resync);
+        }
+        let mut recovered = full.clone();
+        recovered["revision"] = json!(5);
+        recovered["mode"] = json!("i");
+        recovered["runs"][0]["text"] = json!("new");
+        apply_event(recovered.clone(), &shared).unwrap();
+        let restored = shared.lock().snapshot.render.clone().unwrap();
+        assert!(!shared.lock().render_resync);
+        apply_event(delta, &shared).unwrap();
+        apply_event(full, &shared).unwrap();
+        assert!(Arc::ptr_eq(
+            &restored,
+            shared.lock().snapshot.render.as_ref().unwrap()
+        ));
+        apply_event(json!({"event":"render_disabled"}), &shared).unwrap();
+        apply_event(recovered, &shared).unwrap();
+        assert!(
+            shared.lock().snapshot.render.is_none(),
+            "old keyframe cannot undo disable"
+        );
+    }
+
+    #[test]
+    fn fragmented_delta_gap_requests_keyframe_and_preserves_command_channel() {
+        let scratch = Scratch::new();
+        let editor = session(&scratch);
+        let (mut writer, mut reader) = attach(&editor, None);
+        let mut wire = String::new();
+        reader.read_line(&mut wire).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&wire).unwrap()["render_protocol"],
+            2
+        );
+        let full = json!({"event":"render","revision":1,"supported":true,
+            "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",
+            "view":{"row":0,"column":0,"rows":2,"columns":20},
+            "runs":[{"row":0,"column":0,"text":"界","cells":2}]});
+        writeln!(writer, "{full}").unwrap();
+        wait_for(|| editor.render_snapshot().is_some());
+        let mut delta = full.clone();
+        delta.as_object_mut().unwrap().remove("runs");
+        delta["event"] = json!("render_delta");
+        delta["base_revision"] = json!(2);
+        delta["revision"] = json!(3);
+        delta["row_updates"] = json!([]);
+        for bytes in format!("{delta}\n").as_bytes().chunks(7) {
+            writer.write_all(bytes).unwrap();
+        }
+        wire.clear();
+        reader.read_line(&mut wire).unwrap();
+        let recovery: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(recovery["action"], "render_resync");
+        assert_eq!(recovery["id"], 0);
+        assert!(editor.snapshot().connected);
+        assert!(editor.render_snapshot().is_none());
+        let mut recovered = full;
+        recovered["revision"] = json!(4);
+        writeln!(writer, "{recovered}").unwrap();
+        wait_for(|| {
+            editor
+                .render_snapshot()
+                .is_some_and(|frame| frame.revision == 4)
+        });
+        editor.send(Vim9Command::Save).unwrap();
+        wire.clear();
+        reader.read_line(&mut wire).unwrap();
+        let save: Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(save["action"], "save");
+        assert!(save["id"].as_u64().unwrap() > 0);
+        writeln!(
+            writer,
+            "{}",
+            json!({"event":"response","id":save["id"],"ok":true})
+        )
+        .unwrap();
+        wait_for(|| editor.snapshot().pending == 0);
+    }
+
+    #[test]
     fn native_render_rejects_invalid_geometry_colors_and_embedded_control_text() {
         let shared = Mutex::new(Shared {
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
         });
         let frame = json!({"event":"render","revision":1,"supported":true,
             "rows":30,"columns":120,"window":1000,"buffer":1,
@@ -1210,6 +1409,9 @@ mod tests {
         let shared = Mutex::new(Shared {
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
         });
         apply_event(json!({"event":"state", "cwd":"/project/src", "filetype":"rust", "encoding":"utf-8", "line_count":500, "window_count":2, "build":{"running":false, "cancelled":true, "truncated":23}}), &shared).unwrap();
         let snapshot = &shared.lock().snapshot;
@@ -1324,6 +1526,9 @@ mod tests {
         let shared = Mutex::new(Shared {
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
         });
         apply_event(json!({"event":"state","buffers":vec![json!({"id":1});300],"capabilities":["eval","definition","definition","format"],"search":{"query":"needle","count":256,"truncated":3,"exit_code":2,"errors":vec!["search failed";12]}}), &shared).unwrap();
         let snapshot = &shared.lock().snapshot;

@@ -69,11 +69,23 @@ var renderEnabled = false
 var renderTimer = -1
 var renderRevision = 0
 var previousRender = ''
+var renderProtocol = 1
+var previousRenderLayout = ''
+var previousRenderRows: dict<string> = {}
+var renderKeyframeRevision = 0
 var renderBaseKey = ''
 var renderBase: list<dict<any>> = []
 var renderStyles: dict<dict<any>> = {}
 var renderThemeKey = ''
 var renderNormal: dict<any> = {}
+# Each real Vim window has its own viewport and syntax context, even when
+# several windows display the same buffer. Keep the expensive base paint
+# cache per window; cursor/selection overlays are composed on every sample.
+var renderWindowCaches: dict<dict<any>> = {}
+var renderWindowSample: dict<any> = {}
+var renderSamplingWindow = 0
+var renderLineGeneration = ''
+var renderLineCache: dict<dict<any>> = {}
 
 def Send(payload: dict<any>)
   if ch_status(bridge) !=# 'open'
@@ -93,7 +105,7 @@ def Capabilities(): list<string>
   var result = ['open', 'save', 'save_all', 'buffer', 'build', 'cancel_build',
     'goto', 'close_buffer', 'close_current_buffer', 'next_buffer', 'previous_buffer', 'split', 'save_and_build',
     'navigate_back', 'navigate_forward', 'cancel_search',
-    'snapshot', 'set_render', 'next_diagnostic', 'previous_diagnostic', 'quit']
+    'snapshot', 'set_render', 'render_resync', 'next_diagnostic', 'previous_diagnostic', 'quit']
   if executable('rg')
     add(result, 'search')
     add(result, 'search_with_options')
@@ -179,15 +191,13 @@ def RefreshRenderTheme()
 enddef
 
 def RenderFallback(): string
-  if winnr('$') != 1
-    return 'Vim split windows use the compatibility view'
-  elseif &buftype !=# ''
+  if &buftype !=# ''
     return 'This special Vim buffer uses the compatibility view'
   elseif mode(1) !~# '^[nivVR\x16]'
     return 'Vim command, prompt or terminal input uses the compatibility view'
   elseif pumvisible() || !empty(filter(popup_list(), (_, id) => get(popup_getpos(id), 'visible', 0)))
     return 'Vim completion and popup windows use the compatibility view'
-  elseif &diff || &rightleft || &arabic || &spell || &list || &conceallevel > 0 || &cursorcolumn
+  elseif &diff || &rightleft || &arabic || &spell || &list || &conceallevel > 0 || &cursorcolumn || !empty(&wincolor)
     return 'This Vim display option needs the compatibility view'
   elseif get(winsaveview(), 'coladd', 0) > 0
       || (index(['v', 'V', "\<C-V>"], mode(1)) >= 0 && getpos('v')[3] > 0)
@@ -338,7 +348,7 @@ def RenderSelected(glyph: dict<any>, visual: string, anchor: list<number>, curre
   return true
 enddef
 
-def RenderFrame(): dict<any>
+def RenderWindowFrame(): dict<any>
   var info = getwininfo(win_getid())[0]
   var view = {row: info.winrow - 1, column: info.wincol - 1,
     rows: info.height, columns: info.width}
@@ -355,6 +365,10 @@ def RenderFrame(): dict<any>
   var savedView = winsaveview()
   var first = line('w0')
   var last = line('w$')
+  frame.topline = first
+  frame.botline = last
+  frame.leftcol = savedView.leftcol
+  frame.textoff = info.textoff
   if view.rows > 200 || view.columns > 400 || last - first > 200
     frame.supported = false
     frame.fallback_reason = 'This viewport exceeds the bounded native paint budget'
@@ -410,14 +424,36 @@ def RenderFrame(): dict<any>
     property.definition = empty(propertyType) ? {}
       : (typeBuffer > 0 ? prop_type_get(propertyType, {bufnr: typeBuffer}) : prop_type_get(propertyType))
   endfor
-  var baseKey = string([bufnr(), b:changedtick, first, last, savedView.leftcol,
-    view, info.textoff, &tabstop, &vartabstop, &wrap, &syntax, &synmaxcol,
+  # A scroll changes screen rows, not the semantic paint of every surviving
+  # buffer line. A buffer edit still invalidates all lines: syntax regions can
+  # propagate arbitrarily far beyond the edited line.
+  var generation = string([bufnr(), b:changedtick, savedView.leftcol,
+    view.column, view.columns, info.textoff, &tabstop, &vartabstop, &wrap, &syntax, &synmaxcol,
     &number, &relativenumber, &numberwidth, &ambiwidth, renderThemeKey,
-    &hlsearch, v:hlsearch, @/, &ignorecase, &smartcase, properties])
+    &hlsearch, v:hlsearch, @/, &ignorecase, &smartcase, &magic, &iskeyword, &isprint])
+  if generation !=# renderLineGeneration
+    renderLineGeneration = generation
+    renderLineCache = {}
+  endif
+  var baseKey = string([generation, first, last, view, properties])
   if baseKey !=# renderBaseKey
     renderBase = []
+    var nextLines: dict<dict<any>> = {}
     for lineNumber in range(first, last)
       var text = getline(lineNumber)
+      var row = view.row + lineNumber - first
+      var lineProperties = filter(copy(properties), (_, item) => item.lnum == lineNumber)
+      var lineKey = string([text, lineProperties])
+      var cached = get(renderLineCache, string(lineNumber), {})
+      if !empty(cached) && cached.key ==# lineKey
+        for stored in cached.base
+          var glyph = copy(stored)
+          glyph.row = row
+          add(renderBase, glyph)
+        endfor
+        nextLines[string(lineNumber)] = cached
+        continue
+      endif
       if foldclosed(lineNumber) >= 0
         reason = 'Closed Vim folds use the compatibility view'
         break
@@ -431,13 +467,12 @@ def RenderFrame(): dict<any>
         reason = 'Control and bidirectional text use the compatibility view'
         break
       endif
-      var row = view.row + lineNumber - first
       var searchRanges = RenderSearchRanges(text)
-      var lineProperties = filter(copy(properties), (_, item) => item.lnum == lineNumber)
       if len(lineProperties) > 128
         reason = 'This line exceeds the native property paint budget'
         break
       endif
+      var runStart = len(renderBase)
       var byteColumn = 0
       var virtualColumn = 0
       var asciiLine = strlen(text) == strchars(text)
@@ -506,9 +541,14 @@ def RenderFrame(): dict<any>
       if !empty(reason)
         break
       endif
+      nextLines[string(lineNumber)] = {key: lineKey,
+        base: runStart < len(renderBase) ? renderBase[runStart :] : []}
     endfor
     if empty(reason)
       renderBaseKey = baseKey
+      # Keep only the visible lines. Scrolling one row reuses every surviving
+      # row without accumulating a second copy of a large Vim document.
+      renderLineCache = nextLines
     endif
   endif
   if !empty(reason)
@@ -639,6 +679,102 @@ def RenderFrame(): dict<any>
   return frame
 enddef
 
+# win_execute() switches only Vim's evaluation context: no WinEnter/BufEnter
+# and no directory changes. The command itself is explicitly noautocmd and
+# this callback only reads buffer/window state. Do not use win_gotoid(),
+# :normal, cursor(), or a text widget to manufacture a second editor state.
+def SampleRenderWindow()
+  var key = string(win_getid())
+  var cache = get(renderWindowCaches, key, {})
+  renderBaseKey = get(cache, 'key', '')
+  renderBase = get(cache, 'base', [])
+  renderLineGeneration = get(cache, 'generation', '')
+  renderLineCache = get(cache, 'lines', {})
+  try
+    renderWindowSample = RenderWindowFrame()
+    renderWindowCaches[key] = renderWindowSample.supported
+      ? {key: renderBaseKey, base: renderBase, generation: renderLineGeneration, lines: renderLineCache}
+      : {key: '', base: [], generation: '', lines: {}}
+    if win_getid() != renderSamplingWindow
+      renderWindowSample.cursor.visible = false
+    endif
+    for run in renderWindowSample.runs
+      run.window = win_getid()
+    endfor
+  finally
+    renderBaseKey = ''
+    renderBase = []
+    renderLineGeneration = ''
+    renderLineCache = {}
+  endtry
+enddef
+
+def RenderFrame(): dict<any>
+  var active = win_getid()
+  var activeMode = mode(1)
+  var activeView = winsaveview()
+  var activeBuffer = bufnr()
+  renderSamplingWindow = active
+  # Sampling the active window directly is essential: win_execute() makes
+  # an inactive window Normal temporarily while preserving the caller's
+  # Visual mode. This also prevents Visual selections leaking into siblings.
+  SampleRenderWindow()
+  var frame = renderWindowSample
+  frame.windows = []
+  if !frame.supported
+    return frame
+  endif
+  var ids = gettabinfo(tabpagenr())[0].windows
+  if len(ids) > 16
+    frame.supported = false
+    frame.fallback_reason = 'This Vim layout exceeds the bounded native window budget'
+    frame.runs = []
+    return frame
+  endif
+  var caches: dict<dict<any>> = {}
+  var runs: list<dict<any>> = []
+  var sampleCommand = 'noautocmd call ' .. expand('<SID>') .. 'SampleRenderWindow()'
+  for id in ids
+    if id == active
+      renderWindowSample = frame
+    else
+      renderWindowSample = {}
+      win_execute(id, sampleCommand)
+    endif
+    if empty(renderWindowSample) || !renderWindowSample.supported
+      frame.supported = false
+      frame.fallback_reason = empty(renderWindowSample)
+        ? 'A Vim window changed during native sampling'
+        : 'Window ' .. id .. ': ' .. renderWindowSample.fallback_reason
+      frame.runs = []
+      frame.windows = []
+      return frame
+    endif
+    var sample = renderWindowSample
+    add(frame.windows, {window: sample.window, buffer: sample.buffer,
+      changedtick: sample.changedtick, view: sample.view, cursor: sample.cursor,
+      topline: sample.topline, botline: sample.botline,
+      textoff: sample.textoff, leftcol: sample.leftcol})
+    extend(runs, sample.runs)
+    caches[string(id)] = renderWindowCaches[string(id)]
+  endfor
+  renderWindowCaches = caches
+  frame.runs = runs
+  if win_getid() != active || bufnr() != activeBuffer || mode(1) !=# activeMode || winsaveview() != activeView
+    frame.supported = false
+    frame.fallback_reason = 'Vim changed its active view during native sampling'
+    frame.runs = []
+    frame.windows = []
+  endif
+  return frame
+enddef
+
+def RenderLayoutKey(frame: dict<any>): string
+  var windows = map(copy(get(frame, 'windows', [])), (_, item) => [item.window, item.buffer, item.view])
+  return string([frame.rows, frame.columns, frame.window, frame.buffer,
+    frame.view, frame.default_style, windows])
+enddef
+
 def EmitRender(force: bool = false)
   if !renderEnabled || !authenticated || shuttingDown || ch_status(bridge) !=# 'open'
     return
@@ -654,13 +790,60 @@ def EmitRender(force: bool = false)
     endif
     if force || encoded !=# previousRender
       previousRender = encoded
+      var baseRevision = renderRevision
       renderRevision += 1
       frame.revision = renderRevision
-      Send(frame)
+      var layout = frame.supported ? RenderLayoutKey(frame) : ''
+      var rowRuns: dict<list<dict<any>>> = {}
+      for run in frame.runs
+        var key = string(run.row)
+        if !has_key(rowRuns, key)
+          rowRuns[key] = []
+        endif
+        add(rowRuns[key], run)
+      endfor
+      var rows: dict<string> = {}
+      var updates: list<dict<any>> = []
+      # Replace complete screen rows, preserving within-row paint order.
+      # This includes siblings in a vertical split and explicit empty clears.
+      for row in range(frame.rows)
+        var key = string(row)
+        var runs = get(rowRuns, key, [])
+        var rowData = json_encode(runs)
+        if !empty(runs)
+          rows[key] = rowData
+        endif
+        if rowData !=# get(previousRenderRows, key, '[]')
+          add(updates, {row: row, runs: runs})
+        endif
+      endfor
+      var sentDelta = false
+      if renderProtocol >= 2 && !force && frame.supported && layout ==# previousRenderLayout
+          && renderRevision - renderKeyframeRevision < 120
+        var delta = copy(frame)
+        remove(delta, 'runs')
+        delta.event = 'render_delta'
+        delta.base_revision = baseRevision
+        delta.row_updates = updates
+        # Scrolling a whole viewport can be cheaper as a complete keyframe.
+        if strlen(json_encode(delta)) < strlen(encoded)
+          Send(delta)
+          sentDelta = true
+        endif
+      endif
+      if !sentDelta
+        Send(frame)
+        renderKeyframeRevision = renderRevision
+      endif
+      previousRenderLayout = layout
+      previousRenderRows = rows
     endif
   catch
     # Rendering must never break actual editing or disconnect metadata/actions.
     renderBaseKey = ''
+    previousRender = ''
+    previousRenderLayout = ''
+    previousRenderRows = {}
     renderRevision += 1
     Send({event: 'render', revision: renderRevision, supported: false,
       rows: &lines, columns: &columns, fallback_reason: 'Native paint unavailable: ' .. strcharpart(v:exception, 0, 512)})
@@ -679,6 +862,22 @@ def RenderChanged()
 enddef
 
 def RenderThemeChanged()
+  # :syntax clear/match can change syntax without changing b:changedtick,
+  # &syntax or any highlight group. A command-line transition is therefore
+  # a semantic cache boundary, including commands executed in another window.
+  if get(v:event, 'old_mode', '') =~# '^c' || get(v:event, 'new_mode', '') =~# '^c'
+    renderWindowCaches = {}
+  endif
+  RefreshRenderTheme()
+  RenderChanged()
+enddef
+
+def InvalidateRender()
+  renderWindowCaches = {}
+  renderBaseKey = ''
+  renderBase = []
+  renderLineGeneration = ''
+  renderLineCache = {}
   RefreshRenderTheme()
   RenderChanged()
 enddef
@@ -1364,14 +1563,21 @@ def Dispatch(request: dict<any>, id: number)
       EmitRender(true)
     else
       previousRender = ''
+      previousRenderLayout = ''
+      previousRenderRows = {}
       renderBaseKey = ''
       renderBase = []
+      renderWindowCaches = {}
       if renderTimer >= 0
         timer_stop(renderTimer)
         renderTimer = -1
       endif
       Send({event: 'render_disabled'})
     endif
+  elseif action ==# 'render_resync'
+    # Read-only recovery after a missing/invalid host paint baseline. Do not
+    # feed input or touch Vim's undo, buffer, mode, selection or view state.
+    EmitRender(true)
   elseif action ==# 'snapshot'
     EmitState(true)
     RefreshRenderTheme()
@@ -1543,6 +1749,11 @@ def Receive(_: channel, message: string)
         ch_close(bridge)
         return
       endif
+      var requestedRender: any = get(request, 'render_protocol', 1)
+      if type(requestedRender) != v:t_number || index([1, 2], requestedRender) < 0
+        throw 'Unsupported native render protocol'
+      endif
+      renderProtocol = requestedRender
       authenticated = true
       authToken = ''
       pollTimer = timer_start(750, Poll, {repeat: -1})
@@ -1597,6 +1808,10 @@ augroup JTermVim9Bridge
   autocmd BufWipeout * ForgetView(str2nr(expand('<abuf>')))
   autocmd TextChanged,TextChangedI,TextChangedP,CursorMoved,CursorMovedI,ModeChanged * Changed()
   autocmd ModeChanged,ColorScheme * RenderThemeChanged()
+  autocmd Syntax,FileType * InvalidateRender()
+  # Stock Vim has no universal event for a plugin changing :syntax rules
+  # asynchronously. Providers can explicitly invalidate after such updates.
+  autocmd User JTermVim9RenderInvalidate InvalidateRender()
   autocmd WinScrolled,VimResized,OptionSet * RenderChanged()
   autocmd QuickFixCmdPost * Changed()
   autocmd User LspDiagsUpdated,LspAttached,LspDetached LspDiagnosticsChanged()

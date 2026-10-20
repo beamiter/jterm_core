@@ -24,7 +24,8 @@ These colors do not come from ANSI output, terminal cell colors or `ctermfg`.
 This also works with `notermguicolors`: hexadecimal and named GUI colors,
 including linked highlight groups, retain their GUI values.
 
-Supported single-window code views include ordinary editing, normal/insert/
+Supported ordinary code windows, including horizontal, vertical and mixed Vim
+splits, include editing, normal/insert/
 replace modes, character and line selections, tabs, CJK/wide characters,
 base-plus-combining text, number/relative-number gutters, CursorLine, single-line
 search highlights and non-virtual diagnostic text-property highlights. A
@@ -32,26 +33,51 @@ standard single sign column renders the highest-priority visible sign text,
 GUI sign color, line/number highlights and equal-priority combinations. A
 non-ASCII grapheme keeps its own Vim display advance so font fallback cannot
 shift later glyphs or the input cursor. The host paints only the published
-window rectangle; command and status rows outside it remain Vim-owned.
+window rectangles independently; command/status rows and split separators
+between them remain Vim-owned. Each run names its actual Vim window, buffer
+line and byte range; each window carries its own buffer tick and viewport.
+The active cursor and Visual selection cannot leak into sibling windows.
 
 This is an incremental GUI buffer renderer, not a complete external Vim UI
-protocol. Split/special buffers, actual wrapped continuation rows, closed
+protocol. Special buffers, actual wrapped continuation rows, closed
 folds, visible popups/completion, multiple/image sign columns, fold columns, virtual text, matchadd
 decorations, multiline/positional/zero-width search, virtual-space cursors,
 list/conceal/spell/right-to-left display and block selections through tabs currently publish an explicit
 compatibility reason. Complex zero-width/bidirectional text and clipped wide
 glyphs also fall back. Vim's editing options and text are not changed to make a
-frame renderable. A host must show the live Vim compatibility surface whenever
+frame renderable. More than 16 windows or an unsupported window causes a
+complete compatibility frame. A host must show the live Vim compatibility surface whenever
 the frame is unsupported, disconnected, stale or has mismatched geometry.
 
 Input-driven paints are coalesced on a separate 16 ms timer, independently of
 the 40 ms metadata timer. Visible glyph/syntax data is cached by buffer tick,
-viewport, theme, search and property state. Idle reconciliation catches direct
-`:highlight` changes and plugins; identical paint frames are not republished.
+viewport, theme, search and property state. Each window keeps only its visible
+line cache, so scrolling reuses surviving lines without repeating their syntax
+queries. Any buffer tick invalidates that cache, including multiline syntax
+effects beyond an edit. Idle reconciliation catches direct `:highlight`
+changes; command-mode transitions and `Syntax`/`FileType` invalidate rules.
+An asynchronous plugin changing only syntax rules must emit
+`doautocmd <nomodeline> User JTermVim9RenderInvalidate`.
+Identical paint frames are not republished.
 `render_snapshot()` clones only an `Arc`, without copying buffer lists,
 diagnostics or build output on each GUI frame. Paint work and wire frames are
 bounded; oversized views/lines fall back to Vim. These timing choices are not
 an end-to-end latency or frame-rate guarantee.
+
+The authenticated host negotiates `render_protocol: 2` for real row deltas.
+`render_delta` carries an exact `base_revision`, the new frame metadata and
+`row_updates`. Each item replaces all paint runs on one absolute screen row,
+including every split on that row; an empty list clears old glyphs. A cursor
+move can therefore publish no text. Layout/theme/compatibility changes,
+resynchronization and periodic checkpoints use complete `render` keyframes.
+Older hosts continue receiving full frames. The Rust receiver validates
+nonoverlapping window ownership and applies a delta atomically. A lost or
+invalid base immediately hides native paint and requests a fresh keyframe,
+while Vim editing, saving and metadata communication remain available.
+
+See the [architecture audit and measured validation](vim9-native-render-audit.md)
+for stock Vim API limits, the frontend matrix, performance observations and
+remaining OS IME/Wayland verification gaps.
 
 ## Launch
 

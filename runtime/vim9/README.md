@@ -51,13 +51,17 @@ Vim sends the first message:
 After validating that hello, the host sends:
 
 ```json
-{"action":"auth","protocol":1,"token":"session secret"}
+{"action":"auth","protocol":1,"token":"session secret","render_protocol":2}
 ```
 
 The runtime validates both token type/value and protocol type/value. It rejects
 editing requests until that exchange completes and closes the channel on an
 incorrect authentication message. Authentication success publishes the first
 state; it does not need a separate response with an artificial request id.
+The optional `render_protocol` negotiates native paint transport separately
+from the command protocol. Version 1, also the default when omitted, receives
+complete frames. Version 2 additionally accepts row deltas. Existing command
+and metadata messages continue to use `protocol: 1`.
 
 Subsequent requests have a positive integer `id` and one action. For example:
 
@@ -101,6 +105,7 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | `next_diagnostic` | None | Native `:cnext` |
 | `previous_diagnostic` | None | Native `:cprevious` |
 | `set_render` | Boolean `enabled` | Subscribe/unsubscribe to native GUI buffer paint frames after the session is connected |
+| `render_resync` | None | Request a fresh complete paint frame without changing Vim state; the Rust receiver reserves request id zero for this recovery action |
 | `snapshot` | None | Force a current metadata state and reconcile the subscribed native paint frame |
 | `quit` | None | Native `:qall` without `!`; acknowledge from `VimLeavePre` once Vim accepts exit |
 
@@ -128,10 +133,11 @@ and `protocol`:
 | `supported`, `fallback_reason` | Whether the host can draw this state; otherwise show the actual Vim compatibility view immediately |
 | `buffer`, `window`, `changedtick`, `mode` | Vim-owned identities and editing state; metadata transitions cannot keep another buffer's native frame |
 | `rows`, `columns` | PTY screen dimensions used to produce this paint frame |
-| `view` | `{row,column,rows,columns}` for the exact single-window opaque paint rectangle, including number gutters; command/status rows are outside |
+| `view` | `{row,column,rows,columns}` for the active window's exact opaque paint rectangle, including number gutters; command/status rows and split separators are outside |
 | `cursor` | `{row,column,width,visible}`, using Vim's real screen position and wide-character width |
+| `windows` | Every supported ordinary window in the current tab: `window`, `buffer`, `changedtick`, `view`, `cursor`, `topline`, `botline`, `leftcol`, and `textoff`; only the active cursor is visible |
 | `default_style` | GUI Normal style, with explicit light/dark RGB fallback only when Normal has no GUI color |
-| `runs` | Bounded native glyph runs with `row`, `column`, `text`, `cells`, `style`, `line`, `byte_start`, `byte_end` |
+| `runs` | Bounded native glyph runs with owning `window`, `row`, `column`, `text`, `cells`, `style`, `line`, `byte_start`, `byte_end` |
 
 Screen row/column positions are **zero-based**. A run's `line` is a one-based
 buffer line, or zero for gutter/end-of-buffer decoration. Byte ranges are
@@ -142,6 +148,30 @@ in individual runs; adjacent ASCII with the same style may be combined for
 GUI shaping. Hosts must respect `cells` and cannot independently reflow text
 while continuing to use Vim's input coordinates.
 
+All run coordinates remain global screen coordinates, including in vertical
+and mixed splits. Hosts paint the union of window rectangles, leaving the
+live PTY surface visible in separators, status lines and command rows. Every
+run must fit its owning window. Legacy single-view frames without `windows`
+or run ownership remain readable by the Rust model.
+
+For render transport version 2, a `render_delta` event contains the same
+top-level frame metadata, plus `base_revision` and `row_updates`, and omits
+the full `runs` array. Each row update is `{row, runs}` and replaces **all**
+runs on that global screen row, including neighboring vertical splits.
+An empty `runs` clears the row; empty `row_updates` can update only the cursor
+or other metadata. The base must exactly match the receiver's retained
+revision. Layout, window identity or default-style changes require a complete
+frame. The runtime chooses a delta only when its encoded message is smaller,
+and emits a full checkpoint at least every 120 published revisions.
+
+The Rust receiver validates and applies a delta atomically before publishing
+an immutable `Arc<Vim9RenderFrame>`. On a missing or invalid base it hides
+native paint, requests `render_resync`, and continues processing ordinary
+metadata, keyboard input and editing commands. Old revisions cannot restore
+stale paint during recovery. Metadata that temporarily hides a frame does
+not discard the independent transport baseline. Subscription disable and
+disconnect clear that baseline; re-enable starts with a complete frame.
+
 Styles contain nullable packed `0xRRGGBB` `foreground`, `background` and
 `special`, plus Boolean `bold`, `italic`, `underline`, `undercurl`,
 `strikethrough` and `reverse`. Highlight links are resolved in Vim and values
@@ -151,11 +181,16 @@ palettes are not consulted. Visual selection and supported Search/text-property
 highlights are already composed into the run style.
 
 Native paint is driven by a separate 16 ms input/view coalescer. Buffer glyphs
-and syntax styles are reused when buffer contents and view inputs are
-unchanged; direct `:highlight` changes, property changes and linked groups are
-reconciled too. Neither the 40 ms metadata coalescer nor 750 ms idle poll is the
-primary typing paint path. A supported frame is bounded to 200 rows, 400
-columns, 4,096 characters/16 KiB per source line, 2,048 visible text properties
+and syntax styles are cached per window and visible source line. Overlapping
+scrolls reuse unchanged lines; a changed buffer tick invalidates all cached
+syntax for that buffer, including multiline syntax dependencies. Direct
+`:highlight` changes, property changes and linked groups are reconciled too.
+Syntax/FileType and command-mode transitions invalidate syntax caches; an
+asynchronous syntax provider that changes rules without changing text must
+emit `doautocmd <nomodeline> User JTermVim9RenderInvalidate`. Neither the 40 ms
+metadata coalescer nor 750 ms idle poll is the primary typing paint path.
+A supported frame is bounded to 16 windows, 200 rows, 400 columns,
+4,096 characters/16 KiB per source line, 2,048 visible text properties
 and 900,000 JSON bytes. Unsupported or oversized frames contain a reason and
 no misleading partial native document. The receiver enforces its 1 MiB frame
 limit and validates geometry, RGB values and run text before retaining an Arc.
@@ -304,7 +339,8 @@ need an explicit adapter rather than guessed commands.
 From the core repository:
 
 ```sh
-VIM9_TEST_VIM=/absolute/path/to/vim python runtime/vim9/test_bridge.py
+cd runtime/vim9
+VIM9_TEST_VIM=/absolute/path/to/vim python3 -m unittest -v test_bridge test_render_windows test_render_delta
 ```
 
 `VIM9_TEST_VIM` is optional when `vim` is on PATH. These Python-standard-library
@@ -318,6 +354,14 @@ async build/cancel/output, working-directory correctness, secret cleanup,
 literal rg search, result caps and asynchronous errors. Provider-routing tests
 use user-defined native Vim commands; they do not claim to test an external
 language server. The suite is skipped if no Vim executable is available.
+
+The window suite adds same/different-buffer splits, independent scrolling,
+Visual-mode sampling without focus/autocommand side effects, multiline syntax
+invalidation and unsupported-peer recovery. The delta suite uses the actual
+Vim channel to verify cursor-only updates, Unicode edit/save, explicit cleared
+rows, sibling-pane preservation, forced checkpoints and safe resynchronization.
+Rust tests additionally inject fragmented channel messages and missing bases
+to verify automatic recovery without losing editing commands.
 
 These tests do not validate frontend font rendering, desktop IME integration,
 mouse input or all user plugins; those are frontend/desktop verification tasks.

@@ -387,8 +387,8 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(e.gui_frame()["supported"])
         e.request("split", vertical=True)
         frame = e.gui_frame()
-        self.assertFalse(frame["supported"])
-        self.assertIn("split", frame["fallback_reason"])
+        self.assertTrue(frame["supported"], frame["fallback_reason"])
+        self.assertEqual(len(frame["windows"]), 2)
 
     def test_gui_wrap_fold_and_large_lines_fallback_without_mutating_options(self):
         e = self.editor()
