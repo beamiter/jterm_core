@@ -1,0 +1,71 @@
+name: Validate semantic Vim viewport candidate
+on:
+  push:
+    branches: [work/vim9-viewport-20261021]
+permissions:
+  contents: write
+concurrency:
+  group: vim9-viewport-candidate
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BASE: b8e340c3f47b37367a3c2fe56efcd6fbd641f701
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - run: sudo apt-get update && sudo apt-get install -y vim-nox ripgrep minisign curl
+      - run: python3 .maintenance/apply-vim9-viewport.py
+      - run: cargo fmt --all && git diff --check
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Actual Vim regression suites
+        run: |
+          python3 runtime/vim9/test_overscan.py
+          python3 runtime/vim9/test_bridge.py
+          python3 runtime/vim9/test_render_delta.py
+          python3 runtime/vim9/test_render_windows.py
+          python3 runtime/vim9/test_scroll.py
+          python3 runtime/vim9/test_shell.py
+          cargo test --locked --lib vim9::tests::real_vim9_round_trip -- --ignored
+      - name: Prepare tested commit without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          repo = os.environ['GITHUB_REPOSITORY']
+          base = os.environ['BASE']
+          def req(path, data=None):
+              request = urllib.request.Request('https://api.github.com/repos/' + repo + path,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'],
+                    'Accept':'application/vnd.github+json', 'Content-Type':'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          if req('/git/ref/heads/master')['object']['sha'] != base:
+              raise SystemExit('master advanced; refusing stale candidate')
+          paths = ['src/vim9.rs', 'src/vim9_render.rs', 'src/vim9_viewport.rs',
+              'runtime/vim9/bridge.vim', 'runtime/vim9/test_overscan.py',
+              '.github/workflows/ci.yml', 'docs/vim9-pixel-viewport.md']
+          entries = [{'path':p,'mode':'100644','type':'blob','content':Path(p).read_text()} for p in paths]
+          tree = req('/git/trees', {'base_tree':req('/git/commits/' + base)['tree']['sha'], 'tree':entries})
+          commit = req('/git/commits', {'message':'feat(vim9): sample semantic margins and unify pixel viewport geometry\n\nAdd bounded protocol-3 source rows without moving Vim, validate margins on keyframes and deltas, and share clipped paint/hit/caret coordinates. Preserve protocols 1/2 and fail closed when margins are unsupported. This is the projection foundation, not complete frontend pixel-direct input.', 'tree':tree['sha'], 'parents':[base]})
+          result = {'base':base, 'candidate':commit['sha'], 'files':paths}
+          print('::notice title=Validated viewport candidate::' + json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('```json\n' + json.dumps(result,indent=2) + '\n```\n')
+          PY
