@@ -88,6 +88,20 @@ nonoverlapping window ownership and applies a delta atomically. A lost or
 invalid base immediately hides native paint and requests a fresh keyframe,
 while Vim editing, saving and metadata communication remain available.
 
+Render protocol 4 retains version 3's source-bound input and publishes up to
+eight real source rows before/after each viewport. Version 3 hosts continue
+receiving two rows. The wider bounded margins let ordinary three-line wheel
+notches and short bursts move through real text while awaiting Vim's exact
+acknowledgement. Oversized frames still retire margins before falling back.
+
+Discrete wheel input follows a 100 ms time-based transition shared by all four
+frontends. Continuous notches add independent, finite transitions; reversing
+retires the previous unplayed tail. Trackpad pixels remain direct OS input.
+The GUI frame clock drives the transition independently of Vim metadata or
+new render messages, and pointer capture freezes future wheel animation at
+the source image used for hit testing. Editing, zoom and topology changes
+retain their existing cancellation rules.
+
 See the [architecture audit and measured validation](vim9-native-render-audit.md)
 for stock Vim API limits, the frontend matrix, performance observations and
 remaining OS IME/Wayland verification gaps.

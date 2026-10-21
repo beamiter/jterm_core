@@ -57,7 +57,7 @@ impl Vim9ShellInvocation {
             let mut number: libc::c_uint = 0;
             // Query a Unix PTY master without changing terminal state.
             (unsafe { libc::ioctl(master_fd, libc::TIOCGPTN, &mut number) == 0 })
-                && self.tty == PathBuf::from(format!("/dev/pts/{number}"))
+                && self.tty == std::path::Path::new(&format!("/dev/pts/{number}"))
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {

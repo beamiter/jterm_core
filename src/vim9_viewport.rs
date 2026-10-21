@@ -81,7 +81,7 @@ impl<'a> Vim9Viewport<'a> {
         let window = frame.windows.iter().find(|item| item.window == window)?;
         let clip = metrics.rect(&window.view)?;
         let rows = (offset_y.abs() / metrics.line_height).ceil();
-        if rows > 2.0 {
+        if rows > 8.0 {
             return None;
         }
         for distance in 1..=rows as i32 {
@@ -492,7 +492,7 @@ mod tests {
             let mut frame = original.clone();
             let window = &mut frame.windows[0];
             match case {
-                0 => window.overscan[0].row = -3,
+                0 => window.overscan[0].row = -9,
                 1 => window.overscan[0].line = 7,
                 2 => window.overscan[0].runs[0].window = 999,
                 3 => window.overscan[0].runs[0].row = 1,

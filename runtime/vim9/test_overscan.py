@@ -9,11 +9,13 @@ from test_bridge import Editor, VIM
 
 @unittest.skipUnless(VIM, "Install Vim 9 to test semantic margins")
 class OverscanTests(unittest.TestCase):
+    protocol = 3
+    margin = 2
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="vim9-overscan-")
         self.editor = Editor(Path(self.directory.name), authenticate=False)
         e = self.editor
-        e.send({"action":"auth", "token":e.token, "protocol":1, "render_protocol":3})
+        e.send({"action":"auth", "token":e.token, "protocol":1, "render_protocol":self.protocol})
         e.wait(lambda m: m.get("event") == "state")
         e.ex("call setline(1, map(range(1, 160), {_, n -> printf('%03d 界 é', n)}))")
         e.ex("set nowrap scrolloff=0 number")
@@ -34,7 +36,9 @@ class OverscanTests(unittest.TestCase):
         frame = self.frame()
         window = next(w for w in frame["windows"] if w["window"] == frame["window"])
         self.assertEqual(window["line_count"], 160)
-        self.assertEqual([r["row"] for r in window["overscan"]], [-2, -1, window["view"]["rows"], window["view"]["rows"] + 1])
+        self.assertEqual([r["row"] for r in window["overscan"]],
+                         list(range(-self.margin, 0))
+                         + list(range(window["view"]["rows"], window["view"]["rows"] + self.margin)))
         for row in window["overscan"]:
             self.assertEqual(row["line"], window["topline"] + row["row"])
             self.assertGreater(row["byte_length"], 0)
@@ -133,6 +137,11 @@ class OverscanTests(unittest.TestCase):
         message = e.wait(lambda m: m.get('event') in ('render', 'render_delta') and m.get('revision', 0) > before['revision'])
         self.assertIn('overscan', message['windows'][0])
         self.assertEqual(message['windows'][0]['overscan'], before['windows'][0]['overscan'])
+
+
+class WheelOverscanTests(OverscanTests):
+    protocol = 4
+    margin = 8
 
 
 if __name__ == '__main__':

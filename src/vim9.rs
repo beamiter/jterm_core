@@ -983,7 +983,7 @@ fn connection(
                         return Ok(false);
                     }
                     let mut reply = serde_json::to_vec(
-                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":3}),
+                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":4}),
                     )
                     .map_err(io::Error::other)?;
                     reply.push(b'\n');
@@ -1545,7 +1545,7 @@ mod tests {
         reader.read_line(&mut wire).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&wire).unwrap()["render_protocol"],
-            3
+            4
         );
         let full = json!({"event":"render","revision":1,"supported":true,
             "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",

@@ -68,8 +68,11 @@ incorrect authentication message. Authentication success publishes the first
 state; it does not need a separate response with an artificial request id.
 The optional `render_protocol` negotiates native paint transport separately
 from the command protocol. Version 1, also the default when omitted, receives
-complete frames. Version 2 additionally accepts row deltas. Existing command
-and metadata messages continue to use `protocol: 1`.
+complete frames. Version 2 additionally accepts row deltas. Version 3 adds
+source-bound scroll/pointer input and two real margin rows per viewport edge.
+Version 4 retains those semantics and extends each margin to eight rows for
+continuous wheel transitions and short bursts. Existing command and metadata
+messages continue to use `protocol: 1`.
 
 Subsequent requests have a positive integer `id` and one action. For example:
 

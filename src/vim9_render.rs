@@ -100,7 +100,7 @@ pub struct Vim9RenderWindow {
     pub textoff: usize,
     /// Zero for old wire versions. Otherwise the actual buffer line count.
     pub line_count: u64,
-    /// Version 3: at most two independently sampled source rows on each edge.
+    /// Version 3 supplies two source rows per edge; version 4 supplies eight.
     pub overscan: Vec<Vim9RenderMarginRow>,
     /// Optional protocol-3 native input capability, false for legacy producers.
     pub native_pointer: bool,
@@ -208,7 +208,7 @@ impl Vim9RenderFrame {
                         || (window.topline > 0
                             && window.topline <= window.botline
                             && window.botline <= window.line_count))
-                    && window.overscan.len() <= 4
+                    && window.overscan.len() <= 16
                     && window.overscan.iter().enumerate().all(|(index, row)| {
                         let source_line = if row.row < 0 {
                             window
@@ -221,8 +221,8 @@ impl Vim9RenderFrame {
                             && row.line > 0
                             && row.line <= window.line_count
                             && source_line == Some(row.line)
-                            && ((-2..0).contains(&row.row)
-                                || (window.view.rows as i32..window.view.rows as i32 + 2)
+                            && ((-8..0).contains(&row.row)
+                                || (window.view.rows as i32..window.view.rows as i32 + 8)
                                     .contains(&row.row))
                             && row.byte_length <= 16_384
                             && row.runs.len() <= 512

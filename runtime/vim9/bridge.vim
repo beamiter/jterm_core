@@ -942,7 +942,7 @@ def SampleRenderWindow()
   renderLineGeneration = get(cache, 'generation', '')
   renderLineCache = get(cache, 'lines', {})
   try
-    renderWindowSample = RenderWindowFrame(renderProtocol >= 3 ? 2 : 0)
+    renderWindowSample = RenderWindowFrame(renderProtocol >= 4 ? 8 : (renderProtocol >= 3 ? 2 : 0))
     # An unsupported hidden row must not disable a supported visible viewport.
     # Retry without margins; never downgrade a real visible failure silently.
     if renderProtocol >= 3 && !renderWindowSample.supported
@@ -2051,7 +2051,7 @@ def Receive(_: channel, message: string)
         return
       endif
       var requestedRender: any = get(request, 'render_protocol', 1)
-      if type(requestedRender) != v:t_number || index([1, 2, 3], requestedRender) < 0
+      if type(requestedRender) != v:t_number || index([1, 2, 3, 4], requestedRender) < 0
         throw 'Unsupported native render protocol'
       endif
       renderProtocol = requestedRender
