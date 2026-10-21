@@ -71,7 +71,9 @@ from the command protocol. Version 1, also the default when omitted, receives
 complete frames. Version 2 additionally accepts row deltas. Version 3 adds
 source-bound scroll/pointer input and two real margin rows per viewport edge.
 Version 4 retains those semantics and extends each margin to eight rows for
-continuous wheel transitions and short bursts. Existing command and metadata
+continuous wheel transitions and short bursts. Version 5 adds the optional
+`completion` overlay for ordinary, fully visible Insert completion menus. Older
+hosts continue using the live compatibility menu. Existing command and metadata
 messages continue to use `protocol: 1`.
 
 Subsequent requests have a positive integer `id` and one action. For example:

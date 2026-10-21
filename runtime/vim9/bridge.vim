@@ -276,7 +276,7 @@ def RenderFallback(): string
     return 'This special Vim buffer uses the compatibility view'
   elseif mode(1) !~# '^[nivVR\x16]'
     return 'Vim command, prompt or terminal input uses the compatibility view'
-  elseif pumvisible() || !empty(filter(popup_list(), (_, id) => get(popup_getpos(id), 'visible', 0)))
+  elseif (pumvisible() && renderProtocol < 5) || !empty(filter(popup_list(), (_, id) => get(popup_getpos(id), 'visible', 0)))
     return 'Vim completion and popup windows use the compatibility view'
   elseif &diff || &rightleft || &arabic || &spell || &list || &conceallevel > 0 || &cursorcolumn || !empty(&wincolor)
     return 'This Vim display option needs the compatibility view'
@@ -533,7 +533,7 @@ enddef
 # virtual columns remain owned by the compatibility input path.
 def NativePointerAvailable(): bool
   const current = mode(1)
-  if index(['n', 'v'], current) < 0 || !empty(&virtualedit)
+  if pumvisible() || index(['n', 'v'], current) < 0 || !empty(&virtualedit)
       || &selectmode =~# 'mouse' || &mouse !~# (current ==# 'n' ? '[an]' : '[av]')
     return false
   endif
@@ -1051,6 +1051,115 @@ def SampleRenderWindow()
   endtry
 enddef
 
+# Completion remains Vim-owned. Public APIs do not expose pum_first, so never
+# guess which candidates a scrolling/fuzzy menu is showing. Render only a
+# complete, unclipped ordinary list with exact Vim row/column geometry.
+def CompletionText(runs: list<dict<any>>, text: string, row: number, column: number, style: dict<any>)
+  var col = column
+  for index in range(strchars(text, true))
+    var cluster = strcharpart(text, index, 1, true)
+    var cells = strdisplaywidth(cluster)
+    if cells <= 0 || cells > 2
+      throw 'Complex Vim completion text uses the compatibility view'
+    endif
+    if strlen(cluster) == 1 && !empty(runs) && runs[-1].row == row
+        && runs[-1].column + runs[-1].cells == col && runs[-1].style == style
+        && runs[-1].text =~# '^[\x20-\x7e]*$'
+      runs[-1].text ..= cluster
+      runs[-1].cells += cells
+    else
+      add(runs, {window: 0, row: row, column: col, text: cluster, cells: cells,
+        line: 0, byte_start: 0, byte_end: 0, style: style})
+    endif
+    col += cells
+  endfor
+enddef
+
+def RenderCompletion(): dict<any>
+  var position = pum_getpos()
+  if mode(1) !~# '^i' || empty(position) || position.size != position.height
+      || position.scrollbar || position.height <= 0 || position.height > 64
+      || position.width <= 0 || position.width > 511
+    throw 'Scrolling Vim completion menus use the compatibility view'
+  endif
+  for option in ['pumborder', 'pumshadow', 'pumopt']
+    if exists('+' .. option) && !empty(eval('&' .. option))
+      throw 'Decorated Vim completion menus use the compatibility view'
+    endif
+  endfor
+  if (exists('+pumopacity') && index([0, 100], eval('&pumopacity')) < 0)
+      || (exists('+completeitemalign') && index(['', 'abbr,kind,menu'], eval('&completeitemalign')) < 0)
+      || &completeopt =~# '\<fuzzy\>'
+    throw 'Custom Vim completion layout uses the compatibility view'
+  endif
+  for pair in [['PmenuMatch', 'Pmenu'], ['PmenuMatchSel', 'PmenuSel']]
+    var matchStyle = RenderStyle(hlID(pair[0]))
+    if matchStyle != RenderStyle(0) && matchStyle != RenderStyle(hlID(pair[1]))
+      throw 'Vim completion match highlighting uses the compatibility view'
+    endif
+  endfor
+  var info = complete_info(['items', 'selected'])
+  var candidates = get(info, 'items', [])
+  if len(candidates) != position.size || info.selected < -1 || info.selected >= len(candidates)
+    throw 'Filtered Vim completion menus use the compatibility view'
+  endif
+  var widths = [0, 0, 0]
+  var labels: list<list<string>> = []
+  for item in candidates
+    var word = empty(get(item, 'abbr', '')) ? item.word : item.abbr
+    var fields = [word, get(item, 'kind', ''), get(item, 'menu', '')]
+    for field in range(3)
+      var text = fields[field]
+      if strlen(text) > 2048 || text =~# '[\x00-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
+        throw 'Complex Vim completion labels use the compatibility view'
+      endif
+      widths[field] = max([widths[field], strdisplaywidth(text) + (field > 0 && !empty(text) ? 1 : 0)])
+    endfor
+    add(labels, fields)
+  endfor
+  var starts = [position.col, position.col + widths[0] + 1,
+    position.col + widths[0] + 1 + widths[1]]
+  for field in range(3)
+    var needed = widths[field] - (field > 0 && widths[field] > 0 ? 1 : 0)
+    if needed > 0 && starts[field] + needed > position.col + position.width
+      throw 'Clipped Vim completion labels use the compatibility view'
+    endif
+  endfor
+  var left = position.col > 0 ? 1 : 0
+  var view = {row: position.row, column: position.col - left,
+    rows: position.height, columns: position.width + left}
+  if view.row < 0 || view.column < 0 || view.row + view.rows > &lines
+      || view.column + view.columns > &columns
+    throw 'Vim completion geometry uses the compatibility view'
+  endif
+  var normal = MergeRenderStyle(renderNormal, RenderStyle(hlID('Pmenu')))
+  var runs: list<dict<any>> = []
+  for index in range(len(candidates))
+    var selected = index == info.selected
+    var rowStyle = selected ? MergeRenderStyle(renderNormal, RenderStyle(hlID('PmenuSel'))) : normal
+    var row = position.row + index
+    CompletionText(runs, repeat(' ', view.columns), row, view.column, rowStyle)
+    for field in range(3)
+      var label = labels[index][field]
+      if empty(label)
+        continue
+      endif
+      var group = field == 0 ? (selected ? 'PmenuSel' : 'Pmenu')
+        : (field == 1 ? (selected ? 'PmenuKindSel' : 'PmenuKind') : (selected ? 'PmenuExtraSel' : 'PmenuExtra'))
+      var style = MergeRenderStyle(rowStyle, RenderStyle(hlID(group)))
+      var custom = get(candidates[index], field == 0 ? 'abbr_hlgroup' : (field == 1 ? 'kind_hlgroup' : ''), '')
+      if !empty(custom)
+        style = MergeRenderStyle(style, RenderStyle(hlID(custom)))
+      endif
+      CompletionText(runs, label, row, starts[field], style)
+    endfor
+  endfor
+  if len(runs) > 4096
+    throw 'Vim completion exceeds the native paint budget'
+  endif
+  return {view: view, default_style: normal, runs: runs}
+enddef
+
 def RenderFrame(): dict<any>
   var active = win_getid()
   var activeMode = mode(1)
@@ -1115,6 +1224,17 @@ def RenderFrame(): dict<any>
     frame.runs = []
     frame.windows = []
   endif
+  frame.completion = v:null
+  if frame.supported && pumvisible()
+    try
+      frame.completion = RenderCompletion()
+    catch
+      frame.supported = false
+      frame.fallback_reason = v:exception
+      frame.runs = []
+      frame.windows = []
+    endtry
+  endif
   return frame
 enddef
 
@@ -1141,6 +1261,7 @@ def EmitRender(force: bool = false)
       frame.supported = false
       frame.fallback_reason = 'Native paint data exceeds the bounded frame budget'
       frame.runs = []
+      frame.completion = v:null
       encoded = json_encode(frame)
     endif
     if force || encoded !=# previousRender
@@ -2130,7 +2251,7 @@ def Receive(_: channel, message: string)
         return
       endif
       var requestedRender: any = get(request, 'render_protocol', 1)
-      if type(requestedRender) != v:t_number || index([1, 2, 3, 4], requestedRender) < 0
+      if type(requestedRender) != v:t_number || index([1, 2, 3, 4, 5], requestedRender) < 0
         throw 'Unsupported native render protocol'
       endif
       renderProtocol = requestedRender
@@ -2193,6 +2314,7 @@ augroup JTermVim9Bridge
   # asynchronously. Providers can explicitly invalidate after such updates.
   autocmd User JTermVim9RenderInvalidate InvalidateRender()
   autocmd WinScrolled,VimResized,OptionSet * RenderChanged()
+  autocmd CompleteChanged,CompleteDone * RenderChanged()
   autocmd QuickFixCmdPost * Changed()
   autocmd User LspDiagsUpdated,LspAttached,LspDetached LspDiagnosticsChanged()
   autocmd VimLeavePre * Leaving()

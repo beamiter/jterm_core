@@ -41,7 +41,7 @@ The active cursor and Visual selection cannot leak into sibling windows.
 
 This is an incremental GUI buffer renderer, not a complete external Vim UI
 protocol. Special buffers, actual wrapped continuation rows, closed
-folds, visible popups/completion, multiple/image sign columns, fold columns, virtual text,
+folds, general popup windows and complex/scrolling completion menus, multiple/image sign columns, fold columns, virtual text,
 multiline/positional/zero-width search and match patterns, conceal matches, virtual-space cursors,
 list/conceal/spell/right-to-left display and block selections through tabs currently publish an explicit
 compatibility reason. Complex zero-width/bidirectional text and clipped wide
@@ -375,3 +375,33 @@ Vim's live compatibility surface. Native showmatch timing is not inferred from
 terminal bytes. The runtime tests exercise real modes, ordered overlays,
 exclusive Visual inheritance, language mappings, linked/theme RGB changes,
 wide/combining/empty source cells and cursor-only deltas.
+
+
+## Native Insert completion (render protocol 5)
+
+Ordinary Insert completion can keep the native GUI buffer visible. The bridge
+reads the real `complete_info()` candidates and `pum_getpos()` geometry, then
+publishes a separate optional `completion` object with `view`, `default_style`
+and display-only `runs`. The rectangle includes Vim's one-cell left padding
+where present; it may cross splits and Vim status rows. Completion runs never
+become buffer/source anchors. GUI `Pmenu`, `PmenuSel`, `PmenuKind[Sel]` and
+`PmenuExtra[Sel]` styles are independent of terminal `cterm` colors. Available
+per-item `abbr_hlgroup`/`kind_hlgroup` metadata is merged when Vim exposes it.
+Older Vim builds (including the tested 9.2.0858) omit those fields from
+`complete_info()`; on them only the standard menu highlight groups are known.
+
+Candidate generation, filtering, key mappings, selection, acceptance and
+cancellation stay in Vim. The menu uses Vim's exact grid and original PTY
+keyboard/mouse route, without stealing focus or adding a second completion
+engine. Menu appearance retires old native scroll/pointer transforms.
+`CompleteChanged` and `CompleteDone` request a native paint; selection-only
+and close updates can be row deltas, and `completion: null` clears old paint.
+The receiver validates menu geometry, GUI colors, budgets and source-free runs.
+
+The supported list must fit completely without a scrollbar and use default
+column order, fully visible ordinary labels, and non-fuzzy ordering. Scrolling,
+filtered, clipped, bordered, translucent, custom `pumopt`, separate info/popup
+windows and distinct `PmenuMatch[Sel]` highlights retain explicit compatibility
+reasons. Public Vim APIs do not expose the first visible candidate or original
+match leader; this implementation does not guess them. Protocols 1–4 always
+retain the existing compatibility behavior while a completion menu is visible.

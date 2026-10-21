@@ -114,6 +114,16 @@ pub struct Vim9RenderWindow {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct Vim9RenderCompletion {
+    /// Vim's exact popup rectangle, independent of buffer/split ownership.
+    pub view: Vim9RenderRect,
+    pub default_style: Vim9RenderStyle,
+    /// Display-only glyphs and row backgrounds, never buffer source anchors.
+    pub runs: Vec<Vim9RenderRun>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Vim9RenderFrame {
     pub revision: u64,
     /// False means the host must immediately show Vim's compatibility view.
@@ -136,6 +146,8 @@ pub struct Vim9RenderFrame {
     /// Plain ASCII with equal style may be coalesced. Each non-ASCII grapheme
     /// remains separate so font fallback cannot shift later cursor geometry.
     pub runs: Vec<Vim9RenderRun>,
+    /// Protocol 5 ordinary Insert completion; None also explicitly clears it.
+    pub completion: Option<Vim9RenderCompletion>,
 }
 
 impl Vim9RenderFrame {
@@ -180,6 +192,29 @@ impl Vim9RenderFrame {
                 <= 24_000
             && self.windows.len() <= 16
             && style_valid(&self.default_style)
+            && self.completion.as_ref().is_none_or(|menu| {
+                self.supported
+                    && self.mode.starts_with('i')
+                    && menu.view.rows > 0
+                    && menu.view.rows <= 64
+                    && menu.view.columns > 0
+                    && menu.view.columns <= 512
+                    && within(menu.view.row, menu.view.rows, self.rows)
+                    && within(menu.view.column, menu.view.columns, self.columns)
+                    && style_valid(&menu.default_style)
+                    && menu.runs.len() <= 4096
+                    && menu.runs.iter().all(|run| {
+                        run.cells > 0
+                            && menu.view.contains(run.row, run.column)
+                            && within(run.column, run.cells, menu.view.column + menu.view.columns)
+                            && run.line == 0
+                            && run.byte_start == 0
+                            && run.byte_end == 0
+                            && run.text.len() <= 4096
+                            && !run.text.chars().any(|c| c.is_ascii_control())
+                            && style_valid(&run.style)
+                    })
+            })
             && self.cursor.appearance.as_ref().is_none_or(|a| a.valid())
             && within(self.view.row, self.view.rows, self.rows)
             && within(self.view.column, self.view.columns, self.columns)
@@ -381,6 +416,64 @@ impl RenderDelta {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn completion_overlay_can_cross_splits_but_never_becomes_source_paint() {
+        let mut value = split_frame();
+        value["mode"] = json!("ic");
+        value["completion"] = json!({
+            "view":{"row":2,"column":35,"rows":2,"columns":20},
+            "default_style":{"foreground":0xabcdef,"background":0x123456},
+            "runs":[{"row":2,"column":35,"text":"native completion","cells":17}]
+        });
+        let frame: Vim9RenderFrame = serde_json::from_value(value.clone()).unwrap();
+        assert!(frame.valid());
+        assert_eq!(frame.runs.len(), 3);
+        for (field, bad) in [
+            ("cells", json!(30)),
+            ("line", json!(1)),
+            ("text", json!("untrusted\ncontrol")),
+            ("style", json!({"foreground":0x1000000})),
+        ] {
+            let mut broken = value.clone();
+            broken["completion"]["runs"][0][field] = bad;
+            assert!(!serde_json::from_value::<Vim9RenderFrame>(broken)
+                .unwrap()
+                .valid());
+        }
+        value["mode"] = json!("n");
+        assert!(!serde_json::from_value::<Vim9RenderFrame>(value)
+            .unwrap()
+            .valid());
+    }
+
+    #[test]
+    fn completion_only_delta_updates_and_closes_without_reusing_old_menu() {
+        let mut value = split_frame();
+        value["mode"] = json!("i");
+        let first: Vim9RenderFrame = serde_json::from_value(value.clone()).unwrap();
+        value["revision"] = json!(2);
+        value["base_revision"] = json!(1);
+        value["row_updates"] = json!([]);
+        value["runs"] = json!([]);
+        value["completion"] = json!({"view":{"row":2,"column":35,"rows":1,"columns":20},
+            "runs":[{"row":2,"column":35,"text":"candidate","cells":9}]});
+        let menu = serde_json::from_value::<RenderDelta>(value.clone())
+            .unwrap()
+            .apply(&first)
+            .unwrap();
+        assert!(menu.completion.is_some());
+        assert_eq!(menu.runs, first.runs);
+        value["revision"] = json!(3);
+        value["base_revision"] = json!(2);
+        value["completion"] = Value::Null;
+        let closed = serde_json::from_value::<RenderDelta>(value)
+            .unwrap()
+            .apply(&menu)
+            .unwrap();
+        assert!(closed.completion.is_none());
+        assert_eq!(closed.runs, first.runs);
+    }
 
     fn split_frame() -> Value {
         json!({
