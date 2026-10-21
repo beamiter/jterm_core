@@ -1,0 +1,153 @@
+name: Prepare native Vim core upgrade
+
+on:
+  workflow_call:
+    inputs:
+      core_revision:
+        description: Immutable jterm_core commit to adopt
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: >-
+      github.ref == 'refs/heads/master' &&
+      contains(fromJSON('["beamiter/anvil","beamiter/forge","beamiter/ember","beamiter/frost"]'), github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CORE_REVISION: ${{ inputs.core_revision }}
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: native-vim-core-upgrade
+      - name: Update exact pins without re-resolving unrelated packages
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          target = os.environ['CORE_REVISION']
+          if re.fullmatch(r'[0-9a-f]{40}', target) is None:
+              raise SystemExit('core_revision must be a full lowercase commit SHA')
+          manifest = Path('Cargo.toml')
+          lock = Path('Cargo.lock')
+          text = manifest.read_text()
+          parsed = tomllib.loads(text)
+          pins = []
+          for section in ('dependencies', 'dev-dependencies'):
+              item = parsed.get(section, {}).get('jterm_core')
+              if not isinstance(item, dict) or item.get('git') != 'https://github.com/beamiter/jterm_core.git':
+                  raise SystemExit(f'Unexpected core dependency in {section}')
+              pins.append(item.get('rev'))
+          if len(set(pins)) != 1 or re.fullmatch(r'[0-9a-f]{40}', pins[0] or '') is None:
+              raise SystemExit('Expected one consistent immutable core revision')
+          previous = pins[0]
+          if previous == target:
+              raise SystemExit('Core is already pinned to this revision')
+          old_lock = lock.read_text()
+          packages = tomllib.loads(old_lock)['package']
+          core = [p for p in packages if p['name'] == 'jterm_core']
+          expected_source = f'git+https://github.com/beamiter/jterm_core.git?rev={previous}#{previous}'
+          if len(core) != 1 or core[0].get('source') != expected_source:
+              raise SystemExit('Unexpected core lock source; refusing broad dependency update')
+          if text.count(previous) != 2 or old_lock.count(expected_source) != 1:
+              raise SystemExit('Unexpected revision occurrence count')
+          manifest.write_text(text.replace(previous, target))
+          lock.write_text(old_lock.replace(expected_source, expected_source.replace(previous, target)))
+          changed = tomllib.loads(lock.read_text())['package']
+          for before, after in zip(packages, changed, strict=True):
+              if before['name'] != 'jterm_core' and before != after:
+                  raise SystemExit('Unrelated lock entry changed')
+          print(f'Core pin: {previous} -> {target}')
+          PY
+      - name: Install frontend build prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          case "$GITHUB_REPOSITORY" in
+            beamiter/anvil|beamiter/forge)
+              sudo apt-get install -y pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev
+              ;;
+            beamiter/ember|beamiter/frost)
+              sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libegl1-mesa-dev
+              ;;
+            *) exit 1 ;;
+          esac
+      - name: Format Rust and validate the pinned dependency graph
+        run: |
+          cargo fmt --all
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/native-vim-metadata.json"
+          git diff --check
+      - name: Check production application
+        run: cargo check --locked
+      - name: Prepare candidate commit without updating any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+          from pathlib import Path
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          base = os.environ['GITHUB_SHA']
+          target = os.environ['CORE_REVISION']
+          api = f'https://api.github.com/repos/{repo}'
+          def request(path, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = urllib.request.Request(api + path, data=body, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+              })
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+
+          # Never publish from a stale checkout, and never move a ref here.
+          head = request('/git/ref/heads/master')['object']['sha']
+          if head != base:
+              raise SystemExit(f'master advanced: expected {base}, found {head}')
+          names = subprocess.check_output(['git', 'diff', '--name-only', '-z']).decode().split('\0')
+          names = [name for name in names if name]
+          if not {'Cargo.toml', 'Cargo.lock'}.issubset(names):
+              raise SystemExit('Expected both the manifest and lockfile to change')
+          if any(name not in {'Cargo.toml', 'Cargo.lock'} and not name.endswith('.rs') for name in names):
+              raise SystemExit('Unexpected file changed during preparation')
+          entries = []
+          for name in names:
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name]).decode().split()[0]
+              blob = request('/git/blobs', {'content': Path(name).read_text(), 'encoding': 'utf-8'})
+              entries.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': blob['sha']})
+          base_tree = request('/git/commits/' + base)['tree']['sha']
+          tree = request('/git/trees', {'base_tree': base_tree, 'tree': entries})
+          message = ('perf(vim9): adopt bounded scroll tails and precise split input\n\n'
+                     f'Pin jterm_core {target} in manifest and lockfile without changing unrelated dependencies. '
+                     'Apply rustfmt and verify the production application with cargo check --locked. '
+                     'No installation or application restart. Full GUI/hardware validation remains separate.')
+          commit = request('/git/commits', {'message': message, 'tree': tree['sha'], 'parents': [base]})
+          result = {'repository': repo, 'base': base, 'candidate': commit['sha'], 'core': target, 'files': names}
+          print('::notice title=Prepared Vim9 core upgrade::' + json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Candidate (not published)\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
