@@ -70,6 +70,19 @@ pub struct Vim9RenderRun {
     pub byte_end: usize,
 }
 
+/// A real buffer row outside the visible split. `row` is signed and relative
+/// to its viewport's top, never a terminal screen coordinate. Nested runs use
+/// row zero; their columns and source bytes retain the same meaning as visible
+/// runs. Empty lines are explicit, so missing paint is never guessed as text.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9RenderMarginRow {
+    pub row: i32,
+    pub line: u64,
+    pub byte_length: usize,
+    pub runs: Vec<Vim9RenderRun>,
+}
+
 /// A visible Vim window, sampled in that window's own buffer/option context.
 /// Status lines and split separators are deliberately outside `view`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -85,6 +98,10 @@ pub struct Vim9RenderWindow {
     pub botline: u64,
     pub leftcol: usize,
     pub textoff: usize,
+    /// Zero for old wire versions. Otherwise the actual buffer line count.
+    pub line_count: u64,
+    /// Version 3: at most two independently sampled source rows on each edge.
+    pub overscan: Vec<Vim9RenderMarginRow>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -145,7 +162,14 @@ impl Vim9RenderFrame {
                     && self.buffer > 0
                     && self.view.rows > 0
                     && self.view.columns > 0))
-            && self.runs.len() <= 24_000
+            && self.runs.len()
+                + self
+                    .windows
+                    .iter()
+                    .flat_map(|window| &window.overscan)
+                    .map(|row| row.runs.len())
+                    .sum::<usize>()
+                <= 24_000
             && self.windows.len() <= 16
             && style_valid(&self.default_style)
             && within(self.view.row, self.view.rows, self.rows)
@@ -167,6 +191,52 @@ impl Vim9RenderFrame {
                     && within(window.view.row, window.view.rows, self.rows)
                     && within(window.view.column, window.view.columns, self.columns)
                     && window.textoff <= window.view.columns
+                    && (window.line_count == 0
+                        || (window.topline > 0
+                            && window.topline <= window.botline
+                            && window.botline <= window.line_count))
+                    && window.overscan.len() <= 4
+                    && window.overscan.iter().enumerate().all(|(index, row)| {
+                        let source_line = if row.row < 0 {
+                            window
+                                .topline
+                                .checked_sub(u64::from(row.row.unsigned_abs()))
+                        } else {
+                            window.topline.checked_add(row.row as u64)
+                        };
+                        window.line_count > 0
+                            && row.line > 0
+                            && row.line <= window.line_count
+                            && source_line == Some(row.line)
+                            && ((-2..0).contains(&row.row)
+                                || (window.view.rows as i32..window.view.rows as i32 + 2)
+                                    .contains(&row.row))
+                            && row.byte_length <= 16_384
+                            && row.runs.len() <= 512
+                            && window.overscan[..index]
+                                .iter()
+                                .all(|other| other.row < row.row)
+                            && row.runs.iter().all(|run| {
+                                run.window == window.window
+                                    && run.row == 0
+                                    && run.cells > 0
+                                    && run.column >= window.view.column
+                                    && within(
+                                        run.column,
+                                        run.cells,
+                                        window.view.column + window.view.columns,
+                                    )
+                                    && (run.line == 0 || run.line == row.line)
+                                    && run.byte_start <= run.byte_end
+                                    && (run.line == 0 || run.byte_end <= row.byte_length)
+                                    && run.text.len() <= 64 * 1024
+                                    && !run
+                                        .text
+                                        .chars()
+                                        .any(|character| character.is_ascii_control())
+                                    && style_valid(&run.style)
+                            })
+                    })
                     && (!window.cursor.visible
                         || (window.window == self.window
                             && window

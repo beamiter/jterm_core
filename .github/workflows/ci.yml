@@ -64,4 +64,5 @@ jobs:
           python3 runtime/vim9/test_bridge.py
           python3 runtime/vim9/test_shell.py
           python3 runtime/vim9/test_scroll.py
+          python3 runtime/vim9/test_overscan.py
           cargo test --locked --lib vim9::tests::real_vim9_round_trip -- --ignored

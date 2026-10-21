@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 30
     env:
       CORE_REVISION: ${{ inputs.core_revision }}
-      CARGO_TERM_COLOR: always
+      CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
@@ -80,23 +80,23 @@ jobs:
       - name: Install frontend build prerequisites
         shell: bash
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           case "$GITHUB_REPOSITORY" in
             beamiter/anvil|beamiter/forge)
-              sudo apt-get install -y pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev
+              sudo apt-get install -y -qq pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev
               ;;
             beamiter/ember|beamiter/frost)
-              sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libegl1-mesa-dev
+              sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libegl1-mesa-dev
               ;;
             *) exit 1 ;;
           esac
-      - name: Format Rust and validate the pinned dependency graph
+      - name: Check formatting and the pinned dependency graph without rewriting source
         run: |
-          cargo fmt --all
-          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/native-vim-metadata.json"
+          cargo fmt --all -- --check
+          cargo metadata --quiet --locked --format-version 1 > "$RUNNER_TEMP/native-vim-metadata.json"
           git diff --check
-      - name: Check production application
-        run: cargo check --locked
+      - name: Check application, tests, examples and benchmarks
+        run: cargo check --quiet --locked --all-targets
       - name: Prepare candidate commit without updating any branch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -130,10 +130,8 @@ jobs:
               raise SystemExit(f'master advanced: expected {base}, found {head}')
           names = subprocess.check_output(['git', 'diff', '--name-only', '-z']).decode().split('\0')
           names = [name for name in names if name]
-          if not {'Cargo.toml', 'Cargo.lock'}.issubset(names):
-              raise SystemExit('Expected both the manifest and lockfile to change')
-          if any(name not in {'Cargo.toml', 'Cargo.lock'} and not name.endswith('.rs') for name in names):
-              raise SystemExit('Unexpected file changed during preparation')
+          if set(names) != {'Cargo.toml', 'Cargo.lock'}:
+              raise SystemExit('A core-only upgrade must change exactly the manifest and lockfile')
           entries = []
           for name in names:
               mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name]).decode().split()[0]
@@ -141,12 +139,12 @@ jobs:
               entries.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': blob['sha']})
           base_tree = request('/git/commits/' + base)['tree']['sha']
           tree = request('/git/trees', {'base_tree': base_tree, 'tree': entries})
-          message = ('perf(vim9): adopt bounded scroll tails and precise split input\n\n'
+          message = ('chore(vim9): adopt validated shared core revision\n\n'
                      f'Pin jterm_core {target} in manifest and lockfile without changing unrelated dependencies. '
-                     'Apply rustfmt and verify the production application with cargo check --locked. '
-                     'No installation or application restart. Full GUI/hardware validation remains separate.')
+                     'Verify formatting and cargo check --locked --all-targets; source files are not rewritten. '
+                     'No installation or application restart. Runtime GUI and hardware acceptance remain separate.')
           commit = request('/git/commits', {'message': message, 'tree': tree['sha'], 'parents': [base]})
-          result = {'repository': repo, 'base': base, 'candidate': commit['sha'], 'core': target, 'files': names}
+          result = {'repository': repo, 'base': base, 'candidate': commit['sha'], 'tree': tree['sha'], 'core': target, 'files': names}
           print('::notice title=Prepared Vim9 core upgrade::' + json.dumps(result))
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
               summary.write('## Candidate (not published)\n\n```json\n' + json.dumps(result, indent=2) + '\n```\n')

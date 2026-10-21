@@ -29,8 +29,8 @@ pub use project::{Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot};
 #[path = "vim9_render.rs"]
 mod render;
 pub use render::{
-    Vim9RenderCursor, Vim9RenderFrame, Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle,
-    Vim9RenderWindow,
+    Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMarginRow, Vim9RenderRect, Vim9RenderRun,
+    Vim9RenderStyle, Vim9RenderWindow,
 };
 
 #[path = "vim9_gui.rs"]
@@ -50,6 +50,10 @@ pub use shell::{shell_argv_eligible, Vim9ShellIntegration, VIM9_SHELL_EXEC};
 #[path = "vim9_scroll.rs"]
 mod scroll;
 pub use scroll::{Vim9ScrollAccumulator, Vim9ScrollAnimation};
+
+#[path = "vim9_viewport.rs"]
+mod viewport;
+pub use viewport::{Vim9ProjectedRun, Vim9Viewport, Vim9ViewportAnchor};
 
 const PROTOCOL: u64 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
@@ -874,7 +878,7 @@ fn connection(
                         return Ok(false);
                     }
                     let mut reply = serde_json::to_vec(
-                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":2}),
+                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":3}),
                     )
                     .map_err(io::Error::other)?;
                     reply.push(b'\n');
@@ -1363,7 +1367,7 @@ mod tests {
         reader.read_line(&mut wire).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&wire).unwrap()["render_protocol"],
-            2
+            3
         );
         let full = json!({"event":"render","revision":1,"supported":true,
             "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",

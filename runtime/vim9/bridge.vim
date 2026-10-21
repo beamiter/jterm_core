@@ -352,7 +352,7 @@ def RenderSelected(glyph: dict<any>, visual: string, anchor: list<number>, curre
   return true
 enddef
 
-def RenderWindowFrame(): dict<any>
+def RenderWindowFrame(margin: number = 0): dict<any>
   var info = getwininfo(win_getid())[0]
   var view = {row: info.winrow - 1, column: info.wincol - 1,
     rows: info.height, columns: info.width}
@@ -373,7 +373,14 @@ def RenderWindowFrame(): dict<any>
   frame.botline = last
   frame.leftcol = savedView.leftcol
   frame.textoff = info.textoff
-  if view.rows > 200 || view.columns > 400 || last - first > 200
+  frame.line_count = line('$')
+  frame.overscan = []
+  var visibleFirst = first
+  if margin > 0
+    first = max([1, first - margin])
+    last = min([line('$'), last + margin])
+  endif
+  if view.rows > 200 || view.columns > 400 || last - first > 200 + 2 * margin
     frame.supported = false
     frame.fallback_reason = 'This viewport exceeds the bounded native paint budget'
     return frame
@@ -670,11 +677,34 @@ def RenderWindowFrame(): dict<any>
         style: style})
     endif
   endfor
-  for row in range(view.row + last - first + 1, view.row + view.rows - 1)
+  for row in range(view.row + last - first + 1, max([view.row + last - first, view.row + view.rows + visibleFirst - first - 1]))
     add(frame.runs, {row: row, column: view.column, text: '~', cells: 1,
       line: 0, byte_start: 0, byte_end: 0,
       style: MergeRenderStyle(renderNormal, RenderStyle(hlID('EndOfBuffer')))})
   endfor
+  if margin > 0
+    var marginRows: dict<dict<any>> = {}
+    for lineNumber in range(first, last)
+      var relative = lineNumber - visibleFirst
+      if relative < 0 || relative >= view.rows
+        var edge = {row: relative, line: lineNumber, byte_length: strlen(getline(lineNumber)), runs: []}
+        marginRows[string(relative)] = edge
+        add(frame.overscan, edge)
+      endif
+    endfor
+    var visibleRuns: list<dict<any>> = []
+    for run in frame.runs
+      var relative = run.row - view.row - (visibleFirst - first)
+      if relative >= 0 && relative < view.rows
+        run.row = view.row + relative
+        add(visibleRuns, run)
+      elseif has_key(marginRows, string(relative))
+        run.row = 0
+        add(marginRows[string(relative)].runs, run)
+      endif
+    endfor
+    frame.runs = visibleRuns
+  endif
   var position = screenpos(win_getid(), line('.'), col('.'))
   if get(position, 'row', 0) > 0 && get(position, 'curscol', 0) > 0
     frame.cursor = {row: position.row - 1, column: position.curscol - 1,
@@ -696,7 +726,14 @@ def SampleRenderWindow()
   renderLineGeneration = get(cache, 'generation', '')
   renderLineCache = get(cache, 'lines', {})
   try
-    renderWindowSample = RenderWindowFrame()
+    renderWindowSample = RenderWindowFrame(renderProtocol >= 3 ? 2 : 0)
+    # An unsupported hidden row must not disable a supported visible viewport.
+    # Retry without margins; never downgrade a real visible failure silently.
+    if renderProtocol >= 3 && !renderWindowSample.supported
+      renderBaseKey = ''
+      renderBase = []
+      renderWindowSample = RenderWindowFrame()
+    endif
     renderWindowCaches[key] = renderWindowSample.supported
       ? {key: renderBaseKey, base: renderBase, generation: renderLineGeneration, lines: renderLineCache}
       : {key: '', base: [], generation: '', lines: {}}
@@ -705,6 +742,11 @@ def SampleRenderWindow()
     endif
     for run in renderWindowSample.runs
       run.window = win_getid()
+    endfor
+    for edge in get(renderWindowSample, 'overscan', [])
+      for run in edge.runs
+        run.window = win_getid()
+      endfor
     endfor
   finally
     renderBaseKey = ''
@@ -759,12 +801,14 @@ def RenderFrame(): dict<any>
     add(frame.windows, {window: sample.window, buffer: sample.buffer,
       changedtick: sample.changedtick, view: sample.view, cursor: sample.cursor,
       topline: sample.topline, botline: sample.botline,
-      textoff: sample.textoff, leftcol: sample.leftcol})
+      textoff: sample.textoff, leftcol: sample.leftcol,
+      line_count: sample.line_count, overscan: sample.overscan})
     extend(runs, sample.runs)
     caches[string(id)] = renderWindowCaches[string(id)]
   endfor
   renderWindowCaches = caches
   frame.runs = runs
+  remove(frame, 'overscan')
   if win_getid() != active || bufnr() != activeBuffer || mode(1) !=# activeMode || winsaveview() != activeView
     frame.supported = false
     frame.fallback_reason = 'Vim changed its active view during native sampling'
@@ -787,6 +831,12 @@ def EmitRender(force: bool = false)
   try
     var frame = RenderFrame()
     var encoded = json_encode(frame)
+    if strlen(encoded) > 900000
+      for window in get(frame, 'windows', [])
+        window.overscan = []
+      endfor
+      encoded = json_encode(frame)
+    endif
     if strlen(encoded) > 900000
       frame.supported = false
       frame.fallback_reason = 'Native paint data exceeds the bounded frame budget'
@@ -1776,7 +1826,7 @@ def Receive(_: channel, message: string)
         return
       endif
       var requestedRender: any = get(request, 'render_protocol', 1)
-      if type(requestedRender) != v:t_number || index([1, 2], requestedRender) < 0
+      if type(requestedRender) != v:t_number || index([1, 2, 3], requestedRender) < 0
         throw 'Unsupported native render protocol'
       endif
       renderProtocol = requestedRender
