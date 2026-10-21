@@ -28,7 +28,7 @@ jobs:
           python3 .maintenance/apply-vim9-viewport.py
           python3 .maintenance/refine-vim9-viewport.py
       - run: cargo fmt --all && git diff --check
-      - run: cargo test --quiet --locked --all-targets -- --quiet
+      - run: cargo test --quiet --locked --all-targets
       - run: cargo clippy --quiet --locked --all-targets -- -D warnings
       - run: cargo doc --quiet --locked --no-deps
         env:
