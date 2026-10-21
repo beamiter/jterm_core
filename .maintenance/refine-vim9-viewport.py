@@ -23,7 +23,7 @@ replace('src/vim9_viewport.rs', '''            self.anchor(projected, offset)
             let rect = self.row_rect(i64::from(row.row),
                 self.window.view.column.checked_add(self.window.textoff)?, 1)?;
             Some(Vim9ViewportAnchor {
-                revision: self.frame.revision, position: position.clone(), byte_end: 0,
+                revision: self.frame.revision, position: *position, byte_end: 0,
                 rect, clip: intersect(rect, self.clip)?,
             })
         })
