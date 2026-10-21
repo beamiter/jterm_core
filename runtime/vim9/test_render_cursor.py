@@ -66,8 +66,12 @@ class RenderCursorTests(unittest.TestCase):
     def test_language_mapping_uses_second_linked_highlight(self):
         e = self.editor
         e.ex("highlight! link NativeLinked NativeInsert")
-        e.ex("set guicursor=n:block-NativeCursor/NativeLinked iminsert=1")
+        e.ex("set guicursor=n-i:block-NativeCursor/NativeLinked iminsert=1")
+        self.assertEqual(self.appearance()["style"]["background"], 0xe1a273)
+        e.keys("i")
+        e.painted(lambda f: f["mode"] == "i")
         self.assertEqual(self.appearance()["style"]["background"], 0x73a2e1)
+        e.keys("\x1b")
         e.ex("set iminsert=0")
         self.assertEqual(self.appearance()["style"]["background"], 0xe1a273)
 

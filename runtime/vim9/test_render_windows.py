@@ -121,7 +121,9 @@ class RenderWindowTests(unittest.TestCase):
         original_window = first["window"]
         e.request("split", vertical=True)
         e.request("goto", line=100, column=5)
-        e.keys("zt")
+        # Wait for the viewport command to finish; a bridge snapshot may be
+        # serviced before asynchronous PTY keys during a loaded GUI build.
+        e.ex("normal! zt")
         split = self.assert_native()
         windows = {w["window"]: w for w in split["windows"]}
         self.assertEqual(len(windows), 2)

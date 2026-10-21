@@ -29,7 +29,10 @@ impl Default for Vim9CursorAppearance {
         Self {
             shape: Vim9CursorShape::Block,
             percentage: 100,
-            style: Vim9RenderStyle::default(),
+            style: Vim9RenderStyle {
+                reverse: true,
+                ..Default::default()
+            },
             blinkwait: 700,
             blinkon: 400,
             blinkoff: 250,
@@ -84,10 +87,6 @@ impl Vim9CursorAppearance {
         let mut bg = under.background.or(normal.background).unwrap_or(0x20242c);
         if under.reverse {
             std::mem::swap(&mut fg, &mut bg);
-        }
-        if self.style.foreground.is_none() && self.style.background.is_none() && !self.style.reverse
-        {
-            return (bg, fg);
         }
         fg = self.style.foreground.unwrap_or(fg);
         bg = self.style.background.unwrap_or(bg);
@@ -211,6 +210,7 @@ mod tests {
         assert_eq!(a.colors(&under, &normal), (0x654321, 0xabcdef));
         a.style.foreground = Some(0x102030);
         a.style.background = Some(0xa0b0c0);
+        a.style.reverse = false;
         assert_eq!(a.colors(&under, &normal), (0x102030, 0xa0b0c0));
         a.style.reverse = true;
         assert_eq!(a.colors(&under, &normal), (0xa0b0c0, 0x102030));

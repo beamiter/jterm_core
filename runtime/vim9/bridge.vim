@@ -148,8 +148,13 @@ def RenderCursorAppearance(): dict<any>
   endif
   var result = copy(cursorShapes[name])
   var groups = split(remove(result, 'group'), '/', true)
-  var group = get(groups, &iminsert == 1 && len(groups) > 1 ? 1 : 0, '')
-  result.style = copy(RenderStyle(hlID(group)))
+  var mapped = (name ==# 'i' || name ==# 'r') && &iminsert == 1
+  var group = get(groups, mapped && len(groups) > 1 ? 1 : 0, '')
+  var id = hlID(group)
+  result.style = copy(RenderStyle(id))
+  if id == 0
+    result.style.reverse = true
+  endif
   return result
 enddef
 # Each real Vim window has its own viewport and syntax context, even when
