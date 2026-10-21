@@ -63,7 +63,7 @@ impl Vim9EntryRequest {
 
 /// The managed shell shim forwards the real executable and every already
 /// expanded argument separately. No shell command string is parsed or run.
-/// Frontends call this before their normal CLI parser, with argv[0] removed.
+/// Frontends call this before their normal CLI parser, with `argv[0]` removed.
 pub fn shell_vim_request(args: &[std::ffi::OsString]) -> Result<Option<Vim9EntryRequest>, String> {
     if args.first().is_none_or(|arg| arg != "--vim-shell") {
         return Ok(None);
