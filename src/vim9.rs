@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -39,7 +41,15 @@ pub use gui::{
 
 #[path = "vim9_entry.rs"]
 mod entry;
-pub use entry::{explicit_ide_target, Vim9EntryRequest, Vim9EntryTrigger};
+pub use entry::{explicit_ide_target, shell_vim_request, Vim9EntryRequest, Vim9EntryTrigger};
+
+#[path = "vim9_shell.rs"]
+mod shell;
+pub use shell::{shell_argv_eligible, Vim9ShellIntegration, VIM9_SHELL_EXEC};
+
+#[path = "vim9_scroll.rs"]
+mod scroll;
+pub use scroll::{Vim9ScrollAccumulator, Vim9ScrollAnimation};
 
 const PROTOCOL: u64 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
@@ -272,6 +282,13 @@ pub enum Vim9Command {
     Format,
     NextDiagnostic,
     PreviousDiagnostic,
+    /// Scroll an existing window without focusing it or evaluating user text.
+    /// Positive counts move the viewport down. Hosts retain fractional input
+    /// and coalesce it before sending at most 120 lines in one request.
+    Scroll {
+        window: i64,
+        lines: i32,
+    },
     /// Subscribe to buffer-origin GUI paint frames, independently of PTY
     /// output. Existing hosts remain unchanged until they explicitly opt in.
     SetRender {
@@ -284,6 +301,13 @@ pub enum Vim9Command {
 impl Vim9Command {
     fn frame(&self, id: u64) -> io::Result<Vec<u8>> {
         match self {
+            Self::Scroll { window, lines }
+                if *window <= 0 || *lines == 0 || lines.unsigned_abs() > 120 =>
+            {
+                return Err(invalid(
+                    "Scroll needs a window and between 1 and 120 signed lines",
+                ));
+            }
             Self::Open { path, line, column } => {
                 if path.is_empty() || path.contains('\0') || *line == Some(0) || *column == Some(0)
                 {
@@ -359,6 +383,7 @@ struct SessionInner {
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     next_id: AtomicU64,
+    wake: UnixStream,
 }
 
 impl Drop for SessionInner {
@@ -366,6 +391,7 @@ impl Drop for SessionInner {
         // Never join a socket worker on a UI thread. Its poll and socket
         // timeouts are bounded, and it does not hold an owning session Arc.
         self.stop.store(true, Ordering::Release);
+        let _ = (&self.wake).write(&[1]);
         set_disconnected(&self.shared, None);
     }
 }
@@ -390,17 +416,37 @@ impl Vim9Session {
     /// in an existing directory. The caller must launch the returned command
     /// in a dedicated PTY, never inject it into an existing shell's input.
     pub fn start(request: Vim9EntryRequest) -> io::Result<Self> {
-        let (entry_id, target) = request.into_parts();
-        let program = find_vim()?;
-        let (root, file) = project_target(&target)?;
+        let (entry_id, target, shell_launch) = request.into_parts();
         let runtime = RUNTIME.path()?;
-        Self::prepare(root, file, program, runtime, entry_id)
+        if let Some((program, args)) = shell_launch {
+            // A shell invocation owns its exact cwd and argv. Do not climb to
+            // a project root, collapse several files, or reinterpret +commands.
+            Self::prepare_argv(target, program, args, runtime, entry_id)
+        } else {
+            let program = find_vim()?;
+            let (root, file) = project_target(&target)?;
+            Self::prepare(root, file, program, runtime, entry_id)
+        }
     }
 
     fn prepare(
         root: PathBuf,
         file: Option<PathBuf>,
         program: String,
+        runtime: PathBuf,
+        entry_id: uuid::Uuid,
+    ) -> io::Result<Self> {
+        let mut args = vec!["-N".into(), "--".into()];
+        if let Some(file) = file {
+            args.push(path_text(&file)?);
+        }
+        Self::prepare_argv(root, program, args, runtime, entry_id)
+    }
+
+    fn prepare_argv(
+        root: PathBuf,
+        program: String,
+        original_args: Vec<String>,
         runtime: PathBuf,
         entry_id: uuid::Uuid,
     ) -> io::Result<Self> {
@@ -412,10 +458,8 @@ impl Vim9Session {
             format!("JTERM_VIM9_TOKEN={token}"),
             format!("JTERM_VIM9_ROOT={}", path_text(&root)?),
         ];
-        let mut args = vec!["-N".into(), "-S".into(), path_text(&runtime)?, "--".into()];
-        if let Some(file) = file {
-            args.push(path_text(&file)?);
-        }
+        let mut args = vec!["-S".into(), path_text(&runtime)?];
+        args.extend(original_args);
         let mut launch = Vim9Launch {
             program,
             args,
@@ -445,12 +489,15 @@ impl Vim9Session {
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded(MAX_PENDING);
+        let (wake, reader) = UnixStream::pair()?;
+        wake.set_nonblocking(true)?;
+        reader.set_nonblocking(true)?;
         let worker_shared = shared.clone();
         let worker_stop = stop.clone();
         thread::Builder::new()
             .name("vim9-bridge".into())
             .spawn(move || {
-                bridge_worker(listener, token, rx, worker_shared, worker_stop);
+                bridge_worker(listener, token, rx, worker_shared, worker_stop, reader);
             })?;
         Ok(Self(Arc::new(SessionInner {
             entry_id,
@@ -459,6 +506,7 @@ impl Vim9Session {
             shared,
             stop,
             next_id: AtomicU64::new(1),
+            wake,
         })))
     }
 
@@ -479,6 +527,7 @@ impl Vim9Session {
     /// modified-buffer quit must not call this method.
     pub fn revoke(&self) {
         self.0.stop.store(true, Ordering::Release);
+        let _ = (&self.0.wake).write(&[1]);
         set_disconnected(&self.0.shared, None);
     }
 
@@ -546,6 +595,9 @@ impl Vim9Session {
             };
             return Err(io::Error::new(kind, "Vim9 command queue is unavailable"));
         }
+        // Wake the socket worker immediately. A full nonblocking wake socket
+        // already contains a notification; commands remain in the bounded queue.
+        let _ = (&self.0.wake).write(&[1]);
         shared.snapshot.error = None;
         Ok(id)
     }
@@ -581,9 +633,10 @@ fn find_vim() -> io::Result<String> {
         // launch reports a missing host executable; do not stat the wrong one.
         return Ok(configured);
     }
-    if let Some(path) =
-        crate::host::resolve_configured_program(&configured, std::env::var_os("PATH").as_deref())
-    {
+    // A native window can itself be launched from an integrated shell. Never
+    // feed its PATH shim back into the editor PTY and recursively open windows.
+    let path = shell::path_without_shim();
+    if let Some(path) = crate::host::resolve_configured_program(&configured, path.as_deref()) {
         return path_text(&fs::canonicalize(path)?);
     }
     Err(io::Error::new(io::ErrorKind::NotFound,
@@ -696,6 +749,7 @@ fn bridge_worker(
     requests: Receiver<Request>,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
+    wake: UnixStream,
 ) {
     let started = Instant::now();
     let mut announced_timeout = false;
@@ -703,7 +757,7 @@ fn bridge_worker(
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, address)) if address.ip().is_loopback() => {
-                match connection(stream, &token, &requests, &shared, &stop) {
+                match connection(stream, &token, &requests, &shared, &stop, &wake) {
                     Ok(authenticated) => {
                         if authenticated {
                             connected_once = true;
@@ -749,10 +803,11 @@ fn connection(
     requests: &Receiver<Request>,
     shared: &Mutex<Shared>,
     stop: &AtomicBool,
+    wake: &UnixStream,
 ) -> Result<bool, (bool, io::Error)> {
     let mut authenticated = false;
     let mut run = || -> io::Result<bool> {
-        stream.set_read_timeout(Some(TICK))?;
+        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
         stream.set_write_timeout(Some(Duration::from_millis(250)))?;
         stream.set_nodelay(true)?;
         let deadline = Instant::now() + AUTH_TIMEOUT;
@@ -775,6 +830,14 @@ fn connection(
                         stream.write_all(&request.bytes)?;
                     }
                 }
+            }
+            let timeout = if requests.is_empty() || !authenticated {
+                250
+            } else {
+                0
+            };
+            if !wait_for_editor(&stream, wake, timeout)? {
+                continue;
             }
             match stream.read(&mut chunk) {
                 Ok(0) => return Ok(authenticated),
@@ -837,6 +900,36 @@ fn connection(
         Ok(authenticated)
     };
     run().map_err(|error| (authenticated, error))
+}
+
+/// Sleep on either editor data or newly queued host input. The former 20 ms
+/// socket read timeout delayed every wheel event and command arriving at idle.
+/// This wakeup is event driven and consumes no extra idle polling budget.
+fn wait_for_editor(stream: &TcpStream, mut wake: &UnixStream, timeout: i32) -> io::Result<bool> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: both descriptors remain owned throughout poll; the array has
+    // exactly the two initialized entries described by nfds.
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let mut bytes = [0_u8; 128];
+    while matches!(wake.read(&mut bytes), Ok(n) if n > 0) {}
+    Ok(descriptors[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
 }
 
 fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {

@@ -18,7 +18,9 @@ The four frontends share `Vim9UiConfig` and the same TOML section:
 
 ```toml
 [vim9]
+auto_gui = true
 native_buffer = true
+smooth_scroll = true
 toolbar = false
 buffer_tabs = false
 status_bar = false
@@ -36,8 +38,10 @@ font controls, Vim's own command line and error feedback remain accessible.
 Hidden controls reclaim their layout space. Project scanning is deferred until
 the project UI is requested. Workbench shortcuts must not put focus into an
 invisible field; save and buffer font zoom remain editor actions. A frontend
-may reveal a tool in response to an explicit command. Normal `vim` in a shell
-still follows the explicit-entry contract and does not switch app modes.
+may reveal a tool in response to an explicit command. Interactive `vim` in a
+managed local shell opens the frontend's native editor window automatically.
+The calling shell waits until Vim exits. See [shell entry and scrolling](vim9-shell-scroll.md)
+for argument preservation, compatibility cases and the presentation contract.
 
 ## Rendering boundary
 

@@ -97,6 +97,7 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | `close_buffer` | Positive integer `buffer` | Unlist a saved buffer with `:bdelete`; always refuse modified buffers, including hidden ones |
 | `close_current_buffer` | None | Resolve the current buffer inside Vim after earlier commands, then apply the same protected close |
 | `split` | Boolean `vertical` | Native `:vsplit` or `:split` of the current buffer |
+| `scroll` | Positive `window`; signed nonzero `lines` with magnitude ≤120 | Scroll that window in the current tab using Vim's own viewport semantics; preserve focus and buffer contents; positive counts move down |
 | `save` | None | Native `:update`, including the user's write hooks |
 | `save_all` | None | Native `:wall`, including ordinary Vim write errors |
 | `build` | Optional/empty `command` | Start an async shell job; an empty command uses expanded `makeprg` |

@@ -12,7 +12,10 @@ use super::{Vim9RenderCursor, Vim9RenderFrame, Vim9RenderRect, Vim9RenderRun};
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9UiConfig {
+    /// Route interactive `vim` commands in managed local shells to this GUI.
+    pub auto_gui: bool,
     pub native_buffer: bool,
+    pub smooth_scroll: bool,
     pub toolbar: bool,
     pub buffer_tabs: bool,
     pub status_bar: bool,
@@ -23,7 +26,9 @@ pub struct Vim9UiConfig {
 impl Default for Vim9UiConfig {
     fn default() -> Self {
         Self {
+            auto_gui: true,
             native_buffer: true,
+            smooth_scroll: true,
             toolbar: false,
             buffer_tabs: false,
             status_bar: false,

@@ -1552,6 +1552,25 @@ def LspAction(action: string, request: dict<any>)
   endif
 enddef
 
+def ScrollWindow(request: dict<any>)
+  SafeToChange()
+  const window = PositiveNumber(request, 'window')
+  const count: any = get(request, 'lines', 0)
+  if type(count) != v:t_number || count == 0 || count < -120 || count > 120
+    throw 'Scroll requires between 1 and 120 signed lines'
+  endif
+  # win_id2win() only accepts a window in the active tab. A delayed wheel event
+  # must never move a closed split or silently scroll the currently focused one.
+  if win_id2win(window) == 0 || getwinvar(window, '&buftype') !=# ''
+    throw 'The requested editor window is no longer available'
+  endif
+  # Numeric validation makes this a fixed command, not an Ex/eval interface.
+  # win_execute preserves focus/cwd and avoids WinEnter/BufEnter side effects.
+  const key = count > 0 ? "\<C-E>" : "\<C-Y>"
+  win_execute(window, 'noautocmd keepjumps normal! ' .. abs(count) .. key)
+  Changed()
+enddef
+
 def Dispatch(request: dict<any>, id: number)
   var action = RequiredString(request, 'action', 64)
   if action ==# 'set_render'
@@ -1587,6 +1606,8 @@ def Dispatch(request: dict<any>, id: number)
     EmitState(true)
     RefreshRenderTheme()
     EmitRender()
+  elseif action ==# 'scroll'
+    ScrollWindow(request)
   elseif action ==# 'build'
     StartBuild(request)
   elseif action ==# 'cancel_build'
