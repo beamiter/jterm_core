@@ -1,8 +1,9 @@
 # Native Vim9 workbenches
 
 Anvil, Forge, Ember and Frost share an editor bridge around a **real Vim 9
-process**. Anvil and Forge host a dedicated GTK workbench, Ember uses an editor
-tab, and Frost opens an Iced/WGPU editor window. Each can subscribe to native
+process**. Managed shell entry stays in the originating GUI: Ember uses an
+editor tab, while Anvil, Forge and Frost embed the workbench in the source pane.
+Explicit standalone IDE launches remain available. Each can subscribe to native
 GUI buffer paint frames independently of Vim's PTY compatibility display.
 The workbench supplies project navigation, buffer tabs, code actions, project
 search, build controls, quickfix navigation and editor state.

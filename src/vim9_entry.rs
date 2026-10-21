@@ -48,6 +48,14 @@ impl Vim9EntryRequest {
         Self::authorize(target, Vim9EntryTrigger::CommandLine).expect("explicit --ide")
     }
 
+    pub(super) fn shell_cwd(&mut self, cwd: PathBuf) -> Result<(), String> {
+        if !self.is_shell_command() || !cwd.is_absolute() || !cwd.is_dir() {
+            return Err("Invalid shell Vim working directory".into());
+        }
+        self.target = cwd;
+        Ok(())
+    }
+
     pub fn target(&self) -> &Path {
         &self.target
     }

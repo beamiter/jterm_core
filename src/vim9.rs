@@ -47,6 +47,12 @@ pub use entry::{explicit_ide_target, shell_vim_request, Vim9EntryRequest, Vim9En
 mod shell;
 pub use shell::{shell_argv_eligible, Vim9ShellIntegration, VIM9_SHELL_EXEC};
 
+#[path = "vim9_shell_host.rs"]
+mod shell_host;
+pub use shell_host::{
+    forward_shell_vim, take_shell_vim_requests, Vim9ShellCompletion, Vim9ShellInvocation,
+};
+
 #[path = "vim9_scroll.rs"]
 mod scroll;
 pub use scroll::{Vim9ScrollAccumulator, Vim9ScrollAnimation};

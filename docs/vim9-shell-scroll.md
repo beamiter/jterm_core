@@ -3,10 +3,19 @@
 ## Starting the editor
 
 In a managed local interactive shell, `vim`, `vim +42 file`, `vim -d a b` and
-multi-file invocations open that terminal frontend's native Vim editor window.
-The originating shell waits; quitting Vim returns its exit status to that
-shell. This is a separate native window/process in the current architecture,
-not an in-place replacement of an arbitrary running terminal application.
+multi-file invocations open the native Vim editor inside the GUI that owns
+that shell. Ember adds an editor tab in the same window; Frost, Forge and Anvil
+show it inside the originating pane. The shell waits, and quitting Vim returns
+the real exit status and restores the original shell. No additional GUI window
+or GUI event loop is started for managed shell entry.
+
+The CLI helper hands the exact argv and working directory to a private,
+authenticated Unix socket owned by the running GUI. The originating PTY
+identifies the destination even after a tab switch. Shell output and restored
+session metadata cannot request an editor. Closing an editor/tab asks Vim to
+quit and retains unsaved-buffer protection; the helper completes only after
+actual editor exit. A rejected or abandoned handoff returns failure to the
+shell rather than opening a duplicate editor.
 
 The shell first performs its usual expansions and argument quoting. A private,
 executable cache shim forwards those arguments one by one via

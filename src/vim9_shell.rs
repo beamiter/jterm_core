@@ -1,6 +1,6 @@
 //! Child-local shell integration. The GUI does not parse shell command strings
 //! or trust terminal output to enter an editor. A tiny PATH shim forwards the
-//! actual shell-expanded argv to the same frontend and waits for its exit.
+//! actual shell-expanded argv to the owning GUI and waits for Vim to exit.
 
 use std::ffi::OsString;
 use std::io;
@@ -54,20 +54,20 @@ impl Vim9ShellIntegration {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
             .into_string()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PATH must be UTF-8"))?;
-        Ok(Self {
-            environment: vec![
-                ("PATH".into(), path),
-                ("JTERM_VIM9_FRONTEND".into(), text(&frontend)?),
-                ("JTERM_VIM9_SHIM_DIR".into(), text(&cache)?),
-                // Bash imports this before its normal startup files. It survives
-                // login profiles that reset PATH. A user's later vim alias/function
-                // keeps precedence, and `command vim` remains an explicit bypass.
-                (
-                    "BASH_FUNC_vim%%".into(),
-                    "() { \"$JTERM_VIM9_SHIM_DIR/vim\" \"$@\"; }".into(),
-                ),
-            ],
-        })
+        let mut environment = vec![
+            ("PATH".into(), path),
+            ("JTERM_VIM9_FRONTEND".into(), text(&frontend)?),
+            ("JTERM_VIM9_SHIM_DIR".into(), text(&cache)?),
+            // Bash imports this before its normal startup files. It survives
+            // login profiles that reset PATH. A user's later vim alias/function
+            // keeps precedence, and `command vim` remains an explicit bypass.
+            (
+                "BASH_FUNC_vim%%".into(),
+                "() { \"$JTERM_VIM9_SHIM_DIR/vim\" \"$@\"; }".into(),
+            ),
+        ];
+        environment.extend(super::shell_host::host_environment()?);
+        Ok(Self { environment })
     }
 
     pub fn env(&self) -> Vec<(String, String)> {

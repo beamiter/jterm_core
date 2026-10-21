@@ -4,8 +4,9 @@ Native IDE construction consumes a `Vim9EntryRequest`. Frontends mint this
 request at an IDE button/menu/shortcut action, after parsing an explicit
 IDE launch flag, or through the managed shell's exact `--vim-shell` argv route.
 The latter is the automatic native GUI entry for an interactive `vim` command;
-it forwards the resolved executable, cwd and arguments without parsing a shell
-command string. `Vim9Session::start` does not accept an ordinary filesystem
+it forwards the resolved executable, cwd and arguments over the owning GUI's
+private shell-host socket without parsing a shell command string or starting
+another GUI. `Vim9Session::start` does not accept an ordinary filesystem
 path. Cwd, title, passive shell command text (including vim/nvim), process observation,
 bridge traffic, late/cross-tab events and session restore cannot authorize
 entry. The request is neither cloneable nor serializable and is consumed once.
