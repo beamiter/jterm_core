@@ -239,34 +239,58 @@ impl<'a> Vim9Viewport<'a> {
             .or_else(|| self.empty_anchor_at(x, y))
     }
 
-    fn empty_anchor_at(&self, x: f32, y: f32) -> Option<Vim9ViewportAnchor> {
-        // Empty margin lines are explicitly sampled, not inferred from gaps in
-        // paint runs (which could also mean a horizontally scrolled long line).
+    fn source_rows(&self) -> impl Iterator<Item = (i64, u64, usize)> + '_ {
         self.window
-            .overscan
+            .line_lengths
             .iter()
-            .filter(|row| row.byte_length == 0)
-            .find_map(|row| {
-                let rect = self.row_rect(
-                    i64::from(row.row),
-                    self.window.view.column.checked_add(self.window.textoff)?,
-                    1,
-                )?;
-                let clip = intersect(rect, self.clip)?;
-                clip.contains(x, y).then_some(Vim9ViewportAnchor {
-                    revision: self.frame.revision,
-                    position: Vim9BufferPosition {
-                        window: self.window.window,
-                        buffer: self.window.buffer,
-                        changedtick: self.window.changedtick,
-                        line: row.line,
-                        byte_column: 0,
-                    },
-                    byte_end: 0,
-                    rect,
-                    clip,
+            .enumerate()
+            .map(|(row, length)| (row as i64, self.window.topline + row as u64, *length))
+            .chain(
+                self.window
+                    .overscan
+                    .iter()
+                    .map(|row| (i64::from(row.row), row.line, row.byte_length)),
+            )
+    }
+
+    fn end_anchor(&self, row: i64, line: u64, length: usize) -> Option<Vim9ViewportAnchor> {
+        let mut rect = self.row_rect(
+            row,
+            self.window.view.column.checked_add(self.window.textoff)?,
+            1,
+        )?;
+        if length > 0 {
+            rect.x = self
+                .runs()
+                .filter(|p| {
+                    p.run.line == line
+                        && p.run.byte_end == length
+                        && p.run.byte_start < p.run.byte_end
                 })
-            })
+                .map(|p| p.rect.x + p.rect.width)
+                .reduce(f32::max)?;
+        }
+        Some(Vim9ViewportAnchor {
+            revision: self.frame.revision,
+            position: Vim9BufferPosition {
+                window: self.window.window,
+                buffer: self.window.buffer,
+                changedtick: self.window.changedtick,
+                line,
+                byte_column: length,
+            },
+            byte_end: length,
+            rect,
+            clip: intersect(rect, self.clip)?,
+        })
+    }
+
+    fn empty_anchor_at(&self, x: f32, y: f32) -> Option<Vim9ViewportAnchor> {
+        self.source_rows().find_map(|(row, line, length)| {
+            let anchor = self.end_anchor(row, line, length)?;
+            (x >= anchor.rect.x && y >= anchor.clip.y && y < anchor.clip.y + anchor.clip.height)
+                .then_some(anchor)
+        })
     }
 
     /// Re-resolve a delayed card/hover by source bytes and buffer generation.
@@ -301,25 +325,12 @@ impl<'a> Vim9Viewport<'a> {
                 self.anchor(projected, offset)
             })
             .or_else(|| {
-                if position.byte_column != 0 {
-                    return None;
-                }
-                let row = self
-                    .window
-                    .overscan
-                    .iter()
-                    .find(|row| row.line == position.line && row.byte_length == 0)?;
-                let rect = self.row_rect(
-                    i64::from(row.row),
-                    self.window.view.column.checked_add(self.window.textoff)?,
-                    1,
-                )?;
-                Some(Vim9ViewportAnchor {
-                    revision: self.frame.revision,
-                    position: *position,
-                    byte_end: 0,
-                    rect,
-                    clip: intersect(rect, self.clip)?,
+                self.source_rows().find_map(|(row, line, length)| {
+                    if line == position.line && length == position.byte_column {
+                        self.end_anchor(row, line, length)
+                    } else {
+                        None
+                    }
                 })
             })
     }
@@ -492,5 +503,26 @@ mod tests {
             }
             assert!(!frame.valid(), "case {case}");
         }
+    }
+
+    #[test]
+    fn explicit_visible_empty_rows_and_eol_are_source_targets() {
+        let mut frame = frame();
+        frame.windows[0].line_lengths = vec![2, 3, 1, 0];
+        let view = Vim9Viewport::new(&frame, 10, metrics(), -0.5).unwrap();
+        let empty = view.anchor_at(45.0, 65.0).unwrap();
+        assert_eq!((empty.position.line, empty.position.byte_column), (13, 0));
+        assert_eq!(view.anchor_for_position(&empty.position), Some(empty));
+        let end = view.anchor_at(45.0, 5.0).unwrap();
+        assert_eq!((end.position.line, end.position.byte_column), (10, 2));
+        assert_eq!(view.anchor_for_position(&end.position), Some(end));
+        assert!(view.anchor_at(65.0, 65.0).is_none());
+    }
+
+    #[test]
+    fn absent_visible_source_metadata_does_not_invent_an_empty_line() {
+        let frame = frame();
+        let view = Vim9Viewport::new(&frame, 10, metrics(), 0.0).unwrap();
+        assert!(view.anchor_at(45.0, 65.0).is_none());
     }
 }

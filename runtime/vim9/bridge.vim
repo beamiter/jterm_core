@@ -84,6 +84,8 @@ var renderNormal: dict<any> = {}
 var renderWindowCaches: dict<dict<any>> = {}
 var renderWindowSample: dict<any> = {}
 var renderSamplingWindow = 0
+var scrollAcknowledgements: dict<number> = {}
+var pointerGesture: dict<any> = {}
 var renderLineGeneration = ''
 var renderLineCache: dict<dict<any>> = {}
 
@@ -105,7 +107,7 @@ def Capabilities(): list<string>
   var result = ['open', 'save', 'save_all', 'buffer', 'build', 'cancel_build',
     'goto', 'close_buffer', 'close_current_buffer', 'next_buffer', 'previous_buffer', 'split', 'save_and_build',
     'navigate_back', 'navigate_forward', 'cancel_search',
-    'snapshot', 'set_render', 'render_resync', 'next_diagnostic', 'previous_diagnostic', 'quit']
+    'snapshot', 'set_render', 'render_resync', 'scroll_view', 'pointer', 'next_diagnostic', 'previous_diagnostic', 'quit']
   if executable('rg')
     add(result, 'search')
     add(result, 'search_with_options')
@@ -352,6 +354,122 @@ def RenderSelected(glyph: dict<any>, visual: string, anchor: list<number>, curre
   return true
 enddef
 
+var nativeScrollLeft = -1
+
+def SampleNativeScrollLeft()
+  nativeScrollLeft = winsaveview().leftcol
+enddef
+
+# Standard primary-pointer gestures only. Custom mappings, Select-mode and
+# virtual columns remain owned by the compatibility input path.
+def NativePointerAvailable(): bool
+  const current = mode(1)
+  if index(['n', 'v'], current) < 0 || !empty(&virtualedit)
+      || &selectmode =~# 'mouse' || &mouse !~# (current ==# 'n' ? '[an]' : '[av]')
+    return false
+  endif
+  for mappingMode in ['n', 'x']
+    for key in ['<LeftMouse>', '<LeftDrag>', '<LeftRelease>']
+      if !empty(maparg(key, mappingMode))
+        return false
+      endif
+    endfor
+  endfor
+  return true
+enddef
+
+def NativeSourceWindow(request: dict<any>): number
+  const window = PositiveNumber(request, 'window')
+  const buffer = PositiveNumber(request, 'buffer')
+  const tick: any = get(request, 'changedtick', -1)
+  const info = getwininfo(window)
+  if win_id2win(window) == 0 || empty(info) || info[0].bufnr != buffer
+      || type(tick) != v:t_number || tick < 0 || getbufvar(buffer, 'changedtick') != tick
+      || getbufvar(buffer, '&buftype') !=# ''
+    throw 'The native source window or buffer generation changed'
+  endif
+  return window
+enddef
+
+def ScrollSourceWindow(request: dict<any>, id: number)
+  SafeToChange()
+  if mode(1) !=# 'n' || SaveInputPending()
+    throw 'Precision scrolling requires idle Normal mode'
+  endif
+  const window = NativeSourceWindow(request)
+  const info = getwininfo(window)[0]
+  const top = PositiveNumber(request, 'topline')
+  const left: any = get(request, 'leftcol', -1)
+  if info.topline != top
+    throw 'The native viewport changed before scrolling'
+  endif
+  nativeScrollLeft = -1
+  win_execute(window, 'call ' .. expand('<SID>') .. 'SampleNativeScrollLeft()')
+  if type(left) != v:t_number || left < 0 || nativeScrollLeft != left
+    throw 'The horizontal native viewport changed before scrolling'
+  endif
+  ScrollWindow(request)
+  scrollAcknowledgements = filter(scrollAcknowledgements, (key, _) => win_id2win(str2nr(key)) > 0)
+  scrollAcknowledgements[string(window)] = id
+  # Publish the acknowledged semantic view before the response. The host does
+  # not have to infer completion from cursor-only or unrelated render frames.
+  EmitRender()
+enddef
+
+def SourcePointer(request: dict<any>)
+  const previous = pointerGesture
+  pointerGesture = {}
+  SafeToChange()
+  if !NativePointerAvailable() || SaveInputPending()
+    throw 'This input state or mouse mapping uses Vim compatibility input'
+  endif
+  const window = NativeSourceWindow(request)
+  const gesture = PositiveNumber(request, 'gesture')
+  const phase = RequiredString(request, 'phase', 16)
+  if index(['press', 'drag', 'release'], phase) < 0
+    throw 'Unknown native pointer phase'
+  endif
+  const lineNumber = PositiveNumber(request, 'line')
+  const byte: any = get(request, 'byte_column', -1)
+  const textRows = getbufline(request.buffer, lineNumber)
+  if empty(textRows) || type(byte) != v:t_number || byte < 0
+      || byte > strlen(textRows[0]) || byte > 16384
+      || (byte < strlen(textRows[0]) && byteidxcomp(textRows[0], charidx(textRows[0], byte, true)) != byte)
+    throw 'Native pointer position is not a valid source byte boundary'
+  endif
+  if phase !=# 'press'
+    if empty(previous) || previous.gesture != gesture || previous.window != window
+        || win_getid() != window || previous.buffer != bufnr() || previous.tick != b:changedtick
+        || previous.mode !=# mode(1) || previous.cursor !=# getcurpos()[1 : 2]
+      throw 'The native pointer gesture was interrupted; it will not be replayed'
+    endif
+  else
+    if !win_gotoid(window)
+      throw 'The requested native pointer window is unavailable'
+    endif
+    # WinEnter/BufEnter hooks are allowed to run, but cannot redirect the click
+    # to a different buffer or invalidate its captured source generation.
+    NativeSourceWindow(request)
+    if win_getid() != window || !NativePointerAvailable() || !empty(RenderFallback())
+      throw 'The target window no longer supports this native pointer gesture'
+    endif
+    if mode(1) ==# 'v'
+      execute "normal! \<Esc>"
+    endif
+  endif
+  if phase !=# 'press' && mode(1) ==# 'n'
+      && previous.target !=# [lineNumber, byte]
+    normal! v
+  endif
+  cursor(lineNumber, byte + 1)
+  if phase !=# 'release'
+    pointerGesture = {gesture: gesture, window: window, buffer: bufnr(),
+      tick: b:changedtick, mode: mode(1), cursor: getcurpos()[1 : 2], target: [lineNumber, byte]}
+  endif
+  Changed()
+  EmitRender()
+enddef
+
 def RenderWindowFrame(margin: number = 0): dict<any>
   var info = getwininfo(win_getid())[0]
   var view = {row: info.winrow - 1, column: info.wincol - 1,
@@ -375,6 +493,9 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   frame.textoff = info.textoff
   frame.line_count = line('$')
   frame.overscan = []
+  frame.native_pointer = renderProtocol >= 3 && NativePointerAvailable()
+  frame.scroll_ack = get(scrollAcknowledgements, string(win_getid()), 0)
+  frame.line_lengths = map(getline(first, last), (_, text) => strlen(text))
   var visibleFirst = first
   if margin > 0
     first = max([1, first - margin])
@@ -802,13 +923,18 @@ def RenderFrame(): dict<any>
       changedtick: sample.changedtick, view: sample.view, cursor: sample.cursor,
       topline: sample.topline, botline: sample.botline,
       textoff: sample.textoff, leftcol: sample.leftcol,
-      line_count: sample.line_count, overscan: sample.overscan})
+      line_count: sample.line_count, overscan: sample.overscan,
+      native_pointer: sample.native_pointer, scroll_ack: sample.scroll_ack,
+      line_lengths: sample.line_lengths})
     extend(runs, sample.runs)
     caches[string(id)] = renderWindowCaches[string(id)]
   endfor
   renderWindowCaches = caches
   frame.runs = runs
   remove(frame, 'overscan')
+  remove(frame, 'line_lengths')
+  remove(frame, 'native_pointer')
+  remove(frame, 'scroll_ack')
   if win_getid() != active || bufnr() != activeBuffer || mode(1) !=# activeMode || winsaveview() != activeView
     frame.supported = false
     frame.fallback_reason = 'Vim changed its active view during native sampling'
@@ -1658,6 +1784,10 @@ def Dispatch(request: dict<any>, id: number)
     EmitRender()
   elseif action ==# 'scroll'
     ScrollWindow(request)
+  elseif action ==# 'scroll_view'
+    ScrollSourceWindow(request, id)
+  elseif action ==# 'pointer'
+    SourcePointer(request)
   elseif action ==# 'build'
     StartBuild(request)
   elseif action ==# 'cancel_build'

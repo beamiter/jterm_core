@@ -1,0 +1,26 @@
+name: Real Vim pixel input
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: vim9-pixel-input-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  source-input:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
+      - run: |
+          python3 runtime/vim9/test_pixel_input.py
+          python3 runtime/vim9/test_overscan.py
+          python3 runtime/vim9/test_render_delta.py
+          python3 runtime/vim9/test_render_windows.py

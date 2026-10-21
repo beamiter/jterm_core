@@ -102,6 +102,12 @@ pub struct Vim9RenderWindow {
     pub line_count: u64,
     /// Version 3: at most two independently sampled source rows on each edge.
     pub overscan: Vec<Vim9RenderMarginRow>,
+    /// Optional protocol-3 native input capability, false for legacy producers.
+    pub native_pointer: bool,
+    /// Last successfully applied source-bound scroll request in this split.
+    pub scroll_ack: u64,
+    /// Explicit visible source-line lengths, including empty and EOL targets.
+    pub line_lengths: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -191,6 +197,13 @@ impl Vim9RenderFrame {
                     && within(window.view.row, window.view.rows, self.rows)
                     && within(window.view.column, window.view.columns, self.columns)
                     && window.textoff <= window.view.columns
+                    && window.scroll_ack <= i64::MAX as u64
+                    && window.line_lengths.len() <= window.view.rows
+                    && window.line_lengths.iter().all(|length| *length <= 16384)
+                    && (window.line_lengths.is_empty()
+                        || window.line_lengths.len() as u64
+                            == window.botline.saturating_sub(window.topline) + 1)
+                    && (!window.native_pointer || !window.line_lengths.is_empty())
                     && (window.line_count == 0
                         || (window.topline > 0
                             && window.topline <= window.botline

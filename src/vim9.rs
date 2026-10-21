@@ -55,6 +55,19 @@ pub use scroll::{Vim9ScrollAccumulator, Vim9ScrollAnimation};
 mod viewport;
 pub use viewport::{Vim9ProjectedRun, Vim9Viewport, Vim9ViewportAnchor};
 
+#[path = "vim9_pixel_scroll.rs"]
+mod pixel_scroll;
+pub use pixel_scroll::Vim9PixelScroll;
+
+/// Source-bound primary-pointer phases. No arbitrary Vim keys or Ex commands.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Vim9PointerPhase {
+    Press,
+    Drag,
+    Release,
+}
+
 const PROTOCOL: u64 = 1;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_COMMAND: usize = 64 * 1024;
@@ -298,6 +311,25 @@ pub enum Vim9Command {
     SetRender {
         enabled: bool,
     },
+    /// A precision-scroll transaction bound to the sampled source and view.
+    ScrollView {
+        window: i64,
+        buffer: i64,
+        changedtick: u64,
+        topline: u64,
+        leftcol: usize,
+        lines: i32,
+    },
+    /// A standard primary click/character drag using captured source bytes.
+    Pointer {
+        window: i64,
+        buffer: i64,
+        changedtick: u64,
+        line: u64,
+        byte_column: usize,
+        gesture: u64,
+        phase: Vim9PointerPhase,
+    },
     Snapshot,
     Quit,
 }
@@ -305,6 +337,43 @@ pub enum Vim9Command {
 impl Vim9Command {
     fn frame(&self, id: u64) -> io::Result<Vec<u8>> {
         match self {
+            Self::ScrollView {
+                window,
+                buffer,
+                changedtick,
+                topline,
+                leftcol,
+                lines,
+            } if *window <= 0
+                || *buffer <= 0
+                || *changedtick > i64::MAX as u64
+                || *topline == 0
+                || *topline > i32::MAX as u64
+                || *leftcol > i32::MAX as usize
+                || *lines == 0
+                || lines.unsigned_abs() > 120 =>
+            {
+                return Err(invalid("Invalid source-bound precision-scroll transaction"));
+            }
+            Self::Pointer {
+                window,
+                buffer,
+                changedtick,
+                line,
+                byte_column,
+                gesture,
+                ..
+            } if *window <= 0
+                || *buffer <= 0
+                || *changedtick > i64::MAX as u64
+                || *line == 0
+                || *line > i32::MAX as u64
+                || *byte_column > 16384
+                || *gesture == 0
+                || *gesture > i32::MAX as u64 =>
+            {
+                return Err(invalid("Invalid source-bound pointer transaction"));
+            }
             Self::Scroll { window, lines }
                 if *window <= 0 || *lines == 0 || lines.unsigned_abs() > 120 =>
             {
