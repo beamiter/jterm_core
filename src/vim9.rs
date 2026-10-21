@@ -474,6 +474,23 @@ impl Drop for SessionInner {
 #[derive(Clone)]
 pub struct Vim9Session(Arc<SessionInner>);
 
+/// Native input observes paint and command completion from one worker instant.
+/// Keep this snapshot while reconciling a frame: combining an older render
+/// with a newer completion status can falsely retire a precision gesture.
+#[derive(Clone, Debug, Default)]
+pub struct Vim9InputSnapshot {
+    pub frame: Option<Arc<Vim9RenderFrame>>,
+    pending: HashSet<u64>,
+}
+
+impl Vim9InputSnapshot {
+    /// Whether the request was pending when `frame` was sampled. Completion
+    /// is not success; scroll consumers must still check the frame's ack id.
+    pub fn command_pending(&self, id: u64) -> bool {
+        self.pending.contains(&id)
+    }
+}
+
 impl std::fmt::Debug for Vim9Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Do not include connection credentials in debug dumps.
@@ -628,10 +645,23 @@ impl Vim9Session {
         self.0.shared.lock().snapshot.render.clone()
     }
 
+    /// Sample native paint and bounded outstanding request IDs under one lock.
+    /// This avoids the old-frame/completed-request race without copying editor
+    /// buffers, diagnostics or build output. Subsequent worker events cannot
+    /// change this snapshot while a frontend reconciles its input state.
+    pub fn input_snapshot(&self) -> Vim9InputSnapshot {
+        let shared = self.0.shared.lock();
+        Vim9InputSnapshot {
+            frame: shared.snapshot.render.clone(),
+            pending: shared.pending.clone(),
+        }
+    }
+
     /// Whether a command accepted by `send()` is queued or awaiting its reply.
     /// This does not clone editor metadata or wait for unrelated requests.
     /// Unknown IDs and disconnected sessions return false; a completed command
     /// may have failed, so this is an ordering check rather than a success flag.
+    /// Use `input_snapshot()` when pairing completion with a native paint frame.
     pub fn command_pending(&self, id: u64) -> bool {
         self.0.shared.lock().pending.contains(&id)
     }
@@ -1169,6 +1199,79 @@ mod tests {
             uuid::Uuid::new_v4(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn native_input_snapshot_keeps_ack_and_completion_in_the_same_observation() {
+        let scratch = Scratch::new();
+        let session = session(&scratch);
+        let frame = |revision, top, ack| {
+            json!({
+                "event":"render", "revision":revision, "supported":true, "mode":"n",
+                "rows":5, "columns":10, "window":10, "buffer":1, "changedtick":3,
+                "view":{"row":0,"column":0,"rows":4,"columns":10},
+                "windows":[{"window":10,"buffer":1,"changedtick":3,
+                    "view":{"row":0,"column":0,"rows":4,"columns":10},
+                    "topline":top,"botline":top + 3,"line_count":100,
+                    "native_pointer":true,"line_lengths":[0,0,0,0],"scroll_ack":ack}]
+            })
+        };
+        session.0.shared.lock().pending.insert(41);
+        apply_event(frame(1, 10, 0), &session.0.shared).unwrap();
+        let before = session.input_snapshot();
+        let metrics = Vim9RenderMetrics {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            cell_width: 8.0,
+            line_height: 20.0,
+        };
+        let mut scroll =
+            Vim9PixelScroll::new(&before.frame.as_ref().unwrap().windows[0], metrics).unwrap();
+        scroll.push(1.25);
+        scroll.submitted(41);
+
+        // Vim emits the acknowledged frame before the command response. Each
+        // retained observation must remain usable even after both arrive.
+        apply_event(frame(2, 11, 41), &session.0.shared).unwrap();
+        let acknowledged = session.input_snapshot();
+        apply_event(
+            json!({"event":"response","id":41,"ok":true}),
+            &session.0.shared,
+        )
+        .unwrap();
+        let completed = session.input_snapshot();
+        assert!(before.command_pending(41));
+        assert!(acknowledged.command_pending(41));
+        assert!(!completed.command_pending(41));
+        assert!(Arc::ptr_eq(
+            acknowledged.frame.as_ref().unwrap(),
+            completed.frame.as_ref().unwrap()
+        ));
+        assert_eq!(before.frame.as_ref().unwrap().windows[0].scroll_ack, 0);
+        assert!(scroll.reconcile(
+            &before.frame.as_ref().unwrap().windows[0],
+            metrics,
+            before.command_pending(41)
+        ));
+        assert!(scroll.reconcile(
+            &completed.frame.as_ref().unwrap().windows[0],
+            metrics,
+            completed.command_pending(41)
+        ));
+        scroll.push(0.75);
+        assert!(matches!(
+            scroll.command(),
+            Some(Vim9Command::ScrollView {
+                topline: 11,
+                lines: 1,
+                ..
+            })
+        ));
+        session.revoke();
+        let disconnected = session.input_snapshot();
+        assert!(disconnected.frame.is_none());
+        assert!(!disconnected.command_pending(41));
+        assert!(before.command_pending(41));
     }
 
     #[test]

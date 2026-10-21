@@ -32,6 +32,32 @@ same offset. A core dependency update alone does not integrate a frontend.
 The earlier viewport validation document describes the prior foundation stage;
 this document describes the new shared input transaction layer.
 
+## Atomic observation of paint and completion
+
+Native input consumers use `Vim9Session::input_snapshot()` to obtain the render
+frame and pending request IDs under the same worker lock. Keep that
+`Vim9InputSnapshot` while reconciling scroll and pointer state; its
+`command_pending(id)` refers to the instant captured with `frame`.
+
+Calling `render_snapshot()` and then the live `command_pending()` can observe
+an old frame followed by a completed response if the worker publishes an ack
+between those reads. That falsely looks like a failed scroll and discards its
+remaining fraction. The atomic snapshot preserves the order without waiting
+on the worker or copying buffer lists, diagnostics or build output. It retains
+only an Arc to the frame and the already bounded set of pending IDs.
+
+Completion still does not imply success. Consumers must verify `scroll_ack`
+and source identity as before. A retained snapshot remains immutable after a
+later ack, response or disconnect. Frontends also retain their last actually
+drawn frame for hit testing; a freshly received snapshot is not proof that the
+user has seen it yet.
+
+The atomic-observation follow-up was validated locally with 70 Vim9 Rust
+tests, including retained pre-ack/ack/completed snapshots, preserved fractional
+scroll debt and disconnect invalidation. Clippy on all targets and Rustdoc
+passed with warnings denied; formatting and whitespace checks passed. The
+existing 10-test real Vim pixel-input suite also passed against this bridge.
+
 ## Observed validation — 2026-10-21
 
 Actions run `39540494697`, job `119026863605`, tested clean source candidate
