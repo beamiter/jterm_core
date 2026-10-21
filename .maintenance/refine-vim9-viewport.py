@@ -34,4 +34,9 @@ replace('src/vim9_viewport.rs', '''        assert_eq!((hit.position.line, hit.po
 replace('runtime/vim9/test_overscan.py',
     'def test_text_properties_syntax_search_and_signs_are_not_plain_text_prefetch(self):',
     'def test_text_properties_keep_gui_styling_in_hidden_rows(self):')
-print('Updated v3 negotiation assertion and empty-row anchor re-resolution')
+# Vim accepts an empty range only when end == start - 1. Bottom overscan
+# can otherwise put the first filler row several positions past the end.
+replace('runtime/vim9/bridge.vim',
+    'range(view.row + last - first + 1, view.row + view.rows + visibleFirst - first - 1)',
+    'range(view.row + last - first + 1, max([view.row + last - first, view.row + view.rows + visibleFirst - first - 1]))')
+print('Updated v3 negotiation, empty-row anchors and bounded EOB fill ranges')
