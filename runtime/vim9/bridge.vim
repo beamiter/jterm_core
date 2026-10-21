@@ -78,6 +78,80 @@ var renderBase: list<dict<any>> = []
 var renderStyles: dict<dict<any>> = {}
 var renderThemeKey = ''
 var renderNormal: dict<any> = {}
+var cursorOption: any = v:null
+var cursorShapes: dict<dict<any>> = {}
+
+# Keep the same per-mode reset and ordered 'a:' overlay semantics as Vim's
+# parse_shape_opt(). Sampling does not change the user's guicursor option.
+def ParseCursorOption(value: string)
+  var exclusive = false
+  for part in split(value, ',')
+    var halves = split(part, ':', true)
+    if len(halves) != 2
+      continue
+    endif
+    var modes = split(tolower(halves[0]), '-')
+    exclusive = exclusive || index(modes, 've') >= 0
+    for name in keys(cursorShapes)
+      if index(modes, name) < 0 && index(modes, 'a') < 0
+        continue
+      endif
+      var shape = cursorShapes[name]
+      if index(modes, name) >= 0
+        shape.shape = 'block'
+        shape.percentage = 100
+        shape.blinkwait = 700
+        shape.blinkon = 400
+        shape.blinkoff = 250
+      endif
+      for argument in split(halves[1], '-')
+        var token = tolower(argument)
+        if token ==# 'block'
+          shape.shape = 'block'
+          shape.percentage = 100
+        elseif token =~# '^\(ver\|hor\)\d\+$'
+          shape.shape = token[0 : 2] ==# 'ver' ? 'vertical' : 'horizontal'
+          shape.percentage = min([100, max([1, str2nr(strpart(token, 3))])])
+        elseif token =~# '^blink\(wait\|on\|off\)\d\+$'
+          var field = matchstr(token, '^blink\a\+')
+          shape[field] = min([2147483647, str2nr(strpart(token, strlen(field)))])
+        elseif !empty(argument)
+          shape.group = argument
+        endif
+      endfor
+    endfor
+  endfor
+  if !exclusive
+    cursorShapes.ve = copy(cursorShapes.v)
+  endif
+enddef
+
+def RenderCursorAppearance(): dict<any>
+  var option = exists('+guicursor') ? &guicursor : ''
+  if type(cursorOption) != v:t_string || cursorOption !=# option
+    if empty(cursorShapes)
+      for name in ['n', 'v', 've', 'o', 'i', 'r', 'c', 'ci', 'cr', 'sm']
+        cursorShapes[name] = {shape: 'block', percentage: 100, group: '',
+          blinkwait: 700, blinkon: 400, blinkoff: 250}
+      endfor
+      ParseCursorOption(has('gui')
+        ? 'n-v-c:block-Cursor/lCursor,ve:ver35-Cursor,o:hor50-Cursor,i-ci:ver25-Cursor/lCursor,r-cr:hor20-Cursor/lCursor,sm:block-Cursor-blinkwait175-blinkoff150-blinkon175'
+        : 'n-v-c:block,o:hor50,i-ci:hor15,r-cr:hor30,sm:block')
+    endif
+    ParseCursorOption(option)
+    cursorOption = option
+  endif
+  var current = mode(1)
+  var name = current =~# '^no' ? 'o' : (current =~# '^i' ? 'i' : (current =~# '^R' ? 'r' : 'n'))
+  if index(['v', 'V', "\<C-V>"], current) >= 0
+    name = &selection ==# 'exclusive' ? 've' : 'v'
+  endif
+  var result = copy(cursorShapes[name])
+  var groups = split(remove(result, 'group'), '/', true)
+  var group = get(groups, &iminsert == 1 && len(groups) > 1 ? 1 : 0, '')
+  result.style = copy(RenderStyle(hlID(group)))
+  return result
+enddef
 # Each real Vim window has its own viewport and syntax context, even when
 # several windows display the same buffer. Keep the expensive base paint
 # cache per window; cursor/selection overlays are composed on every sample.
@@ -925,7 +999,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   if get(position, 'row', 0) > 0 && get(position, 'curscol', 0) > 0
     frame.cursor = {row: position.row - 1, column: position.curscol - 1,
       width: max([1, position.endcol - position.curscol + 1]), visible: true,
-      line: line('.'), byte_column: col('.') - 1}
+      line: line('.'), byte_column: col('.') - 1, appearance: RenderCursorAppearance()}
   endif
   return frame
 enddef

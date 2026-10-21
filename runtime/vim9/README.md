@@ -146,7 +146,7 @@ and `protocol`:
 | `buffer`, `window`, `changedtick`, `mode` | Vim-owned identities and editing state; metadata transitions cannot keep another buffer's native frame |
 | `rows`, `columns` | PTY screen dimensions used to produce this paint frame |
 | `view` | `{row,column,rows,columns}` for the active window's exact opaque paint rectangle, including number gutters; command/status rows and split separators are outside |
-| `cursor` | `{row,column,width,visible}`, using Vim's real screen position and wide-character width |
+| `cursor` | `{row,column,width,visible}`, using Vim's real screen position and wide-character width; optional `appearance` carries the resolved `guicursor` shape, percentage, GUI style and millisecond `blinkwait`/`blinkon`/`blinkoff` |
 | `windows` | Every supported ordinary window in the current tab: `window`, `buffer`, `changedtick`, `view`, `cursor`, `topline`, `botline`, `leftcol`, and `textoff`; only the active cursor is visible |
 | `default_style` | GUI Normal style, with explicit light/dark RGB fallback only when Normal has no GUI color |
 | `runs` | Bounded native glyph runs with owning `window`, `row`, `column`, `text`, `cells`, `style`, `line`, `byte_start`, `byte_end` |

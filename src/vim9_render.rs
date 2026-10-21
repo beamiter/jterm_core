@@ -50,6 +50,8 @@ pub struct Vim9RenderCursor {
     /// Zero line means the optional source position was not supplied.
     pub line: u64,
     pub byte_column: usize,
+    /// Optional native GUI shape, RGB highlight and millisecond blink policy.
+    pub appearance: Option<super::Vim9CursorAppearance>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -178,6 +180,7 @@ impl Vim9RenderFrame {
                 <= 24_000
             && self.windows.len() <= 16
             && style_valid(&self.default_style)
+            && self.cursor.appearance.as_ref().is_none_or(|a| a.valid())
             && within(self.view.row, self.view.rows, self.rows)
             && within(self.view.column, self.view.columns, self.columns)
             && (!self.cursor.visible
@@ -191,6 +194,7 @@ impl Vim9RenderFrame {
                     )))
             && self.windows.iter().enumerate().all(|(index, window)| {
                 window.window > 0
+                    && window.cursor.appearance.as_ref().is_none_or(|a| a.valid())
                     && window.buffer > 0
                     && window.view.rows > 0
                     && window.view.columns > 0

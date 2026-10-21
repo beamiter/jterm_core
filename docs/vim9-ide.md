@@ -340,3 +340,38 @@ Official references:
 - [Vim9 script](https://vimhelp.org/vim9.txt.html)
 - [Vim channels, jobs and newline framing](https://vimhelp.org/channel.txt.html)
 - [Vim quickfix and compiler integration](https://vimhelp.org/quickfix.txt.html)
+
+
+## Vim-owned native cursor
+
+Supported buffer frames publish an optional `cursor.appearance` from the real
+Vim `guicursor` setting. Normal, Visual (including exclusive selection),
+operator-pending, Insert and Replace resolve their own block/vertical/horizontal
+shape and percentage. Ordered `a:` overlays, linked highlight groups and the
+second language-mapping highlight are supported without changing Vim options.
+A changed highlight or cursor option can travel in a cursor-only row delta.
+Older frames without appearance keep the frontend's compatibility cursor.
+
+The shared `Vim9CursorBlink` follows `blinkwait`, then `blinkoff`/`blinkon`;
+any zero timing disables blinking. Real source/mode/focus changes and accepted
+keyboard/IME activity restart the wait; unrelated paint revisions do not.
+Unfocused cursors stay visible as outlines and request no blink wakeups.
+The small shape's paint rectangle never replaces the full wide-character
+source/IME rectangle. Solid cursors repaint the source glyph in the cursor
+foreground, retaining shaping and font fallback. With no explicit cursor
+colors, the underlying syntax/Visual colors are reversed.
+
+For example, keep a solid normal-mode block, an insertion bar and a replacement
+underline, with different GUI colors supplied by the user's highlight groups:
+
+```vim
+highlight Cursor guifg=#20242c guibg=#d8dee9
+highlight InsertCursor guifg=#20242c guibg=#73a2e1
+set guicursor=n-v:block-Cursor,i:ver25-InsertCursor,r:hor20-Cursor,a:blinkon0
+```
+
+Command lines, completion popups and other unsupported displays continue to use
+Vim's live compatibility surface. Native showmatch timing is not inferred from
+terminal bytes. The runtime tests exercise real modes, ordered overlays,
+exclusive Visual inheritance, language mappings, linked/theme RGB changes,
+wide/combining/empty source cells and cursor-only deltas.

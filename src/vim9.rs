@@ -33,6 +33,10 @@ pub use render::{
     Vim9RenderStyle, Vim9RenderWindow,
 };
 
+#[path = "vim9_cursor.rs"]
+mod cursor;
+pub use cursor::{Vim9CursorAppearance, Vim9CursorBlink, Vim9CursorShape};
+
 #[path = "vim9_gui.rs"]
 mod gui;
 pub use gui::{
