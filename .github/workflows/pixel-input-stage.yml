@@ -23,8 +23,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep minisign curl
-      - run: python3 .maintenance/apply-pixel-core.py
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep minisign curl > /tmp/deps.log 2>&1 || { tail -80 /tmp/deps.log; exit 1; }
+      - run: |
+          python3 .maintenance/apply-pixel-core.py
+          python3 .maintenance/refine-pixel-core.py
       - run: cargo fmt --all && git diff --check
       - run: cargo test --quiet --locked --all-targets
       - run: cargo clippy --quiet --locked --all-targets -- -D warnings
@@ -56,7 +58,7 @@ jobs:
                   'Content-Type':'application/json'})
               with urllib.request.urlopen(r, timeout=60) as response: return json.load(response)
           if req('/git/ref/heads/master')['object']['sha'] != base: raise SystemExit('master advanced')
-          paths = ['src/vim9.rs', 'src/vim9_render.rs', 'src/vim9_pixel_scroll.rs',
+          paths = ['src/vim9.rs', 'src/vim9_render.rs', 'src/vim9_pixel_scroll.rs', 'src/vim9_viewport.rs',
               'runtime/vim9/bridge.vim', 'runtime/vim9/test_pixel_input.py']
           entries = []
           for p in paths:
