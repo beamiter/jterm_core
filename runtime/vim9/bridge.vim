@@ -206,12 +206,96 @@ def RenderFallback(): string
     return 'Vim virtual-space cursor and selections use the compatibility view'
   elseif &foldcolumn != 0
     return 'Vim fold columns use the compatibility view'
-  elseif !empty(getmatches())
-    return 'Vim match decorations use the compatibility view'
   elseif &hlsearch && v:hlsearch && @/ =~# '\\[_%zn]'
     return 'Multiline and positional Vim searches use the compatibility view'
   endif
+  return RenderMatchFallback(getmatches())
+enddef
+
+def RenderMatchFallback(matches: list<dict<any>>): string
+  if len(matches) > 64
+    return 'Vim matches exceed the bounded native decoration budget'
+  endif
+  var positions = 0
+  for decoration in matches
+    if has_key(decoration, 'conceal') || synIDtrans(hlID(decoration.group)) == hlID('Conceal')
+      return 'Vim conceal matches use the compatibility view'
+    endif
+    if has_key(decoration, 'pattern')
+      # String matching has no buffer/mark/cursor context. Be conservative
+      # about multiline atoms, position atoms and changed match boundaries.
+      # In particular, do not interpret \%l relative to this sampled string.
+      if strlen(decoration.pattern) > 4096 || decoration.pattern =~# '\\[_%zn]' || decoration.pattern =~# "[\r\n]"
+        return 'Multiline and positional Vim match patterns use the compatibility view'
+      endif
+    else
+      positions += len(filter(keys(decoration), (_, key) => key =~# '^pos\d\+$'))
+      if positions > 2048
+        return 'Vim match positions exceed the bounded native decoration budget'
+      endif
+    endif
+  endfor
   return ''
+enddef
+
+# getmatches() is in ascending priority/insertion order. Like Vim, select one
+# winning match rather than merging every overlapping match's attributes.
+# Search has priority zero and wins ties with a priority-zero plugin match.
+def RenderMatchRanges(text: string, lineNumber: number, matches: list<dict<any>>): list<dict<any>>
+  var ranges: list<dict<any>> = []
+  for decoration in matches
+    var style = RenderStyle(hlID(decoration.group))
+    if style == RenderStyle(0)
+      continue
+    endif
+    if has_key(decoration, 'pattern')
+      var offset = 0
+      while offset <= strlen(text)
+        # matchadd() always starts case-sensitive and magic, independent of
+        # ignorecase/smartcase/magic. Explicit pattern switches still win.
+        var found = matchstrpos(text, '\m\C' .. decoration.pattern, offset)
+        if found[1] < 0
+          break
+        endif
+        if found[1] == found[2]
+          throw 'Zero-width Vim match patterns use the compatibility view'
+        endif
+        add(ranges, {start: found[1], end: found[2], priority: decoration.priority, style: style})
+        offset = found[2]
+        if len(ranges) > 512
+          throw 'Vim matches exceed the bounded native line decoration budget'
+        endif
+      endwhile
+    else
+      for [key, position] in items(decoration)
+        if key !~# '^pos\d\+$' || position[0] != lineNumber
+          continue
+        endif
+        var start = len(position) == 1 ? 0 : position[1] - 1
+        var end = len(position) == 1 ? strlen(text) : start + position[2]
+        # Positional matches highlight existing text, never the empty EOL
+        # cell. A byte inside a multi-byte character is not its start.
+        if end > start && end > 0 && start < strlen(text)
+          add(ranges, {start: start, end: end, priority: decoration.priority, style: style})
+          if len(ranges) > 512
+            throw 'Vim matches exceed the bounded native line decoration budget'
+          endif
+        endif
+      endfor
+    endif
+  endfor
+  var search: list<dict<any>> = []
+  var searchStyle = RenderStyle(hlID('Search'))
+  if searchStyle != RenderStyle(0)
+    for span in RenderSearchRanges(text)
+      add(search, {start: span[0], end: span[1], priority: 0, style: searchStyle})
+    endfor
+  endif
+  if len(ranges) + len(search) > 512
+    throw 'Vim matches exceed the bounded native line decoration budget'
+  endif
+  return filter(copy(ranges), (_, span) => span.priority <= 0) + search
+    + filter(ranges, (_, span) => span.priority > 0)
 enddef
 
 def RenderSigns(first: number, last: number): dict<any>
@@ -242,7 +326,7 @@ def RenderSearchRanges(text: string): list<list<number>>
   # pattern retain their usual precedence over the search option defaults.
   var pattern = (&ignorecase && !(&smartcase && @/ =~# '\u') ? '\c' : '\C') .. @/
   var offset = 0
-  while offset <= strlen(text) && len(ranges) < 512
+  while offset <= strlen(text)
     var found = matchstrpos(text, pattern, offset)
     if found[1] < 0
       break
@@ -251,6 +335,9 @@ def RenderSearchRanges(text: string): list<list<number>>
       throw 'Zero-width Vim search highlights use the compatibility view'
     endif
     add(ranges, [found[1], max([found[1] + 1, found[2]])])
+    if len(ranges) > 512
+      throw 'Vim search exceeds the bounded native line decoration budget'
+    endif
     offset = found[2] > found[1] ? found[2] : found[1] + 1
   endwhile
   return ranges
@@ -284,6 +371,9 @@ def AddRenderRun(runs: list<dict<any>>, glyph: dict<any>, style: dict<any>)
   endif
   if has_key(run, 'plain')
     remove(run, 'plain')
+  endif
+  if has_key(run, 'match_style')
+    remove(run, 'match_style')
   endif
   add(runs, run)
 enddef
@@ -540,6 +630,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     endif
   endfor
   var properties = prop_list(first, {end_lnum: last})
+  var matches = getmatches()
   if len(properties) > 2048
     frame.supported = false
     frame.fallback_reason = 'This property list exceeds the bounded native paint budget'
@@ -562,7 +653,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   var generation = string([bufnr(), b:changedtick, savedView.leftcol,
     view.column, view.columns, info.textoff, &tabstop, &vartabstop, &wrap, &syntax, &synmaxcol,
     &number, &relativenumber, &numberwidth, &ambiwidth, renderThemeKey,
-    &hlsearch, v:hlsearch, @/, &ignorecase, &smartcase, &magic, &iskeyword, &isprint])
+    &hlsearch, v:hlsearch, @/, &ignorecase, &smartcase, &magic, &iskeyword, &isprint, matches])
   if generation !=# renderLineGeneration
     renderLineGeneration = generation
     renderLineCache = {}
@@ -599,7 +690,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
         reason = 'Control and bidirectional text use the compatibility view'
         break
       endif
-      var searchRanges = RenderSearchRanges(text)
+      var matchRanges = RenderMatchRanges(text, lineNumber, matches)
       if len(lineProperties) > 128
         reason = 'This line exceeds the native property paint budget'
         break
@@ -641,10 +732,10 @@ def RenderWindowFrame(margin: number = 0): dict<any>
           if !empty(propertyStyle)
             style = propertyCombine ? MergeRenderStyle(style, propertyStyle) : copy(propertyStyle)
           endif
-          for matchRange in searchRanges
-            if byteColumn < matchRange[1] && nextByte > matchRange[0]
-              style = MergeRenderStyle(style, RenderStyle(hlID('Search')))
-              break
+          var matchStyle: dict<any> = {}
+          for matchRange in matchRanges
+            if byteColumn >= matchRange.start && byteColumn < matchRange.end
+              matchStyle = matchRange.style
             endif
           endfor
           var previous = empty(renderBase) ? {} : renderBase[-1]
@@ -652,6 +743,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
               && previous.byte_end == byteColumn && previous.style == style
               && previous.column + previous.cells == view.column + info.textoff + visibleStart
               && previous.override_style == (propertyOverride ? propertyStyle : {})
+              && previous.match_style == matchStyle
             previous.text ..= cluster
             previous.cells += 1
             previous.byte_end = nextByte
@@ -661,7 +753,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
               cells: visibleEnd - visibleStart, line: lineNumber,
               byte_start: byteColumn, byte_end: nextByte,
               virtual_column: virtualColumn, plain: plain,
-              style: style, override_style: propertyOverride ? propertyStyle : {}})
+              style: style, override_style: propertyOverride ? propertyStyle : {}, match_style: matchStyle})
           endif
         endif
         byteColumn = nextByte
@@ -736,6 +828,9 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var style = MergeRenderStyle(renderNormal, glyph.style)
       if has_key(rowStyles, string(glyph.line))
         style = MergeRenderStyle(style, rowStyles[string(glyph.line)])
+      endif
+      if !empty(glyph.match_style)
+        style = MergeRenderStyle(style, glyph.match_style)
       endif
       if !empty(visual) && RenderSelected(glyph, visual, anchor, current, block)
         style = MergeRenderStyle(style, visualStyle)

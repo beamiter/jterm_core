@@ -68,6 +68,22 @@ class OverscanTests(unittest.TestCase):
         self.assertEqual(frame["windows"][0]["topline"], 30)
         self.assertTrue(frame["runs"])
 
+    def test_plugin_matches_keep_byte_ranges_and_rgb_in_smooth_scroll_margins(self):
+        e = self.editor
+        e.ex("highlight MarginMatch guifg=#f1a234 guibg=#654321 gui=undercurl guisp=#ee3344")
+        e.ex("call matchaddpos('MarginMatch', [[29,5,3]])")
+        frame = self.frame()
+        row = next(r for r in frame["windows"][0]["overscan"] if r["line"] == 29)
+        glyph = next(r for r in row["runs"] if r["text"] == "界")
+        self.assertEqual((glyph["byte_start"], glyph["byte_end"], glyph["cells"]), (4, 7, 2))
+        self.assertEqual(glyph["style"]["foreground"], 0xf1a234)
+        self.assertTrue(glyph["style"]["undercurl"])
+        self.assertEqual(glyph["style"]["special"], 0xee3344)
+        e.ex("call clearmatches()")
+        row = next(r for r in self.frame()["windows"][0]["overscan"] if r["line"] == 29)
+        glyph = next(r for r in row["runs"] if r["text"] == "界")
+        self.assertNotEqual(glyph["style"]["foreground"], 0xf1a234)
+
     def test_empty_margin_is_explicit_and_edit_invalidates_it(self):
         e = self.editor
         e.ex("call setline(29, '')")

@@ -349,7 +349,7 @@ From the core repository:
 
 ```sh
 cd runtime/vim9
-VIM9_TEST_VIM=/absolute/path/to/vim python3 -m unittest -v test_bridge test_render_windows test_render_delta
+VIM9_TEST_VIM=/absolute/path/to/vim python3 -m unittest -v test_bridge test_render_windows test_render_matches test_render_delta
 ```
 
 `VIM9_TEST_VIM` is optional when `vim` is on PATH. These Python-standard-library

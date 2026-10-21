@@ -29,7 +29,7 @@ Supported ordinary code windows, including horizontal, vertical and mixed Vim
 splits, include editing, normal/insert/
 replace modes, character and line selections, tabs, CJK/wide characters,
 base-plus-combining text, number/relative-number gutters, CursorLine, single-line
-search highlights and non-virtual diagnostic text-property highlights. A
+search highlights, window-local plugin matches and non-virtual diagnostic text-property highlights. A
 standard single sign column renders the highest-priority visible sign text,
 GUI sign color, line/number highlights and equal-priority combinations. A
 non-ASCII grapheme keeps its own Vim display advance so font fallback cannot
@@ -41,8 +41,8 @@ The active cursor and Visual selection cannot leak into sibling windows.
 
 This is an incremental GUI buffer renderer, not a complete external Vim UI
 protocol. Special buffers, actual wrapped continuation rows, closed
-folds, visible popups/completion, multiple/image sign columns, fold columns, virtual text, matchadd
-decorations, multiline/positional/zero-width search, virtual-space cursors,
+folds, visible popups/completion, multiple/image sign columns, fold columns, virtual text,
+multiline/positional/zero-width search and match patterns, conceal matches, virtual-space cursors,
 list/conceal/spell/right-to-left display and block selections through tabs currently publish an explicit
 compatibility reason. Complex zero-width/bidirectional text and clipped wide
 glyphs also fall back. Vim's editing options and text are not changed to make a
@@ -60,6 +60,18 @@ changes; command-mode transitions and `Syntax`/`FileType` invalidate rules.
 An asynchronous plugin changing only syntax rules must emit
 `doautocmd <nomodeline> User JTermVim9RenderInvalidate`.
 Identical paint frames are not republished.
+
+Ordinary single-line `matchadd()` / `:match` patterns and byte-based
+`matchaddpos()` decorations use native GUI styles, including Vim's built-in
+`matchparen` plugin. Matches remain window-local. The highest-priority match
+wins; equal priorities follow insertion order, and search wins priority-zero
+ties. Match patterns retain Vim's case-sensitive/magic defaults independently
+of search options. Syntax and diagnostic properties combine below the winning
+match, with Visual selection above it. Timer-driven match additions/deletions
+invalidate paint without editing the buffer or requiring a provider hook.
+The bridge bounds each window to 64 matches and 2048 positions and each source
+line to 512 match/search ranges. Unsupported patterns or exhausted budgets
+publish compatibility frames instead of truncating highlights.
 `render_snapshot()` clones only an `Arc`, without copying buffer lists,
 diagnostics or build output on each GUI frame. Paint work and wire frames are
 bounded; oversized views/lines fall back to Vim. These timing choices are not

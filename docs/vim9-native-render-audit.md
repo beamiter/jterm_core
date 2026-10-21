@@ -174,7 +174,7 @@ semantics.
 | Visual and search | Existing bounded Visual/search composition remains active; block selections through tabs and unsupported regex forms use compatibility mode. |
 | Cursor styling | Frontends draw the active cursor from Vim's position and mode. Full `guicursor` shape/blink settings and custom Cursor highlight composition are not yet exported. |
 | Themes | GUI RGB attributes, links, style changes and named colors are separate from cterm palette entries. Per-window `wincolor` currently uses compatibility mode. |
-| Plugins | Supported sign/text-property decorations are explicit. Popups, completion menus, match decorations and unsupported virtual text use compatibility mode. Async syntax providers use the invalidation hook above. |
+| Plugins | Supported signs, text properties, single-line `matchadd()` patterns and byte-based `matchaddpos()` decorations use GUI attributes. Popups, completion menus, complex match patterns, conceal and unsupported virtual text use compatibility mode. Async syntax providers use the invalidation hook above. |
 | Complex layout/text | Wrapped continuation rows, closed folds, conceal, diff, RTL/bidi/control text and special Vim buffers use compatibility mode. Their options are not silently disabled. |
 | Large files | Only visible bounded windows are exported. Vim's own regex syntax synchronization can still be expensive; limits on exported runs are not a bound on arbitrary plugin execution time. |
 
@@ -297,3 +297,15 @@ Failures were in process introspection/cleanup, cgroup handling and a Git
 status probe, outside the changed Vim9 modules; this environment lacks normal
 process/cgroup visibility. The complete library suite is therefore **not**
 reported as green. Frontend validation is recorded in each frontend repository.
+
+### Plugin match validation (2026-10-21)
+
+The complete eight-module runtime suite passes 85 real Vim PTY checks on
+Vim 9.2.0858. Eleven new checks cover plugin priority and search ordering,
+case/magic defaults, empty groups, UTF-8 positions, tabs, whole-line and
+clipped positions, CursorLine/Visual/property composition, asynchronous
+updates, split ownership, built-in matchparen, explicit fallback/recovery,
+row deltas and smooth-scroll margins. Screen attribute comparisons use
+Vim's actual `screenattr()` as an oracle without decoding opaque attribute
+IDs as highlight groups. The Rust Vim9 suite passes 73 tests with its one
+opt-in PTY round trip omitted. Frontend GUI validation is recorded separately.

@@ -135,6 +135,34 @@ class RenderDeltaTests(unittest.TestCase):
         e.request("save")
         self.assertTrue(e.file.read_text(encoding="utf-8").startswith("\nrow 000002"))
 
+    def test_timer_plugin_match_changes_send_exact_row_deltas_without_text_edits(self):
+        e = self.editor
+        e.ex("highlight GuiMatch guifg=#f1a234 guibg=#654321")
+        plugin = self.root / "matches.vim"
+        plugin.write_text(
+            "function! ChangeMatches(timer)\n"
+            "  if empty(getmatches())\n"
+            "    call matchaddpos('GuiMatch', [[2,1,3]])\n"
+            "  else\n"
+            "    call clearmatches()\n"
+            "  endif\n"
+            "endfunction\n"
+            "nnoremap <F10> <Cmd>call timer_start(100, 'ChangeMatches')<CR>\n",
+            encoding="utf-8")
+        e.ex("source " + str(plugin))
+        before = e.gui_frame()
+        for enabled in (True, False):
+            start = e.paint["revision"]
+            e.keys(b"\x1b[21~")
+            e.painted(lambda frame: frame["revision"] > start and frame["supported"]
+                      and any(r["style"]["background"] == 0x654321 for r in frame["runs"]) == enabled)
+            deltas = [event for event in e.paint_events if event["event"] == "render_delta"
+                      and event["revision"] > start and event["row_updates"]]
+            self.assertTrue(deltas)
+            self.assertEqual([row["row"] for row in deltas[-1]["row_updates"]], [1])
+            self.assertEqual(e.paint["changedtick"], before["changedtick"])
+            self.assert_matches_keyframe()
+
     def test_split_row_delta_keeps_peer_paint_and_keyframes_layout_changes(self):
         e = self.editor
         e.request("split", vertical=True)

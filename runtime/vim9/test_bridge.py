@@ -68,6 +68,9 @@ class Editor:
             JTERM_VIM9_ADDR=f"127.0.0.1:{port}",
             JTERM_VIM9_TOKEN=self.token,
             JTERM_VIM9_ROOT=str(root),
+            # A managed terminal may put its GUI launcher first on PATH.
+            # This harness explicitly owns Vim's PTY and bridge endpoint.
+            JTERM_VIM9_AUTO_GUI="0",
         )
         if extra_env:
             env.update(extra_env)

@@ -24,3 +24,4 @@ jobs:
           python3 runtime/vim9/test_overscan.py
           python3 runtime/vim9/test_render_delta.py
           python3 runtime/vim9/test_render_windows.py
+          python3 runtime/vim9/test_render_matches.py
