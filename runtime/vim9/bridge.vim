@@ -259,12 +259,16 @@ def AddRenderRun(runs: list<dict<any>>, glyph: dict<any>, style: dict<any>)
   run.style = style
   # ASCII shaping may be batched. A non-ASCII grapheme always keeps its own
   # Vim-owned display advance, preventing fallback fonts from moving neighbors.
-  var ascii = strlen(run.text) == strchars(run.text) && run.text =~# '^[\x20-\x7e]*$'
+  # A coalesced run must preserve a one-byte/one-cell source mapping. Expanded
+  # tabs remain separate so a native hover can recover the exact buffer byte.
+  var ascii = strlen(run.text) == run.cells && run.byte_end - run.byte_start == run.cells
+    && run.text =~# '^[\x20-\x7e]*$'
   if !empty(runs) && ascii
     var previous = runs[-1]
     if previous.row == run.row && previous.column + previous.cells == run.column
         && previous.line == run.line && previous.byte_end == run.byte_start
-        && previous.style == style && strlen(previous.text) == strchars(previous.text)
+        && previous.style == style && strlen(previous.text) == previous.cells
+        && previous.byte_end - previous.byte_start == previous.cells
         && previous.text =~# '^[\x20-\x7e]*$'
       previous.text ..= run.text
       previous.cells += run.cells
@@ -674,7 +678,8 @@ def RenderWindowFrame(): dict<any>
   var position = screenpos(win_getid(), line('.'), col('.'))
   if get(position, 'row', 0) > 0 && get(position, 'curscol', 0) > 0
     frame.cursor = {row: position.row - 1, column: position.curscol - 1,
-      width: max([1, position.endcol - position.curscol + 1]), visible: true}
+      width: max([1, position.endcol - position.curscol + 1]), visible: true,
+      line: line('.'), byte_column: col('.') - 1}
   endif
   return frame
 enddef

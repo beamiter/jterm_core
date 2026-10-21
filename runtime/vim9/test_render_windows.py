@@ -44,6 +44,32 @@ class RenderWindowTests(unittest.TestCase):
             self.editor.pump(0.02)
         self.fail(f"Vim did not finish writing {name}")
 
+    def test_overlay_anchors_keep_tabs_and_cursor_source_bytes(self):
+        e = self.editor
+        e.ex("set tabstop=4 nonumber norelativenumber")
+        e.ex("call setline(1, ['a\tbc界é', ''])")
+        e.ex("normal! gg0")
+        frame = self.assert_native()
+        runs = [r for r in frame["runs"] if r["line"] == 1 and r["byte_end"] > r["byte_start"]]
+        tab = next(r for r in runs if r["byte_start"] == 1)
+        self.assertEqual((tab["text"], tab["cells"], tab["byte_end"]), ("   ", 3, 2))
+        following = next(r for r in runs if r["byte_start"] == 2)
+        self.assertEqual((following["text"], following["cells"], following["byte_end"]), ("bc", 2, 4))
+        wide = next(r for r in runs if r["text"] == "界")
+        combining = next(r for r in runs if r["text"] == "é")
+        self.assertEqual((wide["byte_start"], wide["byte_end"], wide["cells"]), (4, 7, 2))
+        self.assertEqual((combining["byte_start"], combining["byte_end"], combining["cells"]), (7, 10, 1))
+        self.assertEqual((frame["cursor"]["line"], frame["cursor"]["byte_column"]), (1, 0))
+        e.keys("A")
+        e.state_where(lambda s: s["mode"] == "i")
+        end = self.assert_native()["cursor"]
+        self.assertEqual((end["line"], end["byte_column"]), (1, 10))
+        e.keys(b"\x1b")
+        e.ex("normal! G0")
+        blank = self.assert_native()["cursor"]
+        self.assertTrue(blank["visible"])
+        self.assertEqual((blank["line"], blank["byte_column"]), (2, 0))
+
     def test_split_buffers_edit_save_and_gui_syntax_are_vim_authoritative(self):
         e = self.editor
         e.ex("syntax match GuiWord /original/")

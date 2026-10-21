@@ -46,6 +46,10 @@ pub struct Vim9RenderCursor {
     /// Vim display cells, including wide-character geometry.
     pub width: usize,
     pub visible: bool,
+    /// Source position for native overlays at empty lines and insertion ends.
+    /// Zero line means the optional source position was not supplied.
+    pub line: u64,
+    pub byte_column: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]

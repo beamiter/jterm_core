@@ -31,6 +31,12 @@ pub use render::{
     Vim9RenderWindow,
 };
 
+#[path = "vim9_gui.rs"]
+mod gui;
+pub use gui::{
+    Vim9BufferPosition, Vim9PixelRect, Vim9RenderAnchor, Vim9RenderMetrics, Vim9UiConfig,
+};
+
 #[path = "vim9_entry.rs"]
 mod entry;
 pub use entry::{explicit_ide_target, Vim9EntryRequest, Vim9EntryTrigger};

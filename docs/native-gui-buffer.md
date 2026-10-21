@@ -12,6 +12,33 @@ owns the visible buffer's text drawing, RGB colors, decorations and cursor.
 The protocol transports drawing data derived from Vim's buffer and GUI
 highlight attributes, independently of terminal escape sequences.
 
+## Buffer-first defaults
+
+The four frontends share `Vim9UiConfig` and the same TOML section:
+
+```toml
+[vim9]
+native_buffer = true
+toolbar = false
+buffer_tabs = false
+status_bar = false
+project_panel = false
+tool_panel = false
+```
+
+Missing fields inherit these defaults, including when an older configuration
+has no `[vim9]` section. Enabling a project panel or toolbar does not toggle the
+buffer renderer. Disabling the native buffer uses the working Vim display
+without enabling workbench controls. `tool_panel` covers the optional search,
+build, diagnostics and output UI. Window decorations, explicit editor entry,
+font controls, Vim's own command line and error feedback remain accessible.
+
+Hidden controls reclaim their layout space. Project scanning is deferred until
+the project UI is requested. Workbench shortcuts must not put focus into an
+invisible field; save and buffer font zoom remain editor actions. A frontend
+may reveal a tool in response to an explicit command. Normal `vim` in a shell
+still follows the explicit-entry contract and does not switch app modes.
+
 ## Rendering boundary
 
 | Layer | Responsibility |
@@ -41,6 +68,12 @@ position and display width. The source bytes and the logical display width
 are different units; consumers must not equate either with a Unicode scalar
 count. Vim supplies the display geometry. Runs with matching styles can be
 drawn together through the host's text stack.
+
+Coalesced ASCII runs keep a one-byte/one-cell source mapping. Expanded tabs
+remain separate when their displayed cell width differs from their source byte
+length. Non-ASCII graphemes keep their own Vim-owned display advance. This is
+also the mapping used by native overlay attachment points; expanding a tab
+must never shift the source offset of the text that follows it.
 
 Styles carry GUI foreground, background and special colors plus text
 attributes. GUI colors come from Vim's resolved highlight groups, including
@@ -76,6 +109,55 @@ Host window tests complement the shared protocol's real Vim/PTY tests.
 Protocol assertions cannot prove the actual pixels, font fallback, input
 method placement or compositor behavior on the user's desktop.
 
+## Pixel geometry and native overlay attachment points
+
+`Vim9RenderMetrics` is the common conversion from Vim cells to host logical
+pixels. The frontend supplies its actual editor origin, cell width and line
+height; `rect`, `cell_rect`, `cursor_rect` and `cell_at` reuse those metrics for
+paint, input-method placement and future overlays. Fractional advances remain
+fractional. Rounding individual cells creates drift at non-integer zoom/DPI.
+Invalid or non-finite metrics do not produce paint or input geometry.
+
+The core provides a source-aware attachment API without depending on GTK,
+egui or Iced:
+
+| API | Purpose |
+| --- | --- |
+| `frame.anchor_at_cell(row, column)` | Resolve a visible glyph to its window, buffer, changed tick, UTF-8 byte range and cell rectangle |
+| `frame.cursor_anchor()` | Attach to the current glyph, empty line or insertion endpoint |
+| `anchor.position()` | Capture a source position for re-resolution after scroll or zoom |
+| `frame.anchor_for_position(&position)` | Resolve that exact window/buffer generation in the current viewport |
+| `frame.anchor_is_current(&anchor)` | Reject an attachment from a different paint revision or source location |
+| `metrics.rect(&anchor.rect)` | Place the host widget using the same transform as the painted text |
+
+Anchors exclude gutters, line backgrounds, end-of-buffer decorations, split
+separators and terminal-owned status/command rows. A wide glyph, combining
+cluster or expanded tab returns its full source range. Plain ASCII can resolve
+to a single byte/cell inside a shaped run. Two splits displaying the same
+buffer remain distinct through the Vim window identity.
+
+An asynchronous hover result belongs to its owning editor session. Drop it on
+session exit/re-entry, even if another Vim instance later reuses the same
+window IDs. Before painting, check the current frame. If the revision changed,
+re-resolve the captured source position; hide the result when it is off-screen,
+the window closed, the buffer changed, the changed tick differs or the bridge
+entered compatibility mode. Never reuse an old pixel rectangle after scroll,
+resize, font changes or DPI changes. The metadata is an attachment contract,
+not an edit command or permission to mutate a buffer.
+
+## Rendering work
+
+GTK frontends retain the current shaped text/background scene across
+cursor-only, focus and composition updates. Changed text, GUI styles, view
+rectangles, font metrics, font settings or scale invalidate that scene. The
+cursor and preedit layer remain dynamic. Frost groups runs by window before
+painting so all panes do not repeatedly scan every run. Ember uses the same
+fractional geometry for its visible caret and operating-system IME anchor.
+
+These are bounded renderer changes, not a claim of measured end-to-end latency
+on every GPU/compositor. Native smoke tests and real Vim protocol tests cover
+different parts of the boundary.
+
 ## Further work enabled by this boundary
 
 The next UI extensions can consume explicit Vim state and draw native
@@ -83,6 +165,13 @@ completion menus, command/search bars, diagnostic decorations, hover cards and
 inline information. Each needs an input and state contract as well as a
 renderer. Changes to fonts, spacing or animation must preserve the mapping
 between the displayed text and Vim's editing positions.
+
+Hover boards, Markdown previews, decoded images and color pickers can share the
+attachment API while keeping their own native content renderers and input
+handling. This change supplies the attachment and lifetime contract; it does
+not yet implement those four complete features. Arbitrary proportional editing,
+variable-height inline blocks and supported native rendering of all Vim popup,
+fold and wrapped-line states still need additional protocol work.
 
 See [the IDE guide](vim9-ide.md) and
 [the runtime protocol](../runtime/vim9/README.md) for the implemented

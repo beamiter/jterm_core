@@ -1,5 +1,13 @@
 # Vim9 native editor runtime
 
+Host presentation defaults and the source-aware native overlay attachment API
+are documented in [Native GUI buffer](../../docs/native-gui-buffer.md). The
+render cursor optionally includes `line` (one-based) and `byte_column`
+(zero-based UTF-8) so empty lines and insertion endpoints have real source
+anchors. Older frames without these fields still support glyph anchors. ASCII
+run coalescing preserves one-byte/one-cell mapping; expanded tabs stay separate
+when that mapping differs.
+
 `bridge.vim` runs inside an actual Vim 9 editor. The frontend sends normal
 keyboard input to the PTY. Its separate authenticated native Vim channel
 provides metadata, explicit IDE actions and opt-in GUI buffer paint frames.
