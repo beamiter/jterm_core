@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 20
     env:
       BASE: b8e340c3f47b37367a3c2fe56efcd6fbd641f701
-      CARGO_TERM_COLOR: always
+      CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -23,12 +23,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - run: sudo apt-get update && sudo apt-get install -y vim-nox ripgrep minisign curl
-      - run: python3 .maintenance/apply-vim9-viewport.py
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep minisign curl
+      - run: |
+          python3 .maintenance/apply-vim9-viewport.py
+          python3 .maintenance/refine-vim9-viewport.py
       - run: cargo fmt --all && git diff --check
-      - run: cargo test --locked --all-targets
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo doc --locked --no-deps
+      - run: cargo test --quiet --locked --all-targets -- --quiet
+      - run: cargo clippy --quiet --locked --all-targets -- -D warnings
+      - run: cargo doc --quiet --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Actual Vim regression suites
@@ -39,7 +41,7 @@ jobs:
           python3 runtime/vim9/test_render_windows.py
           python3 runtime/vim9/test_scroll.py
           python3 runtime/vim9/test_shell.py
-          cargo test --locked --lib vim9::tests::real_vim9_round_trip -- --ignored
+          cargo test --quiet --locked --lib vim9::tests::real_vim9_round_trip -- --ignored
       - name: Prepare tested commit without moving any branch
         env:
           GH_TOKEN: ${{ github.token }}
