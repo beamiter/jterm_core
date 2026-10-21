@@ -42,12 +42,12 @@ jobs:
           python3 runtime/vim9/test_scroll.py
           python3 runtime/vim9/test_shell.py
           cargo test --quiet --locked --lib vim9::tests::real_vim9_round_trip -- --ignored
-      - name: Prepare tested commit without moving any branch
+      - name: Prepare tested source commit without updating branches or workflows
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import json, os, urllib.request
+          import json, os, urllib.request, urllib.error
           from pathlib import Path
           repo = os.environ['GITHUB_REPOSITORY']
           base = os.environ['BASE']
@@ -56,17 +56,26 @@ jobs:
                   data=None if data is None else json.dumps(data).encode(),
                   headers={'Authorization':'Bearer ' + os.environ['GH_TOKEN'],
                     'Accept':'application/vnd.github+json', 'Content-Type':'application/json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  return json.load(response)
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  print(f'GitHub {path}: {error.code}: {error.read().decode(errors="replace")}')
+                  raise
           if req('/git/ref/heads/master')['object']['sha'] != base:
               raise SystemExit('master advanced; refusing stale candidate')
+          # Workflow changes are published separately using the connected app,
+          # not an Actions token without workflow-write permissions.
           paths = ['src/vim9.rs', 'src/vim9_render.rs', 'src/vim9_viewport.rs',
               'runtime/vim9/bridge.vim', 'runtime/vim9/test_overscan.py',
-              '.github/workflows/ci.yml', 'docs/vim9-pixel-viewport.md']
-          entries = [{'path':p,'mode':'100644','type':'blob','content':Path(p).read_text()} for p in paths]
+              'docs/vim9-pixel-viewport.md']
+          entries = []
+          for path in paths:
+              blob = req('/git/blobs', {'content':Path(path).read_text(), 'encoding':'utf-8'})
+              entries.append({'path':path, 'mode':'100644', 'type':'blob', 'sha':blob['sha']})
           tree = req('/git/trees', {'base_tree':req('/git/commits/' + base)['tree']['sha'], 'tree':entries})
           commit = req('/git/commits', {'message':'feat(vim9): sample semantic margins and unify pixel viewport geometry\n\nAdd bounded protocol-3 source rows without moving Vim, validate margins on keyframes and deltas, and share clipped paint/hit/caret coordinates. Preserve protocols 1/2 and fail closed when margins are unsupported. This is the projection foundation, not complete frontend pixel-direct input.', 'tree':tree['sha'], 'parents':[base]})
-          result = {'base':base, 'candidate':commit['sha'], 'files':paths}
+          result = {'base':base, 'candidate':commit['sha'], 'tree':tree['sha'], 'files':entries}
           print('::notice title=Validated viewport candidate::' + json.dumps(result))
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
               out.write('```json\n' + json.dumps(result,indent=2) + '\n```\n')
