@@ -40,7 +40,7 @@ pub struct Vim9PixelScroll {
 
 impl Vim9PixelScroll {
     pub fn new(window: &Vim9RenderWindow, metrics: Vim9RenderMetrics) -> Option<Self> {
-        if !window.native_pointer
+        if !window.native_scroll
             || window.window <= 0
             || window.buffer <= 0
             || window.topline == 0
@@ -71,7 +71,10 @@ impl Vim9PixelScroll {
     }
 
     fn matches(&self, window: &Vim9RenderWindow, metrics: Vim9RenderMetrics) -> bool {
-        window.native_pointer
+        // A source-bound drag freezes its displayed fraction before entering
+        // characterwise Visual mode. That image remains valid for pointer
+        // hit testing even though Visual mode does not admit new scrolls.
+        (window.native_scroll || window.native_pointer)
             && self.window == window.window
             && self.buffer == window.buffer
             && self.changedtick == window.changedtick
@@ -419,7 +422,7 @@ mod tests {
                 columns: 10,
             },
             line_count: 100,
-            native_pointer: true,
+            native_scroll: true,
             scroll_ack: ack,
             line_lengths: vec![0; 4],
             overscan: [-2, -1, 4, 5]
@@ -447,6 +450,35 @@ mod tests {
         assert!(scroll.command().is_none());
         assert!(scroll.reconcile(&frame.windows[0], metrics(), false));
         assert_eq!(scroll.offset(&frame, metrics()), -6.25);
+    }
+    #[test]
+    fn scroll_capability_is_independent_of_source_pointer_admission() {
+        let mut frame = frame(10, 0);
+        assert!(!frame.windows[0].native_pointer);
+        let mut scroll = Vim9PixelScroll::new(&frame.windows[0], metrics()).unwrap();
+        scroll.push(0.0125);
+        assert_eq!(scroll.offset(&frame, metrics()), -0.25);
+        // A click mapping changing does not retire a valid scroll gesture.
+        frame.windows[0].native_pointer = true;
+        assert!(scroll.reconcile(&frame.windows[0], metrics(), false));
+        assert_eq!(scroll.offset(&frame, metrics()), -0.25);
+        frame.windows[0].native_scroll = false;
+        frame.windows[0].native_pointer = false;
+        assert!(!scroll.reconcile(&frame.windows[0], metrics(), false));
+        assert!(Vim9PixelScroll::new(&frame.windows[0], metrics()).is_none());
+    }
+    #[test]
+    fn frozen_pointer_fraction_survives_characterwise_visual_mode() {
+        let mut frame = frame(10, 0);
+        let mut scroll = Vim9PixelScroll::new(&frame.windows[0], metrics()).unwrap();
+        scroll.push(0.3125);
+        scroll.stop_animation();
+        frame.mode = "v".into();
+        frame.windows[0].native_scroll = false;
+        frame.windows[0].native_pointer = true;
+        assert!(scroll.reconcile(&frame.windows[0], metrics(), false));
+        assert_eq!(scroll.offset(&frame, metrics()), -6.25);
+        assert!(Vim9PixelScroll::new(&frame.windows[0], metrics()).is_none());
     }
     #[test]
     fn acknowledgement_rebases_without_double_movement_and_keeps_new_input() {
@@ -494,7 +526,7 @@ mod tests {
                 3 => w.leftcol += 1,
                 4 => w.textoff += 1,
                 5 => w.topline += 1,
-                _ => w.native_pointer = false,
+                _ => w.native_scroll = false,
             }
             assert!(!original.clone().reconcile(w, metrics(), false));
         }

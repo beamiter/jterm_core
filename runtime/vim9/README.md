@@ -76,6 +76,12 @@ continuous wheel transitions and short bursts. Version 5 adds the optional
 hosts continue using the live compatibility menu. Existing command and metadata
 messages continue to use `protocol: 1`.
 
+Protocol-3 and newer window metadata also has an optional `native_scroll`
+capability, independent of `native_pointer`. It permits source-bound scrolling
+in idle Normal and Insert mode, without requiring mouse input, standard click
+mappings or a particular `virtualedit` setting. Producers without this field
+retain compatibility scrolling. Completion and busy modes do not admit it.
+
 Subsequent requests have a positive integer `id` and one action. For example:
 
 ```json

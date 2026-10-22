@@ -1227,7 +1227,8 @@ mod tests {
                 "windows":[{"window":10,"buffer":1,"changedtick":3,
                     "view":{"row":0,"column":0,"rows":4,"columns":10},
                     "topline":top,"botline":top + 3,"line_count":100,
-                    "native_pointer":true,"line_lengths":[0,0,0,0],"scroll_ack":ack}]
+                    "native_pointer":true,"native_scroll":true,
+                    "line_lengths":[0,0,0,0],"scroll_ack":ack}]
             })
         };
         session.0.shared.lock().pending.insert(41);

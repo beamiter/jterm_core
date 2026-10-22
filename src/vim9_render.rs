@@ -106,6 +106,9 @@ pub struct Vim9RenderWindow {
     pub overscan: Vec<Vim9RenderMarginRow>,
     /// Optional protocol-3 native input capability, false for legacy producers.
     pub native_pointer: bool,
+    /// Source-bound scrolling is independent of mouse mappings, mouse options
+    /// and virtual editing. False for producers predating this capability.
+    pub native_scroll: bool,
     /// Last successfully applied source-bound scroll request in this split.
     pub scroll_ack: u64,
     /// Explicit visible source-line lengths, including empty and EOL targets.
@@ -243,6 +246,8 @@ impl Vim9RenderFrame {
                         || window.line_lengths.len() as u64
                             == window.botline.saturating_sub(window.topline) + 1)
                     && (!window.native_pointer || !window.line_lengths.is_empty())
+                    && (!window.native_scroll
+                        || (window.line_count > 0 && !window.line_lengths.is_empty()))
                     && (window.line_count == 0
                         || (window.topline > 0
                             && window.topline <= window.botline

@@ -100,6 +100,74 @@ class PixelInputTests(unittest.TestCase):
         self.editor.ex('set selectmode=mouse')
         self.assertFalse(self.window()['native_pointer'])
 
+    def test_scroll_capability_does_not_depend_on_mouse_or_virtualedit_options(self):
+        e = self.editor
+        for options in ('virtualedit=block', 'virtualedit=all', 'mouse=',
+                        'mouse=a selectmode=mouse'):
+            with self.subTest(options=options):
+                e.ex('set ' + options)
+                w = self.window()
+                self.assertTrue(w['native_scroll'])
+                reply = e.request('scroll_view', **self.source(w),
+                                  topline=w['topline'], leftcol=w['leftcol'], lines=1)
+                after = self.window()
+                self.assertEqual(after['topline'], w['topline'] + 1)
+                self.assertEqual(after['scroll_ack'], reply['id'])
+                self.assertEqual(after['changedtick'], w['changedtick'])
+        e.ex('nnoremap <LeftMouse> <Nop>')
+        w = self.window()
+        self.assertFalse(w['native_pointer'])
+        self.assertTrue(w['native_scroll'])
+
+    def test_block_virtualedit_keeps_exact_normal_and_characterwise_pointer_targets(self):
+        self.editor.ex('set virtualedit=block')
+        self.assertTrue(self.window()['native_pointer'])
+        self.pointer('press', 31, 0)
+        self.pointer('drag', 31, 4)
+        self.pointer('release', 31, 4)
+        self.assertEqual(self.editor.snapshot()['mode'], 'v')
+        self.assertTrue(self.window()['native_pointer'])
+        self.editor.keys('y')
+        self.editor.state_where(lambda s: s['mode'] == 'n')
+        self.editor.ex("call writefile([getreg('\"')], 'pixel-block-yank.txt')")
+        self.assertEqual((Path(self.directory.name) / 'pixel-block-yank.txt').read_text().strip(), '031 界')
+
+    def test_insert_mode_source_scroll_acknowledges_without_interrupting_unicode_input(self):
+        e = self.editor
+        e.keys('i')
+        e.state_where(lambda s: s['mode'] == 'i')
+        w = self.window()
+        self.assertFalse(w['native_pointer'])
+        self.assertTrue(w['native_scroll'])
+        reply = e.request('scroll_view', **self.source(w), topline=w['topline'],
+                          leftcol=w['leftcol'], lines=1)
+        after = self.window()
+        self.assertEqual(after['topline'], w['topline'] + 1)
+        self.assertEqual(after['scroll_ack'], reply['id'])
+        self.assertEqual(after['changedtick'], w['changedtick'])
+        self.assertEqual(e.snapshot()['mode'], 'i')
+        # Observe later callback/redraw cycles as well as the immediate ack.
+        # The cursor starts on the top row, so Vim must keep its scrolled view
+        # when Insert's next redraw checks that the cursor remains visible.
+        for _ in range(5):
+            e.pump(0.04)
+        self.assertEqual(self.window()['topline'], w['topline'] + 1)
+        self.assertEqual(e.snapshot()['mode'], 'i')
+        e.keys('丝滑')
+        e.keys(b'\x1b')
+        e.state_where(lambda s: s['mode'] == 'n')
+        e.request('save')
+        self.assertIn('丝滑', e.file.read_text(encoding='utf-8'))
+
+    def test_visual_mode_does_not_admit_source_scroll(self):
+        e = self.editor
+        e.keys('v')
+        e.state_where(lambda s: s['mode'] == 'v')
+        w = self.window()
+        self.assertFalse(w['native_scroll'])
+        e.request('scroll_view', **self.source(w), topline=w['topline'],
+                  leftcol=w['leftcol'], lines=1, ok=False)
+
     def test_visible_empty_lines_and_eol_have_explicit_byte_lengths(self):
         self.editor.ex("call setline(31, '')")
         w = self.window()

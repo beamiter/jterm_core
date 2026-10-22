@@ -83,9 +83,11 @@ and retain previous edge rows so the transition does not expose a blank strip.
 Editing, mouse actions, geometry/font changes, buffer changes or compatibility
 fallback settle the transition before new input is interpreted.
 
-Setting `smooth_scroll = false` keeps precise wheel accumulation and native
-scroll commands while removing the easing tail. The GTK implementation also
-respects the system's animation preference.
+Setting `smooth_scroll = false` removes synthesized wheel animation while
+retaining direct pixel scrolling, fractional offsets and native scroll commands.
+The GTK implementation also respects the system's animation preference for
+discrete wheel animation. Mouse options and click mappings do not control the
+independent native scrolling capability, which supports Normal and Insert mode.
 
 The transport wakes its socket worker when a command is enqueued instead of
 waiting for the former 20 ms read timeout. Idle waiting uses descriptor polling,

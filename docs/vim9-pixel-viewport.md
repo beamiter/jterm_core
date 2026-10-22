@@ -30,6 +30,12 @@ launches actual Vim in a PTY with protocols 3 and 4. Legacy bridge tests retain 
 mapping, split clipping, document edges, empty rows, property styles, hidden
 unsupported text, source edits and fresh delta metadata.
 
+Frontends reading `native_scroll` require the matching core source. For local
+coordinated builds before publication, use `scripts/family-cargo.py` as described
+in the repository README; it preserves release pins and lockfiles. Publish the
+core revision and update all four consumers' pins and lockfiles together before
+merging or making a release from the standalone repositories.
+
 ## Wheel presentation
 
 All four frontends use the source-bound pixel controller for supported views.
@@ -41,6 +47,13 @@ provide real text for ordinary wheel bursts while a source-checked request is
 in flight. Exact acknowledgements rebase the same transform without replaying
 motion. A press freezes future animation and uses the displayed source bytes.
 Editing, preedit, zoom, splits and fallback cancel obsolete gestures.
+
+Scrolling uses the independent `native_scroll` capability in Normal and Insert
+mode. Mouse options, click mappings and `virtualedit=block` cannot disable
+pixel motion. The latter also retains exact source-pointer targets in Normal
+and characterwise Visual mode. Animation preferences control synthesized wheel
+transitions; raw touchpad pixels remain direct when animations are disabled.
+Fractional X11 line deltas are precision input and do not acquire a notch tail.
 
 The controller tracks requested motion separately from the motion actually
 displayed. A fast touchpad event can exceed the eight supplied margin rows;

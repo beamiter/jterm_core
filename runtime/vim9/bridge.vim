@@ -533,7 +533,10 @@ enddef
 # virtual columns remain owned by the compatibility input path.
 def NativePointerAvailable(): bool
   const current = mode(1)
-  if pumvisible() || index(['n', 'v'], current) < 0 || !empty(&virtualedit)
+  # 'block' only permits virtual space in blockwise Visual mode, which is
+  # already excluded here. Normal/characterwise source targets remain exact.
+  if pumvisible() || index(['n', 'v'], current) < 0
+      || (!empty(&virtualedit) && &virtualedit !=# 'block')
       || &selectmode =~# 'mouse' || &mouse !~# (current ==# 'n' ? '[an]' : '[av]')
     return false
   endif
@@ -545,6 +548,13 @@ def NativePointerAvailable(): bool
     endfor
   endfor
   return true
+enddef
+
+def NativeScrollAvailable(): bool
+  # Scrolling does not synthesize a pointer gesture. Mouse mappings, mouse=
+  # and virtualedit=block must not disable direct touchpad pixels. Keep busy
+  # modes and completion under Vim's compatibility input ownership.
+  return index(['n', 'i'], mode(1)) >= 0 && !pumvisible()
 enddef
 
 def NativeSourceWindow(request: dict<any>): number
@@ -562,8 +572,8 @@ enddef
 
 def ScrollSourceWindow(request: dict<any>, id: number)
   SafeToChange()
-  if mode(1) !=# 'n' || SaveInputPending()
-    throw 'Precision scrolling requires idle Normal mode'
+  if !NativeScrollAvailable() || SaveInputPending()
+    throw 'Precision scrolling requires idle Normal or Insert mode'
   endif
   const window = NativeSourceWindow(request)
   const info = getwininfo(window)[0]
@@ -663,6 +673,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   frame.line_count = line('$')
   frame.overscan = []
   frame.native_pointer = renderProtocol >= 3 && NativePointerAvailable()
+  frame.native_scroll = renderProtocol >= 3 && NativeScrollAvailable()
   frame.scroll_ack = get(scrollAcknowledgements, string(win_getid()), 0)
   frame.line_lengths = map(getline(first, last), (_, text) => strlen(text))
   var visibleFirst = first
@@ -1207,7 +1218,8 @@ def RenderFrame(): dict<any>
       topline: sample.topline, botline: sample.botline,
       textoff: sample.textoff, leftcol: sample.leftcol,
       line_count: sample.line_count, overscan: sample.overscan,
-      native_pointer: sample.native_pointer, scroll_ack: sample.scroll_ack,
+      native_pointer: sample.native_pointer, native_scroll: sample.native_scroll,
+      scroll_ack: sample.scroll_ack,
       line_lengths: sample.line_lengths})
     extend(runs, sample.runs)
     caches[string(id)] = renderWindowCaches[string(id)]
@@ -1217,6 +1229,7 @@ def RenderFrame(): dict<any>
   remove(frame, 'overscan')
   remove(frame, 'line_lengths')
   remove(frame, 'native_pointer')
+  remove(frame, 'native_scroll')
   remove(frame, 'scroll_ack')
   if win_getid() != active || bufnr() != activeBuffer || mode(1) !=# activeMode || winsaveview() != activeView
     frame.supported = false
