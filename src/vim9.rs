@@ -34,6 +34,13 @@ pub use navigation::{parse_vim9_location, Vim9QuickOpenQuery};
 mod palette;
 pub use palette::{vim9_palette_matches, vim9_palette_query, Vim9PaletteCommand};
 
+#[path = "vim9_workbench.rs"]
+mod workbench;
+pub use workbench::{
+    Vim9WorkbenchAction, Vim9WorkbenchDiagnostics, Vim9WorkbenchGit, Vim9WorkbenchRemote,
+    Vim9WorkbenchState,
+};
+
 #[path = "vim9_render.rs"]
 mod render;
 pub use render::{
@@ -224,6 +231,10 @@ pub struct Vim9Quickfix {
 #[serde(default)]
 pub struct Vim9Snapshot {
     pub connected: bool,
+    /// Source identity for commands originating in a native command palette.
+    pub buffer: i64,
+    pub window: i64,
+    pub changedtick: u64,
     pub mode: String,
     pub file: String,
     pub root: String,
@@ -243,6 +254,7 @@ pub struct Vim9Snapshot {
     pub search: Vim9Search,
     pub navigation: Vim9Navigation,
     pub quickfix: Vim9Quickfix,
+    pub workbench: Vim9WorkbenchState,
     /// Available optional semantic commands; for example `definition`.
     pub capabilities: Vec<String>,
     pub error: Option<String>,
@@ -315,6 +327,14 @@ pub enum Vim9Command {
         name: String,
     },
     Format,
+    /// A fixed provider action, bound to the source which opened the palette.
+    /// There is no arbitrary command or executable string on this interface.
+    Workbench {
+        command: Vim9WorkbenchAction,
+        window: i64,
+        buffer: i64,
+        changedtick: u64,
+    },
     NextDiagnostic,
     PreviousDiagnostic,
     /// Scroll an existing window without focusing it or evaluating user text.
@@ -355,6 +375,14 @@ pub enum Vim9Command {
 impl Vim9Command {
     fn frame(&self, id: u64) -> io::Result<Vec<u8>> {
         match self {
+            Self::Workbench {
+                window,
+                buffer,
+                changedtick,
+                ..
+            } if *window <= 0 || *buffer <= 0 || *changedtick > i64::MAX as u64 => {
+                return Err(invalid("Invalid source-bound workbench action"));
+            }
             Self::ScrollView {
                 window,
                 buffer,
@@ -1088,10 +1116,15 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
                 matches!(
                     capability.as_str(),
                     "definition" | "hover" | "references" | "rename" | "format"
-                )
+                ) || Vim9WorkbenchAction::ALL
+                    .iter()
+                    .any(|action| action.capability() == capability)
             });
             snapshot.capabilities.sort();
             snapshot.capabilities.dedup();
+            snapshot
+                .workbench
+                .bound(snapshot.buffer, snapshot.window, snapshot.changedtick);
             snapshot.connected = true;
             snapshot.pending = shared.pending.len();
             snapshot.error = shared.snapshot.error.take();

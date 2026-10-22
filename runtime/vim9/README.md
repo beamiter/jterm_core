@@ -42,6 +42,14 @@ that copy is then cleared. Address and project-root environment values remain.
 If the environment is absent, sourcing the script is a no-op. Loading it twice
 does not register duplicate callbacks. A lost bridge leaves the editor alive.
 
+After authentication, `g:jterm_vim9_connected` becomes `v:true`,
+`g:jterm_vim9_render_protocol` records the negotiated paint version, and
+`User JTermVim9Ready` fires. Disconnect or exit sets them to `v:false` and `0`
+and fires `User JTermVim9Disconnected` once. These events let a user vimrc
+distinguish a live native session from inherited startup environment values.
+The older `g:jterm_vim9_bridge_loaded` marker remains a load/idempotency marker.
+An exception in a user lifecycle autocommand does not break the channel.
+
 ## Wire protocol
 
 Protocol version 1 is UTF-8 JSON with one object per newline. The native Vim
@@ -117,11 +125,12 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | `search` | Nonempty, single-line `query` | Async literal project search using `rg`, with Smart case by default |
 | `search_with_options` | `query`; `options` object | Async search with `case` (`smart`, `sensitive`, `ignore`), Boolean `regex`/`whole_word`, and one optional string `glob` |
 | `cancel_search` | None | Cancel the current search; retain the preceding quickfix list and invalidate late callbacks |
-| `definition` | None | `:LspGotoDefinition`, or native tags/tagfunc |
-| `hover` | None | `:LspHover` |
-| `references` | None | `:LspShowReferences` |
+| `definition` | None | Advertised workbench provider, then `:LspGotoDefinition` or native tags/tagfunc |
+| `hover` | None | Advertised workbench provider, then `:LspHover` |
+| `references` | None | Advertised workbench provider, then `:LspShowReferences` |
 | `rename` | Nonempty `name` | `:LspRename name`; whitespace/command separators are rejected |
-| `format` | None | `:LspFormat` |
+| `format` | None | Advertised workbench provider, then `:LspFormat` |
+| `workbench` | Fixed `command`; current `window`, `buffer`, `changedtick` | Invoke an available Simple action in the user's vimrc; reject a changed source or removed capability |
 | `next_diagnostic` | None | Native `:cnext` |
 | `previous_diagnostic` | None | Native `:cprevious` |
 | `set_render` | Boolean `enabled` | Subscribe/unsubscribe to native GUI buffer paint frames after the session is connected |
@@ -345,7 +354,7 @@ underlying Vim buffer data is unaffected.
 
 ## Optional Vim9 language features
 
-The supported adapter is [Yegappan's Vim9 LSP](https://github.com/yegappan/lsp).
+The built-in adapter is [Yegappan's Vim9 LSP](https://github.com/yegappan/lsp).
 Its public commands are listed in the action table. The user installs and
 configures that plugin and its language servers in their normal Vim setup;
 this bridge does not download them. Their registered commands determine the
@@ -360,14 +369,106 @@ uses `lsp#diag#GetDiagsForBuf()` when available. Other Vim plugins still load
 and work normally in the editor; native buttons for other command vocabularies
 need an explicit adapter rather than guessed commands.
 
+### Simple plugin workbench
+
+[beamiter/vimrc](https://github.com/beamiter/vimrc) can provide these optional,
+already-loaded global functions. The runtime neither installs the vimrc nor
+sources arbitrary project-local files:
+
+```vim
+def g:VimrcWorkbenchCapabilities(): list<string>
+def g:VimrcWorkbenchAction(action: string)
+def g:VimrcWorkbenchState(): dict<any>
+```
+
+The first hook returns available actions for the **current** buffer. The bridge
+accepts only `definition`, `hover`, `references`, `format` and the twelve
+`simple_*` actions below, deduplicating at most 64 entries. Existing typed
+semantic commands prefer a declared workbench provider, then retain their
+built-in LSP/tags fallback. SimpleCC's rename uses its own prepare-rename and
+Vim prompt workflow; it is deliberately a separate `simple_rename` action and
+does not claim to consume the existing `rename` request's `name` argument.
+
+| Fixed action | Plugin workflow |
+| --- | --- |
+| `simple_files` | SimpleFinder files |
+| `simple_buffers` | SimpleFinder buffers |
+| `simple_grep` | SimpleFinder interactive project grep |
+| `simple_outline` | SimpleCC symbol outline |
+| `simple_rename` | SimpleCC rename with its Vim prompt |
+| `simple_code_action` | SimpleCC code-action chooser |
+| `simple_git_status` | SimpleGit status |
+| `simple_git_diff` | SimpleGit diff |
+| `simple_git_hunk` | SimpleGit hunk preview |
+| `simple_markdown_preview` | SimpleMarkdown preview |
+| `simple_keys` | SimpleWhichKey hints |
+| `simple_workbench` | Vimrc workbench report |
+
+Every native command palette offers this finite catalog with aliases such as
+`>simple`, `>git`, `>markdown` and `>workbench`. Absent plugins, disabled actions
+and unsuitable buffer types remain visible with an unavailable reason. The
+action hook must recheck availability and throw on failure. The native request
+has no free-form Ex command, key sequence, callback name or executable field:
+
+```json
+{"id":42,"action":"workbench","command":"simple_git_hunk","window":1001,"buffer":3,"changedtick":7}
+```
+
+The bridge checks safe Vim mode, the exact current window/buffer/text version,
+the fixed vocabulary and freshly sampled capabilities before invoking the
+hook. It refuses a stale request instead of applying it to another source.
+Plugin prompts, popup windows, diff views and other unsupported displays still
+use the live compatibility renderer, returning to native paint when supported.
+
+`VimrcWorkbenchState()` must only read cached state. The bridge projects a
+closed schema into `Vim9Snapshot.workbench`, ignoring all other fields:
+
+```text
+provider, root, native, large_file
+git: head, ahead, behind, added, changed, removed
+diagnostics: error, warning, info, hint
+remote: connected, label, root
+```
+
+It attaches Vim-owned `buffer`, `window`, and `changedtick` fields, which the
+receiver checks against the enclosing snapshot. String limits are 64
+characters for provider, 128 for branch, 256 for remote label, and 4096 for
+roots. Control characters are removed; integer counts are clamped to
+0–1,000,000. Malformed optional fields use defaults. A missing, throwing or
+disabled state hook yields empty context without interrupting editing. Private
+plugin dictionaries, function references, channels and unrelated fields are
+never serialized. `Vim9WorkbenchState::status_text()` supplies the four hosts'
+compact palette/optional-status context from these caches, without Git/LSP I/O.
+
+The bridge listens for `SimpleGitUpdate`, remote workspace events and
+`VimrcWorkbenchChanged`; its ordinary reconciliation also observes capability
+changes after `:source`. SimpleCC diagnostics here are **severity counts** for
+the current buffer, distinct from the existing quickfix/location-list problem
+rows and their F8 navigation.
+
 ## Real-editor tests
 
 From the core repository:
 
 ```sh
 cd runtime/vim9
-VIM9_TEST_VIM=/absolute/path/to/vim python3 -m unittest -v test_bridge test_render_windows test_render_matches test_render_delta
+VIM9_TEST_VIM=/absolute/path/to/vim python3 -m unittest -v test_bridge test_workbench test_render_windows test_render_matches test_render_delta
 ```
+
+The optional cross-repository suite uses actual `vimrc`, `simplecc`,
+`simplegit` and `simplewhichkey` checkouts. It defaults to sibling directories;
+other checkout layouts can select the vimrc and plugin parent explicitly:
+
+```sh
+VIM9_TEST_VIMRC=/path/to/vimrc VIM9_TEST_SIMPLE_ROOT=/path/to/plugin-parent python3 -m unittest -v test_vimrc_workbench
+```
+
+That suite loads the real configuration and plugin runtimes in isolated test
+homes. SimpleCC's deterministic daemon fixture supplies replies; it tests
+actual command routing, navigation, diagnostic caches, report rendering and
+reload behavior, without installing plugins or contacting language servers or
+remote machines. Its fixture replies are not evidence of an external LSP
+server's correctness.
 
 `VIM9_TEST_VIM` is optional when `vim` is on PATH. These Python-standard-library
 tests create isolated files, actual PTYs and private loopback sockets, then

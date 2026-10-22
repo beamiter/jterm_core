@@ -272,6 +272,17 @@ the picker does not execute arbitrary Ex or shell text. Commands work without
 the project index, including while scanning fails. Use `./>notes` to find a
 literal filename starting with `>`. Escape returns focus to the editor.
 
+When using `beamiter/vimrc`, `>simple` exposes its SimpleFinder, SimpleCC,
+SimpleGit, SimpleMarkdown and SimpleWhichKey workflows. `>git`, `>markdown`
+and `>workbench` narrow that catalog. Missing plugins or unsuitable buffers
+show an unavailable reason, and activation checks the actual source window,
+buffer and text version before calling the vimrc's fixed action adapter.
+The command palette also displays cached branch/hunk counts, diagnostic
+severity counts and connected remote workspace context; the same compact
+summary appears in the optional statusbar. No permanent panel is required.
+See [the Simple workbench contract](../runtime/vim9/README.md#simple-plugin-workbench)
+for hook names, limits and compatibility behavior.
+
 Native split controls create real Vim horizontal/vertical windows sharing
 Vim's buffers and undo. Buffer navigation restores remembered cursor/scroll
 positions. Closing a buffer never forces a write or discards changes, even
@@ -372,6 +383,14 @@ configured by the user's Vim installation. The workbench does not silently
 download plugins or language servers, and it does not claim semantic features
 for a bare Vim installation. See the runtime's [protocol and adapter notes](../runtime/vim9/README.md)
 for supported commands and optional setup.
+
+The vimrc workbench adapter supplies SimpleCC definition, hover, references
+and formatting through the same native controls. `Simple: Rename symbol with
+Vim prompt` preserves SimpleCC's own prepare-rename/prompt workflow; the
+existing typed Rename dialog still requires a provider accepting its supplied
+name. Plugin popup and diff workflows can temporarily use the live Vim
+compatibility view. Native painting resumes when the current display is
+supported again.
 
 ## Closing and lifetime
 

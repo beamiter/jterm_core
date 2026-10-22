@@ -1,0 +1,279 @@
+//! A bounded view of the user's Simple plugin workbench. The editor owns the
+//! providers and their caches; native hosts only display this state and send
+//! finite, source-bound actions back to Vim.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Vim9WorkbenchAction {
+    SimpleFiles,
+    SimpleBuffers,
+    SimpleGrep,
+    SimpleOutline,
+    SimpleRename,
+    SimpleCodeAction,
+    SimpleGitStatus,
+    SimpleGitDiff,
+    SimpleGitHunk,
+    SimpleMarkdownPreview,
+    SimpleKeys,
+    SimpleWorkbench,
+}
+
+impl Vim9WorkbenchAction {
+    pub const ALL: [Self; 12] = [
+        Self::SimpleFiles,
+        Self::SimpleBuffers,
+        Self::SimpleGrep,
+        Self::SimpleOutline,
+        Self::SimpleRename,
+        Self::SimpleCodeAction,
+        Self::SimpleGitStatus,
+        Self::SimpleGitDiff,
+        Self::SimpleGitHunk,
+        Self::SimpleMarkdownPreview,
+        Self::SimpleKeys,
+        Self::SimpleWorkbench,
+    ];
+
+    pub fn capability(self) -> &'static str {
+        match self {
+            Self::SimpleFiles => "simple_files",
+            Self::SimpleBuffers => "simple_buffers",
+            Self::SimpleGrep => "simple_grep",
+            Self::SimpleOutline => "simple_outline",
+            Self::SimpleRename => "simple_rename",
+            Self::SimpleCodeAction => "simple_code_action",
+            Self::SimpleGitStatus => "simple_git_status",
+            Self::SimpleGitDiff => "simple_git_diff",
+            Self::SimpleGitHunk => "simple_git_hunk",
+            Self::SimpleMarkdownPreview => "simple_markdown_preview",
+            Self::SimpleKeys => "simple_keys",
+            Self::SimpleWorkbench => "simple_workbench",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::SimpleFiles => "Simple: Find files",
+            Self::SimpleBuffers => "Simple: Find open buffers",
+            Self::SimpleGrep => "Simple: Search project text",
+            Self::SimpleOutline => "Simple: Show symbol outline",
+            Self::SimpleRename => "Simple: Rename symbol with Vim prompt",
+            Self::SimpleCodeAction => "Simple: Choose code action",
+            Self::SimpleGitStatus => "Simple: Show Git status",
+            Self::SimpleGitDiff => "Simple: Show Git diff",
+            Self::SimpleGitHunk => "Simple: Preview current Git hunk",
+            Self::SimpleMarkdownPreview => "Simple: Toggle Markdown preview",
+            Self::SimpleKeys => "Simple: Show key hints",
+            Self::SimpleWorkbench => "Simple: Inspect workbench",
+        }
+    }
+
+    pub(super) fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::SimpleFiles => &["simplefinder files", "查找文件"],
+            Self::SimpleBuffers => &["simplefinder buffers", "查找缓冲区"],
+            Self::SimpleGrep => &["simplefinder grep", "搜索项目"],
+            Self::SimpleOutline => &["simplecc outline", "符号大纲"],
+            Self::SimpleRename => &["simplecc rename", "重命名符号"],
+            Self::SimpleCodeAction => &["simplecc code action", "代码操作"],
+            Self::SimpleGitStatus => &["simplegit status", "Git 状态"],
+            Self::SimpleGitDiff => &["simplegit diff", "Git 差异"],
+            Self::SimpleGitHunk => &["simplegit hunk", "Git 修改块"],
+            Self::SimpleMarkdownPreview => &["simplemarkdown preview", "Markdown 预览"],
+            Self::SimpleKeys => &["simplewhichkey key hints", "按键提示"],
+            Self::SimpleWorkbench => &["simple workbench health", "工作台状态"],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9WorkbenchGit {
+    pub head: String,
+    pub ahead: u64,
+    pub behind: u64,
+    pub added: u64,
+    pub changed: u64,
+    pub removed: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9WorkbenchDiagnostics {
+    pub error: u64,
+    pub warning: u64,
+    pub info: u64,
+    pub hint: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9WorkbenchRemote {
+    pub connected: bool,
+    pub label: String,
+    pub root: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9WorkbenchState {
+    pub buffer: i64,
+    pub window: i64,
+    pub changedtick: u64,
+    pub provider: String,
+    pub root: String,
+    pub native: bool,
+    pub large_file: bool,
+    pub git: Vim9WorkbenchGit,
+    pub diagnostics: Vim9WorkbenchDiagnostics,
+    pub remote: Vim9WorkbenchRemote,
+}
+
+impl Vim9WorkbenchState {
+    pub(super) fn bound(&mut self, buffer: i64, window: i64, changedtick: u64) {
+        // A provider cannot attach cached metadata to a different source.
+        if self.buffer != buffer || self.window != window || self.changedtick != changedtick {
+            *self = Self::default();
+            return;
+        }
+        fn text(value: &mut String, limit: usize) {
+            *value = value
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(limit)
+                .collect();
+        }
+        text(&mut self.provider, 64);
+        text(&mut self.root, 4096);
+        text(&mut self.git.head, 128);
+        text(&mut self.remote.label, 256);
+        text(&mut self.remote.root, 4096);
+        for value in [
+            &mut self.git.ahead,
+            &mut self.git.behind,
+            &mut self.git.added,
+            &mut self.git.changed,
+            &mut self.git.removed,
+            &mut self.diagnostics.error,
+            &mut self.diagnostics.warning,
+            &mut self.diagnostics.info,
+            &mut self.diagnostics.hint,
+        ] {
+            *value = (*value).min(1_000_000);
+        }
+    }
+
+    /// Shared compact context for the command palette and optional statusbar.
+    /// This only formats already-published caches; it never queries Git/LSP.
+    pub fn status_text(&self) -> String {
+        if self.provider.is_empty() {
+            return String::new();
+        }
+        let mut parts = vec![if self.provider == "simple" {
+            "Simple".to_owned()
+        } else {
+            self.provider.clone()
+        }];
+        if !self.git.head.is_empty() {
+            let mut branch = self.git.head.clone();
+            if self.git.ahead > 0 {
+                branch.push_str(&format!(" ↑{}", self.git.ahead));
+            }
+            if self.git.behind > 0 {
+                branch.push_str(&format!(" ↓{}", self.git.behind));
+            }
+            parts.push(branch);
+        }
+        if self.git.added > 0 || self.git.changed > 0 || self.git.removed > 0 {
+            parts.push(format!(
+                "+{} ~{} -{}",
+                self.git.added, self.git.changed, self.git.removed
+            ));
+        }
+        let d = &self.diagnostics;
+        if d.error > 0 || d.warning > 0 || d.info > 0 || d.hint > 0 {
+            let mut counts = Vec::new();
+            for (label, count) in [
+                ("E", d.error),
+                ("W", d.warning),
+                ("I", d.info),
+                ("H", d.hint),
+            ] {
+                if count > 0 {
+                    counts.push(format!("{label}{count}"));
+                }
+            }
+            parts.push(counts.join(" "));
+        }
+        if self.large_file {
+            parts.push("large file".into());
+        }
+        if self.remote.connected {
+            parts.push(if self.remote.label.is_empty() {
+                "remote".into()
+            } else {
+                format!("remote: {}", self.remote.label)
+            });
+        }
+        parts.join(" · ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiver_bounds_context_and_expires_wrong_sources() {
+        let mut state = Vim9WorkbenchState {
+            buffer: 3,
+            window: 1001,
+            changedtick: 7,
+            provider: "simple".into(),
+            git: Vim9WorkbenchGit {
+                head: "中\n".repeat(200),
+                added: u64::MAX,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        state.bound(3, 1001, 7);
+        assert_eq!(state.git.head.chars().count(), 128);
+        assert!(!state.git.head.contains('\n'));
+        assert_eq!(state.git.added, 1_000_000);
+        state.bound(4, 1001, 7);
+        assert_eq!(state, Vim9WorkbenchState::default());
+    }
+
+    #[test]
+    fn context_is_compact_and_absent_providers_stay_quiet() {
+        assert_eq!(Vim9WorkbenchState::default().status_text(), "");
+        let state = Vim9WorkbenchState {
+            provider: "simple".into(),
+            git: Vim9WorkbenchGit {
+                head: "main".into(),
+                ahead: 2,
+                changed: 1,
+                ..Default::default()
+            },
+            diagnostics: Vim9WorkbenchDiagnostics {
+                error: 1,
+                warning: 2,
+                ..Default::default()
+            },
+            remote: Vim9WorkbenchRemote {
+                connected: true,
+                label: "dev".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            state.status_text(),
+            "Simple · main ↑2 · +0 ~1 -0 · E1 W2 · remote: dev"
+        );
+    }
+}

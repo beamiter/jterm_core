@@ -34,7 +34,7 @@ VIM = os.environ.get("VIM9_TEST_VIM") or shutil.which("vim")
 class Editor:
     def __init__(self, root: Path, *, authenticate: bool = True, plugin: bool = False,
                  failing_rg: bool = False, rg_script: str | None = None,
-                 extra_env: dict[str, str] | None = None):
+                 extra_env: dict[str, str] | None = None, vimrc_extra: str = ""):
         self.root = root
         self.file = root / "main.txt"
         self.file.write_text("original line\nsecond line\n", encoding="utf-8")
@@ -55,7 +55,7 @@ class Editor:
                 "command! -nargs=? LspRename call writefile([<q-args>], 'rename.marker')\n"
                 "command! LspFormat call setline(1, 'formatted by provider')\n"
             )
-        vimrc.write_text(vimrc_text, encoding="utf-8")
+        vimrc.write_text(vimrc_text + vimrc_extra, encoding="utf-8")
         self.token = os.urandom(24).hex()
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.bind(("127.0.0.1", 0))

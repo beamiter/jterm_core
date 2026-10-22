@@ -22,9 +22,12 @@ if empty(address) || empty(authToken)
   finish
 endif
 g:jterm_vim9_bridge_loaded = true
+g:jterm_vim9_connected = false
+g:jterm_vim9_render_protocol = 0
 
 var bridge: channel
 var authenticated = false
+var workbenchConnected = false
 var shuttingDown = false
 var sending = false
 var sequence = 0
@@ -198,6 +201,111 @@ def Reply(id: number, ok: bool, error: string = '')
   Send({event: 'response', id: id, ok: ok, error: strcharpart(error, 0, 2048)})
 enddef
 
+# This is an adapter for the user's already-loaded vimrc, not an Ex/RPC
+# extension point. Both directions have a closed vocabulary and bounded data.
+const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
+  'simple_outline', 'simple_rename', 'simple_code_action', 'simple_git_status',
+  'simple_git_diff', 'simple_git_hunk', 'simple_markdown_preview', 'simple_keys',
+  'simple_workbench']
+const WORKBENCH_SEMANTICS = ['definition', 'hover', 'references', 'format']
+
+def WorkbenchCapabilities(): list<string>
+  var result: list<string> = []
+  if !exists('*g:VimrcWorkbenchCapabilities') || !exists('*g:VimrcWorkbenchAction')
+    return result
+  endif
+  try
+    var provided: any = call('g:VimrcWorkbenchCapabilities', [])
+    if type(provided) != v:t_list
+      return result
+    endif
+    for action in provided[: 63]
+      if type(action) == v:t_string
+          && (index(WORKBENCH_ACTIONS, action) >= 0 || index(WORKBENCH_SEMANTICS, action) >= 0)
+          && index(result, action) < 0
+        add(result, action)
+      endif
+    endfor
+  catch
+    # Optional user hooks may be reloading or their plugins may be absent.
+  endtry
+  return result
+enddef
+
+def WorkbenchText(value: dict<any>, field: string, limit: number): string
+  var item: any = get(value, field, '')
+  return type(item) == v:t_string
+    ? substitute(strcharpart(item, 0, limit), '[[:cntrl:]]', '', 'g') : ''
+enddef
+
+def WorkbenchCount(value: dict<any>, field: string): number
+  var item: any = get(value, field, 0)
+  return type(item) == v:t_number ? min([1000000, max([0, item])]) : 0
+enddef
+
+def WorkbenchBool(value: dict<any>, field: string): bool
+  var item: any = get(value, field, false)
+  return type(item) == v:t_bool ? item : false
+enddef
+
+def WorkbenchDict(value: dict<any>, field: string): dict<any>
+  var item: any = get(value, field, {})
+  return type(item) == v:t_dict ? item : {}
+enddef
+
+def WorkbenchState(): dict<any>
+  if !exists('*g:VimrcWorkbenchState')
+    return {}
+  endif
+  try
+    var source = [bufnr(), win_getid(), b:changedtick]
+    var provided: any = call('g:VimrcWorkbenchState', [])
+    if type(provided) != v:t_dict || empty(provided)
+        || source != [bufnr(), win_getid(), b:changedtick]
+      return {}
+    endif
+    var git = WorkbenchDict(provided, 'git')
+    var diagnostics = WorkbenchDict(provided, 'diagnostics')
+    var remote = WorkbenchDict(provided, 'remote')
+    # Never serialize the returned dictionary itself. A provider could carry
+    # unrelated secrets, functions, channels or cyclic plugin state.
+    return {buffer: bufnr(), window: win_getid(), changedtick: b:changedtick,
+      provider: WorkbenchText(provided, 'provider', 64),
+      root: WorkbenchText(provided, 'root', 4096),
+      native: WorkbenchBool(provided, 'native'),
+      large_file: WorkbenchBool(provided, 'large_file'),
+      git: {head: WorkbenchText(git, 'head', 128),
+        ahead: WorkbenchCount(git, 'ahead'), behind: WorkbenchCount(git, 'behind'),
+        added: WorkbenchCount(git, 'added'), changed: WorkbenchCount(git, 'changed'),
+        removed: WorkbenchCount(git, 'removed')},
+      diagnostics: {error: WorkbenchCount(diagnostics, 'error'),
+        warning: WorkbenchCount(diagnostics, 'warning'), info: WorkbenchCount(diagnostics, 'info'),
+        hint: WorkbenchCount(diagnostics, 'hint')},
+      remote: {connected: WorkbenchBool(remote, 'connected'),
+        label: WorkbenchText(remote, 'label', 256), root: WorkbenchText(remote, 'root', 4096)}}
+  catch
+    return {}
+  endtry
+enddef
+
+def WorkbenchLifecycle(connected: bool)
+  if workbenchConnected == connected
+    return
+  endif
+  workbenchConnected = connected
+  g:jterm_vim9_connected = connected
+  g:jterm_vim9_render_protocol = connected ? renderProtocol : 0
+  try
+    if connected
+      doautocmd <nomodeline> User JTermVim9Ready
+    else
+      doautocmd <nomodeline> User JTermVim9Disconnected
+    endif
+  catch
+    # A user autocommand must not break authenticated channel processing.
+  endtry
+enddef
+
 def Capabilities(): list<string>
   var result = ['open', 'save', 'save_all', 'buffer', 'build', 'cancel_build',
     'goto', 'close_buffer', 'close_current_buffer', 'next_buffer', 'previous_buffer', 'split', 'save_and_build',
@@ -216,7 +324,7 @@ def Capabilities(): list<string>
       add(result, action)
     endif
   endfor
-  return result
+  return uniq(sort(result + WorkbenchCapabilities()))
 enddef
 
 # Native buffer rendering uses Vim's buffer bytes, syntax engine and GUI
@@ -1917,6 +2025,7 @@ def State(): dict<any>
     endif
   endif
   var state: dict<any> = {event: 'state', mode: mode(1), file: expand('%:p'),
+    buffer: bufnr(), window: win_getid(),
     root: projectRoot, cwd: getcwd(), line: line('.'), column: col('.'),
     line_count: line('$'), window_count: winnr('$'), waiting_for_input: !empty(deferredSave),
     modified: &modified, changedtick: b:changedtick, filetype: &filetype,
@@ -1930,6 +2039,7 @@ def State(): dict<any>
     quickfix: {source: source, title: strcharpart(get(quickfix, 'title', ''), 0, 2048),
       index: get(quickfix, 'idx', 0), count: get(quickfix, 'size', 0)},
     capabilities: Capabilities(),
+    workbench: WorkbenchState(),
     build: {running: buildRunning, command: buildCommand, exit_code: buildExit,
       cancelled: buildCancelled, output: copy(buildTail),
       truncated: len(buildLines) + buildDropped - len(buildTail)},
@@ -2411,6 +2521,10 @@ def StartSearch(request: dict<any>)
 enddef
 
 def LspAction(action: string, request: dict<any>)
+  if index(WorkbenchCapabilities(), action) >= 0
+    call('g:VimrcWorkbenchAction', [action])
+    return
+  endif
   var commands = {definition: 'LspGotoDefinition', hover: 'LspHover',
     references: 'LspShowReferences', rename: 'LspRename', format: 'LspFormat'}
   var command: string = get(commands, action, '')
@@ -2434,6 +2548,28 @@ def LspAction(action: string, request: dict<any>)
   else
     execute command
   endif
+enddef
+
+def RunWorkbench(request: dict<any>)
+  var command = RequiredString(request, 'command', 64)
+  if index(WORKBENCH_ACTIONS, command) < 0
+    throw 'Unsupported workbench action: ' .. command
+  endif
+  var window = PositiveNumber(request, 'window')
+  var buffer = PositiveNumber(request, 'buffer')
+  var tick: any = get(request, 'changedtick', -1)
+  if type(tick) != v:t_number || tick < 0
+    throw 'Workbench actions require a valid source changedtick'
+  endif
+  if window != win_getid() || buffer != bufnr() || tick != b:changedtick
+    throw 'The workbench source changed; reopen the command palette'
+  endif
+  # Recheck after preceding queued requests and all mode/source checks. An
+  # action removed by reload must never execute through stale picker metadata.
+  if index(WorkbenchCapabilities(), command) < 0
+    throw 'This workbench action is unavailable for the current buffer'
+  endif
+  call('g:VimrcWorkbenchAction', [command])
 enddef
 
 def ScrollWindow(request: dict<any>)
@@ -2626,6 +2762,8 @@ def Dispatch(request: dict<any>, id: number)
       cnext
     elseif action ==# 'previous_diagnostic'
       cprevious
+    elseif action ==# 'workbench'
+      RunWorkbench(request)
     elseif index(['definition', 'hover', 'references', 'rename', 'format'], action) >= 0
       LspAction(action, request)
     elseif action ==# 'quit'
@@ -2671,6 +2809,7 @@ def Receive(_: channel, message: string)
       renderProtocol = requestedRender
       authenticated = true
       authToken = ''
+      WorkbenchLifecycle(true)
       pollTimer = timer_start(750, Poll, {repeat: -1})
       EmitState(true)
       return
@@ -2685,7 +2824,11 @@ def Receive(_: channel, message: string)
 enddef
 
 def Disconnected(_: channel)
+  var wasConnected = authenticated
   authenticated = false
+  if wasConnected
+    WorkbenchLifecycle(false)
+  endif
   ClearDeferredSave()
   if flushTimer >= 0
     timer_stop(flushTimer)
@@ -2702,6 +2845,9 @@ def Disconnected(_: channel)
 enddef
 
 def Leaving()
+  if authenticated
+    WorkbenchLifecycle(false)
+  endif
   ClearDeferredSave()
   if pendingQuit > 0
     Reply(pendingQuit, true)
@@ -2733,6 +2879,7 @@ augroup JTermVim9Bridge
   autocmd CompleteChanged,CompleteDone * RenderChanged()
   autocmd QuickFixCmdPost * Changed()
   autocmd User LspDiagsUpdated,LspAttached,LspDetached LspDiagnosticsChanged()
+  autocmd User SimpleGitUpdate,SimpleRemoteConnected,SimpleRemoteDisconnected,SimpleRemoteWorkspaceChanged,VimrcWorkbenchChanged Changed()
   autocmd VimLeavePre * Leaving()
 augroup END
 

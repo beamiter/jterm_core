@@ -4,7 +4,7 @@
 
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 
-use super::{Vim9Command, Vim9Snapshot};
+use super::{Vim9Command, Vim9Snapshot, Vim9WorkbenchAction};
 
 /// `>` selects command mode. Prefix a literal filename with `./` when its
 /// basename starts with `>`; the file picker then retains its ordinary policy.
@@ -30,9 +30,10 @@ pub enum Vim9PaletteCommand {
     Format,
     CancelBuild,
     CancelSearch,
+    Workbench(Vim9WorkbenchAction),
 }
 
-const COMMANDS: [Vim9PaletteCommand; 16] = {
+const COMMANDS: [Vim9PaletteCommand; 28] = {
     use Vim9PaletteCommand::*;
     [
         Save,
@@ -51,6 +52,18 @@ const COMMANDS: [Vim9PaletteCommand; 16] = {
         Format,
         CancelBuild,
         CancelSearch,
+        Workbench(Vim9WorkbenchAction::SimpleFiles),
+        Workbench(Vim9WorkbenchAction::SimpleBuffers),
+        Workbench(Vim9WorkbenchAction::SimpleGrep),
+        Workbench(Vim9WorkbenchAction::SimpleOutline),
+        Workbench(Vim9WorkbenchAction::SimpleRename),
+        Workbench(Vim9WorkbenchAction::SimpleCodeAction),
+        Workbench(Vim9WorkbenchAction::SimpleGitStatus),
+        Workbench(Vim9WorkbenchAction::SimpleGitDiff),
+        Workbench(Vim9WorkbenchAction::SimpleGitHunk),
+        Workbench(Vim9WorkbenchAction::SimpleMarkdownPreview),
+        Workbench(Vim9WorkbenchAction::SimpleKeys),
+        Workbench(Vim9WorkbenchAction::SimpleWorkbench),
     ]
 };
 
@@ -73,6 +86,7 @@ impl Vim9PaletteCommand {
             Self::Format => "Format current buffer",
             Self::CancelBuild => "Stop running build",
             Self::CancelSearch => "Stop project search",
+            Self::Workbench(command) => command.title(),
         }
     }
 
@@ -108,6 +122,7 @@ impl Vim9PaletteCommand {
             Self::Format => &["format", "格式化"],
             Self::CancelBuild => &["cancel build", "停止构建"],
             Self::CancelSearch => &["cancel search", "停止搜索"],
+            Self::Workbench(command) => command.aliases(),
         }
     }
 
@@ -153,6 +168,17 @@ impl Vim9PaletteCommand {
                     .any(|value| value == capability))
                 .then_some("The current buffer's language service does not provide this action")
             }
+            Self::Workbench(command) => {
+                if snapshot.buffer <= 0 || snapshot.window <= 0 {
+                    Some("Waiting for the current Vim source identity")
+                } else {
+                    (!snapshot
+                        .capabilities
+                        .iter()
+                        .any(|value| value == command.capability()))
+                    .then_some("This Simple action is unavailable for the current buffer")
+                }
+            }
             _ => None,
         }
     }
@@ -178,6 +204,12 @@ impl Vim9PaletteCommand {
             Self::Format => Vim9Command::Format,
             Self::CancelBuild => Vim9Command::CancelBuild,
             Self::CancelSearch => Vim9Command::CancelSearch,
+            Self::Workbench(command) => Vim9Command::Workbench {
+                command,
+                window: snapshot.window,
+                buffer: snapshot.buffer,
+                changedtick: snapshot.changedtick,
+            },
         })
     }
 }
@@ -278,6 +310,39 @@ mod tests {
         for command in COMMANDS {
             assert!(command.command(&snapshot).is_err());
         }
+    }
+
+    #[test]
+    fn workbench_palette_uses_finite_capabilities_and_captures_source() {
+        let mut snapshot = connected();
+        snapshot.buffer = 4;
+        snapshot.window = 1001;
+        snapshot.changedtick = 9;
+        let action = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleFiles);
+        assert!(action.command(&snapshot).is_err());
+        snapshot.capabilities.push("simple_files".into());
+        let command = action.command(&snapshot).unwrap();
+        let frame = serde_json::to_value(command).unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "action": "workbench", "command": "simple_files", "window": 1001,
+                "buffer": 4, "changedtick": 9
+            })
+        );
+        snapshot.capabilities.clear();
+        assert!(action.command(&snapshot).is_err());
+        let simple = vim9_palette_matches("simple", 256);
+        assert_eq!(simple.len(), Vim9WorkbenchAction::ALL.len());
+        assert!(simple
+            .iter()
+            .all(|value| matches!(value, Vim9PaletteCommand::Workbench(_))));
+        assert_eq!(
+            vim9_palette_matches("simplewhichkey", 1),
+            [Vim9PaletteCommand::Workbench(
+                Vim9WorkbenchAction::SimpleKeys
+            )]
+        );
     }
 
     #[test]
