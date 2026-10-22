@@ -392,6 +392,20 @@ name. Plugin popup and diff workflows can temporarily use the live Vim
 compatibility view. Native painting resumes when the current display is
 supported again.
 
+SimpleCC's cached current-buffer diagnostics also populate the native Problems
+rows without first opening a Vim location list. Their columns are converted
+from UTF-16 to Vim's UTF-8 byte positions, including Chinese text and emoji.
+Diagnostic publication and clearing trigger a bridge refresh; selecting a
+different buffer selects that buffer's cache. The command palette offers
+`Simple: Show buffer diagnostics`, `Simple: Go to next buffer diagnostic` and
+`Simple: Go to previous buffer diagnostic` (search `>simple diagnostic`). These
+actions use SimpleCC's own list, filtering and navigation semantics.
+
+Blocking workbench plugins such as SimpleWhichKey get the live Vim surface
+before their input loop begins. The native overlay returns after the hook
+finishes or fails. Real-plugin regression tests cover key hints, rename
+accept/cancel, code-action cancel and subsequent typing in the original buffer.
+
 ## Closing and lifetime
 
 Native editor close requests ask Vim to quit without `!`. Unsaved changes can
@@ -462,6 +476,19 @@ executable and runtime environment variables.
 The frontend workbenches additionally require native window/keyboard checks
 on the desktop where they will be used; core tests alone do not verify GPU,
 Wayland, font shaping, IME or a particular user's plugin configuration.
+
+The Simple diagnostics/input follow-up was validated with 76 related real-Vim
+tests (bridge, workbench, actual vimrc/Simple plugins, row deltas and split
+windows), 110 shared Rust Vim9 tests, SimpleCC's 15 Vim suites and Vimrc's
+workbench regression. The cross-repository tests use isolated homes and a
+deterministic daemon fixture, including direct cache reads, Unicode navigation,
+publication/clearing and real plugin prompts. Rust formatting and all-target
+Clippy passed. Local-family `check --all-targets` passed for Ember and Frost.
+Forge and Anvil reached a local SDK limitation: system GTK/GLib are too old,
+and the available newer SDK lacks `sysprof-capture-4` pkg-config metadata.
+Their builds and desktop acceptance remain unverified for this follow-up.
+These are source changes; released dependency pins and installed binaries are
+not updated by the local-family validation runner.
 
 Official references:
 

@@ -33,7 +33,7 @@ pub enum Vim9PaletteCommand {
     Workbench(Vim9WorkbenchAction),
 }
 
-const COMMANDS: [Vim9PaletteCommand; 28] = {
+const COMMANDS: [Vim9PaletteCommand; 31] = {
     use Vim9PaletteCommand::*;
     [
         Save,
@@ -58,6 +58,9 @@ const COMMANDS: [Vim9PaletteCommand; 28] = {
         Workbench(Vim9WorkbenchAction::SimpleOutline),
         Workbench(Vim9WorkbenchAction::SimpleRename),
         Workbench(Vim9WorkbenchAction::SimpleCodeAction),
+        Workbench(Vim9WorkbenchAction::SimpleDiagnostics),
+        Workbench(Vim9WorkbenchAction::SimpleNextDiagnostic),
+        Workbench(Vim9WorkbenchAction::SimplePreviousDiagnostic),
         Workbench(Vim9WorkbenchAction::SimpleGitStatus),
         Workbench(Vim9WorkbenchAction::SimpleGitDiff),
         Workbench(Vim9WorkbenchAction::SimpleGitHunk),
@@ -371,6 +374,38 @@ mod tests {
         snapshot.mode = "i".into();
         snapshot.waiting_for_input = false;
         assert!(Vim9PaletteCommand::Save.command(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn simple_diagnostic_actions_keep_plugin_navigation_separate_from_quickfix() {
+        let mut snapshot = connected();
+        snapshot.buffer = 4;
+        snapshot.window = 1001;
+        snapshot.changedtick = 9;
+        for action in [
+            Vim9WorkbenchAction::SimpleDiagnostics,
+            Vim9WorkbenchAction::SimpleNextDiagnostic,
+            Vim9WorkbenchAction::SimplePreviousDiagnostic,
+        ] {
+            let command = Vim9PaletteCommand::Workbench(action);
+            assert!(command.command(&snapshot).is_err());
+            snapshot.capabilities.push(action.capability().into());
+            let request = serde_json::to_value(command.command(&snapshot).unwrap()).unwrap();
+            assert_eq!(request["command"], action.capability());
+            assert_eq!(request["window"], 1001);
+            assert_eq!(request["buffer"], 4);
+            assert_eq!(request["changedtick"], 9);
+            assert!(vim9_palette_matches("simplecc diagnostic", 256).contains(&command));
+        }
+        assert!(Vim9PaletteCommand::NextDiagnostic
+            .command(&snapshot)
+            .is_err());
+        snapshot.waiting_for_input = true;
+        assert!(
+            Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleNextDiagnostic)
+                .command(&snapshot)
+                .is_err()
+        );
     }
 
     #[test]

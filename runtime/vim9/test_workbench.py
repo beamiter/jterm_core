@@ -25,6 +25,9 @@ endfunction
 function! VimrcWorkbenchState() abort
   return get(g:, 'workbench_state', {'provider': 'simple', 'native': get(g:, 'jterm_vim9_connected', v:false)})
 endfunction
+function! VimrcWorkbenchDiagnostics() abort
+  return get(g:, 'workbench_diagnostics', {})
+endfunction
 autocmd User JTermVim9Ready call writefile([string(g:jterm_vim9_connected), string(g:jterm_vim9_render_protocol), string(exists('$JTERM_VIM9_TOKEN'))], 'workbench-ready.marker')
 autocmd User JTermVim9Disconnected call writefile([string(g:jterm_vim9_connected), string(g:jterm_vim9_render_protocol)], 'workbench-disconnected.marker', 'a')
 """
@@ -151,10 +154,83 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_action_failure_is_reported_without_losing_bridge(self):
         e = self.editor()
+        self.assertTrue(e.gui_frame()['supported'])
         e.ex("function! VimrcWorkbenchAction(action) abort\nthrow 'plugin not ready'\nendfunction")
         result = e.request("workbench", command="simple_files", ok=False, **self.source(e.snapshot()))
         self.assertIn("plugin not ready", result["error"])
         self.assertIsInstance(e.snapshot()["buffers"], list)
+        self.assertTrue(e.gui_frame()['supported'], 'failed hooks must restore native painting')
+
+    def test_diagnostic_hook_projects_current_source_and_preserves_user_lists(self):
+        e = self.editor()
+        e.ex("call setqflist([{'filename': expand('%:p'), 'lnum': 2, 'col': 3, 'text': 'shared', 'type': 'W'}])")
+        e.ex("let g:workbench_diagnostics = {'items': [{'line': 2, 'column': 3, 'text': 'shared', 'kind': 'warning'}, {'line': 1, 'column': 4, 'text': 'cached problem', 'kind': 'hint', 'filename': '/unrelated/private-file', 'Callback': function('tr')}], 'total': 2}")
+        e.ex("let g:workbench_diagnostics.items[1].cycle = g:workbench_diagnostics")
+        state = e.snapshot()
+        self.assertEqual(len(state['diagnostics']), 2, 'quickfix/provider duplicates merge')
+        row = next(row for row in state['diagnostics'] if row['text'] == 'cached problem')
+        self.assertEqual(row, {'filename': str(e.file), 'line': 1, 'column': 4,
+                               'text': 'cached problem', 'kind': 'hint', 'column_kind': 'byte'})
+        self.assertEqual(state['quickfix']['count'], 1)
+        self.assertFalse(state['diagnostics_truncated'])
+        self.assertNotIn('private-file', json.dumps(state))
+        # Changes to cached rows (including provider removal/reload) are visible
+        # without a buffer edit or an explicit location-list publication.
+        tick = state['changedtick']
+        e.ex("let g:workbench_diagnostics = {}")
+        cleared = e.snapshot()
+        self.assertEqual(cleared['changedtick'], tick)
+        self.assertEqual([row['text'] for row in cleared['diagnostics']], ['shared'])
+
+    def test_diagnostic_hook_is_bounded_and_reports_provider_omissions(self):
+        e = self.editor()
+        e.ex("let g:workbench_diagnostics = {'items': map(range(300), {_, n -> {'line': n + 1, 'column': 1, 'text': 'cached', 'kind': 'error'}}), 'total': 350}")
+        state = e.snapshot()
+        self.assertEqual(len(state['diagnostics']), 256)
+        self.assertTrue(state['diagnostics_truncated'])
+        self.assertEqual(state['diagnostics_omitted'], 94)
+        e.ex("let g:workbench_diagnostics.total = 99999999")
+        self.assertEqual(e.snapshot()['diagnostics_omitted'], 1_000_000 - 256)
+        e.ex("let g:workbench_diagnostics = {'items': [{'line': 1, 'column': 1, 'text': repeat('中', 3000), 'kind': 'error'}]}")
+        self.assertEqual(len(e.snapshot()['diagnostics'][0]['text']), 2048)
+
+    def test_invalid_or_throwing_diagnostic_hooks_expire_rows_without_breaking_vim(self):
+        e = self.editor()
+        e.ex("let g:workbench_diagnostics = {'items': [{'line': 1, 'column': 1, 'text': 'first', 'kind': 'error'}]}")
+        self.assertEqual(len(e.snapshot()['diagnostics']), 1)
+        for value in ["[]", "{'items': 3}",
+                      "{'items': [v:null, [], {'line': v:true, 'column': 1, 'text': 'bad', 'kind': 'error'}, {'line': 1, 'column': 0, 'text': 'bad', 'kind': 'hint'}, {'line': 1, 'column': 1, 'text': {}, 'kind': 'info'}, {'line': 1, 'column': 1, 'text': 'bad', 'kind': 'unknown'}]}"]:
+            e.ex('let g:workbench_diagnostics = ' + value)
+            state = e.snapshot()
+            self.assertEqual(state['diagnostics'], [])
+            self.assertEqual(state['diagnostics_omitted'], 0)
+        e.ex("function! VimrcWorkbenchDiagnostics() abort\nthrow 'provider reloading'\nendfunction")
+        self.assertEqual(e.snapshot()['diagnostics'], [])
+        e.ex('delfunction VimrcWorkbenchDiagnostics')
+        self.assertEqual(e.snapshot()['diagnostics'], [])
+        e.keys('Q')
+        e.request('save')
+        self.assertEqual(e.file.read_text().splitlines()[0], 'from-user-vimrc')
+
+    def test_blocking_provider_retires_native_overlay_before_waiting_for_keys(self):
+        e = self.editor()
+        e.ex("function! VimrcWorkbenchAction(action) abort\nlet g:provider_key = getcharstr()\nendfunction")
+        self.assertTrue(e.gui_frame()['supported'])
+        source = self.source(e.snapshot())
+        request_id = e.next_id
+        e.next_id += 1
+        e.send({'id': request_id, 'action': 'workbench', 'command': 'simple_files', **source})
+        frame = e.wait(lambda m: m.get('event') == 'render' and not m.get('supported', False))
+        self.assertIn('workbench', frame['fallback_reason'])
+        refused = e.request('open', path=str(e.other), ok=False)
+        self.assertIn('waiting for input', refused['error'])
+        e.request('save', ok=False)
+        e.keys(b'x')
+        self.assertTrue(e.wait(lambda m: m.get('event') == 'response' and m.get('id') == request_id)['ok'])
+        restored = e.wait(lambda m: m.get('event') == 'render' and m.get('supported')
+                          and m['revision'] > frame['revision'])
+        self.assertEqual(restored['buffer'], source['buffer'])
+        self.assertEqual(e.snapshot()['changedtick'], source['changedtick'])
 
     def test_exit_notifies_once_even_if_user_lifecycle_hook_throws(self):
         e = self.editor()

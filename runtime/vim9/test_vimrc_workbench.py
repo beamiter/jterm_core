@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from test_bridge import Editor, VIM
@@ -47,7 +48,7 @@ class VimrcWorkbenchTests(unittest.TestCase):
             editor.close()
         self.directory.cleanup()
 
-    def editor(self, *, authenticate=True, start_cc=False):
+    def editor(self, *, authenticate=True, start_cc=False, interaction_fixture=False):
         # Disable all automatic installation/update/network activity. Only the
         # three checked-out plugin runtimes enter runtimepath. Existing user
         # configuration and caches are isolated by the child process's HOME.
@@ -79,6 +80,38 @@ class VimrcWorkbenchTests(unittest.TestCase):
         if start_cc:
             fixture = self.root / "simplecc-fixture"
             fixture.write_bytes((PLUGIN_ROOT / "simplecc/test/fake_daemon.sh").read_bytes())
+            if interaction_fixture:
+                # Only the daemon wire replies are synthetic. Prepare/prompt,
+                # PTY input and applying the edit use the real SimpleCC runtime.
+                fixture.write_text("""#!/usr/bin/env python3
+import json
+from pathlib import Path
+import sys
+log = Path(__file__).with_suffix('.requests')
+for line in sys.stdin:
+    request = json.loads(line)
+    with log.open('a') as output:
+        output.write(json.dumps(request) + '\\n')
+    kind = request['type']
+    reply = {'id': request.get('id', 0)}
+    if kind == 'initialize':
+        reply.update(type='initialized')
+    elif kind == 'textDocument/prepareRename':
+        reply.update(type='prepareRename', result={'placeholder': 'original'})
+    elif kind == 'textDocument/rename':
+        reply.update(type='rename', edit={'changes': [{
+            'uri': request['uri'], 'edits': [{
+                'line': 0, 'character': 0, 'end_line': 0,
+                'end_character': 8, 'new_text': request['newName']}]}]})
+    elif kind == 'textDocument/codeAction':
+        reply.update(type='codeAction', actions=[{
+            'title': 'Fixture code action', 'kind': 'quickfix', 'index': 0}])
+    elif kind == 'shutdown':
+        break
+    else:
+        continue
+    print(json.dumps(reply), flush=True)
+""", encoding="utf-8")
             fixture.chmod(0o700)
             setup.extend([
                 "let g:simplecc_daemon_path = " + vim_string(fixture),
@@ -109,6 +142,12 @@ class VimrcWorkbenchTests(unittest.TestCase):
         return e.request("workbench", command=command, ok=ok, **{
             name: source[name] for name in ("window", "buffer", "changedtick")
         })
+
+    def assert_pty_text(self, e: Editor, text: bytes):
+        deadline = time.monotonic() + 3
+        while text not in e.screen and time.monotonic() < deadline:
+            e.pump(0.05)
+        self.assertIn(text, e.screen, 'Real plugin interaction must reach the PTY')
 
     def test_real_configuration_handshake_and_native_report(self):
         e = self.editor(authenticate=False)
@@ -148,6 +187,103 @@ class VimrcWorkbenchTests(unittest.TestCase):
         e.request("definition")
         e.state_where(lambda s: s.get("line") == 2)
         self.assertEqual(self.capture(e, "line('.')"), 2)
+
+    def test_simplecc_rename_prompt_cancel_accept_and_native_recovery(self):
+        e = self.editor(start_cc=True, interaction_fixture=True)
+        self.assertIn('simple_rename', e.snapshot()['capabilities'])
+        original = e.snapshot()
+        self.assertTrue(e.gui_frame()['supported'])
+
+        def prompt():
+            source = e.snapshot()
+            e.screen.clear()
+            request_id = e.next_id
+            e.next_id += 1
+            e.send({'id': request_id, 'action': 'workbench', 'command': 'simple_rename',
+                    **{name: source[name] for name in ('window', 'buffer', 'changedtick')}})
+            e.state_where(lambda s: s.get('mode', '').startswith('c'))
+            frame = e.wait(lambda m: m.get('event') == 'render' and not m.get('supported', False)
+                           and 'command' in m.get('fallback_reason', ''))
+            self.assertIn('command', frame['fallback_reason'])
+            self.assert_pty_text(e, b'Rename to: ')
+            return request_id
+
+        cancelled = prompt()
+        e.keys(b'\x1b')
+        e.state_where(lambda s: s.get('mode') == 'n')
+        self.assertTrue(e.wait(lambda m: m.get('event') == 'response' and m.get('id') == cancelled)['ok'])
+        self.assertTrue(e.gui_frame()['supported'])
+        self.assertEqual(self.capture(e, "getline(1, '$')"), ['original line', 'second line'])
+        self.assertEqual(e.snapshot()['buffer'], original['buffer'])
+
+        accepted = prompt()
+        e.keys(b'\x15renamed\r')
+        e.state_where(lambda s: s.get('mode') == 'n' and s.get('modified'))
+        self.assertTrue(e.wait(lambda m: m.get('event') == 'response' and m.get('id') == accepted)['ok'])
+        self.assertTrue(e.gui_frame()['supported'])
+        self.assertEqual(self.capture(e, "getline(1, '$')"), ['renamed line', 'second line'])
+        self.assertEqual(e.snapshot()['buffer'], original['buffer'])
+        requests = [json.loads(line) for line in (self.root / 'simplecc-fixture.requests').read_text().splitlines()]
+        renames = [r for r in requests if r['type'] == 'textDocument/rename']
+        self.assertEqual([r['newName'] for r in renames], ['renamed'])
+        # A following ordinary PTY edit must reach the original Vim buffer.
+        e.keys(b'A!\x1b')
+        e.state_where(lambda s: s.get('mode') == 'n' and s.get('changedtick', 0) > original['changedtick'])
+        self.assertEqual(self.capture(e, 'getline(1)'), 'renamed line!')
+
+    def test_simplecc_code_action_popup_cancel_restores_native_buffer_and_input(self):
+        e = self.editor(start_cc=True, interaction_fixture=True)
+        original = e.snapshot()
+        self.assertTrue(e.gui_frame()['supported'])
+        e.screen.clear()
+        request_id = e.next_id
+        e.next_id += 1
+        e.send({'id': request_id, 'action': 'workbench', 'command': 'simple_code_action',
+                **{name: original[name] for name in ('window', 'buffer', 'changedtick')}})
+        frame = e.wait(lambda m: m.get('event') == 'render' and not m.get('supported', False)
+                       and 'popup' in m.get('fallback_reason', ''))
+        self.assertIn('popup', frame['fallback_reason'])
+        self.assert_pty_text(e, b'Code Actions')
+        e.keys(b'\x1b')
+        self.assertTrue(e.wait(lambda m: m.get('event') == 'response' and m.get('id') == request_id)['ok'])
+        e.wait(lambda m: m.get('event') == 'render' and m.get('supported', False)
+               and m.get('revision', 0) > frame['revision'])
+        self.assertTrue(e.gui_frame()['supported'])
+        self.assertEqual(e.snapshot()['buffer'], original['buffer'])
+        self.assertEqual(self.capture(e, "getline(1, '$')"), ['original line', 'second line'])
+        requests = [json.loads(line) for line in (self.root / 'simplecc-fixture.requests').read_text().splitlines()]
+        self.assertEqual(sum(r['type'] == 'textDocument/codeAction' for r in requests), 1)
+        self.assertFalse(any(r['type'] == 'textDocument/executeAction' for r in requests))
+        e.keys(b'A!\x1b')
+        e.state_where(lambda s: s.get('mode') == 'n' and s.get('changedtick', 0) > original['changedtick'])
+        self.assertEqual(self.capture(e, 'getline(1)'), 'original line!')
+
+    def test_simplewhichkey_blocking_popup_restores_native_buffer_and_input(self):
+        e = self.editor()
+        e.ex('let g:simplewhichkey_delay = 0')
+        original = e.snapshot()
+        self.assertTrue(e.gui_frame()['supported'])
+        e.screen.clear()
+        request_id = e.next_id
+        e.next_id += 1
+        e.send({'id': request_id, 'action': 'workbench', 'command': 'simple_keys',
+                **{name: original[name] for name in ('window', 'buffer', 'changedtick')}})
+        # getcharstr() blocks inside this real plugin action. The bridge must
+        # retire native paint before invoking it, rather than wait for a timer.
+        frame = e.wait(lambda m: m.get('event') == 'render' and not m.get('supported', False))
+        self.assertTrue(any(word in frame['fallback_reason'].lower()
+                            for word in ('popup', 'plugin', 'workbench')), frame)
+        self.assert_pty_text(e, b'<Space>')
+        e.keys(b'\x1b')
+        self.assertTrue(e.wait(lambda m: m.get('event') == 'response' and m.get('id') == request_id)['ok'])
+        e.wait(lambda m: m.get('event') == 'render' and m.get('supported', False)
+               and m.get('revision', 0) > frame['revision'])
+        self.assertTrue(e.gui_frame()['supported'])
+        self.assertEqual(e.snapshot()['buffer'], original['buffer'])
+        self.assertEqual(self.capture(e, "getline(1, '$')"), ['original line', 'second line'])
+        e.keys(b'A!\x1b')
+        e.state_where(lambda s: s.get('mode') == 'n' and s.get('changedtick', 0) > original['changedtick'])
+        self.assertEqual(self.capture(e, 'getline(1)'), 'original line!')
 
     def test_context_cache_never_crosses_buffer_boundary(self):
         e = self.editor()

@@ -291,7 +291,8 @@ Funcrefs, channels, cyclic objects or private plugin state.
 Diagnostics contain `filename`, `line`, byte `column`, `text` and `kind`
 (`error`, `warning`, `info`, `hint`). Sources include Vim's quickfix list, the
 current window's location list, and current-buffer diagnostics exposed by the
-supported Vim9 LSP plugin. Duplicate entries are removed. LSP's default UTF-16
+supported Vim9 LSP plugin or optional workbench diagnostic hook. Duplicate
+entries are removed. LSP's default UTF-16
 columns are converted to Vim byte positions. For a visual-column quickfix item
 in a displayed buffer, Vim's `virtcol2col()` performs the conversion. If that
 buffer has no rendering window, navigation falls back to the correct line's
@@ -379,10 +380,11 @@ sources arbitrary project-local files:
 def g:VimrcWorkbenchCapabilities(): list<string>
 def g:VimrcWorkbenchAction(action: string)
 def g:VimrcWorkbenchState(): dict<any>
+def g:VimrcWorkbenchDiagnostics(): dict<any>
 ```
 
 The first hook returns available actions for the **current** buffer. The bridge
-accepts only `definition`, `hover`, `references`, `format` and the twelve
+accepts only `definition`, `hover`, `references`, `format` and the fifteen
 `simple_*` actions below, deduplicating at most 64 entries. Existing typed
 semantic commands prefer a declared workbench provider, then retain their
 built-in LSP/tags fallback. SimpleCC's rename uses its own prepare-rename and
@@ -397,6 +399,9 @@ does not claim to consume the existing `rename` request's `name` argument.
 | `simple_outline` | SimpleCC symbol outline |
 | `simple_rename` | SimpleCC rename with its Vim prompt |
 | `simple_code_action` | SimpleCC code-action chooser |
+| `simple_diagnostics` | SimpleCC current-buffer location list |
+| `simple_next_diagnostic` | SimpleCC next visible diagnostic, including its severity filter and wrap behavior |
+| `simple_previous_diagnostic` | SimpleCC previous visible diagnostic |
 | `simple_git_status` | SimpleGit status |
 | `simple_git_diff` | SimpleGit diff |
 | `simple_git_hunk` | SimpleGit hunk preview |
@@ -419,6 +424,11 @@ the fixed vocabulary and freshly sampled capabilities before invoking the
 hook. It refuses a stale request instead of applying it to another source.
 Plugin prompts, popup windows, diff views and other unsupported displays still
 use the live compatibility renderer, returning to native paint when supported.
+Before invoking a workbench hook, the bridge flushes a compatibility frame.
+This makes blocking plugin input loops such as SimpleWhichKey's `getcharstr()`
+visible even when they prevent paint timers from running. Native overlays stay
+retired until the synchronous hook returns; failures also restore painting.
+Asynchronous prompts and popups continue using the ordinary mode/display checks.
 
 `VimrcWorkbenchState()` must only read cached state. The bridge projects a
 closed schema into `Vim9Snapshot.workbench`, ignoring all other fields:
@@ -440,11 +450,31 @@ plugin dictionaries, function references, channels and unrelated fields are
 never serialized. `Vim9WorkbenchState::status_text()` supplies the four hosts'
 compact palette/optional-status context from these caches, without Git/LSP I/O.
 
-The bridge listens for `SimpleGitUpdate`, remote workspace events and
+The bridge listens for `SimpleGitUpdate`, `SimpleCCDiagnosticsChanged`, remote workspace events and
 `VimrcWorkbenchChanged`; its ordinary reconciliation also observes capability
-changes after `:source`. SimpleCC diagnostics here are **severity counts** for
-the current buffer, distinct from the existing quickfix/location-list problem
-rows and their F8 navigation.
+changes after `:source`. The workbench status contains **severity counts** for
+the current buffer. The optional diagnostic hook separately returns cached
+problem rows without opening or replacing quickfix/location lists:
+
+```text
+{items: [{line: 1, column: 4, text: 'message', kind: 'warning'}], total: 1}
+```
+
+Positions are positive, one-based line and UTF-8 byte column numbers in the
+current buffer. The bridge supplies the filename and accepts only those four
+item fields, at most 256 rows and 2048 characters per message. Invalid rows are
+ignored; a bounded `total` carries provider omissions into the existing shared
+diagnostic budget. Rows are deduplicated with quickfix/location/LSP results.
+Missing, disabled or throwing hooks expire old provider rows. A changed cached
+snapshot is detected even without a User event or buffer edit.
+
+The vimrc adapter calls only an already-loaded `simplecc#DiagnosticSnapshot()`.
+SimpleCC converts its UTF-16 positions using loaded buffer text and memoizes
+the last bounded result by buffer, text version, diagnostic version, source
+filter and diagnostic path. It performs no daemon request or list mutation.
+Counts and rows can differ when diagnostics have invalid positions/messages.
+Simple diagnostic navigation uses the plugin's own filters; the existing
+`next_diagnostic`/`previous_diagnostic` actions still traverse Vim's quickfix list.
 
 ## Real-editor tests
 
@@ -460,13 +490,15 @@ The optional cross-repository suite uses actual `vimrc`, `simplecc`,
 other checkout layouts can select the vimrc and plugin parent explicitly:
 
 ```sh
-VIM9_TEST_VIMRC=/path/to/vimrc VIM9_TEST_SIMPLE_ROOT=/path/to/plugin-parent python3 -m unittest -v test_vimrc_workbench
+VIM9_TEST_VIMRC=/path/to/vimrc VIM9_TEST_SIMPLE_ROOT=/path/to/plugin-parent python3 -m unittest -v test_vimrc_workbench test_simple_diagnostics
 ```
 
 That suite loads the real configuration and plugin runtimes in isolated test
 homes. SimpleCC's deterministic daemon fixture supplies replies; it tests
 actual command routing, navigation, diagnostic caches, report rendering and
-reload behavior, without installing plugins or contacting language servers or
+reload behavior, plus prompt acceptance/cancellation, blocking WhichKey input,
+popup-to-native recovery and diagnostic publication/clearing with Unicode byte
+positions. These tests run without installing plugins or contacting language servers or
 remote machines. Its fixture replies are not evidence of an external LSP
 server's correctness.
 

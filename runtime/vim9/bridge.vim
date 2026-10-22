@@ -28,6 +28,7 @@ g:jterm_vim9_render_protocol = 0
 var bridge: channel
 var authenticated = false
 var workbenchConnected = false
+var workbenchActionDepth = 0
 var shuttingDown = false
 var sending = false
 var sequence = 0
@@ -206,7 +207,8 @@ enddef
 const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
   'simple_outline', 'simple_rename', 'simple_code_action', 'simple_git_status',
   'simple_git_diff', 'simple_git_hunk', 'simple_markdown_preview', 'simple_keys',
-  'simple_workbench']
+  'simple_workbench', 'simple_diagnostics', 'simple_next_diagnostic',
+  'simple_previous_diagnostic']
 const WORKBENCH_SEMANTICS = ['definition', 'hover', 'references', 'format']
 
 def WorkbenchCapabilities(): list<string>
@@ -1659,6 +1661,12 @@ def RenderCompletion(): dict<any>
 enddef
 
 def RenderFrame(): dict<any>
+  if workbenchActionDepth > 0
+    return {event: 'render', supported: false,
+      fallback_reason: 'A Vim workbench plugin is using the compatibility view',
+      buffer: bufnr(), window: win_getid(), changedtick: b:changedtick, mode: mode(1),
+      rows: &lines, columns: &columns, runs: []}
+  endif
   var active = win_getid()
   var activeMode = mode(1)
   var activeView = winsaveview()
@@ -1896,9 +1904,51 @@ def Utf16ByteColumn(text: string, units: number): number
   return bytes + 1
 enddef
 
+def WorkbenchDiagnostics(): dict<any>
+  var result: dict<any> = {items: [], total: 0}
+  if !exists('*g:VimrcWorkbenchDiagnostics') || empty(expand('%:p'))
+    return result
+  endif
+  try
+    var provided: any = call('g:VimrcWorkbenchDiagnostics', [])
+    if type(provided) != v:t_dict || type(get(provided, 'items', 0)) != v:t_list
+      return result
+    endif
+    # Only current-buffer positions and display text may cross this boundary.
+    # The bridge owns the filename; hooks cannot publish another file's cache
+    # or serialize arbitrary plugin state, callbacks or recursive dictionaries.
+    var entries: list<any> = provided.items
+    for entry in entries[: 255]
+      if type(entry) != v:t_dict
+        continue
+      endif
+      var lnum: any = get(entry, 'line', 0)
+      var column: any = get(entry, 'column', 0)
+      var kind: any = get(entry, 'kind', '')
+      if type(lnum) != v:t_number || lnum <= 0
+          || type(column) != v:t_number || column <= 0
+          || type(kind) != v:t_string || index(['error', 'warning', 'info', 'hint'], kind) < 0
+          || type(get(entry, 'text', 0)) != v:t_string
+        continue
+      endif
+      add(result.items, {line: lnum, column: column, kind: kind,
+        text: WorkbenchText(entry, 'text', 2048)})
+    endfor
+    # Invalid sampled entries are ignored. Uninspected/omitted provider rows
+    # still count against the shared diagnostic budget, with a bounded total.
+    result.total = len(result.items) + min([1000000,
+      max([len(entries), WorkbenchCount(provided, 'total')])]) - min([256, len(entries)])
+  catch
+    # A missing/reloading provider must also expire its previous cached rows.
+    return {items: [], total: 0}
+  endtry
+  return result
+enddef
+
 def Diagnostics(): dict<any>
+  var workbench = WorkbenchDiagnostics()
   var keyNow = string([getqflist({id: 0, changedtick: 0}),
-    getloclist(0, {id: 0, changedtick: 0}), bufnr(), b:changedtick, lspDiagnosticsTick])
+    getloclist(0, {id: 0, changedtick: 0}), bufnr(), b:changedtick, lspDiagnosticsTick, workbench])
   if keyNow ==# diagnosticsKey
     return diagnosticsCache
   endif
@@ -1964,6 +2014,22 @@ def Diagnostics(): dict<any>
       # Plugins own their initialization and server lifecycle.
     endtry
   endif
+  # Simple workbench diagnostics do not create/replace a quickfix or location
+  # list. All four hosts consume the same existing native problem-row schema.
+  var filename = expand('%:p')
+  for entry in workbench.items
+    var key = string([filename, entry.line, entry.column, entry.text])
+    if has_key(seen, key)
+      continue
+    endif
+    seen[key] = true
+    total += 1
+    if len(result) < 256
+      add(result, {filename: filename, line: entry.line, column: entry.column,
+        text: entry.text, kind: entry.kind, column_kind: 'byte'})
+    endif
+  endfor
+  total += workbench.total - len(workbench.items)
   diagnosticsKey = keyNow
   diagnosticsCache = {items: result, total: total}
   return diagnosticsCache
@@ -2134,7 +2200,7 @@ enddef
 
 def SafeToChange()
   var currentMode = mode(1)
-  if currentMode =~# '^no' || currentMode =~# '^[cr!t]'
+  if workbenchActionDepth > 0 || currentMode =~# '^no' || currentMode =~# '^[cr!t]'
       || !empty(state('moaSw'))
     throw 'Vim is busy with a command, operator or completion; finish it before this action'
   endif
@@ -2203,6 +2269,9 @@ enddef
 
 def DeferSaveIfNeeded(request: dict<any>, id: number): bool
   var action = RequiredString(request, 'action', 64)
+  if workbenchActionDepth > 0 && index(['snapshot', 'render_resync', 'set_render', 'cancel_build', 'cancel_search'], action) < 0
+    throw 'A Vim workbench plugin is waiting for input; finish it before another IDE action'
+  endif
   if (!empty(deferredSave) || checkingSaveInput)
       && index(['snapshot', 'cancel_build', 'cancel_search'], action) < 0
     throw 'A save is waiting for Vim to finish input; wait for it before another IDE action'
@@ -2520,9 +2589,28 @@ def StartSearch(request: dict<any>)
   Changed()
 enddef
 
+def InvokeWorkbench(action: string)
+  # Some real providers run getcharstr()/input() inside this channel callback.
+  # They can prevent timer/channel callbacks from running until input arrives.
+  # Retire the native overlay BEFORE entering that loop, and flush any batching
+  # so the PTY popup is visible while the user is choosing. Timer paints must
+  # not put the old overlay back during the provider's initial delay either.
+  workbenchActionDepth += 1
+  try
+    EmitRender(true)
+    FlushSendBatch()
+    call('g:VimrcWorkbenchAction', [action])
+  finally
+    workbenchActionDepth -= 1
+    renderWindowCaches = {}
+    EmitRender(true)
+    Changed()
+  endtry
+enddef
+
 def LspAction(action: string, request: dict<any>)
   if index(WorkbenchCapabilities(), action) >= 0
-    call('g:VimrcWorkbenchAction', [action])
+    InvokeWorkbench(action)
     return
   endif
   var commands = {definition: 'LspGotoDefinition', hover: 'LspHover',
@@ -2569,7 +2657,7 @@ def RunWorkbench(request: dict<any>)
   if index(WorkbenchCapabilities(), command) < 0
     throw 'This workbench action is unavailable for the current buffer'
   endif
-  call('g:VimrcWorkbenchAction', [command])
+  InvokeWorkbench(command)
 enddef
 
 def ScrollWindow(request: dict<any>)
@@ -2878,8 +2966,8 @@ augroup JTermVim9Bridge
   autocmd WinScrolled,VimResized,OptionSet * RenderChanged()
   autocmd CompleteChanged,CompleteDone * RenderChanged()
   autocmd QuickFixCmdPost * Changed()
-  autocmd User LspDiagsUpdated,LspAttached,LspDetached LspDiagnosticsChanged()
-  autocmd User SimpleGitUpdate,SimpleRemoteConnected,SimpleRemoteDisconnected,SimpleRemoteWorkspaceChanged,VimrcWorkbenchChanged Changed()
+  autocmd User LspDiagsUpdated,LspAttached,LspDetached,SimpleCCDiagnosticsChanged,VimrcWorkbenchChanged LspDiagnosticsChanged()
+  autocmd User SimpleGitUpdate,SimpleRemoteConnected,SimpleRemoteDisconnected,SimpleRemoteWorkspaceChanged Changed()
   autocmd VimLeavePre * Leaving()
 augroup END
 
