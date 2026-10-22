@@ -14,9 +14,26 @@ jobs:
   source-input:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      VIM9_SIMPLECC_ROOT: ${{ github.workspace }}/.providers/simplecc
+      VIM9_SIMPLEGIT_ROOT: ${{ github.workspace }}/.providers/simplegit
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          persist-credentials: false
+      - name: Check out audited SimpleCC popup provider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: beamiter/simplecc
+          ref: cf778d681facdf62e63d627c57295b17735b1dae
+          path: .providers/simplecc
+          persist-credentials: false
+      - name: Check out audited SimpleGit popup provider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: beamiter/simplegit
+          ref: af06c595809241c0e403c4f988bd90818af4602b
+          path: .providers/simplegit
           persist-credentials: false
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
       - run: |
@@ -33,3 +50,5 @@ jobs:
           python3 runtime/vim9/test_render_special.py
           python3 runtime/vim9/test_render_listchars.py
           python3 runtime/vim9/test_render_completion.py
+          python3 runtime/vim9/test_render_popups.py
+          python3 runtime/vim9/test_simple_popups.py

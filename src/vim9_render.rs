@@ -125,6 +125,21 @@ pub struct Vim9RenderCompletion {
     pub runs: Vec<Vim9RenderRun>,
 }
 
+/// Protocol 6 display-only Vim popup. Vim owns its contents, geometry, input
+/// filters and lifetime; hosts only paint the sampled surface. Popup runs
+/// deliberately carry no editable buffer/window/source coordinates.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9RenderPopup {
+    pub id: i64,
+    /// Vim's stacking order. The ordinary completion menu has z-index 100.
+    pub zindex: i32,
+    pub view: Vim9RenderRect,
+    pub default_style: Vim9RenderStyle,
+    /// Includes body, padding, border and syntax glyphs in paint order.
+    pub runs: Vec<Vim9RenderRun>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderFrame {
@@ -151,9 +166,19 @@ pub struct Vim9RenderFrame {
     pub runs: Vec<Vim9RenderRun>,
     /// Protocol 5 ordinary Insert completion; None also explicitly clears it.
     pub completion: Option<Vim9RenderCompletion>,
+    /// Protocol 6 popups, ordered by ascending zindex then descending id (Vim
+    /// puts older windows on top at equal zindex). An empty list clears every
+    /// previous surface, including in an otherwise empty row delta.
+    pub popups: Vec<Vim9RenderPopup>,
 }
 
 impl Vim9RenderFrame {
+    /// Overlay input belongs to Vim. Hosts must retire native pointer/scroll
+    /// transforms while these surfaces are visible, including outside them.
+    pub fn has_overlays(&self) -> bool {
+        self.completion.is_some() || !self.popups.is_empty()
+    }
+
     /// Exact native paint ownership, without covering Vim's split separators,
     /// per-window status lines, tab line or command line.
     pub fn paint_views(&self) -> impl Iterator<Item = &Vim9RenderRect> {
@@ -176,6 +201,30 @@ impl Vim9RenderFrame {
         }
         let within =
             |start: usize, count: usize, limit: usize| start <= limit && count <= limit - start;
+        let overlay_valid =
+            |view: &Vim9RenderRect, style: &Vim9RenderStyle, runs: &[Vim9RenderRun]| {
+                self.supported
+                    && view.rows > 0
+                    && view.rows <= 64
+                    && view.columns > 0
+                    && view.columns <= 512
+                    && within(view.row, view.rows, self.rows)
+                    && within(view.column, view.columns, self.columns)
+                    && style_valid(style)
+                    && runs.len() <= 4096
+                    && runs.iter().all(|run| {
+                        run.cells > 0
+                            && view.contains(run.row, run.column)
+                            && within(run.column, run.cells, view.column + view.columns)
+                            && run.window == 0
+                            && run.line == 0
+                            && run.byte_start == 0
+                            && run.byte_end == 0
+                            && run.text.len() <= 4096
+                            && !run.text.chars().any(|c| c.is_ascii_control())
+                            && style_valid(&run.style)
+                    })
+            };
         self.rows > 0
             && self.rows <= 4096
             && self.columns > 0
@@ -196,27 +245,27 @@ impl Vim9RenderFrame {
             && self.windows.len() <= 16
             && style_valid(&self.default_style)
             && self.completion.as_ref().is_none_or(|menu| {
-                self.supported
-                    && self.mode.starts_with('i')
-                    && menu.view.rows > 0
-                    && menu.view.rows <= 64
-                    && menu.view.columns > 0
-                    && menu.view.columns <= 512
-                    && within(menu.view.row, menu.view.rows, self.rows)
-                    && within(menu.view.column, menu.view.columns, self.columns)
-                    && style_valid(&menu.default_style)
-                    && menu.runs.len() <= 4096
-                    && menu.runs.iter().all(|run| {
-                        run.cells > 0
-                            && menu.view.contains(run.row, run.column)
-                            && within(run.column, run.cells, menu.view.column + menu.view.columns)
-                            && run.line == 0
-                            && run.byte_start == 0
-                            && run.byte_end == 0
-                            && run.text.len() <= 4096
-                            && !run.text.chars().any(|c| c.is_ascii_control())
-                            && style_valid(&run.style)
-                    })
+                self.mode.starts_with('i')
+                    && overlay_valid(&menu.view, &menu.default_style, &menu.runs)
+            })
+            && self.popups.len() <= 8
+            && self
+                .popups
+                .iter()
+                .map(|popup| popup.runs.len())
+                .sum::<usize>()
+                <= 4096
+            && self.popups.iter().enumerate().all(|(index, popup)| {
+                popup.id > 0
+                    && (1..=32_000).contains(&popup.zindex)
+                    && overlay_valid(&popup.view, &popup.default_style, &popup.runs)
+                    && self.popups[..index]
+                        .iter()
+                        .all(|other| other.id != popup.id)
+                    && (index == 0
+                        || self.popups[index - 1].zindex < popup.zindex
+                        || (self.popups[index - 1].zindex == popup.zindex
+                            && self.popups[index - 1].id > popup.id))
             })
             && self.cursor.appearance.as_ref().is_none_or(|a| a.valid())
             && within(self.view.row, self.view.rows, self.rows)
@@ -421,6 +470,156 @@ impl RenderDelta {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    fn popup(id: i64, zindex: i32) -> Value {
+        json!({
+            "id": id, "zindex": zindex,
+            "view": {"row":2,"column":35,"rows":3,"columns":20},
+            "default_style":{"foreground":0xabcdef,"background":0x123456},
+            "runs":[{"row":3,"column":36,"text":"文档 é","cells":7,
+                "style":{"foreground":0xfedcba,"italic":true}}]
+        })
+    }
+
+    #[test]
+    fn popups_cross_splits_without_creating_buffer_source_paint() {
+        let mut value = split_frame();
+        let original: Vim9RenderFrame = serde_json::from_value(value.clone()).unwrap();
+        assert!(!original.has_overlays());
+        value["popups"] = json!([popup(300, 50), popup(400, 200)]);
+        let frame: Vim9RenderFrame = serde_json::from_value(value.clone()).unwrap();
+        assert!(frame.valid());
+        assert!(frame.has_overlays());
+        assert_eq!(frame.runs, original.runs);
+        // Column 39 is the separator, not part of either editable split.
+        assert!(!frame.covers(3, 39));
+        assert!(frame.popups[0].view.contains(3, 39));
+        value["mode"] = json!("ic");
+        value["completion"] = json!({
+            "view":{"row":2,"column":35,"rows":1,"columns":20},
+            "runs":[{"row":2,"column":35,"text":"candidate","cells":9}]
+        });
+        let both: Vim9RenderFrame = serde_json::from_value(value).unwrap();
+        assert!(both.valid());
+        assert_eq!(both.popups.len(), 2);
+        assert!(both.completion.is_some());
+    }
+
+    #[test]
+    fn popup_wire_rejects_invalid_geometry_order_and_source_anchors() {
+        let mut valid = split_frame();
+        valid["popups"] = json!([popup(300, 50)]);
+        for (field, bad) in [
+            ("id", json!(0)),
+            ("zindex", json!(0)),
+            ("zindex", json!(32_001)),
+            ("view", json!({"row":9,"column":0,"rows":2,"columns":20})),
+            (
+                "view",
+                json!({"row":0,"column":usize::MAX,"rows":1,"columns":20}),
+            ),
+            ("default_style", json!({"background":0x1000000})),
+        ] {
+            let mut bad_frame = valid.clone();
+            bad_frame["popups"][0][field] = bad;
+            assert!(
+                !serde_json::from_value::<Vim9RenderFrame>(bad_frame)
+                    .unwrap()
+                    .valid(),
+                "popup field {field}"
+            );
+        }
+        for (field, bad) in [
+            ("window", json!(100)),
+            ("line", json!(1)),
+            ("byte_start", json!(1)),
+            ("byte_end", json!(1)),
+            ("cells", json!(30)),
+            ("row", json!(9)),
+            ("text", json!("docs\u{1b}[31m")),
+            ("style", json!({"foreground":0x1000000})),
+        ] {
+            let mut bad_frame = valid.clone();
+            bad_frame["popups"][0]["runs"][0][field] = bad;
+            assert!(
+                !serde_json::from_value::<Vim9RenderFrame>(bad_frame)
+                    .unwrap()
+                    .valid(),
+                "popup run field {field}"
+            );
+        }
+        for surfaces in [
+            json!([popup(300, 50), popup(300, 200)]),
+            json!([popup(400, 200), popup(300, 50)]),
+            json!([popup(300, 50), popup(400, 50)]),
+            json!((1..=9).rev().map(|id| popup(id, 50)).collect::<Vec<_>>()),
+        ] {
+            let mut bad_frame = valid.clone();
+            bad_frame["popups"] = surfaces;
+            assert!(!serde_json::from_value::<Vim9RenderFrame>(bad_frame)
+                .unwrap()
+                .valid());
+        }
+        valid["supported"] = json!(false);
+        assert!(!serde_json::from_value::<Vim9RenderFrame>(valid)
+            .unwrap()
+            .valid());
+    }
+
+    #[test]
+    fn popup_total_paint_budget_is_bounded_across_all_surfaces() {
+        let mut value = split_frame();
+        let mut first = popup(400, 50);
+        let mut second = popup(300, 50);
+        let run = first["runs"][0].clone();
+        first["runs"] = json!(vec![run.clone(); 2048]);
+        second["runs"] = json!(vec![run.clone(); 2048]);
+        value["popups"] = json!([first, second]);
+        assert!(serde_json::from_value::<Vim9RenderFrame>(value.clone())
+            .unwrap()
+            .valid());
+        value["popups"][1]["runs"].as_array_mut().unwrap().push(run);
+        assert!(!serde_json::from_value::<Vim9RenderFrame>(value)
+            .unwrap()
+            .valid());
+    }
+
+    #[test]
+    fn popup_only_deltas_replace_and_clear_without_stale_surfaces() {
+        let value = split_frame();
+        let first: Vim9RenderFrame = serde_json::from_value(value.clone()).unwrap();
+        let mut delta = patch(&value, json!([]));
+        delta["popups"] = json!([popup(300, 50)]);
+        let opened = serde_json::from_value::<RenderDelta>(delta.clone())
+            .unwrap()
+            .apply(&first)
+            .unwrap();
+        assert!(opened.has_overlays());
+        assert_eq!(opened.runs, first.runs);
+        delta["revision"] = json!(3);
+        delta["base_revision"] = json!(2);
+        delta["popups"][0]["default_style"]["foreground"] = json!(0x665544);
+        let updated = serde_json::from_value::<RenderDelta>(delta.clone())
+            .unwrap()
+            .apply(&opened)
+            .unwrap();
+        assert_eq!(updated.popups[0].default_style.foreground, Some(0x665544));
+        assert_eq!(opened.popups[0].default_style.foreground, Some(0xabcdef));
+        delta["revision"] = json!(4);
+        delta["base_revision"] = json!(3);
+        delta["popups"][0]["runs"][0]["line"] = json!(12);
+        assert!(serde_json::from_value::<RenderDelta>(delta.clone())
+            .unwrap()
+            .apply(&updated)
+            .is_none());
+        delta["popups"] = json!([]);
+        let closed = serde_json::from_value::<RenderDelta>(delta)
+            .unwrap()
+            .apply(&updated)
+            .unwrap();
+        assert!(!closed.has_overlays());
+        assert_eq!(closed.runs, first.runs);
+    }
 
     #[test]
     fn completion_overlay_can_cross_splits_but_never_becomes_source_paint() {

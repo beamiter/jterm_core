@@ -44,8 +44,8 @@ pub use workbench::{
 #[path = "vim9_render.rs"]
 mod render;
 pub use render::{
-    Vim9RenderCompletion, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMarginRow, Vim9RenderRect,
-    Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow,
+    Vim9RenderCompletion, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMarginRow, Vim9RenderPopup,
+    Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow,
 };
 
 #[path = "vim9_cursor.rs"]
@@ -1024,7 +1024,7 @@ fn connection(
                         return Ok(false);
                     }
                     let mut reply = serde_json::to_vec(
-                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":5}),
+                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":6}),
                     )
                     .map_err(io::Error::other)?;
                     reply.push(b'\n');
@@ -1599,7 +1599,7 @@ mod tests {
         reader.read_line(&mut wire).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&wire).unwrap()["render_protocol"],
-            5
+            6
         );
         let full = json!({"event":"render","revision":1,"supported":true,
             "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",

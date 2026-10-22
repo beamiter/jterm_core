@@ -43,7 +43,10 @@ class RenderCompletionTests(unittest.TestCase):
     def start(self, e=None):
         e = e or self.editor
         e.keys("A\x12=[complete(col('.'), [{'word':'alpha','abbr':'alpha()','kind':'f','menu':'[LSP]'}, {'word':'beta','kind':'v','menu':'[buf]'}, {'word':'界é','menu':'[utf]'}]), ''][1]\r")
-        return e.painted(lambda f: f.get("completion") is not None or not f["supported"])
+        # The <C-r>= expression briefly enters command-line mode. Its genuine
+        # compatibility frame is not the completion result under test.
+        return e.painted(lambda f: f.get("mode", "").startswith("i")
+                         and (f.get("completion") is not None or not f["supported"]))
 
     def test_menu_gui_runs_unicode_and_vim_selection_acceptance(self):
         e = self.editor
@@ -104,7 +107,8 @@ class RenderCompletionTests(unittest.TestCase):
         e.ex("highlight CompletionMark guifg=#fedcba gui=italic")
         e.ex("call timer_start(40, {-> writefile([json_encode(complete_info())], 'complete-info.json')}, {'repeat': -1})")
         e.keys("A\x12=[complete(col('.'), [{'word':'alpha', 'abbr_hlgroup':'CompletionMark'}, {'word':'beta'}]), ''][1]\r")
-        frame = e.painted(lambda f: f.get("completion") is not None or not f["supported"])
+        frame = e.painted(lambda f: f.get("mode", "").startswith("i")
+                          and (f.get("completion") is not None or not f["supported"]))
         self.assertTrue(frame["supported"], frame.get("fallback_reason"))
         info = None
         deadline = time.monotonic() + 3

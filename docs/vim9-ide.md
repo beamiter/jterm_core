@@ -565,11 +565,54 @@ The receiver validates menu geometry, GUI colors, budgets and source-free runs.
 
 The supported list must fit completely without a scrollbar and use default
 column order, fully visible ordinary labels, and non-fuzzy ordering. Scrolling,
-filtered, clipped, bordered, translucent, custom `pumopt`, separate info/popup
+filtered, clipped, bordered, translucent, custom `pumopt`, unregistered info/popup
 windows and distinct `PmenuMatch[Sel]` highlights retain explicit compatibility
 reasons. Public Vim APIs do not expose the first visible candidate or original
 match leader; this implementation does not guess them. Protocols 1–4 always
 retain the existing compatibility behavior while a completion menu is visible.
+
+## Native Simple text popups (render protocol 6)
+
+SimpleCC hover, signature, diagnostic and completion-documentation windows, and
+SimpleGit hunk/blame windows can retain native buffer painting. Each audited
+provider marks its passive, opaque, mask-free popup with
+`setwinvar(id, 'jterm_native_popup', 1)` after content and filetype are ready.
+It then emits `User JTermVim9PopupChanged` when a subscriber exists, scheduling
+the next native frame without a document edit or slow polling round trip.
+The marker is a provider contract: remove it before introducing masks or
+nonrectangular content. Vim's public `popup_getoptions()` does not expose masks
+reliably, so unregistered popups always use compatibility rendering.
+
+The bridge samples popup buffer text, syntax/text-property GUI styles and
+`popup_getpos()` geometry through Vim APIs; it does not scrape terminal cells.
+`popups` is a complete list of `{id, zindex, view, default_style, runs}` surfaces
+ordered by ascending z-index then descending ID: Vim places the older popup
+on top when z-indices match. Body, padding, border and Unicode glyphs are explicit
+paint. Popup runs have zero `window`, `line`, `byte_start` and `byte_end`: they
+are never source anchors. Limits are eight popups, 64 by 512 cells each, and
+4,096 popup runs per frame. The receiver rejects malformed geometry, colors,
+duplicate IDs, wrong order and source-bearing runs atomically.
+
+All four hosts paint popups below z-index 100 before the ordinary completion
+menu and the remaining popups after it, across split/status gaps and above the
+native cursor. An empty `popups: []` clears prior surfaces even in a delta with
+no changed buffer rows. Opening, updating and closing a popup therefore never
+leave an older overlay attached to a new source frame.
+
+While any visible popup exists, native source pointer and precision-scroll
+requests are disabled and rejected by the bridge. Hosts retire pending native
+scroll/drag transforms and retain the original PTY input route until both the
+live and last presented overlay are gone. Vim owns keyboard filters, selection,
+`moved`, `close`, input and lifetime throughout.
+
+This version accepts complete, unwrapped text, including default `wrap` when
+no line actually wraps. Scrolled/clipped/wrapped content, titles, resize/drag,
+filters, virtual text, conceal, unsupported decorations and excessive budgets
+fall back explicitly. It does not add a rich Markdown/image document renderer,
+code-lens/inlay layout, or generic interactive popup widgets. Protocols 1–5
+retain their previous popup fallback. `runtime/vim9/test_render_popups.py`
+exercises real Vim popups, completion-plus-docs, styles, Unicode, lifecycle,
+input ownership and fallback; each host adds renderer/controller coverage.
 
 ## Native visible whitespace
 

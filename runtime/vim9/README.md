@@ -80,8 +80,10 @@ complete frames. Version 2 additionally accepts row deltas. Version 3 adds
 source-bound scroll/pointer input and two real margin rows per viewport edge.
 Version 4 retains those semantics and extends each margin to eight rows for
 continuous wheel transitions and short bursts. Version 5 adds the optional
-`completion` overlay for ordinary, fully visible Insert completion menus. Older
-hosts continue using the live compatibility menu. Existing command and metadata
+`completion` overlay for ordinary, fully visible Insert completion menus.
+Version 6 adds bounded `popups` for provider-opted-in opaque text windows,
+including borders, padding, GUI syntax styles and simultaneous completion docs.
+Older hosts continue using the live compatibility displays. Existing command and metadata
 messages continue to use `protocol: 1`.
 
 Protocol-3 and newer window metadata also has an optional `native_scroll`
@@ -428,8 +430,9 @@ has no free-form Ex command, key sequence, callback name or executable field:
 The bridge checks safe Vim mode, the exact current window/buffer/text version,
 the fixed vocabulary and freshly sampled capabilities before invoking the
 hook. It refuses a stale request instead of applying it to another source.
-Plugin prompts, popup windows, diff views and other unsupported displays still
-use the live compatibility renderer, returning to native paint when supported.
+Plugin prompts, complex popup windows, diff views and other unsupported displays
+still use the live compatibility renderer, returning to native paint when
+supported. Protocol 6 can paint opted-in passive text popups over the buffer.
 Before invoking a workbench hook, the bridge flushes a compatibility frame.
 This makes blocking plugin input loops such as SimpleWhichKey's `getcharstr()`
 visible even when they prevent paint timers from running. Native overlays stay
@@ -531,6 +534,20 @@ SimpleTree and SimpleTerminal checkouts. They exercise real buffer selection,
 preview cancellation, tree toggle/reveal and a local `/bin/sh` terminal,
 including F8 return and session reuse. Tree tests use an existing daemon binary
 or the plugin's checked-in protocol fixture; nothing is downloaded.
+
+Native text popup tests exercise real Vim geometry, syntax, Unicode, completion
+stacking, explicit clearing and unsupported-display fallback. The optional
+provider suite invokes the actual SimpleCC and SimpleGit callbacks and commands:
+
+```sh
+python3 -m unittest -v test_render_popups
+VIM9_SIMPLECC_ROOT=/path/to/simplecc VIM9_SIMPLEGIT_ROOT=/path/to/simplegit python3 -m unittest -v test_simple_popups
+```
+
+Provider roots default to sibling checkouts. These tests use fixture responses
+and SimpleGit's checked-in Python daemon stub, without installed daemons or
+language servers. CI checks out exact provider commits so popup creation,
+registration, filetypes and asynchronous refresh are tested together.
 
 `VIM9_TEST_VIM` is optional when `vim` is on PATH. These Python-standard-library
 tests create isolated files, actual PTYs and private loopback sockets, then

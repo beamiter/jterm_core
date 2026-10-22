@@ -521,12 +521,16 @@ def WindowNormalStyle(): dict<any>
   return result
 enddef
 
+def VisiblePopups(): list<number>
+  return filter(popup_list(), (_, id) => get(popup_getpos(id), 'visible', 0) != 0)
+enddef
+
 def RenderFallback(): string
   if !RenderableTextBuffer(&buftype)
     return 'This special Vim buffer uses the compatibility view'
   elseif mode(1) !~# '^[nivVR\x16]'
     return 'Vim command, prompt or terminal input uses the compatibility view'
-  elseif (pumvisible() && renderProtocol < 5) || !empty(filter(popup_list(), (_, id) => get(popup_getpos(id), 'visible', 0)))
+  elseif (pumvisible() && renderProtocol < 5) || (renderProtocol < 6 && !empty(VisiblePopups()))
     return 'Vim completion and popup windows use the compatibility view'
   elseif &diff || &rightleft || &arabic || &spell || &conceallevel > 0
     return 'This Vim display option needs the compatibility view'
@@ -834,7 +838,7 @@ def NativePointerAvailable(): bool
   const current = mode(1)
   # 'block' only permits virtual space in blockwise Visual mode, which is
   # already excluded here. Normal/characterwise source targets remain exact.
-  if !NativeTextBuffer(&buftype) || pumvisible() || index(['n', 'v'], current) < 0
+  if !NativeTextBuffer(&buftype) || pumvisible() || !empty(VisiblePopups()) || index(['n', 'v'], current) < 0
       || (!empty(&virtualedit) && &virtualedit !=# 'block')
       || &selectmode =~# 'mouse' || &mouse !~# (current ==# 'n' ? '[an]' : '[av]')
     return false
@@ -853,7 +857,8 @@ def NativeScrollAvailable(): bool
   # Scrolling does not synthesize a pointer gesture. Mouse mappings, mouse=
   # and virtualedit=block must not disable direct touchpad pixels. Keep busy
   # modes and completion under Vim's compatibility input ownership.
-  return NativeTextBuffer(&buftype) && index(['n', 'i'], mode(1)) >= 0 && !pumvisible()
+  return NativeTextBuffer(&buftype) && index(['n', 'i'], mode(1)) >= 0
+    && !pumvisible() && empty(VisiblePopups())
 enddef
 
 def NativeSourceWindow(request: dict<any>): number
@@ -974,7 +979,8 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   var frame: dict<any> = {event: 'render', supported: true, fallback_reason: '',
     rows: &lines, columns: &columns, window: win_getid(), buffer: bufnr(),
     changedtick: b:changedtick, mode: mode(1), view: view,
-    default_style: renderNormal, cursor: {row: 0, column: 0, width: 1, visible: false}, runs: paintRuns}
+    default_style: renderNormal, cursor: {row: 0, column: 0, width: 1, visible: false},
+    runs: paintRuns, completion: v:null, popups: []}
   var reason = RenderFallback()
   var quickfixLine = QuickfixCurrentLine(info)
   if quickfixLine < 0 || quickfixLine > line('$')
@@ -1565,6 +1571,7 @@ def CompletionText(runs: list<dict<any>>, text: string, row: number, column: num
     endif
     if strlen(cluster) == 1 && !empty(runs) && runs[-1].row == row
         && runs[-1].column + runs[-1].cells == col && runs[-1].style == style
+        && strlen(runs[-1].text) == strchars(runs[-1].text)
         && runs[-1].text =~# '^[\x20-\x7e]*$'
       runs[-1].text ..= cluster
       runs[-1].cells += cells
@@ -1662,12 +1669,242 @@ def RenderCompletion(): dict<any>
   return {view: view, default_style: normal, runs: runs}
 enddef
 
+# Vim does not expose popup masks through popup_getoptions(). Only a provider
+# that owns an opaque, rectangular, read-only text popup may opt in by setting
+# w:jterm_native_popup = 1. It must remove that marker before adding a mask or
+# any other transparency. Unregistered plugins retain Vim compatibility paint.
+# Exposed geometry/options are still validated on every sample; this marker is
+# a presentation contract, never permission to synthesize editor input.
+var renderPopupSample: dict<any> = {}
+
+def PopupBox(options: dict<any>, key: string): list<number>
+  if !has_key(options, key)
+    return [0, 0, 0, 0]
+  endif
+  var values: any = options[key]
+  if type(values) != v:t_list
+    throw 'Invalid Vim popup decoration uses the compatibility view'
+  endif
+  if empty(values)
+    return [1, 1, 1, 1]
+  endif
+  if len(values) != 4
+    throw 'Complex Vim popup decoration uses the compatibility view'
+  endif
+  var result: list<number> = []
+  for value in values
+    if type(value) != v:t_number || value < 0 || value > 64
+      throw 'Invalid Vim popup decoration uses the compatibility view'
+    endif
+    add(result, key ==# 'border' ? (value > 0 ? 1 : 0) : value)
+  endfor
+  return result
+enddef
+
+def PopupNormalStyle(): dict<any>
+  var group = WindowNormalGroup()
+  if !group.supported
+    throw 'Vim popup highlight remapping uses the compatibility view'
+  endif
+  # An empty popup wincolor means Pmenu, not the parent split's Normal.
+  var style = copy(RenderStyle(hlID(empty(group.name) ? 'Pmenu' : group.name)))
+  for color in ['foreground', 'background', 'special']
+    if type(style[color]) != v:t_number
+      style[color] = renderNormal[color]
+    endif
+  endfor
+  return style
+enddef
+
+def SampleRenderPopup()
+  var id = win_getid()
+  var registered: any = getwinvar(id, 'jterm_native_popup', 0)
+  if type(registered) != v:t_number || registered != 1
+    throw 'Unregistered Vim popups use the compatibility view'
+  endif
+  var position = popup_getpos(id)
+  var options = popup_getoptions(id)
+  if empty(position) || empty(options) || !get(position, 'visible', 0)
+    throw 'A Vim popup changed during native sampling'
+  endif
+  if has_key(options, 'filter') || !empty(get(options, 'mask', []))
+      || !empty(get(options, 'title', '')) || get(options, 'close', 'none') ==# 'button'
+      || get(options, 'cursorline', 0) || get(options, 'drag', 0)
+      || get(options, 'dragall', 0) || get(options, 'resize', 0)
+      || (has_key(options, 'opacity') && options.opacity != 100)
+    throw 'Interactive or decorated Vim popups use the compatibility view'
+  endif
+  var view = {row: position.line - 1, column: position.col - 1,
+    rows: position.height, columns: position.width}
+  var zindex = get(options, 'zindex', 50)
+  if view.row < 0 || view.column < 0 || view.rows < 1 || view.rows > 64
+      || view.columns < 1 || view.columns > 512 || view.row + view.rows > &lines
+      || view.column + view.columns > &columns || zindex < 1 || zindex > 32000
+    throw 'Vim popup geometry exceeds the native paint budget'
+  endif
+  if position.scrollbar || position.firstline != 1 || position.core_height < line('$')
+      || position.core_width < 1 || position.core_height < 1
+    throw 'Scrolling or clipped Vim popups use the compatibility view'
+  endif
+  var border = PopupBox(options, 'border')
+  var padding = PopupBox(options, 'padding')
+  if position.core_line != position.line + border[0] + padding[0]
+      || position.core_col != position.col + border[3] + padding[3]
+      || position.width != position.core_width + border[1] + border[3] + padding[1] + padding[3]
+      || position.height != position.core_height + border[0] + border[2] + padding[0] + padding[2]
+    throw 'Clipped Vim popup decorations use the compatibility view'
+  endif
+  if (&buftype !=# 'popup' && !NativeTextBuffer(&buftype))
+      || &rightleft || &arabic || &spell || &conceallevel > 0 || &list || &diff
+      || &number || &relativenumber || &foldcolumn != 0
+      || getwininfo(id)[0].textoff != 0 || !empty(getmatches())
+    throw 'This Vim popup display option uses the compatibility view'
+  endif
+  var normal = PopupNormalStyle()
+  var runs: list<dict<any>> = []
+  # Opaque background includes padding and empty/minheight rows.
+  for row in range(view.row, view.row + view.rows - 1)
+    CompletionText(runs, repeat(' ', view.columns), row, view.column, normal)
+  endfor
+  var chars: list<string> = &encoding ==# 'utf-8' && &ambiwidth ==# 'single'
+    ? ['═', '║', '═', '║', '╔', '╗', '╝', '╚']
+    : ['-', '|', '-', '|', '+', '+', '+', '+']
+  var supplied: any = get(options, 'borderchars', [])
+  if !empty(supplied)
+    if type(supplied) != v:t_list || len(supplied) != 8
+      throw 'Complex Vim popup border characters use the compatibility view'
+    endif
+    for glyph in supplied
+      if type(glyph) != v:t_string || strchars(glyph, true) != 1
+          || strdisplaywidth(glyph) != 1 || glyph =~# '[\x00-\x1f\x7f]'
+        throw 'Complex Vim popup border characters use the compatibility view'
+      endif
+    endfor
+    chars = supplied
+  endif
+  var borderStyles: list<dict<any>> = []
+  var groups: any = get(options, 'borderhighlight', ['', '', '', ''])
+  if type(groups) != v:t_list || len(groups) != 4
+    throw 'Complex Vim popup border highlights use the compatibility view'
+  endif
+  for group in groups
+    if type(group) != v:t_string
+      throw 'Invalid Vim popup border highlight uses the compatibility view'
+    endif
+    add(borderStyles, empty(group) ? normal : MergeRenderStyle(normal, RenderStyle(hlID(group))))
+  endfor
+  var bottom = view.row + view.rows - 1
+  var right = view.column + view.columns - 1
+  for side in [0, 2]
+    if border[side] != 0
+      var row = side == 0 ? view.row : bottom
+      CompletionText(runs, repeat(chars[side], view.columns), row, view.column, borderStyles[side])
+    endif
+  endfor
+  for row in range(view.row + border[0], bottom - border[2])
+    if border[3] != 0
+      CompletionText(runs, chars[3], row, view.column, borderStyles[3])
+    endif
+    if border[1] != 0
+      CompletionText(runs, chars[1], row, right, borderStyles[1])
+    endif
+  endfor
+  for corner in [[0, 3, view.row, view.column, 4], [0, 1, view.row, right, 5],
+      [2, 1, bottom, right, 6], [2, 3, bottom, view.column, 7]]
+    if border[corner[0]] && border[corner[1]]
+      CompletionText(runs, chars[corner[4]], corner[2], corner[3], borderStyles[corner[0]])
+    endif
+  endfor
+  var properties = prop_list(1, {end_lnum: line('$')})
+  if len(properties) > 2048
+    throw 'Vim popup properties exceed the native paint budget'
+  endif
+  for property in properties
+    if has_key(property, 'text') || property.col <= 0
+      throw 'Vim popup virtual text uses the compatibility view'
+    endif
+    var name = get(property, 'type', '')
+    var typeBuffer = get(property, 'type_bufnr', 0)
+    property.definition = empty(name) ? {} : (typeBuffer > 0
+      ? prop_type_get(name, {bufnr: typeBuffer}) : prop_type_get(name))
+  endfor
+  for lnum in range(1, line('$'))
+    var text = getline(lnum)
+    if strlen(text) > 16384 || strdisplaywidth(text) > position.core_width
+        || foldclosed(lnum) >= 0 || text =~# '[\x00-\x08\x0a-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
+      throw 'Wrapped, clipped or complex Vim popup text uses the compatibility view'
+    endif
+    var lineProperties = filter(copy(properties), (_, prop) => prop.lnum == lnum)
+    if len(lineProperties) > 128
+      throw 'Vim popup line properties exceed the native paint budget'
+    endif
+    var byteColumn = 0
+    var column = 0
+    for index in range(strchars(text, true))
+      var glyph = strcharpart(text, index, 1, true)
+      var width = strdisplaywidth(glyph, column)
+      if width <= 0 || (width > 2 && glyph !=# "\t")
+        throw 'Complex Vim popup glyphs use the compatibility view'
+      endif
+      var style = RenderStyle(synID(lnum, byteColumn + 1, true))
+      var propertyStyle: dict<any> = {}
+      var priority = -2147483648
+      var combine = true
+      for property in lineProperties
+        var definition = property.definition
+        if byteColumn < property.col - 1 + property.length
+            && byteColumn + strlen(glyph) > property.col - 1
+            && get(definition, 'priority', 0) > priority && !empty(get(definition, 'highlight', ''))
+          propertyStyle = RenderStyle(hlID(definition.highlight))
+          priority = get(definition, 'priority', 0)
+          combine = !!get(definition, 'combine', true)
+        endif
+      endfor
+      if !empty(propertyStyle)
+        style = combine ? MergeRenderStyle(style, propertyStyle) : propertyStyle
+      endif
+      CompletionText(runs, glyph ==# "\t" ? repeat(' ', width) : glyph,
+        position.core_line + lnum - 2, position.core_col + column - 1,
+        MergeRenderStyle(normal, style))
+      byteColumn += strlen(glyph)
+      column += width
+    endfor
+  endfor
+  if len(runs) > 4096
+    throw 'Vim popup runs exceed the native paint budget'
+  endif
+  renderPopupSample = {id: id, zindex: zindex, view: view, default_style: normal, runs: runs}
+enddef
+
+def RenderPopups(): list<dict<any>>
+  var ids = VisiblePopups()
+  if len(ids) > 8
+    throw 'Vim popups exceed the native surface budget'
+  endif
+  var popups: list<dict<any>> = []
+  var count = 0
+  for id in ids
+    renderPopupSample = {}
+    win_execute(id, 'noautocmd call ' .. expand('<SID>') .. 'SampleRenderPopup()')
+    if empty(renderPopupSample)
+      throw 'A Vim popup changed during native sampling'
+    endif
+    count += len(renderPopupSample.runs)
+    if count > 4096
+      throw 'Vim popups exceed the native paint budget'
+    endif
+    add(popups, renderPopupSample)
+  endfor
+  # Vim paints the older popup above a newer popup at the same zindex.
+  return sort(popups, (a, b) => a.zindex == b.zindex ? b.id - a.id : a.zindex - b.zindex)
+enddef
+
 def RenderFrame(): dict<any>
   if workbenchActionDepth > 0
     return {event: 'render', supported: false,
       fallback_reason: 'A Vim workbench plugin is using the compatibility view',
       buffer: bufnr(), window: win_getid(), changedtick: b:changedtick, mode: mode(1),
-      rows: &lines, columns: &columns, runs: []}
+      rows: &lines, columns: &columns, runs: [], completion: v:null, popups: []}
   endif
   var active = win_getid()
   var activeMode = mode(1)
@@ -1734,15 +1971,21 @@ def RenderFrame(): dict<any>
     frame.runs = []
     frame.windows = []
   endif
-  frame.completion = v:null
-  if frame.supported && pumvisible()
+  if frame.supported
     try
-      frame.completion = RenderCompletion()
+      if pumvisible()
+        frame.completion = RenderCompletion()
+      endif
+      if renderProtocol >= 6
+        frame.popups = RenderPopups()
+      endif
     catch
       frame.supported = false
       frame.fallback_reason = v:exception
       frame.runs = []
       frame.windows = []
+      frame.completion = v:null
+      frame.popups = []
     endtry
   endif
   return frame
@@ -1779,6 +2022,7 @@ def EmitRender(force: bool = false)
       frame.fallback_reason = 'Native paint data exceeds the bounded frame budget'
       frame.runs = []
       frame.completion = v:null
+      frame.popups = []
       encoded = json_encode(frame)
     endif
     if force || encoded !=# previousRender
@@ -1839,7 +2083,8 @@ def EmitRender(force: bool = false)
     previousRenderRows = {}
     renderRevision += 1
     Send({event: 'render', revision: renderRevision, supported: false,
-      rows: &lines, columns: &columns, fallback_reason: 'Native paint unavailable: ' .. strcharpart(v:exception, 0, 512)})
+      rows: &lines, columns: &columns, completion: v:null, popups: [],
+      fallback_reason: 'Native paint unavailable: ' .. strcharpart(v:exception, 0, 512)})
   endtry
 enddef
 
@@ -2893,7 +3138,7 @@ def Receive(_: channel, message: string)
         return
       endif
       var requestedRender: any = get(request, 'render_protocol', 1)
-      if type(requestedRender) != v:t_number || index([1, 2, 3, 4, 5], requestedRender) < 0
+      if type(requestedRender) != v:t_number || index([1, 2, 3, 4, 5, 6], requestedRender) < 0
         throw 'Unsupported native render protocol'
       endif
       renderProtocol = requestedRender
@@ -2965,6 +3210,7 @@ augroup JTermVim9Bridge
   # Stock Vim has no universal event for a plugin changing :syntax rules
   # asynchronously. Providers can explicitly invalidate after such updates.
   autocmd User JTermVim9RenderInvalidate InvalidateRender()
+  autocmd User JTermVim9PopupChanged RenderChanged()
   autocmd WinScrolled,VimResized,OptionSet * RenderChanged()
   autocmd CompleteChanged,CompleteDone * RenderChanged()
   autocmd QuickFixCmdPost * Changed()
