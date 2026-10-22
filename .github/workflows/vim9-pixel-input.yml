@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/simplecc
-          ref: 476941ca2b4a59d3ead74dcb7d985a2c197902b3
+          ref: f4ac8b2a33ed09f76af544c1dce4aac0c7f72a70
           path: .providers/simplecc
           persist-credentials: false
       - name: Check out audited SimpleGit popup provider

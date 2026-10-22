@@ -31,7 +31,8 @@ replace modes, character and line selections, tabs, CJK/wide characters,
 base-plus-combining text, number/relative-number gutters, CursorLine,
 CursorColumn and colorcolumn guides, single-line
 search highlights, window-local plugin matches, diagnostic text-property
-highlights and bounded after/EOL virtual labels (see below). A
+highlights, bounded after/EOL virtual labels and inline hints in `nowrap`
+Normal/Insert/Replace views (see below). A
 standard single sign column renders the highest-priority visible sign text,
 GUI sign color, line/number highlights and equal-priority combinations. A
 non-ASCII grapheme keeps its own Vim display advance so font fallback cannot
@@ -43,7 +44,9 @@ The active cursor and Visual selection cannot leak into sibling windows.
 
 This is an incremental GUI buffer renderer, not a complete external Vim UI
 protocol. Terminal and prompt buffers, actual wrapped continuation rows, closed
-folds, general popup windows and complex/scrolling completion menus, multiple/image sign columns, fold columns, inline/aligned/wrapping virtual text,
+folds, general popup windows and complex/scrolling completion menus,
+multiple/image sign columns, fold columns, inline hints with `wrap`,
+above/below/right or wrapping virtual text, Visual selections with virtual labels,
 multiline/positional/zero-width search and match patterns, conceal matches, virtual-space cursors,
 unsupported listchars, conceal/spell/right-to-left display and block selections through tabs currently publish an explicit
 compatibility reason. Complex zero-width/bidirectional text and clipped wide
@@ -608,7 +611,7 @@ live and last presented overlay are gone. Vim owns keyboard filters, selection,
 
 This version accepts complete, unwrapped text, including default `wrap` when
 no line actually wraps. Scrolled/clipped/wrapped content, titles, resize/drag,
-filters, virtual text, conceal, unsupported decorations and excessive budgets
+filters, popup virtual text, conceal, unsupported decorations and excessive budgets
 fall back explicitly. It does not add a rich Markdown/image document renderer
 or generic interactive popup widgets. Protocols 1–5
 retain their previous popup fallback. `runtime/vim9/test_render_popups.py`
