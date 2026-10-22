@@ -30,6 +30,10 @@ pub use project::{Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot};
 mod navigation;
 pub use navigation::{parse_vim9_location, Vim9QuickOpenQuery};
 
+#[path = "vim9_palette.rs"]
+mod palette;
+pub use palette::{vim9_palette_matches, vim9_palette_query, Vim9PaletteCommand};
+
 #[path = "vim9_render.rs"]
 mod render;
 pub use render::{
@@ -2085,7 +2089,13 @@ mod tests {
             child.0.try_wait().unwrap().is_none(),
             "dirty Vim must remain alive"
         );
-        editor.send(Vim9Command::Save).unwrap();
+        editor
+            .send(
+                Vim9PaletteCommand::Save
+                    .command(&editor.snapshot())
+                    .unwrap(),
+            )
+            .unwrap();
         wait_for(|| editor.snapshot().pending == 0 && !editor.snapshot().modified);
         assert_eq!(fs::read_to_string(&second).unwrap(), "three\nfXour\n");
 
@@ -2111,16 +2121,34 @@ mod tests {
         assert_eq!(editor.snapshot().column, 3);
         assert_eq!(editor.snapshot().line_count, 2);
         assert_eq!(editor.snapshot().encoding, "utf-8");
-        editor.send(Vim9Command::PreviousBuffer).unwrap();
+        editor
+            .send(
+                Vim9PaletteCommand::PreviousBuffer
+                    .command(&editor.snapshot())
+                    .unwrap(),
+            )
+            .unwrap();
         wait_for(|| {
             editor.snapshot().pending == 0 && editor.snapshot().file == first.to_str().unwrap()
         });
-        editor.send(Vim9Command::NextBuffer).unwrap();
+        editor
+            .send(
+                Vim9PaletteCommand::NextBuffer
+                    .command(&editor.snapshot())
+                    .unwrap(),
+            )
+            .unwrap();
         wait_for(|| {
             editor.snapshot().pending == 0 && editor.snapshot().file == second.to_str().unwrap()
         });
         assert_eq!(editor.snapshot().column, 3);
-        editor.send(Vim9Command::Split { vertical: true }).unwrap();
+        editor
+            .send(
+                Vim9PaletteCommand::SplitVertical
+                    .command(&editor.snapshot())
+                    .unwrap(),
+            )
+            .unwrap();
         wait_for(|| editor.snapshot().pending == 0 && editor.snapshot().window_count == 2);
         master.write_all(b"iY\x1b").unwrap();
         wait_for(|| editor.snapshot().modified && editor.snapshot().mode == "n");

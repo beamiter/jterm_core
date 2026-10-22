@@ -149,7 +149,7 @@ not in a normal terminal tab or a native text field):
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+Shift+P` | Quick Open: fuzzy-match project-relative filenames |
+| `Ctrl+Shift+P` | Quick Open: fuzzy-match filenames, or start with `>` for commands |
 | `Ctrl+Shift+G` | Go to a one-based `line` or `line:byte-column` in the current buffer |
 | `Ctrl+S` / `Ctrl+Shift+S` | Save / Save all |
 | `Ctrl+Shift+F` | Focus project search |
@@ -184,6 +184,19 @@ An exact indexed prefix also wins: when `notes:42` is a real file,
 explicit Open path control. All four frontends share the same parser and send
 typed Open/Goto actions; the query never becomes an Ex or shell command.
 
+Start the same picker query with `>` to search the shared command palette.
+For example, `>vertical split`, `>format` and `>hover` find split, formatting
+and symbol documentation actions. Names and aliases support case-insensitive
+fuzzy matching, including common Chinese labels. The palette lists shortcuts
+and explains unavailable actions, such as a missing language-service capability,
+an empty quickfix list or a stopped build. Availability is checked again on
+activation against the current Vim state. Save/all, buffer switching, splits,
+jump history, quickfix navigation, definition, documentation, references,
+formatting and stopping an active build/search use existing typed commands;
+the picker does not execute arbitrary Ex or shell text. Commands work without
+the project index, including while scanning fails. Use `./>notes` to find a
+literal filename starting with `>`. Escape returns focus to the editor.
+
 Native split controls create real Vim horizontal/vertical windows sharing
 Vim's buffers and undo. Buffer navigation restores remembered cursor/scroll
 positions. Closing a buffer never forces a write or discards changes, even
@@ -191,6 +204,12 @@ when `hidden` is set; closing the last saved buffer leaves an unnamed Vim
 buffer. Keyboard close resolves the current buffer inside Vim after earlier
 navigation commands; a buffer tab's close button targets that specific tab.
 Ordinary `Ctrl+P`, `Ctrl+G`, `Ctrl+O` and `Ctrl+W` remain Vim keys.
+
+When multiple native splits are visible, a thin inner accent outline identifies
+the active Vim window without moving text or covering its status line or
+separators. Completion overlays remain above the focus indicator. Problem rows
+show severity and a project-relative location, with full detail available on
+hover; the actual quickfix list continues to own F8 navigation.
 
 The native Back and Forward controls share Vim's real per-window jumplist
 with `Ctrl+O` / `Ctrl+I`, including file, definition and quickfix jumps. Native
