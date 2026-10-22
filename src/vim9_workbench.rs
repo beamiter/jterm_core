@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum Vim9WorkbenchAction {
     SimpleFiles,
+    SimpleRecent,
+    SimpleTreeToggle,
+    SimpleTreeReveal,
+    SimpleTerminalToggle,
+    SimpleTerminalNew,
+    SimpleTerminalNext,
+    SimpleTerminalPrevious,
     SimpleBuffers,
     SimpleGrep,
     SimpleOutline,
@@ -25,8 +32,15 @@ pub enum Vim9WorkbenchAction {
 }
 
 impl Vim9WorkbenchAction {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 22] = [
         Self::SimpleFiles,
+        Self::SimpleRecent,
+        Self::SimpleTreeToggle,
+        Self::SimpleTreeReveal,
+        Self::SimpleTerminalToggle,
+        Self::SimpleTerminalNew,
+        Self::SimpleTerminalNext,
+        Self::SimpleTerminalPrevious,
         Self::SimpleBuffers,
         Self::SimpleGrep,
         Self::SimpleOutline,
@@ -46,6 +60,13 @@ impl Vim9WorkbenchAction {
     pub fn capability(self) -> &'static str {
         match self {
             Self::SimpleFiles => "simple_files",
+            Self::SimpleRecent => "simple_recent",
+            Self::SimpleTreeToggle => "simple_tree_toggle",
+            Self::SimpleTreeReveal => "simple_tree_reveal",
+            Self::SimpleTerminalToggle => "simple_terminal_toggle",
+            Self::SimpleTerminalNew => "simple_terminal_new",
+            Self::SimpleTerminalNext => "simple_terminal_next",
+            Self::SimpleTerminalPrevious => "simple_terminal_previous",
             Self::SimpleBuffers => "simple_buffers",
             Self::SimpleGrep => "simple_grep",
             Self::SimpleOutline => "simple_outline",
@@ -66,6 +87,13 @@ impl Vim9WorkbenchAction {
     pub fn title(self) -> &'static str {
         match self {
             Self::SimpleFiles => "Simple: Find files",
+            Self::SimpleRecent => "Simple: Find recent files",
+            Self::SimpleTreeToggle => "Simple: Toggle project tree",
+            Self::SimpleTreeReveal => "Simple: Reveal current file in tree",
+            Self::SimpleTerminalToggle => "Simple: Toggle terminal",
+            Self::SimpleTerminalNew => "Simple: Open new terminal",
+            Self::SimpleTerminalNext => "Simple: Switch to next terminal",
+            Self::SimpleTerminalPrevious => "Simple: Switch to previous terminal",
             Self::SimpleBuffers => "Simple: Find open buffers",
             Self::SimpleGrep => "Simple: Search project text",
             Self::SimpleOutline => "Simple: Show symbol outline",
@@ -86,6 +114,13 @@ impl Vim9WorkbenchAction {
     pub(super) fn aliases(self) -> &'static [&'static str] {
         match self {
             Self::SimpleFiles => &["simplefinder files", "查找文件"],
+            Self::SimpleRecent => &["simplefinder recent history", "最近文件"],
+            Self::SimpleTreeToggle => &["simpletree simpleremote tree explorer", "项目目录树"],
+            Self::SimpleTreeReveal => &["simpletree simpleremote reveal file", "定位当前文件"],
+            Self::SimpleTerminalToggle => &["simpleterminal toggle shell", "切换终端"],
+            Self::SimpleTerminalNew => &["simpleterminal new shell", "新建终端"],
+            Self::SimpleTerminalNext => &["simpleterminal next shell", "下一个终端"],
+            Self::SimpleTerminalPrevious => &["simpleterminal previous shell", "上一个终端"],
             Self::SimpleBuffers => &["simplefinder buffers", "查找缓冲区"],
             Self::SimpleGrep => &["simplefinder grep", "搜索项目"],
             Self::SimpleOutline => &["simplecc outline", "符号大纲"],

@@ -33,7 +33,7 @@ pub enum Vim9PaletteCommand {
     Workbench(Vim9WorkbenchAction),
 }
 
-const COMMANDS: [Vim9PaletteCommand; 31] = {
+const COMMANDS: [Vim9PaletteCommand; 38] = {
     use Vim9PaletteCommand::*;
     [
         Save,
@@ -53,6 +53,13 @@ const COMMANDS: [Vim9PaletteCommand; 31] = {
         CancelBuild,
         CancelSearch,
         Workbench(Vim9WorkbenchAction::SimpleFiles),
+        Workbench(Vim9WorkbenchAction::SimpleRecent),
+        Workbench(Vim9WorkbenchAction::SimpleTreeToggle),
+        Workbench(Vim9WorkbenchAction::SimpleTreeReveal),
+        Workbench(Vim9WorkbenchAction::SimpleTerminalToggle),
+        Workbench(Vim9WorkbenchAction::SimpleTerminalNew),
+        Workbench(Vim9WorkbenchAction::SimpleTerminalNext),
+        Workbench(Vim9WorkbenchAction::SimpleTerminalPrevious),
         Workbench(Vim9WorkbenchAction::SimpleBuffers),
         Workbench(Vim9WorkbenchAction::SimpleGrep),
         Workbench(Vim9WorkbenchAction::SimpleOutline),
@@ -405,6 +412,48 @@ mod tests {
             Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleNextDiagnostic)
                 .command(&snapshot)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_actions_capture_source_and_leave_terminal_job_input_to_vim() {
+        let mut snapshot = connected();
+        snapshot.buffer = 4;
+        snapshot.window = 1001;
+        snapshot.changedtick = 9;
+        for action in [
+            Vim9WorkbenchAction::SimpleRecent,
+            Vim9WorkbenchAction::SimpleTreeToggle,
+            Vim9WorkbenchAction::SimpleTreeReveal,
+            Vim9WorkbenchAction::SimpleTerminalToggle,
+            Vim9WorkbenchAction::SimpleTerminalNew,
+            Vim9WorkbenchAction::SimpleTerminalNext,
+            Vim9WorkbenchAction::SimpleTerminalPrevious,
+        ] {
+            let command = Vim9PaletteCommand::Workbench(action);
+            assert!(command.command(&snapshot).is_err());
+            snapshot.capabilities.push(action.capability().into());
+            let request = serde_json::to_value(command.command(&snapshot).unwrap()).unwrap();
+            assert_eq!(request["command"], action.capability());
+            assert_eq!(request["window"], 1001);
+            assert_eq!(request["buffer"], 4);
+            assert_eq!(request["changedtick"], 9);
+            snapshot.mode = "t".into();
+            assert!(command.command(&snapshot).is_err());
+            snapshot.mode = "n".into();
+        }
+        assert_eq!(vim9_palette_matches("simpleterminal", 256).len(), 4);
+        let tree = vim9_palette_matches("simpletree", 2);
+        assert!(tree.contains(&Vim9PaletteCommand::Workbench(
+            Vim9WorkbenchAction::SimpleTreeToggle
+        )));
+        assert!(tree.contains(&Vim9PaletteCommand::Workbench(
+            Vim9WorkbenchAction::SimpleTreeReveal
+        )));
+        assert!(
+            vim9_palette_matches("最近文件", 256).contains(&Vim9PaletteCommand::Workbench(
+                Vim9WorkbenchAction::SimpleRecent
+            ))
         );
     }
 

@@ -208,7 +208,9 @@ const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
   'simple_outline', 'simple_rename', 'simple_code_action', 'simple_git_status',
   'simple_git_diff', 'simple_git_hunk', 'simple_markdown_preview', 'simple_keys',
   'simple_workbench', 'simple_diagnostics', 'simple_next_diagnostic',
-  'simple_previous_diagnostic']
+  'simple_previous_diagnostic', 'simple_recent', 'simple_tree_toggle',
+  'simple_tree_reveal', 'simple_terminal_toggle', 'simple_terminal_new',
+  'simple_terminal_next', 'simple_terminal_previous']
 const WORKBENCH_SEMANTICS = ['definition', 'hover', 'references', 'format']
 
 def WorkbenchCapabilities(): list<string>

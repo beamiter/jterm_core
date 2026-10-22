@@ -384,7 +384,7 @@ def g:VimrcWorkbenchDiagnostics(): dict<any>
 ```
 
 The first hook returns available actions for the **current** buffer. The bridge
-accepts only `definition`, `hover`, `references`, `format` and the fifteen
+accepts only `definition`, `hover`, `references`, `format` and the twenty-two
 `simple_*` actions below, deduplicating at most 64 entries. Existing typed
 semantic commands prefer a declared workbench provider, then retain their
 built-in LSP/tags fallback. SimpleCC's rename uses its own prepare-rename and
@@ -394,6 +394,12 @@ does not claim to consume the existing `rename` request's `name` argument.
 | Fixed action | Plugin workflow |
 | --- | --- |
 | `simple_files` | SimpleFinder files |
+| `simple_recent` | SimpleFinder recent files |
+| `simple_tree_toggle` | SimpleRemote project tree, or SimpleTree when the remote wrapper is absent |
+| `simple_tree_reveal` | Reveal the current file through SimpleRemote, or SimpleTree |
+| `simple_terminal_toggle` | Show/hide the current SimpleTerminal session |
+| `simple_terminal_new` | Open a new SimpleTerminal session |
+| `simple_terminal_next` / `simple_terminal_previous` | Cycle SimpleTerminal sessions |
 | `simple_buffers` | SimpleFinder buffers |
 | `simple_grep` | SimpleFinder interactive project grep |
 | `simple_outline` | SimpleCC symbol outline |
@@ -410,7 +416,7 @@ does not claim to consume the existing `rename` request's `name` argument.
 | `simple_workbench` | Vimrc workbench report |
 
 Every native command palette offers this finite catalog with aliases such as
-`>simple`, `>git`, `>markdown` and `>workbench`. Absent plugins, disabled actions
+`>simple`, `>simpletree`, `>simpleterminal`, `>git`, `>markdown` and `>workbench`. Absent plugins, disabled actions
 and unsuitable buffer types remain visible with an unavailable reason. The
 action hook must recheck availability and throw on failure. The native request
 has no free-form Ex command, key sequence, callback name or executable field:
@@ -429,6 +435,25 @@ This makes blocking plugin input loops such as SimpleWhichKey's `getcharstr()`
 visible even when they prevent paint timers from running. Native overlays stay
 retired until the synchronous hook returns; failures also restore painting.
 Asynchronous prompts and popups continue using the ordinary mode/display checks.
+
+Tree actions reuse the vimrc's remote-aware commands when present, so a remote
+workspace is not silently redirected to a local tree. Reveal requires a named
+file buffer and follows the plugin's requirement to open the tree first;
+it locates the file while preserving the source-window focus. Toggling the
+tree also works from its own scratch buffer.
+The companion SimpleTree change restores selection after a background file
+refresh through `cursor()` rather than synthesized Normal keys. This keeps
+Vim's input safety state intact, so a subsequent native action does not become
+stuck behind a false pending-input state.
+Terminal actions take no shell command or session identifier from the host.
+The plugin owns shell selection, local/remote workspace routing and session
+lifetime. Toggle or cycle with no existing session can create one, matching
+the original plugin commands. Hiding a terminal preserves the running session.
+Terminal-job mode continues to reject native workbench actions. Its F8 and
+Shift-F8 keys stay with Vim in all four frontends, including when the native
+Problems panel is visible; the same applies in Terminal-Normal mode.
+Reopening a session can preserve Terminal-Normal mode; `i` resumes shell input
+using Vim's existing terminal behavior.
 
 `VimrcWorkbenchState()` must only read cached state. The bridge projects a
 closed schema into `Vim9Snapshot.workbench`, ignoring all other fields:
@@ -490,7 +515,7 @@ The optional cross-repository suite uses actual `vimrc`, `simplecc`,
 other checkout layouts can select the vimrc and plugin parent explicitly:
 
 ```sh
-VIM9_TEST_VIMRC=/path/to/vimrc VIM9_TEST_SIMPLE_ROOT=/path/to/plugin-parent python3 -m unittest -v test_vimrc_workbench test_simple_diagnostics
+VIM9_TEST_VIMRC=/path/to/vimrc VIM9_TEST_SIMPLE_ROOT=/path/to/plugin-parent python3 -m unittest -v test_vimrc_workbench test_simple_diagnostics test_simple_finder test_simple_workspace
 ```
 
 That suite loads the real configuration and plugin runtimes in isolated test
@@ -501,6 +526,11 @@ popup-to-native recovery and diagnostic publication/clearing with Unicode byte
 positions. These tests run without installing plugins or contacting language servers or
 remote machines. Its fixture replies are not evidence of an external LSP
 server's correctness.
+The optional finder/workspace suites additionally need the SimpleFinder,
+SimpleTree and SimpleTerminal checkouts. They exercise real buffer selection,
+preview cancellation, tree toggle/reveal and a local `/bin/sh` terminal,
+including F8 return and session reuse. Tree tests use an existing daemon binary
+or the plugin's checked-in protocol fixture; nothing is downloaded.
 
 `VIM9_TEST_VIM` is optional when `vim` is on PATH. These Python-standard-library
 tests create isolated files, actual PTYs and private loopback sockets, then

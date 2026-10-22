@@ -273,7 +273,7 @@ the project index, including while scanning fails. Use `./>notes` to find a
 literal filename starting with `>`. Escape returns focus to the editor.
 
 When using `beamiter/vimrc`, `>simple` exposes its SimpleFinder, SimpleCC,
-SimpleGit, SimpleMarkdown and SimpleWhichKey workflows. `>git`, `>markdown`
+SimpleGit, SimpleMarkdown, SimpleWhichKey, SimpleTree and SimpleTerminal workflows. `>git`, `>markdown`
 and `>workbench` narrow that catalog. Missing plugins or unsuitable buffers
 show an unavailable reason, and activation checks the actual source window,
 buffer and text version before calling the vimrc's fixed action adapter.
@@ -282,6 +282,14 @@ severity counts and connected remote workspace context; the same compact
 summary appears in the optional statusbar. No permanent panel is required.
 See [the Simple workbench contract](../runtime/vim9/README.md#simple-plugin-workbench)
 for hook names, limits and compatibility behavior.
+
+`>simpletree` toggles the project tree or reveals the current file using the
+same remote-aware routing as the vimrc's tree mappings. `>simpleterminal`
+shows/hides, creates or cycles plugin-owned sessions. The plugin can create a
+session when none exists and follows the current local/remote workspace.
+F8/Shift-F8 remain Vim keys while a terminal is active, even with the native
+Problems panel visible. Hiding it returns to the editor without killing the
+shell. `Simple: Find recent files` adds the existing SimpleFinder history picker.
 
 Native split controls create real Vim horizontal/vertical windows sharing
 Vim's buffers and undo. Buffer navigation restores remembered cursor/scroll
@@ -483,12 +491,14 @@ windows), 110 shared Rust Vim9 tests, SimpleCC's 15 Vim suites and Vimrc's
 workbench regression. The cross-repository tests use isolated homes and a
 deterministic daemon fixture, including direct cache reads, Unicode navigation,
 publication/clearing and real plugin prompts. Rust formatting and all-target
-Clippy passed. Local-family `check --all-targets` passed for Ember and Frost.
-Forge and Anvil reached a local SDK limitation: system GTK/GLib are too old,
-and the available newer SDK lacks `sysprof-capture-4` pkg-config metadata.
-Their builds and desktop acceptance remain unverified for this follow-up.
-These are source changes; released dependency pins and installed binaries are
-not updated by the local-family validation runner.
+Clippy passed. The subsequent workspace follow-up adds real Finder selection,
+tree reveal/background refresh and two-session terminal tests, plus 111 shared
+Rust Vim9 tests. F8/Shift-F8 routing tests passed for all four frontends; the
+GTK harnesses use the matching Nix GCC/glibc toolchain. The initial GTK SDK gap
+was resolved with its exact `sysprof-capture` and `appstream` development
+dependencies, allowing Forge and Anvil's all-target checks to run as well.
+The local-family runner itself does not change release pins or install
+binaries. Desktop GPU/IME acceptance remains separate from these checks.
 
 Official references:
 

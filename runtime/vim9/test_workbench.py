@@ -65,9 +65,14 @@ class WorkbenchTests(unittest.TestCase):
         e.connection.close()
         e.connection = None
         deadline = time.monotonic() + 2
-        while not (self.root / "workbench-disconnected.marker").exists() and time.monotonic() < deadline:
+        marker = self.root / "workbench-disconnected.marker"
+        # writefile() creates the file before writing its contents. Waiting
+        # for existence alone races the real callback under parallel builds.
+        while time.monotonic() < deadline:
+            if marker.exists() and marker.read_text() == "v:false\n0\n":
+                break
             e.pump(0.02)
-        self.assertEqual((self.root / "workbench-disconnected.marker").read_text(), "v:false\n0\n")
+        self.assertEqual(marker.read_text(), "v:false\n0\n")
         self.assertIsNone(e.process.poll(), "a lost provider bridge must leave Vim alive")
 
     def test_capabilities_are_closed_bounded_and_rechecked(self):
@@ -135,6 +140,22 @@ class WorkbenchTests(unittest.TestCase):
         self.assertFalse((self.root / "workbench-actions.marker").exists())
         e.request("workbench", command="simple_files", **current)
         self.assertEqual((self.root / "workbench-actions.marker").read_text(), "simple_files\n")
+
+    def test_workspace_actions_use_closed_source_bound_catalog(self):
+        e = self.editor()
+        actions = ['simple_recent', 'simple_tree_toggle', 'simple_tree_reveal',
+                   'simple_terminal_toggle', 'simple_terminal_new',
+                   'simple_terminal_next', 'simple_terminal_previous']
+        e.ex('let g:workbench_actions = ' + str(actions))
+        source = self.source(e.snapshot())
+        for action in actions:
+            e.request('workbench', command=action, **source)
+        self.assertEqual((self.root / 'workbench-actions.marker').read_text().splitlines(), actions)
+        # The workspace extension must not become a generic terminal command
+        # or destructive session control transport.
+        for action in ['simple_terminal_kill', 'simple_terminal_send', 'simple_tree_delete']:
+            e.request('workbench', command=action, ok=False, **source)
+        self.assertEqual((self.root / 'workbench-actions.marker').read_text().splitlines(), actions)
 
     def test_semantic_provider_precedence_preserves_typed_rename(self):
         e = self.editor(plugin=True)
