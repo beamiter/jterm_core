@@ -28,6 +28,8 @@ var authenticated = false
 var shuttingDown = false
 var sending = false
 var sequence = 0
+var sendBatchDepth = 0
+var sendBatch = ''
 var pendingQuit = 0
 var flushTimer = -1
 var pollTimer = -1
@@ -77,6 +79,7 @@ var renderBaseKey = ''
 var renderBase: list<dict<any>> = []
 var renderStyles: dict<dict<any>> = {}
 var renderThemeKey = ''
+var renderThemeGeneration = 0
 var renderNormal: dict<any> = {}
 var cursorOption: any = v:null
 var cursorShapes: dict<dict<any>> = {}
@@ -175,7 +178,20 @@ def Send(payload: dict<any>)
   sequence += 1
   payload.protocol = 1
   payload.seq = sequence
-  ch_sendraw(bridge, json_encode(payload) .. "\n")
+  var encoded = json_encode(payload) .. "\n"
+  if sendBatchDepth > 0
+    sendBatch ..= encoded
+  else
+    ch_sendraw(bridge, encoded)
+  endif
+enddef
+
+def FlushSendBatch()
+  var encoded = sendBatch
+  sendBatch = ''
+  if !empty(encoded) && ch_status(bridge) ==# 'open'
+    ch_sendraw(bridge, encoded)
+  endif
 enddef
 
 def Reply(id: number, ok: bool, error: string = '')
@@ -258,6 +274,7 @@ def RefreshRenderTheme()
   var key = string([&background, hlget(), v:colornames])
   if key !=# renderThemeKey
     renderThemeKey = key
+    renderThemeGeneration += 1
     renderBaseKey = ''
     renderStyles = {}
     renderNormal = {}
@@ -454,6 +471,9 @@ def AddRenderRun(runs: list<dict<any>>, glyph: dict<any>, style: dict<any>)
   if has_key(run, 'match_style')
     remove(run, 'match_style')
   endif
+  if has_key(run, 'paint_style')
+    remove(run, 'paint_style')
+  endif
   add(runs, run)
 enddef
 
@@ -587,12 +607,25 @@ def ScrollSourceWindow(request: dict<any>, id: number)
   if type(left) != v:t_number || left < 0 || nativeScrollLeft != left
     throw 'The horizontal native viewport changed before scrolling'
   endif
-  ScrollWindow(request)
-  scrollAcknowledgements = filter(scrollAcknowledgements, (key, _) => win_id2win(str2nr(key)) > 0)
-  scrollAcknowledgements[string(window)] = id
-  # Publish the acknowledged semantic view before the response. The host does
-  # not have to infer completion from cursor-only or unrelated render frames.
-  EmitRender()
+  # Batch only the validated scroll transaction. In particular, getchar(1)
+  # above can run nested callbacks while a save waits for SafeState; those
+  # unrelated input/save callbacks retain their existing immediate delivery.
+  sendBatchDepth += 1
+  try
+    ScrollWindow(request)
+    scrollAcknowledgements = filter(scrollAcknowledgements, (key, _) => win_id2win(str2nr(key)) > 0)
+    scrollAcknowledgements[string(window)] = id
+    # Keep semantic acknowledgement before response, but in one channel write.
+    # Separate small writes can wait for TCP's delayed ACK/Nagle timer and
+    # stall the next source-bound request by roughly 40ms even on loopback.
+    EmitRender()
+    Reply(id, true)
+  finally
+    sendBatchDepth -= 1
+    if sendBatchDepth == 0
+      FlushSendBatch()
+    endif
+  endtry
 enddef
 
 def SourcePointer(request: dict<any>)
@@ -653,10 +686,14 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   var info = getwininfo(win_getid())[0]
   var view = {row: info.winrow - 1, column: info.wincol - 1,
     rows: info.height, columns: info.width}
+  # Keep a statically typed local for the append hot path. Passing frame.runs
+  # (dict<any> lookup) into AddRenderRun makes Vim recursively infer/check the
+  # growing list on every glyph, even when its parameter is list<any>.
+  var paintRuns: list<dict<any>> = []
   var frame: dict<any> = {event: 'render', supported: true, fallback_reason: '',
     rows: &lines, columns: &columns, window: win_getid(), buffer: bufnr(),
     changedtick: b:changedtick, mode: mode(1), view: view,
-    default_style: renderNormal, cursor: {row: 0, column: 0, width: 1, visible: false}, runs: []}
+    default_style: renderNormal, cursor: {row: 0, column: 0, width: 1, visible: false}, runs: paintRuns}
   var reason = RenderFallback()
   if !empty(reason)
     frame.supported = false
@@ -742,7 +779,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   # propagate arbitrarily far beyond the edited line.
   var generation = string([bufnr(), b:changedtick, savedView.leftcol,
     view.column, view.columns, info.textoff, &tabstop, &vartabstop, &wrap, &syntax, &synmaxcol,
-    &number, &relativenumber, &numberwidth, &ambiwidth, renderThemeKey,
+    &number, &relativenumber, &numberwidth, &ambiwidth, renderThemeGeneration,
     &hlsearch, v:hlsearch, @/, &ignorecase, &smartcase, &magic, &iskeyword, &isprint, matches])
   if generation !=# renderLineGeneration
     renderLineGeneration = generation
@@ -855,8 +892,21 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       if !empty(reason)
         break
       endif
-      nextLines[string(lineNumber)] = {key: lineKey,
-        base: runStart < len(renderBase) ? renderBase[runStart :] : []}
+      var lineBase = runStart < len(renderBase) ? renderBase[runStart :] : []
+      # Default/syntax/property/match composition is source-line data, not
+      # viewport data. Surviving lines reuse it while cursor/Visual overlays
+      # are composed from current Vim state below.
+      for glyph in lineBase
+        var paintStyle = MergeRenderStyle(renderNormal, glyph.style)
+        if !empty(glyph.match_style)
+          paintStyle = MergeRenderStyle(paintStyle, glyph.match_style)
+        endif
+        if !empty(glyph.override_style)
+          paintStyle = MergeRenderStyle(paintStyle, glyph.override_style)
+        endif
+        glyph.paint_style = paintStyle
+      endfor
+      nextLines[string(lineNumber)] = {key: lineKey, base: lineBase}
     endfor
     if empty(reason)
       renderBaseKey = baseKey
@@ -915,20 +965,23 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       return frame
     endif
     for glyph in empty(visual) ? [baseGlyph] : RenderSelectionSegments(baseGlyph, visual, anchor, current, block)
-      var style = MergeRenderStyle(renderNormal, glyph.style)
-      if has_key(rowStyles, string(glyph.line))
-        style = MergeRenderStyle(style, rowStyles[string(glyph.line)])
+      var style = glyph.paint_style
+      if !empty(visual) || has_key(rowStyles, string(glyph.line))
+        style = MergeRenderStyle(renderNormal, glyph.style)
+        if has_key(rowStyles, string(glyph.line))
+          style = MergeRenderStyle(style, rowStyles[string(glyph.line)])
+        endif
+        if !empty(glyph.match_style)
+          style = MergeRenderStyle(style, glyph.match_style)
+        endif
+        if !empty(visual) && RenderSelected(glyph, visual, anchor, current, block)
+          style = MergeRenderStyle(style, visualStyle)
+        endif
+        if !empty(glyph.override_style)
+          style = MergeRenderStyle(style, glyph.override_style)
+        endif
       endif
-      if !empty(glyph.match_style)
-        style = MergeRenderStyle(style, glyph.match_style)
-      endif
-      if !empty(visual) && RenderSelected(glyph, visual, anchor, current, block)
-        style = MergeRenderStyle(style, visualStyle)
-      endif
-      if !empty(glyph.override_style)
-        style = MergeRenderStyle(style, glyph.override_style)
-      endif
-      AddRenderRun(frame.runs, glyph, style)
+      AddRenderRun(paintRuns, glyph, style)
     endfor
   endfor
   # Vim selects one display cell for the newline, including an empty buffer
@@ -1260,6 +1313,13 @@ enddef
 def EmitRender(force: bool = false)
   if !renderEnabled || !authenticated || shuttingDown || ch_status(bridge) !=# 'open'
     return
+  endif
+  # Source-bound scrolling publishes before its response. That paint already
+  # consumes the work queued by Changed()/WinScrolled; leaving the 16ms timer
+  # alive would sample and compose the same viewport again after every ack.
+  if renderTimer >= 0
+    timer_stop(renderTimer)
+    renderTimer = -1
   endif
   try
     var frame = RenderFrame()
@@ -2094,6 +2154,7 @@ def Dispatch(request: dict<any>, id: number)
     ScrollWindow(request)
   elseif action ==# 'scroll_view'
     ScrollSourceWindow(request, id)
+    return  # The ordered response was included with the semantic ack.
   elseif action ==# 'pointer'
     SourcePointer(request)
   elseif action ==# 'build'
@@ -2306,6 +2367,8 @@ def Leaving()
     Reply(pendingQuit, true)
   endif
   Send({event: 'bye'})
+  # A nested shutdown must not strand a scroll's already-encoded messages.
+  FlushSendBatch()
   shuttingDown = true
   if buildRunning
     job_stop(buildJob)

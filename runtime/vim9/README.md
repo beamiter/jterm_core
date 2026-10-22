@@ -392,6 +392,15 @@ to verify automatic recovery without losing editing commands.
 These tests do not validate frontend font rendering, desktop IME integration,
 mouse input or all user plugins; those are frontend/desktop verification tasks.
 
+## Scroll performance
+
+`python3 runtime/vim9/benchmark_scroll.py --lines 10000` measures protocol-5
+source-bound scroll requests with real Vim, Rust syntax, Unicode, relative
+numbers, CursorLine and one/two windows. `--runtime /path/to/bridge.vim` compares
+an exported baseline. It reports ordered semantic ack/response latency and Vim
+CPU, not GUI FPS. See the [measured pipeline follow-up](../../docs/vim9-scroll-validation.md)
+for the workload, results and remaining display acceptance boundaries.
+
 ## Primary references
 
 - [Official Vim channel/job documentation](https://github.com/vim/vim/blob/master/runtime/doc/channel.txt): NL framing, callbacks, async jobs and channel lifetime.

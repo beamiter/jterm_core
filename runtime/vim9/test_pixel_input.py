@@ -45,6 +45,31 @@ class PixelInputTests(unittest.TestCase):
         self.assertEqual(after['window'], w['window'])
         self.assertEqual(after['changedtick'], w['changedtick'])
 
+    def test_sustained_scroll_orders_each_semantic_ack_before_its_response(self):
+        e = self.editor
+        e.ex('set number relativenumber cursorline scrolloff=5')
+        w = self.window()
+        original = w.copy()
+        for lines in [1] * 16 + [-1] * 16:
+            reply = e.request('scroll_view', **self.source(w),
+                              topline=w['topline'], leftcol=w['leftcol'], lines=lines)
+            frame = e.wait(lambda m: m.get('event') in ('render', 'render_delta')
+                           and any(v.get('scroll_ack') == reply['id'] for v in m.get('windows', [])))
+            self.assertTrue(frame['supported'], frame.get('fallback_reason'))
+            self.assertLess(frame['seq'], reply['seq'])
+            after = next(v for v in frame['windows'] if v['window'] == w['window'])
+            self.assertEqual(after['topline'], w['topline'] + lines)
+            self.assertEqual(after['changedtick'], original['changedtick'])
+            w = after
+        self.assertEqual(w['topline'], original['topline'])
+        # A rejected stale request must flush its error and leave the next
+        # valid transaction usable, rather than stranding a batched response.
+        e.request('scroll_view', **self.source(w), topline=w['topline'] + 1,
+                  leftcol=w['leftcol'], lines=1, ok=False)
+        reply = e.request('scroll_view', **self.source(w), topline=w['topline'],
+                          leftcol=w['leftcol'], lines=1)
+        self.assertEqual(self.window()['scroll_ack'], reply['id'])
+
     def test_stale_scroll_does_not_move_a_repurposed_viewport(self):
         w = self.window()
         self.editor.ex('normal! 50Gzt')
