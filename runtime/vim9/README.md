@@ -572,6 +572,36 @@ to verify automatic recovery without losing editing commands.
 These tests do not validate frontend font rendering, desktop IME integration,
 mouse input or all user plugins; those are frontend/desktop verification tasks.
 
+## After/EOL virtual text
+
+The source-free buffer run format also carries bounded Vim text properties
+whose `col` is zero, `text_align` is `after` and `text_wrap` is `truncate`
+(omitted fields have those defaults). Source runs keep their original byte
+ranges and columns. Virtual labels use `line=0`, `byte_start=byte_end=0`,
+actual window identity and GUI property styles. ASCII can coalesce within a
+label; each non-ASCII grapheme retains Vim's display-cell advance.
+
+This is a producer addition with no new wire field or protocol version.
+`g:jterm_vim9_virtual_text_after` is true only after bridge authentication and
+is cleared before `User JTermVim9Disconnected`. Older protocol-6 producers
+do not publish this capability. `User SimpleCCDecorationsChanged` schedules
+native repaint after provider-owned property creation, clearing or replacement;
+the next ordinary row delta carries the complete replacement paint.
+
+Property priority/creation order, padding, listchars EOL, row/column guides,
+split-local styles, nowrap clipping and semantic scroll margins are supported.
+Limits are 128 labels per line, 1,024 characters/4,096 bytes per label and
+32,768 label bytes per sampled window, within the existing 2,048-property
+and frame budgets. Inline/above/below/right/wrapping text, Visual selections
+with labels, control/bidirectional content, a partially clipped wide glyph and
+wrap-mode truncation remain explicit compatibility states. The bridge never
+changes the user's options or turns off a provider to force native paint.
+
+Run `python3 -m unittest -v test_render_virtual_text` from this directory.
+The test uses Vim's real screen as a glyph/highlight oracle and covers
+source-byte/save invariants, EOL clicks, event-driven updates and removals
+with the fallback poll stopped, exact row deltas, splits and scroll margins.
+
 ## Scroll performance
 
 `python3 runtime/vim9/benchmark_scroll.py --lines 10000` measures protocol-5

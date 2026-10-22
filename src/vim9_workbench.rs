@@ -20,6 +20,9 @@ pub enum Vim9WorkbenchAction {
     SimpleOutline,
     SimpleRename,
     SimpleCodeAction,
+    SimpleCodeLens,
+    SimpleCodeLensRun,
+    SimpleInlayHints,
     SimpleDiagnostics,
     SimpleNextDiagnostic,
     SimplePreviousDiagnostic,
@@ -32,7 +35,7 @@ pub enum Vim9WorkbenchAction {
 }
 
 impl Vim9WorkbenchAction {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 25] = [
         Self::SimpleFiles,
         Self::SimpleRecent,
         Self::SimpleTreeToggle,
@@ -46,6 +49,9 @@ impl Vim9WorkbenchAction {
         Self::SimpleOutline,
         Self::SimpleRename,
         Self::SimpleCodeAction,
+        Self::SimpleCodeLens,
+        Self::SimpleCodeLensRun,
+        Self::SimpleInlayHints,
         Self::SimpleDiagnostics,
         Self::SimpleNextDiagnostic,
         Self::SimplePreviousDiagnostic,
@@ -72,6 +78,9 @@ impl Vim9WorkbenchAction {
             Self::SimpleOutline => "simple_outline",
             Self::SimpleRename => "simple_rename",
             Self::SimpleCodeAction => "simple_code_action",
+            Self::SimpleCodeLens => "simple_code_lens",
+            Self::SimpleCodeLensRun => "simple_code_lens_run",
+            Self::SimpleInlayHints => "simple_inlay_hints",
             Self::SimpleDiagnostics => "simple_diagnostics",
             Self::SimpleNextDiagnostic => "simple_next_diagnostic",
             Self::SimplePreviousDiagnostic => "simple_previous_diagnostic",
@@ -99,6 +108,9 @@ impl Vim9WorkbenchAction {
             Self::SimpleOutline => "Simple: Show symbol outline",
             Self::SimpleRename => "Simple: Rename symbol with Vim prompt",
             Self::SimpleCodeAction => "Simple: Choose code action",
+            Self::SimpleCodeLens => "Simple: Refresh CodeLens",
+            Self::SimpleCodeLensRun => "Simple: Run CodeLens at cursor",
+            Self::SimpleInlayHints => "Simple: Toggle inlay hints",
             Self::SimpleDiagnostics => "Simple: Show buffer diagnostics",
             Self::SimpleNextDiagnostic => "Simple: Go to next buffer diagnostic",
             Self::SimplePreviousDiagnostic => "Simple: Go to previous buffer diagnostic",
@@ -126,6 +138,9 @@ impl Vim9WorkbenchAction {
             Self::SimpleOutline => &["simplecc outline", "符号大纲"],
             Self::SimpleRename => &["simplecc rename", "重命名符号"],
             Self::SimpleCodeAction => &["simplecc code action", "代码操作"],
+            Self::SimpleCodeLens => &["simplecc code lens refresh", "刷新代码透镜"],
+            Self::SimpleCodeLensRun => &["simplecc code lens run", "执行代码透镜"],
+            Self::SimpleInlayHints => &["simplecc inlay hints toggle", "行内提示"],
             Self::SimpleDiagnostics => &["simplecc diagnostics problems", "缓冲区诊断"],
             Self::SimpleNextDiagnostic => &["simplecc next diagnostic error", "下一条诊断"],
             Self::SimplePreviousDiagnostic => &["simplecc previous diagnostic error", "上一条诊断"],

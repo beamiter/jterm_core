@@ -48,7 +48,8 @@ class VimrcWorkbenchTests(unittest.TestCase):
             editor.close()
         self.directory.cleanup()
 
-    def editor(self, *, authenticate=True, start_cc=False, interaction_fixture=False):
+    def editor(self, *, authenticate=True, start_cc=False, interaction_fixture=False,
+               editor_class=Editor, extra_setup=""):
         # Disable all automatic installation/update/network activity. Only the
         # three checked-out plugin runtimes enter runtimepath. Existing user
         # configuration and caches are isolated by the child process's HOME.
@@ -117,10 +118,10 @@ for line in sys.stdin:
                 "let g:simplecc_daemon_path = " + vim_string(fixture),
                 "autocmd VimEnter * setfiletype rust | SimpleCCStart",
             ])
-        e = Editor(
+        e = editor_class(
             self.root,
             authenticate=authenticate,
-            vimrc_extra="\n".join(setup) + "\n",
+            vimrc_extra="\n".join(setup) + "\n" + extra_setup,
             extra_env={
                 "HOME": str(self.home),
                 "XDG_STATE_HOME": str(self.root / "state"),

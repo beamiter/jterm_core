@@ -17,6 +17,8 @@ jobs:
     env:
       VIM9_SIMPLECC_ROOT: ${{ github.workspace }}/.providers/simplecc
       VIM9_SIMPLEGIT_ROOT: ${{ github.workspace }}/.providers/simplegit
+      VIM9_TEST_SIMPLE_ROOT: ${{ github.workspace }}/.providers
+      VIM9_TEST_VIMRC: ${{ github.workspace }}/.providers/vimrc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -25,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/simplecc
-          ref: cf778d681facdf62e63d627c57295b17735b1dae
+          ref: 25ae3392e025e349fc767ab7a38089f7e12e222f
           path: .providers/simplecc
           persist-credentials: false
       - name: Check out audited SimpleGit popup provider
@@ -34,6 +36,20 @@ jobs:
           repository: beamiter/simplegit
           ref: af06c595809241c0e403c4f988bd90818af4602b
           path: .providers/simplegit
+          persist-credentials: false
+      - name: Check out audited Vim workbench configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: beamiter/vimrc
+          ref: a2aaecf72a62d96ce044d44f398f0edcd213a49c
+          path: .providers/vimrc
+          persist-credentials: false
+      - name: Check out audited SimpleWhichKey provider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: beamiter/simplewhichkey
+          ref: 365c9c34a68dded6c65ca0163f2443e880306b8a
+          path: .providers/simplewhichkey
           persist-credentials: false
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
       - run: |
@@ -51,4 +67,6 @@ jobs:
           python3 runtime/vim9/test_render_listchars.py
           python3 runtime/vim9/test_render_completion.py
           python3 runtime/vim9/test_render_popups.py
+          python3 runtime/vim9/test_render_virtual_text.py
           python3 runtime/vim9/test_simple_popups.py
+          python3 runtime/vim9/test_simple_code_lens.py

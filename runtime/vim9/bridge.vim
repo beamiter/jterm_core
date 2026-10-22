@@ -24,6 +24,7 @@ endif
 g:jterm_vim9_bridge_loaded = true
 g:jterm_vim9_connected = false
 g:jterm_vim9_render_protocol = 0
+g:jterm_vim9_virtual_text_after = false
 
 var bridge: channel
 var authenticated = false
@@ -210,7 +211,8 @@ const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
   'simple_workbench', 'simple_diagnostics', 'simple_next_diagnostic',
   'simple_previous_diagnostic', 'simple_recent', 'simple_tree_toggle',
   'simple_tree_reveal', 'simple_terminal_toggle', 'simple_terminal_new',
-  'simple_terminal_next', 'simple_terminal_previous']
+  'simple_terminal_next', 'simple_terminal_previous', 'simple_code_lens',
+  'simple_code_lens_run', 'simple_inlay_hints']
 const WORKBENCH_SEMANTICS = ['definition', 'hover', 'references', 'format']
 
 def WorkbenchCapabilities(): list<string>
@@ -299,6 +301,9 @@ def WorkbenchLifecycle(connected: bool)
   workbenchConnected = connected
   g:jterm_vim9_connected = connected
   g:jterm_vim9_render_protocol = connected ? renderProtocol : 0
+  # This producer capability is independent of the wire version: older
+  # protocol-6 bridges did not compose virtual text into source-free runs.
+  g:jterm_vim9_virtual_text_after = connected
   try
     if connected
       doautocmd <nomodeline> User JTermVim9Ready
@@ -966,6 +971,74 @@ def SourcePointer(request: dict<any>)
   EmitRender()
 enddef
 
+def AfterPropertyOrder(left: dict<any>, right: dict<any>): number
+  var leftPriority = get(left.definition, 'priority', 0)
+  var rightPriority = get(right.definition, 'priority', 0)
+  # prop_list() returns newest first at equal priority; Vim draws the oldest
+  # label first. Across priorities, the higher-priority label comes first.
+  return leftPriority == rightPriority ? right.order - left.order
+    : (leftPriority > rightPriority ? -1 : 1)
+enddef
+
+def RenderAfterText(runs: list<dict<any>>, properties: list<any>, context: dict<any>): string
+  var column = strdisplaywidth(getline(context.line)) + (context.eol ? 1 : 0)
+  var right = context.left + context.width
+  for property in sort(copy(properties), AfterPropertyOrder)
+    column += get(property, 'text_padding_left', 0)
+    var text = property.text
+    # Vim's wrap+truncate branch adds an ellipsis, with additional wide-glyph
+    # and padding rules. Until that display branch is modeled, do not guess.
+    if &wrap && column + strdisplaywidth(text) > context.width
+      return 'Truncated wrapped Vim virtual text uses the compatibility view'
+    endif
+    var style = context.style
+    var highlight = get(property.definition, 'highlight', '')
+    if !empty(highlight)
+      style = MergeRenderStyle(style, RenderStyle(hlID(highlight)))
+    endif
+    var previousPlain = false
+    for index in range(strchars(text, true))
+      var cluster = strcharpart(text, index, 1, true)
+      var cells = strdisplaywidth(cluster)
+      if cells <= 0 || cells > 2
+        return 'Complex Vim virtual text uses the compatibility view'
+      endif
+      var finish = column + cells
+      if finish > context.left && column < right
+        if column < context.left || finish > right
+          return 'Partially clipped Vim virtual text uses the compatibility view'
+        endif
+        var glyphStyle = style
+        var guide = get(context.guides, string(column), {})
+        if !empty(guide)
+          glyphStyle = MergeRenderStyle(glyphStyle, guide)
+        endif
+        var plain = strlen(cluster) == 1
+        var screenColumn = context.column + column - context.left
+        if previousPlain && plain && runs[-1].column + runs[-1].cells == screenColumn
+            && runs[-1].style == glyphStyle
+          runs[-1].text ..= cluster
+          runs[-1].cells += cells
+        else
+          add(runs, {row: context.row, column: screenColumn, text: cluster, cells: cells,
+            line: 0, byte_start: 0, byte_end: 0, style: glyphStyle})
+        endif
+        previousPlain = plain
+      else
+        previousPlain = false
+      endif
+      column = finish
+      if column >= right
+        break
+      endif
+    endfor
+    if column >= right
+      break
+    endif
+  endfor
+  return ''
+enddef
+
 def RenderWindowFrame(margin: number = 0): dict<any>
   var windowNormal = WindowNormalStyle()
   var listChars = RenderListChars()
@@ -1047,23 +1120,56 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       return frame
     endif
   endfor
-  var properties = prop_list(first, {end_lnum: last})
+  var allProperties = prop_list(first, {end_lnum: last})
+  var properties: list<dict<any>> = []
+  var afterLines: dict<list<any>> = {}
+  var afterBytes = 0
   var matches = getmatches()
-  if len(properties) > 2048
+  if len(allProperties) > 2048
     frame.supported = false
     frame.fallback_reason = 'This property list exceeds the bounded native paint budget'
     return frame
   endif
-  for property in properties
-    if has_key(property, 'text') || property.col <= 0
-      frame.supported = false
-      frame.fallback_reason = 'Vim virtual text uses the compatibility view'
-      return frame
-    endif
+  for property in allProperties
     var propertyType = get(property, 'type', '')
     var typeBuffer = get(property, 'type_bufnr', 0)
     property.definition = empty(propertyType) ? {}
       : (typeBuffer > 0 ? prop_type_get(propertyType, {bufnr: typeBuffer}) : prop_type_get(propertyType))
+    if has_key(property, 'text')
+      var text = property.text
+      var padding = get(property, 'text_padding_left', 0)
+      afterBytes += strlen(text)
+      if property.col != 0 || get(property, 'text_align', 'after') !=# 'after'
+          || get(property, 'text_wrap', 'truncate') !=# 'truncate'
+        reason = 'Inline, aligned or wrapping Vim virtual text uses the compatibility view'
+      elseif index(['v', 'V', "\<C-V>"], mode(1)) >= 0
+        reason = 'Visual selections with Vim virtual text use the compatibility view'
+      elseif empty(property.definition) || strlen(text) > 4096 || strchars(text) > 1024
+          || padding < 0 || padding > 400 || afterBytes > 32768
+        reason = 'Vim virtual text exceeds the bounded native paint budget'
+      elseif text =~# '[\x00-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
+        reason = 'Control and bidirectional Vim virtual text uses the compatibility view'
+      else
+        var key = string(property.lnum)
+        if !has_key(afterLines, key)
+          afterLines[key] = []
+        endif
+        property.order = len(afterLines[key])
+        add(afterLines[key], property)
+        if len(afterLines[key]) > 128
+          reason = 'This line exceeds the native virtual text paint budget'
+        endif
+      endif
+    elseif property.col <= 0
+      reason = 'This Vim property uses the compatibility view'
+    else
+      add(properties, property)
+    endif
+    if !empty(reason)
+      frame.supported = false
+      frame.fallback_reason = reason
+      return frame
+    endif
   endfor
   # A scroll changes screen rows, not the semantic paint of every surviving
   # buffer line. A buffer edit still invalidates all lines: syntax regions can
@@ -1447,6 +1553,21 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       endif
     endfor
   endif
+  for [key, labels] in items(afterLines)
+    var lineNumber = str2nr(key)
+    var context = {line: lineNumber, row: view.row + lineNumber - first,
+      column: view.column + info.textoff, width: textWidth, left: savedView.leftcol,
+      eol: has_key(listChars, 'eol'),
+      style: MergeRenderStyle(windowNormal, get(rowStyles, key, {})),
+      guides: get(get(guideRows, key, {}), 'styles', {})}
+    reason = RenderAfterText(paintRuns, labels, context)
+    if !empty(reason)
+      frame.supported = false
+      frame.fallback_reason = reason
+      frame.runs = []
+      return frame
+    endif
+  endfor
   for lineNumber in range(first, last)
     var sign = get(signs, string(lineNumber), {})
     var signText = get(sign, 'text', '')
@@ -3211,6 +3332,7 @@ augroup JTermVim9Bridge
   # asynchronously. Providers can explicitly invalidate after such updates.
   autocmd User JTermVim9RenderInvalidate InvalidateRender()
   autocmd User JTermVim9PopupChanged RenderChanged()
+  autocmd User SimpleCCDecorationsChanged RenderChanged()
   autocmd WinScrolled,VimResized,OptionSet * RenderChanged()
   autocmd CompleteChanged,CompleteDone * RenderChanged()
   autocmd QuickFixCmdPost * Changed()

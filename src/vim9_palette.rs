@@ -33,7 +33,7 @@ pub enum Vim9PaletteCommand {
     Workbench(Vim9WorkbenchAction),
 }
 
-const COMMANDS: [Vim9PaletteCommand; 38] = {
+const COMMANDS: [Vim9PaletteCommand; 41] = {
     use Vim9PaletteCommand::*;
     [
         Save,
@@ -65,6 +65,9 @@ const COMMANDS: [Vim9PaletteCommand; 38] = {
         Workbench(Vim9WorkbenchAction::SimpleOutline),
         Workbench(Vim9WorkbenchAction::SimpleRename),
         Workbench(Vim9WorkbenchAction::SimpleCodeAction),
+        Workbench(Vim9WorkbenchAction::SimpleCodeLens),
+        Workbench(Vim9WorkbenchAction::SimpleCodeLensRun),
+        Workbench(Vim9WorkbenchAction::SimpleInlayHints),
         Workbench(Vim9WorkbenchAction::SimpleDiagnostics),
         Workbench(Vim9WorkbenchAction::SimpleNextDiagnostic),
         Workbench(Vim9WorkbenchAction::SimplePreviousDiagnostic),
@@ -455,6 +458,44 @@ mod tests {
                 Vim9WorkbenchAction::SimpleRecent
             ))
         );
+    }
+
+    #[test]
+    fn code_lens_and_hint_actions_recheck_the_current_source_and_capability() {
+        let mut snapshot = connected();
+        snapshot.buffer = 4;
+        snapshot.window = 1001;
+        snapshot.changedtick = 9;
+        for (action, query) in [
+            (Vim9WorkbenchAction::SimpleCodeLens, "刷新代码透镜"),
+            (Vim9WorkbenchAction::SimpleCodeLensRun, "执行代码透镜"),
+            (Vim9WorkbenchAction::SimpleInlayHints, "行内提示"),
+        ] {
+            let command = Vim9PaletteCommand::Workbench(action);
+            assert!(vim9_palette_matches(query, 256).contains(&command));
+            assert!(command.command(&snapshot).is_err());
+            snapshot.capabilities.push(action.capability().into());
+            let request = serde_json::to_value(command.command(&snapshot).unwrap()).unwrap();
+            assert_eq!(request["action"], "workbench");
+            assert_eq!(request["command"], action.capability());
+            assert_eq!(request["window"], 1001);
+            assert_eq!(request["buffer"], 4);
+            assert_eq!(request["changedtick"], 9);
+
+            // A palette can outlive a buffer switch or provider shutdown. It
+            // must use the new snapshot, never an earlier advertised command.
+            snapshot.capabilities.clear();
+            snapshot.buffer += 1;
+            snapshot.changedtick += 1;
+            assert!(command.command(&snapshot).is_err());
+            snapshot.capabilities.push(action.capability().into());
+            snapshot.waiting_for_input = true;
+            assert!(command.command(&snapshot).is_err());
+            snapshot.waiting_for_input = false;
+            snapshot.capabilities.clear();
+            snapshot.buffer = 4;
+            snapshot.changedtick = 9;
+        }
     }
 
     #[test]
