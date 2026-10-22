@@ -288,15 +288,138 @@ def RefreshRenderTheme()
   endif
 enddef
 
+def NativeTextBuffer(type: string): bool
+  # These buffers still own ordinary Vim text, byte positions and undo. Their
+  # write/readonly/autocommand semantics remain entirely Vim's responsibility.
+  return index(['', 'nofile', 'nowrite', 'acwrite'], type) >= 0
+enddef
+
+def RenderableTextBuffer(type: string): bool
+  # Help and quickfix own special Enter/mouse semantics. They may publish
+  # source paint, but never enter the semantic pointer/scroll input path.
+  return NativeTextBuffer(type) || type ==# 'help' || type ==# 'quickfix'
+enddef
+
+def ListCharGlyphs(value: string): list<string>
+  var glyphs: list<string> = []
+  var offset = 0
+  while offset < strlen(value)
+    var tail = strpart(value, offset)
+    var glyph = strcharpart(tail, 0, 1)
+    var bytes = strlen(glyph)
+    if glyph ==# '\'
+      var kind = strpart(tail, 1, 1)
+      var digits = kind ==# 'x' ? 2 : (kind ==# 'u' ? 4 : (kind ==# 'U' ? 8 : 0))
+      var hex = strpart(tail, 2, digits)
+      if digits == 0 || strlen(hex) != digits || hex !~# '^\x\+$'
+        throw 'This listchars escape uses the compatibility view'
+      endif
+      var codepoint = str2nr(hex, 16)
+      if codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)
+        throw 'This listchars codepoint uses the compatibility view'
+      endif
+      glyph = nr2char(codepoint)
+      bytes = digits + 2
+    endif
+    if strdisplaywidth(glyph) != 1 || glyph =~# '[\x00-\x1f\x7f]'
+      throw 'Native listchars requires single-cell printable glyphs'
+    endif
+    add(glyphs, glyph)
+    offset += bytes
+  endwhile
+  return glyphs
+enddef
+
+def RenderListChars(): dict<list<string>>
+  var result: dict<list<string>> = {}
+  if !&list
+    return result
+  endif
+  for entry in split(&listchars, ',')
+    var colon = stridx(entry, ':')
+    var name = strpart(entry, 0, colon)
+    if colon < 0 || index(['tab', 'space', 'lead', 'trail', 'nbsp', 'eol', 'extends', 'precedes', 'conceal'], name) < 0
+      throw 'This listchars field uses the compatibility view'
+    endif
+    var glyphs = ListCharGlyphs(strpart(entry, colon + 1))
+    if (name ==# 'tab' && len(glyphs) != 2 && len(glyphs) != 3)
+        || (name !=# 'tab' && len(glyphs) != 1)
+      throw 'This listchars glyph sequence uses the compatibility view'
+    endif
+    result[name] = glyphs
+  endfor
+  return result
+enddef
+
+def QuickfixCurrentLine(info: dict<any>): number
+  if &buftype !=# 'quickfix'
+    return 0
+  endif
+  if !get(info, 'quickfix', 0)
+    return -1
+  endif
+  var list = get(info, 'loclist', 0)
+    ? getloclist(0, {idx: 0, qfbufnr: 0}) : getqflist({idx: 0, qfbufnr: 0})
+  # A plugin may construct a lookalike special buffer or retire a list. Never
+  # decorate it with another list's current entry.
+  if get(list, 'qfbufnr', 0) != bufnr()
+    return -1
+  endif
+  return get(list, 'idx', 0)
+enddef
+
+def WindowNormalGroup(): dict<any>
+  if !exists('+winhighlight')
+    return {supported: true, name: &wincolor}
+  endif
+  # New Vim versions implement wincolor using a Normal-only winhighlight
+  # mapping. Read the effective mapping: wincolor itself can be stale after
+  # :set winhighlight=. General highlight remapping needs a separate adapter.
+  var mapping = getwinvar(0, '&winhighlight')
+  if empty(mapping)
+    return {supported: true, name: ''}
+  endif
+  var pair = split(mapping, ':', true)
+  if len(pair) != 2 || index(['!(', 'Normal'], pair[0]) < 0
+      || empty(pair[1]) || pair[1] =~# '[!,]'
+    return {supported: false, name: ''}
+  endif
+  return {supported: true, name: pair[1]}
+enddef
+
+def WindowNormalStyle(): dict<any>
+  var group = WindowNormalGroup()
+  if empty(group.name)
+    return renderNormal
+  endif
+  var id = synIDtrans(hlID(group.name))
+  var style = RenderStyle(id)
+  if style == RenderStyle(0) && synIDattr(id, 'nocombine', 'gui') !=# '1'
+    return renderNormal
+  endif
+  # wincolor replaces Normal's attributes, while unspecified colors retain
+  # the global Normal colors. Never rebind RenderColor's fg/bg references or
+  # the globally cached raw syntax styles to the last sampled window.
+  var result = copy(style)
+  for color in ['foreground', 'background', 'special']
+    if type(result[color]) != v:t_number
+      result[color] = renderNormal[color]
+    endif
+  endfor
+  return result
+enddef
+
 def RenderFallback(): string
-  if &buftype !=# ''
+  if !RenderableTextBuffer(&buftype)
     return 'This special Vim buffer uses the compatibility view'
   elseif mode(1) !~# '^[nivVR\x16]'
     return 'Vim command, prompt or terminal input uses the compatibility view'
   elseif (pumvisible() && renderProtocol < 5) || !empty(filter(popup_list(), (_, id) => get(popup_getpos(id), 'visible', 0)))
     return 'Vim completion and popup windows use the compatibility view'
-  elseif &diff || &rightleft || &arabic || &spell || &list || &conceallevel > 0 || &cursorcolumn || !empty(&wincolor)
+  elseif &diff || &rightleft || &arabic || &spell || &conceallevel > 0
     return 'This Vim display option needs the compatibility view'
+  elseif !WindowNormalGroup().supported
+    return 'General Vim window highlight remapping uses the compatibility view'
   elseif get(winsaveview(), 'coladd', 0) > 0
       || (index(['v', 'V', "\<C-V>"], mode(1)) >= 0 && getpos('v')[3] > 0)
     return 'Vim virtual-space cursor and selections use the compatibility view'
@@ -439,42 +562,33 @@ def RenderSearchRanges(text: string): list<list<number>>
   return ranges
 enddef
 
-def AddRenderRun(runs: list<dict<any>>, glyph: dict<any>, style: dict<any>)
-  var run = copy(glyph)
-  run.style = style
+def AddRenderRun(runs: list<dict<any>>, glyph: dict<any>, style: dict<any>, previousPlain: bool): bool
   # ASCII shaping may be batched. A non-ASCII grapheme always keeps its own
   # Vim-owned display advance, preventing fallback fonts from moving neighbors.
   # A coalesced run must preserve a one-byte/one-cell source mapping. Expanded
   # tabs remain separate so a native hover can recover the exact buffer byte.
-  var ascii = strlen(run.text) == run.cells && run.byte_end - run.byte_start == run.cells
-    && run.text =~# '^[\x20-\x7e]*$'
-  if !empty(runs) && ascii
+  # Extraction already classifies printable single-byte, non-tab glyphs.
+  # Selection segments preserve that classification and the byte/cell ratio.
+  # Track the previous classification separately: a one-cell fragment of an
+  # expanded tab must not merge with neighboring ASCII despite its short text.
+  var ascii = glyph.plain
+  if !empty(runs) && ascii && previousPlain
     var previous = runs[-1]
-    if previous.row == run.row && previous.column + previous.cells == run.column
-        && previous.line == run.line && previous.byte_end == run.byte_start
-        && previous.style == style && strlen(previous.text) == previous.cells
-        && previous.byte_end - previous.byte_start == previous.cells
-        && previous.text =~# '^[\x20-\x7e]*$'
-      previous.text ..= run.text
-      previous.cells += run.cells
-      previous.byte_end = run.byte_end
-      return
+    if previous.row == glyph.row && previous.column + previous.cells == glyph.column
+        && previous.line == glyph.line && previous.byte_end == glyph.byte_start
+        && previous.style == style
+      previous.text ..= glyph.text
+      previous.cells += glyph.cells
+      previous.byte_end = glyph.byte_end
+      return true
     endif
   endif
-  remove(run, 'virtual_column')
-  if has_key(run, 'override_style')
-    remove(run, 'override_style')
-  endif
-  if has_key(run, 'plain')
-    remove(run, 'plain')
-  endif
-  if has_key(run, 'match_style')
-    remove(run, 'match_style')
-  endif
-  if has_key(run, 'paint_style')
-    remove(run, 'paint_style')
-  endif
-  add(runs, run)
+  # Materialize only wire fields. Copying every cached paint/selection field
+  # and deleting it again was paid for every visible glyph on every frame.
+  add(runs, {row: glyph.row, column: glyph.column, text: glyph.text,
+    cells: glyph.cells, line: glyph.line, byte_start: glyph.byte_start,
+    byte_end: glyph.byte_end, style: style})
+  return ascii
 enddef
 
 def RenderSelectionSegments(glyph: dict<any>, visual: string, anchor: list<number>, current: list<number>, block: list<number>): list<dict<any>>
@@ -512,6 +626,59 @@ def RenderSelectionSegments(glyph: dict<any>, visual: string, anchor: list<numbe
     endif
   endfor
   return result
+enddef
+
+# Column guides are window-local display overlays, not source-line syntax.
+# Split only ASCII spans and expanded tabs; a wide/combining glyph keeps its
+# atomic source range and takes the style at its first display cell, like Vim.
+def RenderColumnSegments(glyph: dict<any>, columns: list<number>, leftcol: number): list<dict<any>>
+  if empty(columns) || (!glyph.plain && !get(glyph, 'tab', false))
+    return [glyph]
+  endif
+  var first = max([glyph.virtual_column, leftcol])
+  var cuts = [0, glyph.cells]
+  for column in columns
+    if column >= first && column < first + glyph.cells
+      add(cuts, column - first)
+      add(cuts, column - first + 1)
+    endif
+  endfor
+  cuts = uniq(sort(cuts, 'n'))
+  if len(cuts) == 2
+    return [glyph]
+  endif
+  var result: list<dict<any>> = []
+  for index in range(len(cuts) - 1)
+    var start = cuts[index]
+    var count = cuts[index + 1] - start
+    var part = copy(glyph)
+    part.text = strpart(glyph.text, start, count)
+    part.column += start
+    part.virtual_column = first + start
+    part.cells = count
+    if glyph.plain
+      part.byte_start += start
+      part.byte_end = part.byte_start + count
+    endif
+    add(result, part)
+  endfor
+  return result
+enddef
+
+def RenderColorColumns(leftcol: number, width: number): list<number>
+  var columns: list<number> = []
+  # Vim accepts at most 256 entries, with signed entries relative to textwidth.
+  for entry in split(&colorcolumn, ',')[0 : 255]
+    var relative = entry =~# '^[+-]'
+    if relative && &textwidth == 0
+      continue
+    endif
+    var column = str2nr(entry) + (relative ? &textwidth : 0) - 1
+    if column >= leftcol && column < leftcol + width
+      add(columns, column)
+    endif
+  endfor
+  return uniq(sort(columns, 'n'))
 enddef
 
 def RenderSelected(glyph: dict<any>, visual: string, anchor: list<number>, current: list<number>, block: list<number>): bool
@@ -555,7 +722,7 @@ def NativePointerAvailable(): bool
   const current = mode(1)
   # 'block' only permits virtual space in blockwise Visual mode, which is
   # already excluded here. Normal/characterwise source targets remain exact.
-  if pumvisible() || index(['n', 'v'], current) < 0
+  if !NativeTextBuffer(&buftype) || pumvisible() || index(['n', 'v'], current) < 0
       || (!empty(&virtualedit) && &virtualedit !=# 'block')
       || &selectmode =~# 'mouse' || &mouse !~# (current ==# 'n' ? '[an]' : '[av]')
     return false
@@ -574,7 +741,7 @@ def NativeScrollAvailable(): bool
   # Scrolling does not synthesize a pointer gesture. Mouse mappings, mouse=
   # and virtualedit=block must not disable direct touchpad pixels. Keep busy
   # modes and completion under Vim's compatibility input ownership.
-  return index(['n', 'i'], mode(1)) >= 0 && !pumvisible()
+  return NativeTextBuffer(&buftype) && index(['n', 'i'], mode(1)) >= 0 && !pumvisible()
 enddef
 
 def NativeSourceWindow(request: dict<any>): number
@@ -584,7 +751,7 @@ def NativeSourceWindow(request: dict<any>): number
   const info = getwininfo(window)
   if win_id2win(window) == 0 || empty(info) || info[0].bufnr != buffer
       || type(tick) != v:t_number || tick < 0 || getbufvar(buffer, 'changedtick') != tick
-      || getbufvar(buffer, '&buftype') !=# ''
+      || !NativeTextBuffer(getbufvar(buffer, '&buftype'))
     throw 'The native source window or buffer generation changed'
   endif
   return window
@@ -683,6 +850,8 @@ def SourcePointer(request: dict<any>)
 enddef
 
 def RenderWindowFrame(margin: number = 0): dict<any>
+  var windowNormal = WindowNormalStyle()
+  var listChars = RenderListChars()
   var info = getwininfo(win_getid())[0]
   var view = {row: info.winrow - 1, column: info.wincol - 1,
     rows: info.height, columns: info.width}
@@ -695,6 +864,10 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     changedtick: b:changedtick, mode: mode(1), view: view,
     default_style: renderNormal, cursor: {row: 0, column: 0, width: 1, visible: false}, runs: paintRuns}
   var reason = RenderFallback()
+  var quickfixLine = QuickfixCurrentLine(info)
+  if quickfixLine < 0 || quickfixLine > line('$')
+    reason = 'This quickfix window has no authoritative list identity'
+  endif
   if !empty(reason)
     frame.supported = false
     frame.fallback_reason = reason
@@ -779,7 +952,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   # propagate arbitrarily far beyond the edited line.
   var generation = string([bufnr(), b:changedtick, savedView.leftcol,
     view.column, view.columns, info.textoff, &tabstop, &vartabstop, &wrap, &syntax, &synmaxcol,
-    &number, &relativenumber, &numberwidth, &ambiwidth, renderThemeGeneration,
+    &number, &relativenumber, &numberwidth, &ambiwidth, &list, &listchars, renderThemeGeneration, windowNormal,
     &hlsearch, v:hlsearch, @/, &ignorecase, &smartcase, &magic, &iskeyword, &isprint, matches])
   if generation !=# renderLineGeneration
     renderLineGeneration = generation
@@ -789,6 +962,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   if baseKey !=# renderBaseKey
     renderBase = []
     var nextLines: dict<dict<any>> = {}
+    var noListStyle: dict<any> = {}
     for lineNumber in range(first, last)
       var text = getline(lineNumber)
       var row = view.row + lineNumber - first
@@ -813,6 +987,16 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       elseif &wrap && strdisplaywidth(text) > textWidth
         reason = 'Wrapped Vim continuation rows use the compatibility view'
         break
+      elseif &list && &wrap && has_key(listChars, 'eol') && strdisplaywidth(text) >= textWidth
+        reason = 'A wrapped listchars EOL marker uses the compatibility view'
+        break
+      elseif &list && stridx(text, "\t") >= 0 && !has_key(listChars, 'tab')
+        reason = 'Default ^I listchars tab geometry uses the compatibility view'
+        break
+      elseif &list && ((has_key(listChars, 'precedes') && savedView.leftcol > 0 && strdisplaywidth(text) > savedView.leftcol)
+          || (has_key(listChars, 'extends') && !&wrap && strdisplaywidth(text) > savedView.leftcol + textWidth))
+        reason = 'This active listchars horizontal-edge marker uses the compatibility view'
+        break
       elseif text =~# '[\x00-\x08\x0a-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
         reason = 'Control and bidirectional text use the compatibility view'
         break
@@ -826,10 +1010,37 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var byteColumn = 0
       var virtualColumn = 0
       var asciiLine = strlen(text) == strchars(text)
+      var leadEnd = &list ? match(text, '[^ \t]') : 0
+      var trailStart = &list ? match(text, '[ \t]*$') : strlen(text)
+      if leadEnd < 0
+        leadEnd = strlen(text)
+      endif
       for charIndex in range(strchars(text, true))
         var cluster = asciiLine ? strpart(text, charIndex, 1) : strcharpart(text, charIndex, 1, true)
         var plain = strlen(cluster) == 1 && cluster !=# "\t"
         var cells = plain ? 1 : strdisplaywidth(cluster, virtualColumn)
+        var display = cluster
+        var listStyle = noListStyle
+        var listedTab = &list && cluster ==# "\t"
+        if &list && cluster ==# ' '
+          var field = byteColumn >= trailStart && has_key(listChars, 'trail') ? 'trail'
+            : (byteColumn < leadEnd && has_key(listChars, 'lead') ? 'lead' : 'space')
+          if has_key(listChars, field)
+            display = listChars[field][0]
+            listStyle = RenderStyle(hlID('SpecialKey'))
+            plain = false
+          endif
+        elseif &list && (cluster ==# "\u00a0" || cluster ==# "\u202f") && has_key(listChars, 'nbsp')
+          if cells != 1
+            reason = 'This nonbreaking-space listchars width uses the compatibility view'
+            break
+          endif
+          display = listChars.nbsp[0]
+          listStyle = RenderStyle(hlID('SpecialKey'))
+          plain = false
+        elseif listedTab
+          listStyle = RenderStyle(hlID('SpecialKey'))
+        endif
         var nextByte = byteColumn + strlen(cluster)
         var start = virtualColumn - savedView.leftcol
         var finish = start + cells
@@ -874,13 +1085,27 @@ def RenderWindowFrame(margin: number = 0): dict<any>
             previous.text ..= cluster
             previous.cells += 1
             previous.byte_end = nextByte
+          elseif listedTab
+            # One explicit glyph per display cell keeps Unicode marker bytes
+            # out of ASCII selection/column slicing. Every cell still names
+            # the same original one-byte Tab, never the replacement text.
+            var markers = listChars.tab
+            for visibleColumn in range(visibleStart, visibleEnd - 1)
+              var cell = visibleColumn - start
+              var marker = len(markers) == 3 && cell == cells - 1 ? markers[2]
+                : (cell == 0 ? markers[0] : markers[1])
+              add(renderBase, {row: row, column: view.column + info.textoff + visibleColumn,
+                text: marker, cells: 1, line: lineNumber, byte_start: byteColumn, byte_end: nextByte,
+                virtual_column: virtualColumn + cell, plain: false, tab: true, list_style: listStyle,
+                style: style, override_style: propertyOverride ? propertyStyle : {}, match_style: matchStyle})
+            endfor
           else
             add(renderBase, {row: row, column: view.column + info.textoff + visibleStart,
-              text: cluster ==# "\t" ? repeat(' ', visibleEnd - visibleStart) : cluster,
+              text: cluster ==# "\t" ? repeat(' ', visibleEnd - visibleStart) : display,
               cells: visibleEnd - visibleStart, line: lineNumber,
               byte_start: byteColumn, byte_end: nextByte,
-              virtual_column: virtualColumn, plain: plain,
-              style: style, override_style: propertyOverride ? propertyStyle : {}, match_style: matchStyle})
+              virtual_column: virtualColumn, plain: plain, tab: cluster ==# "\t",
+              style: style, list_style: listStyle, override_style: propertyOverride ? propertyStyle : {}, match_style: matchStyle})
           endif
         endif
         byteColumn = nextByte
@@ -897,7 +1122,10 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       # viewport data. Surviving lines reuse it while cursor/Visual overlays
       # are composed from current Vim state below.
       for glyph in lineBase
-        var paintStyle = MergeRenderStyle(renderNormal, glyph.style)
+        var paintStyle = MergeRenderStyle(windowNormal, glyph.style)
+        if &list && !empty(glyph.list_style) && empty(glyph.match_style)
+          paintStyle = MergeRenderStyle(paintStyle, glyph.list_style)
+        endif
         if !empty(glyph.match_style)
           paintStyle = MergeRenderStyle(paintStyle, glyph.match_style)
         endif
@@ -921,6 +1149,17 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     frame.fallback_reason = reason
     return frame
   endif
+  if windowNormal != renderNormal
+    # This existing run shape carries per-window Normal without a protocol
+    # extension. It covers gutters and blank/EOF cells before their own groups
+    # and source glyphs, and never advertises a fabricated buffer position.
+    var lastBackground = max([view.row + last - first,
+      view.row + view.rows + visibleFirst - first - 1])
+    for row in range(view.row, lastBackground)
+      add(paintRuns, {row: row, column: view.column, cells: view.columns,
+        text: '', line: 0, byte_start: 0, byte_end: 0, style: windowNormal})
+    endfor
+  endif
   var visual = mode(1)
   if index(['v', 'V', "\<C-V>"], visual) < 0
     visual = ''
@@ -938,6 +1177,22 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   endif
   var visualStyle = RenderStyle(hlID('Visual'))
   var cursorLineStyle = RenderStyle(hlID('CursorLine'))
+  var position = screenpos(win_getid(), line('.'), col('.'))
+  # virtcol('.') reports the last cell of a wide character. CursorColumn
+  # follows Vim's actual cursor cell: first for wide text, last for a Normal
+  # mode tab, and first for an Insert mode tab. Reuse the cursor paint oracle.
+  var cursorColumn = &cursorcolumn
+    ? (get(position, 'curscol', 0) > 0
+      ? position.curscol - 1 - view.column - info.textoff + savedView.leftcol
+      : virtcol('.', true)[0] - 1) : -1
+  var colorColumns = empty(&colorcolumn) ? [] : RenderColorColumns(savedView.leftcol, textWidth)
+  var guideEnabled = !empty(colorColumns)
+    || (cursorColumn >= savedView.leftcol && cursorColumn < savedView.leftcol + textWidth)
+  # With both guides disabled, retain the ordinary single paint loop: no
+  # per-line guide dictionaries and no per-glyph guide segmentation calls.
+  var colorStyle = RenderStyle(hlID('ColorColumn'))
+  var cursorGuideStyle = RenderStyle(hlID('CursorColumn'))
+  var guideRows: dict<dict<any>> = {}
   var rowStyles: dict<dict<any>> = {}
   for lineNumber in range(first, last)
     var sign = get(signs, string(lineNumber), {})
@@ -945,18 +1200,47 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     if !empty(get(sign, 'linehl', ''))
       lineStyle = RenderStyle(hlID(sign.linehl))
     endif
-    var lineCursor = &cursorline && lineNumber == line('.') && &cursorlineopt =~# '\<\(screenline\|line\)\>'
+    var currentQuickfix = quickfixLine > 0 && lineNumber == quickfixLine
+    if currentQuickfix
+      # Vim applies the current quickfix item independently of its cursor or
+      # changedtick. It replaces sign linehl before CursorLine composition.
+      lineStyle = RenderStyle(hlID('QuickFixLine'))
+    endif
+    var lineCursor = &cursorline && lineNumber == line('.') && &cursorlineopt !=# 'number'
     if lineCursor
-      lineStyle = get(sign, 'priority', 0) >= 100
+      var lineWins = !empty(get(sign, 'linehl', '')) ? get(sign, 'priority', 0) >= 100 : currentQuickfix
+      lineStyle = lineWins
         ? MergeRenderStyle(cursorLineStyle, lineStyle) : MergeRenderStyle(lineStyle, cursorLineStyle)
     endif
     if !empty(lineStyle)
       rowStyles[string(lineNumber)] = lineStyle
+      # A whole-window Normal backdrop is identified by line=0/empty text.
+      # QuickFixLine is one source row, not a new Normal for the entire pane.
       add(frame.runs, {row: view.row + lineNumber - first, column: view.column + info.textoff,
         cells: textWidth, text: repeat(' ', textWidth), line: lineNumber,
-        byte_start: 0, byte_end: 0, style: MergeRenderStyle(renderNormal, lineStyle)})
+        byte_start: 0, byte_end: 0, style: MergeRenderStyle(windowNormal, lineStyle)})
+    endif
+    if guideEnabled
+      var guides: dict<any> = {}
+      for column in colorColumns
+        guides[string(column)] = colorStyle
+      endfor
+      if cursorColumn >= savedView.leftcol && cursorColumn < savedView.leftcol + textWidth
+          && lineNumber != current[1]
+        guides[string(cursorColumn)] = cursorGuideStyle
+      endif
+      guideRows[string(lineNumber)] = {styles: guides, columns: map(keys(guides), (_, column) => str2nr(column))}
+      # Source-free runs paint guides beyond EOL. A one-column pane uses a
+      # space to avoid the empty-text/full-width Normal backdrop signature.
+      for [column, guideStyle] in items(guides)
+        add(frame.runs, {row: view.row + lineNumber - first,
+          column: view.column + info.textoff + str2nr(column) - savedView.leftcol,
+          text: view.columns == 1 ? ' ' : '', cells: 1, line: 0, byte_start: 0, byte_end: 0,
+          style: MergeRenderStyle(MergeRenderStyle(windowNormal, lineStyle), guideStyle)})
+      endfor
     endif
   endfor
+  var previousPlain = false
   for baseGlyph in renderBase
     if visual ==# "\<C-V>" && strpart(getline(baseGlyph.line), baseGlyph.byte_start, baseGlyph.byte_end - baseGlyph.byte_start) ==# "\t"
       frame.supported = false
@@ -964,26 +1248,68 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       frame.runs = []
       return frame
     endif
-    for glyph in empty(visual) ? [baseGlyph] : RenderSelectionSegments(baseGlyph, visual, anchor, current, block)
+    var glyphs = empty(visual) ? [baseGlyph] : RenderSelectionSegments(baseGlyph, visual, anchor, current, block)
+    var paintGuide = guideEnabled && empty(baseGlyph.match_style)
+      && (empty(visual) || baseGlyph.line < min([anchor[1], current[1]])
+        || baseGlyph.line > max([anchor[1], current[1]]))
+    if paintGuide
+      var columns = guideRows[string(baseGlyph.line)].columns
+      var pieces: list<dict<any>> = []
+      for selected in glyphs
+        extend(pieces, RenderColumnSegments(selected, columns, savedView.leftcol))
+      endfor
+      glyphs = pieces
+    endif
+    for glyph in glyphs
       var style = glyph.paint_style
+      var selectedCell = !empty(visual) && RenderSelected(glyph, visual, anchor, current, block)
       if !empty(visual) || has_key(rowStyles, string(glyph.line))
-        style = MergeRenderStyle(renderNormal, glyph.style)
+        style = MergeRenderStyle(windowNormal, glyph.style)
         if has_key(rowStyles, string(glyph.line))
           style = MergeRenderStyle(style, rowStyles[string(glyph.line)])
+        endif
+        if &list && !empty(glyph.list_style) && empty(glyph.match_style) && !selectedCell
+          style = MergeRenderStyle(style, glyph.list_style)
         endif
         if !empty(glyph.match_style)
           style = MergeRenderStyle(style, glyph.match_style)
         endif
-        if !empty(visual) && RenderSelected(glyph, visual, anchor, current, block)
+        if selectedCell
           style = MergeRenderStyle(style, visualStyle)
         endif
         if !empty(glyph.override_style)
           style = MergeRenderStyle(style, glyph.override_style)
         endif
       endif
-      AddRenderRun(paintRuns, glyph, style)
+      if paintGuide
+        var guide = get(guideRows[string(glyph.line)].styles, string(max([glyph.virtual_column, savedView.leftcol])), {})
+        if !empty(guide)
+          style = MergeRenderStyle(style, guide)
+        endif
+      endif
+      previousPlain = AddRenderRun(paintRuns, glyph, style, previousPlain)
     endfor
   endfor
+  if has_key(listChars, 'eol')
+    for lineNumber in range(first, last)
+      var column = strdisplaywidth(getline(lineNumber)) - savedView.leftcol
+      if column >= 0 && column < textWidth
+        var style = MergeRenderStyle(windowNormal, get(rowStyles, string(lineNumber), {}))
+        style = MergeRenderStyle(style, RenderStyle(hlID('NonText')))
+        var visualLine = !empty(visual) && lineNumber >= min([anchor[1], current[1]])
+          && lineNumber <= max([anchor[1], current[1]])
+        if guideEnabled && !visualLine
+          var guide = get(guideRows[string(lineNumber)].styles, string(column + savedView.leftcol), {})
+          if !empty(guide)
+            style = MergeRenderStyle(style, guide)
+          endif
+        endif
+        add(paintRuns, {row: view.row + lineNumber - first,
+          column: view.column + info.textoff + column, text: listChars.eol[0], cells: 1,
+          line: 0, byte_start: 0, byte_end: 0, style: style})
+      endif
+    endfor
+  endif
   # Vim selects one display cell for the newline, including an empty buffer
   # line. Painting only existing glyphs would silently erase that selection.
   if visual ==# 'V' || visual ==# 'v'
@@ -994,11 +1320,11 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var endColumn = strdisplaywidth(text) - savedView.leftcol
       if endColumn >= 0 && endColumn < textWidth
           && (visual ==# 'V' || lineNumber < highLine
-            || max([anchor[2], current[2]]) > strlen(text))
-        var endStyle = MergeRenderStyle(renderNormal, visualStyle)
+            || (!has_key(listChars, 'eol') && max([anchor[2], current[2]]) > strlen(text)))
+        var endStyle = MergeRenderStyle(windowNormal, visualStyle)
         add(frame.runs, {row: view.row + lineNumber - first,
           column: view.column + info.textoff + endColumn,
-          text: ' ', cells: 1, line: lineNumber,
+          text: has_key(listChars, 'eol') ? listChars.eol[0] : ' ', cells: 1, line: has_key(listChars, 'eol') ? 0 : lineNumber,
           byte_start: strlen(text), byte_end: strlen(text), style: endStyle})
       endif
     endfor
@@ -1009,7 +1335,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     var signHighlight = &cursorline && lineNumber == line('.') && !empty(get(sign, 'culhl', ''))
       ? sign.culhl : get(sign, 'texthl', '')
     if signWidth > 0
-      var columnStyle = MergeRenderStyle(renderNormal,
+      var columnStyle = MergeRenderStyle(windowNormal,
         RenderStyle(hlID(&cursorline && lineNumber == line('.') ? 'CursorLineSign' : 'SignColumn')))
       var label = signText .. repeat(' ', max([0, signWidth - strdisplaywidth(signText)]))
       add(frame.runs, {row: view.row + lineNumber - first, column: view.column,
@@ -1020,7 +1346,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var number = &relativenumber && (lineNumber != line('.') || !&number)
         ? abs(lineNumber - line('.')) : lineNumber
       var label = printf('%*d ', max([1, numberWidth - 1]), number)
-      var style = MergeRenderStyle(renderNormal,
+      var style = MergeRenderStyle(windowNormal,
         RenderStyle(hlID(lineNumber == line('.') ? 'CursorLineNr' : 'LineNr')))
       if !empty(get(sign, 'numhl', ''))
         style = MergeRenderStyle(style, RenderStyle(hlID(sign.numhl)))
@@ -1039,7 +1365,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   for row in range(view.row + last - first + 1, max([view.row + last - first, view.row + view.rows + visibleFirst - first - 1]))
     add(frame.runs, {row: row, column: view.column, text: '~', cells: 1,
       line: 0, byte_start: 0, byte_end: 0,
-      style: MergeRenderStyle(renderNormal, RenderStyle(hlID('EndOfBuffer')))})
+      style: MergeRenderStyle(windowNormal, RenderStyle(hlID('EndOfBuffer')))})
   endfor
   if margin > 0
     var marginRows: dict<dict<any>> = {}
@@ -1064,10 +1390,9 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     endfor
     frame.runs = visibleRuns
   endif
-  var position = screenpos(win_getid(), line('.'), col('.'))
   if get(position, 'row', 0) > 0 && get(position, 'curscol', 0) > 0
     frame.cursor = {row: position.row - 1, column: position.curscol - 1,
-      width: max([1, position.endcol - position.curscol + 1]), visible: true,
+      width: strpart(getline('.'), col('.') - 1, 1) ==# "\t" ? 1 : max([1, position.endcol - position.curscol + 1]), visible: true,
       line: line('.'), byte_column: col('.') - 1, appearance: RenderCursorAppearance()}
   endif
   return frame
@@ -1196,11 +1521,12 @@ def RenderCompletion(): dict<any>
       || view.column + view.columns > &columns
     throw 'Vim completion geometry uses the compatibility view'
   endif
-  var normal = MergeRenderStyle(renderNormal, RenderStyle(hlID('Pmenu')))
+  var windowNormal = WindowNormalStyle()
+  var normal = MergeRenderStyle(windowNormal, RenderStyle(hlID('Pmenu')))
   var runs: list<dict<any>> = []
   for index in range(len(candidates))
     var selected = index == info.selected
-    var rowStyle = selected ? MergeRenderStyle(renderNormal, RenderStyle(hlID('PmenuSel'))) : normal
+    var rowStyle = selected ? MergeRenderStyle(windowNormal, RenderStyle(hlID('PmenuSel'))) : normal
     var row = position.row + index
     CompletionText(runs, repeat(' ', view.columns), row, view.column, rowStyle)
     for field in range(3)
@@ -1556,6 +1882,14 @@ enddef
 
 def State(): dict<any>
   var infos = getbufinfo({buflisted: 1})
+  # Keep the selected tab discoverable even when the list reaches its cap.
+  # Preserve Vim's buffer ordering, replacing only the final retained entry.
+  if len(infos) > 256
+    var current = filter(copy(infos), (_, info) => info.bufnr == bufnr())
+    if !empty(current) && index(mapnew(infos[0 : 255], (_, info) => info.bufnr), bufnr()) < 0
+      infos[255] = current[0]
+    endif
+  endif
   var buffers: list<dict<any>> = []
   for info in infos
     if len(buffers) >= 256
@@ -1610,7 +1944,13 @@ def State(): dict<any>
       state.diagnostics_truncated = true
       state.diagnostics_omitted += 1
     elseif !empty(state.buffers)
-      remove(state.buffers, -1)
+      var discard = len(state.buffers) - 1
+      # Prefer retaining the current tab, but the wire budget remains a hard
+      # bound. A synthetic buffer name can itself occupy most of the frame.
+      if discard > 0 && state.buffers[discard].current
+        discard -= 1
+      endif
+      remove(state.buffers, discard)
       state.buffers_truncated = true
       state.buffers_omitted += 1
     else
@@ -1665,7 +2005,7 @@ def LspDiagnosticsChanged()
 enddef
 
 def RememberView()
-  if &buftype ==# ''
+  if NativeTextBuffer(&buftype)
     bufferViews[string(bufnr())] = winsaveview()
   endif
 enddef
@@ -2105,7 +2445,7 @@ def ScrollWindow(request: dict<any>)
   endif
   # win_id2win() only accepts a window in the active tab. A delayed wheel event
   # must never move a closed split or silently scroll the currently focused one.
-  if win_id2win(window) == 0 || getwinvar(window, '&buftype') !=# ''
+  if win_id2win(window) == 0 || !NativeTextBuffer(getwinvar(window, '&buftype'))
     throw 'The requested editor window is no longer available'
   endif
   # Numeric validation makes this a fixed command, not an Ex/eval interface.

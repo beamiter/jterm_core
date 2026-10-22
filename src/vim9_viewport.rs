@@ -423,6 +423,58 @@ mod tests {
     }
 
     #[test]
+    fn visible_whitespace_glyphs_keep_original_bytes_and_eol_target() {
+        let mut frame = frame();
+        frame.windows[0].line_lengths = vec![2, 3, 1, 0];
+        frame.runs.retain(|run| run.line != 10);
+        // The source is a space followed by one Tab. Display markers may use
+        // multiple UTF-8 bytes, while every expanded Tab cell owns one byte.
+        for (column, text, start, end) in [
+            (0, "·", 0, 1),
+            (1, "»", 1, 2),
+            (2, "·", 1, 2),
+            (3, "·", 1, 2),
+            (4, "↲", 2, 2),
+        ] {
+            frame.runs.push(super::super::Vim9RenderRun {
+                window: 10,
+                row: 0,
+                column,
+                cells: 1,
+                text: text.into(),
+                line: 10,
+                byte_start: start,
+                byte_end: end,
+                ..Default::default()
+            });
+        }
+        assert!(frame.valid());
+        let view = Vim9Viewport::new(&frame, 10, metrics(), -6.25).unwrap();
+        for (x, start, end) in [(1.0, 0, 1), (9.0, 1, 2), (17.0, 1, 2), (25.0, 1, 2)] {
+            let hit = view.anchor_at(x, 5.0).unwrap();
+            assert_eq!(
+                (hit.position.line, hit.position.byte_column, hit.byte_end),
+                (10, start, end)
+            );
+            assert_eq!(
+                view.anchor_for_position(&hit.position).unwrap().position,
+                hit.position,
+            );
+        }
+        for x in [33.0, 49.0] {
+            let end = view.anchor_at(x, 5.0).unwrap();
+            assert_eq!(
+                (end.position.line, end.position.byte_column, end.byte_end),
+                (10, 2, 2)
+            );
+            assert_eq!(
+                end.rect.x, 32.0,
+                "The EOL marker must not extend source text"
+            );
+        }
+    }
+
+    #[test]
     fn geometry_and_missing_or_insufficient_margins_fail_closed() {
         let mut frame = frame();
         for offset in [f32::NAN, f32::INFINITY, 40.01, -40.01] {
@@ -517,6 +569,58 @@ mod tests {
         assert_eq!((end.position.line, end.position.byte_column), (10, 2));
         assert_eq!(view.anchor_for_position(&end.position), Some(end));
         assert!(view.anchor_at(65.0, 65.0).is_none());
+    }
+
+    #[test]
+    fn display_only_column_backgrounds_do_not_capture_source_hits() {
+        let mut frame = frame();
+        frame.windows[0].line_lengths = vec![2, 3, 1, 0];
+        // Exercise decoration on either side of the text in paint order.
+        // Pure backgrounds own display cells, never a source byte range.
+        for row in 0..4 {
+            let decoration = super::super::Vim9RenderRun {
+                window: 10,
+                row,
+                column: 0,
+                cells: 8,
+                style: super::super::Vim9RenderStyle {
+                    background: Some(0x123456),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            frame.runs.insert(0, decoration.clone());
+            frame.runs.push(decoration);
+        }
+        frame.windows[0].overscan[2]
+            .runs
+            .push(super::super::Vim9RenderRun {
+                window: 10,
+                column: 1,
+                cells: 1,
+                style: super::super::Vim9RenderStyle {
+                    background: Some(0x654321),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        assert!(frame.valid());
+        let view = Vim9Viewport::new(&frame, 10, metrics(), -6.25).unwrap();
+        for (x, y, line, byte, end) in [
+            (8.5, 5.0, 10, 1, 2),
+            (16.5, 25.0, 11, 0, 3),
+            (24.5, 45.0, 12, 0, 1),
+            (45.0, 65.0, 13, 0, 0),
+            (45.0, 5.0, 10, 2, 2),
+            (9.0, 75.0, 14, 1, 2),
+        ] {
+            let hit = view.anchor_at(x, y).unwrap();
+            assert_eq!(
+                (hit.position.line, hit.position.byte_column, hit.byte_end),
+                (line, byte, end)
+            );
+            assert_eq!(view.anchor_for_position(&hit.position), Some(hit));
+        }
     }
 
     #[test]

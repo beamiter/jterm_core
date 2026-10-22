@@ -1,0 +1,257 @@
+{
+  "date": "2026-10-22",
+  "scope": "Local producer/transport benchmarks; not GUI frame intervals or input-to-photon latency.",
+  "vim": {
+    "version": "9.2",
+    "patches": "1-858",
+    "compiled": "2026-07-27 17:06:12",
+    "features": [
+      "profile",
+      "vim9script",
+      "channel"
+    ]
+  },
+  "runtime_sha256": {
+    "baseline": "df201dc86c134cc7c913695bde8495dfd3b2707313424ad99ec5523e85f58b34",
+    "candidate": "e6de1fddb3fd6966e72d13d33e355e54d33a5369e15f672bda9cb21a7b861e58"
+  },
+  "execution_order": "Two rounds of baseline then candidate for each benchmark; see per-run samples and tail latency.",
+  "results": [
+    {
+      "benchmark": "benchmark_scroll",
+      "round": 0,
+      "runtime": "baseline",
+      "result": {
+        "windows": 1,
+        "buffer_lines": 10000,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "scroll_ack": {
+          "samples": 60,
+          "min_ms": 6.84,
+          "median_ms": 7.316,
+          "p95_ms": 7.655,
+          "max_ms": 7.685
+        },
+        "cursor_moves": 60,
+        "vim_cpu_ms_per_scroll": 6.5
+      }
+    },
+    {
+      "benchmark": "benchmark_scroll",
+      "round": 0,
+      "runtime": "current",
+      "result": {
+        "windows": 1,
+        "buffer_lines": 10000,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "scroll_ack": {
+          "samples": 60,
+          "min_ms": 6.275,
+          "median_ms": 6.712,
+          "p95_ms": 7.777,
+          "max_ms": 17.524
+        },
+        "cursor_moves": 60,
+        "vim_cpu_ms_per_scroll": 6.167
+      }
+    },
+    {
+      "benchmark": "benchmark_scroll",
+      "round": 1,
+      "runtime": "baseline",
+      "result": {
+        "windows": 1,
+        "buffer_lines": 10000,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "scroll_ack": {
+          "samples": 60,
+          "min_ms": 7.083,
+          "median_ms": 7.75,
+          "p95_ms": 10.179,
+          "max_ms": 12.54
+        },
+        "cursor_moves": 60,
+        "vim_cpu_ms_per_scroll": 7.167
+      }
+    },
+    {
+      "benchmark": "benchmark_scroll",
+      "round": 1,
+      "runtime": "current",
+      "result": {
+        "windows": 1,
+        "buffer_lines": 10000,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "scroll_ack": {
+          "samples": 60,
+          "min_ms": 6.383,
+          "median_ms": 6.812,
+          "p95_ms": 7.572,
+          "max_ms": 8.572
+        },
+        "cursor_moves": 60,
+        "vim_cpu_ms_per_scroll": 6.0
+      }
+    },
+    {
+      "benchmark": "benchmark_render",
+      "round": 0,
+      "runtime": "baseline",
+      "result": {
+        "buffer_lines": 10000,
+        "buffer_bytes": 460000,
+        "windows": 1,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "syntax": "Vim runtime rust",
+        "initial_forced_frame_ms": 8.984,
+        "cached_forced_frame": {
+          "samples": 10,
+          "min_ms": 14.154,
+          "median_ms": 14.365,
+          "p95_ms": 14.571,
+          "max_ms": 14.571
+        },
+        "ctrl_e_to_semantic_frame": {
+          "samples": 40,
+          "min_ms": 19.446,
+          "median_ms": 21.809,
+          "p95_ms": 37.647,
+          "max_ms": 43.273
+        },
+        "vim_cpu_ms_per_scroll": 9.75,
+        "full_frame_bytes_min": 95521,
+        "full_frame_bytes_max": 95621,
+        "visible_runs_max": 348,
+        "last_viewports": [
+          {
+            "window": 1000,
+            "topline": 41,
+            "botline": 69
+          }
+        ]
+      }
+    },
+    {
+      "benchmark": "benchmark_render",
+      "round": 0,
+      "runtime": "current",
+      "result": {
+        "buffer_lines": 10000,
+        "buffer_bytes": 460000,
+        "windows": 1,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "syntax": "Vim runtime rust",
+        "initial_forced_frame_ms": 14.987,
+        "cached_forced_frame": {
+          "samples": 10,
+          "min_ms": 15.323,
+          "median_ms": 18.158,
+          "p95_ms": 46.119,
+          "max_ms": 46.119
+        },
+        "ctrl_e_to_semantic_frame": {
+          "samples": 40,
+          "min_ms": 12.019,
+          "median_ms": 19.372,
+          "p95_ms": 30.369,
+          "max_ms": 30.72
+        },
+        "vim_cpu_ms_per_scroll": 4.75,
+        "full_frame_bytes_min": 95521,
+        "full_frame_bytes_max": 95621,
+        "visible_runs_max": 348,
+        "last_viewports": [
+          {
+            "window": 1000,
+            "topline": 41,
+            "botline": 69
+          }
+        ]
+      }
+    },
+    {
+      "benchmark": "benchmark_render",
+      "round": 1,
+      "runtime": "baseline",
+      "result": {
+        "buffer_lines": 10000,
+        "buffer_bytes": 460000,
+        "windows": 1,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "syntax": "Vim runtime rust",
+        "initial_forced_frame_ms": 34.579,
+        "cached_forced_frame": {
+          "samples": 10,
+          "min_ms": 14.532,
+          "median_ms": 20.628,
+          "p95_ms": 69.797,
+          "max_ms": 69.797
+        },
+        "ctrl_e_to_semantic_frame": {
+          "samples": 40,
+          "min_ms": 5.183,
+          "median_ms": 29.07,
+          "p95_ms": 41.352,
+          "max_ms": 49.311
+        },
+        "vim_cpu_ms_per_scroll": 12.75,
+        "full_frame_bytes_min": 95521,
+        "full_frame_bytes_max": 95621,
+        "visible_runs_max": 348,
+        "last_viewports": [
+          {
+            "window": 1000,
+            "topline": 41,
+            "botline": 69
+          }
+        ]
+      }
+    },
+    {
+      "benchmark": "benchmark_render",
+      "round": 1,
+      "runtime": "current",
+      "result": {
+        "buffer_lines": 10000,
+        "buffer_bytes": 460000,
+        "windows": 1,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "syntax": "Vim runtime rust",
+        "initial_forced_frame_ms": 26.535,
+        "cached_forced_frame": {
+          "samples": 10,
+          "min_ms": 14.521,
+          "median_ms": 23.879,
+          "p95_ms": 57.451,
+          "max_ms": 57.451
+        },
+        "ctrl_e_to_semantic_frame": {
+          "samples": 40,
+          "min_ms": 13.181,
+          "median_ms": 31.16,
+          "p95_ms": 36.961,
+          "max_ms": 45.603
+        },
+        "vim_cpu_ms_per_scroll": 12.75,
+        "full_frame_bytes_min": 95521,
+        "full_frame_bytes_max": 95621,
+        "visible_runs_max": 348,
+        "last_viewports": [
+          {
+            "window": 1000,
+            "topline": 41,
+            "botline": 69
+          }
+        ]
+      }
+    }
+  ]
+}

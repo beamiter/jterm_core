@@ -1,0 +1,91 @@
+{
+  "purpose": "Check ordinary nolist scrolling after adding bounded native listchars support",
+  "limits": "One sequential pair on a shared host; other frontend builds were running. Measures Vim semantic transport, not displayed frame time or FPS.",
+  "command": "python3 runtime/vim9/benchmark_render.py --lines 10000 --samples 30 --windows 1",
+  "baseline_sha256": "1d620bc1bca647db80cf448c32c0384b262e3c17df564e0149f493ad5126d504",
+  "candidate_sha256": "eda74406ce42319cd821ccb61a9063181d47fbcafa679b6704e5368b5c9de144",
+  "baseline": {
+    "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+    "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+    "runtime": "/tmp/vim9-modernization-baseline-20261022.vim",
+    "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+    "results": [
+      {
+        "buffer_lines": 10000,
+        "buffer_bytes": 460000,
+        "windows": 1,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "syntax": "Vim runtime rust",
+        "initial_forced_frame_ms": 45.228,
+        "cached_forced_frame": {
+          "samples": 10,
+          "min_ms": 16.565,
+          "median_ms": 28.983,
+          "p95_ms": 66.433,
+          "max_ms": 66.433
+        },
+        "ctrl_e_to_semantic_frame": {
+          "samples": 30,
+          "min_ms": 21.012,
+          "median_ms": 34.71,
+          "p95_ms": 45.36,
+          "max_ms": 50.062
+        },
+        "vim_cpu_ms_per_scroll": 18.0,
+        "full_frame_bytes_min": 95521,
+        "full_frame_bytes_max": 95621,
+        "visible_runs_max": 348,
+        "last_viewports": [
+          {
+            "window": 1000,
+            "topline": 31,
+            "botline": 59
+          }
+        ]
+      }
+    ]
+  },
+  "candidate": {
+    "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+    "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+    "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+    "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+    "results": [
+      {
+        "buffer_lines": 10000,
+        "buffer_bytes": 460000,
+        "windows": 1,
+        "pty_rows": 30,
+        "pty_columns": 120,
+        "syntax": "Vim runtime rust",
+        "initial_forced_frame_ms": 83.48,
+        "cached_forced_frame": {
+          "samples": 10,
+          "min_ms": 19.834,
+          "median_ms": 28.86,
+          "p95_ms": 55.118,
+          "max_ms": 55.118
+        },
+        "ctrl_e_to_semantic_frame": {
+          "samples": 30,
+          "min_ms": 21.864,
+          "median_ms": 35.421,
+          "p95_ms": 36.733,
+          "max_ms": 39.434
+        },
+        "vim_cpu_ms_per_scroll": 18.0,
+        "full_frame_bytes_min": 95521,
+        "full_frame_bytes_max": 95621,
+        "visible_runs_max": 348,
+        "last_viewports": [
+          {
+            "window": 1000,
+            "topline": 31,
+            "botline": 59
+          }
+        ]
+      }
+    ]
+  }
+}

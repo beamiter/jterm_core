@@ -172,10 +172,10 @@ semantics.
 | Font scale and HiDPI | GUI font rasterization is frontend-owned; the resized PTY geometry must be acknowledged before drawing old geometry. A transport test is not a HiDPI visual test. |
 | Vim splits | Same/different buffers and independent scrolling are supported within paint budgets; only the active window has the active cursor/selection. |
 | Visual and search | Existing bounded Visual/search composition remains active; block selections through tabs and unsupported regex forms use compatibility mode. |
-| Cursor styling | Frontends draw the active cursor from Vim's position and mode. Full `guicursor` shape/blink settings and custom Cursor highlight composition are not yet exported. |
-| Themes | GUI RGB attributes, links, style changes and named colors are separate from cterm palette entries. Per-window `wincolor` currently uses compatibility mode. |
-| Plugins | Supported signs, text properties, single-line `matchadd()` patterns and byte-based `matchaddpos()` decorations use GUI attributes. Popups, completion menus, complex match patterns, conceal and unsupported virtual text use compatibility mode. Async syntax providers use the invalidation hook above. |
-| Complex layout/text | Wrapped continuation rows, closed folds, conceal, diff, RTL/bidi/control text and special Vim buffers use compatibility mode. Their options are not silently disabled. |
+| Cursor styling | Vim's `guicursor` supplies block/bar/underline geometry, GUI highlight colors and blink timings. The host clock restarts on input and focus changes, not idle paint revisions. Full source-cell geometry remains available to IME and hit testing. |
+| Themes | GUI RGB attributes, links, style changes and named colors are separate from cterm palette entries. Window-local `wincolor` and Normal-only `winhighlight` mappings are supported; general remapping uses compatibility mode. |
+| Plugins | Supported signs, text properties, single-line `matchadd()` patterns and byte-based `matchaddpos()` decorations use GUI attributes. Protocol 5 also paints ordinary Insert completion menus. General popups, complex match patterns, conceal and unsupported virtual text use compatibility mode. Async syntax providers use the invalidation hook above. |
+| Complex layout/text | Wrapped continuation rows, closed folds, conceal, diff and RTL/bidi/control text use compatibility mode. Supported help/quickfix windows use native paint with Vim-owned input; terminal and prompt buffers retain compatibility. User options are not silently disabled. |
 | Large files | Only visible bounded windows are exported. Vim's own regex syntax synchronization can still be expensive; limits on exported runs are not a bound on arbitrary plugin execution time. |
 
 Compatibility mode exposes the real Vim screen and the reason for falling
@@ -309,3 +309,161 @@ row deltas and smooth-scroll margins. Screen attribute comparisons use
 Vim's actual `screenattr()` as an oracle without decoding opaque attribute
 IDs as highlight groups. The Rust Vim9 suite passes 73 tests with its one
 opt-in PTY round trip omitted. Frontend GUI validation is recorded separately.
+
+## Rendering follow-up — 2026-10-22
+
+The render producer now reuses each glyph's validated plain-ASCII marker and
+constructs only the wire fields on a new paint run. It no longer copies the
+entire internal glyph dictionary and removes its cache fields for every run.
+In matched Vim profiles, 8,294 `AddRenderRun` calls took 30.21 ms before and
+15.15 ms after this change, about 0.58 ms less work per sampled frame.
+
+Two alternating baseline/candidate runs of the protocol-5 scroll benchmark
+used a 30×120 viewport, one window, 10,000 source lines and 60 requests each.
+Median request-to-ack latency changed from 7.316 to 6.712 ms and from 7.750 to
+6.812 ms (approximately 8–12%). The older full-frame input benchmark was noisy
+and did not show a consistent latency improvement. These are producer and
+transport measurements, not GUI frame rates or physical input-to-photon tests.
+The paired raw results are retained in `docs/vim9-render-followup-benchmark.json`.
+
+All four frontends now preserve the full cursor cell when calculating cursor
+shape and then clip its paint to the visible viewport. A partially visible row
+therefore does not move or resize an underline cursor or the glyph beneath a
+block cursor. IME anchors and pointer hit areas continue to use the visible
+clipped geometry. Ember keeps foreground color outside the egui layout key,
+allowing body text, recoloring and cursor inversion to share shaped galleys.
+Anvil and Forge use borrowed text cache lookups and retain Pango width/baseline
+measurements, invalidating them with the font context. A million warm lookup
+iterations in their isolated production-cache benchmark allocate no strings;
+the earlier tuple-key lookup allocated a million. This is a cache benchmark,
+not a rendering FPS measurement. Frost retains Iced's existing text cache.
+
+Validation includes the real-Vim bridge and semantic rendering suites, Ember
+shape/cursor tests and Frost pixel-geometry/input regressions. GTK production
+code and pixel tests compile, and the extracted cache/geometry tests execute;
+the GTK pixel test still requires a host with the project's supported GTK
+version. Wayland, high-refresh display and OS IME acceptance remain separate.
+
+## Native column rendering — 2026-10-22
+
+Ordinary `cursorcolumn` no longer forces a compatibility frame. The producer
+also composes `colorcolumn`, including absolute and textwidth-relative entries,
+into native GUI styles. Guides stay window-local and are emitted in semantic
+margins as well as the visible viewport. Source text keeps Vim's syntax, match,
+search, property and Visual precedence; empty/EOL guide runs have `line=0` and
+empty byte ranges and cannot become source-pointer targets.
+
+Tests use real `screenattr()` observations to distinguish Vim's source-text and
+EOL branches: Visual suppresses guides on the affected source rows but may
+retain guides beyond a short or empty line. The actual `screenpos().curscol`
+also distinguishes a wide glyph's first cell from a Normal-mode tab's final
+cell. Tab fragments preserve their original byte range; they must not be
+coalesced with adjacent ASCII merely because one fragment occupies one cell.
+The existing `cursorlineopt=both` line highlight is now recognized explicitly.
+
+Guides outside the visible horizontal range skip guide construction and glyph
+segmentation. An ordinary view with guides disabled keeps the original single
+paint loop. Folded and wrapped views retain compatibility rendering because
+the current viewport contract maps one buffer line to one display row; native
+support for those views requires an explicit display-row/source map.
+
+## Scratch and window-Normal coverage — 2026-10-22
+
+The producer now permits ordinary nofile, nowrite and acwrite text buffers
+through the same native rendering and source-input checks as file buffers.
+It preserves Vim's buffer type, modification flags and write/autocommand
+semantics. Terminal and prompt buffers retain compatibility; help and quickfix
+use the separate native-paint/Vim-input policy described below.
+
+Window-local Normal colors are carried by existing, source-free full-width
+background runs before decorations and real text, including blank/EOF rows
+and semantic margins. Raw highlight-group caches and global `fg`/`bg` aliases
+are not rebound while sampling another split. The line-cache generation
+includes the resolved window Normal so palette changes without a buffer edit
+cannot reuse stale colors. Consumers use this backdrop for their local clear,
+IME/caret fallback and focus colors; old protocols without a backdrop retain
+their global Normal behavior. No public Rust API or wire field was added.
+
+## Special text windows: native paint with Vim-owned input
+
+Help and error-list rendering now has a separate admission policy from native
+source editing. `RenderableTextBuffer` admits help/quickfix; `NativeTextBuffer`
+continues to restrict source-pointer and typed scroll commands to ordinary
+file/nofile/nowrite/acwrite text. Metadata explicitly disables both native
+input capabilities for the special windows. Frontends use that declaration
+only when source metadata is present, preserving old-protocol behavior.
+They retire pending scroll/animation state and wait out an old fractional
+presentation before passing raw events through the established PTY route.
+
+QuickFixLine is derived from the authoritative quickfix/location-list buffer
+identity and current index, not syntax or the text cursor. It is recomposed
+without requiring a changedtick. Tests compare native text and highlight
+layers with actual Vim, and exercise Enter, Ctrl-] and SGR double-clicks.
+Concealment, wrapped continuation rows and unsupported display states continue
+to publish explicit compatibility frames; no option is changed automatically.
+
+The full-window-width, empty-text, `line=0` backdrop shape is reserved for
+window Normal. QuickFixLine rows retain their actual buffer line with an empty
+byte span and full-width spaces, so they cannot change the inferred window
+palette and can still paint line decorations through EOL. A guide in a
+one-column split uses a space instead of the reserved empty-text signature.
+Neither form creates an editable source span.
+
+## Visible whitespace and mouse confirmation — 2026-10-22
+
+Common `listchars` settings now use the semantic paint path: explicit two- or
+three-glyph Tab markers, space/lead/trail, both ordinary and narrow NBSP, and
+EOL. Glyphs must occupy one Vim display cell. Safe hexadecimal option escapes
+are decoded without evaluating an expression. Each Tab cell is emitted
+separately with its original byte span, preventing UTF-8 markers from entering
+ASCII byte slicing. EOL is display-only. Cache generations include the
+window-local list options, so split-specific settings and asynchronous option
+changes cannot reuse stale paint. The Tab caret remains one cell; a wide source
+character retains its full width.
+
+Default `^I` Tab geometry, unsupported marker fields, active horizontal-edge
+markers and EOL-induced wrapped continuation rows still use explicit
+compatibility. Seven new real-Vim checks compare glyphs and highlight ordering
+with `screenstring()`/`screenattr()` oracles, exercise source-pointer and save
+semantics, and cover split-local updates, horizontal clipping and overscan.
+
+Mapped GTK dialogs now own keyboard input before workspace capture handlers.
+Body clicks in all four frontends restart the original native blink wait,
+including a repeated click at the same source cell. Frost routes an inactive
+embedded body's first click after establishing pane focus, retains current
+modifiers and click counts, and includes Ctrl/Alt bits in app mouse reports.
+
+The complete real-Vim runtime discovery run passes 154 tests with one optional
+completion-metadata test skipped (155 total, 149.217 s). The shared Rust
+viewport test also verifies that Unicode replacement markers keep their
+original space/Tab bytes and do not move the EOL source target.
+
+A single ordinary-`nolist` before/after scroll comparison measured 18.0 ms of
+Vim CPU per scroll in both versions. Median input-to-semantic-frame time was
+34.710/35.421 ms; frame sizes and run counts were identical. Concurrent builds
+and the single sample pair limit this check: it detects no material CPU
+regression here and establishes no GUI frame-rate or latency improvement.
+Raw results and runtime hashes are in
+`docs/vim9-whitespace-followup-benchmark.json`.
+
+The rebuilt Forge executable was also inspected in an isolated X11 window
+with minimal Vim startup settings. `notermguicolors` and deliberately different
+cterm colors leave the buffer at native GUI Normal `#1e1e2e`, with exact
+SpecialKey `#f38ba8` and NonText `#89b4fa` pixels. The captured source includes
+Tab, trailing spaces, CJK and a combining mark; Vim's observation file confirms
+the original text and the requested list options. The inspected screenshot is
+`forge/target/vim-font-fix/native-whitespace.png` in the sibling checkout.
+It is a local verification artifact and is not included in the source release.
+
+Frontend follow-up validation: Forge passes five focused checks, including
+actual X11 dialog keyboard ownership, repeated body-click focus/blink,
+single-cell Unicode markers and the real font keyboard/wheel regression.
+Anvil's final all-targets typecheck passes. Frost passes 37 buffer, 27 font and
+19 body-filter checks, plus its separately executed real dual-Vim mouse test;
+these filters overlap and are not summed. Ember passes 34 buffer checks.
+Frost's event snapshot retains entry identity, presentation and event-time
+modifiers; source replacement or stationary viewport changes cannot reinterpret
+an old click as raw coordinates in another buffer. Its modifier ledger is
+updated before the child widget decides click ownership. The real-Vim test
+checks Ctrl/Alt press/drag/release isolation and exactly one paired release
+when a host modal interrupts an existing app gesture.

@@ -28,7 +28,8 @@ including linked highlight groups, retain their GUI values.
 Supported ordinary code windows, including horizontal, vertical and mixed Vim
 splits, include editing, normal/insert/
 replace modes, character and line selections, tabs, CJK/wide characters,
-base-plus-combining text, number/relative-number gutters, CursorLine, single-line
+base-plus-combining text, number/relative-number gutters, CursorLine,
+CursorColumn and colorcolumn guides, single-line
 search highlights, window-local plugin matches and non-virtual diagnostic text-property highlights. A
 standard single sign column renders the highest-priority visible sign text,
 GUI sign color, line/number highlights and equal-priority combinations. A
@@ -40,10 +41,10 @@ line and byte range; each window carries its own buffer tick and viewport.
 The active cursor and Visual selection cannot leak into sibling windows.
 
 This is an incremental GUI buffer renderer, not a complete external Vim UI
-protocol. Special buffers, actual wrapped continuation rows, closed
+protocol. Terminal and prompt buffers, actual wrapped continuation rows, closed
 folds, general popup windows and complex/scrolling completion menus, multiple/image sign columns, fold columns, virtual text,
 multiline/positional/zero-width search and match patterns, conceal matches, virtual-space cursors,
-list/conceal/spell/right-to-left display and block selections through tabs currently publish an explicit
+unsupported listchars, conceal/spell/right-to-left display and block selections through tabs currently publish an explicit
 compatibility reason. Complex zero-width/bidirectional text and clipped wide
 glyphs also fall back. Vim's editing options and text are not changed to make a
 frame renderable. More than 16 windows or an unsupported window causes a
@@ -106,6 +107,76 @@ See the [architecture audit and measured validation](vim9-native-render-audit.md
 for stock Vim API limits, the frontend matrix, performance observations and
 remaining OS IME/Wayland verification gaps.
 
+## Scratch buffers and window-local colors
+
+Ordinary text buffers with `buftype=nofile`, `nowrite` or `acwrite` use native
+text rendering and source-bound mouse/scroll input under the same display and
+input eligibility rules as files. Their source remains Vim's real buffer,
+including its undo history, `modifiable`, `readonly` and plugin mappings.
+The bridge does not turn a scratch name into a filesystem write: `:update` is
+Vim's normal no-op for unmodified nofile/nowrite buffers, while acwrite retains
+its `BufWriteCmd` callback and reports Vim's error if no handler is available.
+Terminal and prompt buffers retain the compatibility surface. Help and error-list
+windows use the separate native-paint/Vim-input policy below.
+
+`wincolor` keeps each split's Normal colors and attributes on the native path:
+
+```vim
+highlight NativePane guifg=#ddeeff guibg=#17212b
+setlocal wincolor=NativePane
+```
+
+The window background covers empty lines, end-of-line space, end-of-buffer
+rows and scroll margins. Syntax, signs, line numbers and selections keep their
+own highlight precedence. GUI caret fallback, input-method preedit and focus
+indicators use the corresponding window palette; retained scroll imagery is
+retired when that palette changes. Global `fg`/`bg` highlight references remain
+global. Vim versions with `winhighlight` also accept its single Normal mapping;
+more general window highlight remapping still uses compatibility rendering.
+
+## Help and error lists
+
+Help, quickfix and location-list windows can use native text rendering when
+their visible content passes the normal display checks. QuickFixLine follows
+the actual current entry of the corresponding Vim list, independently of the
+text cursor and buffer changedtick. Global quickfix and per-window location
+lists retain separate highlights. Existing syntax, column and Visual layers
+keep Vim's priority.
+
+These special windows retain Vim's own PTY keyboard, mouse and wheel path.
+Enter, Ctrl-], double-clicks and plugin mouse mappings are not translated into
+source-editing commands, and the host does not add scroll animation to them.
+Normal file/scratch splits beside them retain native precision input. A switch
+from a fractional file view first retires its old presentation before handing
+raw pointer coordinates to the special window.
+
+The bridge does not change display options to make a view native. Default help
+concealment and actual wrapped continuation rows still use compatibility
+rendering. A user who chooses plain help text can use
+`setlocal conceallevel=0 nowrap`; help remains readonly/nomodifiable according
+to Vim's own options.
+
+## Native column guides
+
+`cursorcolumn` and `colorcolumn` now stay on the native GUI path in supported
+ordinary buffer views. Each Vim window keeps its own options and cursor column.
+Absolute columns and signed columns relative to `textwidth` are supported:
+
+```vim
+set cursorcolumn
+set colorcolumn=80,120
+" Relative columns use the current textwidth:
+set textwidth=100 colorcolumn=+1
+```
+
+The producer composes these highlights with syntax, CursorLine, matches,
+search, text properties and Visual selection. Wide characters keep their
+whole source range, while an expanded tab may show a highlighted column
+without changing its original byte range. Empty-line and end-of-line guides
+are display-only decorations; they do not become editable text or mouse
+targets. `cursorlineopt=both` also retains its line highlight. Existing wrapped
+line, closed-fold and other compatibility boundaries remain in effect.
+
 ## Launch
 
 Install Vim 9 with `+vim9script`, `+eval`, `+channel`, `+job`, `+timers` and
@@ -138,7 +209,10 @@ an editor tab in its existing terminal application.
 ## Edit, navigate, search and build
 
 Open files from the native file controls. The buffer strip reflects Vim's
-listed buffers and marks modified buffers. Clicking a problem or search result
+listed buffers and marks modified buffers. When the bounded list exceeds 256
+items, the current listed buffer is retained so its tab and modified state
+remain visible. Byte-budget trimming also prefers to retain it, provided its
+own entry fits the frame limit; omitted buffers remain available through Vim. Clicking a problem or search result
 opens its real filename and line/column. Save, Save All, buffer changes and
 diagnostic navigation retain Vim's ordinary errors and modified-buffer checks.
 Vim commands such as `:vsplit`, `:tabnew`, `:undolist` and your existing mappings
@@ -151,6 +225,7 @@ not in a normal terminal tab or a native text field):
 | --- | --- |
 | `Ctrl+Shift+P` | Quick Open: fuzzy-match filenames, or start with `>` for commands |
 | `Ctrl+Shift+G` | Go to a one-based `line` or `line:byte-column` in the current buffer |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Increase / decrease / reset editor font size |
 | `Ctrl+S` / `Ctrl+Shift+S` | Save / Save all |
 | `Ctrl+Shift+F` | Focus project search |
 | `Ctrl+Shift+B` | Focus the build command; enter or confirm to run |
@@ -439,3 +514,22 @@ windows and distinct `PmenuMatch[Sel]` highlights retain explicit compatibility
 reasons. Public Vim APIs do not expose the first visible candidate or original
 match leader; this implementation does not guess them. Protocols 1–4 always
 retain the existing compatibility behavior while a completion menu is visible.
+
+## Native visible whitespace
+
+Common `listchars` settings retain GUI buffer painting, including explicit
+two/three-glyph `tab`, `space`, `lead`, `trail`, `nbsp` and `eol` fields with
+single-cell symbols. For example:
+
+```vim
+set list listchars=tab:»·,trail:·,nbsp:␣,eol:↲
+```
+
+Symbols keep Vim's GUI `SpecialKey`/`NonText` colors, source-byte positions and
+selection/search composition. Tab display cells all refer to the same source
+Tab byte; an EOL symbol has no source span. Saving retains the original text.
+Window-local option changes invalidate native paint without requiring an edit.
+
+Unsupported marker fields, default `^I` Tab geometry, actually visible
+`extends`/`precedes` markers and wrapped EOL continuation rows retain explicit
+compatibility reasons. The host does not rewrite the user's display options.

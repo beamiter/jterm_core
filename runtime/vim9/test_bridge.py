@@ -590,6 +590,44 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(state["buffers"]), 1)
         self.assertIsNone(e.process.poll(), "Closing the last buffer must keep Vim alive")
 
+    def test_buffer_cap_keeps_current_tab_and_exact_omitted_count(self):
+        e = self.editor()
+        e.ex("for n in range(1, 300) | call setbufvar(bufadd('extra-' .. n .. '.txt'), '&buflisted', 1) | endfor")
+        e.ex("blast")
+        state = e.snapshot()
+        self.assertEqual(len(state["buffers"]), 256)
+        self.assertTrue(state["buffers_truncated"])
+        self.assertEqual(state["buffers_omitted"], 45)
+        current = [b for b in state["buffers"] if b["current"]]
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0]["name"], str(e.root / "extra-300.txt"))
+        e.keys(b"ikeep me\x1b")
+        state = e.state_where(lambda s: s["modified"] and s["mode"] == "n")
+        self.assertTrue(next(b for b in state["buffers"] if b["current"])["modified"])
+        e.request("close_current_buffer", ok=False)
+        e.request("save")
+        e.request("close_current_buffer")
+        state = e.snapshot()
+        self.assertEqual(state["buffers_omitted"], 44)
+        self.assertEqual(next(b for b in state["buffers"] if b["current"])["name"], state["file"])
+        e.ex("blast")
+        state = e.snapshot()
+        self.assertEqual(next(b for b in state["buffers"] if b["current"])["name"],
+                         str(e.root / "extra-299.txt"))
+
+    def test_buffer_byte_budget_can_omit_an_oversized_current_tab(self):
+        e = self.editor()
+        # Vim accepts virtual names much larger than the filesystem's path
+        # limit. file plus this buffer entry would exceed the wire budget.
+        e.ex("let b = bufadd(repeat('x', 500000)) | call setbufvar(b, '&buflisted', 1) | execute 'buffer ' .. b")
+        state = e.snapshot()
+        self.assertEqual(len(state["file"]), 500000)
+        self.assertLessEqual(len(json.dumps(state, ensure_ascii=False).encode()), 900000)
+        self.assertTrue(state["buffers_truncated"])
+        self.assertEqual(state["buffers_omitted"], 2)
+        self.assertEqual(state["buffers"], [])
+        self.assertIsNone(e.process.poll())
+
     def test_native_navigation_shares_vims_jumplist_and_exact_positions(self):
         e = self.editor()
         e.ex("clearjumps")

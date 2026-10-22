@@ -27,4 +27,9 @@ jobs:
           python3 runtime/vim9/test_render_windows.py
           python3 runtime/vim9/test_render_matches.py
           python3 runtime/vim9/test_render_cursor.py
+          python3 runtime/vim9/test_render_columns.py
+          python3 runtime/vim9/test_render_wincolor.py
+          python3 runtime/vim9/test_render_scratch.py
+          python3 runtime/vim9/test_render_special.py
+          python3 runtime/vim9/test_render_listchars.py
           python3 runtime/vim9/test_render_completion.py

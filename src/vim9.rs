@@ -1064,6 +1064,13 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
                 serde_json::from_value(value).map_err(io::Error::other)?;
             snapshot.buffers_truncated |= snapshot.buffers.len() > MAX_ITEMS;
             snapshot.diagnostics_truncated |= snapshot.diagnostics.len() > MAX_ITEMS;
+            // Older or third-party bridges may send an uncapped list. Keep
+            // its active tab available when enforcing the receiver's bound.
+            if let Some(current) = snapshot.buffers.iter().position(|buffer| buffer.current) {
+                if current >= MAX_ITEMS {
+                    snapshot.buffers.swap(MAX_ITEMS - 1, current);
+                }
+            }
             snapshot.buffers.truncate(MAX_ITEMS);
             snapshot.diagnostics.truncate(MAX_ITEMS);
             snapshot.search.errors.truncate(8);
@@ -1930,6 +1937,33 @@ mod tests {
         assert_eq!(snapshot.search.exit_code, 2);
         assert_eq!(snapshot.search.truncated, 3);
         assert_eq!(snapshot.search.errors.len(), 8);
+    }
+
+    #[test]
+    fn capped_snapshot_keeps_the_current_buffer() {
+        let shared = Mutex::new(Shared {
+            entry_id: Some(uuid::Uuid::new_v4()),
+            snapshot: Vim9Snapshot::default(),
+            pending: HashSet::new(),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
+        });
+        let buffers: Vec<_> = (1..=300)
+            .map(|id| json!({"id":id,"current":id == 300,"modified":id == 300}))
+            .collect();
+        apply_event(json!({"event":"state","buffers":buffers}), &shared).unwrap();
+        let snapshot = &shared.lock().snapshot;
+        assert_eq!(snapshot.buffers.len(), MAX_ITEMS);
+        assert!(snapshot.buffers_truncated);
+        let current = snapshot
+            .buffers
+            .iter()
+            .find(|buffer| buffer.current)
+            .unwrap();
+        assert_eq!(current.id, 300);
+        assert!(current.modified);
+        assert_eq!(snapshot.buffers[0].id, 1);
     }
 
     #[test]
