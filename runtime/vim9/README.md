@@ -129,6 +129,12 @@ ids and nonpositive positions receive an error. Filenames are passed through
 already has a buffer is matched by its exact absolute name, avoiding Vim's
 pattern-based buffer lookup fallback.
 
+The frontend Quick Open query syntax (`path:line[:byte-column]` and
+`:line[:byte-column]`) resolves to the existing typed `open` and `goto`
+actions. `python3 runtime/vim9/test_quick_navigation.py` checks real Vim
+navigation with literal colon/Ex-special filenames, UTF-8 byte positions,
+jumplist round trips and modified or unnamed current buffers.
+
 ### Native GUI buffer frames
 
 The protocol is backwards compatible: no `render` events are produced before

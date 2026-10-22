@@ -169,6 +169,21 @@ partial results and failures are reported. No recursive I/O runs in a render
 callback, snapshots share immutable file lists, and ranking is recalculated
 only when the query or index changes. Install ripgrep for Quick Open.
 
+Quick Open also accepts `path:line[:byte-column]`, including fuzzy paths such as
+`src/mrs:42:8` and indexed absolute paths copied from a diagnostic. Enter
+`:42` or `:42:8` to move in the current buffer, including an unnamed or modified
+buffer; this does not require a successful file index. The picker shows the
+destination, validates positive coordinates up to 2147483647, and rechecks the
+current query before opening. The column is a one-based UTF-8 byte column, as
+in Vim and compiler diagnostics. Invalid input keeps the picker open and cannot
+activate a previous result. Queries are bounded to 256 characters.
+
+Exact indexed filenames containing colons take precedence over position syntax.
+An exact indexed prefix also wins: when `notes:42` is a real file,
+`notes:42:9` opens that file at line 9. Unindexed/external files still use the
+explicit Open path control. All four frontends share the same parser and send
+typed Open/Goto actions; the query never becomes an Ex or shell command.
+
 Native split controls create real Vim horizontal/vertical windows sharing
 Vim's buffers and undo. Buffer navigation restores remembered cursor/scroll
 positions. Closing a buffer never forces a write or discards changes, even

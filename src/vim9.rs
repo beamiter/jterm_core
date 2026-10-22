@@ -26,6 +26,10 @@ use serde_json::{json, Value};
 mod project;
 pub use project::{Vim9ProjectFile, Vim9ProjectIndex, Vim9ProjectSnapshot};
 
+#[path = "vim9_navigation.rs"]
+mod navigation;
+pub use navigation::{parse_vim9_location, Vim9QuickOpenQuery};
+
 #[path = "vim9_render.rs"]
 mod render;
 pub use render::{
