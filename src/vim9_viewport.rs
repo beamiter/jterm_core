@@ -624,6 +624,50 @@ mod tests {
     }
 
     #[test]
+    fn inline_labels_shift_source_anchors_without_becoming_source_text() {
+        let mut frame = frame();
+        frame.windows[0].line_lengths = vec![2, 3, 1, 0];
+        frame.windows[0].native_pointer = false;
+        frame.windows[0].native_scroll = true;
+        frame.runs[0].text = "A".into();
+        frame.runs[0].cells = 1;
+        frame.runs[0].byte_end = 1;
+        let mut second = frame.runs[0].clone();
+        second.column = 4;
+        second.text = "B".into();
+        second.byte_start = 1;
+        second.byte_end = 2;
+        frame.runs.push(second);
+        frame.runs.push(super::super::Vim9RenderRun {
+            window: 10,
+            row: 0,
+            column: 1,
+            cells: 3,
+            text: "tip".into(),
+            ..Default::default()
+        });
+        assert!(frame.valid());
+        let view = Vim9Viewport::new(&frame, 10, metrics(), -0.5).unwrap();
+        // Hints have no source anchor. The host retains Vim's cell-based
+        // pointer path, while hovering real text still resolves exact bytes.
+        assert!(view.anchor_at(16.0, 5.0).is_none());
+        let source = view.anchor_at(33.0, 5.0).unwrap();
+        assert_eq!(
+            (
+                source.position.line,
+                source.position.byte_column,
+                source.byte_end
+            ),
+            (10, 1, 2)
+        );
+        assert_eq!(source.rect.x, 32.0);
+        assert_eq!(view.anchor_for_position(&source.position), Some(source));
+        let eol = view.anchor_at(48.0, 5.0).unwrap();
+        assert_eq!((eol.position.line, eol.position.byte_column), (10, 2));
+        assert_eq!(eol.rect.x, 40.0);
+    }
+
+    #[test]
     fn absent_visible_source_metadata_does_not_invent_an_empty_line() {
         let frame = frame();
         let view = Vim9Viewport::new(&frame, 10, metrics(), 0.0).unwrap();

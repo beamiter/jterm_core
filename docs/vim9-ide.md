@@ -609,8 +609,8 @@ live and last presented overlay are gone. Vim owns keyboard filters, selection,
 This version accepts complete, unwrapped text, including default `wrap` when
 no line actually wraps. Scrolled/clipped/wrapped content, titles, resize/drag,
 filters, virtual text, conceal, unsupported decorations and excessive budgets
-fall back explicitly. It does not add a rich Markdown/image document renderer,
-inline inlay layout, or generic interactive popup widgets. Protocols 1–5
+fall back explicitly. It does not add a rich Markdown/image document renderer
+or generic interactive popup widgets. Protocols 1–5
 retain their previous popup fallback. `runtime/vim9/test_render_popups.py`
 exercises real Vim popups, completion-plus-docs, styles, Unicode, lifecycle,
 input ownership and fallback; each host adds renderer/controller coverage.
@@ -634,7 +634,7 @@ Unsupported marker fields, default `^I` Tab geometry, actually visible
 `extends`/`precedes` markers and wrapped EOL continuation rows retain explicit
 compatibility reasons. The host does not rewrite the user's display options.
 
-## Native CodeLens and diagnostic labels
+## Native CodeLens, diagnostics and inlay hints
 
 SimpleCC's `:SimpleCCCodeLens` and enabled virtual diagnostics use Vim text
 properties after the original source line. The bridge now paints those labels
@@ -652,25 +652,47 @@ renderer does not execute label text. `User SimpleCCDecorationsChanged`
 refreshes additions, replacements and removals without waiting for a buffer
 edit. Row deltas explicitly clear removed labels while retaining source text.
 
-The supported subset is `col=0`, `text_align=after` (including the default)
-and `text_wrap=truncate` (including the default). Normal/Insert/Replace views
-may use it. Inline inlay hints, above/below/right alignment, requested wrapping,
-Visual selections with virtual labels, control/bidirectional text, partially
-clipped wide glyphs and truncation while `wrap` is enabled still reveal the
-real Vim compatibility view. No option or hint is silently disabled. Inlay
-hints are separate from CodeLens/diagnostic labels; `:SimpleCCInlayHints`
-explicitly toggles them if the user wants to keep the supported EOL labels
-on the native surface.
+The after-line subset is `col=0`, `text_align=after` (including the default)
+and `text_wrap=truncate` (including the default). Inline properties with
+`col>0` also paint natively in `nowrap` Normal/Insert/Replace views. SimpleCC's
+`:SimpleCCInlayHints` can therefore show parameter/type hints on the same GUI
+surface as CodeLens and diagnostics. The original Vim option is never changed.
+
+Inline labels shift following source glyphs while preserving their UTF-8 byte
+ranges. Tabs use the shifted display column, and CJK/combining clusters retain
+their exact cell advance. Same-position labels follow Vim's priority and
+creation order. Source syntax, listchars, row/column guides, split gutters and
+after-line labels continue to compose at the shifted columns. The bridge reads
+buffer, option and property APIs; the terminal screen is used only as a test
+oracle. Insert/Replace carets and EOL carets use a single cell when
+`screenpos().endcol` includes a preceding hint, avoiding a label-wide cursor.
+
+Hint runs remain source-free. In a window containing inline hints, Vim owns
+mouse input through the existing PTY route, including clicks inside hints.
+The bridge also rejects stale native pointer requests after a property-only
+change. Ordinary Normal/Insert source-bound scrolling remains available with
+exact visible/margin source rows. Removing the hints restores native pointer
+ownership. This is not a clickable inlay-widget protocol.
+
+Inline hints with `wrap`, above/below/right alignment, requested wrapping,
+Visual selections with virtual labels, control/bidirectional text, properties
+inside a source grapheme, partially clipped wide glyphs and truncation while
+`wrap` is enabled still reveal the real Vim compatibility view. No option or
+hint is silently disabled.
 
 The bounds are 128 labels per line, 1,024 characters/4,096 UTF-8 bytes per
 label, 32,768 virtual-label bytes per sampled window, and the existing total
 property/frame budgets. Protocol 6 is unchanged because source-free runs
-already carry this paint. `g:jterm_vim9_virtual_text_after` identifies the
-new authenticated producer capability and is cleared before disconnect hooks;
-the protocol number alone does not imply this feature.
+already carry this paint. `g:jterm_vim9_virtual_text_after` and the independent
+`g:jterm_vim9_virtual_text_inline` identify authenticated producer capabilities
+and are cleared before disconnect hooks; the protocol number alone does not
+imply either feature.
 
 `runtime/vim9/test_render_virtual_text.py` compares the paint with actual Vim
 screen glyphs and highlight identities, checks source/save/click semantics,
 split margins, horizontal scroll, property-only delta lifecycle and explicit
-fallback recovery. Host painter tests cover the corresponding GUI surfaces;
+fallback recovery. It also verifies hint priority, tab reflow, insertion/undo,
+ordinary Vim mouse clicks and source-bound scrolling. The real SimpleCC tests
+cover asynchronous provider additions and removals through the workbench.
+Host painter tests cover the corresponding GUI surfaces;
 these checks do not establish desktop latency or arbitrary virtual layouts.

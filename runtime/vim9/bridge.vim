@@ -25,6 +25,7 @@ g:jterm_vim9_bridge_loaded = true
 g:jterm_vim9_connected = false
 g:jterm_vim9_render_protocol = 0
 g:jterm_vim9_virtual_text_after = false
+g:jterm_vim9_virtual_text_inline = false
 
 var bridge: channel
 var authenticated = false
@@ -304,6 +305,7 @@ def WorkbenchLifecycle(connected: bool)
   # This producer capability is independent of the wire version: older
   # protocol-6 bridges did not compose virtual text into source-free runs.
   g:jterm_vim9_virtual_text_after = connected
+  g:jterm_vim9_virtual_text_inline = connected
   try
     if connected
       doautocmd <nomodeline> User JTermVim9Ready
@@ -839,7 +841,7 @@ enddef
 
 # Standard primary-pointer gestures only. Custom mappings, Select-mode and
 # virtual columns remain owned by the compatibility input path.
-def NativePointerAvailable(): bool
+def NativePointerAvailable(checkInline: bool = true): bool
   const current = mode(1)
   # 'block' only permits virtual space in blockwise Visual mode, which is
   # already excluded here. Normal/characterwise source targets remain exact.
@@ -855,6 +857,15 @@ def NativePointerAvailable(): bool
       endif
     endfor
   endfor
+  if checkInline
+    # Property-only changes do not advance changedtick. Recheck at dispatch,
+    # so a delayed native press/drag cannot bypass a newly added inline hint.
+    for property in prop_list(line('w0'), {end_lnum: line('w$')})
+      if property.col > 0 && has_key(property, 'text')
+        return false
+      endif
+    endfor
+  endif
   return true
 enddef
 
@@ -921,7 +932,7 @@ def SourcePointer(request: dict<any>)
   const previous = pointerGesture
   pointerGesture = {}
   SafeToChange()
-  if !NativePointerAvailable() || SaveInputPending()
+  if !NativePointerAvailable(false) || SaveInputPending()
     throw 'This input state or mouse mapping uses Vim compatibility input'
   endif
   const window = NativeSourceWindow(request)
@@ -943,6 +954,9 @@ def SourcePointer(request: dict<any>)
         || win_getid() != window || previous.buffer != bufnr() || previous.tick != b:changedtick
         || previous.mode !=# mode(1) || previous.cursor !=# getcurpos()[1 : 2]
       throw 'The native pointer gesture was interrupted; it will not be replayed'
+    endif
+    if !NativePointerAvailable()
+      throw 'This decorated window uses Vim compatibility pointer input'
     endif
   else
     if !win_gotoid(window)
@@ -980,11 +994,47 @@ def AfterPropertyOrder(left: dict<any>, right: dict<any>): number
     : (leftPriority > rightPriority ? -1 : 1)
 enddef
 
-def RenderAfterText(runs: list<dict<any>>, properties: list<any>, context: dict<any>): string
-  var column = strdisplaywidth(getline(context.line)) + (context.eol ? 1 : 0)
+def InlinePropertyOrder(left: dict<any>, right: dict<any>): number
+  return left.col == right.col ? AfterPropertyOrder(left, right) : left.col - right.col
+enddef
+
+# Inline labels advance the same display column as source characters. In
+# particular a Tab after a hint uses the shifted tab stop, not its old width.
+# Only public source/option/property APIs are read; no terminal grid is sampled.
+def InlineTextLayout(lineNumber: number, properties: list<any>): dict<any>
+  var text = getline(lineNumber)
+  if strlen(text) > 16384 || strchars(text) > 4096
+    return {reason: 'This long line exceeds the bounded native paint budget'}
+  endif
+  var column = 0
+  var byte = 0
+  var labels: list<any> = []
+  var advances: dict<number> = {}
+  for original in sort(copy(properties), InlinePropertyOrder)
+    var property = copy(original)
+    var start = property.col - 1
+    if start < byte || start > strlen(text)
+        || (start < strlen(text) && byteidx(text, charidx(text, start)) != start)
+      return {reason: 'Inline Vim virtual text inside a source grapheme uses the compatibility view'}
+    endif
+    column += strdisplaywidth(strpart(text, byte, start - byte), column)
+    property.paint_column = column
+    var width = strdisplaywidth(property.text)
+    column += width
+    var key = string(start)
+    advances[key] = get(advances, key, 0) + width
+    add(labels, property)
+    byte = start
+  endfor
+  column += strdisplaywidth(strpart(text, byte), column)
+  return {labels: labels, advances: advances, width: column, reason: ''}
+enddef
+
+def RenderVirtualText(runs: list<dict<any>>, properties: list<any>, context: dict<any>): string
+  var column = context.width_before + (context.eol ? 1 : 0)
   var right = context.left + context.width
-  for property in sort(copy(properties), AfterPropertyOrder)
-    column += get(property, 'text_padding_left', 0)
+  for property in (context.inline ? properties : sort(copy(properties), AfterPropertyOrder))
+    column = context.inline ? property.paint_column : column + get(property, 'text_padding_left', 0)
     var text = property.text
     # Vim's wrap+truncate branch adds an ellipsis, with additional wide-glyph
     # and padding rules. Until that display branch is modeled, do not guess.
@@ -1073,7 +1123,8 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   frame.textoff = info.textoff
   frame.line_count = line('$')
   frame.overscan = []
-  frame.native_pointer = renderProtocol >= 3 && NativePointerAvailable()
+  # The bounded property scan below supplies inline pointer ownership.
+  frame.native_pointer = renderProtocol >= 3 && NativePointerAvailable(false)
   frame.native_scroll = renderProtocol >= 3 && NativeScrollAvailable()
   frame.scroll_ack = get(scrollAcknowledgements, string(win_getid()), 0)
   frame.line_lengths = map(getline(first, last), (_, text) => strlen(text))
@@ -1123,6 +1174,9 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   var allProperties = prop_list(first, {end_lnum: last})
   var properties: list<dict<any>> = []
   var afterLines: dict<list<any>> = {}
+  var inlineLines: dict<list<any>> = {}
+  var inlineLayouts: dict<dict<any>> = {}
+  var virtualCounts: dict<number> = {}
   var afterBytes = 0
   var matches = getmatches()
   if len(allProperties) > 2048
@@ -1139,9 +1193,11 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var text = property.text
       var padding = get(property, 'text_padding_left', 0)
       afterBytes += strlen(text)
-      if property.col != 0 || get(property, 'text_align', 'after') !=# 'after'
+      if property.col < 0 || get(property, 'text_align', 'after') !=# 'after'
           || get(property, 'text_wrap', 'truncate') !=# 'truncate'
-        reason = 'Inline, aligned or wrapping Vim virtual text uses the compatibility view'
+        reason = 'Aligned or wrapping Vim virtual text uses the compatibility view'
+      elseif property.col > 0 && &wrap
+        reason = 'Inline Vim virtual text with wrap uses the compatibility view'
       elseif index(['v', 'V', "\<C-V>"], mode(1)) >= 0
         reason = 'Visual selections with Vim virtual text use the compatibility view'
       elseif empty(property.definition) || strlen(text) > 4096 || strchars(text) > 1024
@@ -1151,12 +1207,14 @@ def RenderWindowFrame(margin: number = 0): dict<any>
         reason = 'Control and bidirectional Vim virtual text uses the compatibility view'
       else
         var key = string(property.lnum)
-        if !has_key(afterLines, key)
-          afterLines[key] = []
+        var lines = property.col > 0 ? inlineLines : afterLines
+        if !has_key(lines, key)
+          lines[key] = []
         endif
-        property.order = len(afterLines[key])
-        add(afterLines[key], property)
-        if len(afterLines[key]) > 128
+        property.order = len(lines[key])
+        add(lines[key], property)
+        virtualCounts[key] = get(virtualCounts, key, 0) + 1
+        if virtualCounts[key] > 128
           reason = 'This line exceeds the native virtual text paint budget'
         endif
       endif
@@ -1171,6 +1229,21 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       return frame
     endif
   endfor
+  for [key, labels] in items(inlineLines)
+    var layout = InlineTextLayout(str2nr(key), labels)
+    if !empty(layout.reason)
+      frame.supported = false
+      frame.fallback_reason = layout.reason
+      return frame
+    endif
+    inlineLayouts[key] = layout
+  endfor
+  # A display-only hint is not an editable source range. Until a separate
+  # hint-hit contract exists, Vim owns pointer clicks in this window. Source
+  # scrolling is still exact: every visible/margin row retains its real line.
+  if !empty(inlineLayouts)
+    frame.native_pointer = false
+  endif
   # A scroll changes screen rows, not the semantic paint of every surviving
   # buffer line. A buffer edit still invalidates all lines: syntax regions can
   # propagate arbitrarily far beyond the edited line.
@@ -1182,7 +1255,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     renderLineGeneration = generation
     renderLineCache = {}
   endif
-  var baseKey = string([generation, first, last, view, properties])
+  var baseKey = string([generation, first, last, view, properties, inlineLines])
   if baseKey !=# renderBaseKey
     renderBase = []
     var nextLines: dict<dict<any>> = {}
@@ -1191,7 +1264,10 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var text = getline(lineNumber)
       var row = view.row + lineNumber - first
       var lineProperties = filter(copy(properties), (_, item) => item.lnum == lineNumber)
-      var lineKey = string([text, lineProperties])
+      var inlineLayout = get(inlineLayouts, string(lineNumber), {})
+      var inlineAdvances: dict<number> = get(inlineLayout, 'advances', {})
+      var displayWidth = get(inlineLayout, 'width', strdisplaywidth(text))
+      var lineKey = string([text, lineProperties, get(inlineLines, string(lineNumber), [])])
       var cached = get(renderLineCache, string(lineNumber), {})
       if !empty(cached) && cached.key ==# lineKey
         for stored in cached.base
@@ -1208,17 +1284,17 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       elseif strlen(text) > 16384 || strchars(text) > 4096
         reason = 'This long line exceeds the bounded native paint budget'
         break
-      elseif &wrap && strdisplaywidth(text) > textWidth
+      elseif &wrap && displayWidth > textWidth
         reason = 'Wrapped Vim continuation rows use the compatibility view'
         break
-      elseif &list && &wrap && has_key(listChars, 'eol') && strdisplaywidth(text) >= textWidth
+      elseif &list && &wrap && has_key(listChars, 'eol') && displayWidth >= textWidth
         reason = 'A wrapped listchars EOL marker uses the compatibility view'
         break
       elseif &list && stridx(text, "\t") >= 0 && !has_key(listChars, 'tab')
         reason = 'Default ^I listchars tab geometry uses the compatibility view'
         break
-      elseif &list && ((has_key(listChars, 'precedes') && savedView.leftcol > 0 && strdisplaywidth(text) > savedView.leftcol)
-          || (has_key(listChars, 'extends') && !&wrap && strdisplaywidth(text) > savedView.leftcol + textWidth))
+      elseif &list && ((has_key(listChars, 'precedes') && savedView.leftcol > 0 && displayWidth > savedView.leftcol)
+          || (has_key(listChars, 'extends') && !&wrap && displayWidth > savedView.leftcol + textWidth))
         reason = 'This active listchars horizontal-edge marker uses the compatibility view'
         break
       elseif text =~# '[\x00-\x08\x0a-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
@@ -1240,6 +1316,9 @@ def RenderWindowFrame(margin: number = 0): dict<any>
         leadEnd = strlen(text)
       endif
       for charIndex in range(strchars(text, true))
+        if !empty(inlineAdvances)
+          virtualColumn += get(inlineAdvances, string(byteColumn), 0)
+        endif
         var cluster = asciiLine ? strpart(text, charIndex, 1) : strcharpart(text, charIndex, 1, true)
         var plain = strlen(cluster) == 1 && cluster !=# "\t"
         var cells = plain ? 1 : strdisplaywidth(cluster, virtualColumn)
@@ -1516,7 +1595,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   endfor
   if has_key(listChars, 'eol')
     for lineNumber in range(first, last)
-      var column = strdisplaywidth(getline(lineNumber)) - savedView.leftcol
+      var column = get(get(inlineLayouts, string(lineNumber), {}), 'width', strdisplaywidth(getline(lineNumber))) - savedView.leftcol
       if column >= 0 && column < textWidth
         var style = MergeRenderStyle(windowNormal, get(rowStyles, string(lineNumber), {}))
         style = MergeRenderStyle(style, RenderStyle(hlID('NonText')))
@@ -1553,20 +1632,25 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       endif
     endfor
   endif
-  for [key, labels] in items(afterLines)
-    var lineNumber = str2nr(key)
-    var context = {line: lineNumber, row: view.row + lineNumber - first,
-      column: view.column + info.textoff, width: textWidth, left: savedView.leftcol,
-      eol: has_key(listChars, 'eol'),
-      style: MergeRenderStyle(windowNormal, get(rowStyles, key, {})),
-      guides: get(get(guideRows, key, {}), 'styles', {})}
-    reason = RenderAfterText(paintRuns, labels, context)
-    if !empty(reason)
-      frame.supported = false
-      frame.fallback_reason = reason
-      frame.runs = []
-      return frame
-    endif
+  for inline in [false, true]
+    var lines = inline ? inlineLines : afterLines
+    for [key, labels] in items(lines)
+      var lineNumber = str2nr(key)
+      var layout = get(inlineLayouts, key, {})
+      var context = {line: lineNumber, row: view.row + lineNumber - first,
+        column: view.column + info.textoff, width: textWidth, left: savedView.leftcol,
+        width_before: get(layout, 'width', strdisplaywidth(getline(lineNumber))),
+        inline: inline, eol: has_key(listChars, 'eol'),
+        style: MergeRenderStyle(windowNormal, get(rowStyles, key, {})),
+        guides: get(get(guideRows, key, {}), 'styles', {})}
+      reason = RenderVirtualText(paintRuns, inline ? layout.labels : labels, context)
+      if !empty(reason)
+        frame.supported = false
+        frame.fallback_reason = reason
+        frame.runs = []
+        return frame
+      endif
+    endfor
   endfor
   for lineNumber in range(first, last)
     var sign = get(signs, string(lineNumber), {})
@@ -1630,8 +1714,15 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     frame.runs = visibleRuns
   endif
   if get(position, 'row', 0) > 0 && get(position, 'curscol', 0) > 0
+    var beforeHint = has_key(get(get(inlineLayouts, string(line('.')), {}), 'advances', {}), string(col('.') - 1))
+      && mode(1) =~# '^[iR]'
+    # screenpos().endcol includes virtual text before an Insert/Replace
+    # caret and at EOL. It must not turn the native caret into a label-wide
+    # block, nor advertise the hint's cells as editable source geometry.
+    var narrowCursor = beforeHint || col('.') > strlen(getline('.'))
+      || strpart(getline('.'), col('.') - 1, 1) ==# "\t"
     frame.cursor = {row: position.row - 1, column: position.curscol - 1,
-      width: strpart(getline('.'), col('.') - 1, 1) ==# "\t" ? 1 : max([1, position.endcol - position.curscol + 1]), visible: true,
+      width: narrowCursor ? 1 : max([1, position.endcol - position.curscol + 1]), visible: true,
       line: line('.'), byte_column: col('.') - 1, appearance: RenderCursorAppearance()}
   endif
   return frame

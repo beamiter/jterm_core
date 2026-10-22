@@ -572,19 +572,22 @@ to verify automatic recovery without losing editing commands.
 These tests do not validate frontend font rendering, desktop IME integration,
 mouse input or all user plugins; those are frontend/desktop verification tasks.
 
-## After/EOL virtual text
+## Inline and after/EOL virtual text
 
 The source-free buffer run format also carries bounded Vim text properties
 whose `col` is zero, `text_align` is `after` and `text_wrap` is `truncate`
-(omitted fields have those defaults). Source runs keep their original byte
-ranges and columns. Virtual labels use `line=0`, `byte_start=byte_end=0`,
+(omitted fields have those defaults). Inline properties with `col>0` also
+paint natively in `nowrap` Normal/Insert/Replace views. Source runs keep their
+original UTF-8 byte ranges while inline labels shift the display columns.
+Tabs use the shifted tab stops. Virtual labels use `line=0`, `byte_start=byte_end=0`,
 actual window identity and GUI property styles. ASCII can coalesce within a
 label; each non-ASCII grapheme retains Vim's display-cell advance.
 
 This is a producer addition with no new wire field or protocol version.
-`g:jterm_vim9_virtual_text_after` is true only after bridge authentication and
-is cleared before `User JTermVim9Disconnected`. Older protocol-6 producers
-do not publish this capability. `User SimpleCCDecorationsChanged` schedules
+`g:jterm_vim9_virtual_text_after` and `g:jterm_vim9_virtual_text_inline` are true
+only after bridge authentication and are cleared before
+`User JTermVim9Disconnected`. Older protocol-6 producers may support neither
+or only the after-line capability. `User SimpleCCDecorationsChanged` schedules
 native repaint after provider-owned property creation, clearing or replacement;
 the next ordinary row delta carries the complete replacement paint.
 
@@ -592,15 +595,28 @@ Property priority/creation order, padding, listchars EOL, row/column guides,
 split-local styles, nowrap clipping and semantic scroll margins are supported.
 Limits are 128 labels per line, 1,024 characters/4,096 bytes per label and
 32,768 label bytes per sampled window, within the existing 2,048-property
-and frame budgets. Inline/above/below/right/wrapping text, Visual selections
-with labels, control/bidirectional content, a partially clipped wide glyph and
-wrap-mode truncation remain explicit compatibility states. The bridge never
+and frame budgets. Inline hints with `wrap`, above/below/right/wrapping text,
+Visual selections with labels, control/bidirectional content, properties
+inside source graphemes, a partially clipped wide glyph and wrap-mode
+truncation remain explicit compatibility states. The bridge never
 changes the user's options or turns off a provider to force native paint.
+
+Windows with inline hints publish `native_pointer=false`: Vim owns mouse
+clicks, including clicks in the hint, through the existing PTY route. A
+property-only change also invalidates delayed native pointer requests at
+dispatch. The hint never becomes a source-byte anchor. Normal/Insert
+`native_scroll` retains exact source rows and overscan, and removing all
+inline labels restores native pointer ownership. Insert/Replace and EOL
+carets never take the hint's full width from `screenpos().endcol`.
 
 Run `python3 -m unittest -v test_render_virtual_text` from this directory.
 The test uses Vim's real screen as a glyph/highlight oracle and covers
 source-byte/save invariants, EOL clicks, event-driven updates and removals
 with the fallback poll stopped, exact row deltas, splits and scroll margins.
+Inline cases additionally cover tab reflow, same-column property order,
+source glyph shifts, horizontal clipping, native scroll, Vim-owned hint
+clicks, insertion/undo and caret geometry. `test_simple_inlay_hints.py` covers
+the real vimrc/SimpleCC asynchronous provider path.
 
 ## Scroll performance
 

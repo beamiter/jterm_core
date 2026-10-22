@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vim-owned after/EOL virtual labels, compared with the real screen and input.
+"""Vim-owned inline/after virtual labels, compared with the real screen and input.
 
 No provider callback is needed here: public prop_add()/prop_list() are the
 producer contract. Actual SimpleCC integration is covered separately.
@@ -195,7 +195,7 @@ class RenderVirtualTextTests(unittest.TestCase):
 
     def test_fallback_subsets_recover_without_changing_display_options(self):
         e = self.editor
-        for options in ({"column": 2}, {"text_align": "right"},
+        for options in ({"text_align": "right"},
                         {"text_align": "above"}, {"text_align": "below"}, {"text_wrap": "wrap"}):
             with self.subTest(options=options):
                 self.add(1, "hint", **options)
@@ -303,8 +303,8 @@ class RenderVirtualTextTests(unittest.TestCase):
 
     def test_capability_is_authenticated_and_cleared_before_disconnect_hook(self):
         e = self.editor
-        self.assertEqual(self.read_json("[g:jterm_vim9_connected, g:jterm_vim9_virtual_text_after]"), [True, True])
-        e.ex("autocmd User JTermVim9Disconnected call writefile([json_encode([g:jterm_vim9_connected, g:jterm_vim9_virtual_text_after])], 'disconnected.json')")
+        self.assertEqual(self.read_json("[g:jterm_vim9_connected, g:jterm_vim9_virtual_text_after, g:jterm_vim9_virtual_text_inline]"), [True, True, True])
+        e.ex("autocmd User JTermVim9Disconnected call writefile([json_encode([g:jterm_vim9_connected, g:jterm_vim9_virtual_text_after, g:jterm_vim9_virtual_text_inline])], 'disconnected.json')")
         e.connection.close()
         e.connection = None
         path = self.root / "disconnected.json"
@@ -317,7 +317,207 @@ class RenderVirtualTextTests(unittest.TestCase):
                 break
             except (FileNotFoundError, json.JSONDecodeError):
                 pass
-        self.assertEqual(observed, [False, False])
+        self.assertEqual(observed, [False, False, False])
+
+    def test_inline_order_tabs_unicode_and_saved_source(self):
+        e = self.editor
+        original = self.read_json("getline(1,'$')")
+        before = self.native()
+        self.add(1, " XX", column=2)
+        self.add(1, " YY", column=2)
+        self.add(1, " ZZ", kind="Lens", column=2)
+        self.add(2, "HI", column=2)
+        self.add(2, "Q", column=3)
+        self.add(3, "空 é", column=1)
+        frame = self.native()
+        self.assertEqual(self.row(frame, 1), "a ZZ XX YYbc")
+        self.assertEqual(self.row(frame, 2), "aHI Q界é")
+        self.assert_screen(frame)
+        source = [r for r in frame["runs"] if r["line"] == 2 and r["byte_end"] > r["byte_start"]]
+        tab = next(r for r in source if r["byte_start"] == 1)
+        self.assertEqual((tab["text"], tab["cells"], tab["byte_end"]), (" ", 1, 2))
+        wide = next(r for r in source if r["text"] == "界")
+        self.assertEqual((wide["column"], wide["byte_start"], wide["byte_end"]), (5, 2, 5))
+        labels = [r for r in frame["runs"] if r["style"]["foreground"] in (0x12ab34, 0xab1234)]
+        self.assertTrue(labels)
+        self.assertTrue(all((r["line"], r["byte_start"], r["byte_end"]) == (0, 0, 0) for r in labels))
+        self.assertEqual(frame["changedtick"], before["changedtick"])
+        e.request("save")
+        self.assertEqual(e.file.read_text(), "\n".join(original) + "\n")
+
+    def test_inline_eol_labels_listchars_and_guides_match_vim(self):
+        e = self.editor
+        e.ex("highlight CursorLine guibg=#445566 gui=NONE ctermbg=4 cterm=NONE | set cursorline")
+        e.ex("highlight ColorColumn guibg=#556677 gui=NONE ctermbg=6 cterm=NONE | set colorcolumn=3")
+        e.ex("set list listchars=tab:>-,eol:$ | normal! gg0")
+        self.add(1, "AB", column=2)
+        self.add(1, "END", column=4)
+        self.add(1, " tail", kind="Lens")
+        self.add(2, "X", column=2)
+        frame = self.native()
+        screen = self.assert_screen(frame)
+        self.assertEqual(self.style(frame, 1, 1)["background"], 0x445566)
+        self.assertEqual(self.style(frame, 1, 2)["background"], 0x556677)
+        self.assertNotEqual(screen["attrs"][0][1], screen["attrs"][0][2])
+        e.ex("normal! 2|")
+        frame = self.native()
+        self.assertEqual(frame["cursor"]["column"], 3)
+        self.assertEqual(frame["cursor"]["byte_column"], 1)
+
+    def test_inline_insertion_caret_and_undo_keep_hint_out_of_buffer(self):
+        e = self.editor
+        self.add(1, "type: ", column=1)
+        before = self.native()
+        self.assertEqual(before["cursor"]["column"], 6)
+        e.keys("i")
+        e.state_where(lambda s: s["mode"] == "i")
+        inserted = self.native()
+        self.assertEqual((inserted["cursor"]["column"], inserted["cursor"]["width"]), (0, 1))
+        self.assertTrue(self.window(inserted)["native_scroll"])
+        e.keys("!")
+        e.state_where(lambda s: s["changedtick"] > before["changedtick"])
+        edited = self.native()
+        self.assertEqual(self.row(edited, 1), "!type: abc")
+        e.request("save")
+        self.assertEqual(e.file.read_text().splitlines()[0], "!abc")
+        e.keys(b"\x1bu")
+        e.state_where(lambda s: s["mode"] == "n" and s["changedtick"] > edited["changedtick"])
+        self.assert_screen(self.native())
+        e.request("save")
+        self.assertEqual(e.file.read_text().splitlines()[0], "abc")
+        e.ex("call prop_clear(1)")
+        self.add(1, "END", column=4)
+        e.keys("A")
+        e.state_where(lambda s: s["mode"] == "i")
+        frame = self.native()
+        self.assertEqual((frame["cursor"]["column"], frame["cursor"]["width"]), (3, 1))
+
+    def test_inline_mouse_is_vim_owned_and_removal_restores_native_pointer(self):
+        e = self.editor
+        e.ex("set mouse=a ttymouse=sgr")
+        self.add(1, " parameter: ", column=2)
+        frame = self.native()
+        self.assertFalse(self.window(frame)["native_pointer"])
+        self.assertTrue(self.window(frame)["native_scroll"])
+        active = self.window(frame)
+        e.request("pointer", window=active["window"], buffer=active["buffer"],
+                  changedtick=active["changedtick"], gesture=1, phase="press",
+                  line=1, byte_column=1, ok=False)
+        # Click inside the hint. Vim resolves it to the following source byte.
+        e.keys("\x1b[<0;6;1M\x1b[<0;6;1m")
+        e.state_where(lambda s: s["line"] == 1 and s["column"] == 2)
+        self.assertEqual(e.snapshot()["changedtick"], frame["changedtick"])
+        e.ex("call prop_clear(1)")
+        restored = self.native()
+        self.assertTrue(self.window(restored)["native_pointer"])
+        self.assertEqual(self.row(restored, 1), "abc")
+        self.add(1, "hint", column=2)
+        e.ex("vsplit other.txt | wincmd p")
+        split = self.native()
+        self.assertFalse(self.window(split)["native_pointer"])
+        peer = next(w for w in split["windows"] if w["window"] != split["window"])
+        self.assertTrue(peer["native_pointer"], "An unrelated split retains source pointer input")
+        for phase in ("press", "release"):
+            e.request("pointer", window=peer["window"], buffer=peer["buffer"],
+                      changedtick=peer["changedtick"], gesture=2, phase=phase,
+                      line=1, byte_column=0)
+        self.assertEqual(e.snapshot()["window"], peer["window"])
+
+    def test_inline_horizontal_clipping_uses_shifted_source_columns(self):
+        e = self.editor
+        e.ex("call setline(1, repeat('a', 140))")
+        self.add(1, "01234567890123456789", column=61)
+        e.ex("call cursor(1,130) | call winrestview({'leftcol':65})")
+        frame = self.native()
+        self.assertGreater(self.window(frame)["leftcol"], 0)
+        self.assert_screen(frame)
+        cursor = frame["cursor"]
+        source = next(r for r in frame["runs"] if r["line"] == 1
+                      and r["byte_start"] <= cursor["byte_column"] < r["byte_end"])
+        self.assertEqual(source["column"] + cursor["byte_column"] - source["byte_start"], cursor["column"])
+
+    def test_inline_split_margins_and_source_scroll_keep_window_identity(self):
+        e = self.editor
+        e.ex("call setline(1, map(range(1,80), {_,n -> 'source ' . n}))")
+        e.ex("for n in range(1,80) | call prop_add(n,4,{'type':'Hint','text':':type '}) | endfor")
+        e.request("split", vertical=True)
+        e.ex("normal! 20Gzt")
+        frame = self.native()
+        active = self.window(frame)
+        self.assert_screen(frame)
+        self.assertTrue(active["native_scroll"])
+        self.assertFalse(active["native_pointer"])
+        self.assertTrue(any(r["line"] == 0 and ":type " in r["text"]
+                            for row in active["overscan"] for r in row["runs"]))
+        peer = next(w for w in frame["windows"] if w["window"] != active["window"])
+        e.request("scroll_view", window=active["window"], buffer=active["buffer"],
+                  changedtick=active["changedtick"], topline=active["topline"],
+                  leftcol=active["leftcol"], lines=3)
+        scrolled = self.native()
+        self.assertEqual(self.window(scrolled)["topline"], active["topline"] + 3)
+        self.assertEqual(self.window(scrolled, peer["window"])["topline"], peer["topline"])
+        self.assert_screen(scrolled)
+
+    def test_inline_wrap_visual_and_partial_graphemes_fall_back_and_recover(self):
+        e = self.editor
+        self.add(1, "hint", column=2)
+        e.ex("set wrap")
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("Inline Vim virtual text with wrap", frame["fallback_reason"])
+        self.assertTrue(self.read_json("&wrap"))
+        e.ex("set nowrap")
+        self.native()
+        e.keys("v")
+        e.state_where(lambda s: s["mode"] == "v")
+        self.assertFalse(e.gui_frame()["supported"])
+        e.keys(b"\x1b")
+        e.state_where(lambda s: s["mode"] == "n")
+        self.native()
+        e.ex("call prop_clear(1,5)")
+        self.add(2, "bad", column=4)  # Inside the UTF-8 bytes of 界.
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("grapheme", frame["fallback_reason"])
+        e.ex("call prop_clear(1,5) | call setline(1, repeat('a',119) . 'z')")
+        self.add(1, "界", column=120)
+        frame = e.gui_frame()
+        self.assertFalse(frame["supported"])
+        self.assertIn("Partially clipped", frame["fallback_reason"])
+        e.ex("call prop_clear(1,5)")
+        self.native()
+
+    def test_inline_property_only_replacement_and_clear_update_exact_delta_row(self):
+        e = self.editor
+        e.ex("call setline(1, map(range(1,80), {_,n -> 'source row ' . n}))")
+        script = self.root / "inline-provider.vim"
+        script.write_text(
+            "let g:inline_phase = 0\n"
+            "function! UpdateInline(timer)\n"
+            "  call prop_clear(2)\n"
+            "  if g:inline_phase < 2\n"
+            "    call prop_add(2, 8, {'type':'Hint','text': g:inline_phase == 0 ? 'xx' : 'long hint'})\n"
+            "  endif\n"
+            "  let g:inline_phase += 1\n"
+            "  doautocmd <nomodeline> User SimpleCCDecorationsChanged\n"
+            "endfunction\n"
+            "nnoremap <F10> <Cmd>call timer_start(80, 'UpdateInline')<CR>\n")
+        e.ex("source " + str(script))
+        e.ex("for t in timer_info() | if t.time == 750 && string(t.callback) =~# '_Poll' | call timer_stop(t.id) | endif | endfor")
+        before = self.native()
+        for text in ("xx", "long hint", ""):
+            revision = e.paint["revision"]
+            e.keys(b"\x1b[21~")
+            expected = "source " + text + "row 2"
+            frame = e.painted(lambda f: f["revision"] > revision and f["supported"]
+                              and self.row(f, 2) == expected)
+            self.assertEqual(frame["changedtick"], before["changedtick"])
+            updates = [event for event in e.paint_events if event["event"] == "render_delta"
+                       and event["revision"] > revision and event["row_updates"]]
+            self.assertTrue(updates)
+            self.assertEqual([row["row"] for row in updates[-1]["row_updates"]], [1])
+            self.assertEqual(canonical(copy.deepcopy(e.paint)), canonical(self.native()))
+            self.assertEqual(self.window(frame)["native_pointer"], not bool(text))
 
 
 if __name__ == "__main__":
