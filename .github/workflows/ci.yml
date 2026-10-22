@@ -62,6 +62,7 @@ jobs:
       - name: Real Vim9 editor and project workflow
         run: |
           python3 runtime/vim9/test_bridge.py
+          python3 runtime/vim9/test_workbench.py
           python3 runtime/vim9/test_shell.py
           python3 runtime/vim9/test_scroll.py
           python3 runtime/vim9/test_overscan.py

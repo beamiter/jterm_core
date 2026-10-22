@@ -327,7 +327,8 @@ pub enum Vim9Command {
         name: String,
     },
     Format,
-    /// A fixed provider action, bound to the source which opened the palette.
+    /// A fixed provider action, bound to the source snapshot used when the
+    /// palette action is activated.
     /// There is no arbitrary command or executable string on this interface.
     Workbench {
         command: Vim9WorkbenchAction,
