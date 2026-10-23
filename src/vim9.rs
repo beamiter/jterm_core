@@ -5,7 +5,7 @@
 //! opt-in buffer-origin GUI paint frames. It never reconstructs the document,
 //! GUI colors or editor commands from terminal output.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -33,6 +33,10 @@ pub use navigation::{parse_vim9_location, Vim9QuickOpenQuery};
 #[path = "vim9_palette.rs"]
 mod palette;
 pub use palette::{vim9_palette_matches, vim9_palette_query, Vim9PaletteCommand};
+
+#[path = "vim9_workspace.rs"]
+mod workspace;
+pub use workspace::{Vim9WorkbenchFocus, Vim9WorkspaceState, Vim9WorkspaceStateStore};
 
 #[path = "vim9_workbench.rs"]
 mod workbench;
@@ -296,6 +300,7 @@ pub enum Vim9Command {
     },
     /// Resolve the current buffer in Vim after preceding queued navigation.
     CloseCurrentBuffer,
+    ReopenBuffer,
     NextBuffer,
     PreviousBuffer,
     /// Traverse the current Vim window's native jumplist without mappings.
@@ -499,6 +504,7 @@ struct Shared {
     entry_id: Option<uuid::Uuid>,
     snapshot: Vim9Snapshot,
     pending: HashSet<u64>,
+    pending_palette: HashMap<u64, Vim9PaletteCommand>,
     // Kept independently of the UI snapshot: metadata may temporarily hide a
     // frame on a mode change without invalidating the ordered wire baseline.
     render_baseline: Option<Arc<Vim9RenderFrame>>,
@@ -630,6 +636,7 @@ impl Vim9Session {
                 ..Default::default()
             },
             pending: HashSet::new(),
+            pending_palette: HashMap::new(),
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
@@ -745,9 +752,13 @@ impl Vim9Session {
         }
         // Register before enqueue so an immediate reply cannot race the id.
         shared.pending.insert(id);
+        if let Some(palette) = Vim9PaletteCommand::from_request(&command) {
+            shared.pending_palette.insert(id, palette);
+        }
         shared.snapshot.pending = shared.pending.len();
         if let Err(error) = self.0.requests.try_send(Request { id, bytes }) {
             shared.pending.remove(&id);
+            shared.pending_palette.remove(&id);
             shared.snapshot.pending = shared.pending.len();
             let kind = match error {
                 TrySendError::Full(_) => io::ErrorKind::WouldBlock,
@@ -898,6 +909,7 @@ fn set_disconnected(shared: &Mutex<Shared>, error: Option<String>) {
     shared.render_resync = false;
     shared.snapshot.pending = 0;
     shared.pending.clear();
+    shared.pending_palette.clear();
     if let Some(error) = error {
         shared.snapshot.error = Some(error);
     }
@@ -1094,6 +1106,7 @@ fn wait_for_editor(stream: &TcpStream, mut wake: &UnixStream, timeout: i32) -> i
 
 fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
     let mut shared = shared.lock();
+    let mut completed_palette = None;
     if shared.entry_id.is_none() {
         return Ok(());
     }
@@ -1126,7 +1139,7 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
             snapshot.capabilities.retain(|capability| {
                 matches!(
                     capability.as_str(),
-                    "definition" | "hover" | "references" | "rename" | "format"
+                    "definition" | "hover" | "references" | "rename" | "format" | "reopen_buffer"
                 ) || Vim9WorkbenchAction::ALL
                     .iter()
                     .any(|action| action.capability() == capability)
@@ -1212,6 +1225,10 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid("Editor response has no request id"))?;
             if shared.pending.remove(&id) {
+                let command = shared.pending_palette.remove(&id);
+                if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                    completed_palette = command;
+                }
                 shared.snapshot.pending = shared.pending.len();
                 if value.get("ok").and_then(Value::as_bool) == Some(false) {
                     shared.snapshot.error = Some(
@@ -1236,6 +1253,10 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
         // New informational events are forward-compatible; no data from an
         // unknown event is interpreted as a command or written to the PTY.
         _ => {}
+    }
+    drop(shared);
+    if let Some(command) = completed_palette {
+        workspace::remember_command(command.id());
     }
     Ok(())
 }
@@ -1342,6 +1363,38 @@ mod tests {
         assert!(disconnected.frame.is_none());
         assert!(!disconnected.command_pending(41));
         assert!(before.command_pending(41));
+    }
+
+    #[test]
+    fn recent_palette_history_records_only_successfully_acknowledged_commands() {
+        let shared = Mutex::new(Shared {
+            entry_id: Some(uuid::Uuid::new_v4()),
+            snapshot: Vim9Snapshot::default(),
+            pending: HashSet::from([9001, 9002]),
+            pending_palette: HashMap::from([
+                (9001, Vim9PaletteCommand::ReopenBuffer),
+                (
+                    9002,
+                    Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleDocPin),
+                ),
+            ]),
+            render_baseline: None,
+            render_revision: 0,
+            render_resync: false,
+        });
+        apply_event(
+            json!({"event":"response","id":9001,"ok":false,"error":"no history"}),
+            &shared,
+        )
+        .unwrap();
+        assert!(!workspace::recent_commands()
+            .iter()
+            .any(|id| id == "reopen_buffer"));
+        apply_event(json!({"event":"response","id":9002,"ok":true}), &shared).unwrap();
+        assert!(workspace::recent_commands()
+            .iter()
+            .any(|id| id == "simple_doc_pin"));
+        assert!(shared.lock().pending_palette.is_empty());
     }
 
     #[test]
@@ -1465,6 +1518,7 @@ mod tests {
                 ..Default::default()
             },
             pending: HashSet::new(),
+            pending_palette: HashMap::new(),
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
@@ -1526,6 +1580,7 @@ mod tests {
                 ..Default::default()
             },
             pending: HashSet::new(),
+            pending_palette: HashMap::new(),
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
@@ -1662,6 +1717,7 @@ mod tests {
             entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
+            pending_palette: HashMap::new(),
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
@@ -1879,6 +1935,7 @@ mod tests {
             entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
+            pending_palette: HashMap::new(),
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
@@ -1997,6 +2054,7 @@ mod tests {
             entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
+            pending_palette: HashMap::new(),
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
@@ -2018,6 +2076,7 @@ mod tests {
             entry_id: Some(uuid::Uuid::new_v4()),
             snapshot: Vim9Snapshot::default(),
             pending: HashSet::new(),
+            pending_palette: HashMap::new(),
             render_baseline: None,
             render_revision: 0,
             render_resync: false,

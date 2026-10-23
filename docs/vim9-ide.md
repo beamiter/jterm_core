@@ -15,6 +15,33 @@ center editor draws buffer-origin text with Vim's **GUI** highlight colors and
 attributes through native GUI text rendering. PTY input remains connected to
 real Vim; the GUI does not maintain another editable document.
 
+## Vimrc workflows and workbench state
+
+The matching Vimrc exposes safe close/reopen and pinned LSP documentation as
+finite, capability-checked commands. Closing switches each existing Vim window
+to another file before deleting the buffer, preserving split geometry. Reopen
+restores the last file position; remote files wait for a successful read.
+Pinned documentation is a readonly Vim split with normal search and copy.
+
+Native Save, Save All and save-before-build use the Vimrc save hooks when
+available. Per-project/filetype opt-in policies run format, organize imports
+and write in order. Failure, stale edits or timeout prevent the build. Remote
+buffers wait for the matching write acknowledgement. Ordinary `:w` retains its
+standard behavior; without the hooks the bridge uses normal Vim writes.
+
+`Vim9WorkspaceStateStore` persists bounded presentation per canonical launch
+project and frontend: search text/options, supported panels and dimensions,
+output tab and focus. Hosts restore fields without submitting searches or
+builds. State lives in `$XDG_STATE_HOME/jterm/vim9`, falling back to
+`~/.local/state/jterm/vim9`; `JTERM_VIM9_NO_WORKSPACE_STATE=1` disables it.
+Atomic JSON files contain no build command, output or executable session
+fragments. Vim sessions continue to own buffers and remote reconnection.
+
+The palette remembers only successfully acknowledged finite commands. Recent
+commands rank first for an empty query and break equally scored text matches.
+Failed requests never enter this history. Frontend quick navigation supports
+PageUp/PageDown using the visible result-page size.
+
 ## Native buffer display
 
 The core publishes an immutable `Vim9RenderFrame` over the authenticated editor

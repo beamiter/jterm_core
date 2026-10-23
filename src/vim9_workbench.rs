@@ -26,6 +26,7 @@ pub enum Vim9WorkbenchAction {
     SimpleSupertypes,
     SimpleSubtypes,
     SimpleSignatureHelp,
+    SimpleDocPin,
     SimpleRename,
     SimpleCodeAction,
     SimpleCodeLens,
@@ -43,7 +44,7 @@ pub enum Vim9WorkbenchAction {
 }
 
 impl Vim9WorkbenchAction {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::SimpleFiles,
         Self::SimpleRecent,
         Self::SimpleTreeToggle,
@@ -63,6 +64,7 @@ impl Vim9WorkbenchAction {
         Self::SimpleSupertypes,
         Self::SimpleSubtypes,
         Self::SimpleSignatureHelp,
+        Self::SimpleDocPin,
         Self::SimpleRename,
         Self::SimpleCodeAction,
         Self::SimpleCodeLens,
@@ -100,6 +102,7 @@ impl Vim9WorkbenchAction {
             Self::SimpleSupertypes => "simple_supertypes",
             Self::SimpleSubtypes => "simple_subtypes",
             Self::SimpleSignatureHelp => "simple_signature_help",
+            Self::SimpleDocPin => "simple_doc_pin",
             Self::SimpleRename => "simple_rename",
             Self::SimpleCodeAction => "simple_code_action",
             Self::SimpleCodeLens => "simple_code_lens",
@@ -138,6 +141,7 @@ impl Vim9WorkbenchAction {
             Self::SimpleSupertypes => "Simple: Show supertypes",
             Self::SimpleSubtypes => "Simple: Show subtypes",
             Self::SimpleSignatureHelp => "Simple: Show signature help",
+            Self::SimpleDocPin => "Simple: Pin documentation in a split",
             Self::SimpleRename => "Simple: Rename symbol with Vim prompt",
             Self::SimpleCodeAction => "Simple: Choose code action",
             Self::SimpleCodeLens => "Simple: Refresh CodeLens",
@@ -178,6 +182,7 @@ impl Vim9WorkbenchAction {
             Self::SimpleSupertypes => &["simplecc supertypes parent type hierarchy", "父类型"],
             Self::SimpleSubtypes => &["simplecc subtypes child type hierarchy", "子类型"],
             Self::SimpleSignatureHelp => &["simplecc signature help parameters", "签名帮助"],
+            Self::SimpleDocPin => &["simplecc pin documentation split", "固定文档分屏"],
             Self::SimpleRename => &["simplecc rename", "重命名符号"],
             Self::SimpleCodeAction => &["simplecc code action", "代码操作"],
             Self::SimpleCodeLens => &["simplecc code lens refresh", "刷新代码透镜"],

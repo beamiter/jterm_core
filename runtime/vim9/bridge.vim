@@ -208,6 +208,7 @@ enddef
 # This is an adapter for the user's already-loaded vimrc, not an Ex/RPC
 # extension point. Both directions have a closed vocabulary and bounded data.
 const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
+  'simple_doc_pin',
   'simple_outline', 'simple_rename', 'simple_code_action', 'simple_git_status',
   'simple_git_diff', 'simple_git_hunk', 'simple_markdown_preview', 'simple_keys',
   'simple_workbench', 'simple_diagnostics', 'simple_next_diagnostic',
@@ -330,6 +331,9 @@ def Capabilities(): list<string>
   if executable('rg')
     add(result, 'search')
     add(result, 'search_with_options')
+  endif
+  if exists('*g:VimrcCanReopenBuffer') && g:VimrcCanReopenBuffer()
+    add(result, 'reopen_buffer')
   endif
   if exists(':LspGotoDefinition') == 2 || !empty(tagfiles()) || !empty(&tagfunc)
     add(result, 'definition')
@@ -3334,7 +3338,24 @@ def Dispatch(request: dict<any>, id: number)
       if getbufvar(number, '&modified')
         throw 'Unsaved changes: save this buffer before closing it'
       endif
-      execute 'bdelete ' .. number
+      if exists('*g:VimrcCloseBuffer')
+        g:VimrcCloseBuffer(number)
+      else
+        # Keep generic Vim sessions' splits even without the user's provider.
+        var replacement = filter(getbufinfo({buflisted: 1}), (_, b) => b.bufnr != number
+          && index(['', 'acwrite'], getbufvar(b.bufnr, '&buftype')) >= 0)
+        var other = empty(replacement) ? bufadd('') : replacement[0].bufnr
+        setbufvar(other, '&buflisted', 1)
+        for window in win_findbuf(number)
+          win_execute(window, 'keepalt keepjumps buffer ' .. other)
+        endfor
+        execute 'bdelete ' .. number
+      endif
+    elseif action ==# 'reopen_buffer'
+      if !exists('*g:VimrcReopenBuffer')
+        throw 'Reopen is available with the Vimrc buffer workbench'
+      endif
+      g:VimrcReopenBuffer()
     elseif action ==# 'split'
       var vertical: any = get(request, 'vertical', v:null)
       if type(vertical) != v:t_bool
@@ -3346,14 +3367,32 @@ def Dispatch(request: dict<any>, id: number)
         split
       endif
     elseif action ==# 'save'
-      update
+      if exists('*g:VimrcSave')
+        g:VimrcSave()
+      else
+        update
+      endif
     elseif action ==# 'save_all'
-      wall
+      if exists('*g:VimrcSaveAllWait')
+        var saved = g:VimrcSaveAllWait(5000)
+        if saved.status !=# 'success'
+          throw saved.message
+        endif
+      else
+        wall
+      endif
     elseif action ==# 'save_and_build'
       # Validate before any write. :wall errors (including readonly/unnamed
       # buffers and failing write hooks) prevent StartBuild from being reached.
       var command = BuildCommand(request)
-      wall
+      if exists('*g:VimrcSaveAllWait')
+        var saved = g:VimrcSaveAllWait(5000)
+        if saved.status !=# 'success'
+          throw saved.message
+        endif
+      else
+        wall
+      endif
       if !empty(filter(getbufinfo({buflisted: 1}), (_, info) => info.changed != 0))
         throw 'Some buffers remain modified; save them before building'
       endif

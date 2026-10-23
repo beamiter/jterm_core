@@ -18,6 +18,8 @@ pub enum Vim9PaletteCommand {
     SaveAll,
     PreviousBuffer,
     NextBuffer,
+    CloseCurrentBuffer,
+    ReopenBuffer,
     SplitHorizontal,
     SplitVertical,
     NavigateBack,
@@ -33,7 +35,7 @@ pub enum Vim9PaletteCommand {
     Workbench(Vim9WorkbenchAction),
 }
 
-const COMMANDS: [Vim9PaletteCommand; 49] = {
+const COMMANDS: [Vim9PaletteCommand; 52] = {
     use Vim9PaletteCommand::*;
     [
         Save,
@@ -42,6 +44,8 @@ const COMMANDS: [Vim9PaletteCommand; 49] = {
         SplitHorizontal,
         PreviousBuffer,
         NextBuffer,
+        CloseCurrentBuffer,
+        ReopenBuffer,
         NavigateBack,
         NavigateForward,
         NextDiagnostic,
@@ -71,6 +75,7 @@ const COMMANDS: [Vim9PaletteCommand; 49] = {
         Workbench(Vim9WorkbenchAction::SimpleSupertypes),
         Workbench(Vim9WorkbenchAction::SimpleSubtypes),
         Workbench(Vim9WorkbenchAction::SimpleSignatureHelp),
+        Workbench(Vim9WorkbenchAction::SimpleDocPin),
         Workbench(Vim9WorkbenchAction::SimpleRename),
         Workbench(Vim9WorkbenchAction::SimpleCodeAction),
         Workbench(Vim9WorkbenchAction::SimpleCodeLens),
@@ -95,6 +100,8 @@ impl Vim9PaletteCommand {
             Self::SaveAll => "Save all buffers",
             Self::PreviousBuffer => "Switch to previous buffer",
             Self::NextBuffer => "Switch to next buffer",
+            Self::CloseCurrentBuffer => "Close current buffer and keep splits",
+            Self::ReopenBuffer => "Reopen recently closed file",
             Self::SplitHorizontal => "Split editor horizontally",
             Self::SplitVertical => "Split editor vertically",
             Self::NavigateBack => "Go back to previous position",
@@ -117,6 +124,7 @@ impl Vim9PaletteCommand {
             Self::SaveAll => "Ctrl+Shift+S",
             Self::PreviousBuffer => "Ctrl+Shift+PageUp",
             Self::NextBuffer => "Ctrl+Shift+PageDown",
+            Self::CloseCurrentBuffer => "Ctrl+Shift+W",
             Self::NavigateBack => "Alt+Left",
             Self::NavigateForward => "Alt+Right",
             Self::NextDiagnostic => "F8",
@@ -131,6 +139,12 @@ impl Vim9PaletteCommand {
             Self::SaveAll => &["write all", "save all", "全部保存"],
             Self::PreviousBuffer => &["previous file", "previous tab", "上一个文件"],
             Self::NextBuffer => &["next file", "next tab", "下一个文件"],
+            Self::CloseCurrentBuffer => &["close file", "close buffer", "关闭文件"],
+            Self::ReopenBuffer => &[
+                "reopen closed file",
+                "restore closed buffer",
+                "恢复关闭文件",
+            ],
             Self::SplitHorizontal => &["horizontal split", "split below", "水平分屏"],
             Self::SplitVertical => &["vertical split", "split right", "垂直分屏"],
             Self::NavigateBack => &["jump back", "jumplist back", "返回"],
@@ -162,6 +176,14 @@ impl Vim9PaletteCommand {
             return Some("Finish the current Vim command or input first");
         }
         match self {
+            Self::CloseCurrentBuffer
+                if snapshot.buffers.iter().any(|b| b.current && b.modified) =>
+            {
+                Some("Save this buffer before closing it")
+            }
+            Self::ReopenBuffer if !snapshot.capabilities.iter().any(|c| c == "reopen_buffer") => {
+                Some("No recently closed file in this Vim session")
+            }
             Self::PreviousBuffer | Self::NextBuffer
                 if snapshot.buffers.len() < 2 && !snapshot.buffers_truncated =>
             {
@@ -219,6 +241,8 @@ impl Vim9PaletteCommand {
             Self::SaveAll => Vim9Command::SaveAll,
             Self::PreviousBuffer => Vim9Command::PreviousBuffer,
             Self::NextBuffer => Vim9Command::NextBuffer,
+            Self::CloseCurrentBuffer => Vim9Command::CloseCurrentBuffer,
+            Self::ReopenBuffer => Vim9Command::ReopenBuffer,
             Self::SplitHorizontal => Vim9Command::Split { vertical: false },
             Self::SplitVertical => Vim9Command::Split { vertical: true },
             Self::NavigateBack => Vim9Command::NavigateBack,
@@ -243,10 +267,65 @@ impl Vim9PaletteCommand {
     }
 }
 
+impl Vim9PaletteCommand {
+    pub(super) fn id(self) -> &'static str {
+        match self {
+            Self::Save => "save",
+            Self::SaveAll => "save_all",
+            Self::PreviousBuffer => "previous_buffer",
+            Self::NextBuffer => "next_buffer",
+            Self::CloseCurrentBuffer => "close_current_buffer",
+            Self::ReopenBuffer => "reopen_buffer",
+            Self::SplitHorizontal => "split_horizontal",
+            Self::SplitVertical => "split_vertical",
+            Self::NavigateBack => "navigate_back",
+            Self::NavigateForward => "navigate_forward",
+            Self::NextDiagnostic => "next_diagnostic",
+            Self::PreviousDiagnostic => "previous_diagnostic",
+            Self::Definition => "definition",
+            Self::Hover => "hover",
+            Self::References => "references",
+            Self::Format => "format",
+            Self::CancelBuild => "cancel_build",
+            Self::CancelSearch => "cancel_search",
+            Self::Workbench(command) => command.capability(),
+        }
+    }
+
+    pub(super) fn from_request(request: &Vim9Command) -> Option<Self> {
+        Some(match request {
+            Vim9Command::Save => Self::Save,
+            Vim9Command::SaveAll => Self::SaveAll,
+            Vim9Command::PreviousBuffer => Self::PreviousBuffer,
+            Vim9Command::NextBuffer => Self::NextBuffer,
+            Vim9Command::CloseCurrentBuffer => Self::CloseCurrentBuffer,
+            Vim9Command::ReopenBuffer => Self::ReopenBuffer,
+            Vim9Command::Split { vertical: true } => Self::SplitVertical,
+            Vim9Command::Split { vertical: false } => Self::SplitHorizontal,
+            Vim9Command::NavigateBack => Self::NavigateBack,
+            Vim9Command::NavigateForward => Self::NavigateForward,
+            Vim9Command::NextDiagnostic => Self::NextDiagnostic,
+            Vim9Command::PreviousDiagnostic => Self::PreviousDiagnostic,
+            Vim9Command::Definition => Self::Definition,
+            Vim9Command::Hover => Self::Hover,
+            Vim9Command::References => Self::References,
+            Vim9Command::Format => Self::Format,
+            Vim9Command::CancelBuild => Self::CancelBuild,
+            Vim9Command::CancelSearch => Self::CancelSearch,
+            Vim9Command::Workbench { command, .. } => Self::Workbench(*command),
+            _ => return None,
+        })
+    }
+}
+
 /// Case-insensitive fuzzy matching of names and aliases. Ordering is stable
 /// across state updates so a language-server reply cannot move the selection.
 /// Unavailable commands remain discoverable, with their current reason.
 pub fn vim9_palette_matches(query: &str, limit: usize) -> Vec<Vim9PaletteCommand> {
+    matches_with_recent(query, limit, &super::workspace::recent_commands())
+}
+
+fn matches_with_recent(query: &str, limit: usize, recent: &[String]) -> Vec<Vim9PaletteCommand> {
     let query = query.trim();
     if query.chars().count() > 256 || query.contains(['\r', '\n', '\0']) {
         return Vec::new();
@@ -265,14 +344,22 @@ pub fn vim9_palette_matches(query: &str, limit: usize) -> Vec<Vim9PaletteCommand
                     .filter_map(|label| matcher.fuzzy_match(label, query))
                     .max()
             }?;
-            Some((command, score, index))
+            let recency = recent
+                .iter()
+                .position(|id| id == command.id())
+                .unwrap_or(usize::MAX);
+            Some((command, score, recency, index))
         })
         .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+    ranked.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
     ranked
         .into_iter()
         .take(limit.min(256))
-        .map(|(command, _, _)| command)
+        .map(|(command, _, _, _)| command)
         .collect()
 }
 
@@ -301,7 +388,7 @@ mod tests {
 
     #[test]
     fn bounded_catalog_matches_aliases_and_keeps_stable_order() {
-        assert_eq!(vim9_palette_matches("", 256), COMMANDS);
+        assert_eq!(matches_with_recent("", 256, &[]), COMMANDS);
         assert_eq!(
             vim9_palette_matches("vertical split", 1),
             [Vim9PaletteCommand::SplitVertical]
@@ -324,6 +411,17 @@ mod tests {
         }
         assert!(vim9_palette_matches("save", 0).is_empty());
         assert_eq!(vim9_palette_matches("save", 1).len(), 1);
+    }
+
+    #[test]
+    fn recent_commands_rank_equal_matches_without_changing_the_catalog() {
+        let recent = vec!["reopen_buffer".into(), "save".into()];
+        let matches = matches_with_recent("", 256, &recent);
+        assert_eq!(matches[0], Vim9PaletteCommand::ReopenBuffer);
+        assert_eq!(matches[1], Vim9PaletteCommand::Save);
+        assert_eq!(matches.len(), COMMANDS.len());
+        assert!(matches_with_recent("close", 256, &recent)
+            .contains(&Vim9PaletteCommand::CloseCurrentBuffer));
     }
 
     #[test]

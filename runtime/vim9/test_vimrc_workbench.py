@@ -308,7 +308,7 @@ for line in sys.stdin:
         e = self.editor()
         maps = "[maparg('<Space>fs', 'n'), maparg('<C-h>', 'n'), maparg('<Space>vw', 'n')]"
         before = self.capture(e, maps)
-        self.assertIn("update", before[0])
+        self.assertEqual(before[0], "<Cmd>VimrcSave<CR>")
         self.assertIn("VimrcWorkbench", before[2])
         for _ in range(2):
             e.ex("execute 'source ' .. fnameescape(" + vim_string(VIMRC_ROOT / ".vimrc") + ")")
