@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/simplecc
-          ref: 9d89711c92aca59cb79ef5857c911b487a7c8076
+          ref: fa8bf93070fa53a5f17e11ae11fc719cc6b94af2
           path: .providers/simplecc
           persist-credentials: false
       - name: Check out audited SimpleGit popup provider
@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/vimrc
-          ref: 27abbc9143d5b7abbddd78c4610e367fac4c252e
+          ref: 256c8aaa36028a14be6576506dadf50b94781af0
           path: .providers/vimrc
           persist-credentials: false
       - name: Check out audited SimpleWhichKey provider

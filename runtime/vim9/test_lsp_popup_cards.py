@@ -37,8 +37,23 @@ class LspPopupCardTests(unittest.TestCase):
         daemon = self.root / 'popup-daemon'
         daemon.write_text('''#!/usr/bin/env python3
 from pathlib import Path
-import json, sys
+import json, sys, threading, time
 root = Path(__file__).parent
+output = threading.Lock()
+def emit(event):
+    with output:
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+def delayed(event, request):
+    gate = root / ('reply-' + str(request['id']) + '.release')
+    while not gate.exists():
+        time.sleep(.01)
+    # One stdout lock keeps the sentinel behind its corresponding reply even
+    # when several deliberately reordered requests are released concurrently.
+    with output:
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+        print(json.dumps({'type': 'diagnostics', 'uri': request['uri'],
+            'server': 'delivery-sentinel', 'items': [{'line': 0, 'character': 0,
+            'severity': 4, 'message': 'delivered ' + str(request['id'])}]}), flush=True)
 for line in sys.stdin:
     r = json.loads(line)
     with (root / 'popup.requests').open('a') as out:
@@ -63,7 +78,10 @@ for line in sys.stdin:
         break
     else:
         continue
-    print(json.dumps(event, ensure_ascii=False), flush=True)
+    if kind in ('textDocument/hover', 'textDocument/signatureHelp') and (root / 'popup.gate').exists():
+        threading.Thread(target=delayed, args=(event, r), daemon=True).start()
+    else:
+        emit(event)
 ''', encoding='utf-8')
         daemon.chmod(0o700)
         e = self.editor(editor_class=CardEditor, extra_setup=(
@@ -78,6 +96,45 @@ for line in sys.stdin:
         self.assertTrue(self.capture(e, 'g:jterm_vim9_popup_cards'))
         self.assertTrue(e.gui_frame()['supported'])
         return e
+
+    def gate_replies(self):
+        # The diagnostics event is emitted immediately after the held reply on
+        # the same channel. Its observer records popup state without entering
+        # command-line mode (which would itself dismiss insert signatures).
+        self.delivery = self.root / 'popup-delivery.json'
+        source = self.e.snapshot()['buffer']
+        expression = ("{'items': simplecc#DiagnosticSnapshot(" + str(source)
+                      + ").items, 'popups': popup_list(), 'mode': mode()}")
+        self.e.ex("autocmd User SimpleCCDiagnosticsChanged call writefile([json_encode("
+                  + expression + ")], " + harness.vim_string(self.delivery) + ")")
+        self.e.ex('inoremap <C-g>q <Cmd>SimpleCCPopupClose<CR>')
+        (self.root / 'popup.gate').touch()
+
+    def pending(self, kind, after=0):
+        wire = 'textDocument/' + kind
+        self.until(self.e, lambda: any(r['type'] == wire and r.get('id', 0) > after
+                                     for r in self.requests()))
+        return max(r['id'] for r in self.requests() if r['type'] == wire)
+
+    def release(self, request):
+        (self.root / f'reply-{request}.release').touch()
+        marker = f'delivered {request}'
+        def delivered():
+            if not self.delivery.exists():
+                return False
+            try:
+                snapshot = json.loads(self.delivery.read_text())
+            except json.JSONDecodeError:
+                return False
+            return any(item.get('text') == marker for item in snapshot['items'])
+        self.until(self.e, delivered)
+        return json.loads(self.delivery.read_text())
+
+    def assert_discarded(self, request):
+        delivered = self.release(request)
+        self.assertEqual(delivered['popups'], [], 'reply reached Vim before this assertion')
+        self.e.painted(lambda f: f['supported'] and not f.get('popups'))
+        return delivered
 
     @staticmethod
     def popup_text(popup):
@@ -163,6 +220,67 @@ for line in sys.stdin:
         self.assertIn('é', self.popup_text(popup))
         self.assertTrue(self.capture(e, 'popup_getpos(popup_list()[0]).scrollbar'))
         self.assert_source()
+
+    def test_delayed_hover_is_discarded_after_source_context_changes(self):
+        e = self.start()
+        self.gate_replies()
+        last = 0
+        for change in ('close', 'move', 'edit', 'window'):
+            with self.subTest(change=change):
+                e.ex('SimpleCCHover')
+                request = self.pending('hover', after=last)
+                last = request
+                if change == 'close':
+                    e.ex('SimpleCCPopupClose')
+                elif change == 'move':
+                    e.keys('j')
+                    e.state_where(lambda state: state['line'] == 2)
+                elif change == 'edit':
+                    e.ex("call setline(1, 'updated source line')")
+                else:
+                    e.ex('split')
+                self.assert_discarded(request)
+                if change == 'window':
+                    e.ex('close')
+
+    def test_delayed_insert_signature_stays_dismissed_after_leave_or_close(self):
+        e = self.start()
+        self.gate_replies()
+        last = 0
+        for change in ('insert_leave', 'close_in_insert'):
+            with self.subTest(change=change):
+                e.keys(b'i\x07s')
+                request = self.pending('signatureHelp', after=last)
+                last = request
+                self.assertTrue(e.snapshot()['mode'].startswith('i'))
+                if change == 'insert_leave':
+                    e.keys(b'\x1b')
+                    e.state_where(lambda state: state['mode'] == 'n')
+                else:
+                    e.keys(b'\x07q')
+                    self.assertTrue(e.snapshot()['mode'].startswith('i'))
+                delivered = self.assert_discarded(request)
+                self.assertEqual(delivered['mode'].startswith('i'), change == 'close_in_insert')
+                if change == 'close_in_insert':
+                    e.keys(b'\x1b')
+                    e.state_where(lambda state: state['mode'] == 'n')
+
+    def test_reordered_replies_preserve_the_latest_valid_hover_and_signature(self):
+        e = self.start()
+        self.gate_replies()
+        for kind, command in (('hover', 'SimpleCCHover'), ('signatureHelp', 'SimpleCCSignatureHelp')):
+            with self.subTest(kind=kind):
+                previous = max((r.get('id', 0) for r in self.requests()), default=0)
+                e.ex(command)
+                older = self.pending(kind, after=previous)
+                e.ex(command)
+                latest = self.pending(kind, after=older)
+                self.assert_discarded(older)
+                delivered = self.release(latest)
+                self.assertEqual(len(delivered['popups']), 1)
+                self.card('hover' if kind == 'hover' else 'signature')
+                e.ex('SimpleCCPopupClose')
+                e.painted(lambda frame: frame['supported'] and not frame.get('popups'))
 
     def test_completion_documentation_card_closes_on_cancel_and_accept(self):
         e = self.start()

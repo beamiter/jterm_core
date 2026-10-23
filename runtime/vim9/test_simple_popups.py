@@ -91,6 +91,15 @@ class SimplePopupTests(unittest.TestCase):
         return json.loads((self.root / "oracle.json").read_text(encoding="utf-8"))
 
     def callback(self, name, *arguments):
+        kind = {"OnHover": "hover", "OnSignatureHelp": "signature"}.get(name)
+        if kind:
+            # Current providers require the real request anchor before accepting
+            # a reply. Older pinned providers accept the extra id unchanged.
+            self.popup_sequence = getattr(self, "popup_sequence", 3000) + 1
+            arguments = (dict(arguments[0], id=self.popup_sequence), *arguments[1:])
+            self.editor.ex(
+                f"if exists('*{self.prefix}RememberPopupRequest') | "
+                f"call {self.prefix}RememberPopupRequest('{kind}', {self.popup_sequence}) | endif")
         self.editor.ex(f"call call({vim_json(self.prefix + name)}, {vim_json(arguments)})")
 
     def stop_watchdog(self):
@@ -154,7 +163,10 @@ class SimplePopupTests(unittest.TestCase):
         script.write_text(
             f"let g:ProviderSignature = function('{self.prefix}OnSignatureHelp')\n"
             "function! CloseProviderSignature(timer)\n"
-            "  call g:ProviderSignature({'signatures':[]})\n"
+            f"  if exists('*{self.prefix}RememberPopupRequest')\n"
+            f"    call {self.prefix}RememberPopupRequest('signature', 4000)\n"
+            "  endif\n"
+            "  call g:ProviderSignature({'id':4000, 'signatures':[]})\n"
             "  call writefile([json_encode({'events':g:test_popup_events, 'popups':popup_list()})], 'signature-closed.json')\n"
             "endfunction\n", encoding="utf-8")
         e.ex("source " + str(script))
