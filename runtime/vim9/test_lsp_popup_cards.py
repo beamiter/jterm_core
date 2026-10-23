@@ -291,6 +291,20 @@ for line in sys.stdin:
         e.painted(lambda f: f['supported'] and not f.get('popups'))
         self.assert_source()
 
+    def test_readonly_signature_key_keeps_source_and_native_card(self):
+        e = self.start()
+        e.ex('setlocal readonly | call g:VimrcConfigureFiletype()')
+        e.keys(b'i\x07s')
+        _, signature = self.card('signature')
+        self.assertIn('alpha(value: int)', self.popup_text(signature))
+        current = e.snapshot()
+        self.assertTrue(current['mode'].startswith('i'))
+        self.assertEqual(current['changedtick'], self.source['changedtick'])
+        e.keys(b'\x1b')
+        e.state_where(lambda state: state['mode'] == 'n')
+        self.assertEqual(self.capture(e, '[&readonly, &modified]'), [1, 0])
+        self.assert_source()
+
     def test_user_opt_out_keeps_classic_popup(self):
         e = self.start()
         e.ex('let g:simplecc_popup_cards = 0')

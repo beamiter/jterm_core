@@ -113,6 +113,27 @@ for line in sys.stdin:
         self.assertTrue(self.capture(e, "!empty(filter(getwininfo(), 'v:val.quickfix'))"))
         self.assertEqual(self.capture(e, 'len(getloclist(0))'), 3)
 
+    def test_folded_readonly_scratch_diagnostic_jump_reveals_and_returns(self):
+        e, _ = self.diagnostic_editor()
+        e.ex("call setline(3, 'outside folded code')")
+        e.ex('setlocal buftype=acwrite readonly foldmethod=manual foldenable | 1,2fold | normal! 3G')
+        e.ex('clearjumps')
+        before = e.snapshot()
+        self.assertEqual(self.capture(e, 'foldclosed(2)'), 1)
+        self.assertFalse(e.gui_frame()['supported'])
+        self.workbench(e, 'simple_previous_diagnostic')
+        e.state_where(lambda state: state['line'] == 2 and state['column'] == 3)
+        self.assertEqual(self.capture(e, 'foldclosed(2)'), -1)
+        self.assertTrue(e.gui_frame()['supported'])
+        e.keys(b'\x0f')
+        returned = e.state_where(lambda state: state['line'] == 3 and state['column'] == before['column'])
+        for field in ('window', 'buffer', 'changedtick'):
+            self.assertEqual(returned[field], before[field], field)
+        self.assertEqual(self.capture(e, 'getline(1)'), '中😀alpha')
+        self.assertEqual(self.capture(e, '&readonly'), 1)
+        e.keys(b'\x09')
+        e.state_where(lambda state: state['line'] == 2 and state['column'] == 3)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

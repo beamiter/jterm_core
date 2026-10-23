@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/simplecc
-          ref: 7063ed03af5eaa8263af68d6538f8b45e4148ecd
+          ref: f5b560ef3256aaf188d4c0a5161f12fc0cb8b92d
           path: .providers/simplecc
           persist-credentials: false
       - name: Check out audited SimpleGit popup provider
@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/vimrc
-          ref: 676aca71af572ae11fcf3e12e4947433384c23d1
+          ref: 46e83b1f11aa76e0d8a4f252556dafb109b7769b
           path: .providers/vimrc
           persist-credentials: false
       - name: Check out audited SimpleWhichKey provider
@@ -70,6 +70,7 @@ jobs:
           python3 runtime/vim9/test_render_virtual_text.py
           python3 runtime/vim9/test_simple_popups.py
           python3 runtime/vim9/test_simple_code_lens.py
+          python3 runtime/vim9/test_simple_diagnostics.py
           python3 runtime/vim9/test_simple_inlay_hints.py
           python3 runtime/vim9/test_simple_navigation.py
           python3 runtime/vim9/test_semantic_editing.py
