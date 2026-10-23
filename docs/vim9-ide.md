@@ -404,6 +404,24 @@ name. Plugin popup and diff workflows can temporarily use the live Vim
 compatibility view. Native painting resumes when the current display is
 supported again.
 
+The shared palette also exposes SimpleCC implementation and type-definition
+jumps, live workspace-symbol search, incoming/outgoing calls, parent/child type
+hierarchies and signature help. Open it with `Ctrl+Shift+P`, then search
+`>implementation`, `>type definition`, `>workspace symbols`, `>incoming calls`,
+`>outgoing calls`, `>supertypes`, `>subtypes` or `>signature help`. Chinese
+aliases include `>跳转实现`, `>类型定义`, `>工作区符号` and `>签名帮助`.
+Existing vimrc leader mappings continue to call the same provider commands.
+Navigation works in readonly code buffers; large-file protection, missing
+providers and disabled actions remain visible as unavailable entries.
+
+SimpleCC owns the actual jumps, Unicode position conversion and result lists.
+Signature help can use the native passive popup surface. The interactive live
+workspace-symbol picker retains Vim's compatibility display and keyboard
+filter; Enter selects a result and Escape cancels it. The host binds each
+workbench action to the buffer, window, changedtick and cursor at activation,
+so a queued action is rejected if its source position changes before Vim runs
+it. Older hosts without cursor fields retain their earlier identity checks.
+
 SimpleCC's cached current-buffer diagnostics also populate the native Problems
 rows without first opening a Vim location list. Their columns are converted
 from UTF-16 to Vim's UTF-8 byte positions, including Chinese text and emoji.

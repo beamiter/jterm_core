@@ -335,6 +335,9 @@ pub enum Vim9Command {
         window: i64,
         buffer: i64,
         changedtick: u64,
+        /// One-based Vim cursor line and UTF-8 byte column.
+        line: i64,
+        column: i64,
     },
     NextDiagnostic,
     PreviousDiagnostic,
@@ -380,8 +383,15 @@ impl Vim9Command {
                 window,
                 buffer,
                 changedtick,
+                line,
+                column,
                 ..
-            } if *window <= 0 || *buffer <= 0 || *changedtick > i64::MAX as u64 => {
+            } if *window <= 0
+                || *buffer <= 0
+                || *changedtick > i64::MAX as u64
+                || *line <= 0
+                || *column <= 0 =>
+            {
                 return Err(invalid("Invalid source-bound workbench action"));
             }
             Self::ScrollView {
@@ -1705,6 +1715,35 @@ mod tests {
         }
         .frame(1)
         .is_err());
+    }
+
+    #[test]
+    fn workbench_actions_validate_cursor_coordinates() {
+        for (line, column) in [(0, 1), (1, 0), (-1, 1), (1, -1)] {
+            assert!(Vim9Command::Workbench {
+                command: Vim9WorkbenchAction::SimpleRename,
+                window: 1,
+                buffer: 1,
+                changedtick: 0,
+                line,
+                column,
+            }
+            .frame(1)
+            .is_err());
+        }
+        let bytes = Vim9Command::Workbench {
+            command: Vim9WorkbenchAction::SimpleRename,
+            window: 1,
+            buffer: 1,
+            changedtick: 0,
+            line: 2,
+            column: 5,
+        }
+        .frame(1)
+        .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["line"], 2);
+        assert_eq!(value["column"], 5);
     }
 
     #[test]

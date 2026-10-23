@@ -51,6 +51,12 @@ jobs:
           ref: 365c9c34a68dded6c65ca0163f2443e880306b8a
           path: .providers/simplewhichkey
           persist-credentials: false
+      # Exercise the candidate cross-repository catalog without a floating
+      # vimrc ref. Remove the overlay when its published commit is pinned above.
+      - name: Apply candidate Vim workbench action catalog
+        run: |
+          git -C .providers/vimrc apply --check "$GITHUB_WORKSPACE/runtime/vim9/fixtures/vimrc-semantic-actions.patch"
+          git -C .providers/vimrc apply "$GITHUB_WORKSPACE/runtime/vim9/fixtures/vimrc-semantic-actions.patch"
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
       - run: |
           python3 runtime/vim9/test_pixel_input.py
@@ -71,3 +77,4 @@ jobs:
           python3 runtime/vim9/test_simple_popups.py
           python3 runtime/vim9/test_simple_code_lens.py
           python3 runtime/vim9/test_simple_inlay_hints.py
+          python3 runtime/vim9/test_simple_navigation.py

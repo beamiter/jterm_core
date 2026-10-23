@@ -141,7 +141,7 @@ for line in sys.stdin:
     def workbench(self, e: Editor, command: str, *, state=None, ok=True):
         source = state or e.snapshot()
         return e.request("workbench", command=command, ok=ok, **{
-            name: source[name] for name in ("window", "buffer", "changedtick")
+            name: source[name] for name in ("window", "buffer", "changedtick", "line", "column")
         })
 
     def assert_pty_text(self, e: Editor, text: bytes):
@@ -201,7 +201,7 @@ for line in sys.stdin:
             request_id = e.next_id
             e.next_id += 1
             e.send({'id': request_id, 'action': 'workbench', 'command': 'simple_rename',
-                    **{name: source[name] for name in ('window', 'buffer', 'changedtick')}})
+                    **{name: source[name] for name in ('window', 'buffer', 'changedtick', 'line', 'column')}})
             e.state_where(lambda s: s.get('mode', '').startswith('c'))
             frame = e.wait(lambda m: m.get('event') == 'render' and not m.get('supported', False)
                            and 'command' in m.get('fallback_reason', ''))
@@ -240,7 +240,7 @@ for line in sys.stdin:
         request_id = e.next_id
         e.next_id += 1
         e.send({'id': request_id, 'action': 'workbench', 'command': 'simple_code_action',
-                **{name: original[name] for name in ('window', 'buffer', 'changedtick')}})
+                **{name: original[name] for name in ('window', 'buffer', 'changedtick', 'line', 'column')}})
         frame = e.wait(lambda m: m.get('event') == 'render' and not m.get('supported', False)
                        and 'popup' in m.get('fallback_reason', ''))
         self.assertIn('popup', frame['fallback_reason'])
@@ -268,7 +268,7 @@ for line in sys.stdin:
         request_id = e.next_id
         e.next_id += 1
         e.send({'id': request_id, 'action': 'workbench', 'command': 'simple_keys',
-                **{name: original[name] for name in ('window', 'buffer', 'changedtick')}})
+                **{name: original[name] for name in ('window', 'buffer', 'changedtick', 'line', 'column')}})
         # getcharstr() blocks inside this real plugin action. The bridge must
         # retire native paint before invoking it, rather than wait for a timer.
         frame = e.wait(lambda m: m.get('event') == 'render' and not m.get('supported', False))

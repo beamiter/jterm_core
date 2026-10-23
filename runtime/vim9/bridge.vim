@@ -213,7 +213,10 @@ const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
   'simple_previous_diagnostic', 'simple_recent', 'simple_tree_toggle',
   'simple_tree_reveal', 'simple_terminal_toggle', 'simple_terminal_new',
   'simple_terminal_next', 'simple_terminal_previous', 'simple_code_lens',
-  'simple_code_lens_run', 'simple_inlay_hints']
+  'simple_code_lens_run', 'simple_inlay_hints', 'simple_implementation',
+  'simple_type_definition', 'simple_workspace_symbols', 'simple_incoming_calls',
+  'simple_outgoing_calls', 'simple_supertypes', 'simple_subtypes',
+  'simple_signature_help']
 const WORKBENCH_SEMANTICS = ['definition', 'hover', 'references', 'format']
 
 def WorkbenchCapabilities(): list<string>
@@ -3110,6 +3113,19 @@ def RunWorkbench(request: dict<any>)
   endif
   if window != win_getid() || buffer != bufnr() || tick != b:changedtick
     throw 'The workbench source changed; reopen the command palette'
+  endif
+  # Older hosts omitted both coordinates. New requests bind every action to
+  # the exact one-based Vim line/UTF-8 byte column observed at activation.
+  if has_key(request, 'line') || has_key(request, 'column')
+    var sourceLine: any = get(request, 'line', v:null)
+    var sourceColumn: any = get(request, 'column', v:null)
+    if type(sourceLine) != v:t_number || sourceLine <= 0
+        || type(sourceColumn) != v:t_number || sourceColumn <= 0
+      throw 'Workbench actions require a valid source cursor line and byte column'
+    endif
+    if sourceLine != line('.') || sourceColumn != col('.')
+      throw 'The workbench source cursor changed; reopen the command palette'
+    endif
   endif
   # Recheck after preceding queued requests and all mode/source checks. An
   # action removed by reload must never execute through stale picker metadata.

@@ -18,6 +18,14 @@ pub enum Vim9WorkbenchAction {
     SimpleBuffers,
     SimpleGrep,
     SimpleOutline,
+    SimpleImplementation,
+    SimpleTypeDefinition,
+    SimpleWorkspaceSymbols,
+    SimpleIncomingCalls,
+    SimpleOutgoingCalls,
+    SimpleSupertypes,
+    SimpleSubtypes,
+    SimpleSignatureHelp,
     SimpleRename,
     SimpleCodeAction,
     SimpleCodeLens,
@@ -35,7 +43,7 @@ pub enum Vim9WorkbenchAction {
 }
 
 impl Vim9WorkbenchAction {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 33] = [
         Self::SimpleFiles,
         Self::SimpleRecent,
         Self::SimpleTreeToggle,
@@ -47,6 +55,14 @@ impl Vim9WorkbenchAction {
         Self::SimpleBuffers,
         Self::SimpleGrep,
         Self::SimpleOutline,
+        Self::SimpleImplementation,
+        Self::SimpleTypeDefinition,
+        Self::SimpleWorkspaceSymbols,
+        Self::SimpleIncomingCalls,
+        Self::SimpleOutgoingCalls,
+        Self::SimpleSupertypes,
+        Self::SimpleSubtypes,
+        Self::SimpleSignatureHelp,
         Self::SimpleRename,
         Self::SimpleCodeAction,
         Self::SimpleCodeLens,
@@ -76,6 +92,14 @@ impl Vim9WorkbenchAction {
             Self::SimpleBuffers => "simple_buffers",
             Self::SimpleGrep => "simple_grep",
             Self::SimpleOutline => "simple_outline",
+            Self::SimpleImplementation => "simple_implementation",
+            Self::SimpleTypeDefinition => "simple_type_definition",
+            Self::SimpleWorkspaceSymbols => "simple_workspace_symbols",
+            Self::SimpleIncomingCalls => "simple_incoming_calls",
+            Self::SimpleOutgoingCalls => "simple_outgoing_calls",
+            Self::SimpleSupertypes => "simple_supertypes",
+            Self::SimpleSubtypes => "simple_subtypes",
+            Self::SimpleSignatureHelp => "simple_signature_help",
             Self::SimpleRename => "simple_rename",
             Self::SimpleCodeAction => "simple_code_action",
             Self::SimpleCodeLens => "simple_code_lens",
@@ -106,6 +130,14 @@ impl Vim9WorkbenchAction {
             Self::SimpleBuffers => "Simple: Find open buffers",
             Self::SimpleGrep => "Simple: Search project text",
             Self::SimpleOutline => "Simple: Show symbol outline",
+            Self::SimpleImplementation => "Simple: Go to implementation",
+            Self::SimpleTypeDefinition => "Simple: Go to type definition",
+            Self::SimpleWorkspaceSymbols => "Simple: Search workspace symbols",
+            Self::SimpleIncomingCalls => "Simple: Show incoming calls",
+            Self::SimpleOutgoingCalls => "Simple: Show outgoing calls",
+            Self::SimpleSupertypes => "Simple: Show supertypes",
+            Self::SimpleSubtypes => "Simple: Show subtypes",
+            Self::SimpleSignatureHelp => "Simple: Show signature help",
             Self::SimpleRename => "Simple: Rename symbol with Vim prompt",
             Self::SimpleCodeAction => "Simple: Choose code action",
             Self::SimpleCodeLens => "Simple: Refresh CodeLens",
@@ -136,6 +168,16 @@ impl Vim9WorkbenchAction {
             Self::SimpleBuffers => &["simplefinder buffers", "查找缓冲区"],
             Self::SimpleGrep => &["simplefinder grep", "搜索项目"],
             Self::SimpleOutline => &["simplecc outline", "符号大纲"],
+            Self::SimpleImplementation => &["simplecc implementation", "跳转实现"],
+            Self::SimpleTypeDefinition => &["simplecc type definition", "类型定义"],
+            Self::SimpleWorkspaceSymbols => {
+                &["simplecc workspace symbols live search", "工作区符号"]
+            }
+            Self::SimpleIncomingCalls => &["simplecc incoming calls callers hierarchy", "调用者"],
+            Self::SimpleOutgoingCalls => &["simplecc outgoing calls callees hierarchy", "被调用者"],
+            Self::SimpleSupertypes => &["simplecc supertypes parent type hierarchy", "父类型"],
+            Self::SimpleSubtypes => &["simplecc subtypes child type hierarchy", "子类型"],
+            Self::SimpleSignatureHelp => &["simplecc signature help parameters", "签名帮助"],
             Self::SimpleRename => &["simplecc rename", "重命名符号"],
             Self::SimpleCodeAction => &["simplecc code action", "代码操作"],
             Self::SimpleCodeLens => &["simplecc code lens refresh", "刷新代码透镜"],
@@ -290,6 +332,17 @@ impl Vim9WorkbenchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_catalog_has_unique_wire_ids_matching_serde() {
+        let mut ids = std::collections::HashSet::new();
+        for action in Vim9WorkbenchAction::ALL {
+            assert!(ids.insert(action.capability()));
+            assert_eq!(serde_json::to_value(action).unwrap(), action.capability());
+            assert!(!action.title().is_empty());
+            assert!(!action.aliases().is_empty());
+        }
+    }
 
     #[test]
     fn receiver_bounds_context_and_expires_wrong_sources() {

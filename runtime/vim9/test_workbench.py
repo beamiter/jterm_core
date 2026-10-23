@@ -52,7 +52,7 @@ class WorkbenchTests(unittest.TestCase):
 
     @staticmethod
     def source(state):
-        return {name: state[name] for name in ["window", "buffer", "changedtick"]}
+        return {name: state[name] for name in ["window", "buffer", "changedtick", "line", "column"]}
 
     def test_authenticated_lifecycle_and_disconnect_are_observable(self):
         e = self.editor(authenticate=False)
@@ -61,7 +61,8 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual((self.root / "workbench-ready.marker").read_text(), "v:true\n1\n0\n")
         state = e.snapshot()
         self.assertIs(state["workbench"]["native"], True)
-        self.assertEqual(self.source(state["workbench"]), self.source(state))
+        for name in ("window", "buffer", "changedtick"):
+            self.assertEqual(state["workbench"][name], state[name])
         e.connection.close()
         e.connection = None
         deadline = time.monotonic() + 2
@@ -107,7 +108,8 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(len(context["remote"]["root"]), 4096)
         self.assertNotIn("must-not-cross", json.dumps(state))
         self.assertNotIn("Callback", context)
-        self.assertEqual(self.source(context), self.source(state))
+        self.assertEqual({name: context[name] for name in ("window", "buffer", "changedtick")},
+                         {name: state[name] for name in ("window", "buffer", "changedtick")})
 
     def test_malformed_or_throwing_state_hooks_do_not_break_editing(self):
         e = self.editor()
@@ -141,11 +143,44 @@ class WorkbenchTests(unittest.TestCase):
         e.request("workbench", command="simple_files", **current)
         self.assertEqual((self.root / "workbench-actions.marker").read_text(), "simple_files\n")
 
+    def test_cursor_bound_actions_reject_moved_and_malformed_sources(self):
+        e = self.editor()
+        e.ex("call setline(1, ['a中word', 'second']) | call cursor(1, 5)")
+        before = e.snapshot()
+        source = self.source(before)
+        self.assertEqual(source["column"], 5)  # UTF-8 byte column, not character index.
+        e.ex("call cursor(2, 1)")
+        moved = e.snapshot()
+        self.assertEqual(before["changedtick"], moved["changedtick"])
+        result = e.request("workbench", command="simple_rename", ok=False, **source)
+        self.assertIn("cursor changed", result["error"])
+        current = self.source(moved)
+        for field in ("line", "column"):
+            for invalid in (True, False, 0, -1, "1", None, 1.5, [], {}):
+                request = {**current, field: invalid}
+                e.request("workbench", command="simple_rename", ok=False, **request)
+            request = dict(current)
+            del request[field]
+            e.request("workbench", command="simple_rename", ok=False, **request)
+        self.assertFalse((self.root / "workbench-actions.marker").exists())
+        after = e.snapshot()
+        for field in ("buffer", "window", "changedtick", "line", "column"):
+            self.assertEqual(after[field], moved[field])
+        e.request("workbench", command="simple_rename", **current)
+        legacy = {key: current[key] for key in ("buffer", "window", "changedtick")}
+        e.request("workbench", command="simple_files", **legacy)
+        self.assertEqual((self.root / "workbench-actions.marker").read_text().splitlines(),
+                         ["simple_rename", "simple_files"])
+
     def test_workspace_actions_use_closed_source_bound_catalog(self):
         e = self.editor()
         actions = ['simple_recent', 'simple_tree_toggle', 'simple_tree_reveal',
                    'simple_terminal_toggle', 'simple_terminal_new',
-                   'simple_terminal_next', 'simple_terminal_previous']
+                   'simple_terminal_next', 'simple_terminal_previous',
+                   'simple_implementation', 'simple_type_definition',
+                   'simple_workspace_symbols', 'simple_incoming_calls',
+                   'simple_outgoing_calls', 'simple_supertypes',
+                   'simple_subtypes', 'simple_signature_help']
         e.ex('let g:workbench_actions = ' + str(actions))
         source = self.source(e.snapshot())
         for action in actions:

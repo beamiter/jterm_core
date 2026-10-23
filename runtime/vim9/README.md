@@ -132,7 +132,7 @@ in subsequent state. Events include an increasing `seq` and `protocol: 1`.
 | `references` | None | Advertised workbench provider, then `:LspShowReferences` |
 | `rename` | Nonempty `name` | `:LspRename name`; whitespace/command separators are rejected |
 | `format` | None | Advertised workbench provider, then `:LspFormat` |
-| `workbench` | Fixed `command`; current `window`, `buffer`, `changedtick` | Invoke an available Simple action in the user's vimrc; reject a changed source or removed capability |
+| `workbench` | Fixed `command`; current `window`, `buffer`, `changedtick`; optional paired `line`, `column` | Invoke an available Simple action in the user's vimrc; reject a changed source/cursor or removed capability |
 | `next_diagnostic` | None | Native `:cnext` |
 | `previous_diagnostic` | None | Native `:cprevious` |
 | `set_render` | Boolean `enabled` | Subscribe/unsubscribe to native GUI buffer paint frames after the session is connected |
@@ -386,7 +386,7 @@ def g:VimrcWorkbenchDiagnostics(): dict<any>
 ```
 
 The first hook returns available actions for the **current** buffer. The bridge
-accepts only `definition`, `hover`, `references`, `format` and the twenty-two
+accepts only `definition`, `hover`, `references`, `format` and the thirty-three
 `simple_*` actions below, deduplicating at most 64 entries. Existing typed
 semantic commands prefer a declared workbench provider, then retain their
 built-in LSP/tags fallback. SimpleCC's rename uses its own prepare-rename and
@@ -405,8 +405,15 @@ does not claim to consume the existing `rename` request's `name` argument.
 | `simple_buffers` | SimpleFinder buffers |
 | `simple_grep` | SimpleFinder interactive project grep |
 | `simple_outline` | SimpleCC symbol outline |
+| `simple_implementation` / `simple_type_definition` | SimpleCC implementation and type-definition navigation |
+| `simple_workspace_symbols` | SimpleCC live workspace-symbol search, retaining its interactive Vim popup |
+| `simple_incoming_calls` / `simple_outgoing_calls` | SimpleCC caller and callee hierarchy |
+| `simple_supertypes` / `simple_subtypes` | SimpleCC parent and child type hierarchy |
+| `simple_signature_help` | SimpleCC signature and active-parameter help |
 | `simple_rename` | SimpleCC rename with its Vim prompt |
 | `simple_code_action` | SimpleCC code-action chooser |
+| `simple_code_lens` / `simple_code_lens_run` | Refresh SimpleCC CodeLens or run a lens at the cursor |
+| `simple_inlay_hints` | Toggle SimpleCC inline type and parameter hints |
 | `simple_diagnostics` | SimpleCC current-buffer location list |
 | `simple_next_diagnostic` | SimpleCC next visible diagnostic, including its severity filter and wrap behavior |
 | `simple_previous_diagnostic` | SimpleCC previous visible diagnostic |
@@ -424,12 +431,17 @@ action hook must recheck availability and throw on failure. The native request
 has no free-form Ex command, key sequence, callback name or executable field:
 
 ```json
-{"id":42,"action":"workbench","command":"simple_git_hunk","window":1001,"buffer":3,"changedtick":7}
+{"id":42,"action":"workbench","command":"simple_git_hunk","window":1001,"buffer":3,"changedtick":7,"line":12,"column":5}
 ```
 
 The bridge checks safe Vim mode, the exact current window/buffer/text version,
 the fixed vocabulary and freshly sampled capabilities before invoking the
 hook. It refuses a stale request instead of applying it to another source.
+New hosts also bind the one-based Vim line and UTF-8 byte column at activation.
+A cursor move before dispatch therefore rejects the action even when the
+buffer's changedtick has not changed. Both coordinates must be positive
+integers and match the current cursor; supplying only one is invalid. Older
+hosts may omit both fields and retain the earlier source-identity checks.
 Plugin prompts, complex popup windows, diff views and other unsupported displays
 still use the live compatibility renderer, returning to native paint when
 supported. Protocol 6 can paint opted-in passive text popups over the buffer.
@@ -438,6 +450,15 @@ This makes blocking plugin input loops such as SimpleWhichKey's `getcharstr()`
 visible even when they prevent paint timers from running. Native overlays stay
 retired until the synchronous hook returns; failures also restore painting.
 Asynchronous prompts and popups continue using the ordinary mode/display checks.
+
+Semantic navigation actions allow readonly and nonmodifiable code buffers,
+but retain the vimrc's large-file and special-buffer guards. The language
+server and SimpleCC own target resolution, UTF-16 conversion, multiple-result
+lists and hierarchy selection. The live workspace-symbol picker uses its
+existing filtered popup on the compatibility surface; signature help uses
+the provider's opted-in native passive text popup when supported. Search
+`>simple implementation`, `>simple type definition`, `>workspace symbols`,
+`>incoming calls`, `>supertypes` or `>signature help` in any frontend.
 
 Tree actions reuse the vimrc's remote-aware commands when present, so a remote
 workspace is not silently redirected to a local tree. Reveal requires a named
@@ -520,6 +541,16 @@ other checkout layouts can select the vimrc and plugin parent explicitly:
 ```sh
 VIM9_TEST_VIMRC=/path/to/vimrc VIM9_TEST_SIMPLE_ROOT=/path/to/plugin-parent python3 -m unittest -v test_vimrc_workbench test_simple_diagnostics test_simple_finder test_simple_workspace
 ```
+
+With the semantic-navigation vimrc action catalog, also run
+`python3 runtime/vim9/test_simple_navigation.py` from the core repository with
+the same environment. Its deterministic daemon replies exercise the actual
+SimpleCC requests, UTF-16 target positions, result lists, interactive symbol
+search and native signature popup through a real Vim PTY.
+The pixel-input CI keeps its audited vimrc revision and applies the exact
+candidate catalog patch in `fixtures/vimrc-semantic-actions.patch` before this
+test; a changed patch context fails the job. Once that vimrc change is
+published and pinned, remove the temporary overlay and keep the test.
 
 That suite loads the real configuration and plugin runtimes in isolated test
 homes. SimpleCC's deterministic daemon fixture supplies replies; it tests

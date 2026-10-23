@@ -33,7 +33,7 @@ pub enum Vim9PaletteCommand {
     Workbench(Vim9WorkbenchAction),
 }
 
-const COMMANDS: [Vim9PaletteCommand; 41] = {
+const COMMANDS: [Vim9PaletteCommand; 49] = {
     use Vim9PaletteCommand::*;
     [
         Save,
@@ -63,6 +63,14 @@ const COMMANDS: [Vim9PaletteCommand; 41] = {
         Workbench(Vim9WorkbenchAction::SimpleBuffers),
         Workbench(Vim9WorkbenchAction::SimpleGrep),
         Workbench(Vim9WorkbenchAction::SimpleOutline),
+        Workbench(Vim9WorkbenchAction::SimpleImplementation),
+        Workbench(Vim9WorkbenchAction::SimpleTypeDefinition),
+        Workbench(Vim9WorkbenchAction::SimpleWorkspaceSymbols),
+        Workbench(Vim9WorkbenchAction::SimpleIncomingCalls),
+        Workbench(Vim9WorkbenchAction::SimpleOutgoingCalls),
+        Workbench(Vim9WorkbenchAction::SimpleSupertypes),
+        Workbench(Vim9WorkbenchAction::SimpleSubtypes),
+        Workbench(Vim9WorkbenchAction::SimpleSignatureHelp),
         Workbench(Vim9WorkbenchAction::SimpleRename),
         Workbench(Vim9WorkbenchAction::SimpleCodeAction),
         Workbench(Vim9WorkbenchAction::SimpleCodeLens),
@@ -182,7 +190,13 @@ impl Vim9PaletteCommand {
                 .then_some("The current buffer's language service does not provide this action")
             }
             Self::Workbench(command) => {
-                if snapshot.buffer <= 0 || snapshot.window <= 0 {
+                if snapshot.buffer <= 0
+                    || snapshot.window <= 0
+                    || snapshot.line == 0
+                    || snapshot.column == 0
+                    || snapshot.line > i64::MAX as u64
+                    || snapshot.column > i64::MAX as u64
+                {
                     Some("Waiting for the current Vim source identity")
                 } else {
                     (!snapshot
@@ -222,6 +236,8 @@ impl Vim9PaletteCommand {
                 window: snapshot.window,
                 buffer: snapshot.buffer,
                 changedtick: snapshot.changedtick,
+                line: i64::try_from(snapshot.line).map_err(|_| "Invalid Vim source line")?,
+                column: i64::try_from(snapshot.column).map_err(|_| "Invalid Vim source column")?,
             },
         })
     }
@@ -268,6 +284,8 @@ mod tests {
         Vim9Snapshot {
             connected: true,
             mode: "n".into(),
+            line: 1,
+            column: 1,
             ..Default::default()
         }
     }
@@ -340,7 +358,7 @@ mod tests {
             frame,
             serde_json::json!({
                 "action": "workbench", "command": "simple_files", "window": 1001,
-                "buffer": 4, "changedtick": 9
+                "buffer": 4, "changedtick": 9, "line": snapshot.line, "column": snapshot.column
             })
         );
         snapshot.capabilities.clear();
@@ -495,6 +513,66 @@ mod tests {
             snapshot.capabilities.clear();
             snapshot.buffer = 4;
             snapshot.changedtick = 9;
+        }
+    }
+
+    #[test]
+    fn semantic_navigation_actions_capture_cursor_and_recheck_live_state() {
+        let mut snapshot = connected();
+        snapshot.buffer = 4;
+        snapshot.window = 1001;
+        snapshot.changedtick = 9;
+        snapshot.line = 7;
+        snapshot.column = 12;
+        for (action, query) in [
+            (Vim9WorkbenchAction::SimpleImplementation, "跳转实现"),
+            (Vim9WorkbenchAction::SimpleTypeDefinition, "类型定义"),
+            (Vim9WorkbenchAction::SimpleWorkspaceSymbols, "工作区符号"),
+            (Vim9WorkbenchAction::SimpleIncomingCalls, "调用者"),
+            (Vim9WorkbenchAction::SimpleOutgoingCalls, "被调用者"),
+            (Vim9WorkbenchAction::SimpleSupertypes, "父类型"),
+            (Vim9WorkbenchAction::SimpleSubtypes, "子类型"),
+            (Vim9WorkbenchAction::SimpleSignatureHelp, "签名帮助"),
+        ] {
+            let command = Vim9PaletteCommand::Workbench(action);
+            assert!(vim9_palette_matches(query, 256).contains(&command));
+            assert!(command.command(&snapshot).is_err());
+            snapshot.capabilities.push(action.capability().into());
+            let request = serde_json::to_value(command.command(&snapshot).unwrap()).unwrap();
+            assert_eq!(request["command"], action.capability());
+            assert_eq!(request["window"], 1001);
+            assert_eq!(request["buffer"], 4);
+            assert_eq!(request["changedtick"], 9);
+            assert_eq!(request["line"], 7);
+            assert_eq!(request["column"], 12);
+
+            snapshot.column += 1;
+            let moved = serde_json::to_value(command.command(&snapshot).unwrap()).unwrap();
+            assert_eq!(moved["column"], 13);
+            snapshot.column -= 1;
+            snapshot.waiting_for_input = true;
+            assert!(command.command(&snapshot).is_err());
+            snapshot.waiting_for_input = false;
+            snapshot.mode = "t".into();
+            assert!(command.command(&snapshot).is_err());
+            snapshot.mode = "n".into();
+            snapshot.capabilities.clear();
+            assert!(command.command(&snapshot).is_err());
+        }
+    }
+
+    #[test]
+    fn workbench_rejects_missing_or_unrepresentable_cursor_coordinates() {
+        let mut snapshot = connected();
+        snapshot.buffer = 4;
+        snapshot.window = 1001;
+        snapshot.capabilities.push("simple_files".into());
+        let command = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleFiles);
+        for (line, column) in [(0, 1), (1, 0), (u64::MAX, 1), (1, u64::MAX)] {
+            snapshot.line = line;
+            snapshot.column = column;
+            assert!(command.unavailable_reason(&snapshot).is_some());
+            assert!(command.command(&snapshot).is_err());
         }
     }
 
