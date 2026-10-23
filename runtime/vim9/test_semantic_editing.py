@@ -51,14 +51,14 @@ for line in sys.stdin:
         out.write(json.dumps(r) + '\\n')
     k = r['type']
     e = {'id': r.get('id', 0)}
-    if k == 'initialize': e.update(type='initialized')
+    if k == 'initialize': e.update(type='initialized', capabilities={'code_action_identity': True})
     elif k in ('textDocument/definition', 'textDocument/references'):
         e.update(type=k.split('/')[-1], locations=[{'uri': r['uri'], 'line': 1, 'character': 0}])
     elif k == 'textDocument/prepareRename':
         e.update(type='prepareRename', result={'placeholder': 'original', 'default_behavior': True})
     elif k == 'textDocument/signatureHelp':
         e.update(type='signatureHelp', signatures=[{'label': 'fixture(value: int)'}])
-    elif k == 'textDocument/codeAction': e.update(type='codeAction', actions=[])
+    elif k == 'textDocument/codeAction': e.update(type='codeAction', generation=r['id'], uri=r['uri'], actions=[])
     elif k in ('textDocument/rangeFormatting', 'textDocument/formatting'):
         e.update(type='formatting', edits=[{'line': 0, 'character': 0, 'end_line': 0, 'end_character': 8, 'new_text': 'FORMATTED'}])
         if k == 'textDocument/rangeFormatting':

@@ -68,7 +68,7 @@ for line in sys.stdin:
         event.update(type='signatureHelp', signatures=[{
             'label': 'alpha(value: int)', 'active_parameter': 0,
             'parameters': [{'label': 'value', 'documentation': 'input value 界é'}],
-            'documentation': 'Signature documentation'}])
+            'documentation': (root / 'signature.txt').read_text() if (root / 'signature.txt').exists() else 'Signature documentation'}])
     elif kind == 'textDocument/didOpen':
         event.update(type='diagnostics', uri=r['uri'], server='fixture', items=[{
             'line': 0, 'character': 0, 'end_line': 0, 'end_character': 6,
@@ -107,7 +107,10 @@ for line in sys.stdin:
                       + ").items, 'popups': popup_list(), 'mode': mode()}")
         self.e.ex("autocmd User SimpleCCDiagnosticsChanged call writefile([json_encode("
                   + expression + ")], " + harness.vim_string(self.delivery) + ")")
-        self.e.ex('inoremap <C-g>q <Cmd>SimpleCCPopupClose<CR>')
+        # This lifecycle fixture explicitly closes a pending (not yet visible)
+        # card; the user's conditional document key intentionally falls back
+        # when no card is visible. Override its local binding for this test.
+        self.e.ex('inoremap <buffer> <C-g>q <Cmd>SimpleCCPopupClose<CR>')
         (self.root / 'popup.gate').touch()
 
     def pending(self, kind, after=0):
@@ -153,6 +156,97 @@ for line in sys.stdin:
         for key in ('window', 'buffer', 'changedtick', 'line', 'column'):
             self.assertEqual(current[key], self.source[key], key)
         self.assertEqual(self.capture(self.e, "getline(1, '$')"), ['original line', 'second line'])
+
+    def observe_insert_docs(self):
+        self.observer = self.root / 'insert-doc-observer.json'
+        script = self.root / 'insert-doc-observer.vim'
+        script.write_text(
+            "let g:insert_doc_events = 0\n"
+            "function! ObserveInsertDocs()\n"
+            "  let g:insert_doc_events += 1\n"
+            "  let cards = map(copy(popup_list()), {_,id -> {'id':id, 'firstline':get(popup_getpos(id), 'firstline', 1)}})\n"
+            "  let observation = {'event':g:insert_doc_events, 'mode':mode(), 'position':getcurpos(), 'lines':getline(1, '$'), 'tick':b:changedtick, 'undo':undotree().seq_cur, 'pum':pumvisible(), 'selected':complete_info(['selected']).selected, 'cards':cards}\n"
+            "  call writefile([json_encode(observation)], " + harness.vim_string(self.observer) + ")\n"
+            "endfunction\n"
+            "augroup TestInsertDocs\n"
+            "  autocmd!\n"
+            "  autocmd User JTermVim9PopupChanged call ObserveInsertDocs()\n"
+            "augroup END\n", encoding='utf-8')
+        self.e.ex('source ' + str(script))
+
+    def insert_observation(self, after=0):
+        observed = {}
+        def ready():
+            if not self.observer.exists():
+                return False
+            try:
+                value = json.loads(self.observer.read_text())
+            except json.JSONDecodeError:
+                return False
+            if value['event'] <= after:
+                return False
+            observed.update(value)
+            return True
+        self.until(self.e, ready)
+        return observed
+
+    def exercise_insert_doc_keys(self):
+        before = self.insert_observation()
+        self.assertEqual(before['mode'], 'i')
+        current = before
+        for key, direction in ((b'\x07f', 1), (b'\x07b', -1), (b'\x07q', 0)):
+            self.e.keys(key)
+            current = self.insert_observation(after=current['event'])
+            for field in ('mode', 'position', 'lines', 'tick', 'undo', 'pum', 'selected'):
+                self.assertEqual(current[field], before[field], field)
+            if direction > 0:
+                self.assertGreater(current['cards'][0]['firstline'], before['cards'][0]['firstline'])
+            elif direction < 0:
+                self.assertEqual(current['cards'][0]['firstline'], before['cards'][0]['firstline'])
+            else:
+                self.assertEqual(current['cards'], [])
+        self.e.painted(lambda frame: frame['supported'] and frame['mode'].startswith('i')
+                       and not frame.get('popups'))
+
+    def test_insert_doc_keys_preserve_signature_source_mode_and_undo(self):
+        e = self.start()
+        self.observe_insert_docs()
+        (self.root / 'signature.txt').write_text('\n'.join(f'Argument detail {n}' for n in range(40)))
+        self.assertEqual(self.capture(e, 'simplecc#PopupScrollKey(1, "\\<C-g>f")'), '\x07f')
+        self.assertEqual(self.capture(e, 'simplecc#PopupCloseKey("\\<C-g>q")'), '\x07q')
+        e.keys(b'i\x07s')
+        self.card('signature')
+        self.exercise_insert_doc_keys()
+        e.keys(b'\x1b')
+        e.state_where(lambda state: state['mode'] == 'n')
+        self.assert_source()
+
+    def test_insert_doc_keys_preserve_completion_menu_selection(self):
+        e = self.start()
+        self.observe_insert_docs()
+        plugin = str((harness.PLUGIN_ROOT / 'simplecc/autoload/simplecc.vim').resolve())
+        sid = self.capture(e, 'filter(getscriptinfo(), {_,s -> s.name ==# '
+                           + harness.vim_string(plugin) + '})[0].sid')
+        script = self.root / 'insert-completion-docs.vim'
+        script.write_text(
+            f"let g:InsertCompletionDocumentation = function('<SNR>{sid}_ShowCompletionDocumentation')\n"
+            "function! InsertCompletionDocsTimer(timer)\n"
+            "  if pumvisible()\n"
+            "    call g:InsertCompletionDocumentation({'documentation':join(map(range(1, 40), {_,n -> 'Completion detail ' . n}), \"\\n\")})\n"
+            "  endif\n"
+            "endfunction\n", encoding='utf-8')
+        e.ex('source ' + str(script))
+        e.ex('set completeopt=menuone,noinsert')
+        e.ex('highlight! link PmenuMatch Pmenu | highlight! link PmenuMatchSel PmenuSel')
+        e.keys("A\x12=[complete(col('.'), ['alpha', 'beta']), timer_start(100, 'InsertCompletionDocsTimer'), ''][2]\r")
+        self.card('completion_documentation')
+        self.assertEqual(self.insert_observation()['selected'], 0)
+        self.assertEqual(self.insert_observation()['pum'], 1)
+        self.exercise_insert_doc_keys()
+        self.assertTrue(e.snapshot()['mode'].startswith('i'))
+        e.keys(b'\x05\x1b')
+        e.state_where(lambda state: state['mode'] == 'n')
+        self.assertEqual(self.capture(e, "getline(1, '$')"), ['original line', 'second line'])
 
     def test_long_hover_wraps_scrolls_with_vimrc_keys_and_closes_without_editing(self):
         e = self.start()

@@ -96,7 +96,7 @@ for line in sys.stdin:
     kind = request['type']
     reply = {'id': request.get('id', 0)}
     if kind == 'initialize':
-        reply.update(type='initialized')
+        reply.update(type='initialized', capabilities={'code_action_identity': True})
     elif kind == 'textDocument/prepareRename':
         reply.update(type='prepareRename', result={'placeholder': 'original'})
     elif kind == 'textDocument/rename':
@@ -105,7 +105,7 @@ for line in sys.stdin:
                 'line': 0, 'character': 0, 'end_line': 0,
                 'end_character': 8, 'new_text': request['newName']}]}]})
     elif kind == 'textDocument/codeAction':
-        reply.update(type='codeAction', actions=[{
+        reply.update(type='codeAction', generation=request['id'], uri=request['uri'], actions=[{
             'title': 'Fixture code action', 'kind': 'quickfix', 'index': 0}])
     elif kind == 'shutdown':
         break
