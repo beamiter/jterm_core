@@ -61,6 +61,19 @@ original session store and credentials configuration in effect without reading
 credentials. The Claude equivalent uses `CLAUDE_CONFIG_DIR`.
 
 `display_command` shell-quotes each argument for a review/confirmation view.
+Before creating the PTY, call `launch.resolve_for_spawn()` and surface its
+error without opening an empty tab. This activation-only step finds absolute
+Codex/Claude executables in the inherited absolute PATH entries, common user
+bin directories, and up to 128 NVM version directories. NVM's bounded default
+alias is preferred, followed by descending numeric versions. Relative/empty
+PATH entries and shell-profile evaluation are excluded.
+
+The resolved argv uses an absolute `env` helper and explicit child PATH. It
+keeps the chosen CLI's bin directory and matching Node runtime available for
+`#!/usr/bin/env node` npm launchers, including a local-bin symlink into an NVM
+installation. Original provider-home assignments, cwd and session UUID remain
+unchanged. Discovery and command previews do not resolve executables.
+
 Hosts still launch argv directly. Missing project directories and deleted
 history produce a recoverable error; the manager does not silently resume in
 a different directory. Archived sessions are visible but require the user to

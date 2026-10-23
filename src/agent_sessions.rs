@@ -4,6 +4,8 @@
 //! Files are sampled at their head and tail within hard byte and entry ceilings;
 //! discovery belongs on a worker, not the GUI thread.
 
+mod desktop_launch;
+
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
@@ -967,14 +969,14 @@ impl Parsed {
                     }
                     _ => {}
                 },
-                "response_item" => {
-                    if payload.get("type").and_then(Value::as_str) == Some("message") {
-                        let text = content_text(&payload["content"]);
-                        match payload.get("role").and_then(Value::as_str) {
-                            Some("user") => self.user_text(&text),
-                            Some("assistant") if !text.is_empty() => self.preview = text,
-                            _ => {}
-                        }
+                "response_item"
+                    if payload.get("type").and_then(Value::as_str) == Some("message") =>
+                {
+                    let text = content_text(&payload["content"]);
+                    match payload.get("role").and_then(Value::as_str) {
+                        Some("user") => self.user_text(&text),
+                        Some("assistant") if !text.is_empty() => self.preview = text,
+                        _ => {}
                     }
                 }
                 _ => {}
