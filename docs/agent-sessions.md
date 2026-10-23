@@ -47,6 +47,40 @@ per scan; working-directory similarity never creates a match.
 waiting for a permission, or idle. A CLI that holds no matching history descriptor
 may therefore have no correlated PID even when a process is alive.
 
+## Ranked query projection
+
+All four native adapters can share `SessionSearchIndex` instead of rebuilding
+search text or duplicating filtering rules for each rendered row. Construct the
+index once from a changed `SessionCatalog`, then retain its returned catalog
+indices for the active query. `AgentSession` and `SessionCatalog` implement
+`PartialEq`/`Eq`, so unchanged discovery snapshots can be ignored without
+resetting selection, scroll position or row widgets.
+
+`SessionQuery` combines text, provider, recorded status, live-only filtering,
+an optional absolute project directory, and `SessionSort`. Every whitespace-
+separated term must match an indexed field. Relevance gives exact session IDs
+first priority, followed by ID/title matches, project/branch matches, then
+recent-message previews. It is not a full-transcript or fuzzy semantic search.
+Search text uses Unicode lowercase matching; stable provider/ID keys break
+remaining timestamp ties independently of catalog row order.
+
+`Relevance` is the default; an empty query retains recent-first ordering.
+`Recent` always orders matches by their modification timestamp. `LiveFirst`
+puts positively observed processes first, then relevance and recency. The
+recorded activity value remains distinct from process liveness in every mode.
+
+A project scope includes its lexical descendants: `/work/repo` includes
+`/work/repo/subdir`, excludes `/work/repo-other`, and normalizes `.`/`..`
+components. Relative scopes return no matches. Resolving symlink aliases or
+finding repository roots belongs to the host; query evaluation never reads the
+filesystem or starts Git. Queries over 4,096 bytes or 64 terms return no matches
+rather than ignoring required terms.
+
+The convenience `catalog.query(&query)` builds a temporary index for one-shot
+callers. GUI event loops should cache `SessionSearchIndex::new(&catalog)` and
+re-query only after text/filter/sort changes or an actual catalog replacement.
+Pins/favorites are not part of this contract and no preference file is written.
+
 ## Resuming
 
 After the user selects and confirms a session, call `resume_launch` again and

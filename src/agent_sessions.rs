@@ -5,6 +5,8 @@
 //! discovery belongs on a worker, not the GUI thread.
 
 mod desktop_launch;
+mod search;
+pub use search::{SessionQuery, SessionSearchIndex, SessionSort};
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -61,7 +63,7 @@ impl SessionStatus {
         self.label()
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSession {
     pub provider: SessionProvider,
     pub id: String,
@@ -179,7 +181,7 @@ impl SessionLaunch {
         crate::process::shell_quote_argv(&args).unwrap_or_else(|| "Invalid resume command".into())
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionCatalog {
     pub sessions: Vec<AgentSession>,
     pub warnings: Vec<String>,
