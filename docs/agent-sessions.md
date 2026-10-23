@@ -79,13 +79,50 @@ rather than ignoring required terms.
 The convenience `catalog.query(&query)` builds a temporary index for one-shot
 callers. GUI event loops should cache `SessionSearchIndex::new(&catalog)` and
 re-query only after text/filter/sort changes or an actual catalog replacement.
-Pins/favorites are not part of this contract and no preference file is written.
+`query_with_library` adds pinned-only and previously-resumed filters from a
+shared `SessionLibrarySnapshot`. `RecentlyResumed` sorts by the receipt
+timestamp, retaining deterministic base order when timestamps tie. Optional
+pin-first ordering is honored only for empty-query `Relevance` browsing;
+search matches and explicit chronological/live sorts retain their meaning.
+
+## Shared pins and resume receipts
+
+`SessionLibraryStore::new()` starts a background load of
+`$XDG_STATE_HOME/jterm/agent-sessions-library.json` (falling back to
+`~/.local/state/jterm/agent-sessions-library.json`). All four terminals use the
+same path. The file stores only provider, UUID, pin state and the most recent
+resume timestamp, never prompts, previews, project paths or credentials.
+
+The constructor, `set_pinned`, `record_resumed`, `refresh`, `poll`, and snapshot
+queries perform no filesystem I/O on the caller's thread. One worker drains a
+bounded queue of up to 256 distinct pending identities; updates for the same
+identity coalesce. Workers continue saving without UI polling, including
+queued work when the store is dropped. A process killed before its background
+write finishes can still lose a pending update; hosts should show Saving while
+`is_busy()` is true rather than promise an immediate durable write.
+
+Each transaction acquires a cross-process directory lock with a two-second
+wait limit, reads current metadata, merges only that transaction's operations,
+and atomically replaces the private file. One terminal never writes its old
+whole snapshot over another terminal's pins. Delayed resume receipts cannot
+move a saved timestamp backwards. Directory and file modes are 0700 and 0600;
+symlink, unsafe permission, malformed, duplicate-key and future-version files
+are rejected and left unchanged. The version-1 JSON is capped at 1 MiB and
+4,096 identities. Errors are nonfatal and exposed by `error()` after `poll()`.
+
+Poll to adopt completed snapshots; refresh periodically while open to observe
+other terminal windows' changes. Re-query cached search indices when the
+snapshot changes. Record a resume only after the host has successfully created
+the PTY or focused a valid existing session tab, not when selecting a row or
+starting a readiness check. This is a launch/switch receipt, not proof that a
+model turn completed successfully.
 
 ## Resuming
 
-After the user selects and confirms a session, call `resume_launch` again and
-launch `program` plus `args` as argv in a new native PTY at `cwd`. Never replace
-this with `--last`: the chosen UUID must survive selection and refresh.
+After the user selects and confirms a session, obtain a fresh, selection-bound
+preflight result and launch its `program` plus `args` as argv in a new native
+PTY at `cwd`. Never replace this with `--last`: the chosen UUID must survive
+selection and refresh.
 
 The launch plan validates the session UUID, source file, and original absolute
 project directory. If the source belongs to a different provider home than the
@@ -95,9 +132,16 @@ original session store and credentials configuration in effect without reading
 credentials. The Claude equivalent uses `CLAUDE_CONFIG_DIR`.
 
 `display_command` shell-quotes each argument for a review/confirmation view.
-Before creating the PTY, call `launch.resolve_for_spawn()` and surface its
-error without opening an empty tab. This activation-only step finds absolute
-Codex/Claude executables in the inherited absolute PATH entries, common user
+Native pickers use `SessionPreflight` to run `resume_launch` and
+`resolve_for_spawn` on a worker, bound to the selected provider/UUID, source,
+cwd and archive state. A changed selection or confirmation refresh invalidates
+old results. At most one worker and one replaceable latest request exist;
+readiness never executes the CLI or a shell profile. Hosts require a fresh,
+matching `Ready` result before creating a new PTY, and display `Unavailable`
+without opening an empty tab.
+
+`launch.resolve_for_spawn()` performs the activation-only executable lookup.
+It finds absolute Codex/Claude executables in the inherited absolute PATH entries, common user
 bin directories, and up to 128 NVM version directories. NVM's bounded default
 alias is preferred, followed by descending numeric versions. Relative/empty
 PATH entries and shell-profile evaluation are excluded.

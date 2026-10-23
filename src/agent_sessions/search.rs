@@ -1,6 +1,6 @@
 //! Cached, deterministic session search shared by every native frontend.
 //! Build once after a changed catalog; queries never inspect the filesystem.
-use super::{AgentSession, SessionCatalog, SessionProvider, SessionStatus};
+use super::{AgentSession, SessionCatalog, SessionLibrarySnapshot, SessionProvider, SessionStatus};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
@@ -13,14 +13,21 @@ pub enum SessionSort {
     Relevance,
     Recent,
     LiveFirst,
+    RecentlyResumed,
 }
 impl SessionSort {
-    pub const ALL: [Self; 3] = [Self::Relevance, Self::Recent, Self::LiveFirst];
+    pub const ALL: [Self; 4] = [
+        Self::Relevance,
+        Self::Recent,
+        Self::LiveFirst,
+        Self::RecentlyResumed,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Self::Relevance => "Best match",
             Self::Recent => "Recent",
             Self::LiveFirst => "Live first",
+            Self::RecentlyResumed => "Recently resumed",
         }
     }
 }
@@ -29,6 +36,14 @@ impl std::fmt::Display for SessionSort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.label())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionLibraryFilter {
+    pub pinned_only: bool,
+    pub recent_only: bool,
+    /// Empty-query default browsing only; never displace exact search matches.
+    pub pinned_first: bool,
 }
 
 /// `project` includes the absolute directory and its lexical descendants.
@@ -85,6 +100,48 @@ impl SessionSearchIndex {
                 .collect(),
         }
     }
+    pub fn query_with_library(
+        &self,
+        query: &SessionQuery<'_>,
+        library: &SessionLibrarySnapshot,
+        filter: SessionLibraryFilter,
+    ) -> Vec<usize> {
+        let mut indices = self.query(query);
+        indices.retain(|index| {
+            let entry = &self.entries[*index];
+            (!filter.pinned_only || library.is_pinned(entry.provider, &entry.key))
+                && (!filter.recent_only
+                    || library.last_resumed(entry.provider, &entry.key).is_some())
+        });
+        let pinned_first = filter.pinned_first
+            && query.text.trim().is_empty()
+            && query.sort == SessionSort::Relevance;
+        if pinned_first || query.sort == SessionSort::RecentlyResumed {
+            // Stable sort preserves relevance/recency and identity tie-breaks
+            // from the base projection when preference metadata ties.
+            indices.sort_by(|a, b| {
+                let left = &self.entries[*a];
+                let right = &self.entries[*b];
+                let pins = if pinned_first {
+                    library
+                        .is_pinned(right.provider, &right.key)
+                        .cmp(&library.is_pinned(left.provider, &left.key))
+                } else {
+                    std::cmp::Ordering::Equal
+                };
+                pins.then_with(|| {
+                    if query.sort == SessionSort::RecentlyResumed {
+                        library
+                            .last_resumed(right.provider, &right.key)
+                            .cmp(&library.last_resumed(left.provider, &left.key))
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+            });
+        }
+        indices
+    }
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -136,7 +193,7 @@ impl SessionSearchIndex {
             let a = &self.entries[*left];
             let b = &self.entries[*right];
             let priority = match query.sort {
-                SessionSort::Recent => std::cmp::Ordering::Equal,
+                SessionSort::Recent | SessionSort::RecentlyResumed => std::cmp::Ordering::Equal,
                 SessionSort::Relevance => right_score.cmp(left_score),
                 SessionSort::LiveFirst => b
                     .live
@@ -564,5 +621,81 @@ mod tests {
         assert_eq!(index.len(), 2048);
         assert!(!index.is_empty());
         assert!(SessionSearchIndex::default().is_empty());
+    }
+    #[test]
+    fn library_filters_sort_receipts_and_never_override_nonempty_search() {
+        use crate::agent_sessions::SessionLibraryEntry;
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let c = "33333333-3333-4333-8333-333333333333";
+        let catalog = catalog(vec![
+            session(a, "Exact renderer", "/repo", "", 300),
+            session(b, "Other work", "/repo", "renderer", 200),
+            session(c, "Never resumed", "/repo", "", 100),
+        ]);
+        let library = SessionLibrarySnapshot::from_entries(vec![
+            SessionLibraryEntry {
+                provider: SessionProvider::Codex,
+                id: a.into(),
+                pinned: false,
+                last_resumed_ms: Some(10),
+            },
+            SessionLibraryEntry {
+                provider: SessionProvider::Codex,
+                id: b.into(),
+                pinned: true,
+                last_resumed_ms: Some(20),
+            },
+        ])
+        .unwrap();
+        let index = SessionSearchIndex::new(&catalog);
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery::default(),
+                &library,
+                SessionLibraryFilter {
+                    pinned_first: true,
+                    ..SessionLibraryFilter::default()
+                }
+            ),
+            [1, 0, 2]
+        );
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery {
+                    text: "renderer",
+                    ..SessionQuery::default()
+                },
+                &library,
+                SessionLibraryFilter {
+                    pinned_first: true,
+                    ..SessionLibraryFilter::default()
+                }
+            ),
+            [0, 1]
+        );
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery {
+                    sort: SessionSort::RecentlyResumed,
+                    ..SessionQuery::default()
+                },
+                &library,
+                SessionLibraryFilter::default()
+            ),
+            [1, 0, 2]
+        );
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery::default(),
+                &library,
+                SessionLibraryFilter {
+                    pinned_only: true,
+                    recent_only: true,
+                    pinned_first: false
+                }
+            ),
+            [1]
+        );
     }
 }

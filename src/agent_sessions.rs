@@ -5,8 +5,12 @@
 //! discovery belongs on a worker, not the GUI thread.
 
 mod desktop_launch;
+mod library;
+mod preflight;
+pub use library::{SessionLibraryEntry, SessionLibrarySnapshot, SessionLibraryStore};
+pub use preflight::{SessionPreflight, SessionPreflightState};
 mod search;
-pub use search::{SessionQuery, SessionSearchIndex, SessionSort};
+pub use search::{SessionLibraryFilter, SessionQuery, SessionSearchIndex, SessionSort};
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -1260,7 +1264,7 @@ mod tests {
         let record = json!({"type":"user","sessionId":ID,"cwd":f.0,"isSidechain":true,"message":{"content":"Internal agent task"}});
         f.write(
             &format!("claude/projects/project/{ID}.jsonl"),
-            &[record.clone()],
+            std::slice::from_ref(&record),
         );
         f.write(
             &format!("claude/projects/project/{ID}/subagents/{ID}.jsonl"),
@@ -1448,7 +1452,7 @@ mod tests {
         std::os::unix::fs::symlink(fs::canonicalize(source).unwrap(), process.join("fd/3"))
             .unwrap();
         let uid = unsafe { libc::geteuid() };
-        let live = discover_live_processes_from(&proc_root, &[session.clone()], uid);
+        let live = discover_live_processes_from(&proc_root, std::slice::from_ref(&session), uid);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].id, ID);
         assert_eq!(live[0].pid, 100);
