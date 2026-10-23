@@ -8,8 +8,9 @@ mod desktop_launch;
 mod library;
 mod preflight;
 pub use library::{
-    SessionLibraryEntry, SessionLibrarySnapshot, SessionLibraryStore, SessionOrganization,
-    SESSION_ALIAS_MAX_BYTES, SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
+    SessionBatchAction, SessionLibraryEntry, SessionLibrarySnapshot, SessionLibraryStore,
+    SessionOrganization, SESSION_ALIAS_MAX_BYTES, SESSION_BATCH_LIMIT, SESSION_TAG_LIMIT,
+    SESSION_TAG_MAX_BYTES,
 };
 pub use preflight::{SessionPreflight, SessionPreflightState};
 mod search;

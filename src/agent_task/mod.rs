@@ -51,11 +51,13 @@ pub fn app_display() -> String {
     }
 }
 
+pub mod brief;
 pub mod context;
 pub mod dashboard;
 pub mod driver;
 pub mod drivers;
 pub mod event;
+pub mod inspector;
 pub mod launcher;
 pub mod native;
 pub mod pinned_dir;
@@ -69,6 +71,8 @@ pub mod worktree;
 // with ember's so the frontends can share adapters and documentation. The
 // panel consumes only part of it today, so items without a current caller
 // are explicitly allowed to stay.
+#[allow(unused_imports)]
+pub use brief::{TaskBrief, TaskValidationRecipe, TASK_GOAL_MAX_BYTES};
 #[allow(unused_imports)]
 pub use context::{ContextError, SemanticCommandContext};
 #[allow(unused_imports)]
@@ -100,6 +104,8 @@ pub use event::{
     AgentSessionOutcome, AgentTurnId, ApprovalId, InvalidNativeAgentSessionId,
     InvalidProviderSessionId, NativeAgentSessionId, ProviderSessionId,
 };
+#[allow(unused_imports)]
+pub use inspector::{TaskInspector, TaskInspectorField};
 #[allow(unused_imports)]
 pub use launcher::{AgentLaunchError, AgentLaunchSpec};
 #[allow(unused_imports)]

@@ -48,6 +48,8 @@ impl fmt::Display for TaskValidationPath {
 /// Why a task's source command cannot safely become a validation process.
 #[derive(Debug)]
 pub enum TaskValidationError {
+    InvalidBrief(String),
+    MissingValidationRecipe,
     MissingSourceContext,
     MissingCommand,
     MissingSourceShell,
@@ -93,6 +95,8 @@ pub enum TaskValidationError {
 impl fmt::Display for TaskValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBrief(detail) => write!(formatter, "invalid authored task: {detail}"),
+            Self::MissingValidationRecipe => formatter.write_str("this authored task has no validation command; inspect and explicitly accept the work after human review"),
             Self::MissingSourceContext => {
                 formatter.write_str("task has no source command context to validate")
             }
@@ -196,23 +200,50 @@ impl std::error::Error for TaskValidationError {
 pub fn prepare_task_validation(
     task: &AgentTask,
 ) -> Result<PreparedTaskValidation, TaskValidationError> {
-    let context = task
-        .source_context
-        .as_ref()
-        .ok_or(TaskValidationError::MissingSourceContext)?;
-
-    // Producer-declared truncation is stronger evidence than an absent value:
-    // never let an omitted oversized command look like an ordinary gap.
-    if context.command_truncated {
-        return Err(TaskValidationError::CommandTruncated);
-    }
-    let raw_command = context
-        .command
-        .as_deref()
-        .ok_or(TaskValidationError::MissingCommand)?;
-    if !context.command_exact {
-        return Err(TaskValidationError::CommandNotExact);
-    }
+    let (raw_command, source_shell, source_cwd) = if let Some(brief) = &task.brief {
+        brief
+            .validate()
+            .map_err(TaskValidationError::InvalidBrief)?;
+        if task.source_context.is_some() {
+            return Err(TaskValidationError::InvalidBrief(
+                "ambiguous task origin".into(),
+            ));
+        }
+        let recipe = brief
+            .validation
+            .as_ref()
+            .ok_or(TaskValidationError::MissingValidationRecipe)?;
+        (
+            recipe.command.as_str(),
+            Some(recipe.shell.as_str()),
+            Some(task.repo_root.as_path()),
+        )
+    } else {
+        let context = task
+            .source_context
+            .as_ref()
+            .ok_or(TaskValidationError::MissingSourceContext)?;
+        // Producer-declared truncation must never become an ordinary absence.
+        if context.command_truncated {
+            return Err(TaskValidationError::CommandTruncated);
+        }
+        let command = context
+            .command
+            .as_deref()
+            .ok_or(TaskValidationError::MissingCommand)?;
+        if !context.command_exact {
+            return Err(TaskValidationError::CommandNotExact);
+        }
+        (
+            command,
+            context.source_shell.as_deref(),
+            context
+                .cwd
+                .as_deref()
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(Path::new),
+        )
+    };
     let command = sanitize_history_replay(raw_command, MAX_HISTORY_COMMAND_BYTES)
         .map_err(map_command_error)?;
     if raw_command.contains(['\n', '\r']) || command.contains(['\n', '\r']) {
@@ -224,9 +255,7 @@ pub fn prepare_task_validation(
     if command != raw_command {
         return Err(TaskValidationError::CommandContainsControlCharacter);
     }
-    let source_shell = context
-        .source_shell
-        .as_deref()
+    let source_shell = source_shell
         .filter(|shell| !shell.trim().is_empty())
         .ok_or(TaskValidationError::MissingSourceShell)?
         .to_string();
@@ -237,11 +266,7 @@ pub fn prepare_task_validation(
         return Err(TaskValidationError::InvalidSourceShell);
     }
 
-    let source_cwd = context
-        .cwd
-        .as_deref()
-        .filter(|cwd| !cwd.trim().is_empty())
-        .ok_or(TaskValidationError::MissingSourceCwd)?;
+    let source_cwd = source_cwd.ok_or(TaskValidationError::MissingSourceCwd)?;
     let repository = canonical_directory(&task.repo_root, TaskValidationPath::RepositoryRoot)?;
     if repository != task.repo_root {
         return Err(TaskValidationError::RepositoryRootRedirected {
@@ -249,7 +274,7 @@ pub fn prepare_task_validation(
             resolved: repository,
         });
     }
-    let source_cwd = canonical_directory(Path::new(source_cwd), TaskValidationPath::SourceCwd)?;
+    let source_cwd = canonical_directory(source_cwd, TaskValidationPath::SourceCwd)?;
     let relative_cwd = source_cwd.strip_prefix(&repository).map_err(|_| {
         TaskValidationError::SourceCwdOutsideRepository {
             cwd: source_cwd.clone(),
@@ -406,6 +431,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
             }),
+            brief: None,
             runtime_kind: TaskRuntimeKind::Unassigned,
             terminal_session_id: None,
             validation: TaskValidationState::default(),
@@ -450,6 +476,61 @@ mod tests {
             ))
             .unwrap();
         (root, repository, managed.path)
+    }
+
+    #[test]
+    fn authored_validation_pins_the_worktree_root_without_running_the_command() {
+        let (_root, repository, worktree) = repository_and_worktree("authored-validation");
+        let mut task = validation_task(repository.clone(), worktree.clone(), repository.clone());
+        task.source_context = None;
+        let recipe = crate::agent_task::TaskValidationRecipe::new(
+            "touch validation-must-not-run",
+            "/bin/bash",
+        )
+        .unwrap();
+        task.brief =
+            Some(crate::agent_task::TaskBrief::new("Improve a project", Some(recipe)).unwrap());
+        let prepared = prepare_task_validation(&task).unwrap();
+        assert_eq!(prepared.command, "touch validation-must-not-run");
+        assert_eq!(prepared.source_shell, "/bin/bash");
+        assert_eq!(prepared.cwd, worktree);
+        assert!(!task.worktree_path.join("validation-must-not-run").exists());
+        assert!(!repository.join("validation-must-not-run").exists());
+        task.brief.as_mut().unwrap().validation = None;
+        assert!(matches!(
+            prepare_task_validation(&task),
+            Err(TaskValidationError::MissingValidationRecipe)
+        ));
+    }
+
+    #[test]
+    fn malformed_authored_recipe_never_falls_back_to_terminal_evidence() {
+        let (_root, repository, worktree) =
+            repository_and_worktree("ambiguous-authored-validation");
+        let mut task = validation_task(repository.clone(), worktree, repository);
+        task.brief = Some(
+            crate::agent_task::TaskBrief::new(
+                "Explicit goal",
+                Some(crate::agent_task::TaskValidationRecipe::new("true", "/bin/bash").unwrap()),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            prepare_task_validation(&task),
+            Err(TaskValidationError::InvalidBrief(_))
+        ));
+        task.source_context = None;
+        task.brief
+            .as_mut()
+            .unwrap()
+            .validation
+            .as_mut()
+            .unwrap()
+            .command = "true\nfalse".into();
+        assert!(matches!(
+            prepare_task_validation(&task),
+            Err(TaskValidationError::InvalidBrief(_))
+        ));
     }
 
     #[test]

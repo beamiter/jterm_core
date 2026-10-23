@@ -11,10 +11,51 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_PENDING: usize = 256;
+pub const SESSION_BATCH_LIMIT: usize = MAX_PENDING;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 pub const SESSION_ALIAS_MAX_BYTES: usize = 160;
 pub const SESSION_TAG_MAX_BYTES: usize = 32;
 pub const SESSION_TAG_LIMIT: usize = 12;
+
+/// Explicit, reversible organization of a captured set of session identities.
+/// Tag operations merge relative to the latest disk state, preserving aliases
+/// and tags concurrently added by another terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionBatchAction {
+    Pin(bool),
+    Archive(bool),
+    AddTag(String),
+    RemoveTag(String),
+}
+
+impl SessionBatchAction {
+    fn normalized(self) -> Result<Self, String> {
+        match self {
+            Self::AddTag(tag) | Self::RemoveTag(tag) if tag.trim().is_empty() => {
+                Err("Enter one session tag for the batch operation.".into())
+            }
+            Self::AddTag(tag) => Ok(Self::AddTag(normalize_batch_tag(tag)?)),
+            Self::RemoveTag(tag) => Ok(Self::RemoveTag(normalize_batch_tag(tag)?)),
+            action => Ok(action),
+        }
+    }
+}
+
+fn normalize_batch_tag(tag: String) -> Result<String, String> {
+    if tag.len() > SESSION_TAG_MAX_BYTES * 4 {
+        return Err("Each session tag must be at most 32 bytes.".into());
+    }
+    let organization = SessionOrganization {
+        tags: vec![tag],
+        ..SessionOrganization::default()
+    }
+    .normalized()?;
+    organization
+        .tags
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Enter one session tag for the batch operation.".into())
+}
 
 /// Personal organization only. This never changes a provider transcript,
 /// process, approval, or native task lifecycle.
@@ -218,6 +259,7 @@ struct Change {
     resumed: Option<u64>,
     details: Option<(Option<String>, Vec<String>)>,
     archived: Option<bool>,
+    tag_changes: BTreeMap<String, bool>,
 }
 impl Default for SessionLibraryStore {
     fn default() -> Self {
@@ -426,6 +468,70 @@ impl SessionLibraryStore {
             .min(u64::MAX as u128) as u64;
         self.enqueue(provider, id, None, Some(timestamp.max(1)), None, None)
     }
+
+    /// Validate and admit every target before changing the bounded queue. The
+    /// worker applies the captured identities in one atomic disk transaction.
+    /// This returns the unique accepted count, not an optimistic success receipt;
+    /// callers must poll completion and preserve selection when saving fails.
+    pub fn apply_batch(
+        &mut self,
+        identities: &[(SessionProvider, String)],
+        action: SessionBatchAction,
+    ) -> Result<usize, String> {
+        if identities.is_empty() || identities.len() > SESSION_BATCH_LIMIT {
+            return Err("Select between 1 and 256 conversations for a batch operation.".into());
+        }
+        let action = action.normalized()?;
+        let mut targets = BTreeMap::new();
+        for (provider, id) in identities {
+            if !valid_id(id) {
+                return Err("Cannot update session library: invalid session UUID; no batch changes were queued.".into());
+            }
+            targets.insert(key(*provider, id), (*provider, id.to_ascii_lowercase()));
+        }
+        if !self.available {
+            return Err(self
+                .error
+                .clone()
+                .unwrap_or_else(|| "Session library worker is unavailable.".into()));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Session library queue is unavailable.")?;
+        let additional = targets
+            .keys()
+            .filter(|identity| !state.pending.contains_key(*identity))
+            .count();
+        if state.pending.len().saturating_add(additional) > MAX_PENDING {
+            return Err("Session library is busy; no batch changes were queued. Wait for pending changes to finish.".into());
+        }
+        let count = targets.len();
+        for (identity, (provider, id)) in targets {
+            let change = state.pending.entry(identity).or_insert_with(|| Change {
+                provider,
+                id,
+                pinned: None,
+                resumed: None,
+                details: None,
+                archived: None,
+                tag_changes: BTreeMap::new(),
+            });
+            match &action {
+                SessionBatchAction::Pin(value) => change.pinned = Some(*value),
+                SessionBatchAction::Archive(value) => change.archived = Some(*value),
+                SessionBatchAction::AddTag(tag) => {
+                    change.tag_changes.insert(tag.clone(), true);
+                }
+                SessionBatchAction::RemoveTag(tag) => {
+                    change.tag_changes.insert(tag.clone(), false);
+                }
+            }
+        }
+        drop(state);
+        let _ = self.wake.try_send(());
+        Ok(count)
+    }
     fn enqueue(
         &mut self,
         provider: SessionProvider,
@@ -459,6 +565,7 @@ impl SessionLibraryStore {
             resumed: None,
             details: None,
             archived: None,
+            tag_changes: BTreeMap::new(),
         });
         if pinned.is_some() {
             change.pinned = pinned;
@@ -468,6 +575,9 @@ impl SessionLibraryStore {
         }
         if details.is_some() {
             change.details = details;
+            // An explicitly saved editor replaces the tags visible there;
+            // subsequent batch tag operations still apply after this save.
+            change.tag_changes.clear();
         }
         if archived.is_some() {
             change.archived = archived;
@@ -586,7 +696,7 @@ fn transaction(
         if let Some(timestamp) = change.resumed {
             entry.last_resumed_ms = Some(entry.last_resumed_ms.unwrap_or(0).max(timestamp));
         }
-        if change.details.is_some() || change.archived.is_some() {
+        if change.details.is_some() || change.archived.is_some() || !change.tag_changes.is_empty() {
             let organization = snapshot.organization.entry(identity.clone()).or_default();
             if let Some((alias, tags)) = &change.details {
                 organization.alias.clone_from(alias);
@@ -595,6 +705,18 @@ fn transaction(
             if let Some(archived) = change.archived {
                 organization.archived = archived;
             }
+            for (tag, present) in &change.tag_changes {
+                if *present {
+                    if !organization.tags.contains(tag) {
+                        organization.tags.push(tag.clone());
+                    }
+                } else {
+                    organization.tags.retain(|existing| existing != tag);
+                }
+            }
+            // Check every merged target before the atomic file replacement.
+            // A full target fails the entire transaction, never a partial batch.
+            *organization = organization.clone().normalized()?;
         }
     }
     snapshot.organization.retain(|_, entry| !entry.is_empty());
@@ -780,6 +902,7 @@ mod tests {
                 resumed,
                 details: None,
                 archived: None,
+                tag_changes: BTreeMap::new(),
             },
         )])
     }
@@ -798,6 +921,209 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
+    #[test]
+    fn batch_validation_and_capacity_admission_never_queue_a_partial_selection() {
+        let (wake, _receiver) = mpsc::sync_channel(1);
+        let mut store = SessionLibraryStore {
+            snapshot: SessionLibrarySnapshot::default(),
+            state: Arc::new(Mutex::new(WorkerState::default())),
+            wake,
+            loaded: true,
+            available: true,
+            error: None,
+        };
+        let bad = vec![
+            (SessionProvider::Codex, ID.into()),
+            (SessionProvider::Codex, "invalid".into()),
+        ];
+        assert!(store
+            .apply_batch(&bad, SessionBatchAction::Pin(true))
+            .is_err());
+        assert!(store.state.lock().unwrap().pending.is_empty());
+        for number in 0..(MAX_PENDING - 1) {
+            store
+                .set_pinned(
+                    SessionProvider::Codex,
+                    &format!("{number:08x}-1111-4111-8111-111111111111"),
+                    false,
+                )
+                .unwrap();
+        }
+        let existing = "00000000-1111-4111-8111-111111111111";
+        let targets = vec![
+            (SessionProvider::Codex, existing.into()),
+            (SessionProvider::Codex, ID.into()),
+            (SessionProvider::Claude, OTHER.into()),
+        ];
+        assert!(store
+            .apply_batch(&targets, SessionBatchAction::Pin(true))
+            .is_err());
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.pending.len(), MAX_PENDING - 1);
+        assert_eq!(
+            state.pending[&key(SessionProvider::Codex, existing)].pinned,
+            Some(false)
+        );
+        assert!(!state.pending.contains_key(&key(SessionProvider::Codex, ID)));
+    }
+
+    #[test]
+    fn batch_tags_merge_with_other_windows_and_preserve_identity_fields() {
+        let fixture = Fixture::new();
+        let mut first = SessionLibraryStore::with_path(fixture.path());
+        let mut second = SessionLibraryStore::with_path(fixture.path());
+        settle(&mut first);
+        settle(&mut second);
+        first
+            .set_details(SessionProvider::Codex, ID, "Keep this alias", "existing")
+            .unwrap();
+        first.record_resumed(SessionProvider::Codex, ID).unwrap();
+        settle(&mut first);
+        let receipt = first.snapshot().last_resumed(SessionProvider::Codex, ID);
+        let targets = vec![
+            (SessionProvider::Codex, ID.into()),
+            (SessionProvider::Claude, OTHER.into()),
+        ];
+        let held = LibraryLock::acquire(&fixture.path()).unwrap();
+        assert_eq!(
+            first
+                .apply_batch(&targets, SessionBatchAction::AddTag(" REVIEW ".into()))
+                .unwrap(),
+            2
+        );
+        second
+            .apply_batch(&targets, SessionBatchAction::AddTag("urgent".into()))
+            .unwrap();
+        drop(held);
+        settle(&mut first);
+        settle(&mut second);
+        first.refresh();
+        settle(&mut first);
+        assert_eq!(
+            first.snapshot().tags(SessionProvider::Codex, ID),
+            ["existing", "review", "urgent"]
+        );
+        assert_eq!(
+            first.snapshot().tags(SessionProvider::Claude, OTHER),
+            ["review", "urgent"]
+        );
+        assert_eq!(
+            first.snapshot().alias(SessionProvider::Codex, ID),
+            Some("Keep this alias")
+        );
+        assert_eq!(
+            first.snapshot().last_resumed(SessionProvider::Codex, ID),
+            receipt
+        );
+        first
+            .apply_batch(&targets, SessionBatchAction::RemoveTag("review".into()))
+            .unwrap();
+        first
+            .apply_batch(&targets, SessionBatchAction::Pin(true))
+            .unwrap();
+        first
+            .apply_batch(&targets, SessionBatchAction::Archive(true))
+            .unwrap();
+        settle(&mut first);
+        for (provider, id) in &targets {
+            assert!(first.snapshot().is_pinned(*provider, id));
+            assert!(first.snapshot().is_archived(*provider, id));
+            assert!(!first
+                .snapshot()
+                .tags(*provider, id)
+                .contains(&"review".into()));
+        }
+        first
+            .apply_batch(&targets, SessionBatchAction::Archive(false))
+            .unwrap();
+        first
+            .apply_batch(&targets, SessionBatchAction::Pin(false))
+            .unwrap();
+        settle(&mut first);
+        assert_eq!(
+            first.snapshot().alias(SessionProvider::Codex, ID),
+            Some("Keep this alias")
+        );
+        assert_eq!(
+            first.snapshot().last_resumed(SessionProvider::Codex, ID),
+            receipt
+        );
+    }
+
+    #[test]
+    fn one_full_tag_set_aborts_the_entire_batch_on_disk() {
+        let fixture = Fixture::new();
+        let mut store = SessionLibraryStore::with_path(fixture.path());
+        settle(&mut store);
+        let tags = (0..SESSION_TAG_LIMIT)
+            .map(|i| format!("tag{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        store
+            .set_details(SessionProvider::Codex, ID, "Full", &tags)
+            .unwrap();
+        store
+            .set_details(SessionProvider::Claude, OTHER, "Other", "keep")
+            .unwrap();
+        settle(&mut store);
+        let before = fs::read(fixture.path()).unwrap();
+        let targets = vec![
+            (SessionProvider::Claude, OTHER.into()),
+            (SessionProvider::Codex, ID.into()),
+        ];
+        store
+            .apply_batch(&targets, SessionBatchAction::AddTag("overflow".into()))
+            .unwrap();
+        settle(&mut store);
+        assert!(store.error().is_some());
+        assert_eq!(fs::read(fixture.path()).unwrap(), before);
+        assert_eq!(
+            store.snapshot().tags(SessionProvider::Claude, OTHER),
+            ["keep"]
+        );
+    }
+
+    #[test]
+    fn batch_deduplicates_provider_identity_and_respects_editor_order() {
+        let (wake, _receiver) = mpsc::sync_channel(1);
+        let mut store = SessionLibraryStore {
+            snapshot: SessionLibrarySnapshot::default(),
+            state: Arc::new(Mutex::new(WorkerState::default())),
+            wake,
+            loaded: true,
+            available: true,
+            error: None,
+        };
+        let targets = vec![
+            (SessionProvider::Codex, ID.into()),
+            (SessionProvider::Codex, ID.to_uppercase()),
+            (SessionProvider::Claude, ID.into()),
+        ];
+        assert_eq!(
+            store
+                .apply_batch(&targets, SessionBatchAction::AddTag("before".into()))
+                .unwrap(),
+            2
+        );
+        store
+            .set_details(SessionProvider::Codex, ID, "Saved", "explicit")
+            .unwrap();
+        store
+            .apply_batch(&targets, SessionBatchAction::AddTag("after".into()))
+            .unwrap();
+        let fixture = Fixture::new();
+        let snapshot = transaction(&fixture.path(), &store.state.lock().unwrap().pending).unwrap();
+        assert_eq!(
+            snapshot.tags(SessionProvider::Codex, ID),
+            ["after", "explicit"]
+        );
+        assert_eq!(
+            snapshot.tags(SessionProvider::Claude, ID),
+            ["after", "before"]
+        );
+        assert_eq!(snapshot.alias(SessionProvider::Codex, ID), Some("Saved"));
+    }
+
     #[test]
     fn asynchronous_pin_unpin_and_resume_survive_a_fresh_store() {
         let f = Fixture::new();

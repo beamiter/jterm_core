@@ -197,6 +197,17 @@ pub enum TaskRuntimeKind {
     TerminalFallback,
 }
 
+impl TaskRuntimeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unassigned => "Not started",
+            Self::Terminal => "Terminal Agent",
+            Self::Native => "Native Agent",
+            Self::TerminalFallback => "Terminal fallback after native attempt",
+        }
+    }
+}
+
 impl TaskStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -274,6 +285,9 @@ pub struct AgentTask {
     pub base_commit: String,
     pub source: Option<TaskSource>,
     pub source_context: Option<super::SemanticCommandContext>,
+    /// Explicit user-authored work, never fabricated terminal evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<super::TaskBrief>,
     #[serde(default)]
     pub runtime_kind: TaskRuntimeKind,
     /// Stable jsh/PTY session ID for the opaque terminal fallback.
@@ -293,6 +307,41 @@ pub struct AgentTask {
 }
 
 impl AgentTask {
+    pub fn validation_command(&self) -> Option<&str> {
+        match &self.brief {
+            Some(brief) => brief
+                .validation
+                .as_ref()
+                .map(|recipe| recipe.command.as_str()),
+            None => self
+                .source_context
+                .as_ref()
+                .and_then(|context| context.command.as_deref()),
+        }
+    }
+
+    pub fn validation_shell(&self) -> Option<&str> {
+        match &self.brief {
+            Some(brief) => brief
+                .validation
+                .as_ref()
+                .map(|recipe| recipe.shell.as_str()),
+            None => self
+                .source_context
+                .as_ref()
+                .and_then(|context| context.source_shell.as_deref()),
+        }
+    }
+
+    /// Display/dispatch hint only. The manager rechecks all completion gates.
+    pub fn requires_manual_review(&self) -> bool {
+        self.source_context.is_none()
+            && self
+                .brief
+                .as_ref()
+                .is_some_and(|brief| brief.validation.is_none() && brief.validate().is_ok())
+    }
+
     pub fn needs_attention(&self) -> bool {
         // While validation is running, ReadyForReview is only an internal
         // prerequisite and should not pull the task to the user prematurely.
@@ -312,6 +361,8 @@ pub enum TaskError {
     WorktreePathMustBeAbsolute,
     WorktreeMatchesRepoRoot,
     InvalidSourceContext,
+    InvalidBrief(String),
+    CannotCompleteAfterManualReview(TaskId),
     InvalidTerminalSessionId,
     NativeRuntimeAlreadySelected(TaskId),
     NativeEventStreamActive(TaskId),
@@ -381,6 +432,8 @@ impl fmt::Display for TaskError {
             Self::InvalidSourceContext => {
                 formatter.write_str("task source context has invalid stable identifiers")
             }
+            Self::InvalidBrief(detail) => write!(formatter, "invalid authored task: {detail}"),
+            Self::CannotCompleteAfterManualReview(task_id) => write!(formatter, "task {task_id} requires an authored goal without a validation recipe, stopped execution, and ready-for-review status before manual acceptance"),
             Self::InvalidTerminalSessionId => {
                 formatter.write_str("Agent terminal session ID is invalid")
             }
@@ -505,6 +558,30 @@ impl TaskManager {
     }
 
     pub fn create(&mut self, new_task: NewTask) -> Result<TaskId, TaskError> {
+        self.create_internal(new_task, None)
+    }
+
+    /// Register a prepared project task without starting a provider or running
+    /// validation. A goal and captured command evidence are distinct origins.
+    pub fn create_with_brief(
+        &mut self,
+        new_task: NewTask,
+        brief: super::TaskBrief,
+    ) -> Result<TaskId, TaskError> {
+        if new_task.source_context.is_some() {
+            return Err(TaskError::InvalidBrief(
+                "a task cannot combine an authored goal with command provenance".into(),
+            ));
+        }
+        brief.validate().map_err(TaskError::InvalidBrief)?;
+        self.create_internal(new_task, Some(brief))
+    }
+
+    fn create_internal(
+        &mut self,
+        new_task: NewTask,
+        brief: Option<super::TaskBrief>,
+    ) -> Result<TaskId, TaskError> {
         validate_new_task(&new_task)?;
         let id = TaskId::new();
         let now = unix_time_ms();
@@ -522,6 +599,7 @@ impl TaskManager {
                 execution_id: context.source_execution_id.clone(),
             }),
             source_context: new_task.source_context,
+            brief,
             runtime_kind: TaskRuntimeKind::Unassigned,
             terminal_session_id: None,
             validation: TaskValidationState::default(),
@@ -1540,6 +1618,29 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Explicitly accept a reviewed authored task that requested human review
+    /// instead of a validation command. Failed-command tasks and any task with
+    /// a validation recipe can never use this path to bypass validation.
+    pub fn complete_after_manual_review(&mut self, task_id: TaskId) -> Result<(), TaskError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(TaskError::NativeEventStreamActive(task_id));
+        }
+        let task = self.task_mut(task_id)?;
+        if !task.requires_manual_review()
+            || task.status != TaskStatus::ReadyForReview
+            || task.validation.status != TaskValidationStatus::NotRun
+        {
+            return Err(TaskError::CannotCompleteAfterManualReview(task_id));
+        }
+        task.status = TaskStatus::Completed;
+        task.status_detail = Some(
+            "Work explicitly accepted after human review; no validation command was configured"
+                .into(),
+        );
+        task.updated_at_ms = unix_time_ms();
+        Ok(())
+    }
+
     fn task_mut(&mut self, task_id: TaskId) -> Result<&mut AgentTask, TaskError> {
         let index = self
             .task_indices
@@ -1606,6 +1707,139 @@ mod tests {
     use super::*;
     use crate::agent_task::SemanticCommandContext;
     use std::path::Path;
+
+    #[test]
+    fn authored_creation_is_distinct_from_evidence_and_never_starts_execution() {
+        let mut manager = TaskManager::new();
+        let mut input = new_task("Improve the task manager");
+        let brief =
+            super::super::TaskBrief::new("Keep project navigation predictable.", None).unwrap();
+        assert!(manager
+            .create_with_brief(input.clone(), brief.clone())
+            .is_err());
+        assert!(manager.tasks().is_empty());
+        input.source_context = None;
+        let id = manager.create_with_brief(input, brief.clone()).unwrap();
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.brief, Some(brief));
+        assert!(task.source.is_none() && task.source_context.is_none());
+        assert_eq!(task.status, TaskStatus::Created);
+        assert_eq!(task.runtime_kind, TaskRuntimeKind::Unassigned);
+        assert!(task.terminal_session_id.is_none());
+        assert!(!manager.has_active_agent_event_stream(id));
+        let decoded: AgentTask =
+            serde_json::from_str(&serde_json::to_string(task).unwrap()).unwrap();
+        assert_eq!(decoded.brief, task.brief);
+        assert!(manager.complete_after_manual_review(id).is_err());
+    }
+
+    #[test]
+    fn authored_manual_acceptance_waits_for_review_and_stopped_native_stream() {
+        let mut manager = TaskManager::new();
+        let mut input = new_task("Review this project");
+        input.source_context = None;
+        let id = manager
+            .create_with_brief(
+                input,
+                super::super::TaskBrief::new("Review the changes.", None).unwrap(),
+            )
+            .unwrap();
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(3, turn_completed(turn), None))
+            .unwrap();
+        assert_eq!(
+            manager.complete_after_manual_review(id),
+            Err(TaskError::NativeEventStreamActive(id))
+        );
+        manager
+            .apply_agent_event(stream.event(
+                4,
+                AgentEventKind::Cancelled,
+                Some("user finished the session".into()),
+            ))
+            .unwrap();
+        assert!(manager.complete_after_validation(id).is_err());
+        manager.complete_after_manual_review(id).unwrap();
+        let task = manager.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.validation.status, TaskValidationStatus::NotRun);
+        assert!(task
+            .status_detail
+            .as_deref()
+            .unwrap()
+            .contains("human review"));
+        assert!(manager.complete_after_manual_review(id).is_err());
+    }
+
+    #[test]
+    fn manual_acceptance_cannot_bypass_legacy_or_authored_validation() {
+        let mut manager = TaskManager::new();
+        let legacy = manager
+            .create(new_task("Fix the captured failure"))
+            .unwrap();
+        manager
+            .update_status(legacy, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        assert!(manager.complete_after_manual_review(legacy).is_err());
+        let mut input = new_task("Authored task with acceptance check");
+        input.source_context = None;
+        let recipe = super::super::TaskValidationRecipe::new("cargo test", "/bin/bash").unwrap();
+        let id = manager
+            .create_with_brief(
+                input,
+                super::super::TaskBrief::new("Improve tests", Some(recipe)).unwrap(),
+            )
+            .unwrap();
+        manager
+            .update_status(id, TaskStatus::ReadyForReview, None)
+            .unwrap();
+        assert!(manager.complete_after_manual_review(id).is_err());
+        assert!(manager.complete_after_validation(id).is_err());
+        assert_eq!(
+            manager.get(id).unwrap().validation_command(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            manager.get(id).unwrap().validation_shell(),
+            Some("/bin/bash")
+        );
+        manager.task_mut(id).unwrap().validation.status = TaskValidationStatus::Passed;
+        assert!(manager.complete_after_manual_review(id).is_err());
+        manager.complete_after_validation(id).unwrap();
+    }
+
+    #[test]
+    fn inspector_is_bounded_and_does_not_mutate_the_task() {
+        let mut manager = TaskManager::new();
+        let mut input = new_task("Inspect authored work");
+        input.source_context = None;
+        let id = manager
+            .create_with_brief(
+                input,
+                super::super::TaskBrief::new("First line\nSecond line", None).unwrap(),
+            )
+            .unwrap();
+        let task = manager.get(id).unwrap().clone();
+        let inspection = super::super::TaskInspector::from_task(&task);
+        assert_eq!(inspection.goal.as_deref(), Some("First line\nSecond line"));
+        assert!(inspection
+            .fields
+            .iter()
+            .any(|field| field.label == "Origin" && field.value.contains("User-authored")));
+        assert!(inspection
+            .fields
+            .iter()
+            .all(|field| field.value.len() <= 4096));
+        assert_eq!(manager.get(id).unwrap(), &task);
+    }
 
     fn new_task(title: &str) -> NewTask {
         NewTask {

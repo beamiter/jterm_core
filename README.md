@@ -35,8 +35,12 @@ v2 is selected only for a peer that has already advertised v2 support.
   separately evidenced live process IDs, and exact-UUID resume plans for native
   new-tab launch. The shared conversation library adds local aliases, tags,
   reversible archives, project summaries and structured search, with atomic
-  cross-process metadata merges. Native task dashboards share five sort orders
-  and visible-task attention navigation. See [CLI agent sessions and
+  cross-process metadata merges and all-or-nothing batch pin/archive/tag updates.
+  Native task dashboards share five sort orders, visible-task attention
+  navigation, explicit project task briefs, optional validation recipes and a
+  bounded facts inspector. Creating an isolated task never starts its Agent;
+  authored work without a recipe has a separate explicit human acceptance path.
+  See [CLI agent sessions and
   management](docs/agent-sessions.md).
 
 - A real Vim 9 IDE bridge for all four native workbenches. `vim9::Vim9Session`

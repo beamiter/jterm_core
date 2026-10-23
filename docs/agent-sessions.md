@@ -33,6 +33,59 @@ return selections. TaskManager and approval paths still decide what operations
 can execute. A filter that hides the selection never selects another task
 automatically.
 
+### Bulk organization
+
+The managers keep the inspected conversation separate from the checked batch.
+Select visible conversations, review the selected/hidden counts, and explicitly
+pin, unpin, archive, restore, add one tag, or remove one tag. A selection is bound
+to provider and UUID, not to row positions or a later search result. Selection,
+search and tag editing do not resume conversations.
+
+`SessionLibraryStore::apply_batch` validates all identities and admits at most
+`SESSION_BATCH_LIMIT` (256) targets together. An invalid identity or insufficient
+queue capacity admits none. The worker merges relative tag changes against the
+latest private file under the process lock, preserving aliases, history, pins
+and unrelated tags. If any target exceeds a metadata limit, the entire disk
+transaction fails without a partial write. UI adapters retain their selection
+and show the error until the user can retry. A successful enqueue is not a
+durability receipt; polling completion remains required.
+
+### Project task creation and review
+
+`TaskBrief` represents a user's explicit goal, independently of captured
+`SemanticCommandContext`. The four task panels can create an isolated worktree
+from a title, project, provider and goal without requiring a failed command.
+`TaskManager::create_with_brief` registers it in `Created` with no runtime or
+terminal binding. Starting the provider is a separate action for every provider.
+
+Goals allow 16 KiB of UTF-8 with structural newline/tab characters. Native and
+PTY task prompts validate the goal, honor existing sharing/redaction policy and
+identify its authored provenance. Native preparation pins the managed worktree
+and uses its repository root; it does not invent shell evidence. An optional
+`TaskValidationRecipe` captures one exact command and the absolute configured
+shell. Validation uses the same containment and pinned-directory checks as
+command-created tasks and requires a separate explicit action.
+
+A task with a recipe retains the existing requirement that its latest validation
+pass before acceptance. A task authored without a recipe can instead be accepted
+through `complete_after_manual_review`, only after it is ready for review, its
+native stream has ended and no validation has run. This explicit human-review
+path cannot complete legacy command tasks or tasks with a configured recipe,
+and it never records a fictitious passing validation.
+
+`TaskInspector` supplies bounded project/worktree, branch, immutable baseline,
+origin, runtime, actual validation/exit facts, timestamps and next-step guidance.
+It is a presentation of current evidence, not a synthetic lifecycle history or
+an action capability. Frontends may additionally display actual retained native
+turn/file history and its truncation indicators.
+
+Authored goals are retained in the running task. Existing frontend recovery
+journals intentionally omit task instructions and terminal output; this upgrade
+does not silently widen that persistence contract. To continue authored work
+after restart, re-enter the goal in a new task; recovery can still expose the
+retained worktree metadata. The session library
+continues to store organization only, never authored task goals.
+
 ## Discovery and presentation
 
 `SessionScanner::refresh` starts one background scan. Hosts poll it from their
