@@ -212,6 +212,11 @@ an editor tab in its existing terminal application.
 
 ## Edit, navigate, search and build
 
+Anvil and Forge keep native editor controls disabled until Vim's first complete
+editor state arrives, so a connected channel alone cannot enable a premature
+palette action. A rejected palette action keeps its feedback visible while
+live capabilities refresh; changing the query or selection clears it.
+
 Open files from the native file controls. The buffer strip reflects Vim's
 listed buffers and marks modified buffers. When the bounded list exceeds 256
 items, the current listed buffer is retained so its tab and modified state
@@ -413,6 +418,17 @@ aliases include `>跳转实现`, `>类型定义`, `>工作区符号` and `>签�
 Existing vimrc leader mappings continue to call the same provider commands.
 Navigation works in readonly code buffers; large-file protection, missing
 providers and disabled actions remain visible as unavailable entries.
+
+The vimrc also installs buffer-local F12 (definition), Shift-F12 (references)
+and F2 (rename) for supported code files. In Insert mode, Ctrl-G followed by
+`s` requests signature help without leaving Insert mode or replacing Vim's
+Ctrl-K digraph input. With the default Space leader, Visual `Space ca`/`la`
+requests code actions for the current selection and `Space cf`/`fm`/`lf`
+formats the selected lines; Normal mode still formats the whole document.
+These mappings preserve existing user bindings, work with SimpleRemote
+`acwrite` buffers, and release the configuration's own mappings when the
+provider, filetype or large-file policy changes. Readonly files retain F12
+and Shift-F12; editing mappings require a writable buffer.
 
 SimpleCC owns the actual jumps, Unicode position conversion and result lists.
 Signature help can use the native passive popup surface. The interactive live
@@ -627,7 +643,7 @@ scroll/drag transforms and retain the original PTY input route until both the
 live and last presented overlay are gone. Vim owns keyboard filters, selection,
 `moved`, `close`, input and lifetime throughout.
 
-This version accepts complete, unwrapped text, including default `wrap` when
+Protocol 6 accepts complete, unwrapped text, including default `wrap` when
 no line actually wraps. Scrolled/clipped/wrapped content, titles, resize/drag,
 filters, popup virtual text, conceal, unsupported decorations and excessive budgets
 fall back explicitly. It does not add a rich Markdown/image document renderer
@@ -635,6 +651,35 @@ or generic interactive popup widgets. Protocols 1–5
 retain their previous popup fallback. `runtime/vim9/test_render_popups.py`
 exercises real Vim popups, completion-plus-docs, styles, Unicode, lifecycle,
 input ownership and fallback; each host adds renderer/controller coverage.
+
+## Native LSP documentation cards (render protocol 7)
+
+SimpleCC hover, signature help, diagnostic details and completion documentation
+can use native rounded cards with a subtle shadow and outline. The provider
+explicitly registers `hover`, `signature`, `diagnostic` or
+`completion_documentation`; ordinary Vim popups keep their existing appearance.
+Colors come from the user's GUI theme. Text keeps Vim's grid, font metrics,
+syntax and text-property highlights, so there is no second editable document
+or browser renderer behind the popup.
+
+The candidate SimpleCC provider wraps long documentation into real popup-buffer
+lines before setting `nowrap`. Protocol 7 samples only visible physical lines
+and draws Vim's scrollbar from its actual viewport and GUI highlight groups.
+Long docs can therefore scroll without replacing native buffer painting.
+General wrapped popups, filtered pickers, masks and unsupported text still
+retain the compatibility path.
+
+With the accompanying vimrc, Normal-mode Ctrl-F/Ctrl-B scroll an open SimpleCC
+documentation popup; with no popup they retain Vim's ordinary page movement.
+`Space lq` closes SimpleCC's documentation windows, preserving the source
+buffer, cursor and interactive symbol picker. Existing user mappings win.
+`g:simplecc_popup_cards = 0` keeps the classic presentation. The authenticated
+`g:jterm_vim9_popup_cards` flag is true only for protocol 7 and is reset on
+disconnect; old protocols retain their previous presentation.
+
+The card's rounded edge and shadow are visual decoration. Vim still owns the
+original rectangular mouse region, focus, scroll input and popup lifetime.
+Markdown remains Vim syntax text, with the original server markers preserved.
 
 ## Native visible whitespace
 

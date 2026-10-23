@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/simplecc
-          ref: f4ac8b2a33ed09f76af544c1dce4aac0c7f72a70
+          ref: bd711d6e273fc2db4e8ef96618629309b621d306
           path: .providers/simplecc
           persist-credentials: false
       - name: Check out audited SimpleGit popup provider
@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/vimrc
-          ref: 70ce22c888b783f6ee481d84c5793755324fd29f
+          ref: 27abbc9143d5b7abbddd78c4610e367fac4c252e
           path: .providers/vimrc
           persist-credentials: false
       - name: Check out audited SimpleWhichKey provider
@@ -51,12 +51,6 @@ jobs:
           ref: 365c9c34a68dded6c65ca0163f2443e880306b8a
           path: .providers/simplewhichkey
           persist-credentials: false
-      # Exercise the candidate cross-repository catalog without a floating
-      # vimrc ref. Remove the overlay when its published commit is pinned above.
-      - name: Apply candidate Vim workbench action catalog
-        run: |
-          git -C .providers/vimrc apply --check "$GITHUB_WORKSPACE/runtime/vim9/fixtures/vimrc-semantic-actions.patch"
-          git -C .providers/vimrc apply "$GITHUB_WORKSPACE/runtime/vim9/fixtures/vimrc-semantic-actions.patch"
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
       - run: |
           python3 runtime/vim9/test_pixel_input.py
@@ -78,3 +72,6 @@ jobs:
           python3 runtime/vim9/test_simple_code_lens.py
           python3 runtime/vim9/test_simple_inlay_hints.py
           python3 runtime/vim9/test_simple_navigation.py
+          python3 runtime/vim9/test_semantic_editing.py
+          python3 runtime/vim9/test_render_popup_cards.py
+          python3 runtime/vim9/test_lsp_popup_cards.py

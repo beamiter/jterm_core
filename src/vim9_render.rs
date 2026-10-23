@@ -131,6 +131,8 @@ pub struct Vim9RenderCompletion {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderPopup {
+    /// Protocol 7 optional provider presentation hint; unknown values remain classic.
+    pub kind: String,
     pub id: i64,
     /// Vim's stacking order. The ordinary completion menu has z-index 100.
     pub zindex: i32,
@@ -138,6 +140,15 @@ pub struct Vim9RenderPopup {
     pub default_style: Vim9RenderStyle,
     /// Includes body, padding, border and syntax glyphs in paint order.
     pub runs: Vec<Vim9RenderRun>,
+}
+
+impl Vim9RenderPopup {
+    pub fn is_documentation_card(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            "hover" | "signature" | "diagnostic" | "completion_documentation"
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -257,6 +268,7 @@ impl Vim9RenderFrame {
                 <= 4096
             && self.popups.iter().enumerate().all(|(index, popup)| {
                 popup.id > 0
+                    && popup.kind.len() <= 32
                     && (1..=32_000).contains(&popup.zindex)
                     && overlay_valid(&popup.view, &popup.default_style, &popup.runs)
                     && self.popups[..index]
@@ -585,16 +597,48 @@ mod tests {
     }
 
     #[test]
+    fn popup_card_kinds_are_bounded_and_unknown_values_remain_classic() {
+        for kind in [
+            "",
+            "hover",
+            "signature",
+            "diagnostic",
+            "completion_documentation",
+            "future",
+        ] {
+            let mut value = split_frame();
+            let mut surface = popup(300, 50);
+            surface["kind"] = json!(kind);
+            value["popups"] = json!([surface]);
+            let frame: Vim9RenderFrame = serde_json::from_value(value).unwrap();
+            assert!(frame.valid());
+            assert_eq!(
+                frame.popups[0].is_documentation_card(),
+                !matches!(kind, "" | "future")
+            );
+        }
+        let mut value = split_frame();
+        let mut surface = popup(300, 50);
+        surface["kind"] = json!("x".repeat(33));
+        value["popups"] = json!([surface]);
+        assert!(!serde_json::from_value::<Vim9RenderFrame>(value)
+            .unwrap()
+            .valid());
+    }
+
+    #[test]
     fn popup_only_deltas_replace_and_clear_without_stale_surfaces() {
         let value = split_frame();
         let first: Vim9RenderFrame = serde_json::from_value(value.clone()).unwrap();
         let mut delta = patch(&value, json!([]));
         delta["popups"] = json!([popup(300, 50)]);
+        delta["popups"][0]["kind"] = json!("hover");
         let opened = serde_json::from_value::<RenderDelta>(delta.clone())
             .unwrap()
             .apply(&first)
             .unwrap();
         assert!(opened.has_overlays());
+        assert!(opened.popups[0].is_documentation_card());
         assert_eq!(opened.runs, first.runs);
         delta["revision"] = json!(3);
         delta["base_revision"] = json!(2);
@@ -604,6 +648,7 @@ mod tests {
             .apply(&opened)
             .unwrap();
         assert_eq!(updated.popups[0].default_style.foreground, Some(0x665544));
+        assert_eq!(updated.popups[0].kind, "hover");
         assert_eq!(opened.popups[0].default_style.foreground, Some(0xabcdef));
         delta["revision"] = json!(4);
         delta["base_revision"] = json!(3);

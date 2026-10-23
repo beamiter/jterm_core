@@ -23,6 +23,7 @@ if empty(address) || empty(authToken)
 endif
 g:jterm_vim9_bridge_loaded = true
 g:jterm_vim9_connected = false
+g:jterm_vim9_popup_cards = false
 g:jterm_vim9_render_protocol = 0
 g:jterm_vim9_virtual_text_after = false
 g:jterm_vim9_virtual_text_inline = false
@@ -304,6 +305,7 @@ def WorkbenchLifecycle(connected: bool)
   endif
   workbenchConnected = connected
   g:jterm_vim9_connected = connected
+  g:jterm_vim9_popup_cards = connected && renderProtocol >= 7
   g:jterm_vim9_render_protocol = connected ? renderProtocol : 0
   # This producer capability is independent of the wire version: older
   # protocol-6 bridges did not compose virtual text into source-free runs.
@@ -1950,15 +1952,16 @@ def SampleRenderPopup()
     throw 'Interactive or decorated Vim popups use the compatibility view'
   endif
   var view = {row: position.line - 1, column: position.col - 1,
-    rows: position.height, columns: position.width}
+    rows: position.height, columns: position.width + position.scrollbar}
   var zindex = get(options, 'zindex', 50)
   if view.row < 0 || view.column < 0 || view.rows < 1 || view.rows > 64
       || view.columns < 1 || view.columns > 512 || view.row + view.rows > &lines
       || view.column + view.columns > &columns || zindex < 1 || zindex > 32000
     throw 'Vim popup geometry exceeds the native paint budget'
   endif
-  if position.scrollbar || position.firstline != 1 || position.core_height < line('$')
-      || position.core_width < 1 || position.core_height < 1
+  if position.core_width < 1 || position.core_height < 1
+      || (renderProtocol < 7 && (position.scrollbar || position.firstline != 1 || position.core_height < line('$')))
+      || (get(options, 'wrap', 1) && (position.scrollbar || position.firstline != 1 || position.core_height < line('$')))
     throw 'Scrolling or clipped Vim popups use the compatibility view'
   endif
   var border = PopupBox(options, 'border')
@@ -2030,7 +2033,9 @@ def SampleRenderPopup()
       CompletionText(runs, chars[corner[4]], corner[2], corner[3], borderStyles[corner[0]])
     endif
   endfor
-  var properties = prop_list(1, {end_lnum: line('$')})
+  var first = position.firstline
+  var last = min([line('$'), first + position.core_height - 1])
+  var properties = prop_list(first, {end_lnum: last})
   if len(properties) > 2048
     throw 'Vim popup properties exceed the native paint budget'
   endif
@@ -2043,7 +2048,7 @@ def SampleRenderPopup()
     property.definition = empty(name) ? {} : (typeBuffer > 0
       ? prop_type_get(name, {bufnr: typeBuffer}) : prop_type_get(name))
   endfor
-  for lnum in range(1, line('$'))
+  for lnum in range(first, last)
     var text = getline(lnum)
     if strlen(text) > 16384 || strdisplaywidth(text) > position.core_width
         || foldclosed(lnum) >= 0 || text =~# '[\x00-\x08\x0a-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
@@ -2079,7 +2084,7 @@ def SampleRenderPopup()
         style = combine ? MergeRenderStyle(style, propertyStyle) : propertyStyle
       endif
       CompletionText(runs, glyph ==# "\t" ? repeat(' ', width) : glyph,
-        position.core_line + lnum - 2, position.core_col + column - 1,
+        position.core_line + lnum - first - 1, position.core_col + column - 1,
         MergeRenderStyle(normal, style))
       byteColumn += strlen(glyph)
       column += width
@@ -2088,7 +2093,39 @@ def SampleRenderPopup()
   if len(runs) > 4096
     throw 'Vim popup runs exceed the native paint budget'
   endif
+  if position.scrollbar
+    # Mirror popupwin.c's source-based thumb calculation, never terminal cells.
+    var height = position.core_height
+    var count = line('$')
+    var thumbHeight = (height * height + count / 2) / count
+    if first > 1 && thumbHeight == height
+      thumbHeight -= 1
+    endif
+    thumbHeight = max([1, thumbHeight])
+    var thumbTop = count <= height ? 0 : (first - 1 + (count / height) / 2) * (height - thumbHeight) / (count - height)
+    if first > 1 && thumbTop == 0 && height > 1
+      thumbTop = 1
+    endif
+    thumbTop = min([thumbTop, height + padding[2] - 1])
+    var track = MergeRenderStyle(normal, RenderStyle(hlID(get(options, 'scrollbarhighlight', 'PmenuSbar'))))
+    var thumb = MergeRenderStyle(normal, RenderStyle(hlID(get(options, 'thumbhighlight', 'PmenuThumb'))))
+    for offset in range(height)
+      CompletionText(runs, ' ', position.core_line - 1 + offset,
+        view.column + view.columns - 1 - border[1],
+        offset >= thumbTop && offset < thumbTop + thumbHeight ? thumb : track)
+    endfor
+  endif
+  var kind = ''
+  var requestedKind: any = getwinvar(id, 'jterm_native_popup_kind', '')
+  if renderProtocol >= 7 && type(requestedKind) == v:t_string
+      && index(['hover', 'signature', 'diagnostic', 'completion_documentation'], requestedKind) >= 0
+      && border == [0, 0, 0, 0] && min(padding) >= 1
+    kind = requestedKind
+  endif
   renderPopupSample = {id: id, zindex: zindex, view: view, default_style: normal, runs: runs}
+  if renderProtocol >= 7
+    renderPopupSample.kind = kind
+  endif
 enddef
 
 def RenderPopups(): list<dict<any>>
@@ -3366,7 +3403,7 @@ def Receive(_: channel, message: string)
         return
       endif
       var requestedRender: any = get(request, 'render_protocol', 1)
-      if type(requestedRender) != v:t_number || index([1, 2, 3, 4, 5, 6], requestedRender) < 0
+      if type(requestedRender) != v:t_number || index([1, 2, 3, 4, 5, 6, 7], requestedRender) < 0
         throw 'Unsupported native render protocol'
       endif
       renderProtocol = requestedRender

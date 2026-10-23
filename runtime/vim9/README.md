@@ -547,10 +547,11 @@ With the semantic-navigation vimrc action catalog, also run
 the same environment. Its deterministic daemon replies exercise the actual
 SimpleCC requests, UTF-16 target positions, result lists, interactive symbol
 search and native signature popup through a real Vim PTY.
-The pixel-input CI keeps its audited vimrc revision and applies the exact
-candidate catalog patch in `fixtures/vimrc-semantic-actions.patch` before this
-test; a changed patch context fails the job. Once that vimrc change is
-published and pinned, remove the temporary overlay and keep the test.
+`test_semantic_editing.py` additionally exercises the actual buffer-local
+F12/Shift-F12/F2 keys, insert-mode signature help, first-use Visual ranges and
+stale formatting replies. The pixel-input CI pins the published vimrc and
+SimpleCC revisions containing this integration, without floating refs or
+candidate source overlays.
 
 That suite loads the real configuration and plugin runtimes in isolated test
 homes. SimpleCC's deterministic daemon fixture supplies replies; it tests
@@ -602,6 +603,33 @@ to verify automatic recovery without losing editing commands.
 
 These tests do not validate frontend font rendering, desktop IME integration,
 mouse input or all user plugins; those are frontend/desktop verification tasks.
+
+## Protocol 7 documentation cards
+
+The host now negotiates render protocol 7. After authentication,
+`g:jterm_vim9_popup_cards` is true for protocol 7 and false for older hosts;
+it is reset before the disconnect hook. A registered, undecorated popup may
+publish a bounded `kind` string: `hover`, `signature`, `diagnostic` or
+`completion_documentation`. The hint is projected only with no Vim character
+border and at least one cell of padding on every side. Unknown or missing
+kinds retain the ordinary popup painter.
+
+All four native hosts render these surfaces as rounded theme-colored cards,
+with a subtle shadow and outline. Vim's original rectangle, text positions,
+font grid, z-index and input ownership remain authoritative. Card padding is
+provided by Vim; hosts do not relayout text or turn documentation into HTML.
+
+Registered `nowrap` popups may expose a vertical viewport in protocol 7. The
+bridge samples the visible physical buffer lines and Vim's scrollbar styles
+and geometry. The extra scrollbar column is included in the published view.
+SimpleCC preflows long documentation into actual popup-buffer lines; general
+wrapped, concealed, filtered or masked surfaces still use compatibility paint.
+Protocols 1–6 retain their previous scrolling boundary.
+
+`test_render_popup_cards.py` exercises registration, geometry, scrolling and
+legacy negotiation. `test_lsp_popup_cards.py` uses the actual candidate vimrc
+and SimpleCC provider with daemon reply fixtures to test long hover, signature,
+diagnostics, completion documentation, paging, cancellation and opt-out.
 
 ## Inline and after/EOL virtual text
 
