@@ -38,3 +38,4 @@ serde_json = { version = "1.0.151", features = ["raw_value"] }
 serde_norway = "=0.9.42"
 toml = "1.1"
 unicode-width = "0.2"
+zstd = "0.13"

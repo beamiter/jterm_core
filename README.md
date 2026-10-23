@@ -31,6 +31,10 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 ## Shared surfaces
 
+- Read-only Codex and Claude CLI session discovery, bounded previews and search,
+  separately evidenced live process IDs, and exact-UUID resume plans for native
+  new-tab launch. See [CLI agent sessions](docs/agent-sessions.md).
+
 - A real Vim 9 IDE bridge for all four native workbenches. `vim9::Vim9Session`
   prepares a dedicated editor process, transports typed editor actions over
   an authenticated loopback channel, and publishes buffers, mode, cursor,
