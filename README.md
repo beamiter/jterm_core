@@ -33,7 +33,11 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 - Read-only Codex and Claude CLI session discovery, bounded previews and search,
   separately evidenced live process IDs, and exact-UUID resume plans for native
-  new-tab launch. See [CLI agent sessions](docs/agent-sessions.md).
+  new-tab launch. The shared conversation library adds local aliases, tags,
+  reversible archives, project summaries and structured search, with atomic
+  cross-process metadata merges. Native task dashboards share five sort orders
+  and visible-task attention navigation. See [CLI agent sessions and
+  management](docs/agent-sessions.md).
 
 - A real Vim 9 IDE bridge for all four native workbenches. `vim9::Vim9Session`
   prepares a dedicated editor process, transports typed editor actions over

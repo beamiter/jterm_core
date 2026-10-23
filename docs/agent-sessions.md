@@ -5,6 +5,34 @@ index of existing Codex and Claude CLI conversations. It is separate from
 `agent_task`: creating an experimental native task is not required to find or
 resume an ordinary CLI conversation.
 
+## Agent management workspace
+
+The four native managers share personal organization: give a conversation a
+recognizable name, add comma-separated tags, pin it, or archive it locally.
+Use **Active library**, **Archived here**, or **All conversations** to change the
+view, and select a project directory to include its descendants. Project summaries
+show active conversations, recorded input requests, observed live CLIs, pins and
+local archives. Recorded input requests and live processes remain separate facts.
+
+Names and tags are saved explicitly. UI adapters retain an identity-bound draft
+while the catalog refreshes, and show saving/error feedback. An empty name restores
+the provider title; an empty tag field removes the tags. Names allow 160 UTF-8
+bytes, and up to 12 tags of 32 bytes each are normalized, deduplicated and sorted.
+Control and invisible formatting characters are rejected before saving.
+
+Local archive is reversible organization, independent of the provider's own
+archive and of native task completion. It hides a conversation from the default
+view without deleting its history or affecting an active process. Restoring a
+local archive does not unarchive a provider-owned Codex transcript.
+
+For isolated native tasks, `agent_task::DashboardSnapshot` adds five presentation
+orders: needs-you first, recent update, oldest update, title and project.
+`next_attention` cycles the currently visible tasks needing input or review;
+`step_selection` navigates visible stable identities. These functions only
+return selections. TaskManager and approval paths still decide what operations
+can execute. A filter that hides the selection never selects another task
+automatically.
+
 ## Discovery and presentation
 
 `SessionScanner::refresh` starts one background scan. Hosts poll it from their
@@ -79,21 +107,44 @@ rather than ignoring required terms.
 The convenience `catalog.query(&query)` builds a temporary index for one-shot
 callers. GUI event loops should cache `SessionSearchIndex::new(&catalog)` and
 re-query only after text/filter/sort changes or an actual catalog replacement.
-`query_with_library` adds pinned-only and previously-resumed filters from a
+`query_with_library` adds local-archive, pinned-only and previously-resumed filters from a
 shared `SessionLibrarySnapshot`. `RecentlyResumed` sorts by the receipt
 timestamp, retaining deterministic base order when timestamps tie. Optional
 pin-first ordering is honored only for empty-query `Relevance` browsing;
 search matches and explicit chronological/live sorts retain their meaning.
+
+The same query parser supports aliases, tags, phrases and field constraints:
+
+| Search | Matches |
+| --- | --- |
+| `renderer gui` | Both terms across title, alias, tags, project, branch or preview |
+| `provider:codex tag:review` | Codex conversations with the exact normalized tag |
+| `project:/work/repo` | That absolute directory and its lexical descendants |
+| `title:"renderer redesign"` | A phrase in the provider title or local alias |
+| `branch:feature -tag:done` | Matching branch, excluding the exact tag |
+| `is:live is:pinned` | An observed live CLI that is also pinned |
+| `is:archived` | Locally archived conversations, including from the initial Active view |
+| `status:waiting` | Last recorded input request, independently of liveness |
+| `status:archived` | Provider-archived transcripts, independently of local archive |
+
+`name:` aliases `title:`, `cwd:` aliases `project:`, and `id:` and `is:resumed`
+are also supported. All constraints intersect. A minus outside quotes excludes
+a term. Within double quotes, `\"` and `\\` escape a quote or backslash. Unknown
+field prefixes remain literal, preserving URLs and ordinary colon-containing
+text. Invalid or over-limit queries return no matches; `query_error` supplies
+the native UI explanation. These are metadata queries, never shell commands.
 
 ## Shared pins and resume receipts
 
 `SessionLibraryStore::new()` starts a background load of
 `$XDG_STATE_HOME/jterm/agent-sessions-library.json` (falling back to
 `~/.local/state/jterm/agent-sessions-library.json`). All four terminals use the
-same path. The file stores only provider, UUID, pin state and the most recent
-resume timestamp, never prompts, previews, project paths or credentials.
+same path. The file stores provider, UUID, pin state, the most recent resume
+timestamp, and optional user-authored alias/tags/local archive state. Provider
+prompts, previews, project paths and credentials are never copied into it.
 
-The constructor, `set_pinned`, `record_resumed`, `refresh`, `poll`, and snapshot
+The constructor, `set_pinned`, `set_details`, `set_archived`, `record_resumed`,
+`refresh`, `poll`, and snapshot
 queries perform no filesystem I/O on the caller's thread. One worker drains a
 bounded queue of up to 256 distinct pending identities; updates for the same
 identity coalesce. Workers continue saving without UI polling, including
@@ -104,11 +155,16 @@ write finishes can still lose a pending update; hosts should show Saving while
 Each transaction acquires a cross-process directory lock with a two-second
 wait limit, reads current metadata, merges only that transaction's operations,
 and atomically replaces the private file. One terminal never writes its old
-whole snapshot over another terminal's pins. Delayed resume receipts cannot
+whole snapshot over another terminal's organization. Alias and tags save together;
+pin, archive and resume receipt updates merge independently. Concurrent edits to
+the same alias/tag pair use the last completed transaction. Delayed resume receipts cannot
 move a saved timestamp backwards. Directory and file modes are 0700 and 0600;
 symlink, unsafe permission, malformed, duplicate-key and future-version files
-are rejected and left unchanged. The version-1 JSON is capped at 1 MiB and
-4,096 identities. Errors are nonfatal and exposed by `error()` after `poll()`.
+are rejected and left unchanged. Version-1 metadata is accepted and migrated to
+version 2 on a successful write, preserving pins and resume receipts. Older
+version-1-only binaries reject the new format instead of overwriting it; update
+all four frontends together. JSON remains capped at 1 MiB and 4,096 identities.
+Errors are nonfatal and exposed by `error()` after `poll()`.
 
 Poll to adopt completed snapshots; refresh periodically while open to observe
 other terminal windows' changes. Re-query cached search indices when the

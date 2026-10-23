@@ -74,7 +74,7 @@ pub use context::{ContextError, SemanticCommandContext};
 #[allow(unused_imports)]
 pub use dashboard::{
     DashboardActivity, DashboardCounts, DashboardFilter, DashboardGroup, DashboardRow,
-    DashboardSnapshot, DashboardView,
+    DashboardSnapshot, DashboardSort, DashboardView,
 };
 #[allow(unused_imports)]
 pub use driver::{

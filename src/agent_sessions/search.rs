@@ -1,11 +1,56 @@
 //! Cached, deterministic session search shared by every native frontend.
 //! Build once after a changed catalog; queries never inspect the filesystem.
 use super::{AgentSession, SessionCatalog, SessionLibrarySnapshot, SessionProvider, SessionStatus};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_QUERY_TERMS: usize = 64;
+
+/// Local organization is independent of a provider's archived transcript state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionArchiveFilter {
+    #[default]
+    Active,
+    Archived,
+    All,
+}
+impl SessionArchiveFilter {
+    pub const ALL: [Self; 3] = [Self::Active, Self::Archived, Self::All];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active library",
+            Self::Archived => "Archived here",
+            Self::All => "All conversations",
+        }
+    }
+    fn matches(self, archived: bool) -> bool {
+        match self {
+            Self::Active => !archived,
+            Self::Archived => archived,
+            Self::All => true,
+        }
+    }
+}
+impl std::fmt::Display for SessionArchiveFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// Counts include this directory and its lexical descendants, matching the
+/// project picker scope. Active totals exclude local archives; archived is an
+/// independent count. A recorded wait is not proof of a currently blocked CLI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionProjectSummary {
+    pub root: PathBuf,
+    pub total: usize,
+    pub live: usize,
+    pub waiting: usize,
+    pub pinned: usize,
+    pub archived: usize,
+    pub updated_at_ms: u64,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SessionSort {
@@ -44,6 +89,7 @@ pub struct SessionLibraryFilter {
     pub recent_only: bool,
     /// Empty-query default browsing only; never displace exact search matches.
     pub pinned_first: bool,
+    pub archive: SessionArchiveFilter,
 }
 
 /// `project` includes the absolute directory and its lexical descendants.
@@ -106,13 +152,7 @@ impl SessionSearchIndex {
         library: &SessionLibrarySnapshot,
         filter: SessionLibraryFilter,
     ) -> Vec<usize> {
-        let mut indices = self.query(query);
-        indices.retain(|index| {
-            let entry = &self.entries[*index];
-            (!filter.pinned_only || library.is_pinned(entry.provider, &entry.key))
-                && (!filter.recent_only
-                    || library.last_resumed(entry.provider, &entry.key).is_some())
-        });
+        let mut indices = self.query_filtered(query, Some(library), filter);
         let pinned_first = filter.pinned_first
             && query.text.trim().is_empty()
             && query.sort == SessionSort::Relevance;
@@ -148,18 +188,80 @@ impl SessionSearchIndex {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    pub fn query_error(text: &str) -> Option<String> {
+        parse_query(text).err()
+    }
+    pub fn projects(&self, library: &SessionLibrarySnapshot) -> Vec<SessionProjectSummary> {
+        let mut projects: BTreeMap<PathBuf, SessionProjectSummary> = self
+            .entries
+            .iter()
+            .filter_map(|entry| entry.directory.clone())
+            .map(|root| {
+                (
+                    root.clone(),
+                    SessionProjectSummary {
+                        root,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        for entry in &self.entries {
+            let Some(directory) = &entry.directory else {
+                continue;
+            };
+            // Only cataloged project directories are exposed. Ancestor walks
+            // avoid a quadratic all-projects scan for large history catalogs.
+            for ancestor in directory.ancestors() {
+                let Some(project) = projects.get_mut(ancestor) else {
+                    continue;
+                };
+                project.updated_at_ms = project.updated_at_ms.max(entry.updated_at_ms);
+                if library.is_archived(entry.provider, &entry.key) {
+                    project.archived += 1;
+                } else {
+                    project.total += 1;
+                    project.live += usize::from(entry.live);
+                    project.waiting += usize::from(entry.status == SessionStatus::Waiting);
+                    project.pinned += usize::from(library.is_pinned(entry.provider, &entry.key));
+                }
+            }
+        }
+        projects.into_values().collect()
+    }
     /// All whitespace-separated terms must match some indexed field. The
     /// returned indices refer to the catalog supplied to `new`, never sorted
     /// row numbers or a refreshed catalog. Rebuild after replacing that catalog.
     pub fn query(&self, query: &SessionQuery<'_>) -> Vec<usize> {
-        if query.text.len() > MAX_QUERY_BYTES {
+        self.query_filtered(
+            query,
+            None,
+            SessionLibraryFilter {
+                archive: SessionArchiveFilter::All,
+                ..Default::default()
+            },
+        )
+    }
+    fn query_filtered(
+        &self,
+        query: &SessionQuery<'_>,
+        library: Option<&SessionLibrarySnapshot>,
+        filter: SessionLibraryFilter,
+    ) -> Vec<usize> {
+        let Ok(terms) = parse_query(query.text) else {
             return Vec::new();
-        }
+        };
         let normalized = query.text.trim().to_lowercase();
-        let terms = normalized.split_whitespace().collect::<Vec<_>>();
-        if terms.len() > MAX_QUERY_TERMS {
-            return Vec::new();
-        }
+        // An explicit positive is:archived searches the archive even when the
+        // initial browsing view is Active. Other filters still intersect.
+        let archive = if filter.archive == SessionArchiveFilter::Active
+            && terms.iter().any(|term| {
+                term.field == SearchField::Is && term.value == "archived" && !term.negative
+            }) {
+            SessionArchiveFilter::Archived
+        } else {
+            filter.archive
+        };
         let project = match query.project {
             Some(path) => match normalized_absolute(path) {
                 Some(path) => Some(path),
@@ -172,11 +274,21 @@ impl SessionSearchIndex {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
+                let archived =
+                    library.is_some_and(|library| library.is_archived(entry.provider, &entry.key));
                 if query
                     .provider
                     .is_some_and(|provider| entry.provider != provider)
                     || query.status.is_some_and(|status| entry.status != status)
                     || (query.live_only && !entry.live)
+                    || !archive.matches(archived)
+                    || (filter.pinned_only
+                        && !library
+                            .is_some_and(|library| library.is_pinned(entry.provider, &entry.key)))
+                    || (filter.recent_only
+                        && !library.is_some_and(|library| {
+                            library.last_resumed(entry.provider, &entry.key).is_some()
+                        }))
                     || project.as_ref().is_some_and(|root| {
                         entry
                             .directory
@@ -186,7 +298,9 @@ impl SessionSearchIndex {
                 {
                     return None;
                 }
-                entry.score(&normalized, &terms).map(|score| (index, score))
+                entry
+                    .score_terms(&normalized, &terms, library)
+                    .map(|score| (index, score))
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|(left, left_score), (right, right_score)| {
@@ -216,6 +330,111 @@ impl SessionCatalog {
         SessionSearchIndex::new(self).query(query)
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchField {
+    Any,
+    Title,
+    Id,
+    Provider,
+    Project,
+    Branch,
+    Tag,
+    Status,
+    Is,
+}
+#[derive(Debug)]
+struct SearchTerm {
+    field: SearchField,
+    value: String,
+    path: Option<PathBuf>,
+    negative: bool,
+}
+
+/// A small bounded query language, not a shell or regex. Unknown prefixes stay
+/// literal (URLs and paths remain searchable). Quotes keep a phrase together;
+/// a leading minus outside quotes excludes a term.
+fn parse_query(text: &str) -> Result<Vec<SearchTerm>, String> {
+    if text.len() > MAX_QUERY_BYTES {
+        return Err("Search is limited to 4,096 bytes.".into());
+    }
+    if crate::review_input::contains_noncontrol_visual_spoofing(text)
+        || text.chars().any(|c| c.is_control() && !c.is_whitespace())
+    {
+        return Err("Search contains unsupported control or formatting characters.".into());
+    }
+    let mut chars = text.chars().peekable();
+    let mut terms = Vec::new();
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let negative_prefix = chars.peek() == Some(&'-');
+        let mut value = String::new();
+        let mut quoted = false;
+        while let Some(character) = chars.next() {
+            if character == '"' {
+                quoted = !quoted;
+            } else if quoted
+                && character == '\\'
+                && chars.peek().is_some_and(|c| matches!(c, '"' | '\\'))
+            {
+                value.push(chars.next().expect("peeked character"));
+            } else if character.is_whitespace() && !quoted {
+                break;
+            } else {
+                value.push(character);
+            }
+        }
+        if quoted {
+            return Err("Close the double quote to finish this search phrase.".into());
+        }
+        let negative = negative_prefix && value.len() > 1;
+        if negative {
+            value.remove(0);
+        }
+        let (field, value) = match value.split_once(':') {
+            Some((prefix, rest)) => match prefix.to_ascii_lowercase().as_str() {
+                "title" | "name" => (SearchField::Title, rest),
+                "id" => (SearchField::Id, rest),
+                "provider" => (SearchField::Provider, rest),
+                "project" | "cwd" => (SearchField::Project, rest),
+                "branch" => (SearchField::Branch, rest),
+                "tag" => (SearchField::Tag, rest),
+                "status" => (SearchField::Status, rest),
+                "is" => (SearchField::Is, rest),
+                _ => (SearchField::Any, value.as_str()),
+            },
+            None => (SearchField::Any, value.as_str()),
+        };
+        if value.is_empty() {
+            return Err("Add a value after the search field or inside the quotes.".into());
+        }
+        let path = (field == SearchField::Project)
+            .then(|| normalized_absolute(Path::new(value)))
+            .flatten();
+        let value = value.to_lowercase();
+        if field == SearchField::Is
+            && !matches!(value.as_str(), "live" | "pinned" | "archived" | "resumed")
+        {
+            return Err("Use is:live, is:pinned, is:archived, or is:resumed.".into());
+        }
+        terms.push(SearchTerm {
+            field,
+            value,
+            path,
+            negative,
+        });
+        if terms.len() > MAX_QUERY_TERMS {
+            return Err("Search is limited to 64 terms.".into());
+        }
+    }
+    Ok(terms)
+}
+
 impl SearchEntry {
     fn new(session: &AgentSession, live: bool) -> Self {
         Self {
@@ -239,6 +458,85 @@ impl SearchEntry {
             updated_at_ms: session.updated_at_ms,
             live,
         }
+    }
+    fn score_terms(
+        &self,
+        query: &str,
+        terms: &[SearchTerm],
+        library: Option<&SessionLibrarySnapshot>,
+    ) -> Option<u64> {
+        let alias = library
+            .and_then(|library| library.alias(self.provider, &self.key))
+            .unwrap_or_default()
+            .to_lowercase();
+        let tags = library.map_or(&[][..], |library| library.tags(self.provider, &self.key));
+        let mut total = 0;
+        for term in terms {
+            let value = term.value.as_str();
+            let score = match term.field {
+                SearchField::Any => self
+                    .score("", &[value])
+                    .unwrap_or(0)
+                    .max(u64::from(field_score(&alias, value, 40_000)))
+                    .max(
+                        tags.iter()
+                            .map(|tag| u64::from(field_score(tag, value, 10_000)))
+                            .max()
+                            .unwrap_or(0),
+                    ),
+                SearchField::Title => u64::from(
+                    field_score(&self.title, value, 30_000).max(field_score(&alias, value, 40_000)),
+                ),
+                SearchField::Id => u64::from(field_score(&self.id, value, 100_000)),
+                SearchField::Provider => u64::from(self.provider_name == value),
+                SearchField::Project => match &term.path {
+                    Some(root) => u64::from(
+                        self.directory
+                            .as_ref()
+                            .is_some_and(|path| path.starts_with(root)),
+                    ),
+                    None => u64::from(field_score(&self.cwd, value, 5_000)),
+                },
+                SearchField::Branch => u64::from(field_score(&self.branch, value, 5_000)),
+                SearchField::Tag => u64::from(tags.iter().any(|tag| tag == value)),
+                SearchField::Status => u64::from(match value {
+                    "working" | "running" => self.status == SessionStatus::Working,
+                    "waiting" | "needs-input" | "approval" => self.status == SessionStatus::Waiting,
+                    "idle" | "ready" => self.status == SessionStatus::Idle,
+                    "unknown" => self.status == SessionStatus::Unknown,
+                    "archived" => self.status == SessionStatus::Archived,
+                    _ => false,
+                }),
+                SearchField::Is => {
+                    u64::from(match value {
+                        "live" => self.live,
+                        "pinned" => library
+                            .is_some_and(|library| library.is_pinned(self.provider, &self.key)),
+                        "archived" => library
+                            .is_some_and(|library| library.is_archived(self.provider, &self.key)),
+                        "resumed" => library.is_some_and(|library| {
+                            library.last_resumed(self.provider, &self.key).is_some()
+                        }),
+                        _ => false,
+                    })
+                }
+            };
+            if (score > 0) == term.negative {
+                return None;
+            }
+            if !term.negative {
+                total += score;
+            }
+        }
+        if !query.is_empty() {
+            if self.id == query {
+                total += 1_000_000_000;
+            }
+            if self.title == query || alias == query {
+                total += 100_000;
+            }
+        }
+        Some(total)
     }
     fn score(&self, query: &str, terms: &[&str]) -> Option<u64> {
         let mut score = 0u64;
@@ -692,10 +990,320 @@ mod tests {
                 SessionLibraryFilter {
                     pinned_only: true,
                     recent_only: true,
-                    pinned_first: false
+                    pinned_first: false,
+                    ..SessionLibraryFilter::default()
                 }
             ),
             [1]
+        );
+    }
+
+    #[test]
+    fn management_query_combines_alias_tags_provider_project_and_exclusions() {
+        use crate::agent_sessions::SessionOrganization;
+        let id = "11111111-1111-4111-8111-111111111111";
+        let catalog = catalog(vec![
+            session(id, "Original provider title", "/work/repo", "", 1),
+            session("other", "Renderer", "/work/repo-other", "", 2),
+        ]);
+        let library = SessionLibrarySnapshot::default()
+            .with_organization(
+                SessionProvider::Codex,
+                id,
+                SessionOrganization {
+                    alias: Some("Renderer project".into()),
+                    tags: vec!["GUI".into(), "needs review".into()],
+                    archived: false,
+                },
+            )
+            .unwrap();
+        let index = SessionSearchIndex::new(&catalog);
+        for text in [
+            "renderer gui",
+            "provider:codex project:/work/repo tag:gui",
+            "title:\"renderer project\" -tag:done",
+            "tag:\"needs review\"",
+            "name:renderer -provider:claude tag:gui",
+        ] {
+            assert_eq!(
+                index.query_with_library(
+                    &SessionQuery {
+                        text,
+                        ..Default::default()
+                    },
+                    &library,
+                    SessionLibraryFilter::default()
+                ),
+                [0],
+                "{text}"
+            );
+        }
+        for text in [
+            "tag:gu",
+            "tag:gui -title:renderer",
+            "provider:claude",
+            "project:/work/repo/subdir",
+        ] {
+            assert!(
+                index
+                    .query_with_library(
+                        &SessionQuery {
+                            text,
+                            ..Default::default()
+                        },
+                        &library,
+                        SessionLibraryFilter::default()
+                    )
+                    .is_empty(),
+                "{text}"
+            );
+        }
+        // Both the original provider title and local alias remain searchable.
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery {
+                    text: "original provider",
+                    ..Default::default()
+                },
+                &library,
+                SessionLibraryFilter::default()
+            ),
+            [0]
+        );
+    }
+
+    #[test]
+    fn archive_is_reversible_local_metadata_and_not_provider_status_or_liveness() {
+        use crate::agent_sessions::SessionOrganization;
+        let id = "11111111-1111-4111-8111-111111111111";
+        let other = "22222222-2222-4222-8222-222222222222";
+        let mut provider_archived = session(other, "Provider archive", "/repo", "", 2);
+        provider_archived.archived = true;
+        provider_archived.status = SessionStatus::Archived;
+        let catalog = catalog(vec![
+            session(id, "Local archive", "/repo", "", 1),
+            provider_archived,
+        ]);
+        let before = catalog.clone();
+        let index = SessionSearchIndex::new(&catalog);
+        let library = SessionLibrarySnapshot::default()
+            .with_organization(
+                SessionProvider::Codex,
+                id,
+                SessionOrganization {
+                    archived: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery::default(),
+                &library,
+                SessionLibraryFilter::default()
+            ),
+            [1]
+        );
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery::default(),
+                &library,
+                SessionLibraryFilter {
+                    archive: SessionArchiveFilter::Archived,
+                    ..Default::default()
+                }
+            ),
+            [0]
+        );
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery {
+                    text: "is:archived",
+                    ..Default::default()
+                },
+                &library,
+                SessionLibraryFilter::default()
+            ),
+            [0]
+        );
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery {
+                    text: "status:archived",
+                    ..Default::default()
+                },
+                &library,
+                SessionLibraryFilter::default()
+            ),
+            [1]
+        );
+        assert!(index
+            .query_with_library(
+                &SessionQuery {
+                    text: "is:live",
+                    ..Default::default()
+                },
+                &library,
+                SessionLibraryFilter {
+                    archive: SessionArchiveFilter::All,
+                    ..Default::default()
+                }
+            )
+            .is_empty());
+        let restored = library
+            .with_organization(SessionProvider::Codex, id, SessionOrganization::default())
+            .unwrap();
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery::default(),
+                &restored,
+                SessionLibraryFilter::default()
+            ),
+            [1, 0]
+        );
+        assert_eq!(catalog, before);
+    }
+
+    #[test]
+    fn structured_search_reports_errors_and_preserves_literal_urls_and_quoted_minuses() {
+        let catalog = catalog(vec![session(
+            "one",
+            "-renderer https://example.com \"hello\"",
+            "/work/repo",
+            "",
+            1,
+        )]);
+        let index = SessionSearchIndex::new(&catalog);
+        for text in [
+            "tag:",
+            "\"unfinished",
+            "is:unknown",
+            "\u{202e}hidden",
+            "\"\"",
+        ] {
+            assert!(SessionSearchIndex::query_error(text).is_some(), "{text}");
+            assert!(index
+                .query(&SessionQuery {
+                    text,
+                    ..Default::default()
+                })
+                .is_empty());
+        }
+        for text in ["\"-renderer\"", "https://example.com", "\"\\\"hello\\\"\""] {
+            assert!(SessionSearchIndex::query_error(text).is_none(), "{text}");
+            assert_eq!(
+                index.query(&SessionQuery {
+                    text,
+                    ..Default::default()
+                }),
+                [0],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_summaries_match_descendant_scope_and_separate_waiting_from_live() {
+        use crate::agent_sessions::{SessionLibraryEntry, SessionOrganization};
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let mut waiting = session(a, "Recorded waiting", "/work/repo", "", 1);
+        waiting.status = SessionStatus::Waiting;
+        let mut catalog = catalog(vec![
+            waiting,
+            session(b, "Archived child", "/work/repo/subdir", "", 5),
+            session("sibling", "Sibling", "/work/repo-other", "", 8),
+        ]);
+        catalog.live_processes.push(LiveSessionProcess {
+            provider: SessionProvider::Codex,
+            id: "sibling".into(),
+            pid: 1234,
+        });
+        let library = SessionLibrarySnapshot::from_entries(vec![SessionLibraryEntry {
+            provider: SessionProvider::Codex,
+            id: a.into(),
+            pinned: true,
+            last_resumed_ms: None,
+        }])
+        .unwrap()
+        .with_organization(
+            SessionProvider::Codex,
+            b,
+            SessionOrganization {
+                archived: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let index = SessionSearchIndex::new(&catalog);
+        let projects = index.projects(&library);
+        let project = projects
+            .iter()
+            .find(|project| project.root == Path::new("/work/repo"))
+            .unwrap();
+        assert_eq!(
+            (
+                project.total,
+                project.waiting,
+                project.live,
+                project.pinned,
+                project.archived,
+                project.updated_at_ms
+            ),
+            (1, 1, 0, 1, 1, 5)
+        );
+        assert_eq!(
+            index
+                .query_with_library(
+                    &SessionQuery {
+                        project: Some(&project.root),
+                        ..Default::default()
+                    },
+                    &library,
+                    SessionLibraryFilter::default()
+                )
+                .len(),
+            project.total
+        );
+        assert_eq!(
+            projects
+                .iter()
+                .find(|project| project.root == Path::new("/work/repo-other"))
+                .unwrap()
+                .live,
+            1
+        );
+    }
+
+    #[test]
+    fn exact_session_identity_still_outranks_a_local_alias_and_tags() {
+        use crate::agent_sessions::SessionOrganization;
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let index = SessionSearchIndex::new(&catalog(vec![
+            session(a, "Exact UUID", "/repo", "", 1),
+            session(b, "Newer alias", "/repo", "", 20),
+        ]));
+        let library = SessionLibrarySnapshot::default()
+            .with_organization(
+                SessionProvider::Codex,
+                b,
+                SessionOrganization {
+                    alias: Some(a.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            index.query_with_library(
+                &SessionQuery {
+                    text: a,
+                    ..Default::default()
+                },
+                &library,
+                SessionLibraryFilter::default()
+            ),
+            [0, 1]
         );
     }
 }

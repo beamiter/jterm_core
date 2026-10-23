@@ -12,6 +12,57 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_PENDING: usize = 256;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+pub const SESSION_ALIAS_MAX_BYTES: usize = 160;
+pub const SESSION_TAG_MAX_BYTES: usize = 32;
+pub const SESSION_TAG_LIMIT: usize = 12;
+
+/// Personal organization only. This never changes a provider transcript,
+/// process, approval, or native task lifecycle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionOrganization {
+    pub alias: Option<String>,
+    pub tags: Vec<String>,
+    pub archived: bool,
+}
+
+impl SessionOrganization {
+    fn normalized(self) -> Result<Self, String> {
+        let alias = self.alias.unwrap_or_default();
+        if alias.len() > SESSION_ALIAS_MAX_BYTES || unsafe_label(&alias) {
+            return Err(
+                "A session name must be at most 160 bytes without control characters.".into(),
+            );
+        }
+        if self.tags.len() > SESSION_TAG_LIMIT {
+            return Err("Use at most 12 session tags.".into());
+        }
+        let mut tags = Vec::new();
+        for tag in self.tags {
+            if unsafe_label(&tag) || tag.contains(',') {
+                return Err("Tags cannot contain commas or control characters.".into());
+            }
+            let tag = tag.trim().to_lowercase();
+            if tag.len() > SESSION_TAG_MAX_BYTES {
+                return Err("Each session tag must be at most 32 bytes.".into());
+            }
+            if !tag.is_empty() && !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        tags.sort();
+        Ok(Self {
+            alias: (!alias.trim().is_empty()).then(|| alias.trim().to_owned()),
+            tags,
+            archived: self.archived,
+        })
+    }
+    fn is_empty(&self) -> bool {
+        self.alias.is_none() && self.tags.is_empty() && !self.archived
+    }
+}
+fn unsafe_label(text: &str) -> bool {
+    text.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(text)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionLibraryEntry {
@@ -23,6 +74,7 @@ pub struct SessionLibraryEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionLibrarySnapshot {
     entries: BTreeMap<String, SessionLibraryEntry>,
+    organization: BTreeMap<String, SessionOrganization>,
 }
 impl SessionLibrarySnapshot {
     pub fn from_entries(entries: Vec<SessionLibraryEntry>) -> Result<Self, String> {
@@ -47,6 +99,71 @@ impl SessionLibrarySnapshot {
             .entries
             .retain(|_, entry| entry.pinned || entry.last_resumed_ms.is_some());
         Ok(snapshot)
+    }
+    /// Construct or augment a snapshot without disk access. The same validation
+    /// is used when reading persistent metadata and accepting editor input.
+    pub fn with_organization(
+        mut self,
+        provider: SessionProvider,
+        id: &str,
+        organization: SessionOrganization,
+    ) -> Result<Self, String> {
+        if !valid_id(id) {
+            return Err("Session library contains an invalid session UUID.".into());
+        }
+        let organization = organization.normalized()?;
+        let identity = key(provider, id);
+        if organization.is_empty() {
+            self.organization.remove(&identity);
+            if self
+                .entries
+                .get(&identity)
+                .is_some_and(|entry| !entry.pinned && entry.last_resumed_ms.is_none())
+            {
+                self.entries.remove(&identity);
+            }
+        } else {
+            self.entries
+                .entry(identity.clone())
+                .or_insert_with(|| SessionLibraryEntry {
+                    provider,
+                    id: id.to_ascii_lowercase(),
+                    pinned: false,
+                    last_resumed_ms: None,
+                });
+            self.organization.insert(identity, organization);
+        }
+        if self.entries.len() > MAX_ENTRIES {
+            return Err("Session library exceeds its 4,096-entry limit.".into());
+        }
+        Ok(self)
+    }
+    pub fn organization(
+        &self,
+        provider: SessionProvider,
+        id: &str,
+    ) -> Option<&SessionOrganization> {
+        self.organization.get(&key(provider, id))
+    }
+    pub fn alias(&self, provider: SessionProvider, id: &str) -> Option<&str> {
+        self.organization(provider, id)
+            .and_then(|entry| entry.alias.as_deref())
+    }
+    pub fn tags(&self, provider: SessionProvider, id: &str) -> &[String] {
+        self.organization(provider, id)
+            .map_or(&[], |entry| entry.tags.as_slice())
+    }
+    pub fn is_archived(&self, provider: SessionProvider, id: &str) -> bool {
+        self.organization(provider, id)
+            .is_some_and(|entry| entry.archived)
+    }
+    pub fn display_title<'a>(
+        &'a self,
+        provider: SessionProvider,
+        id: &str,
+        fallback: &'a str,
+    ) -> &'a str {
+        self.alias(provider, id).unwrap_or(fallback)
     }
     pub fn is_pinned(&self, provider: SessionProvider, id: &str) -> bool {
         self.entries
@@ -99,6 +216,8 @@ struct Change {
     id: String,
     pinned: Option<bool>,
     resumed: Option<u64>,
+    details: Option<(Option<String>, Vec<String>)>,
+    archived: Option<bool>,
 }
 impl Default for SessionLibraryStore {
     fn default() -> Self {
@@ -250,7 +369,54 @@ impl SessionLibraryStore {
         id: &str,
         pinned: bool,
     ) -> Result<(), String> {
-        self.enqueue(provider, id, Some(pinned), None)
+        self.enqueue(provider, id, Some(pinned), None, None, None)
+    }
+    /// Save the editor as one transaction. Pin/history/archive updates from
+    /// other windows are merged independently under the cross-process lock.
+    pub fn set_details(
+        &mut self,
+        provider: SessionProvider,
+        id: &str,
+        alias: &str,
+        tags: &str,
+    ) -> Result<(), String> {
+        // Bound input before splitting or allocating user-controlled strings.
+        // Editors render saved tags with `join(", ")`, so the raw budget must
+        // include both delimiter bytes even when all 12 tags fill their limit.
+        if alias.len() > SESSION_ALIAS_MAX_BYTES
+            || tags.len() > (SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT
+            || unsafe_label(tags)
+        {
+            return Err("Session name or tags exceed the editor limits.".into());
+        }
+        let organization = SessionOrganization {
+            alias: Some(alias.into()),
+            tags: if tags.trim().is_empty() {
+                Vec::new()
+            } else {
+                tags.split(',').map(str::to_owned).collect()
+            },
+            archived: false,
+        }
+        .normalized()?;
+        self.enqueue(
+            provider,
+            id,
+            None,
+            None,
+            Some((organization.alias, organization.tags)),
+            None,
+        )
+    }
+    /// Reversible local archive. Provider-owned history and running processes
+    /// remain unchanged, and no launch/action capability is created.
+    pub fn set_archived(
+        &mut self,
+        provider: SessionProvider,
+        id: &str,
+        archived: bool,
+    ) -> Result<(), String> {
+        self.enqueue(provider, id, None, None, None, Some(archived))
     }
     pub fn record_resumed(&mut self, provider: SessionProvider, id: &str) -> Result<(), String> {
         let timestamp = SystemTime::now()
@@ -258,7 +424,7 @@ impl SessionLibraryStore {
             .unwrap_or_default()
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        self.enqueue(provider, id, None, Some(timestamp.max(1)))
+        self.enqueue(provider, id, None, Some(timestamp.max(1)), None, None)
     }
     fn enqueue(
         &mut self,
@@ -266,6 +432,8 @@ impl SessionLibraryStore {
         id: &str,
         pinned: Option<bool>,
         resumed: Option<u64>,
+        details: Option<(Option<String>, Vec<String>)>,
+        archived: Option<bool>,
     ) -> Result<(), String> {
         if !valid_id(id) {
             return Err("Cannot update session library: invalid session UUID.".into());
@@ -289,12 +457,20 @@ impl SessionLibraryStore {
             id: id.to_ascii_lowercase(),
             pinned: None,
             resumed: None,
+            details: None,
+            archived: None,
         });
         if pinned.is_some() {
             change.pinned = pinned;
         }
         if let Some(timestamp) = resumed {
             change.resumed = Some(change.resumed.unwrap_or(0).max(timestamp));
+        }
+        if details.is_some() {
+            change.details = details;
+        }
+        if archived.is_some() {
+            change.archived = archived;
         }
         drop(state);
         let _ = self.wake.try_send(());
@@ -324,22 +500,44 @@ struct WireEntry {
     pinned: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_resumed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    archived: bool,
 }
 fn decode(text: &str) -> Result<SessionLibrarySnapshot, String> {
     crate::bounded_json::validate_no_duplicate_members(text.as_bytes())
         .map_err(|_| "Session library contains duplicate or malformed JSON fields.")?;
     let wire: WireLibrary = serde_json::from_str(text)
         .map_err(|_| "Session library JSON is malformed; it was left unchanged.")?;
-    if wire.version != 1 {
+    if !matches!(wire.version, 1 | 2) {
         return Err("Session library version is unsupported; it was left unchanged.".into());
     }
     let mut entries = Vec::new();
+    let mut organization = Vec::new();
     for entry in wire.sessions {
+        if wire.version == 1 && (entry.alias.is_some() || !entry.tags.is_empty() || entry.archived)
+        {
+            return Err(
+                "Session organization requires library version 2; it was left unchanged.".into(),
+            );
+        }
         let provider = match entry.provider.as_str() {
             "codex" => SessionProvider::Codex,
             "claude" => SessionProvider::Claude,
             _ => return Err("Session library contains an unsupported provider.".into()),
         };
+        organization.push((
+            provider,
+            entry.id.clone(),
+            SessionOrganization {
+                alias: entry.alias,
+                tags: entry.tags,
+                archived: entry.archived,
+            },
+        ));
         entries.push(SessionLibraryEntry {
             provider,
             id: entry.id,
@@ -347,7 +545,11 @@ fn decode(text: &str) -> Result<SessionLibrarySnapshot, String> {
             last_resumed_ms: entry.last_resumed_ms,
         });
     }
-    SessionLibrarySnapshot::from_entries(entries)
+    let mut snapshot = SessionLibrarySnapshot::from_entries(entries)?;
+    for (provider, id, details) in organization {
+        snapshot = snapshot.with_organization(provider, &id, details)?;
+    }
+    Ok(snapshot)
 }
 fn transaction(
     path: &Path,
@@ -384,15 +586,28 @@ fn transaction(
         if let Some(timestamp) = change.resumed {
             entry.last_resumed_ms = Some(entry.last_resumed_ms.unwrap_or(0).max(timestamp));
         }
+        if change.details.is_some() || change.archived.is_some() {
+            let organization = snapshot.organization.entry(identity.clone()).or_default();
+            if let Some((alias, tags)) = &change.details {
+                organization.alias.clone_from(alias);
+                organization.tags.clone_from(tags);
+            }
+            if let Some(archived) = change.archived {
+                organization.archived = archived;
+            }
+        }
     }
-    snapshot
-        .entries
-        .retain(|_, entry| entry.pinned || entry.last_resumed_ms.is_some());
+    snapshot.organization.retain(|_, entry| !entry.is_empty());
+    snapshot.entries.retain(|identity, entry| {
+        entry.pinned
+            || entry.last_resumed_ms.is_some()
+            || snapshot.organization.contains_key(identity)
+    });
     if snapshot.entries.len() > MAX_ENTRIES {
         return Err("Session library is full (4,096 identities); no changes were written.".into());
     }
     let wire = WireLibrary {
-        version: 1,
+        version: 2,
         sessions: snapshot
             .entries
             .values()
@@ -405,6 +620,9 @@ fn transaction(
                 id: entry.id.clone(),
                 pinned: entry.pinned,
                 last_resumed_ms: entry.last_resumed_ms,
+                alias: snapshot.alias(entry.provider, &entry.id).map(str::to_owned),
+                tags: snapshot.tags(entry.provider, &entry.id).to_vec(),
+                archived: snapshot.is_archived(entry.provider, &entry.id),
             })
             .collect(),
     };
@@ -560,6 +778,8 @@ mod tests {
                 id: id.into(),
                 pinned,
                 resumed,
+                details: None,
+                archived: None,
             },
         )])
     }
@@ -608,6 +828,195 @@ mod tests {
         );
     }
     #[test]
+    fn legacy_library_migrates_organization_without_losing_pin_or_resume_receipts() {
+        let f = Fixture::new();
+        f.write(format!(r#"{{"version":1,"sessions":[{{"provider":"codex","id":"{ID}","pinned":true,"last_resumed_ms":42}}]}}"#).as_bytes());
+        let mut store = SessionLibraryStore::with_path(f.path());
+        settle(&mut store);
+        store
+            .set_details(
+                SessionProvider::Codex,
+                ID,
+                "  Renderer overhaul  ",
+                "GUI, 项目, gui",
+            )
+            .unwrap();
+        store
+            .set_archived(SessionProvider::Codex, ID, true)
+            .unwrap();
+        settle(&mut store);
+        assert!(store.error().is_none());
+        let mut reopened = SessionLibraryStore::with_path(f.path());
+        settle(&mut reopened);
+        let snapshot = reopened.snapshot();
+        assert_eq!(
+            snapshot.alias(SessionProvider::Codex, ID),
+            Some("Renderer overhaul")
+        );
+        assert_eq!(snapshot.tags(SessionProvider::Codex, ID), ["gui", "项目"]);
+        assert!(snapshot.is_archived(SessionProvider::Codex, ID));
+        assert!(snapshot.is_pinned(SessionProvider::Codex, ID));
+        assert_eq!(snapshot.last_resumed(SessionProvider::Codex, ID), Some(42));
+        assert_eq!(snapshot.alias(SessionProvider::Claude, ID), None);
+        let wire: serde_json::Value = serde_json::from_slice(&fs::read(f.path()).unwrap()).unwrap();
+        assert_eq!(wire["version"], 2);
+    }
+    #[test]
+    fn multiple_windows_merge_details_archive_pin_and_history_for_the_same_identity() {
+        let f = Fixture::new();
+        let mut editor = SessionLibraryStore::with_path(f.path());
+        let mut browser = SessionLibraryStore::with_path(f.path());
+        settle(&mut editor);
+        settle(&mut browser);
+        let held = LibraryLock::acquire(&f.path()).unwrap();
+        editor
+            .set_details(SessionProvider::Codex, ID, "Release", "ready, review")
+            .unwrap();
+        browser
+            .set_archived(SessionProvider::Codex, ID, true)
+            .unwrap();
+        browser
+            .set_pinned(SessionProvider::Codex, ID, true)
+            .unwrap();
+        browser.record_resumed(SessionProvider::Codex, ID).unwrap();
+        drop(held);
+        settle(&mut editor);
+        settle(&mut browser);
+        editor.refresh();
+        settle(&mut editor);
+        let snapshot = editor.snapshot();
+        assert_eq!(snapshot.alias(SessionProvider::Codex, ID), Some("Release"));
+        assert_eq!(
+            snapshot.tags(SessionProvider::Codex, ID),
+            ["ready", "review"]
+        );
+        assert!(snapshot.is_pinned(SessionProvider::Codex, ID));
+        assert!(snapshot.is_archived(SessionProvider::Codex, ID));
+        assert!(snapshot.last_resumed(SessionProvider::Codex, ID).is_some());
+        // Clearing details must not clear independently written archive/pin/history.
+        editor
+            .set_details(SessionProvider::Codex, ID, "", "")
+            .unwrap();
+        settle(&mut editor);
+        assert_eq!(editor.snapshot().alias(SessionProvider::Codex, ID), None);
+        assert!(editor.snapshot().is_archived(SessionProvider::Codex, ID));
+        assert!(editor.snapshot().is_pinned(SessionProvider::Codex, ID));
+    }
+    #[test]
+    fn metadata_only_identity_survives_then_disappears_after_explicit_clear() {
+        let f = Fixture::new();
+        let mut store = SessionLibraryStore::with_path(f.path());
+        store
+            .set_details(SessionProvider::Claude, ID, "项目", "")
+            .unwrap();
+        settle(&mut store);
+        assert_eq!(store.snapshot().len(), 1);
+        assert_eq!(
+            store.snapshot().last_resumed(SessionProvider::Claude, ID),
+            None
+        );
+        store
+            .set_archived(SessionProvider::Claude, ID, true)
+            .unwrap();
+        store
+            .set_details(SessionProvider::Claude, ID, "", "")
+            .unwrap();
+        settle(&mut store);
+        assert_eq!(store.snapshot().len(), 1);
+        store
+            .set_archived(SessionProvider::Claude, ID, false)
+            .unwrap();
+        settle(&mut store);
+        assert!(store.snapshot().is_empty());
+    }
+    #[test]
+    fn invalid_editor_values_do_not_replace_saved_organization() {
+        let f = Fixture::new();
+        let mut store = SessionLibraryStore::with_path(f.path());
+        store
+            .set_details(SessionProvider::Codex, ID, "Keep me", "good")
+            .unwrap();
+        settle(&mut store);
+        let original = fs::read(f.path()).unwrap();
+        for (alias, tags) in [
+            ("x".repeat(161), "good".into()),
+            ("ok".into(), "x".repeat(33)),
+            ("invisible\u{202e}".into(), "good".into()),
+            ("newline\nname".into(), "good".into()),
+            ("ok".into(), "\n".into()),
+            ("ok".into(), "tag,".repeat(13)),
+        ] {
+            assert!(store
+                .set_details(SessionProvider::Codex, ID, &alias, &tags)
+                .is_err());
+        }
+        assert!(store
+            .set_archived(SessionProvider::Codex, "--last", true)
+            .is_err());
+        settle(&mut store);
+        assert_eq!(fs::read(f.path()).unwrap(), original);
+    }
+    #[test]
+    fn full_tag_set_can_be_reopened_and_saved_using_editor_delimiters() {
+        let f = Fixture::new();
+        let tags = (0..SESSION_TAG_LIMIT)
+            .map(|index| format!("{index:02}{}", "x".repeat(SESSION_TAG_MAX_BYTES - 2)))
+            .collect::<Vec<_>>();
+        {
+            let mut store = SessionLibraryStore::with_path(f.path());
+            store
+                .set_details(SessionProvider::Codex, ID, "Original", &tags.join(","))
+                .unwrap();
+            settle(&mut store);
+        }
+        let mut reopened = SessionLibraryStore::with_path(f.path());
+        settle(&mut reopened);
+        let editor_tags = reopened
+            .snapshot()
+            .tags(SessionProvider::Codex, ID)
+            .join(", ");
+        assert_eq!(editor_tags.len(), 406);
+        reopened
+            .set_details(SessionProvider::Codex, ID, "Renamed", &editor_tags)
+            .unwrap();
+        settle(&mut reopened);
+        assert!(reopened.error().is_none());
+        assert_eq!(reopened.snapshot().tags(SessionProvider::Codex, ID), tags);
+        assert_eq!(
+            reopened.snapshot().alias(SessionProvider::Codex, ID),
+            Some("Renamed")
+        );
+    }
+    #[test]
+    fn archive_and_details_queue_coalesce_without_erasing_one_another() {
+        let f = Fixture::new();
+        let held = LibraryLock::acquire(&f.path()).unwrap();
+        let mut store = SessionLibraryStore::with_path(f.path());
+        store
+            .set_details(SessionProvider::Claude, ID, "First draft", "one")
+            .unwrap();
+        store
+            .set_archived(SessionProvider::Claude, ID, true)
+            .unwrap();
+        store.set_pinned(SessionProvider::Claude, ID, true).unwrap();
+        store
+            .set_details(SessionProvider::Claude, ID, "Final draft", "two")
+            .unwrap();
+        store
+            .set_archived(SessionProvider::Claude, ID, false)
+            .unwrap();
+        drop(held);
+        settle(&mut store);
+        assert!(store.error().is_none());
+        assert_eq!(
+            store.snapshot().alias(SessionProvider::Claude, ID),
+            Some("Final draft")
+        );
+        assert_eq!(store.snapshot().tags(SessionProvider::Claude, ID), ["two"]);
+        assert!(store.snapshot().is_pinned(SessionProvider::Claude, ID));
+        assert!(!store.snapshot().is_archived(SessionProvider::Claude, ID));
+    }
+    #[test]
     fn concurrent_transactions_merge_unrelated_pins_and_receipts() {
         let f = Fixture::new();
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -653,7 +1062,7 @@ mod tests {
         for bytes in [
             b"not json".to_vec(),
             br#"{"version":1,"version":1,"sessions":[]}"#.to_vec(),
-            br#"{"version":2,"sessions":[]}"#.to_vec(),
+            br#"{"version":3,"sessions":[]}"#.to_vec(),
             vec![b'x'; MAX_FILE_BYTES as usize + 1],
         ] {
             let f = Fixture::new();

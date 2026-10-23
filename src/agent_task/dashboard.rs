@@ -132,6 +132,56 @@ impl DashboardRow {
             2
         }
     }
+    fn matches_text(&self, query: &str) -> bool {
+        let identity = self.id.to_string();
+        let fields = [
+            self.title.as_str(),
+            self.branch.as_str(),
+            self.repo_label.as_str(),
+            self.provider.display_name(),
+            self.status_detail.as_deref().unwrap_or_default(),
+            identity.as_str(),
+        ];
+        query.split_whitespace().all(|term| {
+            fields
+                .iter()
+                .any(|field| field.to_lowercase().contains(term))
+        })
+    }
+}
+
+/// Presentation ordering never changes lifecycle or action eligibility.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DashboardSort {
+    #[default]
+    Attention,
+    Recent,
+    Oldest,
+    Title,
+    Project,
+}
+impl DashboardSort {
+    pub const ALL: [Self; 5] = [
+        Self::Attention,
+        Self::Recent,
+        Self::Oldest,
+        Self::Title,
+        Self::Project,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Attention => "Needs you first",
+            Self::Recent => "Recently updated",
+            Self::Oldest => "Oldest update",
+            Self::Title => "Task name",
+            Self::Project => "Project",
+        }
+    }
+}
+impl std::fmt::Display for DashboardSort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
 }
 
 /// All constraints are ANDed. Repository matching uses the original exact path
@@ -225,17 +275,7 @@ impl DashboardSnapshot {
         let query = safe_inline_display(text.trim(), DASHBOARD_QUERY_MAX_BYTES).to_lowercase();
         let mut snapshot = Self::default();
         for row in rows {
-            let matches_text = query.is_empty()
-                || [
-                    row.title.as_str(),
-                    row.branch.as_str(),
-                    row.repo_label.as_str(),
-                    row.provider.display_name(),
-                    row.status_detail.as_deref().unwrap_or_default(),
-                ]
-                .iter()
-                .any(|field| field.to_lowercase().contains(&query));
-            if !matches_text {
+            if !row.matches_text(&query) {
                 continue;
             }
             snapshot.counts.add(row);
@@ -243,13 +283,7 @@ impl DashboardSnapshot {
                 snapshot.rows.push(row.clone());
             }
         }
-        snapshot.rows.sort_by_cached_key(|row| {
-            (
-                row.rank(),
-                std::cmp::Reverse(row.updated_at_ms),
-                row.id.to_string(),
-            )
-        });
+        snapshot.sort_rows(DashboardSort::default());
         snapshot
     }
 
@@ -270,17 +304,7 @@ impl DashboardSnapshot {
                 continue;
             }
             let row = DashboardRow::from_task(task, activity(task.id));
-            let matches_text = query.is_empty()
-                || [
-                    row.title.as_str(),
-                    row.branch.as_str(),
-                    row.repo_label.as_str(),
-                    row.provider.display_name(),
-                    row.status_detail.as_deref().unwrap_or_default(),
-                ]
-                .iter()
-                .any(|field| field.to_lowercase().contains(&query));
-            if !matches_text {
+            if !row.matches_text(&query) {
                 continue;
             }
             snapshot.counts.add(&row);
@@ -288,13 +312,7 @@ impl DashboardSnapshot {
                 snapshot.rows.push(row);
             }
         }
-        snapshot.rows.sort_by_cached_key(|row| {
-            (
-                row.rank(),
-                std::cmp::Reverse(row.updated_at_ms),
-                row.id.to_string(),
-            )
-        });
+        snapshot.sort_rows(DashboardSort::default());
         snapshot
     }
 
@@ -302,6 +320,47 @@ impl DashboardSnapshot {
     /// task merely because the previous selection is hidden or removed.
     pub fn selected_index(&self, selected: Option<TaskId>) -> Option<usize> {
         selected.and_then(|id| self.rows.iter().position(|row| row.id == id))
+    }
+    pub fn sort_rows(&mut self, sort: DashboardSort) {
+        self.rows.sort_by_cached_key(|row| {
+            let recent = u64::MAX - row.updated_at_ms;
+            let (name, rank, time) = match sort {
+                DashboardSort::Attention => (String::new(), row.rank(), recent),
+                DashboardSort::Recent => (String::new(), 0, recent),
+                DashboardSort::Oldest => (String::new(), 0, row.updated_at_ms),
+                DashboardSort::Title => (row.title.to_lowercase(), 0, recent),
+                DashboardSort::Project => (row.repo_label.to_lowercase(), row.rank(), recent),
+            };
+            (name, rank, time, row.id.to_string())
+        });
+    }
+    /// Explicit navigation only. Filtering/refresh must never call this to
+    /// silently replace a hidden selected task with a different identity.
+    pub fn step_selection(&self, selected: Option<TaskId>, forward: bool) -> Option<TaskId> {
+        let length = self.rows.len();
+        if length == 0 {
+            return None;
+        }
+        let next = match (self.selected_index(selected), forward) {
+            (Some(index), true) => (index + 1) % length,
+            (Some(index), false) => (index + length - 1) % length,
+            (None, true) => 0,
+            (None, false) => length - 1,
+        };
+        Some(self.rows[next].id)
+    }
+    pub fn next_attention(&self, selected: Option<TaskId>) -> Option<TaskId> {
+        let length = self.rows.len();
+        if length == 0 {
+            return None;
+        }
+        let start = self
+            .selected_index(selected)
+            .map_or(0, |index| (index + 1) % length);
+        (0..length)
+            .map(|offset| &self.rows[(start + offset) % length])
+            .find(|row| row.needs_attention)
+            .map(|row| row.id)
     }
 }
 
@@ -331,6 +390,112 @@ mod tests {
 
     fn project(tasks: &[AgentTask], filter: DashboardFilter<'_>) -> DashboardSnapshot {
         DashboardSnapshot::project(tasks, |_| DashboardActivity::default(), filter)
+    }
+
+    #[test]
+    fn management_sort_and_navigation_only_select_visible_stable_identities() {
+        let mut a = task(TaskStatus::WaitingForApproval);
+        a.title = "Zulu review".into();
+        a.repo_root = "/z-project".into();
+        a.updated_at_ms = 10;
+        let mut b = task(TaskStatus::Working);
+        b.title = "Alpha work".into();
+        b.repo_root = "/a-project".into();
+        b.updated_at_ms = 30;
+        let mut c = task(TaskStatus::WaitingForHuman);
+        c.title = "Beta input".into();
+        c.repo_root = "/a-project".into();
+        c.updated_at_ms = 20;
+        let tasks = vec![a, b, c];
+        let original = tasks.clone();
+        let mut snapshot = project(&tasks, DashboardFilter::default());
+        let counts = snapshot.counts.clone();
+        assert_eq!(
+            snapshot.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [tasks[2].id, tasks[0].id, tasks[1].id]
+        );
+        snapshot.sort_rows(DashboardSort::Recent);
+        assert_eq!(snapshot.rows[0].id, tasks[1].id);
+        snapshot.sort_rows(DashboardSort::Oldest);
+        assert_eq!(snapshot.rows[0].id, tasks[0].id);
+        snapshot.sort_rows(DashboardSort::Title);
+        assert_eq!(
+            snapshot.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [tasks[1].id, tasks[2].id, tasks[0].id]
+        );
+        assert_eq!(
+            snapshot.step_selection(Some(tasks[0].id), true),
+            Some(tasks[1].id)
+        );
+        assert_eq!(
+            snapshot.step_selection(Some(tasks[1].id), false),
+            Some(tasks[0].id)
+        );
+        assert_eq!(
+            snapshot.next_attention(Some(tasks[0].id)),
+            Some(tasks[2].id)
+        );
+        snapshot.sort_rows(DashboardSort::Project);
+        assert_eq!(snapshot.rows[0].id, tasks[2].id);
+        assert_eq!(snapshot.counts, counts);
+        assert_eq!(tasks, original);
+        let filtered = project(
+            &tasks,
+            DashboardFilter {
+                text: "alpha",
+                ..Default::default()
+            },
+        );
+        assert_eq!(filtered.selected_index(Some(tasks[0].id)), None);
+        assert_eq!(filtered.next_attention(Some(tasks[0].id)), None);
+        assert_eq!(
+            filtered.step_selection(Some(tasks[0].id), true),
+            Some(tasks[1].id)
+        );
+        assert_eq!(
+            DashboardSnapshot::default().step_selection(None, true),
+            None
+        );
+        assert_eq!(DashboardSnapshot::default().next_attention(None), None);
+    }
+
+    #[test]
+    fn task_search_terms_span_fields_and_can_find_exact_task_ids() {
+        let task = task(TaskStatus::Created);
+        let tasks = [task.clone()];
+        assert_eq!(
+            project(
+                &tasks,
+                DashboardFilter {
+                    text: "dashboard codex repo",
+                    ..Default::default()
+                }
+            )
+            .rows
+            .len(),
+            1
+        );
+        assert_eq!(
+            project(
+                &tasks,
+                DashboardFilter {
+                    text: &task.id.to_string(),
+                    ..Default::default()
+                }
+            )
+            .rows[0]
+                .id,
+            task.id
+        );
+        assert!(project(
+            &tasks,
+            DashboardFilter {
+                text: "dashboard missing",
+                ..Default::default()
+            }
+        )
+        .rows
+        .is_empty());
     }
 
     #[test]

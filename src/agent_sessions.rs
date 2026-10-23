@@ -7,10 +7,16 @@
 mod desktop_launch;
 mod library;
 mod preflight;
-pub use library::{SessionLibraryEntry, SessionLibrarySnapshot, SessionLibraryStore};
+pub use library::{
+    SessionLibraryEntry, SessionLibrarySnapshot, SessionLibraryStore, SessionOrganization,
+    SESSION_ALIAS_MAX_BYTES, SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
+};
 pub use preflight::{SessionPreflight, SessionPreflightState};
 mod search;
-pub use search::{SessionLibraryFilter, SessionQuery, SessionSearchIndex, SessionSort};
+pub use search::{
+    SessionArchiveFilter, SessionLibraryFilter, SessionProjectSummary, SessionQuery,
+    SessionSearchIndex, SessionSort,
+};
 
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
