@@ -271,7 +271,7 @@ fn workbench_unavailable_reason(
         action,
         SimpleGitNextHunk | SimpleGitPreviousHunk | SimpleGitStageHunk | SimpleGitUndoHunk
     ) {
-        if snapshot.modified {
+        if snapshot.modified && matches!(action, SimpleGitStageHunk | SimpleGitUndoHunk) {
             return "Save this buffer first; Git hunks describe the saved file";
         }
         if state.large_file {
@@ -574,6 +574,14 @@ mod tests {
             .unavailable_reason(&snapshot)
             .unwrap()
             .contains("Save this buffer"));
+        let next = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleGitNextHunk);
+        assert!(
+            !next
+                .unavailable_reason(&snapshot)
+                .unwrap()
+                .contains("Save this buffer"),
+            "Navigating cached live hunks must not require a saved buffer"
+        );
         let update = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimplePluginUpdate);
         let stop = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimplePluginStop);
         snapshot.workbench.plugins.available = true;

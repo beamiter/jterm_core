@@ -145,6 +145,12 @@ class SimpleEcosystemTests(unittest.TestCase):
         self.assertNotIn("simple_git_undo_hunk", dirty["capabilities"])
         self.workbench(e, "simple_git_stage_hunk", ok=False)
         self.assertEqual(len(self.requests(log, "stage")), 1)
+        # SimpleGit computes live buffer hunks. Editing must keep navigation
+        # available even though disk-mutating stage/discard remain guarded.
+        self.until(e, lambda: "simple_git_next_hunk" in e.state.get("capabilities", []))
+        self.workbench(e, "simple_git_next_hunk")
+        self.assertEqual(e.snapshot()["line"], 2)
+        self.assertTrue(e.snapshot()["modified"])
 
     def test_git_discard_defaults_to_cancel_and_leaves_file_untouched(self):
         e, log = self.git_editor()

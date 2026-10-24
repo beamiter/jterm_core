@@ -135,9 +135,21 @@ for line in sys.stdin:
         return e
 
     def capture(self, e: Editor, expression: str):
-        output = self.root / "capture.json"
+        # A reused pathname can return the previous expression's JSON while
+        # Vim is still draining queued PTY input (notably after yanking from a
+        # documentation split). Give each request its own result identity.
+        self.capture_serial = getattr(self, "capture_serial", 0) + 1
+        output = self.root / f"capture-{self.capture_serial}.json"
         e.ex("call writefile([json_encode(" + expression + ")], " + vim_string(output) + ")")
-        return json.loads(output.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            try:
+                return json.loads(output.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                # writefile creates the file before filling it; a zero-byte
+                # result is not an acknowledgement of the requested value.
+                e.pump(0.02)
+        self.fail("Vim did not finish capture: " + expression)
 
     def workbench(self, e: Editor, command: str, *, state=None, ok=True):
         source = state or e.snapshot()

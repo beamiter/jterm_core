@@ -171,7 +171,11 @@ for line in sys.stdin:
         self.assertFalse(e.snapshot()["build"]["running"])
         (self.root / "save.fail").unlink()
         e.request("save_and_build", command="cat main.txt > built.txt")
-        self.until(e, lambda: (self.root / "built.txt").exists())
+        # Shell redirection creates built.txt before cat has written it. Wait
+        # for this build's completion, then inspect its committed output.
+        self.until(e, lambda: (e.state.get("build", {}).get("command") == "cat main.txt > built.txt"
+                              and not e.state["build"]["running"]
+                              and e.state["build"]["exit_code"] == 0))
         self.assertEqual((self.root / "built.txt").read_text(), "organized\nsecond line\n")
 
 

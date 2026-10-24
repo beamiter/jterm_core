@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: beamiter/vimrc
-          ref: bc53d759e39442cc85bd57e9be9534393e77414a
+          ref: a53367a5ae86a0f75bd7d2450a39577e3e158e5f
           path: .providers/vimrc
           persist-credentials: false
       - name: Check out audited SimpleWhichKey provider
@@ -50,6 +50,27 @@ jobs:
           repository: beamiter/simplewhichkey
           ref: 365c9c34a68dded6c65ca0163f2443e880306b8a
           path: .providers/simplewhichkey
+          persist-credentials: false
+      - name: Check out audited SimplePlug workbench provider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: beamiter/simpleplug
+          ref: 8f1b16113b45e075e6636faff82cd7aa1ccc7327
+          path: .providers/simpleplug
+          persist-credentials: false
+      - name: Check out audited SimpleTree provider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: beamiter/simpletree
+          ref: 9e1556c4a653649a0382d13f0f6ea8579d2bd4fc
+          path: .providers/simpletree
+          persist-credentials: false
+      - name: Check out audited SimpleLine provider
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: beamiter/simpleline
+          ref: e7ab08e8bb71a2f48e815278a436f850e459ad16
+          path: .providers/simpleline
           persist-credentials: false
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
       - run: |
@@ -78,4 +99,5 @@ jobs:
           python3 runtime/vim9/test_render_popup_cards.py
           python3 runtime/vim9/test_lsp_popup_cards.py
           python3 runtime/vim9/test_vimrc_workbench.py
+          python3 runtime/vim9/test_simple_ecosystem.py
           python3 runtime/vim9/test_six_experience.py
