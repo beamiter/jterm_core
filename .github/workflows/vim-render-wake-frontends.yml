@@ -5,6 +5,9 @@ on:
       base:
         type: string
         required: true
+      core:
+        type: string
+        required: true
       patch_sha256:
         type: string
         default: ''
@@ -14,6 +17,7 @@ env:
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: '0'
   RUST_BACKTRACE: '1'
+  CORE: ${{ inputs.core }}
 jobs:
   validate:
     runs-on: ubuntu-24.04
@@ -31,12 +35,13 @@ jobs:
           set -euo pipefail
           app=${GITHUB_REPOSITORY##*/}
           case "$GITHUB_REPOSITORY" in beamiter/anvil|beamiter/forge|beamiter/ember|beamiter/frost) ;; *) exit 1;; esac
+          [[ "$CORE" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ ]]
           echo "APP=$app" >> "$GITHUB_ENV"
           git diff --exit-code "$BASE" -- src scripts packaging Cargo.toml Cargo.lock
           git init -q "$RUNNER_TEMP/wake-core"
-          git -C "$RUNNER_TEMP/wake-core" fetch -q --depth=1 https://github.com/beamiter/jterm_core.git 681c9312db0cac39ac603ae92d70acf97c7735ac
+          git -C "$RUNNER_TEMP/wake-core" fetch -q --depth=1 https://github.com/beamiter/jterm_core.git "$CORE"
           git -C "$RUNNER_TEMP/wake-core" checkout -q --detach FETCH_HEAD
-          test "$(git -C "$RUNNER_TEMP/wake-core" rev-parse HEAD)" = 681c9312db0cac39ac603ae92d70acf97c7735ac
+          test "$(git -C "$RUNNER_TEMP/wake-core" rev-parse HEAD)" = "$CORE"
           mkdir -p evidence
           if [ -n "$PATCH_SHA" ]; then
             git -C "$RUNNER_TEMP/wake-core" fetch -q --depth=1 https://github.com/beamiter/jterm_core.git 1470ea77b7738c8914429380063c2198dffb7be3
@@ -63,6 +68,7 @@ jobs:
           bash scripts/materialize-shared-core.sh
           cmp ../jterm_core/src/vim9.rs "$RUNNER_TEMP/wake-core/src/vim9.rs"
           cmp ../jterm_core/src/vim9_render_watch.rs "$RUNNER_TEMP/wake-core/src/vim9_render_watch.rs"
+          cmp ../jterm_core/runtime/vim9/bridge.vim "$RUNNER_TEMP/wake-core/runtime/vim9/bridge.vim"
           cp packaging/jterm-core-src.tar.gz.sha256 evidence/core-bundle.sha256
       - name: Install native build and isolated X11 prerequisites
         run: |
@@ -96,12 +102,22 @@ jobs:
         if: ${{ inputs.patch_sha256 != '' }}
         run: |
           set -o pipefail
-          cargo test --release --locked --bin "$APP" vim9_ide:: 2>&1 | tee evidence/ide-tests.txt
+          if [ "$APP" = frost ]; then
+            # Iced 0.14 gates its existing test-only Renderer=() behind
+            # debug_assertions. Keep the real binary and Clippy in release;
+            # run the unchanged widget/IDE tests in their supported profile.
+            echo 'Frost existing null-renderer tests: default test profile' > evidence/test-profile.txt
+            cargo test --locked --bin frost vim9_ide:: 2>&1 | tee evidence/ide-tests.txt
+          else
+            echo 'Ember IDE tests: release profile' > evidence/test-profile.txt
+            cargo test --release --locked --bin ember vim9_ide:: 2>&1 | tee evidence/ide-tests.txt
+          fi
           cargo clippy --release --locked --bin "$APP" --all-features -- -D warnings
       - name: Verify the actual bundled runtime
         run: |
           set -o pipefail
           python3 ../jterm_core/runtime/vim9/test_render_property_index.py -v 2>&1 | tee evidence/runtime-tests.txt
+          python3 ../jterm_core/runtime/vim9/test_render_theme_timing.py -v 2>&1 | tee evidence/theme-tests.txt
           cargo test --locked --manifest-path ../jterm_core/Cargo.toml --lib render_watch 2>&1 | tee evidence/watch-tests.txt
       - name: Prepare a guarded clean candidate, leaving master unchanged
         env:
@@ -110,9 +126,9 @@ jobs:
           PATCH_SHA: ${{ inputs.patch_sha256 }}
         run: |
           python3 - <<'PY'
-          import base64,json,os,subprocess,urllib.request,shutil
+          import base64,json,os,subprocess,urllib.request
           from pathlib import Path
-          base=os.environ['BASE']
+          base=os.environ['BASE'];core=os.environ['CORE']
           files=['packaging/jterm-core-src.tar.gz','packaging/jterm-core-src.tar.gz.sha256']
           temporary=['.github/workflows/vim-render-wake-candidate.yml']
           if os.environ['PATCH_SHA']:
@@ -134,16 +150,16 @@ jobs:
               if not path.endswith('.tar.gz'):
                   target=Path('evidence/sources')/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
           tree=request('/git/trees',{'base_tree':request('/git/commits/'+base)['tree']['sha'],'tree':entries})['sha']
-          message='perf(vim): synchronize coalesced render publication core'
+          message='perf(vim): synchronize event notifications and post-command GUI theme refresh'
           if os.environ['PATCH_SHA']:
-              message='perf(vim): replace periodic frame polling with coalesced render notifications'
-          message+='\n\nBundle jterm_core 681c9312db0cac39ac603ae92d70acf97c7735ac. Preserve source-frame identity, explicit compatibility clears, atomic input snapshots and editor exit. Dependency locks and wire protocol are unchanged.\n\nValidate deterministic core packaging, production consumer build/check and actual bundled runtime/watch tests.'
+              message='perf(vim): wake native paint on events and publish post-command themes promptly'
+          message+='\n\nBundle jterm_core '+core+'. Preserve source-frame identity, explicit compatibility clears, atomic input snapshots and editor exit. Refresh GUI definitions after Ex execution without depending on the 750ms fallback poll. Dependency locks and wire protocol are unchanged.\n\nValidate deterministic core packaging, production consumer build/check and actual bundled runtime, polling-independent theme and watch tests.'
           if os.environ['PATCH_SHA']:
-              message+=' Validate native GUI RGB pixels after real XTest/Vim input, production IDE tests and strict release Clippy. Pixel timing is a software-X11 capture bound, not physical display latency. Keep the pixel probe reproducible in scripts.'
+              message+=' Validate native GUI RGB pixels after real XTest/Vim input, production IDE tests in the supported renderer profile and strict release Clippy. Pixel timing is a software-X11 capture bound, not physical display latency. Keep the pixel probe reproducible in scripts.'
           else:
               message+=' GTK keeps its existing compositor-frame-clock consumer; this commit does not claim a new GTK GUI regression run.'
           commit=request('/git/commits',{'message':message,'tree':tree,'parents':[base]})['sha']
-          Path('evidence/candidate.json').write_text(json.dumps({'base':base,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
+          Path('evidence/candidate.json').write_text(json.dumps({'base':base,'core':core,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
           Path('evidence/candidate.patch').write_bytes(subprocess.check_output(['git','diff',base,'--',*[p for p in files if not p.endswith('.tar.gz')]]))
           print('VALIDATED_CANDIDATE='+commit)
           PY
