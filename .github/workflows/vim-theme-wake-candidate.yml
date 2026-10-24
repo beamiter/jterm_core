@@ -1,0 +1,90 @@
+name: Native Vim post-command theme candidate
+on:
+  push:
+    branches: [codex/vim-render-wake-20261024]
+    paths: [.ci/vim-theme-defer.patch.b64, .github/workflows/vim-theme-wake-candidate.yml]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 681c9312db0cac39ac603ae92d70acf97c7735ac
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Apply exact theme candidate to published core
+        run: |
+          mkdir -p evidence
+          git show "$GITHUB_SHA":.ci/vim-theme-defer.patch.b64 > "$RUNNER_TEMP/theme.b64"
+          git show HEAD:runtime/vim9/bridge.vim > "$RUNNER_TEMP/bridge-before.vim"
+          python3 - <<'PY'
+          import base64,zlib,hashlib,subprocess,os
+          from pathlib import Path
+          patch=zlib.decompress(base64.b64decode((Path(os.environ['RUNNER_TEMP'])/'theme.b64').read_text()))
+          assert hashlib.sha256(patch).hexdigest()=='cd6b539b8311aa4ded787e9afe86ff18db9d48199dd38f3d54f297a7ba6b505e'
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          subprocess.run(['git','add','-N','runtime/vim9/test_render_theme_timing.py'],check=True)
+          subprocess.run(['git','diff','--check'],check=True)
+          PY
+      - name: Install real Vim prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
+      - name: Verify old runtime fails the same polling-independent assertion
+        run: |
+          status=0
+          VIM9_THEME_RUNTIME="$RUNNER_TEMP/bridge-before.vim" python3 runtime/vim9/test_render_theme_timing.py PostCommandThemeTests.test_highlight_changes_publish_without_poll -v > evidence/before-regression.txt 2>&1 || status=$?
+          test "$status" -ne 0
+          grep -F 'No expected Vim paint' evidence/before-regression.txt
+      - name: Verify actual post-command theme events
+        run: |
+          set -o pipefail
+          python3 runtime/vim9/test_render_theme_timing.py -v 2>&1 | tee evidence/theme-tests.txt
+          VIM9_PROPERTY_BASELINE="$RUNNER_TEMP/bridge-before.vim" python3 -m unittest discover -s runtime/vim9 -p 'test_render_*.py' -v 2>&1 | tee evidence/render-tests.txt
+          python3 runtime/vim9/test_benchmark_metrics.py -v 2>&1 | tee evidence/benchmark-integrity.txt
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          cache-on-failure: true
+      - name: Validate embedded runtime and real Vim transport
+        run: |
+          set -o pipefail
+          cargo test --locked --lib vim9 2>&1 | tee evidence/rust-tests.txt
+          cargo test --locked --lib vim9::tests::real_vim9_round_trip -- --ignored 2>&1 | tee evidence/real-vim.txt
+      - name: Export guarded two-file candidate without changing master
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64,json,os,subprocess,urllib.request,shutil
+          from pathlib import Path
+          base='681c9312db0cac39ac603ae92d70acf97c7735ac'
+          files=['runtime/vim9/bridge.vim','runtime/vim9/test_render_theme_timing.py']
+          assert set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())==set(files)
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==base
+          api='https://api.github.com/repos/beamiter/jterm_core'
+          def request(path,data=None):
+              req=urllib.request.Request(api+path,data=None if data is None else json.dumps(data).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=30) as r:return json.load(r)
+          assert request('/git/ref/heads/master')['object']['sha']==base
+          entries=[]
+          for path in files:
+              data=Path(path).read_bytes();sha=request('/git/blobs',{'encoding':'base64','content':base64.b64encode(data).decode()})['sha']
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+              target=Path('evidence/sources')/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+          tree=request('/git/trees',{'base_tree':request('/git/commits/'+base)['tree']['sha'],'tree':entries})['sha']
+          message='fix(vim): refresh GUI themes after Ex execution before publishing paint\n\nModeChanged can run before the pending :highlight command. Mark its theme dirty and resolve definitions at the next actual EmitRender, rather than caching the old value until the 750ms reconciliation timer. Preserve coalescing, explicit fallback and periodic discovery of asynchronous plugin changes.\n\nAdd six real-Vim timing/cancellation/link/background/batched/repeated-change regressions with reconciliation polling stopped and without forced snapshots after measured input. Prove the old runtime fails the identical assertion, run the full renderer suite with differential replay, benchmark integrity, Rust Vim tests and real PTY round trip. No dependencies, wire protocol or Rust interface changes.'
+          commit=request('/git/commits',{'message':message,'tree':tree,'parents':[base]})['sha']
+          Path('evidence/candidate.json').write_text(json.dumps({'base':base,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
+          Path('evidence/candidate.patch').write_bytes(subprocess.check_output(['git','diff','--',*files]))
+          print('VALIDATED_CANDIDATE='+commit)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: vim-theme-wake-evidence
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: error
