@@ -1,0 +1,40 @@
+name: Native Vim next-step investigation
+
+on:
+  push:
+    branches: [codex/vim-native-next-20261024]
+    paths: [.github/workflows/vim-native-next.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Collect immutable public source snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p snapshots clones
+          while read -r repo revision; do
+            git init -q "clones/$repo"
+            git -C "clones/$repo" fetch -q --depth=1 "https://github.com/beamiter/$repo.git" "$revision"
+            test "$(git -C "clones/$repo" rev-parse FETCH_HEAD)" = "$revision"
+            git -C "clones/$repo" archive --format=tar.gz --prefix="$repo/" --output="$GITHUB_WORKSPACE/snapshots/$repo.tar.gz" FETCH_HEAD
+            printf '%s %s\n' "$repo" "$revision" >> snapshots/revisions.txt
+          done <<'REVISIONS'
+          jterm_core 0cdb8d4e578066c16af42fa58bde08a2002c6796
+          anvil 2bcad9e95ddb61442c4df218bf0eb3562ac6764a
+          forge 75d68ad9d4c5a8177b2d144800c63cad59ce988b
+          ember 387ec628ecab655819be3b571666f070673590a1
+          frost 3f40e0b483887ad7262aec7cad3fdd42946e4887
+          REVISIONS
+          (cd snapshots && sha256sum *.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: vim-native-pinned-sources
+          path: snapshots/
+          if-no-files-found: error
+          retention-days: 3
