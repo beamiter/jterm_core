@@ -1,0 +1,156 @@
+name: Validate event-driven Vim frontend
+on:
+  workflow_call:
+    inputs:
+      base:
+        type: string
+        required: true
+      patch_sha256:
+        type: string
+        default: ''
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prepare exact frontend and published core
+        env:
+          BASE: ${{ inputs.base }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+        run: |
+          set -euo pipefail
+          app=${GITHUB_REPOSITORY##*/}
+          case "$GITHUB_REPOSITORY" in beamiter/anvil|beamiter/forge|beamiter/ember|beamiter/frost) ;; *) exit 1;; esac
+          echo "APP=$app" >> "$GITHUB_ENV"
+          git diff --exit-code "$BASE" -- src scripts packaging Cargo.toml Cargo.lock
+          git init -q "$RUNNER_TEMP/wake-core"
+          git -C "$RUNNER_TEMP/wake-core" fetch -q --depth=1 https://github.com/beamiter/jterm_core.git 681c9312db0cac39ac603ae92d70acf97c7735ac
+          git -C "$RUNNER_TEMP/wake-core" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/wake-core" rev-parse HEAD)" = 681c9312db0cac39ac603ae92d70acf97c7735ac
+          mkdir -p evidence
+          if [ -n "$PATCH_SHA" ]; then
+            git -C "$RUNNER_TEMP/wake-core" fetch -q --depth=1 https://github.com/beamiter/jterm_core.git 1470ea77b7738c8914429380063c2198dffb7be3
+            git -C "$RUNNER_TEMP/wake-core" show FETCH_HEAD:.ci/render-wake-pixels.b64 > "$RUNNER_TEMP/pixel-probe.b64"
+            python3 - <<'PY'
+          import base64,zlib,hashlib,subprocess,os
+          from pathlib import Path
+          patch=zlib.decompress(base64.b64decode(Path('.ci/vim-render-wake.patch.b64').read_text()))
+          assert hashlib.sha256(patch).hexdigest()==os.environ['PATCH_SHA']
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          probe=zlib.decompress(base64.b64decode((Path(os.environ['RUNNER_TEMP'])/'pixel-probe.b64').read_text()))
+          assert hashlib.sha256(probe).hexdigest()=='eaa0aad8cd62398643a3674939a68bba3da90e6f11307bdc28edb166997b6c00'
+          Path('scripts/native-vim9-render-wake-smoke.py').write_bytes(probe)
+          subprocess.run(['git','add','-N','scripts/test-vim9-render-wake.py','scripts/native-vim9-render-wake-smoke.py'],check=True)
+          PY
+            python3 scripts/test-vim9-render-wake.py
+            python3 -m py_compile scripts/native-vim9-render-wake-smoke.py
+          fi
+          bash scripts/package-shared-core.sh "$RUNNER_TEMP/wake-core"
+          cp packaging/jterm-core-src.tar.gz "$RUNNER_TEMP/first-bundle.tar.gz"
+          bash scripts/package-shared-core.sh "$RUNNER_TEMP/wake-core"
+          cmp packaging/jterm-core-src.tar.gz "$RUNNER_TEMP/first-bundle.tar.gz"
+          bash scripts/materialize-shared-core.sh
+          cmp ../jterm_core/src/vim9.rs "$RUNNER_TEMP/wake-core/src/vim9.rs"
+          cmp ../jterm_core/src/vim9_render_watch.rs "$RUNNER_TEMP/wake-core/src/vim9_render_watch.rs"
+          cp packaging/jterm-core-src.tar.gz.sha256 evidence/core-bundle.sha256
+      - name: Install native build and isolated X11 prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y pkg-config libfontconfig1-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev libxrandr-dev libxkbcommon-dev libegl1-mesa-dev libgl1-mesa-dev libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev xvfb xauth xdotool imagemagick python3-pil fonts-dejavu-core fonts-noto-cjk libxtst6 libxkbcommon-x11-0 mesa-utils vim-nox ripgrep
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: release
+          cache-on-failure: true
+      - name: Format and build production consumer
+        run: |
+          set -o pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+          if [ "$APP" = ember ] || [ "$APP" = frost ]; then
+            cargo build --release --all-features --locked --bin "$APP" 2>&1 | tee evidence/build.txt
+          else
+            cargo check --locked --bin "$APP" 2>&1 | tee evidence/build.txt
+          fi
+      - name: Real native RGB presentation after XTest input
+        if: ${{ inputs.patch_sha256 != '' }}
+        timeout-minutes: 4
+        run: |
+          set -o pipefail
+          xvfb-run -a -s '-screen 0 1600x1100x24' /usr/bin/python3 scripts/native-vim9-render-wake-smoke.py --binary "target/release/$APP" --app "$APP" --samples 16 --output evidence/pixels
+      - name: Consumer Vim IDE regressions
+        if: ${{ inputs.patch_sha256 != '' }}
+        run: |
+          set -o pipefail
+          cargo test --release --locked --bin "$APP" vim9_ide:: 2>&1 | tee evidence/ide-tests.txt
+          cargo clippy --release --locked --bin "$APP" --all-features -- -D warnings
+      - name: Verify the actual bundled runtime
+        run: |
+          set -o pipefail
+          python3 ../jterm_core/runtime/vim9/test_render_property_index.py -v 2>&1 | tee evidence/runtime-tests.txt
+          cargo test --locked --manifest-path ../jterm_core/Cargo.toml --lib render_watch 2>&1 | tee evidence/watch-tests.txt
+      - name: Prepare a guarded clean candidate, leaving master unchanged
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ inputs.base }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import base64,json,os,subprocess,urllib.request,shutil
+          from pathlib import Path
+          base=os.environ['BASE']
+          files=['packaging/jterm-core-src.tar.gz','packaging/jterm-core-src.tar.gz.sha256']
+          temporary=['.github/workflows/vim-render-wake-candidate.yml']
+          if os.environ['PATCH_SHA']:
+              files += ['src/vim9_ide.rs','scripts/test-vim9-render-wake.py','scripts/native-vim9-render-wake-smoke.py']
+              temporary += ['.ci/vim-render-wake.patch.b64']
+          changed=set(subprocess.check_output(['git','diff',base,'--name-only'],text=True).splitlines())
+          assert changed==set(files+temporary), changed
+          assert not subprocess.check_output(['git','diff',base,'--','Cargo.toml','Cargo.lock'])
+          api='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']
+          def request(path,data=None):
+              req=urllib.request.Request(api+path,data=None if data is None else json.dumps(data).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=30) as r:return json.load(r)
+          assert request('/git/ref/heads/master')['object']['sha']==base, 'master advanced; rebase required'
+          entries=[]
+          for path in files:
+              data=Path(path).read_bytes()
+              sha=request('/git/blobs',{'encoding':'base64','content':base64.b64encode(data).decode()})['sha']
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+              if not path.endswith('.tar.gz'):
+                  target=Path('evidence/sources')/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
+          tree=request('/git/trees',{'base_tree':request('/git/commits/'+base)['tree']['sha'],'tree':entries})['sha']
+          message='perf(vim): synchronize coalesced render publication core'
+          if os.environ['PATCH_SHA']:
+              message='perf(vim): replace periodic frame polling with coalesced render notifications'
+          message+='\n\nBundle jterm_core 681c9312db0cac39ac603ae92d70acf97c7735ac. Preserve source-frame identity, explicit compatibility clears, atomic input snapshots and editor exit. Dependency locks and wire protocol are unchanged.\n\nValidate deterministic core packaging, production consumer build/check and actual bundled runtime/watch tests.'
+          if os.environ['PATCH_SHA']:
+              message+=' Validate native GUI RGB pixels after real XTest/Vim input, production IDE tests and strict release Clippy. Pixel timing is a software-X11 capture bound, not physical display latency. Keep the pixel probe reproducible in scripts.'
+          else:
+              message+=' GTK keeps its existing compositor-frame-clock consumer; this commit does not claim a new GTK GUI regression run.'
+          commit=request('/git/commits',{'message':message,'tree':tree,'parents':[base]})['sha']
+          Path('evidence/candidate.json').write_text(json.dumps({'base':base,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
+          Path('evidence/candidate.patch').write_bytes(subprocess.check_output(['git','diff',base,'--',*[p for p in files if not p.endswith('.tar.gz')]]))
+          print('VALIDATED_CANDIDATE='+commit)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: vim-render-wake-frontend-evidence
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: error
