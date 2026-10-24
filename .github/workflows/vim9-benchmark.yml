@@ -1,0 +1,48 @@
+name: Vim benchmark sample integrity
+on:
+  push:
+    branches: [master, 'vim9/benchmark-*']
+    paths:
+      - 'runtime/vim9/**'
+      - '.github/workflows/vim9-benchmark.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'runtime/vim9/**'
+      - '.github/workflows/vim9-benchmark.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: vim9-benchmark-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  benchmark-integrity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate sample identity and percentile statistics
+        run: python3 runtime/vim9/test_benchmark_metrics.py -v
+      - name: Install real Vim
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox
+      - name: Exercise one and two split workloads against real Vim
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 runtime/vim9/benchmark_render.py --lines 1000 --samples 5 --windows 1 2 | tee "$RUNNER_TEMP/vim9-render-benchmark.json"
+          python3 runtime/vim9/benchmark_scroll.py --lines 1000 --samples 5 --windows 1 2 | tee "$RUNNER_TEMP/vim9-scroll-benchmark.json"
+          {
+            echo '## Semantic benchmark smoke results'
+            echo 'These samples check workload correctness, not GUI FPS or a hardware latency budget.'
+            echo '### PTY Ctrl-E'
+            echo '```json'
+            cat "$RUNNER_TEMP/vim9-render-benchmark.json"
+            echo '```'
+            echo '### Source-bound scroll acknowledgement'
+            echo '```json'
+            cat "$RUNNER_TEMP/vim9-scroll-benchmark.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

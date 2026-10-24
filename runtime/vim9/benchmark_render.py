@@ -14,24 +14,13 @@ import collections
 import json
 import os
 from pathlib import Path
-import statistics
 import subprocess
 import tempfile
 import time
 
+from benchmark_metrics import distribution, scroll_frame_matches, validate_workload
 from test_bridge import Editor, VIM
 import test_bridge
-
-
-def distribution(values):
-    ordered = sorted(values)
-    return {
-        "samples": len(values),
-        "min_ms": round(ordered[0], 3),
-        "median_ms": round(statistics.median(ordered), 3),
-        "p95_ms": round(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))], 3),
-        "max_ms": round(ordered[-1], 3),
-    }
 
 
 def process_cpu_seconds(pid):
@@ -44,6 +33,7 @@ def process_cpu_seconds(pid):
 
 
 def measure(lines: int, samples: int, windows: int):
+    validate_workload(lines, samples, windows)
     with tempfile.TemporaryDirectory(prefix="jterm-vim9-bench-") as directory:
         root = Path(directory)
         source = root / "large.rs"
@@ -72,11 +62,11 @@ def measure(lines: int, samples: int, windows: int):
             run_counts = []
             cpu_before = process_cpu_seconds(e.process.pid)
             for _ in range(samples):
-                revision = frame["revision"]
+                previous = frame
                 e.messages = collections.deque(m for m in e.messages if m.get("event") != "render")
                 start = time.perf_counter()
                 e.keys(b"\x05")  # Vim Ctrl-E: scroll the active window by one line.
-                frame = e.wait(lambda m: m.get("event") == "render" and m.get("revision", 0) > revision)
+                frame = e.wait(lambda m: scroll_frame_matches(m, previous))
                 scrolling.append((time.perf_counter() - start) * 1000)
                 if not frame.get("supported"):
                     raise AssertionError(frame.get("fallback_reason"))
@@ -113,8 +103,11 @@ def main():
     args = parser.parse_args()
     if not VIM:
         parser.error("Install Vim 9 or set VIM9_TEST_VIM")
-    if args.lines < 200 or args.samples < 1 or any(w < 1 or w > 2 for w in args.windows):
-        parser.error("Use at least 200 lines, one sample, and one or two windows")
+    try:
+        for windows in args.windows:
+            validate_workload(args.lines, args.samples, windows)
+    except ValueError as error:
+        parser.error(str(error))
     if args.runtime:
         if not args.runtime.is_file():
             parser.error("--runtime must name an existing bridge.vim file")
@@ -122,6 +115,8 @@ def main():
     result = {
         "metric": "input-to-semantic-frame, not displayed frame time or FPS",
         "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
         "runtime": str(test_bridge.RUNTIME),
         "vim": subprocess.check_output([str(VIM), "--version"], text=True).splitlines()[0],
         "results": [measure(args.lines, args.samples, w) for w in args.windows],

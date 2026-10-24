@@ -13,12 +13,14 @@ import subprocess
 import tempfile
 import time
 
-from benchmark_render import distribution, process_cpu_seconds
+from benchmark_metrics import distribution, scroll_frame_matches, validate_workload
+from benchmark_render import process_cpu_seconds
 import test_bridge
 from test_bridge import Editor, VIM
 
 
 def measure(samples, windows, lines):
+    validate_workload(lines, samples, windows)
     with tempfile.TemporaryDirectory(prefix="vim9-scroll-bench-") as directory:
         root = Path(directory)
         editor = Editor(root, authenticate=False)
@@ -38,6 +40,8 @@ def measure(samples, windows, lines):
             frame = editor.gui_frame()
             if not frame["supported"]:
                 raise AssertionError(frame.get("fallback_reason"))
+            if len(frame.get("windows", [])) != windows:
+                raise AssertionError("Wrong window count")
             active = frame["window"]
             window = next(w for w in frame["windows"] if w["window"] == active)
             previous_cursor = window["cursor"].get("line")
@@ -45,13 +49,13 @@ def measure(samples, windows, lines):
             durations = []
             cpu_before = process_cpu_seconds(editor.process.pid)
             for _ in range(samples):
+                previous = frame
                 start = time.perf_counter()
                 reply = editor.request("scroll_view", lines=1, **{
                     key: window[key] for key in
                     ("window", "buffer", "changedtick", "topline", "leftcol")})
                 frame = editor.wait(lambda m:
-                    m.get("event") in ("render", "render_delta")
-                    and any(w.get("scroll_ack") == reply["id"] for w in m.get("windows", [])))
+                    scroll_frame_matches(m, previous, request_id=reply["id"]))
                 durations.append((time.perf_counter() - start) * 1000)
                 if not frame["supported"] or frame["seq"] >= reply["seq"]:
                     raise AssertionError("Scroll lost its supported, ordered semantic acknowledgement")
@@ -81,16 +85,21 @@ def main():
     parser.add_argument("--windows", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--lines", type=int, default=100_000)
     args = parser.parse_args()
-    if not VIM or args.samples < 1 or args.lines < args.samples + 200:
-        parser.error("Install Vim 9, use positive samples and at least samples + 200 lines")
-    if any(w not in (1, 2) for w in args.windows):
-        parser.error("Use one or two windows")
+    if not VIM:
+        parser.error("Install Vim 9 or set VIM9_TEST_VIM")
+    try:
+        for windows in args.windows:
+            validate_workload(args.lines, args.samples, windows)
+    except ValueError as error:
+        parser.error(str(error))
     if args.runtime:
         if not args.runtime.is_file():
             parser.error("--runtime must name an existing bridge.vim")
         test_bridge.RUNTIME = args.runtime.resolve()
     print(json.dumps({
         "metric": "request to ordered semantic ack/response; not displayed latency or FPS",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
         "runtime": str(test_bridge.RUNTIME),
         "vim": subprocess.check_output([VIM, "--version"], text=True).splitlines()[0],
         "results": [measure(args.samples, windows, args.lines) for windows in args.windows],
