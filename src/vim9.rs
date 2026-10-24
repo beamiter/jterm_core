@@ -53,6 +53,10 @@ pub use render::{
     Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow,
 };
 
+#[path = "vim9_render_watch.rs"]
+mod render_watch;
+pub use render_watch::{Vim9RenderCancel, Vim9RenderUpdate, Vim9RenderWaitError, Vim9RenderWatch};
+
 #[path = "vim9_cursor.rs"]
 mod cursor;
 pub use cursor::{Vim9CursorAppearance, Vim9CursorBlink, Vim9CursorShape};
@@ -511,6 +515,7 @@ struct Shared {
     render_baseline: Option<Arc<Vim9RenderFrame>>,
     render_revision: u64,
     render_resync: bool,
+    render_publisher: render_watch::Publisher,
 }
 
 struct SessionInner {
@@ -641,6 +646,7 @@ impl Vim9Session {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = bounded(MAX_PENDING);
@@ -708,6 +714,21 @@ impl Vim9Session {
     /// buffer list, diagnostics, search results or build output.
     pub fn render_snapshot(&self) -> Option<Arc<Vim9RenderFrame>> {
         self.0.shared.lock().snapshot.render.clone()
+    }
+
+    /// Subscribe atomically to the current paint and subsequent accepted changes.
+    /// Updates coalesce in one slot; the subscription does not retain this session.
+    /// Use `input_snapshot()` (not a notification) to reconcile command completion.
+    pub fn watch_render(&self) -> io::Result<Vim9RenderWatch> {
+        let mut shared = self.0.shared.lock();
+        if shared.entry_id != Some(self.0.entry_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Vim entry ended",
+            ));
+        }
+        let frame = shared.snapshot.render.clone();
+        shared.render_publisher.subscribe(frame)
     }
 
     /// Sample native paint and bounded outstanding request IDs under one lock.
@@ -914,6 +935,9 @@ fn set_disconnected(shared: &Mutex<Shared>, error: Option<String>) {
     if let Some(error) = error {
         shared.snapshot.error = Some(error);
     }
+    let wakers = shared.render_publisher.publish(None, true);
+    drop(shared);
+    render_watch::dispatch(wakers);
 }
 
 fn bridge_worker(
@@ -1111,6 +1135,7 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
     if shared.entry_id.is_none() {
         return Ok(());
     }
+    let previous_render = shared.snapshot.render.clone();
     match value.get("event").and_then(Value::as_str) {
         Some("state") => {
             let mut snapshot: Vim9Snapshot =
@@ -1255,7 +1280,21 @@ fn apply_event(value: Value, shared: &Mutex<Shared>) -> io::Result<()> {
         // unknown event is interpreted as a command or written to the PTY.
         _ => {}
     }
+    let changed = match (&previous_render, &shared.snapshot.render) {
+        (Some(before), Some(after)) => !Arc::ptr_eq(before, after),
+        (None, None) => false,
+        _ => true,
+    };
+    let wakers = if changed {
+        let frame = shared.snapshot.render.clone();
+        shared.render_publisher.publish(frame, false)
+    } else {
+        Vec::new()
+    };
     drop(shared);
+    // A frontend executor may re-enter snapshot APIs from wake(). Never run
+    // it with the shared session lock held.
+    render_watch::dispatch(wakers);
     if let Some(command) = completed_palette {
         workspace::remember_command(command.id());
     }
@@ -1290,6 +1329,112 @@ mod tests {
             uuid::Uuid::new_v4(),
         )
         .unwrap()
+    }
+
+    fn watch_frame(revision: u64) -> Value {
+        json!({"event":"render","revision":revision,"supported":true,"mode":"n",
+            "rows":5,"columns":10,"window":10,"buffer":1,
+            "view":{"row":0,"column":0,"rows":4,"columns":10}})
+    }
+
+    #[test]
+    fn render_watch_accepts_new_paint_but_not_duplicates_metadata_or_commands() {
+        let scratch = Scratch::new();
+        let session = session(&scratch);
+        let mut watch = session.watch_render().unwrap();
+        assert!(watch.recv().unwrap().frame.is_none());
+        apply_event(watch_frame(1), &session.0.shared).unwrap();
+        let update = watch.recv().unwrap();
+        assert_eq!(update.frame.unwrap().revision, 1);
+        assert!(update.published_at <= Instant::now());
+        apply_event(watch_frame(1), &session.0.shared).unwrap();
+        apply_event(json!({"event":"state","mode":"n"}), &session.0.shared).unwrap();
+        apply_event(
+            json!({"event":"response","id":99,"ok":true}),
+            &session.0.shared,
+        )
+        .unwrap();
+        assert!(matches!(
+            watch.recv_timeout(Duration::ZERO),
+            Err(Vim9RenderWaitError::Timeout)
+        ));
+        apply_event(json!({"event":"state","mode":"i"}), &session.0.shared).unwrap();
+        assert!(
+            watch.recv().unwrap().frame.is_none(),
+            "metadata invalidation must clear native paint"
+        );
+    }
+
+    #[test]
+    fn render_watch_resync_clear_disable_and_revoke_replace_pending_paint() {
+        let scratch = Scratch::new();
+        let session = session(&scratch);
+        let mut watch = session.watch_render().unwrap();
+        apply_event(watch_frame(1), &session.0.shared).unwrap();
+        apply_event(
+            json!({"event":"render_delta","revision":3,"base_revision":2}),
+            &session.0.shared,
+        )
+        .unwrap();
+        assert!(watch.recv().unwrap().frame.is_none());
+        apply_event(watch_frame(2), &session.0.shared).unwrap();
+        assert!(matches!(
+            watch.recv_timeout(Duration::ZERO),
+            Err(Vim9RenderWaitError::Timeout)
+        ));
+        apply_event(watch_frame(4), &session.0.shared).unwrap();
+        assert_eq!(watch.recv().unwrap().frame.unwrap().revision, 4);
+        apply_event(json!({"event":"render_disabled"}), &session.0.shared).unwrap();
+        assert!(watch.recv().unwrap().frame.is_none());
+        apply_event(watch_frame(5), &session.0.shared).unwrap();
+        session.revoke();
+        assert!(watch.recv().unwrap().frame.is_none());
+        assert!(watch.recv().is_none());
+        apply_event(watch_frame(6), &session.0.shared).unwrap();
+        assert!(watch.recv().is_none());
+        assert!(session.watch_render().is_err());
+    }
+
+    #[test]
+    fn render_watch_does_not_retain_editor_lifetime() {
+        let scratch = Scratch::new();
+        let session = session(&scratch);
+        let mut watch = session.watch_render().unwrap();
+        let weak = Arc::downgrade(&session.0);
+        drop(session);
+        assert!(weak.upgrade().is_none());
+        assert!(watch.recv().unwrap().frame.is_none());
+        assert!(watch.recv().is_none());
+    }
+
+    #[test]
+    fn render_watch_waker_can_read_session_without_lock_reentry_deadlock() {
+        use std::future::Future;
+        use std::task::{Context, Wake, Waker};
+        struct Reenter(Arc<Mutex<Shared>>);
+        impl Wake for Reenter {
+            fn wake(self: Arc<Self>) {
+                assert!(
+                    self.0.try_lock().is_some(),
+                    "frontend waker ran under Shared's lock"
+                );
+            }
+        }
+        let scratch = Scratch::new();
+        let session = session(&scratch);
+        let mut watch = session.watch_render().unwrap();
+        watch.recv();
+        let waker = Waker::from(Arc::new(Reenter(session.0.shared.clone())));
+        let mut next = Box::pin(watch.changed());
+        assert!(next
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        apply_event(watch_frame(1), &session.0.shared).unwrap();
+        assert!(next
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready());
     }
 
     #[test]
@@ -1382,6 +1527,7 @@ mod tests {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         });
         apply_event(
             json!({"event":"response","id":9001,"ok":false,"error":"no history"}),
@@ -1523,6 +1669,7 @@ mod tests {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         });
         let frame = json!({
             "event":"render", "revision":2, "supported":true, "mode":"n",
@@ -1585,6 +1732,7 @@ mod tests {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         });
         let full = json!({"event":"render","revision":1,"supported":true,
             "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",
@@ -1722,6 +1870,7 @@ mod tests {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         });
         let frame = json!({"event":"render","revision":1,"supported":true,
             "rows":30,"columns":120,"window":1000,"buffer":1,
@@ -1940,6 +2089,7 @@ mod tests {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         });
         apply_event(json!({"event":"state", "cwd":"/project/src", "filetype":"rust", "encoding":"utf-8", "line_count":500, "window_count":2, "build":{"running":false, "cancelled":true, "truncated":23}}), &shared).unwrap();
         let snapshot = &shared.lock().snapshot;
@@ -2059,6 +2209,7 @@ mod tests {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         });
         apply_event(json!({"event":"state","buffers":vec![json!({"id":1});300],"capabilities":["eval","definition","definition","format"],"search":{"query":"needle","count":256,"truncated":3,"exit_code":2,"errors":vec!["search failed";12]}}), &shared).unwrap();
         let snapshot = &shared.lock().snapshot;
@@ -2081,6 +2232,7 @@ mod tests {
             render_baseline: None,
             render_revision: 0,
             render_resync: false,
+            render_publisher: render_watch::Publisher::default(),
         });
         let buffers: Vec<_> = (1..=300)
             .map(|id| json!({"id":id,"current":id == 300,"modified":id == 300}))
@@ -2110,6 +2262,226 @@ mod tests {
         assert_eq!(entries[0].name, "z-dir");
         assert!(entries[0].is_dir);
         assert_eq!(entries[1].name, "a.rs");
+    }
+
+    /// Simultaneous observers isolate host notification lag from the same
+    /// actual PTY/Vim/decoder workload. No GPU or presentation claim is made.
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires Vim 9, a PTY and loopback sockets; set VIM9_TEST_VIM"]
+    fn real_vim9_notification_latency() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::CommandExt;
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let scratch = Scratch::new();
+        let first = scratch.0.join("native.txt");
+        let second = scratch.0.join("space | '%.txt");
+        fs::write(
+            &first,
+            (0..1000)
+                .map(|n| format!("source_{n:04} 中文 é\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        fs::write(&second, "three\nfour\n").unwrap();
+        let vimrc = scratch.0.join("user.vimrc");
+        fs::write(
+            &vimrc,
+            "set nocompatible nomore noswapfile nowrap scrolloff=0\nset errorformat=%f:%l:%c:%m\nset shortmess+=I\n",
+        )
+        .unwrap();
+        let runtime = RUNTIME.materialize(&scratch.0.join("runtime")).unwrap();
+        let program = std::env::var("VIM9_TEST_VIM").unwrap_or_else(|_| find_vim().unwrap());
+        let editor = Vim9Session::prepare(
+            scratch.0.clone(),
+            Some(first.clone()),
+            program,
+            runtime,
+            uuid::Uuid::new_v4(),
+        )
+        .unwrap();
+        let mut master = -1;
+        let mut slave = -1;
+        let size = libc::winsize {
+            ws_row: 30,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: output descriptors and window-size pointers are valid.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &size,
+                )
+            },
+            0
+        );
+        // SAFETY: openpty returned two owned descriptors, consumed once here.
+        let mut master = unsafe { fs::File::from_raw_fd(master) };
+        let slave = unsafe { fs::File::from_raw_fd(slave) };
+        let mut command = std::process::Command::new(&editor.launch().program);
+        command
+            .args(["-u", vimrc.to_str().unwrap(), "-i", "NONE", "-n"])
+            .args(&editor.launch().args)
+            .current_dir(editor.root())
+            .env("TERM", "xterm-256color")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        for entry in &editor.launch().env {
+            let (name, value) = entry.split_once('=').unwrap();
+            command.env(name, value);
+        }
+        // SAFETY: only async-signal-safe libc operations run between fork and
+        // exec. The child receives a separate controlling terminal/session.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = Child(command.spawn().unwrap());
+        let mut drain = master.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            while matches!(drain.read(&mut chunk), Ok(1..)) {}
+        });
+        wait_for(|| editor.snapshot().connected);
+        let mut updates = editor.watch_render().unwrap();
+        editor
+            .send(Vim9Command::SetRender { enabled: true })
+            .unwrap();
+        let initial = loop {
+            let update = updates
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native initial frame");
+            if let Some(frame) = update.frame.filter(|frame| frame.supported) {
+                break frame;
+            }
+        };
+        let baseline_window = initial.window;
+        let baseline_buffer = initial.buffer;
+        let baseline_tick = initial.changedtick;
+        let mut expected_top = initial
+            .windows
+            .iter()
+            .find(|w| w.window == baseline_window)
+            .unwrap()
+            .topline;
+        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(4);
+        let polling_editor = editor.clone();
+        let polling_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = polling_stop.clone();
+        let poller = thread::spawn(move || {
+            let mut previous = None;
+            while !worker_stop.load(Ordering::Acquire) {
+                let frame = polling_editor.render_snapshot();
+                let revision = frame.as_ref().map(|frame| frame.revision);
+                if revision != previous {
+                    previous = revision;
+                    if let Some(frame) = frame {
+                        let _ = observed_tx.try_send((frame.revision, Instant::now()));
+                    }
+                }
+                thread::park_timeout(Duration::from_millis(16));
+            }
+        });
+        let samples = 80;
+        let mut input_to_publication = Vec::new();
+        let mut publication_to_event = Vec::new();
+        let mut publication_to_poll = Vec::new();
+        let mut input_to_event = Vec::new();
+        for index in 0..samples {
+            // Different phases of the same real 16ms poll, not two machines
+            // or synthetic sleeps pretending to be a frontend measurement.
+            thread::sleep(Duration::from_micros(
+                1000 + ((index * 7919) % 18000) as u64,
+            ));
+            let sent = Instant::now();
+            master.write_all(&[5]).unwrap(); // real PTY Ctrl-E; Vim owns scrolling
+            expected_top += 1;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let update = loop {
+                let update = updates
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("native Ctrl-E publication");
+                let Some(frame) = update.frame.as_ref() else {
+                    continue;
+                };
+                let Some(window) = frame.windows.iter().find(|w| w.window == baseline_window)
+                else {
+                    continue;
+                };
+                assert_eq!(window.buffer, baseline_buffer);
+                assert_eq!(window.changedtick, baseline_tick);
+                assert!(
+                    window.topline <= expected_top,
+                    "multiple source rows advanced"
+                );
+                if window.topline == expected_top {
+                    break update;
+                }
+            };
+            let notified = Instant::now();
+            let frame = update.frame.as_ref().unwrap();
+            assert!(update.published_at >= sent);
+            let polled = loop {
+                let (revision, time) = observed_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("legacy observer of the same source frame");
+                if revision == frame.revision {
+                    break time;
+                }
+                assert!(
+                    revision < frame.revision,
+                    "observer skipped the sampled frame"
+                );
+            };
+            assert!(polled >= update.published_at);
+            input_to_publication.push((update.published_at - sent).as_secs_f64() * 1000.0);
+            publication_to_event.push((notified - update.published_at).as_secs_f64() * 1000.0);
+            publication_to_poll.push((polled - update.published_at).as_secs_f64() * 1000.0);
+            input_to_event.push((notified - sent).as_secs_f64() * 1000.0);
+        }
+        polling_stop.store(true, Ordering::Release);
+        poller.thread().unpark();
+        poller.join().unwrap();
+        fn stats(mut values: Vec<f64>) -> Value {
+            values.sort_by(f64::total_cmp);
+            let len = values.len();
+            json!({"samples":len,"median_ms":(values[(len - 1) / 2] + values[len / 2]) / 2.0,
+                "p95_ms":values[(len * 95).div_ceil(100) - 1],"min_ms":values[0],"max_ms":values[len - 1]})
+        }
+        let report = json!({
+            "metric":"host-side publication and notification; not GUI paint, compositor presentation or input-to-photon",
+            "comparison":"simultaneous event subscription and legacy 16ms poll observing the same real-Vim source frame",
+            "sample_validation":"one source line advanced; window/buffer/changedtick unchanged; exact render revision matched",
+            "input_to_publication":stats(input_to_publication),
+            "publication_to_event":stats(publication_to_event),
+            "publication_to_legacy_poll":stats(publication_to_poll),
+            "input_to_event":stats(input_to_event)
+        });
+        println!("VIM9_WAKE_BENCHMARK={report}");
+        editor.revoke();
+        assert!(updates.recv().unwrap().frame.is_none());
+        assert!(updates.recv().is_none());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
     }
 
     /// The Python runtime suite exercises Vim's editing semantics; this test
