@@ -77,8 +77,12 @@ class RenderCursorTests(unittest.TestCase):
 
     def test_cursor_theme_change_is_a_delta_without_repainting_text(self):
         e = self.editor
+        # Exercise a cursor-only update without entering command-line fallback.
+        # Returning from :highlight correctly requires a complete native frame;
+        # an extra cursor delta there used to depend on the stale-theme bug.
+        e.ex("nnoremap <silent> <F10> <Cmd>highlight NativeCursor guibg=#ae12cd<Bar>doautocmd <nomodeline> User JTermVim9RenderInvalidate<CR>")
         first = e.gui_frame()
-        e.ex("highlight NativeCursor guibg=#ae12cd")
+        e.keys(b"\x1b[21~")
         updated = e.painted(lambda f: f["revision"] > first["revision"] and f["mode"] == "n"
                             and f["cursor"]["appearance"]["style"]["background"] == 0xae12cd)
         self.assertEqual(first["runs"], updated["runs"])

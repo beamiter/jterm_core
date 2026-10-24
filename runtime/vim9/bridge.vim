@@ -87,6 +87,7 @@ var renderBase: list<dict<any>> = []
 var renderStyles: dict<dict<any>> = {}
 var renderThemeKey = ''
 var renderThemeGeneration = 0
+var renderThemePending = false
 var renderNormal: dict<any> = {}
 var cursorOption: any = v:null
 var cursorShapes: dict<dict<any>> = {}
@@ -2299,6 +2300,12 @@ def EmitRender(force: bool = false)
     renderTimer = -1
   endif
   try
+    if renderThemePending
+      # ModeChanged fires before an Ex command finishes. Resolve its theme
+      # after the input batch, not while :highlight still has its old value.
+      renderThemePending = false
+      RefreshRenderTheme()
+    endif
     var frame = RenderFrame()
     var encoded = json_encode(frame)
     if strlen(encoded) > 900000
@@ -2396,7 +2403,9 @@ def RenderThemeChanged()
   if get(v:event, 'old_mode', '') =~# '^c' || get(v:event, 'new_mode', '') =~# '^c'
     renderWindowCaches = {}
   endif
-  RefreshRenderTheme()
+  # Do not sample before a command-line transition's Ex command executes.
+  # The next actual paint consumes this flag, including immediate scroll/resync.
+  renderThemePending = true
   RenderChanged()
 enddef
 
