@@ -2,7 +2,7 @@ name: Native Vim post-command theme candidate
 on:
   push:
     branches: [codex/vim-render-wake-20261024]
-    paths: [.ci/vim-theme-defer.patch.b64, .github/workflows/vim-theme-wake-candidate.yml]
+    paths: [.ci/vim-theme-defer.patch.b64, .ci/vim-theme-cursor.patch, .github/workflows/vim-theme-wake-candidate.yml]
 permissions:
   contents: write
 jobs:
@@ -19,6 +19,7 @@ jobs:
         run: |
           mkdir -p evidence
           git show "$GITHUB_SHA":.ci/vim-theme-defer.patch.b64 > "$RUNNER_TEMP/theme.b64"
+          git show "$GITHUB_SHA":.ci/vim-theme-cursor.patch > "$RUNNER_TEMP/cursor.patch"
           git show HEAD:runtime/vim9/bridge.vim > "$RUNNER_TEMP/bridge-before.vim"
           python3 - <<'PY'
           import base64,zlib,hashlib,subprocess,os
@@ -27,6 +28,7 @@ jobs:
           assert hashlib.sha256(patch).hexdigest()=='cd6b539b8311aa4ded787e9afe86ff18db9d48199dd38f3d54f297a7ba6b505e'
           subprocess.run(['git','apply','--check','-'],input=patch,check=True)
           subprocess.run(['git','apply','-'],input=patch,check=True)
+          subprocess.run(['git','apply',str(Path(os.environ['RUNNER_TEMP'])/'cursor.patch')],check=True)
           subprocess.run(['git','add','-N','runtime/vim9/test_render_theme_timing.py'],check=True)
           subprocess.run(['git','diff','--check'],check=True)
           PY
@@ -53,15 +55,15 @@ jobs:
           set -o pipefail
           cargo test --locked --lib vim9 2>&1 | tee evidence/rust-tests.txt
           cargo test --locked --lib vim9::tests::real_vim9_round_trip -- --ignored 2>&1 | tee evidence/real-vim.txt
-      - name: Export guarded two-file candidate without changing master
+      - name: Export guarded three-file candidate without changing master
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import base64,json,os,subprocess,urllib.request,shutil
+          import base64,json,os,subprocess,urllib.request
           from pathlib import Path
           base='681c9312db0cac39ac603ae92d70acf97c7735ac'
-          files=['runtime/vim9/bridge.vim','runtime/vim9/test_render_theme_timing.py']
+          files=['runtime/vim9/bridge.vim','runtime/vim9/test_render_theme_timing.py','runtime/vim9/test_render_cursor.py']
           assert set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())==set(files)
           assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==base
           api='https://api.github.com/repos/beamiter/jterm_core'
@@ -75,7 +77,7 @@ jobs:
               entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
               target=Path('evidence/sources')/path;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
           tree=request('/git/trees',{'base_tree':request('/git/commits/'+base)['tree']['sha'],'tree':entries})['sha']
-          message='fix(vim): refresh GUI themes after Ex execution before publishing paint\n\nModeChanged can run before the pending :highlight command. Mark its theme dirty and resolve definitions at the next actual EmitRender, rather than caching the old value until the 750ms reconciliation timer. Preserve coalescing, explicit fallback and periodic discovery of asynchronous plugin changes.\n\nAdd six real-Vim timing/cancellation/link/background/batched/repeated-change regressions with reconciliation polling stopped and without forced snapshots after measured input. Prove the old runtime fails the identical assertion, run the full renderer suite with differential replay, benchmark integrity, Rust Vim tests and real PTY round trip. No dependencies, wire protocol or Rust interface changes.'
+          message='fix(vim): refresh GUI themes after Ex execution before publishing paint\n\nModeChanged can run before the pending :highlight command. Mark its theme dirty and resolve definitions at the next actual EmitRender, rather than caching the old value until the 750ms reconciliation timer. Preserve coalescing, explicit fallback and periodic discovery of asynchronous plugin changes.\n\nAdd six real-Vim timing/cancellation/link/background/batched/repeated-change regressions with reconciliation polling stopped and without forced snapshots after measured input. Prove the old runtime fails the identical assertion. Keep cursor-only empty-row delta checks on an actual mode-preserving Cmd mapping, instead of relying on a second delayed update after command-line fallback. Run the full renderer suite with differential replay, benchmark integrity, Rust Vim tests and real PTY round trip. No dependencies, wire protocol or Rust interface changes.'
           commit=request('/git/commits',{'message':message,'tree':tree,'parents':[base]})['sha']
           Path('evidence/candidate.json').write_text(json.dumps({'base':base,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
           Path('evidence/candidate.patch').write_bytes(subprocess.check_output(['git','diff','--',*files]))
