@@ -41,7 +41,9 @@ v2 is selected only for a peer that has already advertised v2 support.
   bounded facts inspector. Creating an isolated task never starts its Agent;
   authored work without a recipe has a separate explicit human acceptance path.
   See [CLI agent sessions and
-  management](docs/agent-sessions.md).
+  management](docs/agent-sessions.md). The [task command center](docs/agent-task-command-center.md)
+  adds five attention queues, shared structured task search, and current
+  next-step guidance while preserving task identity and runtime action gates.
 
 - A real Vim 9 IDE bridge for all four native workbenches. `vim9::Vim9Session`
   prepares a dedicated editor process, transports typed editor actions over

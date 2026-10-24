@@ -57,10 +57,12 @@ pub mod dashboard;
 pub mod driver;
 pub mod drivers;
 pub mod event;
+pub mod guidance;
 pub mod inspector;
 pub mod launcher;
 pub mod native;
 pub mod pinned_dir;
+pub mod query;
 pub mod replay_text;
 pub mod runtime;
 pub mod task;
@@ -77,8 +79,8 @@ pub use brief::{TaskBrief, TaskValidationRecipe, TASK_GOAL_MAX_BYTES};
 pub use context::{ContextError, SemanticCommandContext};
 #[allow(unused_imports)]
 pub use dashboard::{
-    DashboardActivity, DashboardCounts, DashboardFilter, DashboardGroup, DashboardRow,
-    DashboardSnapshot, DashboardSort, DashboardView,
+    DashboardActivity, DashboardAttentionKind, DashboardCounts, DashboardFilter, DashboardGroup,
+    DashboardRow, DashboardSnapshot, DashboardSort, DashboardView,
 };
 #[allow(unused_imports)]
 pub use driver::{
@@ -105,6 +107,8 @@ pub use event::{
     InvalidProviderSessionId, NativeAgentSessionId, ProviderSessionId,
 };
 #[allow(unused_imports)]
+pub use guidance::TaskGuidance;
+#[allow(unused_imports)]
 pub use inspector::{TaskInspector, TaskInspectorField};
 #[allow(unused_imports)]
 pub use launcher::{AgentLaunchError, AgentLaunchSpec};
@@ -114,6 +118,8 @@ pub use native::{
     NativePromptError, NativePromptPolicy, NativeWorkspaceError, NATIVE_AGENT_FOLLOW_UP_MAX_BYTES,
     PTY_TASK_BRIEF_RELATIVE,
 };
+#[allow(unused_imports)]
+pub use query::{dashboard_query_error, DashboardQuery};
 #[allow(unused_imports)]
 pub use runtime::{
     AgentRuntimeCompletion, AgentRuntimeError, AgentRuntimeIssue, AgentRuntimeManager,

@@ -33,6 +33,13 @@ return selections. TaskManager and approval paths still decide what operations
 can execute. A filter that hides the selection never selects another task
 automatically.
 
+The [task command center](agent-task-command-center.md) adds separate approval,
+reply, validation, review and failure queues, shared structured task queries,
+and runtime-aware next-step explanations. Task state, validation results and
+observed runtime activity stay separate; a passing check does not complete a
+task. The same guide describes the four native interfaces and follow-up draft
+acknowledgements.
+
 ### Bulk organization
 
 The managers keep the inspected conversation separate from the checked batch.

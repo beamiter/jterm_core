@@ -88,9 +88,9 @@ impl TaskInspector {
                 "The isolated task is ready. Starting its Agent requires a separate explicit action."
             }
         } else if task.status == TaskStatus::WaitingForApproval {
-            "Review the exact pending request and choose Approve or Deny. Navigation never approves a request."
+            "Review the exact pending request and use its available response actions. Navigation never approves a request."
         } else if task.status == TaskStatus::WaitingForHuman {
-            "Read the latest Agent question and reply to this task."
+            "Read the latest Agent question and continue through an available reply or terminal action."
         } else if task.status.is_running() {
             "Inspect live output and requests. Stopping the Agent does not accept its work."
         } else if task.status == TaskStatus::Completed {

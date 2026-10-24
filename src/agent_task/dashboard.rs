@@ -1,6 +1,7 @@
 //! Pure, toolkit-independent task-list projection. TaskManager remains the sole
 //! lifecycle authority; activity facts never imply completion or grant actions.
 
+use super::query::DashboardQuery;
 use super::{AgentProvider, AgentTask, TaskId, TaskRuntimeKind, TaskStatus, TaskValidationStatus};
 use crate::review_input::safe_inline_display;
 use std::path::Path;
@@ -8,6 +9,54 @@ use std::path::Path;
 pub const DASHBOARD_TITLE_MAX_BYTES: usize = 256;
 pub const DASHBOARD_DETAIL_MAX_BYTES: usize = 1024;
 pub const DASHBOARD_QUERY_MAX_BYTES: usize = 256;
+
+/// Disjoint human-action queues. Approval, input and a failed run take
+/// precedence over an old validation result; running validation is not review.
+/// These labels do not grant the ability to execute any task action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DashboardAttentionKind {
+    Approval,
+    Input,
+    Validation,
+    Review,
+    Failed,
+}
+
+impl DashboardAttentionKind {
+    pub const ALL: [Self; 5] = [
+        Self::Approval,
+        Self::Input,
+        Self::Validation,
+        Self::Review,
+        Self::Failed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approval => "Approvals",
+            Self::Input => "Needs reply",
+            Self::Validation => "Validation issues",
+            Self::Review => "Ready to review",
+            Self::Failed => "Failed tasks",
+        }
+    }
+
+    pub fn query_value(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Input => "input",
+            Self::Validation => "validation",
+            Self::Review => "review",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for DashboardAttentionKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
 
 /// Mutually exclusive lifecycle buckets, independent of process activity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +146,25 @@ impl DashboardRow {
         DashboardGroup::from_status(self.status)
     }
 
+    pub fn attention_kind(&self) -> Option<DashboardAttentionKind> {
+        if !self.needs_attention
+            || self.status == TaskStatus::Archived
+            || self.validation_status == TaskValidationStatus::Running
+        {
+            return None;
+        }
+        match self.status {
+            TaskStatus::WaitingForApproval => Some(DashboardAttentionKind::Approval),
+            TaskStatus::WaitingForHuman => Some(DashboardAttentionKind::Input),
+            TaskStatus::Failed => Some(DashboardAttentionKind::Failed),
+            _ if self.validation_status.needs_attention() => {
+                Some(DashboardAttentionKind::Validation)
+            }
+            TaskStatus::ReadyForReview => Some(DashboardAttentionKind::Review),
+            _ => None,
+        }
+    }
+
     /// Activity is orthogonal: a review task can retain a live native stream.
     pub fn is_running(&self) -> bool {
         self.status.is_running()
@@ -131,22 +199,6 @@ impl DashboardRow {
         } else {
             2
         }
-    }
-    fn matches_text(&self, query: &str) -> bool {
-        let identity = self.id.to_string();
-        let fields = [
-            self.title.as_str(),
-            self.branch.as_str(),
-            self.repo_label.as_str(),
-            self.provider.display_name(),
-            self.status_detail.as_deref().unwrap_or_default(),
-            identity.as_str(),
-        ];
-        query.split_whitespace().all(|term| {
-            fields
-                .iter()
-                .any(|field| field.to_lowercase().contains(term))
-        })
     }
 }
 
@@ -272,10 +324,12 @@ impl DashboardSnapshot {
     /// Filter an already bounded, domain-derived snapshot without granting
     /// access to the task manager. Native views keep selection separately.
     pub fn filter_rows(rows: &[DashboardRow], text: &str, view: DashboardView) -> Self {
-        let query = safe_inline_display(text.trim(), DASHBOARD_QUERY_MAX_BYTES).to_lowercase();
+        let Ok(query) = DashboardQuery::parse(text) else {
+            return Self::default();
+        };
         let mut snapshot = Self::default();
         for row in rows {
-            if !row.matches_text(&query) {
+            if !query.matches(row) {
                 continue;
             }
             snapshot.counts.add(row);
@@ -292,8 +346,9 @@ impl DashboardSnapshot {
         activity: impl Fn(TaskId) -> DashboardActivity,
         filter: DashboardFilter<'_>,
     ) -> Self {
-        let query =
-            safe_inline_display(filter.text.trim(), DASHBOARD_QUERY_MAX_BYTES).to_lowercase();
+        let Ok(query) = DashboardQuery::parse(filter.text) else {
+            return Self::default();
+        };
         let mut snapshot = Self::default();
         for task in tasks {
             if filter
@@ -304,7 +359,7 @@ impl DashboardSnapshot {
                 continue;
             }
             let row = DashboardRow::from_task(task, activity(task.id));
-            if !row.matches_text(&query) {
+            if !query.matches(&row) {
                 continue;
             }
             snapshot.counts.add(&row);
@@ -707,6 +762,55 @@ mod tests {
         let row = DashboardRow::from_task(&task, DashboardActivity::default());
         assert!(!row.needs_attention);
         assert_eq!(row.group(), DashboardGroup::Archived);
+    }
+
+    #[test]
+    fn attention_queues_partition_only_actionable_rows() {
+        for status in [
+            TaskStatus::Created,
+            TaskStatus::Starting,
+            TaskStatus::Working,
+            TaskStatus::WaitingForApproval,
+            TaskStatus::WaitingForHuman,
+            TaskStatus::ReadyForReview,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+            TaskStatus::Archived,
+        ] {
+            for validation in [
+                TaskValidationStatus::NotRun,
+                TaskValidationStatus::Running,
+                TaskValidationStatus::Passed,
+                TaskValidationStatus::Failed,
+                TaskValidationStatus::Inconclusive,
+                TaskValidationStatus::Cancelled,
+            ] {
+                let mut task = task(status);
+                task.validation.status = validation;
+                let before = task.clone();
+                let row = DashboardRow::from_task(&task, DashboardActivity::default());
+                let kind = row.attention_kind();
+                assert_eq!(
+                    kind.is_some(),
+                    row.needs_attention,
+                    "{status:?} / {validation:?}"
+                );
+                if let Some(kind) = kind {
+                    assert!(DashboardAttentionKind::ALL.contains(&kind));
+                    if status == TaskStatus::WaitingForApproval {
+                        assert_eq!(kind, DashboardAttentionKind::Approval);
+                    } else if status == TaskStatus::WaitingForHuman {
+                        assert_eq!(kind, DashboardAttentionKind::Input);
+                    } else if status == TaskStatus::Failed {
+                        assert_eq!(kind, DashboardAttentionKind::Failed);
+                    } else if validation.needs_attention() {
+                        assert_eq!(kind, DashboardAttentionKind::Validation);
+                    }
+                }
+                assert_eq!(task, before);
+            }
+        }
     }
     #[test]
     fn preparation_cannot_hide_required_human_action() {
