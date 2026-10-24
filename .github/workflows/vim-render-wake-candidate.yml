@@ -1,0 +1,94 @@
+name: Native Vim render wake candidate
+on:
+  push:
+    branches: [codex/vim-render-wake-20261024]
+    paths: [.ci/vim-render-wake.patch.b64, .github/workflows/vim-render-wake-candidate.yml]
+permissions:
+  contents: write
+concurrency:
+  group: vim-render-wake-candidate
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Apply source-bound candidate
+        run: |
+          mkdir -p evidence
+          python3 - <<'PY'
+          import base64,zlib,hashlib,subprocess
+          from pathlib import Path
+          patch=zlib.decompress(base64.b64decode(Path('.ci/vim-render-wake.patch.b64').read_text()))
+          assert hashlib.sha256(patch).hexdigest()=='06e67a8c9a98605b18f1e7a806cc221db1b54ba2d1f9ad1aaa78eba7146572ed'
+          subprocess.run(['git','diff','--exit-code','63e97ebc8c104fcc279309fc66c280dc1c0e19e3','--','src'],check=True)
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          subprocess.run(['git','add','-N','src/vim9_render_watch.rs'],check=True)
+          PY
+      - name: Install real Vim prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          cache-on-failure: true
+      - name: Format and verify patch boundaries
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+      - name: Test production Vim bridge including notification lifecycle
+        run: |
+          set -o pipefail
+          cargo test --locked --lib vim9 2>&1 | tee evidence/vim-tests.txt
+          cargo test --locked --lib vim9::tests::real_vim9_round_trip -- --ignored 2>&1 | tee evidence/real-vim.txt
+      - name: Measure two simultaneous real-Vim observation trials
+        run: |
+          set -o pipefail
+          for trial in 1 2; do
+            cargo test --locked --lib vim9::tests::real_vim9_notification_latency -- --ignored --nocapture 2>&1 | tee "evidence/wakeup-$trial.txt"
+          done
+      - name: Strict production Clippy
+        run: cargo clippy --locked --lib -- -D warnings
+      - name: Export tested candidate without moving master
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64,json,os,subprocess,urllib.request,shutil
+          from pathlib import Path
+          base='63e97ebc8c104fcc279309fc66c280dc1c0e19e3'
+          files=['src/vim9.rs','src/vim9_render_watch.rs']
+          temporary=['.ci/vim-render-wake.patch.b64','.github/workflows/vim-render-wake-candidate.yml']
+          assert set(subprocess.check_output(['git','diff',base,'--name-only'],text=True).splitlines())==set(files+temporary)
+          assert not subprocess.check_output(['git','diff',base,'--','Cargo.toml','Cargo.lock','runtime'])
+          api='https://api.github.com/repos/beamiter/jterm_core'
+          def request(path,data=None):
+              req=urllib.request.Request(api+path,data=None if data is None else json.dumps(data).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=30) as response:return json.load(response)
+          assert request('/git/ref/heads/master')['object']['sha']==base
+          entries=[]
+          for path in files:
+              target=Path('evidence/sources')/path;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(path,target)
+              sha=request('/git/blobs',{'encoding':'base64','content':base64.b64encode(Path(path).read_bytes()).decode()})['sha']
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          tree=request('/git/trees',{'base_tree':request('/git/commits/'+base)['tree']['sha'],'tree':entries})['sha']
+          message='perf(vim): publish coalesced render notifications without frontend polling\n\nAdd executor-neutral async and cancellable blocking latest-frame watches. Preserve atomic initial registration, accepted-frame identity, explicit clears, delta recovery and session revocation. Bound and reclaim subscribers; dispatch executor wakers outside the session lock and do not retain editor lifetimes.\n\nValidate lifecycle/race regressions, existing production Vim tests, real Vim round trip and two same-source PTY observation benchmarks. Published timestamps describe host validation, not rendering or compositor presentation. No dependency or wire-protocol changes.'
+          commit=request('/git/commits',{'message':message,'tree':tree,'parents':[base]})['sha']
+          Path('evidence/candidate.json').write_text(json.dumps({'base':base,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
+          Path('evidence/candidate.patch').write_bytes(subprocess.check_output(['git','diff',base,'--',*files]))
+          print('VALIDATED_CANDIDATE='+commit)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: vim-render-wake-evidence
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: error
