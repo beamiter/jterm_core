@@ -1,0 +1,108 @@
+name: Verify native Vim runtime bundle
+on:
+  workflow_call:
+    inputs:
+      base:
+        type: string
+        required: true
+      core:
+        type: string
+        required: true
+permissions:
+  contents: write
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.base }}
+          persist-credentials: false
+      - name: Resolve immutable validated core
+        env:
+          CORE: ${{ inputs.core }}
+          BASE: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          [[ "$CORE" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$BASE"
+          case "$GITHUB_REPOSITORY" in beamiter/anvil|beamiter/forge|beamiter/ember|beamiter/frost) ;; *) exit 1;; esac
+          git init -q "$RUNNER_TEMP/published-core"
+          git -C "$RUNNER_TEMP/published-core" fetch -q --depth=1 https://github.com/beamiter/jterm_core.git "$CORE"
+          git -C "$RUNNER_TEMP/published-core" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/published-core" rev-parse HEAD)" = "$CORE"
+          mkdir -p evidence
+      - name: Verify runtime-only compatibility and deterministic bundle identity
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import tarfile,subprocess,os,hashlib,json
+          root=Path(os.environ['RUNNER_TEMP'])/'published-core'
+          archive=Path('packaging/jterm-core-src.tar.gz')
+          before={}
+          with tarfile.open(archive) as tar:
+              for entry in tar.getmembers():
+                  if entry.isfile():before[entry.name]=tar.extractfile(entry).read()
+          # This upgrade must not silently change Rust interfaces or dependencies.
+          for name,data in before.items():
+              if name.startswith('src/') or name in ('Cargo.toml','Cargo.lock'):
+                  assert (root/name).read_bytes()==data, name
+          subprocess.run(['bash','scripts/package-shared-core.sh',str(root)],check=True)
+          first=archive.read_bytes()
+          subprocess.run(['bash','scripts/package-shared-core.sh',str(root)],check=True)
+          assert first==archive.read_bytes(), 'nondeterministic package'
+          names=subprocess.check_output(['git','-C',str(root),'ls-tree','-r','--name-only','-z','HEAD','--','Cargo.toml','Cargo.lock','README.md','src','runtime','scripts','tests']).decode().split('\0')
+          expected={n for n in names if n}
+          with tarfile.open(archive) as tar:
+              members={entry.name:entry for entry in tar.getmembers() if not entry.isdir()}
+              assert set(members)==expected, (set(members)-expected,expected-set(members))
+              for name,entry in members.items():
+                  assert entry.isfile(), name
+                  assert tar.extractfile(entry).read()==(root/name).read_bytes(), name
+          subprocess.run(['bash','scripts/materialize-shared-core.sh',str(Path('..')/'jterm_core')],check=True)
+          for name in expected:
+              assert (Path('..')/'jterm_core'/name).read_bytes()==(root/name).read_bytes(), name
+          Path('evidence/bundle-verification.json').write_text(json.dumps({'files':len(expected),'sha256':hashlib.sha256(first).hexdigest(),'rust_and_dependencies_unchanged':True,'repacked_twice_identical':True,'materialized_bytes_match':True},indent=2)+'\n')
+          PY
+      - name: Validate the actual materialized Vim runtime
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox
+          set -o pipefail
+          python3 ../jterm_core/runtime/vim9/test_render_property_index.py -v 2>&1 | tee evidence/property-tests.txt
+          python3 ../jterm_core/runtime/vim9/test_scroll.py -v 2>&1 | tee evidence/scroll-tests.txt
+          python3 ../jterm_core/runtime/vim9/test_benchmark_metrics.py -v 2>&1 | tee evidence/benchmark-integrity.txt
+      - name: Prepare clean two-file candidate without changing master
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ inputs.base }}
+          CORE: ${{ inputs.core }}
+        run: |
+          python3 - <<'PY'
+          import base64,json,os,subprocess,urllib.request
+          from pathlib import Path
+          base=os.environ['BASE'];core=os.environ['CORE']
+          files=['packaging/jterm-core-src.tar.gz','packaging/jterm-core-src.tar.gz.sha256']
+          assert set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())==set(files)
+          api='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']
+          def request(path,data=None):
+              req=urllib.request.Request(api+path,data=None if data is None else json.dumps(data).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=30) as r:return json.load(r)
+          assert request('/git/ref/heads/master')['object']['sha']==base, 'master advanced; rebase required'
+          entries=[]
+          for path in files:
+              sha=request('/git/blobs',{'encoding':'base64','content':base64.b64encode(Path(path).read_bytes()).decode()})['sha']
+              entries.append({'path':path,'mode':'100644','type':'blob','sha':sha})
+          tree=request('/git/trees',{'base_tree':request('/git/commits/'+base)['tree']['sha'],'tree':entries})['sha']
+          message='perf(vim): synchronize frame-local diagnostic rendering core\n\nBundle jterm_core '+core+'. Index dense diagnostic spans by source line and reuse definitions only within the current frame. Preserve live property updates and split buffer isolation.\n\nVerify every packaged and materialized file against the immutable published core, deterministic archive reproduction, unchanged Rust sources and dependency manifests, and real-Vim property, source-bound scrolling, and benchmark integrity tests. This commit changes only the bundled source archive and its checksum; it does not claim a new full frontend build or hardware GUI benchmark.'
+          commit=request('/git/commits',{'message':message,'tree':tree,'parents':[base]})['sha']
+          Path('evidence/candidate.json').write_text(json.dumps({'repository':os.environ['GITHUB_REPOSITORY'],'base':base,'core':core,'commit':commit,'files':entries,'master_updated':False},indent=2)+'\n')
+          print('VALIDATED_CANDIDATE='+commit)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: native-runtime-bundle-candidate
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: error
