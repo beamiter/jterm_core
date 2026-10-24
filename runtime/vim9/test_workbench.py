@@ -123,6 +123,30 @@ class WorkbenchTests(unittest.TestCase):
         e.request("save")
         self.assertEqual(e.file.read_text().splitlines()[0], "from-user-vimrc")
 
+    def test_plugin_service_metadata_is_explicit_and_live_without_buffer_edits(self):
+        e = self.editor()
+        e.ex("let g:workbench_state = {'provider': 'simple', 'plugins': {'available': v:true, 'known': v:true, 'running': v:true, 'operation': repeat('u', 100), 'total': 9, 'completed': 4, 'installed': -3, 'updated': 2, 'errors': 99999999, 'private': 'do-not-publish'}, 'lsp': {'available': v:true, 'status': repeat('中', 400)}, 'tree': {'available': v:true, 'visible': v:true, 'root': repeat('r', 6000)}, 'statusline': {'available': v:true, 'enabled': v:false}}")
+        before = e.snapshot()
+        context = before['workbench']
+        self.assertEqual(context['plugins'], {
+            'available': True, 'known': True, 'running': True, 'operation': 'u' * 64,
+            'total': 9, 'completed': 4, 'installed': 0, 'updated': 2, 'errors': 1_000_000})
+        self.assertEqual(len(context['lsp']['status']), 256)
+        self.assertEqual(len(context['tree']['root']), 4096)
+        self.assertEqual(context['statusline'], {'available': True, 'enabled': False})
+        self.assertNotIn('do-not-publish', json.dumps(before))
+        e.ex("let g:workbench_state.plugins.completed = 5 | doautocmd <nomodeline> User SimplePlugStateChanged")
+        progressed = lambda s: s.get('workbench', {}).get('plugins', {}).get('completed') == 5
+        # ex() drains the PTY and can already receive the event on a fast
+        # machine; do not wait for a second event or force a snapshot request.
+        after = e.state if progressed(e.state) else e.state_where(progressed)
+        self.assertEqual(before['changedtick'], after['changedtick'])
+        e.ex("let g:workbench_state = {'provider': 'simple', 'plugins': [], 'lsp': 'bad', 'tree': 3, 'statusline': {'available': 1, 'enabled': 'yes'}}")
+        context = e.snapshot()['workbench']
+        self.assertFalse(context['plugins']['known'])
+        self.assertFalse(context['plugins']['running'])
+        self.assertEqual(context['statusline'], {'available': False, 'enabled': False})
+
     def test_unknown_stale_and_invalid_actions_cannot_reach_provider(self):
         e = self.editor()
         initial = self.source(e.snapshot())
@@ -180,7 +204,14 @@ class WorkbenchTests(unittest.TestCase):
                    'simple_implementation', 'simple_type_definition',
                    'simple_workspace_symbols', 'simple_incoming_calls',
                    'simple_outgoing_calls', 'simple_supertypes',
-                   'simple_subtypes', 'simple_signature_help']
+                   'simple_subtypes', 'simple_signature_help',
+                   'simple_git_next_hunk', 'simple_git_previous_hunk', 'simple_git_stage_hunk',
+                   'simple_git_undo_hunk', 'simple_git_blame', 'simple_git_blame_line', 'simple_git_history',
+                   'simple_plugin_status', 'simple_plugin_check', 'simple_plugin_install',
+                   'simple_plugin_update', 'simple_plugin_stop', 'simple_plugin_diff',
+                   'simple_plugin_profile', 'simple_plugin_health', 'simple_lsp_status',
+                   'simple_lsp_restart', 'simple_lsp_log', 'simple_tree_refresh',
+                   'simple_statusline_toggle', 'simple_statusline_health']
         e.ex('let g:workbench_actions = ' + str(actions))
         source = self.source(e.snapshot())
         for action in actions:

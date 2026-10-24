@@ -41,8 +41,9 @@ pub use workspace::{Vim9WorkbenchFocus, Vim9WorkspaceState, Vim9WorkspaceStateSt
 #[path = "vim9_workbench.rs"]
 mod workbench;
 pub use workbench::{
-    Vim9WorkbenchAction, Vim9WorkbenchDiagnostics, Vim9WorkbenchGit, Vim9WorkbenchRemote,
-    Vim9WorkbenchState,
+    Vim9WorkbenchAction, Vim9WorkbenchDiagnostics, Vim9WorkbenchGit, Vim9WorkbenchLsp,
+    Vim9WorkbenchPlugins, Vim9WorkbenchRemote, Vim9WorkbenchSection, Vim9WorkbenchState,
+    Vim9WorkbenchStatusline, Vim9WorkbenchTree,
 };
 
 #[path = "vim9_render.rs"]

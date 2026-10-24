@@ -218,7 +218,14 @@ const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
   'simple_code_lens_run', 'simple_inlay_hints', 'simple_implementation',
   'simple_type_definition', 'simple_workspace_symbols', 'simple_incoming_calls',
   'simple_outgoing_calls', 'simple_supertypes', 'simple_subtypes',
-  'simple_signature_help']
+  'simple_signature_help',
+  'simple_git_next_hunk', 'simple_git_previous_hunk', 'simple_git_stage_hunk',
+  'simple_git_undo_hunk', 'simple_git_blame', 'simple_git_blame_line', 'simple_git_history',
+  'simple_plugin_status', 'simple_plugin_check', 'simple_plugin_install',
+  'simple_plugin_update', 'simple_plugin_stop', 'simple_plugin_diff',
+  'simple_plugin_profile', 'simple_plugin_health', 'simple_lsp_status',
+  'simple_lsp_restart', 'simple_lsp_log', 'simple_tree_refresh',
+  'simple_statusline_toggle', 'simple_statusline_health']
 const WORKBENCH_SEMANTICS = ['definition', 'hover', 'references', 'format']
 
 def WorkbenchCapabilities(): list<string>
@@ -279,6 +286,10 @@ def WorkbenchState(): dict<any>
     var git = WorkbenchDict(provided, 'git')
     var diagnostics = WorkbenchDict(provided, 'diagnostics')
     var remote = WorkbenchDict(provided, 'remote')
+    var lsp = WorkbenchDict(provided, 'lsp')
+    var plugins = WorkbenchDict(provided, 'plugins')
+    var tree = WorkbenchDict(provided, 'tree')
+    var statusline = WorkbenchDict(provided, 'statusline')
     # Never serialize the returned dictionary itself. A provider could carry
     # unrelated secrets, functions, channels or cyclic plugin state.
     return {buffer: bufnr(), window: win_getid(), changedtick: b:changedtick,
@@ -294,7 +305,16 @@ def WorkbenchState(): dict<any>
         warning: WorkbenchCount(diagnostics, 'warning'), info: WorkbenchCount(diagnostics, 'info'),
         hint: WorkbenchCount(diagnostics, 'hint')},
       remote: {connected: WorkbenchBool(remote, 'connected'),
-        label: WorkbenchText(remote, 'label', 256), root: WorkbenchText(remote, 'root', 4096)}}
+        label: WorkbenchText(remote, 'label', 256), root: WorkbenchText(remote, 'root', 4096)},
+      lsp: {available: WorkbenchBool(lsp, 'available'), status: WorkbenchText(lsp, 'status', 256)},
+      plugins: {available: WorkbenchBool(plugins, 'available'), known: WorkbenchBool(plugins, 'known'),
+        running: WorkbenchBool(plugins, 'running'), operation: WorkbenchText(plugins, 'operation', 64),
+        total: WorkbenchCount(plugins, 'total'), completed: WorkbenchCount(plugins, 'completed'),
+        installed: WorkbenchCount(plugins, 'installed'), updated: WorkbenchCount(plugins, 'updated'),
+        errors: WorkbenchCount(plugins, 'errors')},
+      tree: {available: WorkbenchBool(tree, 'available'), visible: WorkbenchBool(tree, 'visible'),
+        root: WorkbenchText(tree, 'root', 4096)},
+      statusline: {available: WorkbenchBool(statusline, 'available'), enabled: WorkbenchBool(statusline, 'enabled')}}
   catch
     return {}
   endtry
@@ -3521,6 +3541,7 @@ augroup JTermVim9Bridge
   autocmd QuickFixCmdPost * Changed()
   autocmd User LspDiagsUpdated,LspAttached,LspDetached,SimpleCCDiagnosticsChanged,VimrcWorkbenchChanged LspDiagnosticsChanged()
   autocmd User SimpleGitUpdate,SimpleRemoteConnected,SimpleRemoteDisconnected,SimpleRemoteWorkspaceChanged Changed()
+  autocmd User SimplePlugStateChanged Changed()
   autocmd VimLeavePre * Leaving()
 augroup END
 

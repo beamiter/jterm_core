@@ -49,9 +49,9 @@ class VimrcWorkbenchTests(unittest.TestCase):
         self.directory.cleanup()
 
     def editor(self, *, authenticate=True, start_cc=False, interaction_fixture=False,
-               editor_class=Editor, extra_setup=""):
+               editor_class=Editor, extra_setup="", plugins=PLUGINS, extra_env=None):
         # Disable all automatic installation/update/network activity. Only the
-        # three checked-out plugin runtimes enter runtimepath. Existing user
+        # selected checked-out plugin runtimes enter runtimepath. Existing user
         # configuration and caches are isolated by the child process's HOME.
         setup = [
             "let g:vimrc_skip_plugins = 1",
@@ -67,7 +67,7 @@ class VimrcWorkbenchTests(unittest.TestCase):
             "let g:test_ready_count = 0",
             "let g:test_disconnect_count = 0",
         ]
-        for name in PLUGINS:
+        for name in plugins:
             setup.append("let &runtimepath = " + vim_string(PLUGIN_ROOT / name) + " .. ',' .. &runtimepath")
         setup.extend([
             "execute 'source ' .. fnameescape(" + vim_string(VIMRC_ROOT / ".vimrc") + ")",
@@ -128,6 +128,7 @@ for line in sys.stdin:
                 "XDG_CONFIG_HOME": str(self.root / "config"),
                 "VIMRC_SKIP_PLUGINS": "1",
                 "VIMRC_SKIP_UPDATE_CHECK": "1",
+                **(extra_env or {}),
             },
         )
         self.editors.append(e)

@@ -479,6 +479,71 @@ before their input loop begins. The native overlay returns after the hook
 finishes or fails. Real-plugin regression tests cover key hints, rename
 accept/cancel, code-action cancel and subsequent typing in the original buffer.
 
+## Simple plugin groups and live service state
+
+The existing `Ctrl+Shift+P` picker includes five on-demand groups when the
+vimrc workbench provider is present. They do not enable any persistent IDE
+panels. Each group displays a summary from the same source-bound snapshot
+as the editor; selecting a group only changes the search query.
+
+| Group | Query | Workflows |
+| --- | --- | --- |
+| Git | `>simplegit` | Status/diff, hunk preview/navigation/stage, confirmed hunk discard, blame and file history |
+| Code | `>simplecc` | Existing language navigation and diagnostics, plus service status/restart/log |
+| Tree | `>simpletree` | Toggle, reveal current file, refresh the open tree |
+| Plugins | `>simpleplug` | Status, update check, install, update, stop, diff, startup profile and health |
+| Status | `>simpleline` or `>simplestatusbar` | Toggle or inspect the actual SimpleLine statusbar provider |
+
+These prefixes are exact provider filters. A suffix such as `>simplegit stage`
+fuzzy-searches only that group's actions. All Simple commands come from the
+single typed `Vim9WorkbenchAction::ALL` catalog, so adding an allowed action
+cannot silently omit it from one frontend's command list. Unavailable
+commands remain discoverable and are rechecked against current capabilities
+before activation. The bridge independently checks the buffer, window,
+changedtick and cursor before dispatching any action to Vim.
+
+The workbench snapshot now carries bounded `lsp`, `plugins`, `tree` and
+`statusline` dictionaries in addition to Git/diagnostic/remote context.
+Missing dictionaries retain backward-compatible defaults. `plugins.known`
+distinguishes an older provider with no progress API from an observed idle
+manager. Plugin counters describe the current or last operation, not the
+installed inventory. While running, the picker and optional native statusbar
+show operation progress; completion with errors remains visible.
+
+The paired SimplePlug runtime exports `simpleplug#WorkbenchState()` and emits
+`User SimplePlugStateChanged` at operation transitions and progress updates.
+The hook reads only existing in-memory state. Opening a picker or publishing a
+snapshot does not start a daemon, inspect repositories, install plugins or
+request network updates. Vimrc's action policy exposes Stop only during a
+known running operation and hides competing batch operations while busy.
+An old SimplePlug remains usable, with progress explicitly shown as unknown.
+
+Saved-file Git hunk mutations require a writable, unmodified source with
+cached hunks. Discard opens a Vim confirmation with Cancel selected by default
+and rechecks the source after confirmation. The native overlay yields to Vim
+during this interaction and returns afterward. Existing SimpleGit daemon
+checks continue to own the patch and filesystem operation.
+
+`Space vw` / `:VimrcWorkbench` shows the same provider states in ordinary Vim.
+The vimrc also exposes `:VimrcAction {id}` with contextual completion and a
+`Space P` plugin-management mapping group. Plugin-specific windows and prompts
+continue to use their existing Vim interaction; this integration does not
+replace them with a second editing engine.
+
+For cross-repository verification, place `vimrc`, `simplecc`, `simplegit`,
+`simplewhichkey`, `simpleplug`, `simpletree` and `simpleline` beside this
+checkout, then run from `runtime/vim9`:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_vimrc_workbench test_simple_ecosystem
+```
+
+The suites use the real configuration, plugin runtimes, Vim and authenticated
+bridge. Deterministic daemon fixtures supply replies without network installs
+or remote hosts. They cover silent snapshot reads, tree and statusline state,
+Git source/dirty guards, discard cancellation and source changes while the
+confirmation is open, and plugin progress/duplicate-operation handling.
+
 ## Closing and lifetime
 
 Native editor close requests ask Vim to quit without `!`. Unsaved changes can

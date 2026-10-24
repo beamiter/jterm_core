@@ -35,9 +35,11 @@ pub enum Vim9PaletteCommand {
     Workbench(Vim9WorkbenchAction),
 }
 
-const COMMANDS: [Vim9PaletteCommand; 52] = {
+// The typed workbench catalog is the single source of truth. Every new Simple
+// action is automatically discoverable in all four hosts without a second list.
+const COMMANDS: [Vim9PaletteCommand; 18 + Vim9WorkbenchAction::ALL.len()] = {
     use Vim9PaletteCommand::*;
-    [
+    let base = [
         Save,
         SaveAll,
         SplitVertical,
@@ -56,41 +58,19 @@ const COMMANDS: [Vim9PaletteCommand; 52] = {
         Format,
         CancelBuild,
         CancelSearch,
-        Workbench(Vim9WorkbenchAction::SimpleFiles),
-        Workbench(Vim9WorkbenchAction::SimpleRecent),
-        Workbench(Vim9WorkbenchAction::SimpleTreeToggle),
-        Workbench(Vim9WorkbenchAction::SimpleTreeReveal),
-        Workbench(Vim9WorkbenchAction::SimpleTerminalToggle),
-        Workbench(Vim9WorkbenchAction::SimpleTerminalNew),
-        Workbench(Vim9WorkbenchAction::SimpleTerminalNext),
-        Workbench(Vim9WorkbenchAction::SimpleTerminalPrevious),
-        Workbench(Vim9WorkbenchAction::SimpleBuffers),
-        Workbench(Vim9WorkbenchAction::SimpleGrep),
-        Workbench(Vim9WorkbenchAction::SimpleOutline),
-        Workbench(Vim9WorkbenchAction::SimpleImplementation),
-        Workbench(Vim9WorkbenchAction::SimpleTypeDefinition),
-        Workbench(Vim9WorkbenchAction::SimpleWorkspaceSymbols),
-        Workbench(Vim9WorkbenchAction::SimpleIncomingCalls),
-        Workbench(Vim9WorkbenchAction::SimpleOutgoingCalls),
-        Workbench(Vim9WorkbenchAction::SimpleSupertypes),
-        Workbench(Vim9WorkbenchAction::SimpleSubtypes),
-        Workbench(Vim9WorkbenchAction::SimpleSignatureHelp),
-        Workbench(Vim9WorkbenchAction::SimpleDocPin),
-        Workbench(Vim9WorkbenchAction::SimpleRename),
-        Workbench(Vim9WorkbenchAction::SimpleCodeAction),
-        Workbench(Vim9WorkbenchAction::SimpleCodeLens),
-        Workbench(Vim9WorkbenchAction::SimpleCodeLensRun),
-        Workbench(Vim9WorkbenchAction::SimpleInlayHints),
-        Workbench(Vim9WorkbenchAction::SimpleDiagnostics),
-        Workbench(Vim9WorkbenchAction::SimpleNextDiagnostic),
-        Workbench(Vim9WorkbenchAction::SimplePreviousDiagnostic),
-        Workbench(Vim9WorkbenchAction::SimpleGitStatus),
-        Workbench(Vim9WorkbenchAction::SimpleGitDiff),
-        Workbench(Vim9WorkbenchAction::SimpleGitHunk),
-        Workbench(Vim9WorkbenchAction::SimpleMarkdownPreview),
-        Workbench(Vim9WorkbenchAction::SimpleKeys),
-        Workbench(Vim9WorkbenchAction::SimpleWorkbench),
-    ]
+    ];
+    let mut commands = [Save; 18 + Vim9WorkbenchAction::ALL.len()];
+    let mut index = 0;
+    while index < base.len() {
+        commands[index] = base[index];
+        index += 1;
+    }
+    index = 0;
+    while index < Vim9WorkbenchAction::ALL.len() {
+        commands[base.len() + index] = Workbench(Vim9WorkbenchAction::ALL[index]);
+        index += 1;
+    }
+    commands
 };
 
 impl Vim9PaletteCommand {
@@ -161,6 +141,17 @@ impl Vim9PaletteCommand {
         }
     }
 
+    fn group(self) -> Option<&'static str> {
+        match self {
+            // These typed semantic commands are also supplied by SimpleCC;
+            // they must stay reachable inside Code rather than disappearing
+            // when an exact provider filter replaces the general palette.
+            Self::Definition | Self::Hover | Self::References | Self::Format => Some("simplecc"),
+            Self::Workbench(action) => action.group(),
+            _ => None,
+        }
+    }
+
     /// These hints avoid sending known unavailable actions. Vim remains the
     /// authority for modes, plugins, modified buffers and asynchronous changes.
     pub fn unavailable_reason(self, snapshot: &Vim9Snapshot) -> Option<&'static str> {
@@ -225,7 +216,7 @@ impl Vim9PaletteCommand {
                         .capabilities
                         .iter()
                         .any(|value| value == command.capability()))
-                    .then_some("This Simple action is unavailable for the current buffer")
+                    .then(|| workbench_unavailable_reason(command, snapshot))
                 }
             }
             _ => None,
@@ -264,6 +255,71 @@ impl Vim9PaletteCommand {
                 column: i64::try_from(snapshot.column).map_err(|_| "Invalid Vim source column")?,
             },
         })
+    }
+}
+
+fn workbench_unavailable_reason(
+    action: Vim9WorkbenchAction,
+    snapshot: &Vim9Snapshot,
+) -> &'static str {
+    use Vim9WorkbenchAction::*;
+    let state = &snapshot.workbench;
+    if state.provider.is_empty() {
+        return "Load the vimrc Simple workbench integration";
+    }
+    if matches!(
+        action,
+        SimpleGitNextHunk | SimpleGitPreviousHunk | SimpleGitStageHunk | SimpleGitUndoHunk
+    ) {
+        if snapshot.modified {
+            return "Save this buffer first; Git hunks describe the saved file";
+        }
+        if state.large_file {
+            return "Git hunk actions are paused by large-file protection";
+        }
+        if state.git.added == 0 && state.git.changed == 0 && state.git.removed == 0 {
+            return "No cached changes for this buffer; inspect Git status first";
+        }
+    }
+    match action.group() {
+        Some("simpleplug") if !state.plugins.available => {
+            "Requires the SimplePlug runtime and vimrc integration"
+        }
+        Some("simpleplug") if action == SimplePluginStop && !state.plugins.known => {
+            "Update SimplePlug to expose its live operation state"
+        }
+        Some("simpleplug") if action == SimplePluginStop && !state.plugins.running => {
+            "No plugin operation is running"
+        }
+        Some("simpleplug")
+            if state.plugins.known
+                && state.plugins.running
+                && !matches!(
+                    action,
+                    SimplePluginStop | SimplePluginProfile | SimplePluginHealth
+                ) =>
+        {
+            "A plugin operation is running; wait for it or choose Stop"
+        }
+        Some("simplecc") if !state.lsp.available => {
+            "Requires the SimpleCC runtime and vimrc integration"
+        }
+        Some("simplecc")
+            if state.large_file
+                && !matches!(action, SimpleLspStatus | SimpleLspRestart | SimpleLspLog) =>
+        {
+            "Language actions are paused by large-file protection"
+        }
+        Some("simpletree") if !state.tree.available => {
+            "Requires SimpleTree or the remote tree provider"
+        }
+        Some("simpletree") if action == SimpleTreeRefresh && !state.tree.visible => {
+            "Open the project tree before refreshing it"
+        }
+        Some("simpleline") if !state.statusline.available => {
+            "Requires the SimpleLine statusbar runtime"
+        }
+        _ => "Disabled by Vim configuration or unavailable for this buffer",
     }
 }
 
@@ -330,12 +386,27 @@ fn matches_with_recent(query: &str, limit: usize, recent: &[String]) -> Vec<Vim9
     if query.chars().count() > 256 || query.contains(['\r', '\n', '\0']) {
         return Vec::new();
     }
+    let (prefix, rest) = query.split_once(char::is_whitespace).unwrap_or((query, ""));
+    let group = match prefix.to_ascii_lowercase().as_str() {
+        "simplegit" => Some("simplegit"),
+        "simplecc" => Some("simplecc"),
+        "simpletree" => Some("simpletree"),
+        "simpleplug" => Some("simpleplug"),
+        "simpleline" | "simplestatusbar" => Some("simpleline"),
+        _ => None,
+    };
+    let query = if group.is_some() { rest.trim() } else { query };
     let matcher = SkimMatcherV2::default().ignore_case().element_limit(4096);
     let mut ranked = COMMANDS
         .iter()
         .copied()
         .enumerate()
         .filter_map(|(index, command)| {
+            if let Some(group) = group {
+                if command.group() != Some(group) {
+                    return None;
+                }
+            }
             let score = if query.is_empty() {
                 Some(0)
             } else {
@@ -414,6 +485,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_sections_filter_exactly_and_allow_search_within_group() {
+        for group in [
+            "simplegit",
+            "simplecc",
+            "simpletree",
+            "simpleplug",
+            "simpleline",
+        ] {
+            let matches = matches_with_recent(group, 256, &[]);
+            assert!(!matches.is_empty(), "{group}");
+            assert!(matches.iter().all(|command| command.group() == Some(group)));
+            let expected = Vim9WorkbenchAction::ALL
+                .into_iter()
+                .filter(|action| action.group() == Some(group))
+                .count();
+            assert_eq!(
+                matches.len(),
+                expected + if group == "simplecc" { 4 } else { 0 }
+            );
+        }
+        assert_eq!(
+            matches_with_recent("SIMPLESTATUSBAR", 256, &[]),
+            matches_with_recent("simpleline", 256, &[])
+        );
+        assert_eq!(
+            matches_with_recent("simplegit stage", 256, &[]),
+            [Vim9PaletteCommand::Workbench(
+                Vim9WorkbenchAction::SimpleGitStageHunk
+            )]
+        );
+        assert_eq!(
+            matches_with_recent("simpleplug 安装缺失插件", 256, &[]),
+            [Vim9PaletteCommand::Workbench(
+                Vim9WorkbenchAction::SimplePluginInstall
+            )]
+        );
+        for (query, command) in [
+            ("simplecc hover", Vim9PaletteCommand::Hover),
+            ("simplecc format", Vim9PaletteCommand::Format),
+            ("simplecc references", Vim9PaletteCommand::References),
+            ("simplecc definition", Vim9PaletteCommand::Definition),
+        ] {
+            assert!(
+                matches_with_recent(query, 256, &[]).contains(&command),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
     fn recent_commands_rank_equal_matches_without_changing_the_catalog() {
         let recent = vec!["reopen_buffer".into(), "save".into()];
         let matches = matches_with_recent("", 256, &recent);
@@ -439,6 +560,49 @@ mod tests {
         for command in COMMANDS {
             assert!(command.command(&snapshot).is_err());
         }
+    }
+
+    #[test]
+    fn unavailable_simple_actions_explain_saved_files_busy_plugins_and_missing_state() {
+        let mut snapshot = connected();
+        snapshot.buffer = 4;
+        snapshot.window = 1001;
+        snapshot.workbench.provider = "simple".into();
+        snapshot.modified = true;
+        let stage = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleGitStageHunk);
+        assert!(stage
+            .unavailable_reason(&snapshot)
+            .unwrap()
+            .contains("Save this buffer"));
+        let update = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimplePluginUpdate);
+        let stop = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimplePluginStop);
+        snapshot.workbench.plugins.available = true;
+        assert!(stop
+            .unavailable_reason(&snapshot)
+            .unwrap()
+            .contains("live operation state"));
+        snapshot.workbench.plugins.known = true;
+        assert_eq!(
+            stop.unavailable_reason(&snapshot),
+            Some("No plugin operation is running")
+        );
+        snapshot.workbench.plugins.running = true;
+        assert!(update
+            .unavailable_reason(&snapshot)
+            .unwrap()
+            .contains("choose Stop"));
+        assert!(
+            stop.command(&snapshot).is_err(),
+            "hints must never grant a missing capability"
+        );
+        snapshot.capabilities.push("simple_plugin_stop".into());
+        assert!(stop.command(&snapshot).is_ok());
+        snapshot.workbench.tree.available = true;
+        assert_eq!(
+            Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleTreeRefresh)
+                .unavailable_reason(&snapshot),
+            Some("Open the project tree before refreshing it")
+        );
     }
 
     #[test]

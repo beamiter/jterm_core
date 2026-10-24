@@ -38,13 +38,34 @@ pub enum Vim9WorkbenchAction {
     SimpleGitStatus,
     SimpleGitDiff,
     SimpleGitHunk,
+    SimpleGitNextHunk,
+    SimpleGitPreviousHunk,
+    SimpleGitStageHunk,
+    SimpleGitUndoHunk,
+    SimpleGitBlame,
+    SimpleGitBlameLine,
+    SimpleGitHistory,
+    SimplePluginStatus,
+    SimplePluginCheck,
+    SimplePluginInstall,
+    SimplePluginUpdate,
+    SimplePluginStop,
+    SimplePluginDiff,
+    SimplePluginProfile,
+    SimplePluginHealth,
+    SimpleLspStatus,
+    SimpleLspRestart,
+    SimpleLspLog,
+    SimpleTreeRefresh,
+    SimpleStatuslineToggle,
+    SimpleStatuslineHealth,
     SimpleMarkdownPreview,
     SimpleKeys,
     SimpleWorkbench,
 }
 
 impl Vim9WorkbenchAction {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 55] = [
         Self::SimpleFiles,
         Self::SimpleRecent,
         Self::SimpleTreeToggle,
@@ -76,6 +97,27 @@ impl Vim9WorkbenchAction {
         Self::SimpleGitStatus,
         Self::SimpleGitDiff,
         Self::SimpleGitHunk,
+        Self::SimpleGitNextHunk,
+        Self::SimpleGitPreviousHunk,
+        Self::SimpleGitStageHunk,
+        Self::SimpleGitUndoHunk,
+        Self::SimpleGitBlame,
+        Self::SimpleGitBlameLine,
+        Self::SimpleGitHistory,
+        Self::SimplePluginStatus,
+        Self::SimplePluginCheck,
+        Self::SimplePluginInstall,
+        Self::SimplePluginUpdate,
+        Self::SimplePluginStop,
+        Self::SimplePluginDiff,
+        Self::SimplePluginProfile,
+        Self::SimplePluginHealth,
+        Self::SimpleLspStatus,
+        Self::SimpleLspRestart,
+        Self::SimpleLspLog,
+        Self::SimpleTreeRefresh,
+        Self::SimpleStatuslineToggle,
+        Self::SimpleStatuslineHealth,
         Self::SimpleMarkdownPreview,
         Self::SimpleKeys,
         Self::SimpleWorkbench,
@@ -114,6 +156,27 @@ impl Vim9WorkbenchAction {
             Self::SimpleGitStatus => "simple_git_status",
             Self::SimpleGitDiff => "simple_git_diff",
             Self::SimpleGitHunk => "simple_git_hunk",
+            Self::SimpleGitNextHunk => "simple_git_next_hunk",
+            Self::SimpleGitPreviousHunk => "simple_git_previous_hunk",
+            Self::SimpleGitStageHunk => "simple_git_stage_hunk",
+            Self::SimpleGitUndoHunk => "simple_git_undo_hunk",
+            Self::SimpleGitBlame => "simple_git_blame",
+            Self::SimpleGitBlameLine => "simple_git_blame_line",
+            Self::SimpleGitHistory => "simple_git_history",
+            Self::SimplePluginStatus => "simple_plugin_status",
+            Self::SimplePluginCheck => "simple_plugin_check",
+            Self::SimplePluginInstall => "simple_plugin_install",
+            Self::SimplePluginUpdate => "simple_plugin_update",
+            Self::SimplePluginStop => "simple_plugin_stop",
+            Self::SimplePluginDiff => "simple_plugin_diff",
+            Self::SimplePluginProfile => "simple_plugin_profile",
+            Self::SimplePluginHealth => "simple_plugin_health",
+            Self::SimpleLspStatus => "simple_lsp_status",
+            Self::SimpleLspRestart => "simple_lsp_restart",
+            Self::SimpleLspLog => "simple_lsp_log",
+            Self::SimpleTreeRefresh => "simple_tree_refresh",
+            Self::SimpleStatuslineToggle => "simple_statusline_toggle",
+            Self::SimpleStatuslineHealth => "simple_statusline_health",
             Self::SimpleMarkdownPreview => "simple_markdown_preview",
             Self::SimpleKeys => "simple_keys",
             Self::SimpleWorkbench => "simple_workbench",
@@ -153,6 +216,27 @@ impl Vim9WorkbenchAction {
             Self::SimpleGitStatus => "Simple: Show Git status",
             Self::SimpleGitDiff => "Simple: Show Git diff",
             Self::SimpleGitHunk => "Simple: Preview current Git hunk",
+            Self::SimpleGitNextHunk => "Simple: Go to next Git hunk",
+            Self::SimpleGitPreviousHunk => "Simple: Go to previous Git hunk",
+            Self::SimpleGitStageHunk => "Simple: Stage current Git hunk",
+            Self::SimpleGitUndoHunk => "Simple: Undo current Git hunk with confirmation",
+            Self::SimpleGitBlame => "Simple: Show Git blame",
+            Self::SimpleGitBlameLine => "Simple: Inspect Git blame at cursor",
+            Self::SimpleGitHistory => "Simple: Show Git file history",
+            Self::SimplePluginStatus => "Simple: Show plugin status",
+            Self::SimplePluginCheck => "Simple: Check plugin updates",
+            Self::SimplePluginInstall => "Simple: Install missing plugins",
+            Self::SimplePluginUpdate => "Simple: Update plugins",
+            Self::SimplePluginStop => "Simple: Stop plugin operation",
+            Self::SimplePluginDiff => "Simple: Review plugin changes",
+            Self::SimplePluginProfile => "Simple: Profile plugin startup",
+            Self::SimplePluginHealth => "Simple: Check plugin manager health",
+            Self::SimpleLspStatus => "Simple: Inspect language service status",
+            Self::SimpleLspRestart => "Simple: Restart language service",
+            Self::SimpleLspLog => "Simple: Open language service log",
+            Self::SimpleTreeRefresh => "Simple: Refresh project tree",
+            Self::SimpleStatuslineToggle => "Simple: Toggle Vim statusline",
+            Self::SimpleStatuslineHealth => "Simple: Inspect statusline health",
             Self::SimpleMarkdownPreview => "Simple: Toggle Markdown preview",
             Self::SimpleKeys => "Simple: Show key hints",
             Self::SimpleWorkbench => "Simple: Inspect workbench",
@@ -194,9 +278,87 @@ impl Vim9WorkbenchAction {
             Self::SimpleGitStatus => &["simplegit status", "Git 状态"],
             Self::SimpleGitDiff => &["simplegit diff", "Git 差异"],
             Self::SimpleGitHunk => &["simplegit hunk", "Git 修改块"],
+            Self::SimpleGitNextHunk => &["simplegit next hunk", "下一处 Git 修改"],
+            Self::SimpleGitPreviousHunk => &["simplegit previous hunk", "上一处 Git 修改"],
+            Self::SimpleGitStageHunk => &["simplegit stage hunk index", "暂存 Git 修改块"],
+            Self::SimpleGitUndoHunk => &["simplegit undo reset hunk confirm", "撤销 Git 修改块"],
+            Self::SimpleGitBlame => &["simplegit blame authors", "Git 作者追溯"],
+            Self::SimpleGitBlameLine => &["simplegit blame current line", "当前行 Git 作者"],
+            Self::SimpleGitHistory => &["simplegit file history log", "Git 文件历史"],
+            Self::SimplePluginStatus => &["simpleplug plugins status", "插件状态"],
+            Self::SimplePluginCheck => &["simpleplug plugins check updates", "检查插件更新"],
+            Self::SimplePluginInstall => &["simpleplug install missing plugins", "安装缺失插件"],
+            Self::SimplePluginUpdate => &["simpleplug update plugins", "更新插件"],
+            Self::SimplePluginStop => &["simpleplug stop cancel operation", "停止插件任务"],
+            Self::SimplePluginDiff => &["simpleplug diff review changes", "查看插件变更"],
+            Self::SimplePluginProfile => {
+                &["simpleplug profile startup performance", "插件启动性能"]
+            }
+            Self::SimplePluginHealth => &["simpleplug health diagnostics", "插件管理器健康"],
+            Self::SimpleLspStatus => &["simplecc lsp server status", "语言服务状态"],
+            Self::SimpleLspRestart => &["simplecc lsp restart server", "重启语言服务"],
+            Self::SimpleLspLog => &["simplecc lsp log", "语言服务日志"],
+            Self::SimpleTreeRefresh => &["simpletree refresh explorer", "刷新项目目录树"],
+            Self::SimpleStatuslineToggle => {
+                &["simpleline simplestatusbar toggle statusline", "切换状态栏"]
+            }
+            Self::SimpleStatuslineHealth => {
+                &["simpleline simplestatusbar health statusline", "状态栏健康"]
+            }
             Self::SimpleMarkdownPreview => &["simplemarkdown preview", "Markdown 预览"],
             Self::SimpleKeys => &["simplewhichkey key hints", "按键提示"],
             Self::SimpleWorkbench => &["simple workbench health", "工作台状态"],
+        }
+    }
+
+    /// Exact picker groups keep fuzzy matching from leaking unrelated actions
+    /// into a provider tab (for example, matching "simplegit" across a title).
+    pub(super) fn group(self) -> Option<&'static str> {
+        match self {
+            Self::SimpleGitStatus
+            | Self::SimpleGitDiff
+            | Self::SimpleGitHunk
+            | Self::SimpleGitNextHunk
+            | Self::SimpleGitPreviousHunk
+            | Self::SimpleGitStageHunk
+            | Self::SimpleGitUndoHunk
+            | Self::SimpleGitBlame
+            | Self::SimpleGitBlameLine
+            | Self::SimpleGitHistory => Some("simplegit"),
+            Self::SimpleOutline
+            | Self::SimpleImplementation
+            | Self::SimpleTypeDefinition
+            | Self::SimpleWorkspaceSymbols
+            | Self::SimpleIncomingCalls
+            | Self::SimpleOutgoingCalls
+            | Self::SimpleSupertypes
+            | Self::SimpleSubtypes
+            | Self::SimpleSignatureHelp
+            | Self::SimpleDocPin
+            | Self::SimpleRename
+            | Self::SimpleCodeAction
+            | Self::SimpleCodeLens
+            | Self::SimpleCodeLensRun
+            | Self::SimpleInlayHints
+            | Self::SimpleDiagnostics
+            | Self::SimpleNextDiagnostic
+            | Self::SimplePreviousDiagnostic
+            | Self::SimpleLspStatus
+            | Self::SimpleLspRestart
+            | Self::SimpleLspLog => Some("simplecc"),
+            Self::SimpleTreeToggle | Self::SimpleTreeReveal | Self::SimpleTreeRefresh => {
+                Some("simpletree")
+            }
+            Self::SimplePluginStatus
+            | Self::SimplePluginCheck
+            | Self::SimplePluginInstall
+            | Self::SimplePluginUpdate
+            | Self::SimplePluginStop
+            | Self::SimplePluginDiff
+            | Self::SimplePluginProfile
+            | Self::SimplePluginHealth => Some("simpleplug"),
+            Self::SimpleStatuslineToggle | Self::SimpleStatuslineHealth => Some("simpleline"),
+            _ => None,
         }
     }
 }
@@ -231,6 +393,72 @@ pub struct Vim9WorkbenchRemote {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct Vim9WorkbenchLsp {
+    pub available: bool,
+    pub status: String,
+}
+
+/// Cached progress/results for one plugin-manager operation, not a claim
+/// about the number of plugins currently installed on disk.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9WorkbenchPlugins {
+    pub available: bool,
+    pub known: bool,
+    pub running: bool,
+    pub operation: String,
+    pub total: u64,
+    pub completed: u64,
+    pub installed: u64,
+    pub updated: u64,
+    pub errors: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9WorkbenchTree {
+    pub available: bool,
+    pub visible: bool,
+    pub root: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Vim9WorkbenchStatusline {
+    pub available: bool,
+    pub enabled: bool,
+}
+
+/// On-demand navigation inside the existing native command picker. Queries
+/// select finite action groups; no provider command is executed by browsing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Vim9WorkbenchSection {
+    pub title: &'static str,
+    pub query: &'static str,
+    pub summary: String,
+}
+
+impl Vim9WorkbenchSection {
+    /// Use the palette's explicit `>` mode and exact provider token, including
+    /// the user's statusbar alias. A literal filename never selects a group.
+    pub fn matches_query(&self, input: &str) -> bool {
+        let Some(query) = super::vim9_palette_query(input) else {
+            return false;
+        };
+        let prefix = query.split_whitespace().next().unwrap_or("");
+        let prefix = if prefix.eq_ignore_ascii_case("simplestatusbar") {
+            "simpleline"
+        } else {
+            prefix
+        };
+        self.query
+            .strip_prefix('>')
+            .is_some_and(|group| prefix.eq_ignore_ascii_case(group))
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Vim9WorkbenchState {
     pub buffer: i64,
     pub window: i64,
@@ -242,6 +470,10 @@ pub struct Vim9WorkbenchState {
     pub git: Vim9WorkbenchGit,
     pub diagnostics: Vim9WorkbenchDiagnostics,
     pub remote: Vim9WorkbenchRemote,
+    pub lsp: Vim9WorkbenchLsp,
+    pub plugins: Vim9WorkbenchPlugins,
+    pub tree: Vim9WorkbenchTree,
+    pub statusline: Vim9WorkbenchStatusline,
 }
 
 impl Vim9WorkbenchState {
@@ -263,6 +495,9 @@ impl Vim9WorkbenchState {
         text(&mut self.git.head, 128);
         text(&mut self.remote.label, 256);
         text(&mut self.remote.root, 4096);
+        text(&mut self.lsp.status, 256);
+        text(&mut self.plugins.operation, 64);
+        text(&mut self.tree.root, 4096);
         for value in [
             &mut self.git.ahead,
             &mut self.git.behind,
@@ -273,8 +508,33 @@ impl Vim9WorkbenchState {
             &mut self.diagnostics.warning,
             &mut self.diagnostics.info,
             &mut self.diagnostics.hint,
+            &mut self.plugins.total,
+            &mut self.plugins.completed,
+            &mut self.plugins.installed,
+            &mut self.plugins.updated,
+            &mut self.plugins.errors,
         ] {
             *value = (*value).min(1_000_000);
+        }
+        // Unavailable/unknown providers must not carry stale progress from a
+        // previous session, and a hidden tree is not an active project root.
+        if !self.lsp.available {
+            self.lsp.status.clear();
+        }
+        if !self.plugins.available || !self.plugins.known {
+            self.plugins = Vim9WorkbenchPlugins {
+                available: self.plugins.available,
+                ..Default::default()
+            };
+        } else {
+            self.plugins.completed = self.plugins.completed.min(self.plugins.total);
+        }
+        if !self.tree.available {
+            self.tree.visible = false;
+            self.tree.root.clear();
+        }
+        if !self.statusline.available {
+            self.statusline.enabled = false;
         }
     }
 
@@ -323,6 +583,22 @@ impl Vim9WorkbenchState {
         if self.large_file {
             parts.push("large file".into());
         }
+        if self.lsp.available && !self.lsp.status.is_empty() {
+            parts.push(format!(
+                "LSP {}",
+                self.lsp.status.chars().take(64).collect::<String>()
+            ));
+        }
+        if self.plugins.available && self.plugins.known {
+            if self.plugins.running {
+                parts.push(format!(
+                    "Plugins {} {}/{}",
+                    self.plugins.operation, self.plugins.completed, self.plugins.total
+                ));
+            } else if self.plugins.errors > 0 {
+                parts.push(format!("Plugins {} errors", self.plugins.errors));
+            }
+        }
         if self.remote.connected {
             parts.push(if self.remote.label.is_empty() {
                 "remote".into()
@@ -331,6 +607,112 @@ impl Vim9WorkbenchState {
             });
         }
         parts.join(" · ")
+    }
+
+    /// Summaries use the exact same bounded, source-bound snapshot as the
+    /// editor. Opening the picker never refreshes Git, probes a daemon or
+    /// performs a plugin install/update.
+    pub fn sections(&self) -> Vec<Vim9WorkbenchSection> {
+        if self.provider.is_empty() {
+            return Vec::new();
+        }
+        let git = if self.git.head.is_empty() {
+            "No cached Git branch for this buffer".into()
+        } else {
+            format!(
+                "{} · ↑{} ↓{} · +{} ~{} -{}",
+                self.git.head,
+                self.git.ahead,
+                self.git.behind,
+                self.git.added,
+                self.git.changed,
+                self.git.removed
+            )
+        };
+        let code = if self.large_file {
+            "Large-file mode · language actions paused".into()
+        } else if !self.lsp.available {
+            "SimpleCC is not loaded".into()
+        } else {
+            let status = if self.lsp.status.is_empty() {
+                "status not reported"
+            } else {
+                &self.lsp.status
+            };
+            format!(
+                "{} · E{} W{} I{} H{}",
+                status,
+                self.diagnostics.error,
+                self.diagnostics.warning,
+                self.diagnostics.info,
+                self.diagnostics.hint
+            )
+        };
+        let tree = if !self.tree.available {
+            "Project tree is not loaded".into()
+        } else if self.tree.visible {
+            if self.tree.root.is_empty() {
+                "Project tree open".into()
+            } else {
+                format!("Open · {}", self.tree.root)
+            }
+        } else {
+            "Project tree closed · reveal or open from this group".into()
+        };
+        let plugins = if !self.plugins.available {
+            "SimplePlug is not loaded".into()
+        } else if !self.plugins.known {
+            "No cached plugin operation state · inspect status".into()
+        } else if self.plugins.running {
+            format!(
+                "{} · {}/{} completed · {} errors",
+                self.plugins.operation,
+                self.plugins.completed,
+                self.plugins.total,
+                self.plugins.errors
+            )
+        } else if self.plugins.operation.is_empty() {
+            "Plugin manager ready · no completed operation in this session".into()
+        } else {
+            format!(
+                "Last {} · {} installed · {} updated · {} errors",
+                self.plugins.operation,
+                self.plugins.installed,
+                self.plugins.updated,
+                self.plugins.errors
+            )
+        };
+        let status = if !self.statusline.available {
+            "SimpleLine is not loaded".into()
+        } else if self.statusline.enabled {
+            "SimpleLine enabled · native status follows the same provider caches".into()
+        } else {
+            "SimpleLine disabled · toggle or inspect from this group".into()
+        };
+        [
+            ("Git", ">simplegit", git),
+            ("Code", ">simplecc", code),
+            ("Tree", ">simpletree", tree),
+            ("Plugins", ">simpleplug", plugins),
+            ("Status", ">simpleline", status),
+        ]
+        .into_iter()
+        .map(|(title, query, summary)| Vim9WorkbenchSection {
+            title,
+            query,
+            // Long workspace paths must not push all command rows out of a
+            // small picker. The full value remains in the workbench state.
+            summary: if summary.chars().count() > 256 {
+                summary
+                    .chars()
+                    .take(255)
+                    .chain(std::iter::once('…'))
+                    .collect()
+            } else {
+                summary
+            },
+        })
+        .collect()
     }
 }
 
@@ -398,5 +780,126 @@ mod tests {
             state.status_text(),
             "Simple · main ↑2 · +0 ~1 -0 · E1 W2 · remote: dev"
         );
+    }
+
+    #[test]
+    fn provider_sections_distinguish_absent_unknown_running_and_completed_state() {
+        assert!(Vim9WorkbenchState::default().sections().is_empty());
+        let mut state: Vim9WorkbenchState = serde_json::from_value(serde_json::json!({
+            "provider": "simple", "buffer": 3, "window": 1001, "changedtick": 7,
+            "plugins": {"available": true}
+        }))
+        .unwrap();
+        state.bound(3, 1001, 7);
+        assert_eq!(state.sections().len(), 5);
+        assert!(state.sections()[3].summary.contains("No cached"));
+        assert!(state.sections()[4].summary.contains("not loaded"));
+        assert!(!state.status_text().contains("errors"));
+        state.plugins = Vim9WorkbenchPlugins {
+            available: true,
+            known: true,
+            running: true,
+            operation: "update".into(),
+            total: 8,
+            completed: 3,
+            installed: 1,
+            updated: 2,
+            errors: 1,
+        };
+        state.lsp = Vim9WorkbenchLsp {
+            available: true,
+            status: "ready".into(),
+        };
+        state.statusline = Vim9WorkbenchStatusline {
+            available: true,
+            enabled: false,
+        };
+        assert!(state.sections()[3].summary.contains("3/8 completed"));
+        assert!(state.status_text().contains("Plugins update 3/8"));
+        assert!(state.status_text().contains("LSP ready"));
+        assert!(state.sections()[4].summary.contains("disabled"));
+        state.plugins.running = false;
+        assert!(state.sections()[3].summary.contains("Last update"));
+        assert!(state.status_text().contains("Plugins 1 errors"));
+        state.large_file = true;
+        assert!(state.sections()[1].summary.contains("Large-file mode"));
+    }
+
+    #[test]
+    fn section_selection_uses_the_palette_mode_token_and_alias_rules() {
+        let state = Vim9WorkbenchState {
+            provider: "simple".into(),
+            ..Default::default()
+        };
+        let sections = state.sections();
+        assert!(sections[0].matches_query(">simplegit"));
+        assert!(sections[0].matches_query("  > SIMPLEGIT stage "));
+        assert!(sections[4].matches_query(">simplestatusbar health"));
+        for query in [
+            ">simplegitx",
+            "simplegit",
+            "./>simplegit",
+            ">simpleplug",
+            ">",
+        ] {
+            assert!(!sections[0].matches_query(query), "{query}");
+        }
+    }
+
+    #[test]
+    fn provider_metadata_is_bounded_and_stale_progress_cannot_claim_to_be_live() {
+        let mut state = Vim9WorkbenchState {
+            buffer: 3,
+            window: 1001,
+            changedtick: 7,
+            provider: "simple".into(),
+            plugins: Vim9WorkbenchPlugins {
+                available: true,
+                known: true,
+                running: true,
+                operation: "更\n".repeat(100),
+                total: 8,
+                completed: u64::MAX,
+                installed: u64::MAX,
+                updated: u64::MAX,
+                errors: u64::MAX,
+            },
+            lsp: Vim9WorkbenchLsp {
+                available: true,
+                status: "就\n".repeat(400),
+            },
+            tree: Vim9WorkbenchTree {
+                available: true,
+                visible: true,
+                root: "根\n".repeat(5000),
+            },
+            ..Default::default()
+        };
+        state.bound(3, 1001, 7);
+        assert_eq!(state.plugins.operation.chars().count(), 64);
+        assert_eq!(state.plugins.completed, 8);
+        assert_eq!(state.plugins.errors, 1_000_000);
+        assert_eq!(state.lsp.status.chars().count(), 256);
+        assert_eq!(state.tree.root.chars().count(), 4096);
+        assert!(!state
+            .sections()
+            .iter()
+            .any(|section| section.summary.contains('\n')));
+        assert!(state
+            .sections()
+            .iter()
+            .all(|section| section.summary.chars().count() <= 256));
+        state.plugins.known = false;
+        state.lsp.available = false;
+        state.tree.available = false;
+        state.bound(3, 1001, 7);
+        assert!(!state.plugins.running);
+        assert_eq!(state.plugins.total, 0);
+        assert!(state.plugins.operation.is_empty());
+        assert!(state.lsp.status.is_empty());
+        assert!(!state.tree.visible);
+        assert!(state.sections()[3].summary.contains("No cached"));
+        state.bound(3, 1001, 8);
+        assert!(state.sections().is_empty());
     }
 }
