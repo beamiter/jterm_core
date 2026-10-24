@@ -1202,6 +1202,11 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   endfor
   var allProperties = prop_list(first, {end_lnum: last})
   var properties: list<dict<any>> = []
+  # Index once per frame; scanning the whole property list for every source
+  # row makes dense diagnostics cost O(visible_rows * properties). Definitions
+  # are frame-local so prop_type_change()/deletion still invalidate immediately.
+  var propertyLines: dict<list<any>> = {}
+  var propertyDefinitions: dict<dict<any>> = {}
   var afterLines: dict<list<any>> = {}
   var inlineLines: dict<list<any>> = {}
   var inlineLayouts: dict<dict<any>> = {}
@@ -1216,8 +1221,12 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   for property in allProperties
     var propertyType = get(property, 'type', '')
     var typeBuffer = get(property, 'type_bufnr', 0)
-    property.definition = empty(propertyType) ? {}
-      : (typeBuffer > 0 ? prop_type_get(propertyType, {bufnr: typeBuffer}) : prop_type_get(propertyType))
+    var definitionKey = string([typeBuffer, propertyType])
+    if !has_key(propertyDefinitions, definitionKey)
+      propertyDefinitions[definitionKey] = empty(propertyType) ? {}
+        : (typeBuffer > 0 ? prop_type_get(propertyType, {bufnr: typeBuffer}) : prop_type_get(propertyType))
+    endif
+    property.definition = propertyDefinitions[definitionKey]
     if has_key(property, 'text')
       var text = property.text
       var padding = get(property, 'text_padding_left', 0)
@@ -1251,6 +1260,11 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       reason = 'This Vim property uses the compatibility view'
     else
       add(properties, property)
+      var key = string(property.lnum)
+      if !has_key(propertyLines, key)
+        propertyLines[key] = []
+      endif
+      add(propertyLines[key], property)
     endif
     if !empty(reason)
       frame.supported = false
@@ -1292,7 +1306,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     for lineNumber in range(first, last)
       var text = getline(lineNumber)
       var row = view.row + lineNumber - first
-      var lineProperties = filter(copy(properties), (_, item) => item.lnum == lineNumber)
+      var lineProperties = get(propertyLines, string(lineNumber), [])
       var inlineLayout = get(inlineLayouts, string(lineNumber), {})
       var inlineAdvances: dict<number> = get(inlineLayout, 'advances', {})
       var displayWidth = get(inlineLayout, 'width', strdisplaywidth(text))

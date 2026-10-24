@@ -19,7 +19,7 @@ import test_bridge
 from test_bridge import Editor, VIM
 
 
-def measure(samples, windows, lines):
+def measure(samples, windows, lines, properties_per_line=0):
     validate_workload(lines, samples, windows)
     with tempfile.TemporaryDirectory(prefix="vim9-scroll-bench-") as directory:
         root = Path(directory)
@@ -29,11 +29,24 @@ def measure(samples, windows, lines):
                          "render_protocol": 5})
             editor.wait(lambda m: m.get("event") == "state")
             source = root / "large.rs"
+            name = 'diagnostic_property_value' if properties_per_line else 'value'
             source.write_text("".join(
-                f'let value_{n:05d} = "中文é😀"; // a syntax highlighted line\n'
+                f'let {name}_{n:05d} = "中文é😀"; // a syntax highlighted line\n'
                 for n in range(lines)), encoding="utf-8")
             editor.request("open", path=str(source))
             editor.ex("syntax on | setfiletype rust | set number relativenumber cursorline scrolloff=5")
+            if properties_per_line:
+                # All positions are ASCII source-byte boundaries. Bound fixture
+                # setup to the measured path plus margin, not the whole file.
+                editor.ex("highlight ScrollDiagnostic guifg=#d08a34 guisp=#d08a34 gui=undercurl")
+                editor.ex("call prop_type_add('ScrollDiagnostic', {'highlight':'ScrollDiagnostic'})")
+                properties = root / "properties.vim"
+                properties.write_text(
+                    f"for row in range(1,{min(lines, samples + 256)})\n"
+                    f" for column in range(1,{properties_per_line})\n"
+                    "  call prop_add(row,column,{'type':'ScrollDiagnostic','length':1})\n"
+                    " endfor\nendfor\n", encoding="utf-8")
+                editor.ex("source " + str(properties))
             for _ in range(windows - 1):
                 editor.request("split", vertical=True)
             editor.ex("normal! 100Gzt")
@@ -67,6 +80,7 @@ def measure(samples, windows, lines):
             return {
                 "windows": windows,
                 "buffer_lines": lines,
+                "properties_per_line": properties_per_line,
                 "pty_rows": frame["rows"],
                 "pty_columns": frame["columns"],
                 "scroll_ack": distribution(durations),
@@ -84,6 +98,8 @@ def main():
     parser.add_argument("--samples", type=int, default=160)
     parser.add_argument("--windows", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--lines", type=int, default=100_000)
+    parser.add_argument("--properties-per-line", type=int, choices=range(33), default=0,
+                        metavar="0..32", help="Dense diagnostic-span workload; 0 retains the original benchmark")
     args = parser.parse_args()
     if not VIM:
         parser.error("Install Vim 9 or set VIM9_TEST_VIM")
@@ -102,7 +118,7 @@ def main():
         "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
         "runtime": str(test_bridge.RUNTIME),
         "vim": subprocess.check_output([VIM, "--version"], text=True).splitlines()[0],
-        "results": [measure(args.samples, windows, args.lines) for windows in args.windows],
+        "results": [measure(args.samples, windows, args.lines, args.properties_per_line) for windows in args.windows],
     }, ensure_ascii=False, indent=2))
 
 
