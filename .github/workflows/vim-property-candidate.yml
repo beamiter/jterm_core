@@ -24,8 +24,8 @@ jobs:
           python3 scripts/stage-vim-property-index.py
           git diff --check
           python3 -m py_compile runtime/vim9/benchmark_scroll.py runtime/vim9/test_render_property_index.py
-      - name: Install real Vim
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox
+      - name: Install real Vim and project index prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq vim-nox ripgrep
       - name: Verify native renderer and exact full-frame differential
         shell: bash
         run: |
@@ -58,7 +58,7 @@ jobs:
           from pathlib import Path
           base='0cdb8d4e578066c16af42fa58bde08a2002c6796'
           files=['runtime/vim9/bridge.vim','runtime/vim9/benchmark_scroll.py','runtime/vim9/test_render_property_index.py','.github/workflows/vim9-benchmark.yml']
-          temporary=['scripts/stage-vim-property-index.py','.github/workflows/vim-property-candidate.yml','.github/workflows/vim-native-next.yml','.github/workflows/vim-modal-probe.yml']
+          temporary=['scripts/stage-vim-property-index.py','.github/workflows/vim-property-candidate.yml','.github/workflows/vim-native-next.yml','.github/workflows/vim-modal-probe.yml','.github/workflows/vim-runtime-bundle-candidate.yml']
           changed=set(subprocess.check_output(['git','diff',base,'--name-only'],text=True).splitlines())
           assert changed==set(files+temporary), changed
           assert not subprocess.check_output(['git','diff',base,'--','src','Cargo.toml','Cargo.lock'])
