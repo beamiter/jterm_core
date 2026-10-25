@@ -37,6 +37,12 @@ const TAIL_BYTES: usize = 64 * 1024;
 const MAX_HEAD_BYTES: usize = 1024 * 1024;
 const MAX_WARNINGS: usize = 16;
 
+/// How long a [`SessionCatalog::resume_conflict`] warning must have been
+/// shown before a second Resume counts as "Resume anyway". Hosts ignore an
+/// earlier repeat, so a double-click or a quick double Enter can never confirm
+/// a warning nobody had time to read.
+pub const SESSION_RESUME_ANYWAY_DELAY: Duration = Duration::from_millis(600);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionProvider {
     Codex,

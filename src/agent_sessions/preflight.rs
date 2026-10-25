@@ -32,11 +32,19 @@ impl From<&AgentSession> for Target {
     }
 }
 
-type Check = Arc<dyn Fn(AgentSession) -> Result<SessionLaunch, String> + Send + Sync>;
+type Check = Arc<dyn Fn(AgentSession) -> Checked + Send + Sync>;
+/// What one background check found.
+struct Checked {
+    /// The command people see and copy. It is known whenever the conversation
+    /// itself can be resumed, even if the CLI is missing from this desktop.
+    command: Option<String>,
+    /// The launch to spawn, with its executable resolved.
+    result: Result<SessionLaunch, String>,
+}
 struct Completion {
     target: Target,
     generation: u64,
-    result: Result<SessionLaunch, String>,
+    checked: Checked,
 }
 struct Pending {
     target: Target,
@@ -54,6 +62,7 @@ pub struct SessionPreflight {
     selected: Option<AgentSession>,
     generation: u64,
     state: SessionPreflightState,
+    command: Option<String>,
     pending: Option<Pending>,
     latest: Option<(u64, AgentSession)>,
     check: Check,
@@ -65,17 +74,38 @@ impl Default for SessionPreflight {
 }
 impl SessionPreflight {
     pub fn new() -> Self {
-        Self::with_check(Arc::new(|session| {
-            session.resume_launch()?.resolve_for_spawn()
+        Self::with_checked(Arc::new(|session| match session.resume_launch() {
+            Ok(launch) => Checked {
+                command: Some(launch.display_command()),
+                result: launch.resolve_for_spawn(),
+            },
+            Err(error) => Checked {
+                command: None,
+                result: Err(error),
+            },
         }))
     }
 
-    fn with_check(check: Check) -> Self {
+    #[cfg(test)]
+    fn with_check(
+        check: Arc<dyn Fn(AgentSession) -> Result<SessionLaunch, String> + Send + Sync>,
+    ) -> Self {
+        Self::with_checked(Arc::new(move |session| {
+            let result = check(session);
+            Checked {
+                command: result.as_ref().ok().map(SessionLaunch::display_command),
+                result,
+            }
+        }))
+    }
+
+    fn with_checked(check: Check) -> Self {
         Self {
             target: None,
             selected: None,
             generation: 0,
             state: SessionPreflightState::Idle,
+            command: None,
             pending: None,
             latest: None,
             check,
@@ -93,6 +123,7 @@ impl SessionPreflight {
         self.selected = session.cloned();
         self.generation = self.generation.wrapping_add(1);
         self.latest = None;
+        self.command = None;
         match self.selected.clone() {
             Some(session) => self.enqueue(session),
             None => self.state = SessionPreflightState::Idle,
@@ -116,6 +147,19 @@ impl SessionPreflight {
 
     pub fn is_busy(&self) -> bool {
         self.pending.is_some() || self.latest.is_some()
+    }
+
+    /// The exact resume command for `session` as people should see and copy
+    /// it, including an `env CODEX_HOME=…` or `env CLAUDE_CONFIG_DIR=…`
+    /// prefix. It comes from the background check, so reading it never
+    /// touches the filesystem. `None` until this conversation's first check
+    /// finishes, or when the conversation cannot be resumed. A refresh keeps
+    /// the previous command until its replacement arrives.
+    pub fn command(&self, session: &AgentSession) -> Option<&str> {
+        if self.target.as_ref() != Some(&Target::from(session)) {
+            return None;
+        }
+        self.command.as_deref()
     }
 
     pub fn ready_launch(&self, session: &AgentSession) -> Option<&SessionLaunch> {
@@ -145,15 +189,16 @@ impl SessionPreflight {
         match std::thread::Builder::new()
             .name("agent-session-preflight".into())
             .spawn(move || {
-                let result =
+                let checked =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(session)))
-                        .unwrap_or_else(|_| {
-                            Err("Agent installation check failed; retry the check.".into())
+                        .unwrap_or_else(|_| Checked {
+                            command: None,
+                            result: Err("Agent installation check failed; retry the check.".into()),
                         });
                 let _ = sender.send(Completion {
                     target: thread_target,
                     generation,
-                    result,
+                    checked,
                 });
             }) {
             Ok(_) => {
@@ -197,7 +242,8 @@ impl SessionPreflight {
                 if self.target.as_ref() == Some(&completion.target)
                     && self.generation == completion.generation
                 {
-                    self.state = match completion.result {
+                    self.command = completion.checked.command;
+                    self.state = match completion.checked.result {
                         Ok(launch) => SessionPreflightState::Ready(launch),
                         Err(error) => SessionPreflightState::Unavailable(error),
                     };
@@ -337,6 +383,59 @@ mod tests {
         });
         selected.archived = true;
         assert!(checks.ready_launch(&selected).is_none());
+    }
+
+    #[test]
+    fn display_command_comes_from_the_check_and_survives_a_refresh() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let thread_calls = calls.clone();
+        let mut checks = SessionPreflight::with_checked(Arc::new(move |session| {
+            // The second check finds the conversation but not the CLI: the
+            // command stays copyable while the launch is unavailable.
+            let missing_cli = thread_calls.fetch_add(1, Ordering::SeqCst) > 0;
+            Checked {
+                command: Some(format!("codex resume {}", session.id)),
+                result: if missing_cli {
+                    Err("codex was not found".into())
+                } else {
+                    Ok(launch(session))
+                },
+            }
+        }));
+        let selected = session(1);
+        let expected = format!("codex resume {}", selected.id);
+        assert!(checks.select(Some(&selected)));
+        assert_eq!(checks.command(&selected), None, "not checked yet");
+        until(&mut checks, |checks| {
+            checks.ready_launch(&selected).is_some()
+        });
+        assert_eq!(checks.command(&selected), Some(expected.as_str()));
+        assert_eq!(checks.command(&session(2)), None, "bound to its target");
+        assert!(checks.refresh());
+        assert_eq!(
+            checks.command(&selected),
+            Some(expected.as_str()),
+            "a refresh keeps the previous command until its replacement"
+        );
+        until(&mut checks, |checks| {
+            matches!(checks.state(), SessionPreflightState::Unavailable(_))
+        });
+        assert_eq!(checks.command(&selected), Some(expected.as_str()));
+        assert!(checks.select(Some(&session(2))));
+        assert_eq!(checks.command(&selected), None);
+        assert_eq!(checks.command(&session(2)), None, "cleared with the target");
+    }
+
+    #[test]
+    fn real_check_reports_why_a_conversation_cannot_resume_without_a_command() {
+        let mut checks = SessionPreflight::new();
+        let mut missing = session(1);
+        missing.cwd = "/nonexistent/jterm-preflight-project".into();
+        checks.select(Some(&missing));
+        until(&mut checks, |checks| {
+            matches!(checks.state(), SessionPreflightState::Unavailable(_))
+        });
+        assert_eq!(checks.command(&missing), None);
     }
 
     #[test]

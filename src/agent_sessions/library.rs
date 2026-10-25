@@ -45,6 +45,10 @@ fn normalize_batch_tag(tag: String) -> Result<String, String> {
     if tag.len() > SESSION_TAG_MAX_BYTES * 4 {
         return Err("Each session tag must be at most 32 bytes.".into());
     }
+    if tag.contains(',') {
+        // A batch takes exactly one tag; a comma is never a separator here.
+        return Err("A batch adds or removes one tag; remove the comma.".into());
+    }
     let organization = SessionOrganization {
         tags: vec![tag],
         ..SessionOrganization::default()
@@ -1819,6 +1823,10 @@ mod tests {
             assert_eq!(validated, admitted, "{tag:?}");
             settle(&mut store);
         }
+        assert_eq!(
+            validate_session_batch_tag("a,b").unwrap_err(),
+            "A batch adds or removes one tag; remove the comma."
+        );
     }
 
     #[test]

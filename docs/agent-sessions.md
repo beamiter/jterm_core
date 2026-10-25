@@ -301,17 +301,26 @@ it again would start a second CLI writing to the same history. A host that owns
 the matching tab switches to it; otherwise the first Resume only shows the
 warning, and a separate, explicit "Resume anyway" bound to the same provider and
 UUID proceeds. Changing the selection, a refresh that removes the conversation,
-or Escape withdraws the warning. The evidence can be one scan old, so it is a
-warning rather than a lock.
+or Escape withdraws the warning. A repeat within `SESSION_RESUME_ANYWAY_DELAY`
+(600 ms) of showing the warning is ignored, so a double-click or a quick double
+Enter cannot confirm it unread. A confirmation covers only the attempt it
+started: when that readiness check fails or the attempt is abandoned, the next
+Resume warns again. The evidence can be one scan old, so it is a warning rather
+than a lock.
 
 A background refresh must never move the selection to a different conversation:
 when the inspected conversation leaves the view (another window archived it,
 its recorded state no longer matches a filter), hosts keep its identity, show
 that it is no longer listed, and disable Resume and organization until the user
 selects again. Explicit filter or search edits may still select the first match.
-Display and copy the exact command from `resume_launch().display_command()`,
-which includes any `env CODEX_HOME=…` or `env CLAUDE_CONFIG_DIR=…` prefix. Archived sessions are visible but require the user to
-unarchive them in Codex before resuming.
+Display and copy the exact command from `SessionPreflight::command(session)`,
+which includes any `env CODEX_HOME=…` or `env CLAUDE_CONFIG_DIR=…` prefix. The
+background check computes it together with readiness, so hosts never call
+`resume_launch()` (which checks the project directory and history file) on the
+UI thread. It is `None` until the selected conversation's first check finishes
+and when the conversation itself cannot be resumed; a refresh keeps the previous
+command until the new result arrives. Archived sessions are visible but require
+the user to unarchive them in Codex before resuming.
 
 ## Bounds and limitations
 
