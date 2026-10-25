@@ -127,9 +127,10 @@ invalid values, clock rollback and settling after input stops.
 
 The original helper-only iteration did not include direct pixel input. The
 subsequent source-bound viewport and frontend integration are documented in
-[the pixel viewport contract](vim9-pixel-viewport.md). Wrapped lines, folds,
+[the pixel viewport contract](vim9-pixel-viewport.md). Wrapped lines,
 platform IME correctness and physical Wayland/high-refresh hardware still have
-their documented compatibility and acceptance boundaries.
+their documented compatibility and acceptance boundaries. Closed folds are
+native display rows since render protocol 8 ([native closed folds](vim9-native-folds.md)).
 
 A comparison against VS Code must use the same hardware, files, font, scale,
 refresh rate and input device, with input-to-photon latency and p95/p99 frame

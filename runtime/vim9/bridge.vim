@@ -174,7 +174,11 @@ enddef
 var renderWindowCaches: dict<dict<any>> = {}
 var renderWindowSample: dict<any> = {}
 var renderSamplingWindow = 0
+# The active window's ordered Visual endpoints, used for closed fold rows.
+var renderSamplingVisual: dict<any> = {}
 var scrollAcknowledgements: dict<number> = {}
+var scrollAcknowledgedRows: dict<number> = {}
+var scrollMovedRows = 0
 var pointerGesture: dict<any> = {}
 var renderLineGeneration = ''
 var renderLineCache: dict<dict<any>> = {}
@@ -939,6 +943,12 @@ def NativeSourceWindow(request: dict<any>): number
   return window
 enddef
 
+def MeasureScrolledRows(previousTop: number)
+  var top = line('w0')
+  scrollMovedRows = top >= previousTop ? DisplayRowsBetween(previousTop, top)
+    : -DisplayRowsBetween(top, previousTop)
+enddef
+
 def ScrollSourceWindow(request: dict<any>, id: number)
   SafeToChange()
   if !NativeScrollAvailable() || SaveInputPending()
@@ -962,8 +972,14 @@ def ScrollSourceWindow(request: dict<any>, id: number)
   sendBatchDepth += 1
   try
     ScrollWindow(request)
+    # Count in the scrolled split's own fold state: <C-E>/<C-Y> treat a closed
+    # fold as one row, so a topline delta alone cannot confirm the movement.
+    scrollMovedRows = 0
+    win_execute(window, 'noautocmd call ' .. expand('<SID>') .. 'MeasureScrolledRows(' .. top .. ')')
     scrollAcknowledgements = filter(scrollAcknowledgements, (key, _) => win_id2win(str2nr(key)) > 0)
+    scrollAcknowledgedRows = filter(scrollAcknowledgedRows, (key, _) => win_id2win(str2nr(key)) > 0)
     scrollAcknowledgements[string(window)] = id
+    scrollAcknowledgedRows[string(window)] = scrollMovedRows
     # Keep semantic acknowledgement before response, but in one channel write.
     # Separate small writes can wait for TCP's delayed ACK/Nagle timer and
     # stall the next source-bound request by roughly 40ms even on loopback.
@@ -1138,6 +1154,121 @@ def RenderVirtualText(runs: list<dict<any>>, properties: list<any>, context: dic
   return ''
 enddef
 
+# fillchars 'fold:' item for the sampled window ('-' by default). An empty
+# result means the glyph cannot be painted cell-exactly.
+def RenderFoldFill(): string
+  var value = matchstr(&fillchars, '\%(^\|,\)fold:\zs\%(\\.\|[^,]\)\+')
+  if empty(value)
+    return stridx(',' .. &fillchars, ',fold:') >= 0 ? '' : '-'
+  endif
+  try
+    var glyphs = ListCharGlyphs(value)
+    return len(glyphs) == 1 ? glyphs[0] : ''
+  catch
+    return ''
+  endtry
+enddef
+
+# Vim's own relative numbering counts a closed fold as one row (see
+# get_cursor_rel_lnum()). Count display rows starting in [from, to).
+def DisplayRowsBetween(from: number, to: number): number
+  var count = 0
+  var lineNumber = from
+  while lineNumber < to
+    count += 1
+    var foldEnd = foldclosedend(lineNumber)
+    lineNumber = foldEnd > 0 ? foldEnd + 1 : lineNumber + 1
+  endwhile
+  return count
+enddef
+
+# One closed fold row, composed as Vim's fold_line() draws it: Folded over the
+# whole width, two blank sign cells, the fold-start (or relative) number, the
+# 'foldtext' result truncated before a glyph that would not fit, and the
+# fillchars fold glyph to the window edge. Visual replaces the text style when
+# the whole fold is selected; ColorColumn and CursorColumn then combine with
+# it. Fold glyphs are display-only and never advertise buffer source bytes.
+def RenderFoldRow(runs: list<dict<any>>, context: dict<any>): string
+  var view = context.view
+  var folded = context.folded
+  var gutter = ''
+  if context.sign_width > 0
+    gutter ..= repeat(' ', min([2, view.columns]))
+  endif
+  if context.number
+    var label = context.number_label
+    gutter ..= strpart(label, 0, max([0, view.columns - strlen(gutter)]))
+  endif
+  var textColumn = strlen(gutter)
+  if textColumn > 0
+    add(runs, {row: context.row, column: view.column, text: gutter, cells: textColumn,
+      line: 0, byte_start: 0, byte_end: 0, style: folded})
+  endif
+  var text = foldtextresult(context.line)
+  if text =~# '[\x00-\x08\x0a-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
+    return 'Control and bidirectional fold text uses the compatibility view'
+  elseif strlen(text) > 4096
+    return 'This fold text exceeds the bounded native paint budget'
+  endif
+  var fill = RenderFoldFill()
+  if empty(fill)
+    return 'This fillchars fold glyph uses the compatibility view'
+  endif
+  var base = context.selected ? context.visual : folded
+  # Window-relative cells that combine an extra guide style, in Vim's order.
+  var guides: dict<dict<any>> = {}
+  for column in context.color_columns
+    var cell = textColumn + column - context.leftcol
+    if cell >= textColumn && cell < view.columns
+      guides[string(cell)] = MergeRenderStyle(base, context.color_style)
+    endif
+  endfor
+  if context.cursor_column >= 0
+    var cell = textColumn + context.cursor_column - context.leftcol
+    if cell >= textColumn && cell < view.columns
+      guides[string(cell)] = MergeRenderStyle(get(guides, string(cell), base), context.cursor_style)
+    endif
+  endif
+  var column = textColumn
+  var previousPlain = false
+  for index in range(strchars(text, true))
+    var cluster = strcharpart(text, index, 1, true)
+    var cells = strdisplaywidth(cluster)
+    if cells <= 0 || cells > 2
+      return 'Complex fold text uses the compatibility view'
+    elseif column + cells > view.columns
+      break
+    endif
+    var style = get(guides, string(column), base)
+    var plain = strlen(cluster) == 1
+    if plain && previousPlain && runs[-1].style == style && !has_key(guides, string(column))
+        && !has_key(guides, string(runs[-1].column - view.column + runs[-1].cells - 1))
+      runs[-1].text ..= cluster
+      runs[-1].cells += 1
+    else
+      add(runs, {row: context.row, column: view.column + column, text: cluster, cells: cells,
+        line: 0, byte_start: 0, byte_end: 0, style: style})
+    endif
+    previousPlain = plain
+    column += cells
+  endfor
+  # A filler run of one repeated single-cell glyph is stretched to exactly its
+  # cells by every native painter; only guide cells interrupt it.
+  while column < view.columns
+    var finish = column + 1
+    if !has_key(guides, string(column))
+      while finish < view.columns && !has_key(guides, string(finish))
+        finish += 1
+      endwhile
+    endif
+    add(runs, {row: context.row, column: view.column + column, text: repeat(fill, finish - column),
+      cells: finish - column, line: 0, byte_start: 0, byte_end: 0,
+      style: get(guides, string(column), base)})
+    column = finish
+  endwhile
+  return ''
+enddef
+
 def RenderWindowFrame(margin: number = 0): dict<any>
   var windowNormal = WindowNormalStyle()
   var listChars = RenderListChars()
@@ -1166,6 +1297,28 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   var savedView = winsaveview()
   var first = line('w0')
   var last = line('w$')
+  # A closed fold is one display row. Every sampled row is addressed through
+  # this map, so later rows keep Vim's screen positions below a fold. Hidden
+  # lines inside a fold are never sampled, styled or published.
+  var foldEnds: dict<number> = {}
+  var visibleRows: list<number> = []
+  var rowLine = first
+  while rowLine <= last && len(visibleRows) <= 200
+    add(visibleRows, rowLine)
+    var foldEnd = foldclosedend(rowLine)
+    if foldEnd > 0
+      foldEnds[string(rowLine)] = foldEnd
+      rowLine = foldEnd + 1
+    else
+      rowLine += 1
+    endif
+  endwhile
+  if !empty(foldEnds) && (renderProtocol < 8 || foldclosed(first) != first && foldclosed(first) > 0)
+    frame.supported = false
+    frame.fallback_reason = 'Closed Vim folds use the compatibility view'
+    return frame
+  endif
+  last = max([last, rowLine - 1])
   frame.topline = first
   frame.botline = last
   frame.leftcol = savedView.leftcol
@@ -1176,13 +1329,60 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   frame.native_pointer = renderProtocol >= 3 && NativePointerAvailable(false)
   frame.native_scroll = renderProtocol >= 3 && NativeScrollAvailable()
   frame.scroll_ack = get(scrollAcknowledgements, string(win_getid()), 0)
-  frame.line_lengths = map(getline(first, last), (_, text) => strlen(text))
+  frame.line_lengths = map(copy(visibleRows), (_, lineNumber) => strlen(getline(lineNumber)))
   var visibleFirst = first
+  var aboveRows: list<number> = []
+  var belowRows: list<number> = []
   if margin > 0
-    first = max([1, first - margin])
-    last = min([line('$'), last + margin])
+    # Margins are display rows too: a closed fold above or below the split
+    # contributes one row, never every hidden line it contains.
+    var up = visibleFirst - 1
+    while up >= 1 && len(aboveRows) < margin
+      var start = foldclosed(up)
+      if start > 0
+        foldEnds[string(start)] = foldclosedend(up)
+        insert(aboveRows, start)
+        up = start - 1
+      else
+        insert(aboveRows, up)
+        up -= 1
+      endif
+    endwhile
+    var down = last + 1
+    while down <= line('$') && len(belowRows) < margin
+      add(belowRows, down)
+      var foldEnd = foldclosedend(down)
+      if foldEnd > 0
+        foldEnds[string(down)] = foldEnd
+        down = foldEnd + 1
+      else
+        down += 1
+      endif
+    endwhile
+    if !empty(foldEnds) && renderProtocol < 8
+      frame.supported = false
+      frame.fallback_reason = 'Closed Vim folds use the compatibility view'
+      return frame
+    endif
   endif
-  if view.rows > 200 || view.columns > 400 || last - first > 200 + 2 * margin
+  var displayRows = aboveRows + visibleRows + belowRows
+  var topIndex = len(aboveRows)
+  var rowOffset: dict<number> = {}
+  for index in range(len(displayRows))
+    rowOffset[string(displayRows[index])] = index
+  endfor
+  first = displayRows[0]
+  last = get(foldEnds, string(displayRows[-1]), displayRows[-1])
+  var textRows = empty(foldEnds) ? displayRows
+    : filter(copy(displayRows), (_, lineNumber) => !has_key(foldEnds, string(lineNumber)))
+  if !empty(foldEnds)
+    # Protocol 8 row map. Fold rows are display-only: Vim keeps pointer
+    # ownership in this split, while source-bound scrolling counts rows.
+    frame.display_lines = copy(visibleRows)
+    frame.fold_ends = map(copy(visibleRows), (_, lineNumber) => get(foldEnds, string(lineNumber), 0))
+    frame.native_pointer = false
+  endif
+  if view.rows > 200 || view.columns > 400 || len(displayRows) - 1 > 200 + 2 * margin
     frame.supported = false
     frame.fallback_reason = 'This viewport exceeds the bounded native paint budget'
     return frame
@@ -1197,6 +1397,11 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     ? max([&numberwidth, strlen(string(line('$'))) + 1]) : 0
   var signWidth = info.textoff - numberWidth
   var signs = RenderSigns(first, last)
+  if !empty(foldEnds)
+    # Vim draws neither signs nor sign highlights on a closed fold row, and
+    # hidden lines inside a fold cannot affect the visible sign geometry.
+    filter(signs, (key, _) => has_key(rowOffset, key) && !has_key(foldEnds, key))
+  endif
   if !empty(signs) && (signWidth > 2 || signWidth < 0)
     frame.supported = false
     frame.fallback_reason = 'Multiple Vim sign columns use the compatibility view'
@@ -1211,16 +1416,31 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       return frame
     endif
   endfor
-  # Opening/closing a fold does not change b:changedtick. Check its display
-  # state independently of the buffer/syntax cache on every paint attempt.
-  for lineNumber in range(first, last)
-    if foldclosed(lineNumber) >= 0
-      frame.supported = false
-      frame.fallback_reason = 'Closed Vim folds use the compatibility view'
-      return frame
+  # Opening/closing a fold does not change b:changedtick. The display-row map
+  # above is rebuilt on every paint attempt, independently of the caches.
+  var allProperties: list<dict<any>> = []
+  if empty(foldEnds)
+    allProperties = prop_list(first, {end_lnum: last})
+  else
+    # Fold rows show only their fold text. Query contiguous visible source
+    # segments so diagnostics inside a large closed fold cost nothing.
+    var segmentStart = -1
+    var segmentEnd = -1
+    for lineNumber in textRows
+      if segmentStart > 0 && lineNumber == segmentEnd + 1
+        segmentEnd = lineNumber
+        continue
+      endif
+      if segmentStart > 0
+        extend(allProperties, prop_list(segmentStart, {end_lnum: segmentEnd}))
+      endif
+      segmentStart = lineNumber
+      segmentEnd = lineNumber
+    endfor
+    if segmentStart > 0
+      extend(allProperties, prop_list(segmentStart, {end_lnum: segmentEnd}))
     endif
-  endfor
-  var allProperties = prop_list(first, {end_lnum: last})
+  endif
   var properties: list<dict<any>> = []
   # Index once per frame; scanning the whole property list for every source
   # row makes dense diagnostics cost O(visible_rows * properties). Definitions
@@ -1318,14 +1538,15 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     renderLineGeneration = generation
     renderLineCache = {}
   endif
-  var baseKey = string([generation, first, last, view, properties, inlineLines])
+  # Folding changes which source lines own rows without changing any text.
+  var baseKey = string([generation, first, last, view, properties, inlineLines, foldEnds])
   if baseKey !=# renderBaseKey
     renderBase = []
     var nextLines: dict<dict<any>> = {}
     var noListStyle: dict<any> = {}
-    for lineNumber in range(first, last)
+    for lineNumber in textRows
       var text = getline(lineNumber)
-      var row = view.row + lineNumber - first
+      var row = view.row + rowOffset[string(lineNumber)]
       var lineProperties = get(propertyLines, string(lineNumber), [])
       var inlineLayout = get(inlineLayouts, string(lineNumber), {})
       var inlineAdvances: dict<number> = get(inlineLayout, 'advances', {})
@@ -1333,18 +1554,19 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var lineKey = string([text, lineProperties, get(inlineLines, string(lineNumber), [])])
       var cached = get(renderLineCache, string(lineNumber), {})
       if !empty(cached) && cached.key ==# lineKey
-        for stored in cached.base
-          var glyph = copy(stored)
-          glyph.row = row
-          add(renderBase, glyph)
-        endfor
+        # Cached glyphs are owned by this window's line cache and are only
+        # read when wire runs are materialized, so a scroll retargets their
+        # row in place instead of deep-copying every surviving glyph.
+        if !empty(cached.base) && cached.base[0].row != row
+          for stored in cached.base
+            stored.row = row
+          endfor
+        endif
+        extend(renderBase, cached.base)
         nextLines[string(lineNumber)] = cached
         continue
       endif
-      if foldclosed(lineNumber) >= 0
-        reason = 'Closed Vim folds use the compatibility view'
-        break
-      elseif strlen(text) > 16384 || strchars(text) > 4096
+      if strlen(text) > 16384 || strchars(text) > 4096
         reason = 'This long line exceeds the bounded native paint budget'
         break
       elseif &wrap && displayWidth > textWidth
@@ -1519,8 +1741,8 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     # This existing run shape carries per-window Normal without a protocol
     # extension. It covers gutters and blank/EOF cells before their own groups
     # and source glyphs, and never advertises a fabricated buffer position.
-    var lastBackground = max([view.row + last - first,
-      view.row + view.rows + visibleFirst - first - 1])
+    var lastBackground = max([view.row + len(displayRows) - 1,
+      view.row + view.rows + topIndex - 1])
     for row in range(view.row, lastBackground)
       add(paintRuns, {row: row, column: view.column, cells: view.columns,
         text: '', line: 0, byte_start: 0, byte_end: 0, style: windowNormal})
@@ -1560,7 +1782,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   var cursorGuideStyle = RenderStyle(hlID('CursorColumn'))
   var guideRows: dict<dict<any>> = {}
   var rowStyles: dict<dict<any>> = {}
-  for lineNumber in range(first, last)
+  for lineNumber in textRows
     var sign = get(signs, string(lineNumber), {})
     var lineStyle: dict<any> = {}
     if !empty(get(sign, 'linehl', ''))
@@ -1582,7 +1804,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       rowStyles[string(lineNumber)] = lineStyle
       # A whole-window Normal backdrop is identified by line=0/empty text.
       # QuickFixLine is one source row, not a new Normal for the entire pane.
-      add(frame.runs, {row: view.row + lineNumber - first, column: view.column + info.textoff,
+      add(frame.runs, {row: view.row + rowOffset[string(lineNumber)], column: view.column + info.textoff,
         cells: textWidth, text: repeat(' ', textWidth), line: lineNumber,
         byte_start: 0, byte_end: 0, style: MergeRenderStyle(windowNormal, lineStyle)})
     endif
@@ -1599,7 +1821,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       # Source-free runs paint guides beyond EOL. A one-column pane uses a
       # space to avoid the empty-text/full-width Normal backdrop signature.
       for [column, guideStyle] in items(guides)
-        add(frame.runs, {row: view.row + lineNumber - first,
+        add(frame.runs, {row: view.row + rowOffset[string(lineNumber)],
           column: view.column + info.textoff + str2nr(column) - savedView.leftcol,
           text: view.columns == 1 ? ' ' : '', cells: 1, line: 0, byte_start: 0, byte_end: 0,
           style: MergeRenderStyle(MergeRenderStyle(windowNormal, lineStyle), guideStyle)})
@@ -1657,7 +1879,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     endfor
   endfor
   if has_key(listChars, 'eol')
-    for lineNumber in range(first, last)
+    for lineNumber in textRows
       var column = get(get(inlineLayouts, string(lineNumber), {}), 'width', strdisplaywidth(getline(lineNumber))) - savedView.leftcol
       if column >= 0 && column < textWidth
         var style = MergeRenderStyle(windowNormal, get(rowStyles, string(lineNumber), {}))
@@ -1670,7 +1892,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
             style = MergeRenderStyle(style, guide)
           endif
         endif
-        add(paintRuns, {row: view.row + lineNumber - first,
+        add(paintRuns, {row: view.row + rowOffset[string(lineNumber)],
           column: view.column + info.textoff + column, text: listChars.eol[0], cells: 1,
           line: 0, byte_start: 0, byte_end: 0, style: style})
       endif
@@ -1681,14 +1903,14 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   if visual ==# 'V' || visual ==# 'v'
     var lowLine = min([anchor[1], current[1]])
     var highLine = max([anchor[1], current[1]])
-    for lineNumber in range(max([first, lowLine]), min([last, highLine]))
+    for lineNumber in filter(copy(textRows), (_, l) => l >= lowLine && l <= highLine)
       var text = getline(lineNumber)
       var endColumn = strdisplaywidth(text) - savedView.leftcol
       if endColumn >= 0 && endColumn < textWidth
           && (visual ==# 'V' || lineNumber < highLine
             || (!has_key(listChars, 'eol') && max([anchor[2], current[2]]) > strlen(text)))
         var endStyle = MergeRenderStyle(windowNormal, visualStyle)
-        add(frame.runs, {row: view.row + lineNumber - first,
+        add(frame.runs, {row: view.row + rowOffset[string(lineNumber)],
           column: view.column + info.textoff + endColumn,
           text: has_key(listChars, 'eol') ? listChars.eol[0] : ' ', cells: 1, line: has_key(listChars, 'eol') ? 0 : lineNumber,
           byte_start: strlen(text), byte_end: strlen(text), style: endStyle})
@@ -1700,7 +1922,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     for [key, labels] in items(lines)
       var lineNumber = str2nr(key)
       var layout = get(inlineLayouts, key, {})
-      var context = {line: lineNumber, row: view.row + lineNumber - first,
+      var context = {line: lineNumber, row: view.row + rowOffset[key],
         column: view.column + info.textoff, width: textWidth, left: savedView.leftcol,
         width_before: get(layout, 'width', strdisplaywidth(getline(lineNumber))),
         inline: inline, eol: has_key(listChars, 'eol'),
@@ -1715,8 +1937,69 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       endif
     endfor
   endfor
-  for lineNumber in range(first, last)
-    var sign = get(signs, string(lineNumber), {})
+  var cursorRowLine = foldclosed(line('.')) > 0 ? foldclosed(line('.')) : line('.')
+  var cursorIndex = get(rowOffset, string(cursorRowLine), -1)
+  var foldContext: dict<any> = {}
+  if !empty(foldEnds)
+    # Like ordinary rows, only the active split paints the live selection.
+    var sampling = renderSamplingVisual
+    var selection = !empty(sampling) && win_getid() == renderSamplingWindow
+      && sampling.buffer == bufnr()
+    if selection && sampling.mode ==# "\<C-V>"
+      frame.supported = false
+      frame.fallback_reason = 'Block selections over closed Vim folds use the compatibility view'
+      frame.runs = []
+      return frame
+    endif
+    foldContext = {view: view, sign_width: signWidth, number: &number || &relativenumber,
+      folded: MergeRenderStyle(windowNormal, RenderStyle(hlID('Folded'))),
+      visual: MergeRenderStyle(windowNormal, visualStyle), leftcol: savedView.leftcol,
+      color_columns: colorColumns, color_style: colorStyle,
+      cursor_column: &cursorcolumn ? cursorColumn : -1, cursor_style: cursorGuideStyle,
+      selection: selection ? sampling : {}}
+  endif
+  for lineNumber in displayRows
+    var rowKey = string(lineNumber)
+    var row = view.row + rowOffset[rowKey]
+    # Vim's relative numbers count display rows, so a closed fold between the
+    # cursor and this row counts once (get_cursor_rel_lnum()).
+    var relative = 0
+    if &relativenumber
+      if cursorIndex >= 0
+        relative = abs(rowOffset[rowKey] - cursorIndex)
+      elseif cursorRowLine < first
+        relative = DisplayRowsBetween(cursorRowLine, first) + rowOffset[rowKey]
+      else
+        relative = len(displayRows) - rowOffset[rowKey] + DisplayRowsBetween(last + 1, cursorRowLine)
+      endif
+    endif
+    var numberValue = &relativenumber && (relative != 0 || !&number) ? relative : lineNumber
+    # 'number' + 'relativenumber' left-aligns the absolute cursor row number.
+    var numberLabel = printf(&number && &relativenumber && relative == 0 ? '%-*d ' : '%*d ',
+      max([1, numberWidth - 1]), &number && !&relativenumber ? lineNumber : numberValue)
+    if has_key(foldEnds, rowKey)
+      var foldEnd = foldEnds[rowKey]
+      var selected = false
+      var selection = foldContext.selection
+      if !empty(selection)
+        var low = selection.low
+        var high = selection.high
+        selected = lineNumber >= low[1] && foldEnd <= high[1]
+          && (selection.mode !=# 'v'
+            || ((lineNumber > low[1] || low[2] == 1)
+              && (foldEnd < high[1] || high[2] - 1 - (&selection ==# 'exclusive' ? 1 : 0) >= strlen(getline(foldEnd)))))
+      endif
+      reason = RenderFoldRow(paintRuns, extend({row: row, line: lineNumber, number_label: numberLabel,
+        selected: selected}, foldContext))
+      if !empty(reason)
+        frame.supported = false
+        frame.fallback_reason = reason
+        frame.runs = []
+        return frame
+      endif
+      continue
+    endif
+    var sign = get(signs, rowKey, {})
     var signText = get(sign, 'text', '')
     var signHighlight = &cursorline && lineNumber == line('.') && !empty(get(sign, 'culhl', ''))
       ? sign.culhl : get(sign, 'texthl', '')
@@ -1724,14 +2007,12 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       var columnStyle = MergeRenderStyle(windowNormal,
         RenderStyle(hlID(&cursorline && lineNumber == line('.') ? 'CursorLineSign' : 'SignColumn')))
       var label = signText .. repeat(' ', max([0, signWidth - strdisplaywidth(signText)]))
-      add(frame.runs, {row: view.row + lineNumber - first, column: view.column,
+      add(frame.runs, {row: row, column: view.column,
         text: label, cells: signWidth, line: 0, byte_start: 0, byte_end: 0,
         style: empty(signHighlight) ? columnStyle : MergeRenderStyle(columnStyle, RenderStyle(hlID(signHighlight)))})
     endif
     if &number || &relativenumber
-      var number = &relativenumber && (lineNumber != line('.') || !&number)
-        ? abs(lineNumber - line('.')) : lineNumber
-      var label = printf('%*d ', max([1, numberWidth - 1]), number)
+      var label = numberLabel
       var style = MergeRenderStyle(windowNormal,
         RenderStyle(hlID(lineNumber == line('.') ? 'CursorLineNr' : 'LineNr')))
       if !empty(get(sign, 'numhl', ''))
@@ -1743,29 +2024,32 @@ def RenderWindowFrame(margin: number = 0): dict<any>
           style = MergeRenderStyle(style, RenderStyle(hlID(signHighlight)))
         endif
       endif
-      add(frame.runs, {row: view.row + lineNumber - first, column: view.column + max([0, signWidth]),
+      add(frame.runs, {row: row, column: view.column + max([0, signWidth]),
         text: label, cells: strdisplaywidth(label), line: 0, byte_start: 0, byte_end: 0,
         style: style})
     endif
   endfor
-  for row in range(view.row + last - first + 1, max([view.row + last - first, view.row + view.rows + visibleFirst - first - 1]))
+  for row in range(view.row + len(displayRows), max([view.row + len(displayRows) - 1, view.row + view.rows + topIndex - 1]))
     add(frame.runs, {row: row, column: view.column, text: '~', cells: 1,
       line: 0, byte_start: 0, byte_end: 0,
       style: MergeRenderStyle(windowNormal, RenderStyle(hlID('EndOfBuffer')))})
   endfor
   if margin > 0
     var marginRows: dict<dict<any>> = {}
-    for lineNumber in range(first, last)
-      var relative = lineNumber - visibleFirst
+    for lineNumber in displayRows
+      var relative = rowOffset[string(lineNumber)] - topIndex
       if relative < 0 || relative >= view.rows
         var edge = {row: relative, line: lineNumber, byte_length: strlen(getline(lineNumber)), runs: []}
+        if has_key(foldEnds, string(lineNumber))
+          edge.fold_end = foldEnds[string(lineNumber)]
+        endif
         marginRows[string(relative)] = edge
         add(frame.overscan, edge)
       endif
     endfor
     var visibleRuns: list<dict<any>> = []
     for run in frame.runs
-      var relative = run.row - view.row - (visibleFirst - first)
+      var relative = run.row - view.row - topIndex
       if relative >= 0 && relative < view.rows
         run.row = view.row + relative
         add(visibleRuns, run)
@@ -2234,6 +2518,14 @@ def RenderFrame(): dict<any>
   var activeView = winsaveview()
   var activeBuffer = bufnr()
   renderSamplingWindow = active
+  renderSamplingVisual = {}
+  if index(['v', 'V', "\<C-V>"], activeMode) >= 0
+    var anchor = getpos('v')
+    var current = getpos('.')
+    var ordered = anchor[1] < current[1] || (anchor[1] == current[1] && anchor[2] <= current[2])
+    renderSamplingVisual = {mode: activeMode, buffer: activeBuffer,
+      low: ordered ? anchor : current, high: ordered ? current : anchor}
+  endif
   # Sampling the active window directly is essential: win_execute() makes
   # an inactive window Normal temporarily while preserving the caller's
   # Visual mode. This also prevents Visual selections leaking into siblings.
@@ -2270,14 +2562,24 @@ def RenderFrame(): dict<any>
       return frame
     endif
     var sample = renderWindowSample
-    add(frame.windows, {window: sample.window, buffer: sample.buffer,
+    var metadata = {window: sample.window, buffer: sample.buffer,
       changedtick: sample.changedtick, view: sample.view, cursor: sample.cursor,
       topline: sample.topline, botline: sample.botline,
       textoff: sample.textoff, leftcol: sample.leftcol,
       line_count: sample.line_count, overscan: sample.overscan,
       native_pointer: sample.native_pointer, native_scroll: sample.native_scroll,
       scroll_ack: sample.scroll_ack,
-      line_lengths: sample.line_lengths})
+      line_lengths: sample.line_lengths}
+    if renderProtocol >= 8
+      # Display rows actually moved by the acknowledged request. Without folds
+      # this equals the topline delta; across a closed fold it is smaller.
+      metadata.scroll_rows = get(scrollAcknowledgedRows, string(sample.window), 0)
+      if has_key(sample, 'display_lines')
+        metadata.display_lines = sample.display_lines
+        metadata.fold_ends = sample.fold_ends
+      endif
+    endif
+    add(frame.windows, metadata)
     extend(runs, sample.runs)
     caches[string(id)] = renderWindowCaches[string(id)]
   endfor
@@ -2288,6 +2590,10 @@ def RenderFrame(): dict<any>
   remove(frame, 'native_pointer')
   remove(frame, 'native_scroll')
   remove(frame, 'scroll_ack')
+  if has_key(frame, 'display_lines')
+    remove(frame, 'display_lines')
+    remove(frame, 'fold_ends')
+  endif
   if win_getid() != active || bufnr() != activeBuffer || mode(1) !=# activeMode || winsaveview() != activeView
     frame.supported = false
     frame.fallback_reason = 'Vim changed its active view during native sampling'
@@ -3529,7 +3835,7 @@ def Receive(_: channel, message: string)
         return
       endif
       var requestedRender: any = get(request, 'render_protocol', 1)
-      if type(requestedRender) != v:t_number || index([1, 2, 3, 4, 5, 6, 7], requestedRender) < 0
+      if type(requestedRender) != v:t_number || index([1, 2, 3, 4, 5, 6, 7, 8], requestedRender) < 0
         throw 'Unsupported native render protocol'
       endif
       renderProtocol = requestedRender

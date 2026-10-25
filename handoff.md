@@ -1,5 +1,48 @@
 # Engineering handoff
 
+## 2026-10-25 — native closed folds (render protocol 8)
+
+- Closed folds no longer force the compatibility view. `bridge.vim` builds a
+  display-row map for every sampled split (visible rows and both margins), so
+  a fold is one row and later rows keep Vim's screen positions. Fold rows are
+  composed like Vim's `fold_line()`: `Folded` over the whole width, two blank
+  sign cells, fold-start/relative number, `foldtextresult()` truncated before
+  a glyph that would not fit, `fillchars` `fold:` filler, `Visual` for a fully
+  selected fold, `ColorColumn`/`CursorColumn` combined at `leftcol`-shifted
+  columns, no `CursorLine`. Fold runs are `line: 0` display paint.
+- Hidden lines are never sampled: text properties are queried per visible
+  source segment and signs inside folds are ignored. Relative numbers count
+  display rows (`get_cursor_rel_lnum()`), and `number`+`relativenumber` now
+  left-aligns the absolute cursor-row number on every row (previous native
+  frames right-aligned it; Vim left-aligns).
+- Protocol 8 wire fields: `display_lines`, `fold_ends`, margin `fold_end` and
+  `scroll_rows` (display rows actually moved by the acknowledged
+  `scroll_view`). `Vim9RenderFrame::valid()` requires a contiguous row chain
+  and rejects source runs on fold rows and `native_pointer` on folded splits.
+  New API: `Vim9DisplayRow`, `visible_rows()`, `display_rows()`,
+  `display_row_of()`, `topline_shift()` and `Vim9RenderRun::repeated_glyph()`.
+- `Vim9PixelScroll` acknowledges with `scroll_rows`, so a touchpad stroke or
+  wheel notch across a large fold continues instead of snapping. Clicks in a
+  folded split use Vim's own mouse handling. Protocol 7 and older peers keep
+  the previous fallback. The host now negotiates `RENDER_PROTOCOL = 8`.
+- Scrolling no longer deep-copies every surviving cached glyph to change its
+  row: line-cache glyphs are owned by their window cache and only read when
+  wire runs are materialized, so their row is retargeted in place. Measured
+  with `benchmark_render.py --lines 50000 --samples 200`, three interleaved
+  rounds against the previous bridge: Vim CPU per Ctrl-E scroll 7.7–7.95 ms →
+  6.25–6.7 ms with one window and 9.45–9.9 ms → 8.95–9.45 ms with two splits;
+  median Ctrl-E-to-semantic-frame latency ~24.2 ms → ~22.8 ms (one window).
+  These are Vim-side numbers, not GUI frame times.
+- Validation: `python3 -m unittest discover -p 'test_*.py'` in `runtime/vim9`
+  — 322 real-Vim tests OK (11 new in `test_render_folds.py`, 69 skipped for
+  absent sibling plugin checkouts); `cargo test --lib vim9` 147 OK plus the
+  two ignored real-Vim round trips; clippy `-D warnings`, rustfmt and
+  warning-denied rustdoc clean. In this sandbox the
+  unrelated `git_meta::...status_probe_never_runs_repository_configured_programs`
+  and `codex_app_server::...cgroup_scope_kills_term...` tests fail identically
+  on the untouched base. The ignored real-Vim round trip needs a UTF-8 locale
+  (`LANG=C.UTF-8`). See `docs/vim9-native-folds.md`.
+
 Updated: 2026-09-30 (pending tip beside wave-38 deepen)
 
 ## 2026-09-30 (pending tip — wave-38 deepen)

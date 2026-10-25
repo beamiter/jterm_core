@@ -239,16 +239,19 @@ impl<'a> Vim9Viewport<'a> {
             .or_else(|| self.empty_anchor_at(x, y))
     }
 
+    /// Empty-line and EOL targets. Closed fold rows show display-only fold
+    /// text and never expose an editable source endpoint.
     fn source_rows(&self) -> impl Iterator<Item = (i64, u64, usize)> + '_ {
         self.window
-            .line_lengths
-            .iter()
-            .enumerate()
-            .map(|(row, length)| (row as i64, self.window.topline + row as u64, *length))
+            .visible_rows()
+            .zip(self.window.line_lengths.iter())
+            .filter(|(row, _)| !row.folded)
+            .map(|(row, length)| (row.row, row.line, *length))
             .chain(
                 self.window
                     .overscan
                     .iter()
+                    .filter(|row| row.fold_end == 0)
                     .map(|row| (i64::from(row.row), row.line, row.byte_length)),
             )
     }
@@ -339,6 +342,7 @@ impl<'a> Vim9Viewport<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vim9::Vim9RenderMarginRow;
     use serde_json::json;
 
     fn frame() -> Vim9RenderFrame {
@@ -388,6 +392,48 @@ mod tests {
         assert!(view.anchor_at(9.0, 80.0).is_none());
         assert!(view.anchor_at(64.0, 75.0).is_none());
         assert_eq!(view.cursor_rect().unwrap().y, 13.75);
+    }
+
+    #[test]
+    fn closed_fold_rows_paint_but_never_become_source_targets() {
+        // Row 2 is a closed fold 12..=20; rows below it continue at line 21.
+        let mut frame = frame();
+        let window = &mut frame.windows[0];
+        window.botline = 21;
+        window.display_lines = vec![10, 11, 12, 21];
+        window.fold_ends = vec![0, 0, 20, 0];
+        window.line_lengths = vec![2, 3, 0, 0];
+        window.overscan.retain(|row| row.row < 0);
+        window.overscan.push(Vim9RenderMarginRow {
+            row: 4,
+            line: 22,
+            fold_end: 25,
+            byte_length: 6,
+            ..Default::default()
+        });
+        frame.runs[2] = Vim9RenderRun {
+            window: 10,
+            row: 2,
+            column: 0,
+            cells: 8,
+            text: "+-- 9 li".into(),
+            ..Default::default()
+        };
+        assert!(frame.valid());
+        let view = Vim9Viewport::new(&frame, 10, metrics(), 0.0).unwrap();
+        assert!(view.runs().any(|run| run.run.text.starts_with("+--")));
+        // Neither the fold text nor its EOL position addresses a hidden line.
+        assert!(view.anchor_at(4.0, 45.0).is_none());
+        assert!(view.anchor_at(70.0, 45.0).is_none());
+        let empty = view.anchor_at(4.0, 65.0).unwrap();
+        assert_eq!((empty.position.line, empty.position.byte_column), (21, 0));
+        let hidden = Vim9BufferPosition {
+            line: 15,
+            ..empty.position
+        };
+        assert!(view.anchor_for_position(&hidden).is_none());
+        assert_eq!(frame.windows[0].display_row_of(15), Some(2));
+        assert_eq!(frame.windows[0].display_row_of(24), Some(4));
     }
 
     #[test]

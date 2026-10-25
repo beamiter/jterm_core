@@ -279,7 +279,11 @@ impl Vim9PixelScroll {
         self.advance(now);
         if let Some((id, lines, interpolated)) = self.sent {
             if window.scroll_ack == id {
-                let moved = window.topline as i128 - self.topline as i128;
+                // A closed fold is one display row: Vim moves topline past all
+                // of its lines for one requested row. Protocol 8 reports rows.
+                let moved = window
+                    .scroll_rows
+                    .map_or(window.topline as i128 - self.topline as i128, i128::from);
                 if moved == i128::from(lines) {
                     self.desired -= f64::from(lines);
                     if interpolated {
@@ -501,6 +505,36 @@ mod tests {
         assert!(scroll.reconcile(&new.windows[0], metrics(), false));
         assert_eq!(scroll.offset(&new, metrics()), before + 20.0);
         assert_eq!(scroll.request_id(), None);
+    }
+    #[test]
+    fn fold_acknowledgement_counts_display_rows_not_hidden_lines() {
+        // Row 11 below topline 10 is a closed fold 11..=40. One requested row
+        // moves Vim's topline to 11; the next request moves it past the fold.
+        let old = frame(10, 0);
+        let mut scroll = Vim9PixelScroll::new(&old.windows[0], metrics()).unwrap();
+        scroll.push(2.25);
+        scroll.submitted(51);
+        let before = scroll.offset(&old, metrics());
+        let mut moved = frame(41, 51);
+        moved.windows[0].scroll_rows = Some(2);
+        assert!(scroll.reconcile(&moved.windows[0], metrics(), false));
+        assert_eq!(scroll.offset(&moved, metrics()), before + 40.0);
+        assert_eq!(scroll.request_id(), None);
+        // Without scroll_rows the same topline jump would read as a refusal.
+        let mut legacy = Vim9PixelScroll::new(&old.windows[0], metrics()).unwrap();
+        legacy.push(2.25);
+        legacy.submitted(52);
+        assert!(legacy.reconcile(&frame(41, 52).windows[0], metrics(), false));
+        assert_eq!(legacy.offset(&frame(41, 52), metrics()), 0.0);
+        // A fold at the file edge can absorb less than requested: Vim's count wins.
+        let mut clamped = Vim9PixelScroll::new(&old.windows[0], metrics()).unwrap();
+        clamped.push(2.0);
+        clamped.submitted(53);
+        let mut edge = frame(11, 53);
+        edge.windows[0].scroll_rows = Some(1);
+        assert!(clamped.reconcile(&edge.windows[0], metrics(), false));
+        assert!(clamped.command().is_none());
+        assert_eq!(clamped.offset(&edge, metrics()), 0.0);
     }
     #[test]
     fn failed_or_unrelated_acknowledgements_retire_the_gesture() {

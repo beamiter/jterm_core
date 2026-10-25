@@ -89,6 +89,7 @@ jobs:
           python3 runtime/vim9/test_render_completion.py
           python3 runtime/vim9/test_render_popups.py
           python3 runtime/vim9/test_render_virtual_text.py
+          python3 runtime/vim9/test_render_folds.py
           python3 runtime/vim9/test_simple_popups.py
           python3 runtime/vim9/test_simple_code_lens.py
           python3 runtime/vim9/test_simple_diagnostics.py

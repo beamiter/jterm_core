@@ -49,8 +49,8 @@ pub use workbench::{
 #[path = "vim9_render.rs"]
 mod render;
 pub use render::{
-    Vim9RenderCompletion, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMarginRow, Vim9RenderPopup,
-    Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow,
+    Vim9DisplayRow, Vim9RenderCompletion, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderMarginRow,
+    Vim9RenderPopup, Vim9RenderRect, Vim9RenderRun, Vim9RenderStyle, Vim9RenderWindow,
 };
 
 #[path = "vim9_render_watch.rs"]
@@ -103,6 +103,9 @@ pub enum Vim9PointerPhase {
 }
 
 const PROTOCOL: u64 = 1;
+/// Native paint negotiated at authentication. Version 8 adds closed-fold
+/// display rows; the bridge keeps older peers on their previous contracts.
+const RENDER_PROTOCOL: u64 = 8;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_COMMAND: usize = 64 * 1024;
 const MAX_PENDING: usize = 64;
@@ -1071,7 +1074,7 @@ fn connection(
                         return Ok(false);
                     }
                     let mut reply = serde_json::to_vec(
-                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":7}),
+                        &json!({"action":"auth","token":token,"protocol":PROTOCOL,"render_protocol":RENDER_PROTOCOL}),
                     )
                     .map_err(io::Error::other)?;
                     reply.push(b'\n');
@@ -1813,7 +1816,7 @@ mod tests {
         reader.read_line(&mut wire).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&wire).unwrap()["render_protocol"],
-            7
+            8
         );
         let full = json!({"event":"render","revision":1,"supported":true,
             "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",

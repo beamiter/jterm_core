@@ -105,6 +105,10 @@ continuous wheel transitions and short bursts. Version 5 adds the optional
 `completion` overlay for ordinary, fully visible Insert completion menus.
 Version 6 adds bounded `popups` for provider-opted-in opaque text windows,
 including borders, padding, GUI syntax styles and simultaneous completion docs.
+Version 7 adds documentation cards (below). Version 8 paints closed folds as
+native display rows, with a per-window `display_lines`/`fold_ends` row map,
+fold-aware margins and `scroll_rows` acknowledgements; see
+[native closed folds](../../docs/vim9-native-folds.md).
 Older hosts continue using the live compatibility displays. Existing command and metadata
 messages continue to use `protocol: 1`.
 

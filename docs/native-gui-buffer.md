@@ -174,8 +174,9 @@ Hover boards, Markdown previews, decoded images and color pickers can share the
 attachment API while keeping their own native content renderers and input
 handling. This change supplies the attachment and lifetime contract; it does
 not yet implement those four complete features. Arbitrary proportional editing,
-variable-height inline blocks and supported native rendering of all Vim popup,
-fold and wrapped-line states still need additional protocol work.
+variable-height inline blocks and supported native rendering of all Vim popup
+and wrapped-line states still need additional protocol work. Closed folds are
+painted natively since render protocol 8 ([native closed folds](vim9-native-folds.md)).
 
 See [the IDE guide](vim9-ide.md) and
 [the runtime protocol](../runtime/vim9/README.md) for the implemented
