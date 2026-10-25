@@ -179,6 +179,14 @@ var pointerGesture: dict<any> = {}
 var renderLineGeneration = ''
 var renderLineCache: dict<dict<any>> = {}
 
+def SendEncoded(encoded: string)
+  if sendBatchDepth > 0
+    sendBatch ..= encoded
+  else
+    ch_sendraw(bridge, encoded)
+  endif
+enddef
+
 def Send(payload: dict<any>)
   if ch_status(bridge) !=# 'open'
     return
@@ -186,12 +194,20 @@ def Send(payload: dict<any>)
   sequence += 1
   payload.protocol = 1
   payload.seq = sequence
-  var encoded = json_encode(payload) .. "\n"
-  if sendBatchDepth > 0
-    sendBatch ..= encoded
-  else
-    ch_sendraw(bridge, encoded)
+  SendEncoded(json_encode(payload) .. "\n")
+enddef
+
+# Only consumes complete objects produced by json_encode() below, before
+# transport fields are added. Keep the sampled JSON for equality/size checks
+# and add the numeric envelope without traversing all paint runs a second time.
+def SendRenderJson(encoded: string, revision: number = 0)
+  if ch_status(bridge) !=# 'open'
+    return
   endif
+  sequence += 1
+  var suffix = revision > 0 ? ',"revision":' .. revision : ''
+  SendEncoded(strpart(encoded, 0, strlen(encoded) - 1) .. suffix
+    .. ',"protocol":1,"seq":' .. sequence .. "}\n")
 enddef
 
 def FlushSendBatch()
@@ -2078,14 +2094,27 @@ def SampleRenderPopup()
   if len(properties) > 2048
     throw 'Vim popup properties exceed the native paint budget'
   endif
+  # Keep lookups local to this sample: providers may change a type without
+  # editing the popup buffer. Preserve prop_list() order for priority ties.
+  var propertyLines: dict<list<any>> = {}
+  var propertyDefinitions: dict<dict<any>> = {}
   for property in properties
     if has_key(property, 'text') || property.col <= 0
       throw 'Vim popup virtual text uses the compatibility view'
     endif
     var name = get(property, 'type', '')
     var typeBuffer = get(property, 'type_bufnr', 0)
-    property.definition = empty(name) ? {} : (typeBuffer > 0
-      ? prop_type_get(name, {bufnr: typeBuffer}) : prop_type_get(name))
+    var definitionKey = string([typeBuffer, name])
+    if !has_key(propertyDefinitions, definitionKey)
+      propertyDefinitions[definitionKey] = empty(name) ? {} : (typeBuffer > 0
+        ? prop_type_get(name, {bufnr: typeBuffer}) : prop_type_get(name))
+    endif
+    property.definition = propertyDefinitions[definitionKey]
+    var lineKey = string(property.lnum)
+    if !has_key(propertyLines, lineKey)
+      propertyLines[lineKey] = []
+    endif
+    add(propertyLines[lineKey], property)
   endfor
   for lnum in range(first, last)
     var text = getline(lnum)
@@ -2093,7 +2122,7 @@ def SampleRenderPopup()
         || foldclosed(lnum) >= 0 || text =~# '[\x00-\x08\x0a-\x1f\x7f\u0590-\u08ff\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]'
       throw 'Wrapped, clipped or complex Vim popup text uses the compatibility view'
     endif
-    var lineProperties = filter(copy(properties), (_, prop) => prop.lnum == lnum)
+    var lineProperties = get(propertyLines, string(lnum), [])
     if len(lineProperties) > 128
       throw 'Vim popup line properties exceed the native paint budget'
     endif
@@ -2327,30 +2356,34 @@ def EmitRender(force: bool = false)
       var baseRevision = renderRevision
       renderRevision += 1
       frame.revision = renderRevision
-      var layout = frame.supported ? RenderLayoutKey(frame) : ''
-      var rowRuns: dict<list<dict<any>>> = {}
-      for run in frame.runs
-        var key = string(run.row)
-        if !has_key(rowRuns, key)
-          rowRuns[key] = []
-        endif
-        add(rowRuns[key], run)
-      endfor
+      var layout = renderProtocol >= 2 && frame.supported ? RenderLayoutKey(frame) : ''
       var rows: dict<string> = {}
       var updates: list<dict<any>> = []
-      # Replace complete screen rows, preserving within-row paint order.
-      # This includes siblings in a vertical split and explicit empty clears.
-      for row in range(frame.rows)
-        var key = string(row)
-        var runs = get(rowRuns, key, [])
-        var rowData = json_encode(runs)
-        if !empty(runs)
-          rows[key] = rowData
-        endif
-        if rowData !=# get(previousRenderRows, key, '[]')
-          add(updates, {row: row, runs: runs})
-        endif
-      endfor
+      # Legacy full-frame hosts never consume row deltas. Supported keyframes
+      # still seed a delta baseline; unsupported frames retire it entirely.
+      if renderProtocol >= 2 && frame.supported
+        var rowRuns: dict<list<dict<any>>> = {}
+        for run in frame.runs
+          var key = string(run.row)
+          if !has_key(rowRuns, key)
+            rowRuns[key] = []
+          endif
+          add(rowRuns[key], run)
+        endfor
+        # Replace complete screen rows, preserving within-row paint order.
+        # This includes siblings in a vertical split and explicit empty clears.
+        for row in range(frame.rows)
+          var key = string(row)
+          var runs = get(rowRuns, key, [])
+          var rowData = json_encode(runs)
+          if !empty(runs)
+            rows[key] = rowData
+          endif
+          if rowData !=# get(previousRenderRows, key, '[]')
+            add(updates, {row: row, runs: runs})
+          endif
+        endfor
+      endif
       var sentDelta = false
       if renderProtocol >= 2 && !force && frame.supported && layout ==# previousRenderLayout
           && renderRevision - renderKeyframeRevision < 120
@@ -2360,13 +2393,14 @@ def EmitRender(force: bool = false)
         delta.base_revision = baseRevision
         delta.row_updates = updates
         # Scrolling a whole viewport can be cheaper as a complete keyframe.
-        if strlen(json_encode(delta)) < strlen(encoded)
-          Send(delta)
+        var deltaJson = json_encode(delta)
+        if strlen(deltaJson) < strlen(encoded)
+          SendRenderJson(deltaJson)
           sentDelta = true
         endif
       endif
       if !sentDelta
-        Send(frame)
+        SendRenderJson(encoded, renderRevision)
         renderKeyframeRevision = renderRevision
       endif
       previousRenderLayout = layout

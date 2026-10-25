@@ -7,9 +7,11 @@ and SimpleGit. Vim keeps their input and lifetime; the receiver only paints.
 
 from pathlib import Path
 import json
+import os
 import tempfile
 import unittest
 
+import test_bridge
 from test_bridge import VIM
 from test_render_delta import DeltaEditor, canonical
 
@@ -124,6 +126,92 @@ class RenderPopupTests(unittest.TestCase):
         old = next(r for r in popup["runs"] if r["text"] == "old")
         self.assertEqual(old["style"]["foreground"], 0xf0a145)
         self.assertTrue(old["style"]["underline"])
+
+    def property_popup(self):
+        self.editor.ex("highlight PopupRed guifg=#de1234 gui=NONE | highlight PopupGreen guifg=#12de34 gui=NONE")
+        return self.create(["abcdefgh", "abcdefgh", "abcdefgh"],
+                           {"line": 3, "col": 5, "border": [0, 0, 0, 0], "padding": [0, 0, 0, 0]})
+
+    def property_color(self, row, column=0):
+        popup = self.popup(self.editor.gui_frame())
+        y = popup["view"]["row"] + row
+        x = popup["view"]["column"] + column
+        return next(run["style"]["foreground"] for run in reversed(popup["runs"])
+                    if run["row"] == y and run["column"] <= x < run["column"] + run["cells"])
+
+    def test_popup_property_types_keep_global_and_local_identity(self):
+        self.property_popup()
+        e = self.editor
+        e.ex("call prop_type_add('SharedPopup', {'highlight':'PopupRed'}) | call prop_add(1,1,{'bufnr':winbufnr(g:p),'type':'SharedPopup','length':4})")
+        e.ex("call prop_type_add('SharedPopup', {'bufnr':winbufnr(g:p),'highlight':'PopupGreen'}) | call prop_add(2,1,{'bufnr':winbufnr(g:p),'type':'SharedPopup','length':4})")
+        self.assertEqual(self.property_color(0), 0xde1234)
+        self.assertEqual(self.property_color(1), 0x12de34)
+        e.ex("call prop_type_change('SharedPopup', {'bufnr':winbufnr(g:p),'highlight':'PopupRed'})")
+        self.assertEqual(self.property_color(1), 0xde1234)
+        e.ex("call prop_type_delete('SharedPopup', {'bufnr':winbufnr(g:p)})")
+        self.assertEqual(self.property_color(1), 0x12ab34)
+        self.assertEqual(self.property_color(0), 0xde1234)
+
+    def test_popup_multiline_properties_priority_ties_and_removal(self):
+        self.property_popup()
+        e = self.editor
+        e.ex("call prop_type_add('PopupSpan', {'highlight':'PopupRed','priority':10}) | call prop_add(1,1,{'bufnr':winbufnr(g:p),'type':'PopupSpan','end_lnum':3,'end_col':4})")
+        self.assertEqual([self.property_color(row) for row in range(3)], [0xde1234] * 3)
+        self.assertEqual(self.property_color(2, 5), 0x12ab34)
+        e.ex("call prop_type_add('PopupTop', {'highlight':'PopupGreen','priority':10}) | call prop_add(2,1,{'bufnr':winbufnr(g:p),'type':'PopupTop','length':4})")
+        # Equal priorities retain prop_list() ordering (the newer property first).
+        self.assertEqual(self.property_color(1), 0x12de34)
+        e.ex("call prop_type_change('PopupTop', {'priority':9})")
+        self.assertEqual(self.property_color(1), 0xde1234)
+        e.ex("call prop_remove({'bufnr':winbufnr(g:p),'type':'PopupSpan','all':1})")
+        self.assertEqual(self.property_color(1), 0x12de34)
+        self.assertEqual(self.property_color(0), 0x12ab34)
+
+    def test_popup_property_budgets_still_fall_back(self):
+        self.property_popup()
+        e = self.editor
+        e.ex("call prop_type_add('PopupBudget', {'highlight':'PopupRed'}) | for n in range(1,129) | call prop_add(1,1,{'bufnr':winbufnr(g:p),'type':'PopupBudget','length':1,'id':n}) | endfor")
+        frame = e.gui_frame()
+        self.assertFalse(frame['supported'])
+        self.assertIn('popup line properties exceed', frame['fallback_reason'])
+        e.ex("call prop_clear(1,3,{'bufnr':winbufnr(g:p)})")
+        self.popup(e.gui_frame())
+        e.ex("for n in range(1,2049) | call prop_add(1,1,{'bufnr':winbufnr(g:p),'type':'PopupBudget','length':1,'id':n}) | endfor")
+        frame = e.gui_frame()
+        self.assertFalse(frame['supported'])
+        self.assertIn('popup properties exceed', frame['fallback_reason'])
+
+    @unittest.skipUnless(os.environ.get('VIM9_POPUP_BASELINE'), 'Set VIM9_POPUP_BASELINE for differential replay')
+    def test_popup_property_frames_match_baseline(self):
+        runtime = test_bridge.RUNTIME
+        snapshots = []
+        commands = [
+            "call prop_type_add('PopupSpan', {'highlight':'PopupRed','priority':10}) | call prop_add(1,1,{'bufnr':winbufnr(g:p),'type':'PopupSpan','end_lnum':3,'end_col':4})",
+            "call prop_type_add('PopupTop', {'highlight':'PopupGreen','priority':10}) | call prop_add(2,1,{'bufnr':winbufnr(g:p),'type':'PopupTop','length':4})",
+            "call prop_type_change('PopupTop', {'priority':9})",
+            "call prop_type_change('PopupSpan', {'highlight':'PopupGreen','combine':0})",
+            "call prop_remove({'bufnr':winbufnr(g:p),'type':'PopupSpan','all':1})",
+        ]
+        self.editor.close()
+        try:
+            for source in (Path(os.environ['VIM9_POPUP_BASELINE']), runtime):
+                test_bridge.RUNTIME = source
+                self.editor = PopupEditor(self.root)
+                self.configure()
+                self.property_popup()
+                frames = []
+                for command in commands:
+                    self.editor.ex(command)
+                    frame = self.editor.gui_frame()
+                    self.popup(frame)
+                    frames.append(canonical(frame))
+                snapshots.append(frames)
+                self.editor.close()
+        finally:
+            test_bridge.RUNTIME = runtime
+        for command, before, after in zip(commands, *snapshots):
+            with self.subTest(command=command):
+                self.assertEqual(before, after)
 
     def test_z_order_and_hiding_are_complete_replacements(self):
         self.create(["first"], {"line": 3, "col": 8, "zindex": 200}, name="p1")

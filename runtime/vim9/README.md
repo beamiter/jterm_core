@@ -16,6 +16,20 @@ output remains the live compatibility surface for unsupported Vim displays.
 Vim continues to own editing, undo, registers, mappings, macros, windows,
 completion and plugins; there is no second copy of the document in this bridge.
 
+Paint publication reuses the JSON already computed for frame comparison and
+size limits, adding only the numeric revision/protocol/sequence envelope at
+send time. Legacy full-frame hosts skip row-delta indexing; delta-capable
+hosts still seed exact row baselines on keyframes and clear them on fallback.
+Popup text properties are indexed by source line and their type definitions
+are cached only for the current sample, so provider updates remain immediate.
+The [paired measurements](../../docs/vim9-paint-optimization-benchmark.json)
+separate serialization CPU from semantic-frame timing; neither measures GUI
+FPS or input-to-photon latency.
+
+Run `python3 runtime/vim9/benchmark_serialization.py` from the repository root
+to repeat the isolated CPU measurement against real captured Vim frames.
+The benchmark reports all alternating samples and excludes its warmup round.
+
 ## Requirements and loading
 
 Use Vim 9.0 or later with `+vim9script`, `+channel`, `+job`, `+timers` and

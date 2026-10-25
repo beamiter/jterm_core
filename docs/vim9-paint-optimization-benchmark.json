@@ -1,0 +1,1559 @@
+{
+  "date": "2026-10-25",
+  "baseline_revision": "88afec4c3846a68e0b94103ad7ca9c2ffcfa4a66",
+  "baseline_bridge_sha256": "4ed1ce0ad03e0533f4588d31293244e7cb2b0855c9732f41490fc22305e365ac",
+  "candidate_bridge_sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+  "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+  "scope": "Serialization passes and numeric envelope assembly only; excludes source extraction, transport, display latency and GUI FPS.",
+  "method": "Real Vim frames (30x120, one/two windows, Rust syntax and Unicode); independent Vim process per 400 iterations; child user+system CPU; 5 alternating-order rounds, first excluded from summary. CPU includes process startup.",
+  "fixture_sha256": "5503a89b0c2086b953019ba1835c5aed22ebeb967905dfbdd7c0c4f42295d0ac",
+  "summary": [
+    {
+      "protocol": 1,
+      "path": "full frame",
+      "windows": 1,
+      "before_cpu_us": 1178.599,
+      "after_cpu_us": 480.435,
+      "reduction_percent": 59.2
+    },
+    {
+      "protocol": 7,
+      "path": "cursor-only delta",
+      "windows": 1,
+      "before_cpu_us": 1056.975,
+      "after_cpu_us": 1026.609,
+      "reduction_percent": 2.9
+    },
+    {
+      "protocol": 1,
+      "path": "full frame",
+      "windows": 2,
+      "before_cpu_us": 1993.33,
+      "after_cpu_us": 759.514,
+      "reduction_percent": 61.9
+    },
+    {
+      "protocol": 7,
+      "path": "cursor-only delta",
+      "windows": 2,
+      "before_cpu_us": 1954.731,
+      "after_cpu_us": 1754.8,
+      "reduction_percent": 10.2
+    }
+  ],
+  "end_to_end_note": "Three alternating-order pairs on 100000-line buffers; concurrent builds and external cache cleanup caused large load changes. These raw semantic-frame/scroll-ack observations do not establish a stable end-to-end improvement or regression and are not display latency.",
+  "end_to_end_raw": [
+    {
+      "pair": 1,
+      "variant": "before",
+      "benchmark": "benchmark_scroll.py",
+      "sha256": "4ed1ce0ad03e0533f4588d31293244e7cb2b0855c9732f41490fc22305e365ac",
+      "measurement": {
+        "metric": "request to ordered semantic ack/response; not displayed latency or FPS",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/tmp/vim9-bridge-before.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "windows": 1,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 7.516,
+              "median_ms": 12.775,
+              "p95_ms": 21.247,
+              "max_ms": 28.029
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 11.4
+          },
+          {
+            "windows": 2,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 11.943,
+              "median_ms": 13.099,
+              "p95_ms": 20.955,
+              "max_ms": 27.726
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 12.8
+          }
+        ]
+      }
+    },
+    {
+      "pair": 1,
+      "variant": "before",
+      "benchmark": "benchmark_render.py",
+      "sha256": "4ed1ce0ad03e0533f4588d31293244e7cb2b0855c9732f41490fc22305e365ac",
+      "measurement": {
+        "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+        "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/tmp/vim9-bridge-before.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 1,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 9.886,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 4.079,
+              "median_ms": 14.285,
+              "p95_ms": 54.429,
+              "max_ms": 54.429
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 8.87,
+              "median_ms": 20.302,
+              "p95_ms": 23.188,
+              "max_ms": 26.379
+            },
+            "vim_cpu_ms_per_scroll": 5.5,
+            "full_frame_bytes_min": 95535,
+            "full_frame_bytes_max": 95636,
+            "visible_runs_max": 348,
+            "last_viewports": [
+              {
+                "window": 1000,
+                "topline": 61,
+                "botline": 89
+              }
+            ]
+          },
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 2,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 76.698,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 56.831,
+              "median_ms": 71.815,
+              "p95_ms": 76.819,
+              "max_ms": 76.819
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 17.98,
+              "median_ms": 28.782,
+              "p95_ms": 48.543,
+              "max_ms": 63.744
+            },
+            "vim_cpu_ms_per_scroll": 12.0,
+            "full_frame_bytes_min": 183757,
+            "full_frame_bytes_max": 183858,
+            "visible_runs_max": 672,
+            "last_viewports": [
+              {
+                "window": 1001,
+                "topline": 61,
+                "botline": 88
+              },
+              {
+                "window": 1000,
+                "topline": 1,
+                "botline": 28
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "pair": 1,
+      "variant": "after",
+      "benchmark": "benchmark_scroll.py",
+      "sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+      "measurement": {
+        "metric": "request to ordered semantic ack/response; not displayed latency or FPS",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "windows": 1,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 7.362,
+              "median_ms": 13.262,
+              "p95_ms": 20.447,
+              "max_ms": 41.896
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 11.9
+          },
+          {
+            "windows": 2,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 11.661,
+              "median_ms": 16.77,
+              "p95_ms": 22.532,
+              "max_ms": 36.082
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 14.8
+          }
+        ]
+      }
+    },
+    {
+      "pair": 1,
+      "variant": "after",
+      "benchmark": "benchmark_render.py",
+      "sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+      "measurement": {
+        "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+        "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 1,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 9.644,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 4.944,
+              "median_ms": 15.427,
+              "p95_ms": 15.532,
+              "max_ms": 15.532
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 10.72,
+              "median_ms": 19.457,
+              "p95_ms": 21.334,
+              "max_ms": 22.201
+            },
+            "vim_cpu_ms_per_scroll": 3.833,
+            "full_frame_bytes_min": 95535,
+            "full_frame_bytes_max": 95636,
+            "visible_runs_max": 348,
+            "last_viewports": [
+              {
+                "window": 1000,
+                "topline": 61,
+                "botline": 89
+              }
+            ]
+          },
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 2,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 36.605,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 10.205,
+              "median_ms": 48.042,
+              "p95_ms": 60.121,
+              "max_ms": 60.121
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 11.631,
+              "median_ms": 26.77,
+              "p95_ms": 29.612,
+              "max_ms": 30.87
+            },
+            "vim_cpu_ms_per_scroll": 9.5,
+            "full_frame_bytes_min": 183757,
+            "full_frame_bytes_max": 183858,
+            "visible_runs_max": 672,
+            "last_viewports": [
+              {
+                "window": 1001,
+                "topline": 61,
+                "botline": 88
+              },
+              {
+                "window": 1000,
+                "topline": 1,
+                "botline": 28
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "after",
+      "benchmark": "benchmark_scroll.py",
+      "sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+      "measurement": {
+        "metric": "request to ordered semantic ack/response; not displayed latency or FPS",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "windows": 1,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 10.079,
+              "median_ms": 19.099,
+              "p95_ms": 25.247,
+              "max_ms": 40.395
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 16.4
+          },
+          {
+            "windows": 2,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 11.329,
+              "median_ms": 14.154,
+              "p95_ms": 29.67,
+              "max_ms": 30.368
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 14.2
+          }
+        ]
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "after",
+      "benchmark": "benchmark_render.py",
+      "sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+      "measurement": {
+        "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+        "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 1,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 49.575,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 3.079,
+              "median_ms": 18.717,
+              "p95_ms": 52.953,
+              "max_ms": 52.953
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 3.748,
+              "median_ms": 18.935,
+              "p95_ms": 25.231,
+              "max_ms": 31.244
+            },
+            "vim_cpu_ms_per_scroll": 4.167,
+            "full_frame_bytes_min": 95535,
+            "full_frame_bytes_max": 95636,
+            "visible_runs_max": 348,
+            "last_viewports": [
+              {
+                "window": 1000,
+                "topline": 61,
+                "botline": 89
+              }
+            ]
+          },
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 2,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 18.399,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 4.768,
+              "median_ms": 46.422,
+              "p95_ms": 56.981,
+              "max_ms": 56.981
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 8.722,
+              "median_ms": 20.606,
+              "p95_ms": 21.202,
+              "max_ms": 21.539
+            },
+            "vim_cpu_ms_per_scroll": 4.667,
+            "full_frame_bytes_min": 183757,
+            "full_frame_bytes_max": 183858,
+            "visible_runs_max": 672,
+            "last_viewports": [
+              {
+                "window": 1001,
+                "topline": 61,
+                "botline": 88
+              },
+              {
+                "window": 1000,
+                "topline": 1,
+                "botline": 28
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "before",
+      "benchmark": "benchmark_scroll.py",
+      "sha256": "4ed1ce0ad03e0533f4588d31293244e7cb2b0855c9732f41490fc22305e365ac",
+      "measurement": {
+        "metric": "request to ordered semantic ack/response; not displayed latency or FPS",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/tmp/vim9-bridge-before.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "windows": 1,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 6.714,
+              "median_ms": 7.717,
+              "p95_ms": 9.284,
+              "max_ms": 21.914
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 7.2
+          },
+          {
+            "windows": 2,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 11.372,
+              "median_ms": 12.357,
+              "p95_ms": 26.354,
+              "max_ms": 55.667
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 12.2
+          }
+        ]
+      }
+    },
+    {
+      "pair": 2,
+      "variant": "before",
+      "benchmark": "benchmark_render.py",
+      "sha256": "4ed1ce0ad03e0533f4588d31293244e7cb2b0855c9732f41490fc22305e365ac",
+      "measurement": {
+        "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+        "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/tmp/vim9-bridge-before.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 1,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 56.101,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 18.125,
+              "median_ms": 29.269,
+              "p95_ms": 45.17,
+              "max_ms": 45.17
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 20.32,
+              "median_ms": 36.192,
+              "p95_ms": 41.125,
+              "max_ms": 52.832
+            },
+            "vim_cpu_ms_per_scroll": 18.0,
+            "full_frame_bytes_min": 95535,
+            "full_frame_bytes_max": 95636,
+            "visible_runs_max": 348,
+            "last_viewports": [
+              {
+                "window": 1000,
+                "topline": 61,
+                "botline": 89
+              }
+            ]
+          },
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 2,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 25.143,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 34.166,
+              "median_ms": 65.797,
+              "p95_ms": 70.897,
+              "max_ms": 70.897
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 15.983,
+              "median_ms": 37.117,
+              "p95_ms": 56.687,
+              "max_ms": 67.536
+            },
+            "vim_cpu_ms_per_scroll": 19.667,
+            "full_frame_bytes_min": 183757,
+            "full_frame_bytes_max": 183858,
+            "visible_runs_max": 672,
+            "last_viewports": [
+              {
+                "window": 1001,
+                "topline": 61,
+                "botline": 88
+              },
+              {
+                "window": 1000,
+                "topline": 1,
+                "botline": 28
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "pair": 3,
+      "variant": "before",
+      "benchmark": "benchmark_scroll.py",
+      "sha256": "4ed1ce0ad03e0533f4588d31293244e7cb2b0855c9732f41490fc22305e365ac",
+      "measurement": {
+        "metric": "request to ordered semantic ack/response; not displayed latency or FPS",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/tmp/vim9-bridge-before.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "windows": 1,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 11.177,
+              "median_ms": 36.675,
+              "p95_ms": 84.395,
+              "max_ms": 94.071
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 28.6
+          },
+          {
+            "windows": 2,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 15.302,
+              "median_ms": 55.039,
+              "p95_ms": 105.636,
+              "max_ms": 141.169
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 41.2
+          }
+        ]
+      }
+    },
+    {
+      "pair": 3,
+      "variant": "before",
+      "benchmark": "benchmark_render.py",
+      "sha256": "4ed1ce0ad03e0533f4588d31293244e7cb2b0855c9732f41490fc22305e365ac",
+      "measurement": {
+        "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+        "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/tmp/vim9-bridge-before.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 1,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 55.042,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 11.142,
+              "median_ms": 31.035,
+              "p95_ms": 54.806,
+              "max_ms": 54.806
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 17.317,
+              "median_ms": 31.514,
+              "p95_ms": 49.241,
+              "max_ms": 62.834
+            },
+            "vim_cpu_ms_per_scroll": 12.667,
+            "full_frame_bytes_min": 95535,
+            "full_frame_bytes_max": 95636,
+            "visible_runs_max": 348,
+            "last_viewports": [
+              {
+                "window": 1000,
+                "topline": 61,
+                "botline": 89
+              }
+            ]
+          },
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 2,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 87.809,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 10.858,
+              "median_ms": 60.928,
+              "p95_ms": 87.528,
+              "max_ms": 87.528
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 17.943,
+              "median_ms": 28.555,
+              "p95_ms": 34.588,
+              "max_ms": 37.08
+            },
+            "vim_cpu_ms_per_scroll": 11.5,
+            "full_frame_bytes_min": 183757,
+            "full_frame_bytes_max": 183858,
+            "visible_runs_max": 672,
+            "last_viewports": [
+              {
+                "window": 1001,
+                "topline": 61,
+                "botline": 88
+              },
+              {
+                "window": 1000,
+                "topline": 1,
+                "botline": 28
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "pair": 3,
+      "variant": "after",
+      "benchmark": "benchmark_scroll.py",
+      "sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+      "measurement": {
+        "metric": "request to ordered semantic ack/response; not displayed latency or FPS",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "windows": 1,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 7.818,
+              "median_ms": 14.804,
+              "p95_ms": 18.01,
+              "max_ms": 40.74
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 12.8
+          },
+          {
+            "windows": 2,
+            "buffer_lines": 100000,
+            "properties_per_line": 0,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "scroll_ack": {
+              "samples": 100,
+              "min_ms": 13.348,
+              "median_ms": 25.042,
+              "p95_ms": 32.288,
+              "max_ms": 47.642
+            },
+            "cursor_moves": 100,
+            "vim_cpu_ms_per_scroll": 21.0
+          }
+        ]
+      }
+    },
+    {
+      "pair": 3,
+      "variant": "after",
+      "benchmark": "benchmark_render.py",
+      "sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+      "measurement": {
+        "metric": "input-to-semantic-frame, not displayed frame time or FPS",
+        "transport": "legacy full render frames (render_protocol 2 not negotiated)",
+        "percentile_method": "nearest-rank: ceil(0.95 * samples)",
+        "sample_validation": "active source advances exactly one line; sibling viewports remain unchanged",
+        "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+        "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+        "results": [
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 1,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 56.447,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 6.365,
+              "median_ms": 17.162,
+              "p95_ms": 45.267,
+              "max_ms": 45.267
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 12.045,
+              "median_ms": 23.397,
+              "p95_ms": 32.156,
+              "max_ms": 38.042
+            },
+            "vim_cpu_ms_per_scroll": 7.0,
+            "full_frame_bytes_min": 95535,
+            "full_frame_bytes_max": 95636,
+            "visible_runs_max": 348,
+            "last_viewports": [
+              {
+                "window": 1000,
+                "topline": 61,
+                "botline": 89
+              }
+            ]
+          },
+          {
+            "buffer_lines": 100000,
+            "buffer_bytes": 4600000,
+            "windows": 2,
+            "pty_rows": 30,
+            "pty_columns": 120,
+            "syntax": "Vim runtime rust",
+            "initial_forced_frame_ms": 69.625,
+            "cached_forced_frame": {
+              "samples": 10,
+              "min_ms": 11.303,
+              "median_ms": 49.228,
+              "p95_ms": 61.779,
+              "max_ms": 61.779
+            },
+            "ctrl_e_to_semantic_frame": {
+              "samples": 60,
+              "min_ms": 16.643,
+              "median_ms": 26.323,
+              "p95_ms": 29.302,
+              "max_ms": 30.868
+            },
+            "vim_cpu_ms_per_scroll": 9.0,
+            "full_frame_bytes_min": 183757,
+            "full_frame_bytes_max": 183858,
+            "visible_runs_max": 672,
+            "last_viewports": [
+              {
+                "window": 1001,
+                "topline": 61,
+                "botline": 88
+              },
+              {
+                "window": 1000,
+                "topline": 1,
+                "botline": 28
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "serialization_exploratory": {
+    "samples": [
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 1427.0525
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 496.5999999999998
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 1071.0275000000004
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 1022.0725
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 1964.0249999999994
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 697.3350000000003
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 1951.6025000000006
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 1732.48
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 587.8799999999999
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 1097.3399999999988
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 1028.2150000000006
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 1291.7625000000007
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 729.2524999999991
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 1947.467499999999
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 1757.7650000000006
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 1939.2525000000012
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 1083.4199999999992
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 396.0874999999996
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 1041.3024999999993
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 973.06
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 1961.610000000002
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 708.9200000000009
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 1910.0749999999991
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 1724.617500000001
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 485.9249999999975
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1088.2925000000005
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 1017.577500000001
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1187.1224999999974
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 681.8050000000009
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1991.2850000000014
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 1695.8199999999986
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1921.8775000000023
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1072.4750000000024
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 394.424999999996
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1091.0849999999987
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 949.5600000000023
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1919.745000000002
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 696.507499999998
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1889.8775000000012
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 1782.457499999996
+      }
+    ],
+    "measurement": "per-child getrusage user+system CPU, 400 serializations/invocation, first of five rounds warmup",
+    "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+    "fixture_sha256": "5503a89b0c2086b953019ba1835c5aed22ebeb967905dfbdd7c0c4f42295d0ac",
+    "scope": "JSON encoding passes and numeric envelope assembly only; excludes render construction, transport, GUI drawing, input latency. Old/new paths run sequentially on identical captured real frames. Does not claim GUI FPS improvement.",
+    "summary": [
+      {
+        "windows": 1,
+        "protocol": 1,
+        "old_median_cpu_us": 1085.8562499999998,
+        "new_median_cpu_us": 441.00624999999854,
+        "reduction_percent": 59.38631379614028
+      },
+      {
+        "windows": 1,
+        "protocol": 7,
+        "old_median_cpu_us": 1139.103749999998,
+        "new_median_cpu_us": 995.3187500000005,
+        "reduction_percent": 12.62264302088354
+      },
+      {
+        "windows": 2,
+        "protocol": 1,
+        "old_median_cpu_us": 1954.5387500000006,
+        "new_median_cpu_us": 702.7137499999994,
+        "reduction_percent": 64.04708016149594
+      },
+      {
+        "windows": 2,
+        "protocol": 7,
+        "old_median_cpu_us": 1915.9762500000006,
+        "new_median_cpu_us": 1741.1912500000008,
+        "reduction_percent": 9.122503475708521
+      }
+    ]
+  },
+  "serialization_raw": {
+    "scope": "Compare old/new Vim JSON encoding paths on frozen, real native paint frames.\n\nThis isolates serialization and envelope assembly, not complete rendering,\ntransport latency, displayed frame time or GUI FPS. Each CPU measurement also\nincludes a fresh Vim's startup and fixture decoding, amortized over iterations.\nRun from any directory; Vim and the frame-capture harness need local sockets.\n",
+    "measurement": "per-child getrusage user+system CPU",
+    "iterations": 400,
+    "rounds": 5,
+    "warmup_rounds": 1,
+    "ordering": "old/new on even rounds; new/old on odd rounds",
+    "workload": "500 Rust source lines, Unicode and combining marks; frozen visible frames",
+    "delta": "cursor-only: empty row_updates with unchanged overscan",
+    "runtime": "/home/ubuntu/projects/jterm_core/runtime/vim9/bridge.vim",
+    "runtime_sha256": "d37d24d57a4edf7ca27c061ca0b0ce4f18b44eaddba2cb8ae6e201bc0c1fdbd6",
+    "fixture_sha256": "5503a89b0c2086b953019ba1835c5aed22ebeb967905dfbdd7c0c4f42295d0ac",
+    "serializer_sha256": "d8d75f5a1fec3e9295d49d96116f8c134586056a8b63a58441da49d7f7e08d69",
+    "vim": "VIM - Vi IMproved 9.2 (2026 Feb 14, compiled Jul 27 2026 17:06:12)",
+    "samples": [
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 1110.0175
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 631.4825
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 1479.9774999999997
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 1085.5025
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 2014.460000000001
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 1180.8699999999997
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 0,
+        "cpu_us_per_frame": 2295.3624999999993
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 0,
+        "cpu_us_per_frame": 3335.5825000000004
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 425.29000000000065
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 1103.1025000000002
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 958.4899999999993
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 1063.4075000000005
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 693.1499999999988
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 2013.5300000000007
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 1,
+        "cpu_us_per_frame": 2211.267500000002
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 1,
+        "cpu_us_per_frame": 5692.619999999998
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 1635.2550000000012
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 579.2824999999992
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 1129.9874999999997
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 1112.2450000000006
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 2065.122499999998
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 788.2700000000026
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 2,
+        "cpu_us_per_frame": 1955.2174999999988
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 2,
+        "cpu_us_per_frame": 1764.382500000001
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 433.0624999999979
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1104.2024999999985
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 1075.5025000000014
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1035.6775000000048
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 730.7574999999941
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1931.8400000000036
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 3,
+        "cpu_us_per_frame": 1722.397499999998
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 3,
+        "cpu_us_per_frame": 1921.492500000003
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1252.9949999999983
+      },
+      {
+        "windows": 1,
+        "modern": false,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 527.8075000000022
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1050.5424999999968
+      },
+      {
+        "windows": 1,
+        "modern": true,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 977.7150000000031
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1973.1300000000003
+      },
+      {
+        "windows": 2,
+        "modern": false,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 948.8474999999933
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": false,
+        "round": 4,
+        "cpu_us_per_frame": 1954.2450000000038
+      },
+      {
+        "windows": 2,
+        "modern": true,
+        "optimized": true,
+        "round": 4,
+        "cpu_us_per_frame": 1745.2174999999966
+      }
+    ],
+    "summary": [
+      {
+        "windows": 1,
+        "protocol": 1,
+        "old_median_cpu_us": 1178.5987499999983,
+        "new_median_cpu_us": 480.43500000000006,
+        "reduction_percent": 59.23676314776333
+      },
+      {
+        "windows": 1,
+        "protocol": 7,
+        "old_median_cpu_us": 1056.9749999999985,
+        "new_median_cpu_us": 1026.6087500000021,
+        "reduction_percent": 2.872939284277909
+      },
+      {
+        "windows": 2,
+        "protocol": 1,
+        "old_median_cpu_us": 1993.3300000000004,
+        "new_median_cpu_us": 759.5137499999984,
+        "reduction_percent": 61.89723979471546
+      },
+      {
+        "windows": 2,
+        "protocol": 7,
+        "old_median_cpu_us": 1954.7312500000012,
+        "new_median_cpu_us": 1754.7999999999988,
+        "reduction_percent": 10.228068436517923
+      }
+    ]
+  },
+  "reproduce": "python3 runtime/vim9/benchmark_serialization.py --iterations 400 --rounds 5 --windows 1 2",
+  "interpretation": "Legacy full-frame serialization reductions repeated consistently. Modern single-window cursor delta gain was small and had one per-round regression; do not infer a stable end-to-end gain from these microbenchmarks.",
+  "validation": {
+    "runtime_unittest_discovery": {
+      "total": 301,
+      "passed": 240,
+      "optional_skips": 61,
+      "command": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s runtime/vim9 -p 'test_*.py' -v"
+    },
+    "vimrc_simple_integration": {
+      "passed": 23,
+      "fixtures": "vim-experience-six/integration",
+      "modules": [
+        "test_lsp_popup_cards",
+        "test_six_experience",
+        "test_vimrc_workbench"
+      ]
+    },
+    "popup_baseline_differential": "Full semantic frames match the pre-optimization bridge; popup suite 15/15 with baseline enabled.",
+    "shared_source_archives": {
+      "frontends": [
+        "anvil",
+        "ember",
+        "forge",
+        "frost"
+      ],
+      "sha256": "f7ce351c1e42199d66b8dd417166fa13ac1bac76b675ec227bcc44ef2704e52d"
+    },
+    "frontends": {
+      "ember": {
+        "buffer_tests": 41,
+        "real_vim_tests": 3
+      },
+      "frost": {
+        "buffer_tests": 40,
+        "real_vim_tests": 2
+      },
+      "native_test_locale": "C.UTF-8",
+      "forge": {
+        "unit_tests": 17,
+        "xvfb_pixel_tests": 3,
+        "other_optional_display_tests_not_run": 10
+      },
+      "anvil": {
+        "unit_tests": 17,
+        "xvfb_pixel_tests": 3,
+        "other_optional_display_tests_not_run": 10
+      }
+    },
+    "diff_check": "All five repositories pass git diff --check"
+  }
+}
