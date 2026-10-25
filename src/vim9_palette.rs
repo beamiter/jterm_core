@@ -281,6 +281,22 @@ fn workbench_unavailable_reason(
             return "No cached changes for this buffer; inspect Git status first";
         }
     }
+    if matches!(
+        action,
+        SimpleDiagnosticsErrors | SimpleNextError | SimplePreviousError
+    ) && state.diagnostics.error == 0
+    {
+        return "No cached errors in this buffer";
+    }
+    if action == SimpleTerminalSendLine {
+        return "Requires a live current terminal for this exact source workspace and a nonempty line up to 4096 bytes";
+    }
+    if matches!(action, SimpleRefreshDiagnostics | SimpleHighlightSymbol) {
+        return "Requires a running language server serving this buffer and supporting this action";
+    }
+    if action == SimpleClearHighlights {
+        return "No symbol reference highlights in this buffer";
+    }
     match action.group() {
         Some("simpleplug") if !state.plugins.available => {
             "Requires the SimplePlug runtime and vimrc integration"
@@ -391,6 +407,7 @@ fn matches_with_recent(query: &str, limit: usize, recent: &[String]) -> Vec<Vim9
         "simplegit" => Some("simplegit"),
         "simplecc" => Some("simplecc"),
         "simpletree" => Some("simpletree"),
+        "simpleterminal" => Some("simpleterminal"),
         "simpleplug" => Some("simpleplug"),
         "simpleline" | "simplestatusbar" => Some("simpleline"),
         _ => None,
@@ -733,7 +750,7 @@ mod tests {
             assert!(command.command(&snapshot).is_err());
             snapshot.mode = "n".into();
         }
-        assert_eq!(vim9_palette_matches("simpleterminal", 256).len(), 4);
+        assert_eq!(vim9_palette_matches("simpleterminal", 256).len(), 7);
         let tree = vim9_palette_matches("simpletree", 2);
         assert!(tree.contains(&Vim9PaletteCommand::Workbench(
             Vim9WorkbenchAction::SimpleTreeToggle
@@ -844,6 +861,47 @@ mod tests {
             assert!(command.unavailable_reason(&snapshot).is_some());
             assert!(command.command(&snapshot).is_err());
         }
+    }
+
+    #[test]
+    fn focused_diagnostics_and_terminal_workflows_keep_source_and_capability_gates() {
+        let mut snapshot = connected();
+        snapshot.window = 1001;
+        snapshot.buffer = 4;
+        snapshot.changedtick = 7;
+        snapshot.workbench.provider = "simple".into();
+        snapshot.quickfix.count = 12;
+        let next_error = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleNextError);
+        assert_eq!(
+            next_error.unavailable_reason(&snapshot),
+            Some("No cached errors in this buffer")
+        );
+        let send = Vim9PaletteCommand::Workbench(Vim9WorkbenchAction::SimpleTerminalSendLine);
+        assert!(send
+            .unavailable_reason(&snapshot)
+            .unwrap()
+            .contains("exact source workspace"));
+        for action in [
+            Vim9WorkbenchAction::SimpleNextError,
+            Vim9WorkbenchAction::SimpleRefreshDiagnostics,
+            Vim9WorkbenchAction::SimpleHighlightSymbol,
+            Vim9WorkbenchAction::SimpleTerminalSendLine,
+        ] {
+            snapshot.capabilities = vec![action.capability().into()];
+            let command = Vim9PaletteCommand::Workbench(action);
+            let request = serde_json::to_value(command.command(&snapshot).unwrap()).unwrap();
+            assert_eq!(request["window"], 1001);
+            assert_eq!(request["buffer"], 4);
+            assert_eq!(request["changedtick"], 7);
+            assert_eq!(request["line"], 1);
+            assert_eq!(request["column"], 1);
+            snapshot.capabilities.clear();
+            assert!(command.command(&snapshot).is_err());
+        }
+        let terminal_actions = vim9_palette_matches("simpleterminal", 256);
+        assert_eq!(terminal_actions.len(), 7);
+        assert!(terminal_actions.contains(&send));
+        assert!(vim9_palette_matches("simplecc 下一条错误", 256).contains(&next_error));
     }
 
     #[test]

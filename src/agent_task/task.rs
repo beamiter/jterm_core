@@ -32,6 +32,12 @@ impl TaskId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Canonical UUID text has fixed separators, so numeric UUID order is the
+    /// same deterministic display order without allocating a formatted string.
+    pub(super) fn sort_key(self) -> u128 {
+        self.0.as_u128()
+    }
 }
 
 impl Default for TaskId {

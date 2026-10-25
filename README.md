@@ -36,7 +36,7 @@ v2 is selected only for a peer that has already advertised v2 support.
   new-tab launch. The shared conversation library adds local aliases, tags,
   reversible archives, project summaries and structured search, with atomic
   cross-process metadata merges and all-or-nothing batch pin/archive/tag updates.
-  Native task dashboards share five sort orders, visible-task attention
+  Native task dashboards share six sort orders, bidirectional visible-task attention
   navigation, explicit project task briefs, optional validation recipes and a
   bounded facts inspector. Creating an isolated task never starts its Agent;
   authored work without a recipe has a separate explicit human acceptance path.

@@ -61,11 +61,20 @@ pub enum Vim9WorkbenchAction {
     SimpleStatuslineHealth,
     SimpleMarkdownPreview,
     SimpleKeys,
+    SimpleDiagnosticsErrors,
+    SimpleNextError,
+    SimplePreviousError,
+    SimpleRefreshDiagnostics,
+    SimpleHighlightSymbol,
+    SimpleClearHighlights,
+    SimpleTerminalSendLine,
+    SimpleTerminalList,
+    SimpleTerminalHealth,
     SimpleWorkbench,
 }
 
 impl Vim9WorkbenchAction {
-    pub const ALL: [Self; 55] = [
+    pub const ALL: [Self; 64] = [
         Self::SimpleFiles,
         Self::SimpleRecent,
         Self::SimpleTreeToggle,
@@ -120,6 +129,15 @@ impl Vim9WorkbenchAction {
         Self::SimpleStatuslineHealth,
         Self::SimpleMarkdownPreview,
         Self::SimpleKeys,
+        Self::SimpleDiagnosticsErrors,
+        Self::SimpleNextError,
+        Self::SimplePreviousError,
+        Self::SimpleRefreshDiagnostics,
+        Self::SimpleHighlightSymbol,
+        Self::SimpleClearHighlights,
+        Self::SimpleTerminalSendLine,
+        Self::SimpleTerminalList,
+        Self::SimpleTerminalHealth,
         Self::SimpleWorkbench,
     ];
 
@@ -179,6 +197,15 @@ impl Vim9WorkbenchAction {
             Self::SimpleStatuslineHealth => "simple_statusline_health",
             Self::SimpleMarkdownPreview => "simple_markdown_preview",
             Self::SimpleKeys => "simple_keys",
+            Self::SimpleDiagnosticsErrors => "simple_diagnostics_errors",
+            Self::SimpleNextError => "simple_next_error",
+            Self::SimplePreviousError => "simple_previous_error",
+            Self::SimpleRefreshDiagnostics => "simple_refresh_diagnostics",
+            Self::SimpleHighlightSymbol => "simple_highlight_symbol",
+            Self::SimpleClearHighlights => "simple_clear_highlights",
+            Self::SimpleTerminalSendLine => "simple_terminal_send_line",
+            Self::SimpleTerminalList => "simple_terminal_list",
+            Self::SimpleTerminalHealth => "simple_terminal_health",
             Self::SimpleWorkbench => "simple_workbench",
         }
     }
@@ -239,6 +266,15 @@ impl Vim9WorkbenchAction {
             Self::SimpleStatuslineHealth => "Simple: Inspect statusline health",
             Self::SimpleMarkdownPreview => "Simple: Toggle Markdown preview",
             Self::SimpleKeys => "Simple: Show key hints",
+            Self::SimpleDiagnosticsErrors => "Simple: Show errors in this buffer",
+            Self::SimpleNextError => "Simple: Go to next error",
+            Self::SimplePreviousError => "Simple: Go to previous error",
+            Self::SimpleRefreshDiagnostics => "Simple: Refresh language diagnostics",
+            Self::SimpleHighlightSymbol => "Simple: Highlight symbol references",
+            Self::SimpleClearHighlights => "Simple: Clear symbol reference highlights",
+            Self::SimpleTerminalSendLine => "Simple: Send current line to this workspace terminal",
+            Self::SimpleTerminalList => "Simple: List terminal sessions",
+            Self::SimpleTerminalHealth => "Simple: Inspect terminal health",
             Self::SimpleWorkbench => "Simple: Inspect workbench",
         }
     }
@@ -307,6 +343,25 @@ impl Vim9WorkbenchAction {
             }
             Self::SimpleMarkdownPreview => &["simplemarkdown preview", "Markdown 预览"],
             Self::SimpleKeys => &["simplewhichkey key hints", "按键提示"],
+            Self::SimpleDiagnosticsErrors => &["simplecc errors diagnostics list", "当前文件错误"],
+            Self::SimpleNextError => &["simplecc next error severity", "下一条错误"],
+            Self::SimplePreviousError => &["simplecc previous error severity", "上一条错误"],
+            Self::SimpleRefreshDiagnostics => {
+                &["simplecc refresh pull diagnostics", "刷新语言诊断"]
+            }
+            Self::SimpleHighlightSymbol => &[
+                "simplecc highlight symbol references occurrences",
+                "高亮符号引用",
+            ],
+            Self::SimpleClearHighlights => {
+                &["simplecc clear remove symbol highlights", "清除引用高亮"]
+            }
+            Self::SimpleTerminalSendLine => &[
+                "simpleterminal send current line repl execute workspace",
+                "发送当前行到项目终端",
+            ],
+            Self::SimpleTerminalList => &["simpleterminal list sessions shells", "终端会话列表"],
+            Self::SimpleTerminalHealth => &["simpleterminal health status", "终端健康检查"],
             Self::SimpleWorkbench => &["simple workbench health", "工作台状态"],
         }
     }
@@ -345,7 +400,13 @@ impl Vim9WorkbenchAction {
             | Self::SimplePreviousDiagnostic
             | Self::SimpleLspStatus
             | Self::SimpleLspRestart
-            | Self::SimpleLspLog => Some("simplecc"),
+            | Self::SimpleLspLog
+            | Self::SimpleDiagnosticsErrors
+            | Self::SimpleNextError
+            | Self::SimplePreviousError
+            | Self::SimpleRefreshDiagnostics
+            | Self::SimpleHighlightSymbol
+            | Self::SimpleClearHighlights => Some("simplecc"),
             Self::SimpleTreeToggle | Self::SimpleTreeReveal | Self::SimpleTreeRefresh => {
                 Some("simpletree")
             }
@@ -358,6 +419,13 @@ impl Vim9WorkbenchAction {
             | Self::SimplePluginProfile
             | Self::SimplePluginHealth => Some("simpleplug"),
             Self::SimpleStatuslineToggle | Self::SimpleStatuslineHealth => Some("simpleline"),
+            Self::SimpleTerminalToggle
+            | Self::SimpleTerminalNew
+            | Self::SimpleTerminalNext
+            | Self::SimpleTerminalPrevious
+            | Self::SimpleTerminalSendLine
+            | Self::SimpleTerminalList
+            | Self::SimpleTerminalHealth => Some("simpleterminal"),
             _ => None,
         }
     }

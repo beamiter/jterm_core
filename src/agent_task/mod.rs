@@ -79,8 +79,8 @@ pub use brief::{TaskBrief, TaskValidationRecipe, TASK_GOAL_MAX_BYTES};
 pub use context::{ContextError, SemanticCommandContext};
 #[allow(unused_imports)]
 pub use dashboard::{
-    DashboardActivity, DashboardAttentionKind, DashboardCounts, DashboardFilter, DashboardGroup,
-    DashboardRow, DashboardSnapshot, DashboardSort, DashboardView,
+    DashboardActivity, DashboardAttentionCounts, DashboardAttentionKind, DashboardCounts,
+    DashboardFilter, DashboardGroup, DashboardRow, DashboardSnapshot, DashboardSort, DashboardView,
 };
 #[allow(unused_imports)]
 pub use driver::{

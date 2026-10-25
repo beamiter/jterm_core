@@ -26,6 +26,14 @@ The [paired measurements](../../docs/vim9-paint-optimization-benchmark.json)
 separate serialization CPU from semantic-frame timing; neither measures GUI
 FPS or input-to-photon latency.
 
+LSP diagnostic columns decode each source line once before counting UTF-16
+units. Long lines no longer rescan their UTF-8 prefixes for every codepoint;
+combining marks still count separately, positions inside a surrogate pair
+stay before that character, and positions past EOL clamp to the byte endpoint.
+`python3 -m unittest -v test_lsp_diagnostic_columns` from this directory checks
+the actual authenticated bridge and native Problems metadata with a local
+diagnostic-provider fixture, including long Unicode lines and buffer edits.
+
 Run `python3 runtime/vim9/benchmark_serialization.py` from the repository root
 to repeat the isolated CPU measurement against real captured Vim frames.
 The benchmark reports all alternating samples and excludes its warmup round.
@@ -501,6 +509,10 @@ provider, root, native, large_file
 git: head, ahead, behind, added, changed, removed
 diagnostics: error, warning, info, hint
 remote: connected, label, root
+lsp: available, status
+plugins: available, known, running, operation, total, completed, installed, updated, errors
+tree: available, visible, root
+statusline: available, enabled
 ```
 
 It attaches Vim-owned `buffer`, `window`, and `changedtick` fields, which the
@@ -513,7 +525,41 @@ plugin dictionaries, function references, channels and unrelated fields are
 never serialized. `Vim9WorkbenchState::status_text()` supplies the four hosts'
 compact palette/optional-status context from these caches, without Git/LSP I/O.
 
-The bridge listens for `SimpleGitUpdate`, `SimpleCCDiagnosticsChanged`, remote workspace events and
+The paired vimrc also exposes the existing `>simplegit`, `>simplecc`,
+`>simpletree`, `>simpleplug` and `>simpleline` native groups through the same
+fixed action catalog. It samples only already-loaded provider APIs. The plugin
+progress hook returns a copy of SimplePlug's cached current/last operation
+record; an older provider has `known: false`, rather than fabricated idle or
+completion evidence. Concurrent install/update/check actions are unavailable
+while a known operation runs; Stop requires known running state. Saved Git
+hunk stage/discard require an ordinary writable, unmodified buffer with cached
+changes. Discard defaults to Cancel and rechecks window, buffer, text version
+and cursor after confirmation. Ordinary Vim's `Space P` group uses these same
+action guards while preserving personal mappings.
+
+The focused SimpleCC workflows add `simple_diagnostics_errors`,
+`simple_next_error`, `simple_previous_error`, `simple_refresh_diagnostics`,
+`simple_highlight_symbol` and `simple_clear_highlights`. Error actions use the
+current buffer's cached error count, not quickfix size. The paired SimpleCC
+`WorkbenchSupports()` hook samples running-server/filetype tables without
+starting a service; explicit unsupported features remain unavailable.
+
+The exact `>simpleterminal` group also includes `simple_terminal_list`,
+`simple_terminal_health` and `simple_terminal_send_line`. Sending is an
+explicit user action using only the existing current terminal. The vimrc
+proves remote source URI/path/read-generation against the active connection;
+the paired SimpleTerminal `WorkbenchTarget()` verifies the current session's
+workspace ownership without pruning or switching it. `SendWorkbenchLine()`
+retains the proved PTY buffer across cleanup and rejects an exited/replaced
+target. No source line is embedded in Ex text. Empty/oversized lines or
+control keys other than Tab are refused. The existing typed request's exact
+window, buffer, changedtick and cursor checks still run before dispatch.
+Provider capability reads consider at most 128 values and still filter them
+against the fixed closed action vocabulary; adding these workflows cannot
+silently truncate later actions behind the previous 64-item read window.
+
+The bridge listens for `SimpleGitUpdate`, `SimpleCCDiagnosticsChanged`,
+`SimplePlugStateChanged`, remote workspace events and
 `VimrcWorkbenchChanged`; its ordinary reconciliation also observes capability
 changes after `:source`. The workbench status contains **severity counts** for
 the current buffer. The optional diagnostic hook separately returns cached

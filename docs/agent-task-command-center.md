@@ -33,6 +33,30 @@ The GTK frontends use a counted attention dropdown to fit narrow panels;
 Ember and Frost expose queue buttons. These are alternative presentations of
 the same classification.
 
+All four dashboards offer **Previous needs you** and **Next needs you**.
+They move in the currently displayed order, wrap at the list edge and skip
+tasks that do not need attention. They respect every active filter. A hidden
+selection starts from the last matching task when moving backward, or the first
+when moving forward; navigation never starts, approves or accepts a task.
+Frost keeps each task's follow-up draft while moving in either direction.
+
+The additional **Needs you · oldest update** sort puts attention tasks first
+and orders older updates before newer ones within each activity bucket. This
+helps revisit older requests without losing the distinction between attention,
+active work and finished work. The time is the task's recorded last update,
+not an inferred approval waiting duration. The existing **Needs you first**
+default continues to put the newest updates first. Changing either sort keeps
+the selected task identity and filter counts unchanged. GTK panels place sort
+and navigation on separate rows so the extra controls fit narrow sidebars.
+
+**Selected project** narrows any of the four dashboards to the selected
+task's original repository path. It keeps the current query, provider, quick
+view, attention reason, sort and selected TaskId. The project selector reflects
+the resulting scope. A selection hidden by filters, a removed task or missing
+project metadata leaves the button unavailable; activation checks again.
+Display labels and lossy path text never identify a project, including when
+two non-UTF-8 paths look identical. The button changes view state only.
+
 ## Task search
 
 Words and constraints combine with AND. Double quotes preserve a phrase, and
@@ -133,6 +157,28 @@ This change retains the existing persistence contract. Task instructions and
 runtime transcripts are not newly written into recovery journals. See the
 project-task recovery limitations in [CLI agent sessions](agent-sessions.md).
 
+## Projection costs
+
+The dashboard separates searching a scope from narrowing its visible rows.
+`project_unsorted` and `filter_iter_unsorted` build the searched scope without
+an intermediate sort; `view` or `apply_view` chooses the quick view, attention
+reason and final order while keeping scope counts intact. Existing `project`
+and `filter_rows` retain their earlier default ordering for other callers.
+`attention_counts` classifies each source row once for all five queue badges.
+
+Anvil and Forge reuse one searched scope for both badges and task rows,
+cloning only matching candidates. Ember and Frost no longer parse an empty
+query or sort by the default order before applying the selected order. Frost
+also resolves its domain scope once per dashboard frame, with one inventory
+of live terminal identities rather than rescanning sessions for every task
+and terminal role. This inventory is rebuilt for each projection; focus and
+execution still perform their existing live ownership checks.
+
+Numeric sort modes sort in place and compare UUID values directly, avoiding
+a formatted UUID allocation per row. UUID numeric order equals the previous
+canonical text order; title/project modes still cache their case-folded text
+keys. No task state, query bounds, repository identity or action gate changes.
+
 ## Core validation (2026-10-24)
 
 The Agent domain regression suite passed **254 tests** with one host-dependent
@@ -151,3 +197,42 @@ unmodified `66a2555bb1a58cbd8230f2dea875d06c5544b9c0` baseline. A parallel run
 additionally exposed an intermittent existing Claude process-cleanup test;
 its isolated rerun and the full serial regression passed. No process-management
 implementation or test was changed to obtain these results.
+
+## Navigation upgrade validation (2026-10-25)
+
+The Agent domain suite passed **256 tests** serially with the same existing
+cgroup test excluded. New coverage checks oldest-update attention ordering,
+bidirectional wraparound, hidden selections, empty queues, stable identities
+and unchanged lifecycle/counts. The suite ran outside the filesystem sandbox:
+the sandbox's mapped parent-directory ownership otherwise causes eight
+unchanged launcher trust checks to reject their temporary fixtures.
+
+Frost's Agent panel suite passed **28 tests**, including preserved follow-up
+drafts during backward attention navigation. Ember passed **12** management
+and dashboard tests. Anvil and Forge each passed their display-backed dashboard
+regression with both attention controls and hidden-task rejection exercised.
+Anvil, Forge and Ember all-target checks, core strict Clippy, formatting and whitespace checks
+passed. GTK checks used the existing offline Nix development environment;
+the system GTK/GLib versions are older than the projects require. Nix release
+builds for Anvil and Forge completed with private family-runner lockfiles;
+their version probes passed and their dynamic libraries all resolved.
+
+## Scope and project-focus validation (2026-10-25)
+
+The follow-up Agent domain suite passed **258 tests**, with the same existing
+cgroup test excluded. The new scope tests compare derived views against full
+projections across all six orders, all six quick views and every attention
+reason, including invalid queries and archived validation failures. They also
+check that switching views preserves scope counts and task identities without
+resolving live activity again. Strict all-target core Clippy passed.
+
+Anvil and Forge each passed **seven** task-filter and display-backed dashboard
+checks, including lossless non-UTF-8 project identities, 1,000-task ordering,
+project focus preserving query/provider/selection and hidden-selection refusal.
+The new display regression is part of each frontend's explicit GTK test script.
+Frost's **28** Agent panel tests passed with live-inventory replacement and
+finished-validation checks; Ember's **37** task UI tests and all-target check
+passed. The scope optimization keeps the former ordering and ownership
+semantics; no wall-clock speedup ratio is claimed from these regressions.
+Both GTK releases were rebuilt after production code stabilized; their version
+probes passed and all dynamic libraries resolved.

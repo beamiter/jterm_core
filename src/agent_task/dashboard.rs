@@ -52,6 +52,34 @@ impl DashboardAttentionKind {
     }
 }
 
+/// Counts within an already searched scope, before quick-view narrowing.
+/// One row contributes to at most one reason; this never grants an action.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DashboardAttentionCounts([usize; 5]);
+
+impl DashboardAttentionCounts {
+    pub fn get(self, kind: DashboardAttentionKind) -> usize {
+        self.0[match kind {
+            DashboardAttentionKind::Approval => 0,
+            DashboardAttentionKind::Input => 1,
+            DashboardAttentionKind::Validation => 2,
+            DashboardAttentionKind::Review => 3,
+            DashboardAttentionKind::Failed => 4,
+        }]
+    }
+
+    fn add(&mut self, kind: DashboardAttentionKind) {
+        let index = match kind {
+            DashboardAttentionKind::Approval => 0,
+            DashboardAttentionKind::Input => 1,
+            DashboardAttentionKind::Validation => 2,
+            DashboardAttentionKind::Review => 3,
+            DashboardAttentionKind::Failed => 4,
+        };
+        self.0[index] += 1;
+    }
+}
+
 impl std::fmt::Display for DashboardAttentionKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.label())
@@ -211,14 +239,18 @@ pub enum DashboardSort {
     Oldest,
     Title,
     Project,
+    /// Attention first, with older updates first within each activity bucket.
+    /// This uses recorded update time, not an inferred approval waiting time.
+    AttentionOldest,
 }
 impl DashboardSort {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Attention,
         Self::Recent,
         Self::Oldest,
         Self::Title,
         Self::Project,
+        Self::AttentionOldest,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -227,6 +259,7 @@ impl DashboardSort {
             Self::Oldest => "Oldest update",
             Self::Title => "Task name",
             Self::Project => "Project",
+            Self::AttentionOldest => "Needs you · oldest update",
         }
     }
 }
@@ -324,6 +357,18 @@ impl DashboardSnapshot {
     /// Filter an already bounded, domain-derived snapshot without granting
     /// access to the task manager. Native views keep selection separately.
     pub fn filter_rows(rows: &[DashboardRow], text: &str, view: DashboardView) -> Self {
+        let mut snapshot = Self::filter_iter_unsorted(rows, text, view);
+        snapshot.sort_rows(DashboardSort::default());
+        snapshot
+    }
+
+    /// Search borrowed candidates once, cloning only retained rows. The caller
+    /// chooses the final order after narrowing the resulting scope.
+    pub fn filter_iter_unsorted<'a>(
+        rows: impl IntoIterator<Item = &'a DashboardRow>,
+        text: &str,
+        view: DashboardView,
+    ) -> Self {
         let Ok(query) = DashboardQuery::parse(text) else {
             return Self::default();
         };
@@ -337,11 +382,22 @@ impl DashboardSnapshot {
                 snapshot.rows.push(row.clone());
             }
         }
-        snapshot.sort_rows(DashboardSort::default());
         snapshot
     }
 
     pub fn project<'a>(
+        tasks: impl IntoIterator<Item = &'a AgentTask>,
+        activity: impl Fn(TaskId) -> DashboardActivity,
+        filter: DashboardFilter<'_>,
+    ) -> Self {
+        let mut snapshot = Self::project_unsorted(tasks, activity, filter);
+        snapshot.sort_rows(DashboardSort::default());
+        snapshot
+    }
+
+    /// The same domain projection and counts as `project`, without an
+    /// intermediate sort when a frontend will select its own final order.
+    pub fn project_unsorted<'a>(
         tasks: impl IntoIterator<Item = &'a AgentTask>,
         activity: impl Fn(TaskId) -> DashboardActivity,
         filter: DashboardFilter<'_>,
@@ -367,7 +423,52 @@ impl DashboardSnapshot {
                 snapshot.rows.push(row);
             }
         }
-        snapshot.sort_rows(DashboardSort::default());
+        snapshot
+    }
+
+    pub fn attention_counts(&self) -> DashboardAttentionCounts {
+        let mut counts = DashboardAttentionCounts::default();
+        for row in &self.rows {
+            if let Some(kind) = row.attention_kind() {
+                counts.add(kind);
+            }
+        }
+        counts
+    }
+
+    /// Narrow an existing searched scope without parsing another query or
+    /// recounting its badges. Selection remains owned by the frontend.
+    pub fn apply_view(
+        &mut self,
+        view: DashboardView,
+        attention: Option<DashboardAttentionKind>,
+        sort: DashboardSort,
+    ) {
+        self.rows.retain(|row| {
+            view.matches(row) && attention.is_none_or(|kind| row.attention_kind() == Some(kind))
+        });
+        self.sort_rows(sort);
+    }
+
+    pub fn view(
+        &self,
+        view: DashboardView,
+        attention: Option<DashboardAttentionKind>,
+        sort: DashboardSort,
+    ) -> Self {
+        let mut snapshot = Self {
+            rows: self
+                .rows
+                .iter()
+                .filter(|row| {
+                    view.matches(row)
+                        && attention.is_none_or(|kind| row.attention_kind() == Some(kind))
+                })
+                .cloned()
+                .collect(),
+            counts: self.counts.clone(),
+        };
+        snapshot.sort_rows(sort);
         snapshot
     }
 
@@ -377,18 +478,31 @@ impl DashboardSnapshot {
         selected.and_then(|id| self.rows.iter().position(|row| row.id == id))
     }
     pub fn sort_rows(&mut self, sort: DashboardSort) {
-        self.rows.sort_by_cached_key(|row| {
-            let recent = u64::MAX - row.updated_at_ms;
-            let (name, rank, time) = match sort {
-                DashboardSort::Attention => (String::new(), row.rank(), recent),
-                DashboardSort::Recent => (String::new(), 0, recent),
-                DashboardSort::Oldest => (String::new(), 0, row.updated_at_ms),
-                DashboardSort::Title => (row.title.to_lowercase(), 0, recent),
-                DashboardSort::Project => (row.repo_label.to_lowercase(), row.rank(), recent),
-            };
-            (name, rank, time, row.id.to_string())
-        });
+        match sort {
+            DashboardSort::Title | DashboardSort::Project => {
+                self.rows.sort_by_cached_key(|row| {
+                    let (name, rank) = if sort == DashboardSort::Title {
+                        (row.title.to_lowercase(), 0)
+                    } else {
+                        (row.repo_label.to_lowercase(), row.rank())
+                    };
+                    (name, rank, u64::MAX - row.updated_at_ms, row.id.sort_key())
+                });
+            }
+            _ => self.rows.sort_unstable_by_key(|row| {
+                let recent = u64::MAX - row.updated_at_ms;
+                let (rank, time) = match sort {
+                    DashboardSort::Attention => (row.rank(), recent),
+                    DashboardSort::Recent => (0, recent),
+                    DashboardSort::Oldest => (0, row.updated_at_ms),
+                    DashboardSort::AttentionOldest => (row.rank(), row.updated_at_ms),
+                    DashboardSort::Title | DashboardSort::Project => unreachable!(),
+                };
+                (rank, time, row.id.sort_key())
+            }),
+        }
     }
+
     /// Explicit navigation only. Filtering/refresh must never call this to
     /// silently replace a hidden selected task with a different identity.
     pub fn step_selection(&self, selected: Option<TaskId>, forward: bool) -> Option<TaskId> {
@@ -405,15 +519,35 @@ impl DashboardSnapshot {
         Some(self.rows[next].id)
     }
     pub fn next_attention(&self, selected: Option<TaskId>) -> Option<TaskId> {
+        self.step_attention(selected, true)
+    }
+
+    pub fn previous_attention(&self, selected: Option<TaskId>) -> Option<TaskId> {
+        self.step_attention(selected, false)
+    }
+
+    /// Explicit bidirectional navigation in the current visible order. A hidden
+    /// selection starts at the corresponding edge; no task is acted upon.
+    pub fn step_attention(&self, selected: Option<TaskId>, forward: bool) -> Option<TaskId> {
         let length = self.rows.len();
         if length == 0 {
             return None;
         }
-        let start = self
-            .selected_index(selected)
-            .map_or(0, |index| (index + 1) % length);
+        let start = match (self.selected_index(selected), forward) {
+            (Some(index), true) => (index + 1) % length,
+            (Some(index), false) => (index + length - 1) % length,
+            (None, true) => 0,
+            (None, false) => length - 1,
+        };
         (0..length)
-            .map(|offset| &self.rows[(start + offset) % length])
+            .map(|offset| {
+                let index = if forward {
+                    (start + offset) % length
+                } else {
+                    (start + length - offset) % length
+                };
+                &self.rows[index]
+            })
             .find(|row| row.needs_attention)
             .map(|row| row.id)
     }
@@ -512,6 +646,189 @@ mod tests {
             None
         );
         assert_eq!(DashboardSnapshot::default().next_attention(None), None);
+    }
+
+    #[test]
+    fn attention_age_sort_keeps_live_and_attention_facts_separate() {
+        let mut tasks = vec![
+            task(TaskStatus::WaitingForHuman),
+            task(TaskStatus::WaitingForApproval),
+            task(TaskStatus::Working),
+            task(TaskStatus::Completed),
+        ];
+        for (task, updated) in tasks.iter_mut().zip([30, 20, 10, 1]) {
+            task.updated_at_ms = updated;
+        }
+        let before = tasks.clone();
+        let mut snapshot = project(&tasks, DashboardFilter::default());
+        let counts = snapshot.counts.clone();
+        assert_eq!(snapshot.rows[0].id, tasks[0].id);
+        snapshot.sort_rows(DashboardSort::AttentionOldest);
+        assert_eq!(
+            snapshot.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [tasks[1].id, tasks[0].id, tasks[2].id, tasks[3].id]
+        );
+        assert_eq!(snapshot.counts, counts);
+        assert_eq!(snapshot.selected_index(Some(tasks[0].id)), Some(1));
+        assert_eq!(tasks, before);
+        tasks.reverse();
+        let mut reversed = project(&tasks, DashboardFilter::default());
+        reversed.sort_rows(DashboardSort::AttentionOldest);
+        assert_eq!(snapshot, reversed);
+    }
+
+    #[test]
+    fn derived_views_match_full_projection_and_keep_search_scope_counts() {
+        let mut tasks = vec![
+            task(TaskStatus::Created),
+            task(TaskStatus::Working),
+            task(TaskStatus::WaitingForApproval),
+            task(TaskStatus::WaitingForHuman),
+            task(TaskStatus::ReadyForReview),
+            task(TaskStatus::Failed),
+            task(TaskStatus::ReadyForReview),
+            task(TaskStatus::Completed),
+            task(TaskStatus::Archived),
+        ];
+        tasks[4].validation.status = TaskValidationStatus::Failed;
+        tasks[8].validation.status = TaskValidationStatus::Failed;
+        let original = tasks.clone();
+        for query in ["", "provider:codex -status:archived", "status:invalid"] {
+            let scope = project(
+                &tasks,
+                DashboardFilter {
+                    text: query,
+                    ..Default::default()
+                },
+            );
+            let scope_before = scope.clone();
+            let attention_counts = scope.attention_counts();
+            if !query.contains("invalid") {
+                for kind in DashboardAttentionKind::ALL {
+                    assert_eq!(attention_counts.get(kind), 1);
+                }
+            }
+            for view in [
+                DashboardView::All,
+                DashboardView::NeedsAttention,
+                DashboardView::Running,
+                DashboardView::NotStarted,
+                DashboardView::Review,
+                DashboardView::Finished,
+            ] {
+                for attention in std::iter::once(None).chain(DashboardAttentionKind::ALL.map(Some))
+                {
+                    for sort in DashboardSort::ALL {
+                        let mut expected = project(
+                            &tasks,
+                            DashboardFilter {
+                                text: query,
+                                view,
+                                ..Default::default()
+                            },
+                        );
+                        expected.rows.retain(|row| {
+                            attention.is_none_or(|kind| row.attention_kind() == Some(kind))
+                        });
+                        expected.sort_rows(sort);
+                        assert_eq!(scope.view(view, attention, sort), expected);
+                        let mut in_place = scope.clone();
+                        in_place.apply_view(view, attention, sort);
+                        assert_eq!(in_place, expected);
+                    }
+                }
+            }
+            assert_eq!(scope, scope_before);
+            assert_eq!(attention_counts, scope.attention_counts());
+            assert_eq!(
+                DashboardAttentionKind::ALL
+                    .iter()
+                    .map(|kind| attention_counts.get(*kind))
+                    .sum::<usize>(),
+                scope.counts.attention
+            );
+        }
+        assert_eq!(tasks, original);
+    }
+
+    #[test]
+    fn unsorted_scope_preserves_borrowed_candidate_order_and_projects_activity_once() {
+        let tasks = [
+            task(TaskStatus::Working),
+            task(TaskStatus::WaitingForApproval),
+            task(TaskStatus::Created),
+        ];
+        let visits = std::cell::Cell::new(0);
+        let scope = DashboardSnapshot::project_unsorted(
+            &tasks,
+            |_| {
+                visits.set(visits.get() + 1);
+                DashboardActivity::default()
+            },
+            DashboardFilter::default(),
+        );
+        assert_eq!(visits.get(), tasks.len());
+        assert_eq!(
+            scope.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            tasks.iter().map(|task| task.id).collect::<Vec<_>>()
+        );
+        let borrowed = DashboardSnapshot::filter_iter_unsorted(
+            scope.rows.iter(),
+            "provider:codex",
+            DashboardView::All,
+        );
+        assert_eq!(borrowed, scope);
+        let derived = borrowed.view(DashboardView::NeedsAttention, None, DashboardSort::Recent);
+        assert_eq!(derived.rows.len(), 1);
+        assert_eq!(derived.rows[0].id, tasks[1].id);
+        assert_eq!(derived.counts.total, 3);
+        assert_eq!(
+            visits.get(),
+            tasks.len(),
+            "view switches never resolve live activity again"
+        );
+    }
+
+    #[test]
+    fn attention_navigation_moves_both_ways_through_only_visible_tasks() {
+        let mut tasks = vec![
+            task(TaskStatus::Working),
+            task(TaskStatus::WaitingForApproval),
+            task(TaskStatus::Completed),
+            task(TaskStatus::WaitingForHuman),
+        ];
+        for (index, task) in tasks.iter_mut().enumerate() {
+            task.title = index.to_string();
+        }
+        let mut snapshot = project(&tasks, DashboardFilter::default());
+        snapshot.sort_rows(DashboardSort::Title);
+        for (selected, next, previous) in [
+            (None, 1, 3),
+            (Some(tasks[0].id), 1, 3),
+            (Some(tasks[1].id), 3, 3),
+            (Some(tasks[2].id), 3, 1),
+            (Some(tasks[3].id), 1, 1),
+            (Some(TaskId::new()), 1, 3),
+        ] {
+            assert_eq!(snapshot.next_attention(selected), Some(tasks[next].id));
+            assert_eq!(
+                snapshot.previous_attention(selected),
+                Some(tasks[previous].id)
+            );
+        }
+        snapshot.rows.retain(|row| row.id != tasks[3].id);
+        assert_eq!(
+            snapshot.previous_attention(Some(tasks[3].id)),
+            Some(tasks[1].id)
+        );
+        assert_eq!(
+            snapshot.previous_attention(Some(tasks[1].id)),
+            Some(tasks[1].id)
+        );
+        snapshot.rows.retain(|row| !row.needs_attention);
+        assert_eq!(snapshot.previous_attention(None), None);
+        assert_eq!(snapshot.next_attention(None), None);
+        assert_eq!(DashboardSnapshot::default().previous_attention(None), None);
     }
 
     #[test]

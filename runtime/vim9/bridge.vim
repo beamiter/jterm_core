@@ -242,7 +242,10 @@ const WORKBENCH_ACTIONS = ['simple_files', 'simple_buffers', 'simple_grep',
   'simple_plugin_update', 'simple_plugin_stop', 'simple_plugin_diff',
   'simple_plugin_profile', 'simple_plugin_health', 'simple_lsp_status',
   'simple_lsp_restart', 'simple_lsp_log', 'simple_tree_refresh',
-  'simple_statusline_toggle', 'simple_statusline_health']
+  'simple_statusline_toggle', 'simple_statusline_health',
+  'simple_diagnostics_errors', 'simple_next_error', 'simple_previous_error',
+  'simple_refresh_diagnostics', 'simple_highlight_symbol', 'simple_clear_highlights',
+  'simple_terminal_send_line', 'simple_terminal_list', 'simple_terminal_health']
 const WORKBENCH_SEMANTICS = ['definition', 'hover', 'references', 'format']
 
 def WorkbenchCapabilities(): list<string>
@@ -255,7 +258,7 @@ def WorkbenchCapabilities(): list<string>
     if type(provided) != v:t_list
       return result
     endif
-    for action in provided[: 63]
+    for action in provided[: 127]
       if type(action) == v:t_string
           && (index(WORKBENCH_ACTIONS, action) >= 0 || index(WORKBENCH_SEMANTICS, action) >= 0)
           && index(result, action) < 0
@@ -2468,19 +2471,26 @@ enddef
 # LSP's default character unit is UTF-16; Vim cursor columns are UTF-8 bytes.
 # This avoids depending on the newer three-argument byteidx() API.
 def Utf16ByteColumn(text: string, units: number): number
-  var index = 0
+  if units <= 0
+    return 1
+  endif
   var consumed = 0
   var bytes = 0
-  while index < strchars(text) && consumed < units
-    var point = strgetchar(text, index)
+  # Decode once. Repeated strchars()/strgetchar() rescans UTF-8 prefixes and
+  # makes diagnostics near the end of long source lines quadratic. Iterate
+  # codepoints, not display clusters: combining marks each consume one LSP
+  # unit, and a position inside a surrogate pair stays before that codepoint.
+  for point in str2list(text, true)
     var width = point > 0xffff ? 2 : 1
     if consumed + width > units
       break
     endif
     consumed += width
     bytes += strlen(nr2char(point))
-    index += 1
-  endwhile
+    if consumed >= units
+      break
+    endif
+  endfor
   return bytes + 1
 enddef
 
