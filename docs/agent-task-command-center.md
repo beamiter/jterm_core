@@ -157,6 +157,61 @@ This change retains the existing persistence contract. Task instructions and
 runtime transcripts are not newly written into recovery journals. See the
 project-task recovery limitations in [CLI agent sessions](agent-sessions.md).
 
+## Hidden tasks and restore
+
+Hiding a task (`TaskManager::archive`) is reversible. The manager records the
+lifecycle state in `AgentTask::archived_from`, and `TaskManager::restore`
+returns the task exactly there. Restoring never starts an Agent, reruns
+validation or accepts work; validation records, exit facts, terminal bindings
+and the worktree are unchanged. Hiding an already hidden task is a no-op. A
+record hidden by an older build has no preserved state and reports
+`TaskError::ArchivedStateUnknown` instead of guessing; create a new task for
+its worktree. The field is optional in serialized tasks, so older records load
+unchanged.
+
+`TaskManager::can_archive` answers whether Hide would succeed now without
+changing anything. Dashboards disable Hide while an Agent stream, a running
+lifecycle or a validation is active, and say what has to finish first.
+`archived_count` sizes a "Hidden tasks (N)" view. All four dashboards keep
+hidden tasks out of every ordinary view, queue and badge; the hidden view lists
+only them, offers Restore and read-only inspection, and returns to the ordinary
+view once nothing hidden remains.
+
+## Attention outside the panel
+
+`TaskManager::attention_counts()` classifies visible tasks into the same five
+disjoint queues as dashboard rows, without projecting a dashboard.
+`DashboardAttentionCounts::total()` gives the badge number and `summary()` a
+bounded explanation such as `2 tasks need you: 1 approval, 1 reply`. Anvil and
+Forge show a Tasks button with this count in the top bar, Ember a Tasks chip and
+the sidebar label, Frost the Tasks switcher and Agents button. The badge is a
+pointer to work, not an approval or acceptance path. Ember and Frost add the
+`task:toggle` command on Ctrl+Alt+Shift+T, matching the existing Anvil and Forge
+shortcut.
+
+## Native views and polling
+
+Provider workers now publish a process-unique revision whenever they change the
+live view. `AgentRuntimeManager::snapshot_revision(task)` reads it without
+copying anything, and `shared_snapshot(task)` returns the same `Arc` until the
+view changes. Its content is identical to `snapshot(task)`. Frame- or
+tick-driven dashboards use the shared form, so an idle task no longer copies
+its assistant text, command output and file diffs several times per frame.
+Revisions never repeat for a later run, and a retained final view keeps the
+revision of the last live view.
+
+`needs_fast_poll()` is false while a native session only waits for an approval
+(as it already was at an idle review point). Nothing arrives until the user
+responds, so the low-frequency lifecycle tick is enough; hosts poll promptly for
+a short period after the user's own approve, deny, follow-up, finish or stop
+action instead of polling at frame rate for as long as an approval is pending.
+`CodexAppServerPhase`, `CodexAppServerApprovalKind` and
+`CodexAppServerExitCause` have readable `label()`s for native task views.
+
+Task search normalizes displayed row text only when a term actually compares
+text; enumerated constraints such as `status:` or `provider:` no longer copy
+nine lowercase strings per row.
+
 ## Projection costs
 
 The dashboard separates searching a scope from narrowing its visible rows.
@@ -236,3 +291,14 @@ passed. The scope optimization keeps the former ordering and ownership
 semantics; no wall-clock speedup ratio is claimed from these regressions.
 Both GTK releases were rebuilt after production code stabilized; their version
 probes passed and all dynamic libraries resolved.
+
+## Management upgrade validation (2026-10-25)
+
+The Agent domain suite passed **264 tests** with the existing
+host-dependent cgroup test excluded. New coverage restores hidden tasks to their
+recorded states, refuses restore without one, keeps hidden tasks out of
+attention counts, round-trips `archived_from` (including older records without
+it), compares direct attention counts with dashboard projections and checks
+their summaries, reports approval waits as slow-poll phases, and verifies that
+unchanged views are shared while changed views get a new revision. Strict
+all-target Clippy, rustdoc and formatting checks passed.

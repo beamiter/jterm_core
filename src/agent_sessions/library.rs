@@ -112,15 +112,30 @@ pub fn validate_session_details(alias: &str, tags: &str) -> Result<(), String> {
     editor_details(alias, tags).map(|_| ())
 }
 
+/// Validate the single tag of a batch Add/Remove tag action exactly as
+/// `SessionLibraryStore::apply_batch` will, without queueing a write.
+pub fn validate_session_batch_tag(tag: &str) -> Result<(), String> {
+    SessionBatchAction::AddTag(tag.to_owned())
+        .normalized()
+        .map(|_| ())
+}
+
 fn editor_details(alias: &str, tags: &str) -> Result<SessionOrganization, String> {
     // Bound input before splitting or allocating user-controlled strings.
     // Editors render saved tags with `join(", ")`, so the raw budget must
     // include both delimiter bytes even when all 12 tags fill their limit.
-    if alias.len() > SESSION_ALIAS_MAX_BYTES
-        || tags.len() > (SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT
-        || unsafe_label(tags)
-    {
-        return Err("Session name or tags exceed the editor limits.".into());
+    if alias.len() > SESSION_ALIAS_MAX_BYTES {
+        return Err(format!(
+            "A session name must be at most {SESSION_ALIAS_MAX_BYTES} bytes."
+        ));
+    }
+    if tags.len() > (SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT {
+        return Err(format!(
+            "Use at most {SESSION_TAG_LIMIT} tags of {SESSION_TAG_MAX_BYTES} bytes each."
+        ));
+    }
+    if unsafe_label(tags) {
+        return Err("Tags cannot contain control or formatting characters.".into());
     }
     SessionOrganization {
         alias: Some(alias.into()),
@@ -1773,6 +1788,37 @@ mod tests {
             library.facts(SessionProvider::Codex, OTHER),
             SessionLibraryFacts::default()
         );
+    }
+
+    #[test]
+    fn batch_tag_validation_matches_batch_admission() {
+        let fixture = Fixture::new();
+        let mut store = SessionLibraryStore::with_path(fixture.path());
+        settle(&mut store);
+        let padded = format!("  {}  ", "t".repeat(SESSION_TAG_MAX_BYTES));
+        let long = "t".repeat(SESSION_TAG_MAX_BYTES + 1);
+        let huge = "t".repeat(SESSION_TAG_MAX_BYTES * 4 + 1);
+        for tag in [
+            "review",
+            "  Review  ",
+            "",
+            "   ",
+            "a,b",
+            "bad\u{7}",
+            padded.as_str(),
+            long.as_str(),
+            huge.as_str(),
+        ] {
+            let validated = validate_session_batch_tag(tag);
+            let admitted = store
+                .apply_batch(
+                    &[(SessionProvider::Codex, ID.into())],
+                    SessionBatchAction::AddTag(tag.into()),
+                )
+                .map(|_| ());
+            assert_eq!(validated, admitted, "{tag:?}");
+            settle(&mut store);
+        }
     }
 
     #[test]

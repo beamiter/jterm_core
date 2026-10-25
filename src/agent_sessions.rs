@@ -8,15 +8,15 @@ mod desktop_launch;
 mod library;
 mod preflight;
 pub use library::{
-    validate_session_details, SessionBatchAction, SessionLibraryEntry, SessionLibraryFacts,
-    SessionLibrarySnapshot, SessionLibraryStore, SessionOrganization, SESSION_ALIAS_MAX_BYTES,
-    SESSION_BATCH_LIMIT, SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
+    validate_session_batch_tag, validate_session_details, SessionBatchAction, SessionLibraryEntry,
+    SessionLibraryFacts, SessionLibrarySnapshot, SessionLibraryStore, SessionOrganization,
+    SESSION_ALIAS_MAX_BYTES, SESSION_BATCH_LIMIT, SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
 };
 pub use preflight::{SessionPreflight, SessionPreflightState};
 mod search;
 pub use search::{
     SessionArchiveFilter, SessionLibraryFilter, SessionProjectSummary, SessionQuery,
-    SessionSearchIndex, SessionSort,
+    SessionSearchIndex, SessionSort, SESSION_QUERY_MAX_BYTES,
 };
 
 use serde_json::Value;

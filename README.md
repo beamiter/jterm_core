@@ -44,6 +44,12 @@ v2 is selected only for a peer that has already advertised v2 support.
   management](docs/agent-sessions.md). The [task command center](docs/agent-task-command-center.md)
   adds five attention queues, shared structured task search, and current
   next-step guidance while preserving task identity and runtime action gates.
+  Hidden tasks can be restored to their recorded state, `can_archive` explains
+  when Hide must wait, and `attention_counts()` feeds badges outside the panel.
+  Library writes are reported separately from read-only reloads (`is_saving`),
+  `resume_conflict` warns before a second CLI would share a running
+  conversation's history, and native views publish revisions so unchanged
+  snapshots are shared instead of copied every frame.
 
 - A real Vim 9 IDE bridge for all four native workbenches. `vim9::Vim9Session`
   prepares a dedicated editor process, transports typed editor actions over

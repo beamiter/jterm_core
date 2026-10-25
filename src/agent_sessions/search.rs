@@ -5,7 +5,11 @@ use super::{AgentSession, SessionCatalog, SessionLibrarySnapshot, SessionProvide
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-const MAX_QUERY_BYTES: usize = 4096;
+/// Longest accepted session search, in UTF-8 bytes. Longer text is rejected
+/// with an explanation (`query_error`) and matches nothing; hosts must not
+/// truncate it, which could silently drop a trailing exclusion.
+pub const SESSION_QUERY_MAX_BYTES: usize = 4096;
+const MAX_QUERY_BYTES: usize = SESSION_QUERY_MAX_BYTES;
 const MAX_QUERY_TERMS: usize = 64;
 
 /// Local organization is independent of a provider's archived transcript state.

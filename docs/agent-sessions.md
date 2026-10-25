@@ -210,7 +210,25 @@ bounded queue of up to 256 distinct pending identities; updates for the same
 identity coalesce. Workers continue saving without UI polling, including
 queued work when the store is dropped. A process killed before its background
 write finishes can still lose a pending update; hosts should show Saving while
-`is_busy()` is true rather than promise an immediate durable write.
+`is_saving()` is true rather than promise an immediate durable write.
+
+`is_saving()` covers only user changes: queued, being written, or finished but
+not yet acknowledged by `poll()`. The periodic read-only reload that observes
+other windows never counts, so hosts gate Save, pin, archive and batch controls
+on `is_saving()` and the controls no longer disable themselves on every
+refresh. `is_busy()` still includes that reload and any unacknowledged result;
+use it only to decide how often to poll. A failed write stays in `error()` after
+`poll()` even when a later reload finished first, so a refresh can never turn a
+failed save into an apparent success.
+
+`SessionLibrarySnapshot::facts(provider, id)` returns pin, resume receipt,
+local archive, alias and tags from one identity lookup; row renderers should use
+it instead of separate getters, each of which rebuilds the identity key.
+`validate_session_details(alias, tags)` and `validate_session_batch_tag(tag)`
+apply exactly the checks that `set_details` and `apply_batch` will, without
+queueing anything, so editors can explain a byte limit while the user types.
+Limits are UTF-8 bytes (`SESSION_ALIAS_MAX_BYTES`, `SESSION_TAG_MAX_BYTES`,
+`SESSION_TAG_LIMIT`), not characters.
 
 Each transaction acquires a cross-process directory lock with a two-second
 wait limit, reads current metadata, merges only that transaction's operations,
@@ -227,8 +245,13 @@ all four frontends together. JSON remains capped at 1 MiB and 4,096 identities.
 Errors are nonfatal and exposed by `error()` after `poll()`.
 
 Poll to adopt completed snapshots; refresh periodically while open to observe
-other terminal windows' changes. Re-query cached search indices when the
-snapshot changes. Record a resume only after the host has successfully created
+other terminal windows' changes. `SessionScanner::refresh_if_idle_for(interval)`
+starts a background scan only when none is running and the previous one
+finished at least `interval` ago, so a history slower than the interval never
+causes back-to-back rescans; reload the library only when it returns `true`.
+Explicit refreshes (opening the manager, F5, a Refresh button) should rescan,
+reload the library and recheck readiness together. Re-query cached search
+indices when the snapshot changes. Record a resume only after the host has successfully created
 the PTY or focused a valid existing session tab, not when selecting a row or
 starting a readiness check. This is a launch/switch receipt, not proof that a
 model turn completed successfully.
@@ -270,7 +293,24 @@ unchanged. Discovery and command previews do not resolve executables.
 
 Hosts still launch argv directly. Missing project directories and deleted
 history produce a recoverable error; the manager does not silently resume in
-a different directory. Archived sessions are visible but require the user to
+a different directory.
+
+`SessionCatalog::resume_conflict(session)` explains when the latest scan
+positively observed a CLI process already holding that conversation. Resuming
+it again would start a second CLI writing to the same history. A host that owns
+the matching tab switches to it; otherwise the first Resume only shows the
+warning, and a separate, explicit "Resume anyway" bound to the same provider and
+UUID proceeds. Changing the selection, a refresh that removes the conversation,
+or Escape withdraws the warning. The evidence can be one scan old, so it is a
+warning rather than a lock.
+
+A background refresh must never move the selection to a different conversation:
+when the inspected conversation leaves the view (another window archived it,
+its recorded state no longer matches a filter), hosts keep its identity, show
+that it is no longer listed, and disable Resume and organization until the user
+selects again. Explicit filter or search edits may still select the first match.
+Display and copy the exact command from `resume_launch().display_command()`,
+which includes any `env CODEX_HOME=…` or `env CLAUDE_CONFIG_DIR=…` prefix. Archived sessions are visible but require the user to
 unarchive them in Codex before resuming.
 
 ## Bounds and limitations
@@ -286,7 +326,33 @@ A compressed prefix never supplies an authoritative last state.
 A process-local cache retains at most 4,096 bounded metadata entries keyed by
 source path, nanosecond modification time, and file length. Unchanged files do
 not consume the next scan's transcript budget, so refresh can index additional
-older files after a partial first scan. Codex title indices have a separate
+older files after a partial first scan. After each scan, entries for files under
+that scan's history roots that it no longer selected (deleted, renamed or past
+the newest-file ceiling) are dropped; other roots' entries are untouched. A
+long-running terminal therefore no longer reaches the ceiling and discards the
+whole cache, which used to force a full re-read. Codex title indices have a separate
 2 MiB-per-store tail ceiling. Warnings disclose sampling or budget
 omissions. The cache is not a persistent index, and a cold scan can omit older
 history until refreshed. No provider transcript, home, or archive is modified.
+
+## Management upgrade validation (2026-10-25)
+
+Session search now resolves every library fact for a query with one sorted
+merge between the cached index and the library's ordered maps, instead of
+allocating an identity key for each pin, archive, alias, tag and receipt lookup;
+project summaries use ancestor slots computed when the catalog changes. On a
+release build with 2,048 conversations and 1,024 library identities, empty
+browsing with pins first went from 4.2 ms to 0.2 ms per query, recently-resumed
+ordering from 5.7 ms to 0.2 ms, `tag:` and `is:` filters from about 1.1–1.5 ms
+to 0.1 ms, and project summaries from 5.6 ms to 0.1 ms. A differential run
+against the previous implementation compared 240,000 random queries over 20,000
+random catalogs and libraries (mixed-case UUIDs, aliases, tags, local and
+provider archives, live processes, project scopes, every sort and filter, and
+invalid queries): indices and summaries were identical.
+
+The core suites added coverage for `is_saving()` during reloads, a reload
+finishing before a failed write is polled, editor and batch-tag validation
+matching store admission, one-lookup row facts, completion-based scan cadence,
+scoped cache pruning and resume-conflict text. The four native managers adopt
+these APIs; their own tests cover the second resume confirmation, selections
+that a refresh hides and later shows again, and exact copied commands.
