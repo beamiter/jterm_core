@@ -1,7 +1,8 @@
 //! Cached, deterministic session search shared by every native frontend.
 //! Build once after a changed catalog; queries never inspect the filesystem.
+use super::library::{key as library_key, SessionLibraryFacts as LibraryFacts};
 use super::{AgentSession, SessionCatalog, SessionLibrarySnapshot, SessionProvider, SessionStatus};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 const MAX_QUERY_BYTES: usize = 4096;
@@ -108,6 +109,15 @@ pub struct SessionQuery<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct SessionSearchIndex {
     entries: Vec<SearchEntry>,
+    /// Entry positions ordered by library identity, so one merge with the
+    /// ordered library maps resolves pins and organization for every row.
+    library_order: Vec<usize>,
+    /// Cataloged project directories in component order.
+    project_roots: Vec<PathBuf>,
+    /// Flattened project slots per entry: its own directory and every
+    /// cataloged ancestor. `project_link_ends[i]` closes entry `i`'s range.
+    project_links: Vec<u32>,
+    project_link_ends: Vec<u32>,
 }
 #[derive(Clone, Debug)]
 struct SearchEntry {
@@ -115,6 +125,8 @@ struct SearchEntry {
     status: SessionStatus,
     id: String,
     key: String,
+    /// Prepared once so library lookups never allocate per query row.
+    library_key: String,
     title: String,
     cwd: String,
     branch: String,
@@ -133,18 +145,66 @@ impl SessionSearchIndex {
             .iter()
             .map(|process| (process.provider, process.id.as_str()))
             .collect::<HashSet<_>>();
-        Self {
-            entries: catalog
-                .sessions
-                .iter()
-                .map(|session| {
-                    SearchEntry::new(
-                        session,
-                        live.contains(&(session.provider, session.id.as_str())),
-                    )
-                })
-                .collect(),
+        let entries = catalog
+            .sessions
+            .iter()
+            .map(|session| {
+                SearchEntry::new(
+                    session,
+                    live.contains(&(session.provider, session.id.as_str())),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut library_order = (0..entries.len()).collect::<Vec<_>>();
+        library_order
+            .sort_by(|left, right| entries[*left].library_key.cmp(&entries[*right].library_key));
+        // Project membership depends only on the catalog. Resolve every
+        // directory's cataloged ancestors once, so summaries need no path
+        // hashing or tree walks when only library organization changes.
+        let mut roots = entries
+            .iter()
+            .filter_map(|entry| entry.directory.as_deref())
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots.dedup();
+        let slots = roots
+            .iter()
+            .enumerate()
+            .map(|(slot, root)| (*root, slot as u32))
+            .collect::<HashMap<_, _>>();
+        let mut project_links = Vec::new();
+        let mut project_link_ends = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            if let Some(directory) = &entry.directory {
+                project_links.extend(
+                    directory
+                        .ancestors()
+                        .filter_map(|ancestor| slots.get(ancestor).copied()),
+                );
+            }
+            project_link_ends.push(project_links.len() as u32);
         }
+        let project_roots = roots.into_iter().map(Path::to_path_buf).collect();
+        Self {
+            entries,
+            library_order,
+            project_roots,
+            project_links,
+            project_link_ends,
+        }
+    }
+    /// Library facts for every catalog row, in catalog order.
+    fn library_facts<'a>(&self, library: &'a SessionLibrarySnapshot) -> Vec<LibraryFacts<'a>> {
+        let mut facts = vec![LibraryFacts::default(); self.entries.len()];
+        if !library.is_empty() {
+            library.resolve_sorted(
+                self.library_order
+                    .iter()
+                    .map(|&index| (index, self.entries[index].library_key.as_str())),
+                &mut facts,
+            );
+        }
+        facts
     }
     pub fn query_with_library(
         &self,
@@ -152,35 +212,31 @@ impl SessionSearchIndex {
         library: &SessionLibrarySnapshot,
         filter: SessionLibraryFilter,
     ) -> Vec<usize> {
-        let mut indices = self.query_filtered(query, Some(library), filter);
+        let mut ranked = self.query_filtered(query, Some(library), filter);
         let pinned_first = filter.pinned_first
             && query.text.trim().is_empty()
             && query.sort == SessionSort::Relevance;
-        if pinned_first || query.sort == SessionSort::RecentlyResumed {
+        let resumed_first = query.sort == SessionSort::RecentlyResumed;
+        if pinned_first || resumed_first {
             // Stable sort preserves relevance/recency and identity tie-breaks
-            // from the base projection when preference metadata ties.
-            indices.sort_by(|a, b| {
-                let left = &self.entries[*a];
-                let right = &self.entries[*b];
+            // from the base projection when preference metadata ties. Library
+            // facts were resolved once per row while filtering.
+            ranked.sort_by(|left, right| {
                 let pins = if pinned_first {
-                    library
-                        .is_pinned(right.provider, &right.key)
-                        .cmp(&library.is_pinned(left.provider, &left.key))
+                    right.pinned.cmp(&left.pinned)
                 } else {
                     std::cmp::Ordering::Equal
                 };
                 pins.then_with(|| {
-                    if query.sort == SessionSort::RecentlyResumed {
-                        library
-                            .last_resumed(right.provider, &right.key)
-                            .cmp(&library.last_resumed(left.provider, &left.key))
+                    if resumed_first {
+                        right.last_resumed_ms.cmp(&left.last_resumed_ms)
                     } else {
                         std::cmp::Ordering::Equal
                     }
                 })
             });
         }
-        indices
+        ranked.into_iter().map(|row| row.index).collect()
     }
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -192,42 +248,36 @@ impl SessionSearchIndex {
         parse_query(text).err()
     }
     pub fn projects(&self, library: &SessionLibrarySnapshot) -> Vec<SessionProjectSummary> {
-        let mut projects: BTreeMap<PathBuf, SessionProjectSummary> = self
-            .entries
+        // Only cataloged project directories are exposed; each row counts
+        // toward its own directory and every cataloged ancestor, in the
+        // precomputed component order.
+        let mut projects = self
+            .project_roots
             .iter()
-            .filter_map(|entry| entry.directory.clone())
-            .map(|root| {
-                (
-                    root.clone(),
-                    SessionProjectSummary {
-                        root,
-                        ..Default::default()
-                    },
-                )
+            .map(|root| SessionProjectSummary {
+                root: root.clone(),
+                ..Default::default()
             })
-            .collect();
-        for entry in &self.entries {
-            let Some(directory) = &entry.directory else {
-                continue;
-            };
-            // Only cataloged project directories are exposed. Ancestor walks
-            // avoid a quadratic all-projects scan for large history catalogs.
-            for ancestor in directory.ancestors() {
-                let Some(project) = projects.get_mut(ancestor) else {
-                    continue;
-                };
+            .collect::<Vec<_>>();
+        let facts = self.library_facts(library);
+        let mut start = 0;
+        for ((entry, facts), &end) in self.entries.iter().zip(&facts).zip(&self.project_link_ends) {
+            let end = end as usize;
+            for &slot in &self.project_links[start..end] {
+                let project = &mut projects[slot as usize];
                 project.updated_at_ms = project.updated_at_ms.max(entry.updated_at_ms);
-                if library.is_archived(entry.provider, &entry.key) {
+                if facts.archived {
                     project.archived += 1;
                 } else {
                     project.total += 1;
                     project.live += usize::from(entry.live);
                     project.waiting += usize::from(entry.status == SessionStatus::Waiting);
-                    project.pinned += usize::from(library.is_pinned(entry.provider, &entry.key));
+                    project.pinned += usize::from(facts.pinned);
                 }
             }
+            start = end;
         }
-        projects.into_values().collect()
+        projects
     }
     /// All whitespace-separated terms must match some indexed field. The
     /// returned indices refer to the catalog supplied to `new`, never sorted
@@ -241,13 +291,16 @@ impl SessionSearchIndex {
                 ..Default::default()
             },
         )
+        .into_iter()
+        .map(|row| row.index)
+        .collect()
     }
     fn query_filtered(
         &self,
         query: &SessionQuery<'_>,
         library: Option<&SessionLibrarySnapshot>,
         filter: SessionLibraryFilter,
-    ) -> Vec<usize> {
+    ) -> Vec<RankedRow> {
         let Ok(terms) = parse_query(query.text) else {
             return Vec::new();
         };
@@ -269,26 +322,18 @@ impl SessionSearchIndex {
             },
             None => None,
         };
+        let facts = library.map(|library| self.library_facts(library));
         let mut ranked = self
             .entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let archived =
-                    library.is_some_and(|library| library.is_archived(entry.provider, &entry.key));
+                // Catalog-only constraints are checked before library facts.
                 if query
                     .provider
                     .is_some_and(|provider| entry.provider != provider)
                     || query.status.is_some_and(|status| entry.status != status)
                     || (query.live_only && !entry.live)
-                    || !archive.matches(archived)
-                    || (filter.pinned_only
-                        && !library
-                            .is_some_and(|library| library.is_pinned(entry.provider, &entry.key)))
-                    || (filter.recent_only
-                        && !library.is_some_and(|library| {
-                            library.last_resumed(entry.provider, &entry.key).is_some()
-                        }))
                     || project.as_ref().is_some_and(|root| {
                         entry
                             .directory
@@ -298,30 +343,54 @@ impl SessionSearchIndex {
                 {
                     return None;
                 }
+                // Without a library every organization fact is absent.
+                let facts = facts
+                    .as_ref()
+                    .map_or_else(LibraryFacts::default, |facts| facts[index]);
+                if !archive.matches(facts.archived)
+                    || (filter.pinned_only && !facts.pinned)
+                    || (filter.recent_only && facts.last_resumed_ms.is_none())
+                {
+                    return None;
+                }
                 entry
-                    .score_terms(&normalized, &terms, library)
-                    .map(|score| (index, score))
+                    .score_terms(&normalized, &terms, &facts)
+                    .map(|score| RankedRow {
+                        index,
+                        score,
+                        pinned: facts.pinned,
+                        last_resumed_ms: facts.last_resumed_ms,
+                    })
             })
             .collect::<Vec<_>>();
-        ranked.sort_unstable_by(|(left, left_score), (right, right_score)| {
-            let a = &self.entries[*left];
-            let b = &self.entries[*right];
+        ranked.sort_unstable_by(|left, right| {
+            let a = &self.entries[left.index];
+            let b = &self.entries[right.index];
             let priority = match query.sort {
                 SessionSort::Recent | SessionSort::RecentlyResumed => std::cmp::Ordering::Equal,
-                SessionSort::Relevance => right_score.cmp(left_score),
+                SessionSort::Relevance => right.score.cmp(&left.score),
                 SessionSort::LiveFirst => b
                     .live
                     .cmp(&a.live)
-                    .then_with(|| right_score.cmp(left_score)),
+                    .then_with(|| right.score.cmp(&left.score)),
             };
             priority
                 .then_with(|| b.updated_at_ms.cmp(&a.updated_at_ms))
                 .then_with(|| provider_order(a.provider).cmp(&provider_order(b.provider)))
                 .then_with(|| a.key.cmp(&b.key))
-                .then_with(|| left.cmp(right))
+                .then_with(|| left.index.cmp(&right.index))
         });
-        ranked.into_iter().map(|(index, _)| index).collect()
+        ranked
     }
+}
+
+/// One matching catalog row with the library facts its final order may need.
+#[derive(Clone, Copy, Debug)]
+struct RankedRow {
+    index: usize,
+    score: u64,
+    pinned: bool,
+    last_resumed_ms: Option<u64>,
 }
 impl SessionCatalog {
     /// Convenient one-shot projection. Native event loops should cache a
@@ -442,6 +511,7 @@ impl SearchEntry {
             status: session.status,
             id: session.id.to_lowercase(),
             key: session.id.clone(),
+            library_key: library_key(session.provider, &session.id),
             title: session.title.trim().to_lowercase(),
             cwd: session.cwd.to_string_lossy().to_lowercase(),
             branch: session.branch.as_deref().unwrap_or("").to_lowercase(),
@@ -463,13 +533,14 @@ impl SearchEntry {
         &self,
         query: &str,
         terms: &[SearchTerm],
-        library: Option<&SessionLibrarySnapshot>,
+        facts: &LibraryFacts<'_>,
     ) -> Option<u64> {
-        let alias = library
-            .and_then(|library| library.alias(self.provider, &self.key))
-            .unwrap_or_default()
-            .to_lowercase();
-        let tags = library.map_or(&[][..], |library| library.tags(self.provider, &self.key));
+        // Empty browsing has no terms and no exact-match bonus to compute.
+        if terms.is_empty() {
+            return Some(0);
+        }
+        let alias = facts.alias.map(str::to_lowercase).unwrap_or_default();
+        let tags = facts.tags;
         let mut total = 0;
         for term in terms {
             let value = term.value.as_str();
@@ -507,19 +578,13 @@ impl SearchEntry {
                     "archived" => self.status == SessionStatus::Archived,
                     _ => false,
                 }),
-                SearchField::Is => {
-                    u64::from(match value {
-                        "live" => self.live,
-                        "pinned" => library
-                            .is_some_and(|library| library.is_pinned(self.provider, &self.key)),
-                        "archived" => library
-                            .is_some_and(|library| library.is_archived(self.provider, &self.key)),
-                        "resumed" => library.is_some_and(|library| {
-                            library.last_resumed(self.provider, &self.key).is_some()
-                        }),
-                        _ => false,
-                    })
-                }
+                SearchField::Is => u64::from(match value {
+                    "live" => self.live,
+                    "pinned" => facts.pinned,
+                    "archived" => facts.archived,
+                    "resumed" => facts.last_resumed_ms.is_some(),
+                    _ => false,
+                }),
             };
             if (score > 0) == term.negative {
                 return None;

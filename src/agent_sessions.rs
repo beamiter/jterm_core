@@ -8,9 +8,9 @@ mod desktop_launch;
 mod library;
 mod preflight;
 pub use library::{
-    SessionBatchAction, SessionLibraryEntry, SessionLibrarySnapshot, SessionLibraryStore,
-    SessionOrganization, SESSION_ALIAS_MAX_BYTES, SESSION_BATCH_LIMIT, SESSION_TAG_LIMIT,
-    SESSION_TAG_MAX_BYTES,
+    validate_session_details, SessionBatchAction, SessionLibraryEntry, SessionLibraryFacts,
+    SessionLibrarySnapshot, SessionLibraryStore, SessionOrganization, SESSION_ALIAS_MAX_BYTES,
+    SESSION_BATCH_LIMIT, SESSION_TAG_LIMIT, SESSION_TAG_MAX_BYTES,
 };
 pub use preflight::{SessionPreflight, SessionPreflightState};
 mod search;
@@ -20,13 +20,14 @@ pub use search::{
 };
 
 use serde_json::Value;
+use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_ENTRIES: usize = 32_768;
 const MAX_SESSIONS: usize = 2_048;
@@ -206,6 +207,34 @@ impl SessionCatalog {
             .map(|p| p.pid)
             .collect()
     }
+    /// Explain why resuming would start a second CLI on the same provider
+    /// history: this scan positively observed a process holding the
+    /// conversation. A host that owns the matching tab should switch to it;
+    /// otherwise it should require a separate, explicit confirmation. The
+    /// evidence can be stale by one scan, so this is a warning, not a lock.
+    pub fn resume_conflict(&self, session: &AgentSession) -> Option<String> {
+        let mut pids = self.live_pids(session);
+        if pids.is_empty() {
+            return None;
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        const SHOWN: usize = 3;
+        let mut list = pids
+            .iter()
+            .take(SHOWN)
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if pids.len() > SHOWN {
+            list.push_str(&format!(" and {} more", pids.len() - SHOWN));
+        }
+        Some(format!(
+            "{} is already running this conversation (PID{} {list}). Resuming starts a second CLI that writes to the same history.",
+            session.provider.label(),
+            if pids.len() == 1 { "" } else { "s" },
+        ))
+    }
     pub fn discover() -> Self {
         let Some(home) = dirs::home_dir() else {
             return Self {
@@ -248,12 +277,12 @@ impl SessionCatalog {
         for home in claude_homes {
             roots.push((home.join("projects"), SessionProvider::Claude, false, 2));
         }
-        for (root, provider, archived, depth) in roots {
+        for (root, provider, archived, depth) in &roots {
             collect(
-                &root,
-                provider,
-                archived,
-                depth,
+                root,
+                *provider,
+                *archived,
+                *depth,
                 &mut entries,
                 &mut candidates,
                 &mut catalog,
@@ -271,13 +300,13 @@ impl SessionCatalog {
         }
         let mut bytes_left = MAX_SCAN_BYTES;
         let mut identities = HashMap::<(SessionProvider, String), usize>::new();
-        for candidate in candidates {
+        for candidate in &candidates {
             if bytes_left < HEAD_BYTES + TAIL_BYTES {
                 catalog
                     .warn("History scan reached its 128 MiB budget; older sessions were omitted.");
                 break;
             }
-            match parse_cached(&candidate, &mut bytes_left) {
+            match parse_cached(candidate, &mut bytes_left) {
                 Ok((Some(session), sampled)) => {
                     if sampled {
                         catalog.warn("Some compressed sessions exceed the decompression budget; their last state is unknown.");
@@ -303,6 +332,11 @@ impl SessionCatalog {
                 ),
             }
         }
+        let scanned_roots = roots
+            .iter()
+            .map(|(root, ..)| root.as_path())
+            .collect::<Vec<_>>();
+        prune_session_cache(&scanned_roots, &candidates);
         apply_session_titles(&mut catalog, codex_homes);
         catalog.live_processes = discover_live_processes(&catalog.sessions);
         catalog.sessions.sort_by(|a, b| {
@@ -323,6 +357,7 @@ impl SessionCatalog {
 #[derive(Default)]
 pub struct SessionScanner {
     pending: Option<Receiver<SessionCatalog>>,
+    finished_at: Option<Instant>,
 }
 impl SessionScanner {
     pub fn new() -> Self {
@@ -333,6 +368,23 @@ impl SessionScanner {
     }
     pub fn refresh(&mut self) -> bool {
         self.start(SessionCatalog::discover)
+    }
+    /// Periodic refresh measured from the end of the previous scan. A scan
+    /// slower than `interval` therefore never starts back-to-back rescans,
+    /// and nothing starts while one is still running. Returns whether a scan
+    /// started; hosts usually reload their library in the same step.
+    pub fn refresh_if_idle_for(&mut self, interval: Duration) -> bool {
+        self.start_if_idle_for(interval, SessionCatalog::discover)
+    }
+    fn start_if_idle_for(&mut self, interval: Duration, scan: fn() -> SessionCatalog) -> bool {
+        if self.pending.is_some()
+            || self
+                .finished_at
+                .is_some_and(|finished| finished.elapsed() < interval)
+        {
+            return false;
+        }
+        self.start(scan)
     }
     fn start(&mut self, scan: fn() -> SessionCatalog) -> bool {
         if self.pending.is_some() {
@@ -370,11 +422,13 @@ impl SessionScanner {
         match result {
             Ok(catalog) => {
                 self.pending = None;
+                self.finished_at = Some(Instant::now());
                 Some(catalog)
             }
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
                 self.pending = None;
+                self.finished_at = Some(Instant::now());
                 Some(SessionCatalog {
                     sessions: vec![],
                     warnings: vec!["Session discovery worker stopped; try refreshing.".into()],
@@ -506,6 +560,26 @@ fn parse_cached(
         );
     }
     Ok((session, sampled))
+}
+
+/// Forget cached metadata for files under the scanned history roots that this
+/// scan no longer selected (deleted, renamed or pushed past the newest-file
+/// ceiling). Entries for other roots, such as another provider home scanned by
+/// a different window, are untouched. This keeps the cache bounded by the
+/// candidate ceiling instead of periodically discarding every entry.
+fn prune_session_cache(roots: &[&Path], kept: &[Candidate]) {
+    let Some(cache) = SESSION_CACHE.get() else {
+        return;
+    };
+    let kept = kept
+        .iter()
+        .map(|candidate| candidate.path.as_path())
+        .collect::<HashSet<_>>();
+    if let Ok(mut entries) = cache.lock() {
+        entries.retain(|path, _| {
+            kept.contains(path.as_path()) || !roots.iter().any(|root| path.starts_with(root))
+        });
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1287,6 +1361,107 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
         };
         assert_eq!(launch.display_command(), format!("'codex' 'resume' '{ID}'"));
+    }
+    #[test]
+    fn periodic_refresh_waits_for_the_previous_scan_to_finish() {
+        let mut scanner = SessionScanner::new();
+        let interval = Duration::from_millis(80);
+        assert!(scanner.start_if_idle_for(interval, SessionCatalog::default));
+        assert!(
+            !scanner.start_if_idle_for(Duration::ZERO, SessionCatalog::default),
+            "a running scan is never restarted"
+        );
+        let start = Instant::now();
+        while scanner.poll().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !scanner.start_if_idle_for(interval, SessionCatalog::default),
+            "the interval is measured from completion"
+        );
+        std::thread::sleep(interval);
+        assert!(scanner.start_if_idle_for(interval, SessionCatalog::default));
+    }
+    #[test]
+    fn discovery_prunes_cache_entries_only_for_files_that_left_its_roots() {
+        let f = Fixture::new();
+        let other = Fixture::new();
+        let kept = f.write("codex/sessions/kept.jsonl", &[f.meta(ID)]);
+        let removed = f.write(
+            "codex/sessions/removed.jsonl",
+            &[f.meta("33333333-3333-4333-8333-333333333333")],
+        );
+        let foreign = other.write("codex/sessions/foreign.jsonl", &[other.meta(ID)]);
+        assert_eq!(f.catalog().sessions.len(), 2);
+        assert_eq!(other.catalog().sessions.len(), 1);
+        let cached = |path: &Path| {
+            SESSION_CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .contains_key(path)
+        };
+        assert!(cached(&kept) && cached(&removed) && cached(&foreign));
+        fs::remove_file(&removed).unwrap();
+        assert_eq!(f.catalog().sessions.len(), 1);
+        assert!(cached(&kept), "unchanged files keep their parsed metadata");
+        assert!(!cached(&removed), "a deleted file is forgotten");
+        assert!(cached(&foreign), "another root's entries are untouched");
+    }
+    #[test]
+    fn resume_conflict_reports_only_positive_process_evidence_for_that_identity() {
+        let session = AgentSession {
+            provider: SessionProvider::Codex,
+            id: ID.into(),
+            title: "Renderer".into(),
+            cwd: "/tmp".into(),
+            updated_at_ms: 1,
+            status: SessionStatus::Idle,
+            preview: String::new(),
+            branch: None,
+            source: "/tmp/source.jsonl".into(),
+            archived: false,
+        };
+        let process = |provider, id: &str, pid| LiveSessionProcess {
+            provider,
+            id: id.into(),
+            pid,
+        };
+        let mut catalog = SessionCatalog {
+            sessions: vec![session.clone()],
+            ..SessionCatalog::default()
+        };
+        assert_eq!(catalog.resume_conflict(&session), None);
+        catalog.live_processes = vec![
+            process(SessionProvider::Claude, ID, 7),
+            process(
+                SessionProvider::Codex,
+                "22222222-2222-4222-8222-222222222222",
+                8,
+            ),
+        ];
+        assert_eq!(
+            catalog.resume_conflict(&session),
+            None,
+            "another provider or conversation is not a conflict"
+        );
+        catalog
+            .live_processes
+            .push(process(SessionProvider::Codex, ID, 4242));
+        let warning = catalog.resume_conflict(&session).unwrap();
+        assert!(warning.starts_with("Codex is already running this conversation (PID 4242)."));
+        for pid in [11, 4242, 12, 13, 14] {
+            catalog
+                .live_processes
+                .push(process(SessionProvider::Codex, ID, pid));
+        }
+        let warning = catalog.resume_conflict(&session).unwrap();
+        assert!(
+            warning.contains("(PIDs 11, 12, 13 and 2 more)"),
+            "{warning}"
+        );
     }
     #[test]
     fn scanner_starts_at_most_one_worker() {

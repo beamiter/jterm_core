@@ -310,6 +310,10 @@ pub struct AgentTask {
     pub status_detail: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Lifecycle state the task had when it was hidden, so restoring returns
+    /// it exactly there. Absent for visible tasks and older archived records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_from: Option<TaskStatus>,
 }
 
 impl AgentTask {
@@ -415,6 +419,9 @@ pub enum TaskError {
         status: TaskStatus,
     },
     CannotArchiveRunning(TaskId),
+    NotArchived(TaskId),
+    /// An older hidden record has no preserved state to return to.
+    ArchivedStateUnknown(TaskId),
 }
 
 impl fmt::Display for TaskError {
@@ -532,6 +539,11 @@ impl fmt::Display for TaskError {
             Self::CannotArchiveRunning(task_id) => {
                 write!(formatter, "cannot archive running task {task_id}")
             }
+            Self::NotArchived(task_id) => write!(formatter, "task {task_id} is not hidden"),
+            Self::ArchivedStateUnknown(task_id) => write!(
+                formatter,
+                "hidden task {task_id} has no recorded state to restore; create a new task for its worktree"
+            ),
         }
     }
 }
@@ -613,6 +625,7 @@ impl TaskManager {
             status_detail: None,
             created_at_ms: now,
             updated_at_ms: now,
+            archived_from: None,
         };
         self.task_indices.insert(id, self.tasks.len());
         self.tasks.push(task);
@@ -676,6 +689,20 @@ impl TaskManager {
         self.tasks
             .iter()
             .filter(|task| self.task_needs_attention(task.id))
+            .count()
+    }
+
+    /// The dashboard's five disjoint attention queues over every visible
+    /// task, for badges outside the task panel. Hidden tasks never count.
+    pub fn attention_counts(&self) -> super::DashboardAttentionCounts {
+        super::DashboardAttentionCounts::from_tasks(&self.tasks)
+    }
+
+    /// Number of hidden (archived) tasks that `restore` can bring back.
+    pub fn archived_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Archived)
             .count()
     }
 
@@ -1590,15 +1617,49 @@ impl TaskManager {
         Some(task_id)
     }
 
+    /// Whether `archive` would succeed now, without changing anything. UIs
+    /// use this to disable Hide with an explanation instead of offering an
+    /// action the manager will refuse. Execution still rechecks every gate.
+    pub fn can_archive(&self, task_id: TaskId) -> Result<(), TaskError> {
+        let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
+        if self.native_event_streams.contains_key(&task_id)
+            || task.status.is_running()
+            || task.validation.status == TaskValidationStatus::Running
+        {
+            return Err(TaskError::CannotArchiveRunning(task_id));
+        }
+        Ok(())
+    }
+
+    /// Hide a finished or idle task. Its worktree and evidence are untouched,
+    /// and `restore` returns it to the state recorded here. Hiding an already
+    /// hidden task changes nothing.
     pub fn archive(&mut self, task_id: TaskId) -> Result<(), TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
-            return Err(TaskError::CannotArchiveRunning(task_id));
-        }
+        self.can_archive(task_id)?;
         let task = self.task_mut(task_id)?;
-        if task.status.is_running() || task.validation.status == TaskValidationStatus::Running {
-            return Err(TaskError::CannotArchiveRunning(task_id));
+        if task.status == TaskStatus::Archived {
+            return Ok(());
         }
+        task.archived_from = Some(task.status);
         task.status = TaskStatus::Archived;
+        task.updated_at_ms = unix_time_ms();
+        Ok(())
+    }
+
+    /// Return a hidden task to the lifecycle state it had when hidden.
+    /// Restoring never starts an Agent, reruns validation or accepts work;
+    /// the validation record, exit facts and worktree are unchanged.
+    pub fn restore(&mut self, task_id: TaskId) -> Result<(), TaskError> {
+        let task = self.task_mut(task_id)?;
+        if task.status != TaskStatus::Archived {
+            return Err(TaskError::NotArchived(task_id));
+        }
+        let previous = task
+            .archived_from
+            .filter(|status| *status != TaskStatus::Archived)
+            .ok_or(TaskError::ArchivedStateUnknown(task_id))?;
+        task.status = previous;
+        task.archived_from = None;
         task.updated_at_ms = unix_time_ms();
         Ok(())
     }
@@ -2542,6 +2603,84 @@ mod tests {
         manager.handle_terminal_session_exit("active-session", Some(0));
         manager.archive(id).unwrap();
         assert_eq!(manager.get(id).unwrap().status, TaskStatus::Archived);
+    }
+
+    #[test]
+    fn hidden_tasks_restore_exactly_and_archive_eligibility_is_checkable() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("reversible archive")).unwrap();
+        assert_eq!(manager.can_archive(id), Ok(()));
+        manager
+            .bind_terminal_session(id, "reversible-session".to_string())
+            .unwrap();
+        assert_eq!(
+            manager.can_archive(id),
+            Err(TaskError::CannotArchiveRunning(id)),
+            "a running task cannot be hidden"
+        );
+        manager.handle_terminal_session_exit("reversible-session", Some(0));
+        manager
+            .update_status(id, TaskStatus::ReadyForReview, None)
+            .ok();
+        let before = manager.get(id).unwrap().clone();
+        assert_eq!(manager.archived_count(), 0);
+        manager.archive(id).unwrap();
+        let hidden = manager.get(id).unwrap().clone();
+        assert_eq!(hidden.status, TaskStatus::Archived);
+        assert_eq!(hidden.archived_from, Some(before.status));
+        assert_eq!(manager.archived_count(), 1);
+        assert_eq!(manager.attention_count(), 0, "hidden tasks never need you");
+
+        // Hiding twice is a no-op and keeps the original state to restore.
+        manager.archive(id).unwrap();
+        assert_eq!(manager.get(id).unwrap(), &hidden);
+
+        manager.restore(id).unwrap();
+        let restored = manager.get(id).unwrap();
+        assert_eq!(restored.status, before.status);
+        assert_eq!(restored.archived_from, None);
+        assert_eq!(restored.validation, before.validation);
+        assert_eq!(restored.exit_code, before.exit_code);
+        assert_eq!(restored.terminal_session_id, before.terminal_session_id);
+        assert_eq!(manager.archived_count(), 0);
+        assert_eq!(manager.restore(id), Err(TaskError::NotArchived(id)));
+
+        // An older hidden record without a preserved state is not guessed.
+        manager.archive(id).unwrap();
+        manager.task_mut(id).unwrap().archived_from = None;
+        assert_eq!(
+            manager.restore(id),
+            Err(TaskError::ArchivedStateUnknown(id))
+        );
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Archived);
+        let unknown = TaskId::new();
+        assert_eq!(
+            manager.can_archive(unknown),
+            Err(TaskError::UnknownTask(unknown))
+        );
+        assert_eq!(
+            manager.restore(unknown),
+            Err(TaskError::UnknownTask(unknown))
+        );
+    }
+
+    #[test]
+    fn archived_from_round_trips_and_older_records_deserialize() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("serialized archive")).unwrap();
+        manager.archive(id).unwrap();
+        let task = manager.get(id).unwrap().clone();
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["archived_from"], "created");
+        let decoded: AgentTask = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded, task);
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("archived_from");
+        let decoded: AgentTask = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.archived_from, None);
+        let visible = manager.create(new_task("visible")).unwrap();
+        let json = serde_json::to_value(manager.get(visible).unwrap()).unwrap();
+        assert!(json.get("archived_from").is_none());
     }
 
     #[test]

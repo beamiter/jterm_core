@@ -13,6 +13,9 @@ const MAX_TERMS: usize = 32;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DashboardQuery {
     terms: Vec<Term>,
+    /// Whether any term compares displayed text. Enumerated constraints such
+    /// as `status:` or `provider:` never need lowercase copies of a row.
+    needs_text: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,45 +167,33 @@ impl DashboardQuery {
                 negated: token.negated,
             });
         }
-        Ok(Self { terms })
+        let needs_text = terms.iter().any(|term| {
+            matches!(
+                term.field,
+                Field::Text | Field::Title | Field::Project | Field::Branch | Field::Id
+            )
+        });
+        Ok(Self { terms, needs_text })
     }
 
     pub fn matches(&self, row: &DashboardRow) -> bool {
         if self.terms.is_empty() {
             return true;
         }
-        // Normalize displayed fields once per row, rather than once per term.
-        let title = row.title.to_lowercase();
-        let project = row.repo_label.to_lowercase();
-        let branch = row.branch.to_lowercase();
-        let id = row.id.to_string();
-        let detail = row
-            .status_detail
-            .as_deref()
-            .unwrap_or_default()
-            .to_lowercase();
-        let provider_label = row.provider.display_name().to_lowercase();
-        let state = row.status.label().to_lowercase();
-        let runtime_label = row.runtime_kind.label().to_lowercase();
-        let validation_label = row.validation_status.label().to_lowercase();
-        let text_fields = [
-            &title,
-            &project,
-            &branch,
-            &id,
-            &detail,
-            &provider_label,
-            &state,
-            &runtime_label,
-            &validation_label,
-        ];
+        // Normalize displayed fields once per row, rather than once per term,
+        // and only when a term actually compares displayed text.
+        let text = self.needs_text.then(|| RowText::new(row));
+        let text = || {
+            text.as_ref()
+                .expect("text fields are prepared for text terms")
+        };
         self.terms.iter().all(|term| {
             let matched = term.values.iter().any(|value| match term.field {
-                Field::Text => text_fields.iter().any(|field| field.contains(value)),
-                Field::Title => title.contains(value),
-                Field::Project => project.contains(value),
-                Field::Branch => branch.contains(value),
-                Field::Id => id.contains(value),
+                Field::Text => text().fields().any(|field| field.contains(value.as_str())),
+                Field::Title => text().title.contains(value.as_str()),
+                Field::Project => text().project.contains(value.as_str()),
+                Field::Branch => text().branch.contains(value.as_str()),
+                Field::Id => text().id.contains(value.as_str()),
                 Field::Provider => provider(value) == Some(row.provider),
                 Field::Status => status(value) == Some(row.status),
                 Field::Runtime => runtime(value) == Some(row.runtime_kind),
@@ -228,6 +219,55 @@ impl DashboardQuery {
             });
             matched != term.negated
         })
+    }
+}
+
+/// Lowercase displayed text of one row, built at most once per match.
+struct RowText {
+    title: String,
+    project: String,
+    branch: String,
+    id: String,
+    detail: String,
+    provider: String,
+    state: String,
+    runtime: String,
+    validation: String,
+}
+
+impl RowText {
+    fn new(row: &DashboardRow) -> Self {
+        Self {
+            title: row.title.to_lowercase(),
+            project: row.repo_label.to_lowercase(),
+            branch: row.branch.to_lowercase(),
+            id: row.id.to_string(),
+            detail: row
+                .status_detail
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase(),
+            provider: row.provider.display_name().to_lowercase(),
+            state: row.status.label().to_lowercase(),
+            runtime: row.runtime_kind.label().to_lowercase(),
+            validation: row.validation_status.label().to_lowercase(),
+        }
+    }
+
+    fn fields(&self) -> impl Iterator<Item = &str> {
+        [
+            &self.title,
+            &self.project,
+            &self.branch,
+            &self.id,
+            &self.detail,
+            &self.provider,
+            &self.state,
+            &self.runtime,
+            &self.validation,
+        ]
+        .into_iter()
+        .map(String::as_str)
     }
 }
 

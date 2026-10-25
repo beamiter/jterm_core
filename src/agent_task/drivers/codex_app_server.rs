@@ -5,6 +5,7 @@
 //! the descriptor-pinned workspace capability, and the child process through
 //! final process-group termination and reap.
 
+use super::view_cell::ViewCell;
 use crate::agent_task::driver::{
     agent_event_channel, AgentCancellation, AgentCommand, AgentDriver, AgentDriverError,
     AgentEventReceiveError, AgentEventReceiver, AgentEventSendError, AgentEventSender,
@@ -178,10 +179,39 @@ pub enum CodexAppServerPhase {
     Failed,
 }
 
+impl CodexAppServerPhase {
+    /// Human-readable phase for native task views; never an action gate.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Created => "Not started",
+            Self::Spawning => "Starting the provider",
+            Self::Initializing => "Initializing",
+            Self::StartingThread => "Opening the session",
+            Self::StartingTurn => "Starting a turn",
+            Self::Ready => "Waiting for your next step",
+            Self::Running => "Working",
+            Self::WaitingForApproval => "Waiting for approval",
+            Self::Cancelling => "Cancelling",
+            Self::Stopping => "Stopping",
+            Self::Ended => "Ended",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodexAppServerApprovalKind {
     Command,
     FileChange,
+}
+
+impl CodexAppServerApprovalKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Command => "Command",
+            Self::FileChange => "File change",
+        }
+    }
 }
 
 /// Bounded, display-safe approval information. The JSON-RPC request ID stays
@@ -351,6 +381,22 @@ pub enum CodexAppServerExitCause {
     WorkerPanicked,
 }
 
+impl CodexAppServerExitCause {
+    /// Human-readable reason a native session ended.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Clean => "Finished",
+            Self::Cancelled => "Cancelled",
+            Self::SpawnFailed => "Provider could not start",
+            Self::ProtocolFailed => "Provider protocol error",
+            Self::IoFailed => "Provider connection error",
+            Self::ProviderFailed => "Provider reported a failure",
+            Self::EventDeliveryFailed => "Task updates could not be delivered",
+            Self::WorkerPanicked => "Native worker stopped unexpectedly",
+        }
+    }
+}
+
 /// Process status is recorded only after `wait`/`try_wait` reaped the leader.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodexAppServerProcessExit {
@@ -390,7 +436,7 @@ pub struct CodexAppServerDriver {
     event_sender: Option<AgentEventSender>,
     event_receiver: AgentEventReceiver,
     cancellation: AgentCancellation,
-    view: Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: Arc<ViewCell>,
     exit_report: Arc<Mutex<Option<CodexAppServerExitReport>>>,
     worker: Option<JoinHandle<()>>,
     started: bool,
@@ -414,7 +460,7 @@ impl CodexAppServerDriver {
             event_sender: Some(event_sender),
             event_receiver,
             cancellation: AgentCancellation::new(),
-            view: Arc::new(Mutex::new(CodexAppServerViewSnapshot::default())),
+            view: Arc::new(ViewCell::new(CodexAppServerViewSnapshot::default())),
             exit_report: Arc::new(Mutex::new(None)),
             worker: None,
             started: false,
@@ -423,6 +469,17 @@ impl CodexAppServerDriver {
 
     pub fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
         self.view.lock().clone()
+    }
+
+    /// Process-unique identity of the current view content. It changes
+    /// whenever the worker mutates the view and never repeats across runs.
+    pub fn view_revision(&self) -> u64 {
+        self.view.revision()
+    }
+
+    /// The current view paired with its revision under one lock.
+    pub fn view_snapshot_with_revision(&self) -> (u64, CodexAppServerViewSnapshot) {
+        self.view.snapshot()
     }
 
     pub fn phase(&self) -> CodexAppServerPhase {
@@ -586,7 +643,7 @@ impl AgentDriver for CodexAppServerDriver {
 
 fn try_send_command(
     sender: &Sender<AgentCommand>,
-    view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: &Arc<ViewCell>,
     command: AgentCommand,
 ) -> Result<(), AgentDriverError> {
     let reservation = match &command {
@@ -919,7 +976,7 @@ struct WorkerContext {
     commands: Receiver<AgentCommand>,
     cancellation: AgentCancellation,
     sink: AgentEventSink,
-    view: Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: Arc<ViewCell>,
     process_snapshot: Arc<Mutex<CodexAppServerProcessExit>>,
 }
 
@@ -1994,7 +2051,7 @@ fn set_nonblocking(fd: i32) -> Result<(), WorkerFailure> {
 
 fn finish_without_child(
     sink: &AgentEventSink,
-    view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: &Arc<ViewCell>,
     process_snapshot: Arc<Mutex<CodexAppServerProcessExit>>,
     failure: WorkerFailure,
 ) -> CodexAppServerExitReport {
@@ -2009,7 +2066,7 @@ fn finish_without_child(
 
 fn finish_cancelled_without_child(
     sink: &AgentEventSink,
-    view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: &Arc<ViewCell>,
     process_snapshot: Arc<Mutex<CodexAppServerProcessExit>>,
     detail: impl Into<String>,
 ) -> CodexAppServerExitReport {
@@ -2024,7 +2081,7 @@ fn finish_cancelled_without_child(
 
 fn finish_report(
     sink: &AgentEventSink,
-    view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: &Arc<ViewCell>,
     process_snapshot: Arc<Mutex<CodexAppServerProcessExit>>,
     mut intent: TerminalIntent,
     stderr_tail: String,
@@ -2076,7 +2133,7 @@ struct ProtocolMachine {
     expected_tool_environment: BTreeMap<String, String>,
     credentials: Option<NativeCodexCredentials>,
     sink: AgentEventSink,
-    view: Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: Arc<ViewCell>,
     next_request_id: i64,
     pending_requests: HashMap<RpcId, PendingClientRequest>,
     provider_thread_id: Option<String>,
@@ -2106,7 +2163,7 @@ impl ProtocolMachine {
         authority: NativeProtocolAuthority,
         initial_prompt: Option<AgentPrompt>,
         sink: AgentEventSink,
-        view: Arc<Mutex<CodexAppServerViewSnapshot>>,
+        view: Arc<ViewCell>,
     ) -> Self {
         Self {
             wire_root,
@@ -4016,10 +4073,10 @@ mod tests {
         ProtocolMachine,
         WireWriteQueue,
         AgentEventReceiver,
-        Arc<Mutex<CodexAppServerViewSnapshot>>,
+        Arc<ViewCell>,
     ) {
         let (sender, receiver) = agent_event_channel();
-        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot::default()));
+        let view = Arc::new(ViewCell::new(CodexAppServerViewSnapshot::default()));
         let machine = ProtocolMachine::new(
             "/proc/self/fd/19".into(),
             "/proc/self/fd/19/nested".into(),
@@ -4135,7 +4192,7 @@ mod tests {
         ProtocolMachine,
         WireWriteQueue,
         AgentEventReceiver,
-        Arc<Mutex<CodexAppServerViewSnapshot>>,
+        Arc<ViewCell>,
         AgentTurnId,
     ) {
         let (mut machine, queue, receiver, view) = machine(None);
@@ -4158,7 +4215,7 @@ mod tests {
 
     fn archive_history_turn(
         machine: &mut ProtocolMachine,
-        view: &Arc<Mutex<CodexAppServerViewSnapshot>>,
+        view: &Arc<ViewCell>,
         ordinal: usize,
         follow_up_feedback: Option<String>,
         agent_text: String,
@@ -4719,7 +4776,7 @@ mod tests {
     #[test]
     fn idle_send_reservation_rejects_duplicate_prompt_and_finish_actions() {
         let (sender, receiver) = bounded(CODEX_APP_SERVER_COMMAND_CAPACITY);
-        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot {
+        let view = Arc::new(ViewCell::new(CodexAppServerViewSnapshot {
             phase: CodexAppServerPhase::Ready,
             ..CodexAppServerViewSnapshot::default()
         }));
@@ -4771,7 +4828,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot {
+        let view = Arc::new(ViewCell::new(CodexAppServerViewSnapshot {
             phase: CodexAppServerPhase::Ready,
             ..CodexAppServerViewSnapshot::default()
         }));
@@ -4789,7 +4846,7 @@ mod tests {
     #[test]
     fn live_turn_limit_never_evicts_an_old_provider_identity() {
         let (sender, receiver) = bounded(CODEX_APP_SERVER_COMMAND_CAPACITY);
-        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot {
+        let view = Arc::new(ViewCell::new(CodexAppServerViewSnapshot {
             phase: CodexAppServerPhase::Ready,
             completed_turns: CODEX_APP_SERVER_LIVE_TURN_MAX,
             ..CodexAppServerViewSnapshot::default()
@@ -5574,7 +5631,7 @@ mod tests {
             critical_reserve_bytes: 64 * 1024,
         };
         let (sender, _receiver) = agent_event_channel_with_limits(limits).unwrap();
-        let view = Arc::new(Mutex::new(CodexAppServerViewSnapshot::default()));
+        let view = Arc::new(ViewCell::new(CodexAppServerViewSnapshot::default()));
         let machine = ProtocolMachine::new(
             "/proc/self/fd/1".into(),
             "/proc/self/fd/1".into(),

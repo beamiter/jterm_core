@@ -137,6 +137,22 @@ impl NativeRunningDriver {
         }
     }
 
+    fn view_revision(&self) -> u64 {
+        match self {
+            Self::Codex(driver) => driver.view_revision(),
+            Self::Claude(driver) => driver.view_revision(),
+            Self::Kimi(driver) => driver.view_revision(),
+        }
+    }
+
+    fn view_snapshot_with_revision(&self) -> (u64, CodexAppServerViewSnapshot) {
+        match self {
+            Self::Codex(driver) => driver.view_snapshot_with_revision(),
+            Self::Claude(driver) => driver.view_snapshot_with_revision(),
+            Self::Kimi(driver) => driver.view_snapshot_with_revision(),
+        }
+    }
+
     fn phase(&self) -> CodexAppServerPhase {
         match self {
             Self::Codex(driver) => driver.phase(),
@@ -197,7 +213,9 @@ struct PreparationResult {
 }
 
 struct RetainedCodexAgent {
-    view: CodexAppServerViewSnapshot,
+    view: Arc<CodexAppServerViewSnapshot>,
+    /// Revision of the final live view; retained content never changes.
+    view_revision: u64,
     exit_report: Option<CodexAppServerExitReport>,
     effective_outcome: AgentSessionOutcome,
 }
@@ -223,6 +241,9 @@ pub struct AgentRuntimeManager {
     retained: HashMap<TaskId, RetainedCodexAgent>,
     next_preparation_generation: u64,
     next_poll_index: usize,
+    /// Latest shared live snapshot per task, keyed by view revision. Hosts
+    /// that render every frame reuse it until the provider view changes.
+    shared_snapshots: parking_lot::Mutex<HashMap<TaskId, (u64, Arc<CodexAppServerViewSnapshot>)>>,
 }
 
 #[derive(Debug)]
@@ -990,7 +1011,7 @@ impl AgentRuntimeManager {
                             .or_else(|| exit.detail.clone());
                         completion = Some((
                             runtime.stream.clone(),
-                            runtime.driver.view_snapshot(),
+                            runtime.driver.view_snapshot_with_revision(),
                             exit,
                             outcome,
                             detail,
@@ -999,7 +1020,8 @@ impl AgentRuntimeManager {
                 }
             }
 
-            let Some((stream, view, exit_report, outcome, detail)) = completion else {
+            let Some((stream, (view_revision, view), exit_report, outcome, detail)) = completion
+            else {
                 continue;
             };
             // The report proves the worker has stopped and its child either was
@@ -1028,7 +1050,8 @@ impl AgentRuntimeManager {
             self.retained.insert(
                 task_id,
                 RetainedCodexAgent {
-                    view,
+                    view: Arc::new(view),
+                    view_revision,
                     exit_report: Some(exit_report),
                     effective_outcome: outcome,
                 },
@@ -1173,8 +1196,52 @@ impl AgentRuntimeManager {
             .or_else(|| {
                 self.retained
                     .get(&task_id)
-                    .map(|retained| retained.view.clone())
+                    .map(|retained| retained.view.as_ref().clone())
             })
+    }
+
+    /// Process-unique identity of the view `snapshot` would return. It changes
+    /// whenever the provider view changes, never repeats for a later run, and
+    /// stays fixed for a retained final view. Reading it never clones content.
+    pub fn snapshot_revision(&self, task_id: TaskId) -> Option<u64> {
+        self.running
+            .get(&task_id)
+            .map(|runtime| runtime.driver.view_revision())
+            .or_else(|| {
+                self.retained
+                    .get(&task_id)
+                    .map(|retained| retained.view_revision)
+            })
+    }
+
+    /// The same view as `snapshot`, shared until the provider changes it.
+    /// Repeated calls for an unchanged view return the same allocation, so a
+    /// host can render every frame without copying assistant text, command
+    /// output and file diffs each time. The content is identical to `snapshot`.
+    pub fn shared_snapshot(&self, task_id: TaskId) -> Option<Arc<CodexAppServerViewSnapshot>> {
+        if let Some(retained) = self.retained.get(&task_id) {
+            if !self.running.contains_key(&task_id) {
+                self.shared_snapshots.lock().remove(&task_id);
+                return Some(retained.view.clone());
+            }
+        }
+        let Some(runtime) = self.running.get(&task_id) else {
+            self.shared_snapshots.lock().remove(&task_id);
+            return None;
+        };
+        let revision = runtime.driver.view_revision();
+        let mut shared = self.shared_snapshots.lock();
+        if let Some((cached, view)) = shared.get(&task_id) {
+            if *cached == revision {
+                return Some(view.clone());
+            }
+        }
+        let (revision, view) = runtime.driver.view_snapshot_with_revision();
+        let view = Arc::new(view);
+        // Bound the cache to live runtimes; finished ones use retained views.
+        shared.retain(|id, _| self.running.contains_key(id));
+        shared.insert(task_id, (revision, view.clone()));
+        Some(view)
     }
 
     pub fn exit_report(&self, task_id: TaskId) -> Option<&CodexAppServerExitReport> {
@@ -1218,12 +1285,18 @@ impl AgentRuntimeManager {
         !self.running.is_empty()
     }
 
-    /// True while a provider is starting, executing, waiting, or stopping.
-    /// A loaded thread parked at an idle review point needs only low-frequency
-    /// lifecycle polling until the user sends another turn or finishes it.
+    /// True while a provider is starting, executing or stopping. A loaded
+    /// thread parked at an idle review point, or one blocked on a pending
+    /// approval, produces nothing until the user responds; low-frequency
+    /// lifecycle polling observes those phases without a high-rate loop. The
+    /// host's own approval or follow-up action triggers an immediate poll.
     pub fn needs_fast_poll(&self) -> bool {
         self.running.values().any(|runtime| {
-            !runtime.worker_joined && runtime.driver.phase() != CodexAppServerPhase::Ready
+            !runtime.worker_joined
+                && !matches!(
+                    runtime.driver.phase(),
+                    CodexAppServerPhase::Ready | CodexAppServerPhase::WaitingForApproval
+                )
         })
     }
 
@@ -1235,6 +1308,7 @@ impl AgentRuntimeManager {
 
     pub fn clear_retained(&mut self, task_id: TaskId) {
         self.retained.remove(&task_id);
+        self.shared_snapshots.lock().remove(&task_id);
     }
 }
 
@@ -1516,6 +1590,68 @@ mod tests {
     }
 
     #[test]
+    fn approval_waits_poll_slowly_and_unchanged_views_are_shared_without_copying() {
+        let (mut tasks, task_id) = task_manager();
+        let stream = tasks.start_agent_event_stream(task_id).unwrap();
+        let task = tasks.get(task_id).unwrap();
+        // Never started: no worker, provider or credential is involved.
+        let driver =
+            ClaudeStreamJsonDriver::new(vec!["/bin/true".into()], task.worktree_path.clone());
+        let mut runtime = AgentRuntimeManager::new();
+        runtime.running.insert(
+            task_id,
+            RunningCodexAgent {
+                driver: NativeRunningDriver::Claude(driver),
+                retained_workspace: None,
+                stream,
+                worker_joined: false,
+                forced_failure: None,
+                exit_report: None,
+                pending_prompt: None,
+                finish_requested: false,
+            },
+        );
+        let change = |runtime: &AgentRuntimeManager,
+                      edit: &dyn Fn(&mut CodexAppServerViewSnapshot)| {
+            match &runtime.running[&task_id].driver {
+                NativeRunningDriver::Claude(driver) => driver.mutate_view_for_test(edit),
+                _ => unreachable!("fixture uses the print-stream driver"),
+            }
+        };
+        for (phase, fast) in [
+            (CodexAppServerPhase::Running, true),
+            (CodexAppServerPhase::WaitingForApproval, false),
+            (CodexAppServerPhase::Ready, false),
+            (CodexAppServerPhase::Stopping, true),
+            (CodexAppServerPhase::Cancelling, true),
+        ] {
+            change(&runtime, &|view| view.phase = phase);
+            assert_eq!(runtime.needs_fast_poll(), fast, "{phase:?}");
+        }
+
+        let first = runtime.shared_snapshot(task_id).unwrap();
+        let again = runtime.shared_snapshot(task_id).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "an unchanged view is shared");
+        assert_eq!(*first, runtime.snapshot(task_id).unwrap());
+        let revision = runtime.snapshot_revision(task_id).unwrap();
+        assert_eq!(runtime.snapshot_revision(task_id), Some(revision));
+        change(&runtime, &|view| view.agent_text.push_str("delta"));
+        assert_ne!(runtime.snapshot_revision(task_id), Some(revision));
+        let changed = runtime.shared_snapshot(task_id).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.agent_text, "delta");
+        assert_eq!(first.agent_text, "", "an earlier shared view never changes");
+        assert_eq!(*changed, runtime.snapshot(task_id).unwrap());
+
+        let unknown = TaskId::new();
+        assert!(runtime.shared_snapshot(unknown).is_none());
+        assert!(runtime.snapshot_revision(unknown).is_none());
+        runtime.running.remove(&task_id);
+        assert!(runtime.shared_snapshot(task_id).is_none());
+        assert!(runtime.shared_snapshots.lock().is_empty());
+    }
+
+    #[test]
     fn unconfirmed_cleanup_is_reported_once_and_stays_locked_without_fast_polling() {
         use crate::agent_task::CodexAppServerProcessExit;
 
@@ -1626,7 +1762,8 @@ mod tests {
     fn terminal_continuation_requires_a_stopped_unsuccessful_effective_outcome() {
         let task_id = TaskId::new();
         let retained = |effective_outcome, process| RetainedCodexAgent {
-            view: CodexAppServerViewSnapshot::default(),
+            view: Arc::new(CodexAppServerViewSnapshot::default()),
+            view_revision: 0,
             exit_report: Some(CodexAppServerExitReport {
                 // A runtime-forced failure may override a raw clean provider
                 // report, so eligibility intentionally uses the retained

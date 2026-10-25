@@ -264,6 +264,22 @@ impl ClaudeStreamJsonDriver {
         self.0.view_snapshot()
     }
 
+    pub fn view_revision(&self) -> u64 {
+        self.0.view_revision()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutate_view_for_test(
+        &self,
+        change: impl FnOnce(&mut CodexAppServerViewSnapshot),
+    ) {
+        self.0.mutate_view_for_test(change);
+    }
+
+    pub fn view_snapshot_with_revision(&self) -> (u64, CodexAppServerViewSnapshot) {
+        self.0.view_snapshot_with_revision()
+    }
+
     pub fn phase(&self) -> CodexAppServerPhase {
         self.0.phase()
     }

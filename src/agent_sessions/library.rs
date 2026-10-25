@@ -105,6 +105,35 @@ fn unsafe_label(text: &str) -> bool {
     text.chars().any(char::is_control) || crate::review_input::contains_visual_spoofing(text)
 }
 
+/// Validate a name/tags editor exactly as `SessionLibraryStore::set_details`
+/// will, without queueing a write. Hosts can show the explanation while the
+/// user types instead of discovering a byte limit only after Save.
+pub fn validate_session_details(alias: &str, tags: &str) -> Result<(), String> {
+    editor_details(alias, tags).map(|_| ())
+}
+
+fn editor_details(alias: &str, tags: &str) -> Result<SessionOrganization, String> {
+    // Bound input before splitting or allocating user-controlled strings.
+    // Editors render saved tags with `join(", ")`, so the raw budget must
+    // include both delimiter bytes even when all 12 tags fill their limit.
+    if alias.len() > SESSION_ALIAS_MAX_BYTES
+        || tags.len() > (SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT
+        || unsafe_label(tags)
+    {
+        return Err("Session name or tags exceed the editor limits.".into());
+    }
+    SessionOrganization {
+        alias: Some(alias.into()),
+        tags: if tags.trim().is_empty() {
+            Vec::new()
+        } else {
+            tags.split(',').map(str::to_owned).collect()
+        },
+        archived: false,
+    }
+    .normalized()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionLibraryEntry {
     pub provider: SessionProvider,
@@ -228,8 +257,80 @@ impl SessionLibrarySnapshot {
     pub fn iter(&self) -> impl Iterator<Item = &SessionLibraryEntry> {
         self.entries.values()
     }
+    /// Every library fact for one conversation from a single identity
+    /// lookup. Row renderers should prefer this to separate pin, archive,
+    /// alias, tag and resume queries, which each rebuild the identity key.
+    pub fn facts(&self, provider: SessionProvider, id: &str) -> SessionLibraryFacts<'_> {
+        let identity = key(provider, id);
+        let entry = self.entries.get(&identity);
+        let organization = self.organization.get(&identity);
+        SessionLibraryFacts {
+            pinned: entry.is_some_and(|entry| entry.pinned),
+            last_resumed_ms: entry.and_then(|entry| entry.last_resumed_ms),
+            archived: organization.is_some_and(|organization| organization.archived),
+            alias: organization.and_then(|organization| organization.alias.as_deref()),
+            tags: organization.map_or(&[], |organization| organization.tags.as_slice()),
+        }
+    }
+    /// Resolve library facts for identities prepared by [`key`] and supplied
+    /// in ascending key order. One linear merge with both ordered maps
+    /// replaces a tree lookup per pin, archive, alias and tag question.
+    /// Repeated identities receive the same facts.
+    pub(super) fn resolve_sorted<'a, 'k>(
+        &'a self,
+        sorted: impl Iterator<Item = (usize, &'k str)>,
+        facts: &mut [SessionLibraryFacts<'a>],
+    ) {
+        let mut entries = self.entries.iter().peekable();
+        let mut organization = self.organization.iter().peekable();
+        for (index, identity) in sorted {
+            while entries
+                .next_if(|(key, _)| key.as_str() < identity)
+                .is_some()
+            {}
+            if let Some(&(key, entry)) = entries.peek() {
+                if key == identity {
+                    facts[index].pinned = entry.pinned;
+                    facts[index].last_resumed_ms = entry.last_resumed_ms;
+                }
+            }
+            while organization
+                .next_if(|(key, _)| key.as_str() < identity)
+                .is_some()
+            {}
+            if let Some(&(key, details)) = organization.peek() {
+                if key == identity {
+                    facts[index].archived = details.archived;
+                    facts[index].alias = details.alias.as_deref();
+                    facts[index].tags = details.tags.as_slice();
+                }
+            }
+        }
+    }
 }
-fn key(provider: SessionProvider, id: &str) -> String {
+
+/// Borrowed personal organization for one conversation identity. These are
+/// presentation facts; none of them launches, resumes or stops a provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionLibraryFacts<'a> {
+    pub pinned: bool,
+    /// Most recent launch/switch receipt, never proof of a completed turn.
+    pub last_resumed_ms: Option<u64>,
+    /// Local archive, independent of the provider's archived store.
+    pub archived: bool,
+    pub alias: Option<&'a str>,
+    pub tags: &'a [String],
+}
+
+impl<'a> SessionLibraryFacts<'a> {
+    /// The local name when one is saved, otherwise the provider title.
+    pub fn display_title(&self, fallback: &'a str) -> &'a str {
+        self.alias.unwrap_or(fallback)
+    }
+}
+
+/// Stable library identity: provider label plus the ASCII-lowercased UUID.
+pub(super) fn key(provider: SessionProvider, id: &str) -> String {
     format!("{}:{}", provider.label(), id.to_ascii_lowercase())
 }
 
@@ -248,8 +349,43 @@ struct WorkerState {
     pending: BTreeMap<String, Change>,
     refresh: bool,
     working: bool,
+    /// The in-flight transaction carries user changes, not only a reload.
+    writing: bool,
     closed: bool,
-    latest: Option<Result<SessionLibrarySnapshot, String>>,
+    /// Newest snapshot read or written since the UI last polled.
+    latest: Option<SessionLibrarySnapshot>,
+    /// Newest unacknowledged failure. A failed write is kept until the UI
+    /// polls or a later write succeeds; a read-only reload cannot hide it.
+    failure: Option<WorkerFailure>,
+    /// A write transaction finished since the UI last polled.
+    wrote: bool,
+}
+struct WorkerFailure {
+    message: String,
+    write: bool,
+}
+impl WorkerState {
+    fn has_result(&self) -> bool {
+        self.latest.is_some() || self.failure.is_some()
+    }
+    fn finish(&mut self, write: bool, result: Result<SessionLibrarySnapshot, String>) {
+        self.working = false;
+        self.writing = false;
+        self.wrote |= write;
+        match result {
+            Ok(snapshot) => {
+                self.latest = Some(snapshot);
+                if write || self.failure.as_ref().is_some_and(|failure| !failure.write) {
+                    self.failure = None;
+                }
+            }
+            Err(message) => {
+                if write || !self.failure.as_ref().is_some_and(|failure| failure.write) {
+                    self.failure = Some(WorkerFailure { message, write });
+                }
+            }
+        }
+    }
 }
 #[derive(Clone)]
 struct Change {
@@ -304,8 +440,10 @@ impl SessionLibraryStore {
                             }
                             state.working = true;
                             state.refresh = false;
+                            state.writing = !state.pending.is_empty();
                             std::mem::take(&mut state.pending)
                         };
+                        let write = !job.is_empty();
                         let result = std::panic::catch_unwind(|| transaction(&path, &job))
                             .unwrap_or_else(|_| {
                                 Err(
@@ -314,8 +452,7 @@ impl SessionLibraryStore {
                                 )
                             });
                         let Ok(mut state) = shared.lock() else { return };
-                        state.working = false;
-                        state.latest = Some(result);
+                        state.finish(write, result);
                     }
                 }
             })
@@ -353,14 +490,23 @@ impl SessionLibraryStore {
     pub fn is_loaded(&self) -> bool {
         self.loaded
     }
+    /// Any queued, running or unacknowledged worker result, including the
+    /// periodic read-only reload that observes other terminal windows.
     pub fn is_busy(&self) -> bool {
         self.available
             && self.state.lock().is_ok_and(|state| {
-                state.working
-                    || state.refresh
-                    || !state.pending.is_empty()
-                    || state.latest.is_some()
+                state.working || state.refresh || !state.pending.is_empty() || state.has_result()
             })
+    }
+    /// User changes are queued, being written, or finished without having
+    /// been acknowledged by `poll`. A read-only reload never counts, so
+    /// hosts can show "Saving" and gate editing without a periodic flicker.
+    pub fn is_saving(&self) -> bool {
+        self.available
+            && self
+                .state
+                .lock()
+                .is_ok_and(|state| state.writing || !state.pending.is_empty() || state.wrote)
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -368,27 +514,25 @@ impl SessionLibraryStore {
     /// Apply the newest worker result. Snapshot/error changes both trigger a
     /// repaint; writes progress even if the UI does not call this method.
     pub fn poll(&mut self) -> bool {
-        let result = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|mut state| state.latest.take());
-        let Some(result) = result else { return false };
+        let Some((snapshot, failure)) = self.state.lock().ok().and_then(|mut state| {
+            state.has_result().then(|| {
+                state.wrote = false;
+                (state.latest.take(), state.failure.take())
+            })
+        }) else {
+            return false;
+        };
         let was_loaded = self.loaded;
-        let old_error = self.error.clone();
+        let old_error = self.error.take();
         self.loaded = true;
-        match result {
-            Ok(snapshot) => {
-                let changed = self.snapshot != snapshot;
-                self.snapshot = snapshot;
-                self.error = None;
-                changed || !was_loaded || old_error.is_some()
-            }
-            Err(error) => {
-                self.error = Some(error);
-                !was_loaded || self.error != old_error
-            }
+        let mut changed = !was_loaded;
+        if let Some(snapshot) = snapshot {
+            changed |= self.snapshot != snapshot;
+            self.snapshot = snapshot;
         }
+        // A result without a failure is a success and clears the old error.
+        self.error = failure.map(|failure| failure.message);
+        changed || self.error != old_error
     }
     pub fn refresh(&mut self) -> bool {
         if !self.available {
@@ -422,25 +566,7 @@ impl SessionLibraryStore {
         alias: &str,
         tags: &str,
     ) -> Result<(), String> {
-        // Bound input before splitting or allocating user-controlled strings.
-        // Editors render saved tags with `join(", ")`, so the raw budget must
-        // include both delimiter bytes even when all 12 tags fill their limit.
-        if alias.len() > SESSION_ALIAS_MAX_BYTES
-            || tags.len() > (SESSION_TAG_MAX_BYTES + 2) * SESSION_TAG_LIMIT
-            || unsafe_label(tags)
-        {
-            return Err("Session name or tags exceed the editor limits.".into());
-        }
-        let organization = SessionOrganization {
-            alias: Some(alias.into()),
-            tags: if tags.trim().is_empty() {
-                Vec::new()
-            } else {
-                tags.split(',').map(str::to_owned).collect()
-            },
-            archived: false,
-        }
-        .normalized()?;
+        let organization = editor_details(alias, tags)?;
         self.enqueue(
             provider,
             id,
@@ -1565,7 +1691,7 @@ mod tests {
             let mut store = SessionLibraryStore::with_path(f.path());
             let start = Instant::now();
             loop {
-                if store.state.lock().unwrap().latest.is_some() {
+                if store.state.lock().unwrap().has_result() {
                     break;
                 }
                 assert!(start.elapsed() < Duration::from_secs(3));
@@ -1576,5 +1702,211 @@ mod tests {
             assert!(!store.is_busy());
             assert_eq!(store.error().is_some(), corrupt);
         }
+    }
+
+    /// Wait for the worker to finish everything queued, without polling.
+    fn wait_for_unacknowledged_result(store: &SessionLibraryStore) {
+        let start = Instant::now();
+        loop {
+            {
+                let state = store.state.lock().unwrap();
+                if !state.working
+                    && !state.refresh
+                    && state.pending.is_empty()
+                    && state.has_result()
+                {
+                    return;
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "library worker did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn row_facts_match_individual_queries_for_every_identity_shape() {
+        let library = SessionLibrarySnapshot::from_entries(vec![SessionLibraryEntry {
+            provider: SessionProvider::Codex,
+            id: ID.to_uppercase(),
+            pinned: true,
+            last_resumed_ms: Some(7),
+        }])
+        .unwrap()
+        .with_organization(
+            SessionProvider::Claude,
+            OTHER,
+            SessionOrganization {
+                alias: Some("Named".into()),
+                tags: vec!["b".into(), "a".into()],
+                archived: true,
+            },
+        )
+        .unwrap();
+        let upper = ID.to_uppercase();
+        for (provider, id) in [
+            (SessionProvider::Codex, ID),
+            (SessionProvider::Codex, upper.as_str()),
+            (SessionProvider::Claude, OTHER),
+            (SessionProvider::Claude, ID),
+            (SessionProvider::Codex, OTHER),
+        ] {
+            let facts = library.facts(provider, id);
+            assert_eq!(facts.pinned, library.is_pinned(provider, id));
+            assert_eq!(facts.last_resumed_ms, library.last_resumed(provider, id));
+            assert_eq!(facts.archived, library.is_archived(provider, id));
+            assert_eq!(facts.alias, library.alias(provider, id));
+            assert_eq!(facts.tags, library.tags(provider, id));
+            assert_eq!(
+                facts.display_title("Provider title"),
+                library.display_title(provider, id, "Provider title")
+            );
+        }
+        let named = library.facts(SessionProvider::Claude, OTHER);
+        assert_eq!(
+            (named.alias, named.tags, named.archived),
+            (Some("Named"), &["a".to_string(), "b".to_string()][..], true)
+        );
+        assert_eq!(
+            library.facts(SessionProvider::Codex, OTHER),
+            SessionLibraryFacts::default()
+        );
+    }
+
+    #[test]
+    fn periodic_reload_is_never_reported_as_saving() {
+        let fixture = Fixture::new();
+        let mut store = SessionLibraryStore::with_path(fixture.path());
+        settle(&mut store);
+        assert!(!store.is_saving());
+        assert!(store.refresh());
+        assert!(store.is_busy());
+        assert!(!store.is_saving(), "a read-only reload is not a save");
+        wait_for_unacknowledged_result(&store);
+        assert!(!store.is_saving());
+        assert!(
+            store.is_busy(),
+            "an unacknowledged reload still awaits poll"
+        );
+        store.poll();
+        assert!(!store.is_busy());
+
+        store.set_pinned(SessionProvider::Codex, ID, true).unwrap();
+        assert!(store.is_saving());
+        wait_for_unacknowledged_result(&store);
+        assert!(
+            store.is_saving(),
+            "a finished write stays visible until poll acknowledges it"
+        );
+        assert!(store.poll());
+        assert!(!store.is_saving());
+        assert!(store.error().is_none());
+        assert!(store.snapshot().is_pinned(SessionProvider::Codex, ID));
+    }
+
+    #[test]
+    fn a_reload_cannot_hide_a_failed_write_before_the_ui_polls() {
+        let fixture = Fixture::new();
+        let mut store = SessionLibraryStore::with_path(fixture.path());
+        settle(&mut store);
+        let tags = (0..SESSION_TAG_LIMIT)
+            .map(|i| format!("tag{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        store
+            .set_details(SessionProvider::Codex, ID, "Full", &tags)
+            .unwrap();
+        settle(&mut store);
+        store
+            .apply_batch(
+                &[(SessionProvider::Codex, ID.into())],
+                SessionBatchAction::AddTag("overflow".into()),
+            )
+            .unwrap();
+        wait_for_unacknowledged_result(&store);
+        assert!(
+            store.is_saving(),
+            "the failed write is not yet acknowledged"
+        );
+        assert!(
+            store.refresh(),
+            "another window's reload may run before poll"
+        );
+        wait_for_unacknowledged_result(&store);
+        assert!(store.poll());
+        assert!(
+            store.error().is_some(),
+            "the failed write must remain visible after the successful reload"
+        );
+        assert!(!store.is_saving());
+        assert_eq!(
+            store.snapshot().tags(SessionProvider::Codex, ID).len(),
+            SESSION_TAG_LIMIT
+        );
+
+        // A later reload failure cannot replace an unacknowledged write
+        // failure either; a later successful write clears it.
+        store
+            .apply_batch(
+                &[(SessionProvider::Codex, ID.into())],
+                SessionBatchAction::AddTag("overflow".into()),
+            )
+            .unwrap();
+        wait_for_unacknowledged_result(&store);
+        let write_failure = store
+            .state
+            .lock()
+            .unwrap()
+            .failure
+            .as_ref()
+            .map(|f| f.message.clone());
+        store
+            .state
+            .lock()
+            .unwrap()
+            .finish(false, Err("reload failed".into()));
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .failure
+                .as_ref()
+                .map(|f| f.message.clone()),
+            write_failure
+        );
+        store.set_pinned(SessionProvider::Codex, ID, true).unwrap();
+        settle(&mut store);
+        assert!(store.error().is_none());
+        assert!(store.snapshot().is_pinned(SessionProvider::Codex, ID));
+    }
+
+    #[test]
+    fn editor_validation_matches_save_admission() {
+        let fixture = Fixture::new();
+        let mut store = SessionLibraryStore::with_path(fixture.path());
+        settle(&mut store);
+        let long_alias = "名".repeat(SESSION_ALIAS_MAX_BYTES / 3 + 1);
+        let too_many = (0..=SESSION_TAG_LIMIT)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let long_tag = "t".repeat(SESSION_TAG_MAX_BYTES + 1);
+        for (alias, tags) in [
+            ("Renderer", "gui, review"),
+            ("", ""),
+            (long_alias.as_str(), ""),
+            ("Name", too_many.as_str()),
+            ("Name", long_tag.as_str()),
+            ("Name", "bad\u{202e}tag"),
+            ("Name\u{7}", "a"),
+        ] {
+            let validated = validate_session_details(alias, tags);
+            let saved = store.set_details(SessionProvider::Codex, ID, alias, tags);
+            assert_eq!(validated, saved, "{alias:?} {tags:?}");
+        }
+        settle(&mut store);
     }
 }

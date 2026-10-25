@@ -5,6 +5,7 @@ pub mod codex_app_server;
 pub mod fake;
 pub mod kimi_stream_json;
 mod print_stream;
+mod view_cell;
 
 pub use claude_stream_json::{
     claude_print_argv, parse_stream_json_line, ClaudeStreamJsonDriver, ClaudeStreamSignal,

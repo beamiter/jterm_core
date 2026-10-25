@@ -19,6 +19,7 @@
 //! observed empty after SIGKILL. A descendant that deliberately left the group
 //! (`setsid`/`setpgid`) is outside what this MVP can see or verify.
 
+use super::view_cell::ViewCell;
 use crate::agent_task::driver::{
     agent_event_channel, AgentCancellation, AgentCommand, AgentDriverError, AgentEventReceiveError,
     AgentEventReceiver, AgentEventSender, AgentEventSink, AgentStartRequest,
@@ -138,7 +139,7 @@ pub(super) struct PrintStreamDriver {
     event_sender: Option<AgentEventSender>,
     event_receiver: AgentEventReceiver,
     cancellation: AgentCancellation,
-    view: Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: Arc<ViewCell>,
     exit_report: Arc<Mutex<Option<CodexAppServerExitReport>>>,
     worker: Option<JoinHandle<()>>,
     started: bool,
@@ -161,7 +162,7 @@ impl PrintStreamDriver {
             event_sender: Some(event_sender),
             event_receiver,
             cancellation: AgentCancellation::new(),
-            view: Arc::new(Mutex::new(CodexAppServerViewSnapshot {
+            view: Arc::new(ViewCell::new(CodexAppServerViewSnapshot {
                 phase: CodexAppServerPhase::Created,
                 ..CodexAppServerViewSnapshot::default()
             })),
@@ -173,6 +174,22 @@ impl PrintStreamDriver {
 
     pub fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
         self.view.lock().clone()
+    }
+
+    pub fn view_revision(&self) -> u64 {
+        self.view.revision()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutate_view_for_test(
+        &self,
+        change: impl FnOnce(&mut CodexAppServerViewSnapshot),
+    ) {
+        change(&mut self.view.lock());
+    }
+
+    pub fn view_snapshot_with_revision(&self) -> (u64, CodexAppServerViewSnapshot) {
+        self.view.snapshot()
     }
 
     pub fn phase(&self) -> CodexAppServerPhase {
@@ -545,7 +562,7 @@ fn join_bounded(handle: JoinHandle<()>, timeout: Duration) {
 struct PrintWorker {
     spec: &'static PrintProviderSpec,
     sink: AgentEventSink,
-    view: Arc<Mutex<CodexAppServerViewSnapshot>>,
+    view: Arc<ViewCell>,
     turn_id: AgentTurnId,
     session_started: bool,
     fatal: Option<String>,
@@ -1075,7 +1092,7 @@ mod tests {
         let worker = PrintWorker {
             spec: &TEST_SPEC,
             sink: AgentEventSink::new(stream, sender),
-            view: Arc::new(Mutex::new(CodexAppServerViewSnapshot::default())),
+            view: Arc::new(ViewCell::new(CodexAppServerViewSnapshot::default())),
             turn_id: AgentTurnId::new(),
             session_started: false,
             fatal: None,

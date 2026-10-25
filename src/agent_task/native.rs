@@ -1338,6 +1338,7 @@ mod tests {
             status_detail: None,
             created_at_ms: 0,
             updated_at_ms: 0,
+            archived_from: None,
         }
     }
 

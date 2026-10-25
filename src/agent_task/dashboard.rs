@@ -58,6 +58,61 @@ impl DashboardAttentionKind {
 pub struct DashboardAttentionCounts([usize; 5]);
 
 impl DashboardAttentionCounts {
+    /// Classify tasks directly, with the same disjoint rule as dashboard
+    /// rows. Hidden tasks and running validations never count. Badges outside
+    /// a task panel can use this without projecting a dashboard.
+    pub fn from_tasks<'a>(tasks: impl IntoIterator<Item = &'a AgentTask>) -> Self {
+        let mut counts = Self::default();
+        for task in tasks {
+            if let Some(kind) = attention_kind(
+                task.status,
+                task.validation.status,
+                task.status != TaskStatus::Archived && task.needs_attention(),
+            ) {
+                counts.add(kind);
+            }
+        }
+        counts
+    }
+
+    /// Tasks needing a human, across all five queues.
+    pub fn total(self) -> usize {
+        self.0.iter().sum()
+    }
+
+    /// Bounded one-line explanation for a badge tooltip or status line, such
+    /// as `2 tasks need you: 1 approval, 1 reply`. `None` when nothing waits.
+    pub fn summary(self) -> Option<String> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let parts = DashboardAttentionKind::ALL
+            .into_iter()
+            .filter_map(|kind| {
+                let count = self.get(kind);
+                (count > 0).then(|| {
+                    let (one, many) = match kind {
+                        DashboardAttentionKind::Approval => ("approval", "approvals"),
+                        DashboardAttentionKind::Input => ("reply", "replies"),
+                        DashboardAttentionKind::Validation => {
+                            ("validation issue", "validation issues")
+                        }
+                        DashboardAttentionKind::Review => ("ready to review", "ready to review"),
+                        DashboardAttentionKind::Failed => ("failed", "failed"),
+                    };
+                    format!("{count} {}", if count == 1 { one } else { many })
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(if total == 1 {
+            format!("1 task needs you: {parts}")
+        } else {
+            format!("{total} tasks need you: {parts}")
+        })
+    }
+
     pub fn get(self, kind: DashboardAttentionKind) -> usize {
         self.0[match kind {
             DashboardAttentionKind::Approval => 0,
@@ -83,6 +138,28 @@ impl DashboardAttentionCounts {
 impl std::fmt::Display for DashboardAttentionKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.label())
+    }
+}
+
+/// The single attention queue for a task's facts, shared by rows and badges.
+fn attention_kind(
+    status: TaskStatus,
+    validation_status: TaskValidationStatus,
+    needs_attention: bool,
+) -> Option<DashboardAttentionKind> {
+    if !needs_attention
+        || status == TaskStatus::Archived
+        || validation_status == TaskValidationStatus::Running
+    {
+        return None;
+    }
+    match status {
+        TaskStatus::WaitingForApproval => Some(DashboardAttentionKind::Approval),
+        TaskStatus::WaitingForHuman => Some(DashboardAttentionKind::Input),
+        TaskStatus::Failed => Some(DashboardAttentionKind::Failed),
+        _ if validation_status.needs_attention() => Some(DashboardAttentionKind::Validation),
+        TaskStatus::ReadyForReview => Some(DashboardAttentionKind::Review),
+        _ => None,
     }
 }
 
@@ -175,22 +252,7 @@ impl DashboardRow {
     }
 
     pub fn attention_kind(&self) -> Option<DashboardAttentionKind> {
-        if !self.needs_attention
-            || self.status == TaskStatus::Archived
-            || self.validation_status == TaskValidationStatus::Running
-        {
-            return None;
-        }
-        match self.status {
-            TaskStatus::WaitingForApproval => Some(DashboardAttentionKind::Approval),
-            TaskStatus::WaitingForHuman => Some(DashboardAttentionKind::Input),
-            TaskStatus::Failed => Some(DashboardAttentionKind::Failed),
-            _ if self.validation_status.needs_attention() => {
-                Some(DashboardAttentionKind::Validation)
-            }
-            TaskStatus::ReadyForReview => Some(DashboardAttentionKind::Review),
-            _ => None,
-        }
+        attention_kind(self.status, self.validation_status, self.needs_attention)
     }
 
     /// Activity is orthogonal: a review task can retain a live native stream.
@@ -646,6 +708,70 @@ mod tests {
             None
         );
         assert_eq!(DashboardSnapshot::default().next_attention(None), None);
+    }
+
+    #[test]
+    fn task_attention_counts_match_dashboard_rows_and_explain_themselves() {
+        let mut tasks = vec![
+            task(TaskStatus::WaitingForApproval),
+            task(TaskStatus::WaitingForApproval),
+            task(TaskStatus::WaitingForHuman),
+            task(TaskStatus::ReadyForReview),
+            task(TaskStatus::ReadyForReview),
+            task(TaskStatus::Failed),
+            task(TaskStatus::Working),
+            task(TaskStatus::Completed),
+            task(TaskStatus::Archived),
+            task(TaskStatus::ReadyForReview),
+        ];
+        tasks[4].validation.status = TaskValidationStatus::Failed;
+        tasks[8].validation.status = TaskValidationStatus::Failed;
+        tasks[9].validation.status = TaskValidationStatus::Running;
+        let direct = DashboardAttentionCounts::from_tasks(&tasks);
+        let projected = project(&tasks, DashboardFilter::default()).attention_counts();
+        assert_eq!(direct, projected);
+        assert_eq!(
+            DashboardAttentionKind::ALL.map(|kind| direct.get(kind)),
+            [2, 1, 1, 1, 1]
+        );
+        assert_eq!(direct.total(), 6);
+        assert_eq!(
+            direct.summary().as_deref(),
+            Some("6 tasks need you: 2 approvals, 1 reply, 1 validation issue, 1 ready to review, 1 failed")
+        );
+        let one = DashboardAttentionCounts::from_tasks(&tasks[2..3]);
+        assert_eq!(one.summary().as_deref(), Some("1 task needs you: 1 reply"));
+        assert_eq!(DashboardAttentionCounts::default().summary(), None);
+        assert_eq!(
+            DashboardAttentionCounts::from_tasks(&tasks[6..9]).total(),
+            0
+        );
+
+        let mut manager = TaskManager::new();
+        let id = manager
+            .create(NewTask {
+                title: "Badge".into(),
+                provider: AgentProvider::Claude,
+                repo_root: "/repo".into(),
+                worktree_path: "/worktree".into(),
+                branch: "badge".into(),
+                base_commit: "b".repeat(40),
+                source_context: None,
+            })
+            .unwrap();
+        manager
+            .update_status(id, TaskStatus::WaitingForHuman, None)
+            .unwrap();
+        assert_eq!(
+            manager
+                .attention_counts()
+                .get(DashboardAttentionKind::Input),
+            1
+        );
+        assert_eq!(
+            manager.attention_counts().total(),
+            manager.attention_count()
+        );
     }
 
     #[test]
