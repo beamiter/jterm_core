@@ -1,5 +1,27 @@
 # Engineering handoff
 
+## 2026-10-26 — continuous Block/Chat transcript canvas
+
+- Added toolkit-independent `transcript_canvas::CanvasMotion`: an exact
+  elapsed-time critically damped controller for per-pane logical-pixel wheel
+  movement, live-edge following and explicit navigation. Precision input is
+  direct; wheel reversals cancel unpresented opposite motion; fractional final
+  positions are retained. Repeated output preserves position/velocity instead
+  of restarting an easing timer. Bounds, anchor rebasing, interruption,
+  reduced motion and suspended-frame settling are explicit operations.
+- Native adapters retain their terminal/parser/PTY and stable history
+  identities. GTK uses its display frame clock and existing retained cards;
+  GPU adapters combine a bounded row viewport with one fractional transform
+  shared by paint and pointer mapping. See `docs/transcript-canvas.md` for the
+  interaction contract and the individual frontend handoffs for acceptance.
+- Validation: all 16 new canvas behavior tests passed; `cargo clippy --locked
+  --offline --all-targets -- -D warnings` passed. Full core: 1,896 passed,
+  2 failed, 5 ignored. Both failures were reproduced on unchanged master
+  `90eec597ab93450f7d5ef7a2d8ae392552c59c84`: the hardened Git-status probe
+  and the systemd cgroup attachment test. They are outside the canvas paths.
+  The motion tests include 30/60/90/120/144/240 Hz equivalence; this is an
+  algorithm property, not a physical display frame-time measurement.
+
 ## 2026-10-26 — one GUI companion, a voice and gentle care
 
 - Added toolkit-independent `organism_companion`: mutually exclusive

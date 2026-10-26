@@ -70,6 +70,11 @@ v2 is selected only for a peer that has already advertised v2 support.
   receives no input/output text and requires no AI service; native frontends
   keep rendering, input, history, and configuration ownership. See the
   [Chat-mode contract and verification checklist](docs/chat-mode.md).
+- Continuous Block/Chat canvas motion shared by the native adapters: exact
+  fractional precision input, time-based wheel/live-edge movement, interruption
+  and reading-anchor rebasing. Each pane owns its motion; rendering and pointer
+  mapping use the same pixel position. See the
+  [continuous transcript canvas contract](docs/transcript-canvas.md).
 - OSC/CSI/DCS/APC parsing, Kitty graphics framing, character widths, themes,
   the family keybinding grammar, and the four-way completed-block outcome
   contract (background, success, failure, or unknown status). Completion
