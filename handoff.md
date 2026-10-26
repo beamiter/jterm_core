@@ -3892,3 +3892,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 `process::lifecycle_tests::final_drain_kills_a_background_member_of_the_child_session`
 is timing-sensitive and has been observed failing once under a loaded machine
 while passing on every rerun; if it fails, rerun before investigating.
+
+## 2026-10-27 — request-bound consumer lifecycle
+
+Pinned jagent f269c3c6 and exposed its request tokens and checked response,
+text/tool and failure APIs through the hardened adapter. Live command
+validation and explicit approval remain in force; snapshot encoding is unchanged.
+Consumer path audit: docs/model-request-lifecycle.md.
+
+Validation: Rust 1.99.1 Agent unit tests 43/43, lifecycle regressions 4/4;
+Rust 1.86.0 lifecycle regressions 4/4; strict all-target Clippy passed.
+Complete library run: 1891 passed, 11 failed, 5 ignored. A pristine worktree
+at 925ac84 reproduced the identical 11 failures (restricted process/cgroup,
+permission and helper-environment probes), so this is not a green full-suite
+claim. Upstream jagent passed 400 unit, 1 integration and 6 doc tests under
+both Rust 1.86.0 and 1.99.1. Desktop/live-provider validation is separate.

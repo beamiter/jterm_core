@@ -27,8 +27,8 @@ pub use jagent::safety::{
 pub use jagent::session::{
     parse_action, sample_observation, AgentActivity, AgentSessionSnapshot, AgentSnapshotError,
     AgentState, ApprovedCommand, CancellationToken, CommandExecutionFailure,
-    CommandExecutionOutcome, ModelOutcome, ParseError, ParsedAction, ProposalId, ProposalStatus,
-    SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    CommandExecutionOutcome, ModelOutcome, ModelRequestError, ModelRequestToken, ParseError,
+    ParsedAction, ProposalId, ProposalStatus, SessionError, Turn, MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
 pub use jagent::tools::AgentProtocol;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -175,6 +175,46 @@ impl AgentSession {
 
     pub fn model_failed(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
         self.inner.model_failed(message)
+    }
+
+    /// Capture once before transport; never fetch a replacement token in a callback.
+    pub fn model_request_token(&self) -> Option<ModelRequestToken> {
+        self.inner.model_request_token()
+    }
+
+    pub fn accept_agent_response_for(
+        &mut self,
+        request: &ModelRequestToken,
+        response: &AgentResponse,
+    ) -> Result<ModelOutcome, ModelRequestError> {
+        let outcome = self.inner.accept_agent_response_for(request, response)?;
+        self.validate_live_outcome(outcome).map_err(Into::into)
+    }
+
+    pub fn accept_model_reply_for(
+        &mut self,
+        request: &ModelRequestToken,
+        raw: &str,
+    ) -> Result<ModelOutcome, ModelRequestError> {
+        let outcome = self.inner.accept_model_reply_for(request, raw)?;
+        self.validate_live_outcome(outcome).map_err(Into::into)
+    }
+
+    pub fn accept_model_tool_reply_for(
+        &mut self,
+        request: &ModelRequestToken,
+        reply: &jagent::tools::ToolResponse,
+    ) -> Result<ModelOutcome, ModelRequestError> {
+        let outcome = self.inner.accept_model_tool_reply_for(request, reply)?;
+        self.validate_live_outcome(outcome).map_err(Into::into)
+    }
+
+    pub fn model_failed_for(
+        &mut self,
+        request: &ModelRequestToken,
+        message: impl Into<String>,
+    ) -> Result<(), ModelRequestError> {
+        self.inner.model_failed_for(request, message)
     }
 
     pub fn retry_model(&mut self) -> Result<(), SessionError> {
