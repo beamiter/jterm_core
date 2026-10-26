@@ -175,7 +175,7 @@ semantics.
 | Cursor styling | Vim's `guicursor` supplies block/bar/underline geometry, GUI highlight colors and blink timings. The host clock restarts on input and focus changes, not idle paint revisions. Full source-cell geometry remains available to IME and hit testing. |
 | Themes | GUI RGB attributes, links, style changes and named colors are separate from cterm palette entries. Window-local `wincolor` and Normal-only `winhighlight` mappings are supported; general remapping uses compatibility mode. |
 | Plugins | Supported signs, text properties, single-line `matchadd()` patterns and byte-based `matchaddpos()` decorations use GUI attributes. Protocol 5 also paints ordinary Insert completion menus. General popups, complex match patterns, conceal and unsupported virtual text use compatibility mode. Async syntax providers use the invalidation hook above. |
-| Complex layout/text | Wrapped continuation rows, conceal, diff and RTL/bidi/control text use compatibility mode. Closed folds are native display rows for render protocol 8 hosts ([native closed folds](vim9-native-folds.md)) and compatibility mode for older hosts. Supported help/quickfix windows use native paint with Vim-owned input; terminal and prompt buffers retain compatibility. User options are not silently disabled. |
+| Complex layout/text | Conceal, diff and RTL/bidi/control text use compatibility mode. Closed folds are native display rows for render protocol 8 hosts ([native closed folds](vim9-native-folds.md)) and wrapped continuation rows for protocol 9 hosts ([native soft wrap](vim9-native-wrap.md)); older hosts use compatibility mode. Supported help/quickfix windows use native paint with Vim-owned input; terminal and prompt buffers retain compatibility. User options are not silently disabled. |
 | Large files | Only visible bounded windows are exported. Vim's own regex syntax synchronization can still be expensive; limits on exported runs are not a bound on arbitrary plugin execution time. |
 
 Compatibility mode exposes the real Vim screen and the reason for falling
@@ -363,11 +363,12 @@ The existing `cursorlineopt=both` line highlight is now recognized explicitly.
 
 Guides outside the visible horizontal range skip guide construction and glyph
 segmentation. An ordinary view with guides disabled keeps the original single
-paint loop. Wrapped views retain compatibility rendering because the
-viewport contract maps one buffer line to one display row. Render protocol 8
-added the explicit display-row/source map for closed folds
-([native closed folds](vim9-native-folds.md)); wrapped continuation rows still
-need one.
+paint loop. Render protocol 8 added the explicit display-row/source map for
+closed folds ([native closed folds](vim9-native-folds.md)) and protocol 9
+extended it to wrapped continuation rows
+([native soft wrap](vim9-native-wrap.md)). Guides on wrapped lines still use
+compatibility rendering, because they address virtual columns that continue
+across a line's rows.
 
 ## Scratch and window-Normal coverage — 2026-10-22
 

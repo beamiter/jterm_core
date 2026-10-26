@@ -101,6 +101,10 @@ pub struct Vim9RenderMarginRow {
     /// Protocol 8: last line of the closed fold shown by this row, zero for
     /// an ordinary source row. A fold row is display-only paint.
     pub fold_end: u64,
+    /// Protocol 9: continuation row of a wrapped line, zero for its first row.
+    pub part: u32,
+    /// Protocol 9: screen rows the line occupies; zero means one.
+    pub parts: u32,
 }
 
 /// A visible Vim window, sampled in that window's own buffer/option context.
@@ -141,20 +145,39 @@ pub struct Vim9RenderWindow {
     /// Protocol 8: display rows actually moved by the request in `scroll_ack`.
     /// Older producers omit it and the topline delta remains authoritative.
     pub scroll_rows: Option<i32>,
+    /// Protocol 9, parallel to `display_lines` while wrapped lines are
+    /// sampled: the continuation row of each visible row and the number of
+    /// screen rows its line occupies. Empty means every row is a whole line.
+    pub wrap_parts: Vec<u32>,
+    pub wrap_rows: Vec<u32>,
+    /// Protocol 9 smoothscroll offset: screen cells of the topline above the
+    /// first visible row. With `topline` it identifies the viewport.
+    pub skipcol: usize,
 }
 
-/// One sampled display row of a split: an ordinary source line or a closed
-/// fold covering `line..=last`. `row` is viewport-relative, negative above.
+/// One sampled display row of a split: an ordinary source line, one screen
+/// row (`part` of `parts`) of a wrapped line, or a closed fold covering
+/// `line..=last`. `row` is viewport-relative, negative above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Vim9DisplayRow {
     pub row: i64,
     pub line: u64,
     pub last: u64,
     pub folded: bool,
+    pub part: u32,
+    pub parts: u32,
+}
+
+impl Vim9DisplayRow {
+    /// The row holding the end of its line, where EOL targets live.
+    pub fn ends_line(&self) -> bool {
+        !self.folded && self.part + 1 >= self.parts
+    }
 }
 
 impl Vim9RenderWindow {
-    /// True when closed folds make display rows differ from source lines.
+    /// True when closed folds or wrapped lines make display rows differ from
+    /// source lines.
     pub fn has_display_rows(&self) -> bool {
         !self.display_lines.is_empty()
     }
@@ -167,60 +190,106 @@ impl Vim9RenderWindow {
             .into_iter()
             .flatten()
             .take(self.view.rows)
-            .map(|line| (line, 0));
-        let mapped = self
-            .display_lines
-            .iter()
-            .copied()
-            .zip(self.fold_ends.iter().copied());
+            .map(|line| (line, 0, 0, 1));
+        let mapped = self.display_lines.iter().enumerate().map(|(index, line)| {
+            (
+                *line,
+                self.fold_ends.get(index).copied().unwrap_or(0),
+                self.wrap_parts.get(index).copied().unwrap_or(0),
+                self.wrap_rows.get(index).copied().unwrap_or(1),
+            )
+        });
         legacy
             .chain(mapped)
             .enumerate()
-            .map(|(row, (line, end))| Vim9DisplayRow {
+            .map(|(row, (line, end, part, parts))| Vim9DisplayRow {
                 row: row as i64,
                 line,
                 last: end.max(line),
                 folded: end != 0,
+                part,
+                parts: parts.max(1),
             })
     }
 
     /// Visible and margin rows, ordered from the top margin down.
     pub fn display_rows(&self) -> impl Iterator<Item = Vim9DisplayRow> + '_ {
-        let margin = |edge: &Vim9RenderMarginRow| Vim9DisplayRow {
-            row: i64::from(edge.row),
-            line: edge.line,
-            last: edge.fold_end.max(edge.line),
-            folded: edge.fold_end != 0,
-        };
         self.overscan
             .iter()
             .filter(|edge| edge.row < 0)
-            .map(margin)
+            .map(margin_display_row)
             .chain(self.visible_rows())
             .chain(
                 self.overscan
                     .iter()
                     .filter(|edge| edge.row >= 0)
-                    .map(margin),
+                    .map(margin_display_row),
             )
     }
 
     /// The signed viewport row that displays `line`, including a line hidden
-    /// inside a closed fold. Margin rows count; unsampled lines return None.
+    /// inside a closed fold; a wrapped line resolves to its first sampled
+    /// row. Margin rows count; unsampled lines return None.
     pub fn display_row_of(&self, line: u64) -> Option<i64> {
         self.display_rows()
             .find(|row| (row.line..=row.last).contains(&line))
             .map(|row| row.row)
     }
 
-    /// Protocol 8 producers send the map only together with contiguous row
-    /// coverage: every row starts after the previous row's last line.
+    /// The row showing continuation `part` of `line` (any line of a fold).
+    pub fn display_row_of_part(&self, line: u64, part: u32) -> Option<i64> {
+        self.display_rows()
+            .find(|row| (row.line..=row.last).contains(&line) && (row.folded || row.part == part))
+            .map(|row| row.row)
+    }
+
+    /// Continuation row of the topline shown first (smoothscroll).
+    pub fn top_part(&self) -> u32 {
+        self.wrap_parts.first().copied().unwrap_or(0)
+    }
+
+    /// Whether both samples start at the same display row: the same topline
+    /// and, with 'smoothscroll', the same skipped part of a wrapped topline.
+    pub fn same_first_row(&self, other: &Vim9RenderWindow) -> bool {
+        self.topline == other.topline && self.skipcol == other.skipcol
+    }
+
+    /// Display rows between this viewport's first row and `next`'s. Without
+    /// folds or wrapped lines this is the plain line delta. A closed fold and
+    /// each wrapped screen row count once, as Vim scrolls; None when neither
+    /// sample covers the other's first row, so callers snap instead of
+    /// animating a guess.
+    pub fn topline_shift(&self, next: &Vim9RenderWindow) -> Option<i64> {
+        if !self.has_display_rows() && !next.has_display_rows() {
+            return Some(next.topline as i64 - self.topline as i64);
+        }
+        self.display_row_of_part(next.topline, next.top_part())
+            .or_else(|| {
+                next.display_row_of_part(self.topline, self.top_part())
+                    .map(|row| -row)
+            })
+    }
+
+    /// Protocol 8/9 producers send the map only together with contiguous row
+    /// coverage: each row is the next continuation row of its line or the
+    /// first row after the previous row's last line, in both margins too.
     fn display_map_valid(&self) -> bool {
         if self.display_lines.is_empty() {
             return self.fold_ends.is_empty()
-                && self.overscan.iter().all(|edge| edge.fold_end == 0);
+                && self.wrap_parts.is_empty()
+                && self.wrap_rows.is_empty()
+                && self.skipcol == 0
+                && self
+                    .overscan
+                    .iter()
+                    .all(|edge| edge.fold_end == 0 && edge.part == 0 && edge.parts <= 1);
         }
+        let wrapped = !self.wrap_parts.is_empty();
         if self.fold_ends.len() != self.display_lines.len()
+            || (wrapped
+                && (self.wrap_parts.len() != self.display_lines.len()
+                    || self.wrap_rows.len() != self.display_lines.len()))
+            || (!wrapped && !self.wrap_rows.is_empty())
             || self.display_lines.len() > self.view.rows
             || self.line_lengths.len() != self.display_lines.len()
             || self.native_pointer
@@ -228,63 +297,73 @@ impl Vim9RenderWindow {
         {
             return false;
         }
-        let ends = |row: &Vim9DisplayRow| row.line <= row.last && row.last <= self.line_count;
-        let mut next = Some(self.topline);
+        let shape = |row: &Vim9DisplayRow| {
+            row.line > 0
+                && row.line <= row.last
+                && row.last <= self.line_count
+                && row.part < row.parts
+                && row.parts <= 4096
+                && (!row.folded || (row.part == 0 && row.parts == 1))
+                && (wrapped || row.parts == 1)
+        };
+        // Whether `next` is the display row immediately after `row`.
+        let follows = |row: &Vim9DisplayRow, next: &Vim9DisplayRow| {
+            if row.part + 1 < row.parts {
+                next.line == row.line && next.part == row.part + 1 && next.parts == row.parts
+            } else {
+                row.last.checked_add(1) == Some(next.line) && next.part == 0
+            }
+        };
+        let mut previous: Option<Vim9DisplayRow> = None;
         for row in self.visible_rows() {
-            if next != Some(row.line) || !ends(&row) {
+            let chained = match &previous {
+                None => row.line == self.topline && (row.part > 0) == (self.skipcol > 0),
+                Some(previous) => follows(previous, &row),
+            };
+            if !shape(&row) || !chained {
                 return false;
             }
-            next = row.last.checked_add(1);
+            previous = Some(row);
         }
-        if next.and_then(|line| line.checked_sub(1)) != Some(self.botline) {
+        let Some(bottom) = previous else {
+            return false;
+        };
+        if bottom.last != self.botline {
             return false;
         }
         // Margins continue the same chain outward from both viewport edges.
-        let mut below = Some(self.botline);
+        let mut below = bottom;
         let below_rows = self.overscan.iter().filter(|edge| edge.row >= 0);
         for (expected, edge) in (self.view.rows as i64..).zip(below_rows) {
-            let row = Vim9DisplayRow {
-                row: i64::from(edge.row),
-                line: edge.line,
-                last: edge.fold_end.max(edge.line),
-                folded: edge.fold_end != 0,
-            };
-            if row.row != expected
-                || below.and_then(|line| line.checked_add(1)) != Some(row.line)
-                || !ends(&row)
-                || (edge.fold_end != 0 && edge.fold_end < edge.line)
-            {
+            let row = margin_display_row(edge);
+            if row.row != expected || !shape(&row) || !follows(&below, &row) {
                 return false;
             }
-            below = Some(row.last);
+            below = row;
         }
-        let mut above = Some(self.topline);
+        let Some(mut above) = self.visible_rows().next() else {
+            return false;
+        };
         let above_rows = self.overscan.iter().rev().filter(|edge| edge.row < 0);
         for (distance, edge) in (1..).zip(above_rows) {
-            let expected = -distance;
-            let last = edge.fold_end.max(edge.line);
-            if i64::from(edge.row) != expected
-                || above.and_then(|line| line.checked_sub(1)) != Some(last)
-                || (edge.fold_end != 0 && edge.fold_end < edge.line)
-                || edge.line == 0
-            {
+            let row = margin_display_row(edge);
+            if row.row != -distance || !shape(&row) || !follows(&row, &above) {
                 return false;
             }
-            above = Some(edge.line);
+            above = row;
         }
         true
     }
+}
 
-    /// Display rows between this viewport's topline and `next`'s topline.
-    /// Without folds this is the plain line delta. Across a closed fold it
-    /// counts the fold once, as Vim scrolls; None when neither sample covers
-    /// the other's topline, so callers snap instead of animating a guess.
-    pub fn topline_shift(&self, next: &Vim9RenderWindow) -> Option<i64> {
-        if !self.has_display_rows() && !next.has_display_rows() {
-            return Some(next.topline as i64 - self.topline as i64);
-        }
-        self.display_row_of(next.topline)
-            .or_else(|| next.display_row_of(self.topline).map(|row| -row))
+fn margin_display_row(edge: &Vim9RenderMarginRow) -> Vim9DisplayRow {
+    Vim9DisplayRow {
+        row: i64::from(edge.row),
+        line: edge.line,
+        last: edge.fold_end.max(edge.line),
+        folded: edge.fold_end != 0,
+        part: edge.part,
+        parts: edge.parts.max(1),
     }
 }
 
@@ -1015,7 +1094,9 @@ mod tests {
                 row: 7,
                 line: 22,
                 last: 30,
-                folded: true
+                folded: true,
+                part: 0,
+                parts: 1,
             }
         );
         assert_eq!(
@@ -1104,6 +1185,183 @@ mod tests {
         window.remove("fold_ends");
         let frame: Vim9RenderFrame = serde_json::from_value(legacy).unwrap();
         assert!(!frame.valid());
+    }
+
+    /// One split, 20 columns: smoothscroll shows parts 1..=2 of line 5, then
+    /// line 6, both parts of 7 and line 8. Margins: 4 and part 0 of 5 above,
+    /// both parts of 9 below.
+    fn wrapped_frame() -> Value {
+        let margin = |row: i32, line: u64, part: u32, parts: u32| {
+            json!({"row":row,"line":line,"part":part,"parts":parts,"byte_length":40,"runs":[
+                {"window":100,"row":0,"column":0,"text":"w","cells":1,
+                    "line":line,"byte_start":part * 20,"byte_end":part * 20 + 1}]})
+        };
+        let overscan = json!([
+            margin(-2, 4, 0, 1),
+            margin(-1, 5, 0, 3),
+            margin(6, 9, 0, 2),
+            margin(7, 9, 1, 2)
+        ]);
+        let window = json!({"window":100,"buffer":1,"changedtick":2,
+            "view":{"row":0,"column":0,"rows":6,"columns":20},
+            "topline":5,"botline":8,"skipcol":20,"line_count":40,
+            "native_scroll":true,"native_pointer":false,"scroll_rows":0,
+            "line_lengths":[50,50,3,30,30,4],
+            "display_lines":[5,5,6,7,7,8],
+            "fold_ends":[0,0,0,0,0,0],
+            "wrap_parts":[1,2,0,0,1,0],
+            "wrap_rows":[3,3,1,2,2,1],
+            "overscan":overscan});
+        json!({
+            "revision":1,"supported":true,"rows":7,"columns":20,
+            "window":100,"buffer":1,"changedtick":2,"mode":"n",
+            "view":{"row":0,"column":0,"rows":6,"columns":20},
+            "windows":[window],
+            "runs":[
+                {"window":100,"row":1,"column":0,"text":"tail","cells":4,
+                    "line":5,"byte_start":40,"byte_end":44},
+                {"window":100,"row":4,"column":0,"text":"seven","cells":5,
+                    "line":7,"byte_start":20,"byte_end":25}
+            ]
+        })
+    }
+
+    #[test]
+    fn wrapped_rows_map_each_screen_row_to_a_line_part() {
+        let frame: Vim9RenderFrame = serde_json::from_value(wrapped_frame()).unwrap();
+        assert!(frame.valid());
+        let window = &frame.windows[0];
+        let rows: Vec<_> = window
+            .display_rows()
+            .map(|row| (row.row, row.line, row.part, row.parts))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (-2, 4, 0, 1),
+                (-1, 5, 0, 3),
+                (0, 5, 1, 3),
+                (1, 5, 2, 3),
+                (2, 6, 0, 1),
+                (3, 7, 0, 2),
+                (4, 7, 1, 2),
+                (5, 8, 0, 1),
+                (6, 9, 0, 2),
+                (7, 9, 1, 2),
+            ]
+        );
+        let ends: Vec<_> = window.visible_rows().map(|row| row.ends_line()).collect();
+        assert_eq!(ends, [false, true, true, false, true, true]);
+        assert_eq!(window.display_row_of(5), Some(-1), "first sampled part");
+        assert_eq!(window.display_row_of_part(7, 1), Some(4));
+        assert_eq!(window.display_row_of_part(9, 1), Some(7));
+        assert_eq!(window.display_row_of_part(5, 3), None);
+        assert_eq!(window.top_part(), 1);
+        // Each wrapped screen row is one scrolled row, like <C-E> with
+        // 'smoothscroll'; a move to line 7's second part is four rows.
+        let shifted = |line: u64, part: u32| {
+            let mut next = window.clone();
+            next.topline = line;
+            next.wrap_parts[0] = part;
+            window.topline_shift(&next)
+        };
+        assert!(window.same_first_row(window));
+        let mut unskipped = window.clone();
+        unskipped.skipcol = 0;
+        assert!(!window.same_first_row(&unskipped), "skipcol moves the view");
+        assert_eq!(shifted(6, 0), Some(2));
+        assert_eq!(shifted(7, 1), Some(4));
+        assert_eq!(shifted(5, 0), Some(-1));
+        assert_eq!(shifted(9, 1), Some(7));
+        assert_eq!(shifted(4, 0), Some(-2));
+        assert_eq!(shifted(12, 0), None);
+        // The reverse lookup answers when only the next sample covers the
+        // previous top row.
+        let previous = Vim9RenderWindow {
+            topline: 7,
+            botline: 7,
+            display_lines: vec![7],
+            fold_ends: vec![0],
+            wrap_parts: vec![1],
+            wrap_rows: vec![2],
+            ..Default::default()
+        };
+        assert_eq!(previous.topline_shift(window), Some(-4));
+    }
+
+    #[test]
+    fn wrapped_row_maps_must_chain_parts_and_skipcol() {
+        let base = wrapped_frame();
+        let cases: [(&str, Value); 14] = [
+            ("/windows/0/wrap_parts/0", json!(0)),
+            ("/windows/0/skipcol", json!(0)),
+            ("/windows/0/wrap_parts/1", json!(1)),
+            ("/windows/0/wrap_rows/1", json!(4)),
+            ("/windows/0/wrap_parts/5", json!(1)),
+            ("/windows/0/wrap_parts/2", json!(1)),
+            ("/windows/0/wrap_rows/5", json!(2)),
+            ("/windows/0/wrap_rows", json!([3, 3, 1, 2, 2])),
+            ("/windows/0/wrap_parts", json!([1, 2, 0, 0, 1])),
+            ("/windows/0/wrap_rows/2", json!(5000)),
+            ("/windows/0/overscan/1/part", json!(1)),
+            ("/windows/0/overscan/2/part", json!(1)),
+            ("/windows/0/overscan/3/part", json!(0)),
+            ("/windows/0/overscan/3/parts", json!(3)),
+        ];
+        for (pointer, replacement) in cases {
+            let mut value = base.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            match value.pointer_mut(parent).unwrap() {
+                Value::Array(items) => items[key.parse::<usize>().unwrap()] = replacement,
+                object => {
+                    object
+                        .as_object_mut()
+                        .unwrap()
+                        .insert(key.into(), replacement);
+                }
+            }
+            let frame: Vim9RenderFrame = serde_json::from_value(value).unwrap();
+            assert!(!frame.valid(), "{pointer} must be rejected");
+        }
+        // A wrapped row is never a closed fold.
+        let mut folded = base.clone();
+        folded["windows"][0]["fold_ends"][2] = json!(6);
+        folded["windows"][0]["wrap_rows"][2] = json!(1);
+        let frame: Vim9RenderFrame = serde_json::from_value(folded.clone()).unwrap();
+        assert!(frame.valid(), "a one-row fold row is still well formed");
+        folded["windows"][0]["wrap_parts"][3] = json!(0);
+        folded["windows"][0]["fold_ends"][3] = json!(7);
+        folded["windows"][0]["wrap_rows"][3] = json!(2);
+        let frame: Vim9RenderFrame = serde_json::from_value(folded).unwrap();
+        assert!(!frame.valid(), "fold rows have exactly one part");
+        // Fold-only (protocol 8) maps cannot carry wrap metadata, and legacy
+        // producers cannot smuggle a smoothscroll offset or margin parts.
+        let mut fold_only = base.clone();
+        fold_only["windows"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("wrap_parts");
+        let frame: Vim9RenderFrame = serde_json::from_value(fold_only).unwrap();
+        assert!(!frame.valid());
+        let mut legacy = folded_frame();
+        legacy["windows"][0]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| !["display_lines", "fold_ends", "overscan"].contains(&key.as_str()));
+        legacy["windows"][0]["botline"] = json!(24);
+        assert!(serde_json::from_value::<Vim9RenderFrame>(legacy.clone())
+            .unwrap()
+            .valid());
+        let mut skipped = legacy.clone();
+        skipped["windows"][0]["skipcol"] = json!(40);
+        assert!(!serde_json::from_value::<Vim9RenderFrame>(skipped)
+            .unwrap()
+            .valid());
+        legacy["windows"][0]["overscan"] =
+            json!([{"row":10,"line":25,"part":1,"parts":2,"byte_length":0,"runs":[]}]);
+        assert!(!serde_json::from_value::<Vim9RenderFrame>(legacy)
+            .unwrap()
+            .valid());
     }
 
     fn patch(frame: &Value, row_updates: Value) -> Value {

@@ -104,8 +104,9 @@ pub enum Vim9PointerPhase {
 
 const PROTOCOL: u64 = 1;
 /// Native paint negotiated at authentication. Version 8 adds closed-fold
-/// display rows; the bridge keeps older peers on their previous contracts.
-const RENDER_PROTOCOL: u64 = 8;
+/// display rows and version 9 wrapped continuation rows; the bridge keeps
+/// older peers on their previous contracts.
+const RENDER_PROTOCOL: u64 = 9;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_COMMAND: usize = 64 * 1024;
 const MAX_PENDING: usize = 64;
@@ -373,6 +374,8 @@ pub enum Vim9Command {
         changedtick: u64,
         topline: u64,
         leftcol: usize,
+        /// Smoothscroll offset of the sampled topline (render protocol 9).
+        skipcol: usize,
         lines: i32,
     },
     /// A standard primary click/character drag using captured source bytes.
@@ -413,6 +416,7 @@ impl Vim9Command {
                 changedtick,
                 topline,
                 leftcol,
+                skipcol,
                 lines,
             } if *window <= 0
                 || *buffer <= 0
@@ -420,6 +424,7 @@ impl Vim9Command {
                 || *topline == 0
                 || *topline > i32::MAX as u64
                 || *leftcol > i32::MAX as usize
+                || *skipcol > i32::MAX as usize
                 || *lines == 0
                 || lines.unsigned_abs() > 120 =>
             {
@@ -1816,7 +1821,7 @@ mod tests {
         reader.read_line(&mut wire).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&wire).unwrap()["render_protocol"],
-            8
+            9
         );
         let full = json!({"event":"render","revision":1,"supported":true,
             "rows":3,"columns":20,"window":100,"buffer":1,"mode":"n",

@@ -70,9 +70,10 @@ line and byte range; each window carries its own buffer tick and viewport.
 The active cursor and Visual selection cannot leak into sibling windows.
 
 This is an incremental GUI buffer renderer, not a complete external Vim UI
-protocol. Terminal and prompt buffers, actual wrapped continuation rows,
-closed folds for hosts older than render protocol 8, blockwise selections over
-closed folds, general popup windows and complex/scrolling completion menus,
+protocol. Terminal and prompt buffers, wrapped continuation rows for hosts
+older than render protocol 9 (and the wrapped cases listed in
+[native soft wrap](vim9-native-wrap.md)), closed folds for hosts older than
+render protocol 8, blockwise selections over closed folds, general popup windows and complex/scrolling completion menus,
 multiple/image sign columns, fold columns, inline hints with `wrap`,
 above/below/right or wrapping virtual text, Visual selections with virtual labels,
 multiline/positional/zero-width search and match patterns, conceal matches, virtual-space cursors,
@@ -206,8 +207,8 @@ search, text properties and Visual selection. Wide characters keep their
 whole source range, while an expanded tab may show a highlighted column
 without changing its original byte range. Empty-line and end-of-line guides
 are display-only decorations; they do not become editable text or mouse
-targets. `cursorlineopt=both` also retains its line highlight. Existing wrapped
-line and other compatibility boundaries remain in effect. Closed fold rows
+targets. `cursorlineopt=both` also retains its line highlight. Guides on
+wrapped lines and other compatibility boundaries remain in effect. Closed fold rows
 combine guides exactly as Vim's fold line does; see
 [native closed folds](vim9-native-folds.md).
 

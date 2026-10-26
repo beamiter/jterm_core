@@ -240,18 +240,19 @@ impl<'a> Vim9Viewport<'a> {
     }
 
     /// Empty-line and EOL targets. Closed fold rows show display-only fold
-    /// text and never expose an editable source endpoint.
+    /// text and never expose an editable source endpoint; a wrapped line ends
+    /// on its last continuation row only.
     fn source_rows(&self) -> impl Iterator<Item = (i64, u64, usize)> + '_ {
         self.window
             .visible_rows()
             .zip(self.window.line_lengths.iter())
-            .filter(|(row, _)| !row.folded)
+            .filter(|(row, _)| row.ends_line())
             .map(|(row, length)| (row.row, row.line, *length))
             .chain(
                 self.window
                     .overscan
                     .iter()
-                    .filter(|row| row.fold_end == 0)
+                    .filter(|row| row.fold_end == 0 && row.part + 1 >= row.parts.max(1))
                     .map(|row| (i64::from(row.row), row.line, row.byte_length)),
             )
     }
@@ -434,6 +435,53 @@ mod tests {
         assert!(view.anchor_for_position(&hidden).is_none());
         assert_eq!(frame.windows[0].display_row_of(15), Some(2));
         assert_eq!(frame.windows[0].display_row_of(24), Some(4));
+    }
+
+    #[test]
+    fn wrapped_line_ends_only_on_its_last_continuation_row() {
+        // Line 10 wraps onto rows 0 and 1; 11 and 12 follow on rows 2 and 3.
+        let mut frame = frame();
+        let window = &mut frame.windows[0];
+        window.botline = 12;
+        window.display_lines = vec![10, 10, 11, 12];
+        window.fold_ends = vec![0; 4];
+        window.wrap_parts = vec![0, 1, 0, 0];
+        window.wrap_rows = vec![2, 2, 1, 1];
+        window.line_lengths = vec![4, 4, 3, 1];
+        window.cursor.row = 2;
+        window.overscan.retain(|row| row.row < 0);
+        window.overscan.push(Vim9RenderMarginRow {
+            row: 4,
+            line: 13,
+            ..Default::default()
+        });
+        frame.runs[1].row = 2;
+        frame.runs[2].row = 3;
+        frame.runs.insert(
+            1,
+            Vim9RenderRun {
+                window: 10,
+                row: 1,
+                column: 0,
+                cells: 2,
+                text: "CD".into(),
+                line: 10,
+                byte_start: 2,
+                byte_end: 4,
+                ..Default::default()
+            },
+        );
+        assert!(frame.valid());
+        let view = Vim9Viewport::new(&frame, 10, metrics(), 0.0).unwrap();
+        let hit = view.anchor_at(12.0, 25.0).unwrap();
+        assert_eq!((hit.position.line, hit.position.byte_column), (10, 3));
+        // Space right of the first part is not the end of line 10.
+        assert!(view.anchor_at(40.0, 5.0).is_none());
+        let end = view.anchor_at(40.0, 25.0).unwrap();
+        assert_eq!((end.position.line, end.position.byte_column), (10, 4));
+        assert_eq!(end.rect.y, 20.0);
+        assert_eq!(end.rect.x, 16.0);
+        assert_eq!(view.anchor_for_position(&end.position), Some(end));
     }
 
     #[test]

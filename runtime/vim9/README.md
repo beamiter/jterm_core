@@ -108,7 +108,10 @@ including borders, padding, GUI syntax styles and simultaneous completion docs.
 Version 7 adds documentation cards (below). Version 8 paints closed folds as
 native display rows, with a per-window `display_lines`/`fold_ends` row map,
 fold-aware margins and `scroll_rows` acknowledgements; see
-[native closed folds](../../docs/vim9-native-folds.md).
+[native closed folds](../../docs/vim9-native-folds.md). Version 9 paints
+soft-wrapped continuation rows natively, adding `wrap_parts`/`wrap_rows`, margin
+`part`/`parts` and the `smoothscroll` `skipcol` that `scroll_view` must name; see
+[native soft wrap](../../docs/vim9-native-wrap.md).
 Older hosts continue using the live compatibility displays. Existing command and metadata
 messages continue to use `protocol: 1`.
 

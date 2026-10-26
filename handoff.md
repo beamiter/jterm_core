@@ -1,5 +1,39 @@
 # Engineering handoff
 
+## 2026-10-26 — native soft wrap (render protocol 9)
+
+- Wrapped continuation rows no longer force the compatibility view.
+  `bridge.vim` lays out each wrapped line once per line-cache entry
+  (`WrapLineGlyphs`) and assigns rows from the line's current position. With
+  `linebreak`, `breakindent` or `showbreak` every glyph position comes from
+  Vim's own `virtcol()`. Continuation rows get blank `SignColumn` and number
+  cells in Vim's continuation highlight, `showbreak` before/after the indent
+  (`breakindentopt` `sbr`), Vim's `>` filler before a wide glyph pushed to the
+  next row and tabs split across rows. `smoothscroll` first rows draw `<<<`
+  (and dashes with `number`+`relativenumber`); `display` `lastline`,
+  `truncate` and `""` plus `fillchars` `eob:`/`lastline:` match Vim.
+- Protocol 9 wire fields: `wrap_parts`, `wrap_rows`, window `skipcol`, margin
+  `part`/`parts`; `scroll_view` names `skipcol` and `scroll_rows` counts
+  wrapped rows. `valid()` requires the part chain, a non-zero first part
+  exactly when `skipcol` is non-zero and single-part fold rows; it rejects
+  wrap metadata from fold-only or legacy producers. New API:
+  `Vim9DisplayRow::{part, parts, ends_line()}`, `display_row_of_part()`,
+  `top_part()`, `same_first_row()`; `topline_shift()` counts parts.
+- `Vim9PixelScroll` stores `skipcol`, sends it with `ScrollView` and treats an
+  unrequested `skipcol` change as a move. A wrapped split scrolls natively only
+  with `smoothscroll`; clicks there use Vim's own mouse handling. Frontends
+  compare `same_first_row()` instead of `topline`, so a one-row smoothscroll
+  move animates. The host negotiates `RENDER_PROTOCOL = 9`.
+- vimrc: native windows keep `wrap` on protocol 9 hosts; older hosts get
+  `nowrap` on `JTermVim9Ready`. The workbench report shows the wrap mode.
+- Cost: 20,000 two-row lines, 200 Ctrl-E, three interleaved rounds — Vim CPU
+  per scroll 8.45–9.1 ms with `wrap` vs 13.85–15.6 ms with `nowrap`.
+- Validation: 41 real-Vim Python suites OK (332 tests, 10 new in
+  `test_render_wrap.py`, 69 skipped for absent sibling plugin checkouts);
+  `cargo test --lib vim9` 151 OK plus the two ignored real-Vim round trips;
+  clippy `-D warnings`, rustfmt and warning-denied rustdoc clean. Same
+  sandbox-only failures as below. See `docs/vim9-native-wrap.md`.
+
 ## 2026-10-25 — native closed folds (render protocol 8)
 
 - Closed folds no longer force the compatibility view. `bridge.vim` builds a

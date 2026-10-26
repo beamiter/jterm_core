@@ -21,6 +21,9 @@ pub struct Vim9PixelScroll {
     leftcol: usize,
     textoff: usize,
     topline: u64,
+    /// Smoothscroll offset of the acknowledged topline; with topline it names
+    /// the first display row of a wrapped viewport (render protocol 9).
+    skipcol: usize,
     /// Desired motion relative to the last acknowledged viewport, including
     /// the request in flight. The fraction persists between render frames.
     desired: f64,
@@ -57,6 +60,7 @@ impl Vim9PixelScroll {
             leftcol: window.leftcol,
             textoff: window.textoff,
             topline: window.topline,
+            skipcol: window.skipcol,
             desired: 0.0,
             presented: 0.0,
             before: Self::coverage(window, false),
@@ -280,7 +284,8 @@ impl Vim9PixelScroll {
         if let Some((id, lines, interpolated)) = self.sent {
             if window.scroll_ack == id {
                 // A closed fold is one display row: Vim moves topline past all
-                // of its lines for one requested row. Protocol 8 reports rows.
+                // of its lines for one requested row, and protocol 9 counts
+                // each wrapped screen row. Protocol 8+ reports display rows.
                 let moved = window
                     .scroll_rows
                     .map_or(window.topline as i128 - self.topline as i128, i128::from);
@@ -310,10 +315,11 @@ impl Vim9PixelScroll {
                 }
                 self.sent = None;
                 self.topline = window.topline;
-            } else if !request_pending || self.topline != window.topline {
+                self.skipcol = window.skipcol;
+            } else if !request_pending || !self.same_top(window) {
                 return false;
             }
-        } else if self.topline != window.topline {
+        } else if !self.same_top(window) {
             return false;
         }
         self.before = Self::coverage(window, false);
@@ -326,6 +332,12 @@ impl Vim9PixelScroll {
         }
         self.presented = self.clamp_presentation(self.presented);
         true
+    }
+
+    /// Whether `window` still shows the acknowledged first display row. A
+    /// smoothscroll skipcol change is an unrequested move, like a topline one.
+    fn same_top(&self, window: &Vim9RenderWindow) -> bool {
+        window.topline == self.topline && window.skipcol == self.skipcol
     }
 
     fn command_lines(&self) -> i32 {
@@ -354,6 +366,7 @@ impl Vim9PixelScroll {
             changedtick: self.changedtick,
             topline: self.topline,
             leftcol: self.leftcol,
+            skipcol: self.skipcol,
             lines,
         })
     }
@@ -371,7 +384,7 @@ impl Vim9PixelScroll {
         let Some(window) = frame.windows.iter().find(|w| w.window == self.window) else {
             return 0.0;
         };
-        if !self.matches(window, metrics) || window.topline != self.topline {
+        if !self.matches(window, metrics) || !self.same_top(window) {
             return 0.0;
         }
         let mut coverage = 0;
@@ -535,6 +548,88 @@ mod tests {
         assert!(clamped.reconcile(&edge.windows[0], metrics(), false));
         assert!(clamped.command().is_none());
         assert_eq!(clamped.offset(&edge, metrics()), 0.0);
+    }
+    /// Line 10 wraps onto two rows. With `skip` smoothscroll hides its first
+    /// part, so the viewport starts at part 1.
+    fn wrapped(skip: bool, ack: u64) -> Vim9RenderFrame {
+        let mut frame = frame(10, ack);
+        (frame.rows, frame.columns, frame.window, frame.buffer) = (4, 10, 10, 1);
+        frame.changedtick = 3;
+        frame.view = frame.windows[0].view.clone();
+        let window = &mut frame.windows[0];
+        let margins: [(i32, u64, u32, u32); 4] = if skip {
+            window.skipcol = 10;
+            window.botline = 13;
+            window.display_lines = vec![10, 11, 12, 13];
+            window.wrap_parts = vec![1, 0, 0, 0];
+            window.wrap_rows = vec![2, 1, 1, 1];
+            [(-2, 9, 0, 1), (-1, 10, 0, 2), (4, 14, 0, 1), (5, 15, 0, 1)]
+        } else {
+            window.botline = 12;
+            window.display_lines = vec![10, 10, 11, 12];
+            window.wrap_parts = vec![0, 1, 0, 0];
+            window.wrap_rows = vec![2, 2, 1, 1];
+            [(-2, 8, 0, 1), (-1, 9, 0, 1), (4, 13, 0, 1), (5, 14, 0, 1)]
+        };
+        window.fold_ends = vec![0; 4];
+        window.overscan = margins
+            .into_iter()
+            .map(|(row, line, part, parts)| Vim9RenderMarginRow {
+                row,
+                line,
+                part,
+                parts,
+                ..Default::default()
+            })
+            .collect();
+        assert!(frame.valid());
+        frame
+    }
+    #[test]
+    fn smoothscroll_skipcol_names_the_first_display_row() {
+        let old = wrapped(true, 0);
+        let mut scroll = Vim9PixelScroll::new(&old.windows[0], metrics()).unwrap();
+        scroll.push(1.25);
+        assert!(matches!(
+            scroll.command(),
+            Some(Vim9Command::ScrollView {
+                topline: 10,
+                skipcol: 10,
+                lines: 1,
+                ..
+            })
+        ));
+        scroll.submitted(61);
+        let before = scroll.offset(&old, metrics());
+        assert_eq!(before, -25.0);
+        // One wrapped row up: Vim reports one display row and clears skipcol.
+        let mut moved = frame(11, 61);
+        moved.windows[0].scroll_rows = Some(1);
+        assert!(scroll.reconcile(&moved.windows[0], metrics(), false));
+        assert_eq!(scroll.offset(&moved, metrics()), before + 20.0);
+        assert!(matches!(
+            scroll.command(),
+            None | Some(Vim9Command::ScrollView { skipcol: 0, .. })
+        ));
+        // The same topline with a different skipcol is an unrequested move.
+        let mut fresh = Vim9PixelScroll::new(&old.windows[0], metrics()).unwrap();
+        fresh.push(0.25);
+        let unskipped = wrapped(false, 0);
+        assert_eq!(fresh.offset(&unskipped, metrics()), 0.0);
+        assert!(!fresh.reconcile(&unskipped.windows[0], metrics(), false));
+        // An acknowledgement rebases onto Vim's new skipcol.
+        let mut back = Vim9PixelScroll::new(&old.windows[0], metrics()).unwrap();
+        back.push(-1.0);
+        assert!(matches!(
+            back.command(),
+            Some(Vim9Command::ScrollView { lines: -1, .. })
+        ));
+        back.submitted(62);
+        let mut revealed = wrapped(false, 62);
+        revealed.windows[0].scroll_rows = Some(-1);
+        assert!(back.reconcile(&revealed.windows[0], metrics(), false));
+        assert!(back.reconcile(&revealed.windows[0], metrics(), false));
+        assert!(back.command().is_none());
     }
     #[test]
     fn failed_or_unrelated_acknowledgements_retire_the_gesture() {
