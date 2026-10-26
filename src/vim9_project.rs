@@ -62,13 +62,22 @@ impl Vim9ProjectSnapshot {
                 Some((file, exact, filename_score.is_some(), score))
             })
             .collect::<Vec<_>>();
-        ranked.sort_unstable_by(|a, b| {
+        let compare = |a: &(&Vim9ProjectFile, bool, bool, i64),
+                       b: &(&Vim9ProjectFile, bool, bool, i64)| {
             b.1.cmp(&a.1)
                 .then_with(|| b.2.cmp(&a.2))
                 .then_with(|| b.3.cmp(&a.3))
                 .then_with(|| a.0.relative.len().cmp(&b.0.relative.len()))
                 .then_with(|| a.0.relative.cmp(&b.0.relative))
-        });
+        };
+        // Only the visible prefix needs ordering. Partition first so a broad
+        // query over a large project does not sort thousands of hidden hits
+        // on every keystroke. Use the same total order for both operations.
+        if ranked.len() > limit {
+            ranked.select_nth_unstable_by(limit, compare);
+            ranked.truncate(limit);
+        }
+        ranked.sort_unstable_by(compare);
         ranked
             .into_iter()
             .take(limit)
@@ -428,6 +437,37 @@ mod tests {
             indexed_file(root, b"./-literal $file").unwrap().relative,
             "-literal $file"
         );
+    }
+
+    #[test]
+    fn limited_picker_results_remain_ordered_and_independent_of_index_order() {
+        let root = Path::new("/project");
+        let mut files = (0..1024)
+            .map(|index| {
+                indexed_file(root, format!("src/{index:04}/target.rs").as_bytes()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        files.push(indexed_file(root, b"target.rs").unwrap());
+        files.push(indexed_file(root, "文档/target.rs".as_bytes()).unwrap());
+        let snapshot = Vim9ProjectSnapshot {
+            files: Arc::new(files.clone()),
+            ..Default::default()
+        };
+        let expected = snapshot.matches("target.rs", usize::MAX);
+        assert_eq!(expected.len(), 256);
+        assert_eq!(expected[0].relative, "target.rs");
+
+        files.reverse();
+        let reversed = Vim9ProjectSnapshot {
+            files: Arc::new(files),
+            ..Default::default()
+        };
+        for limit in [1, 2, 7, 64, 255, 256, 1024] {
+            let end = limit.min(256);
+            assert_eq!(snapshot.matches("target.rs", limit), expected[..end]);
+            assert_eq!(reversed.matches("target.rs", limit), expected[..end]);
+        }
+        assert_eq!(snapshot.matches("文档", 1)[0].relative, "文档/target.rs");
     }
 
     #[test]

@@ -147,7 +147,7 @@ fn harden_open_options(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn harden_open_options(_options: &mut OpenOptions) {}
 
-fn validate_history_file(file: &File, description: &str) -> io::Result<()> {
+fn validate_history_file(file: &File, description: &str) -> io::Result<fs::Metadata> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
@@ -186,7 +186,7 @@ fn validate_history_file(file: &File, description: &str) -> io::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(metadata)
 }
 
 fn open_lock_file(path: &Path) -> io::Result<File> {
@@ -194,11 +194,15 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     options.create(true).read(true).write(true);
     harden_open_options(&mut options);
     let file = options.open(path)?;
-    validate_history_file(&file, "command-history lock")?;
+    let _metadata = validate_history_file(&file, "command-history lock")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        // fchmod updates inode metadata even when the mode is unchanged.
+        // Avoid dirtying the persistent sidecar on every command.
+        if _metadata.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
     }
     Ok(file)
 }
@@ -260,11 +264,15 @@ fn open_history_for_append(path: &Path) -> io::Result<File> {
     options.create(true).read(true).append(true);
     harden_open_options(&mut options);
     let file = options.open(path)?;
-    validate_history_file(&file, "command-history file")?;
+    let _metadata = validate_history_file(&file, "command-history file")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        // Keep the existing privacy boundary without forcing a metadata
+        // change (and its durability work) for an already-private file.
+        if _metadata.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
     }
     Ok(file)
 }

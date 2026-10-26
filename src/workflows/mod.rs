@@ -7,6 +7,12 @@
 //! bounded, validated, and rendered into text the app *inserts at the prompt
 //! for review*. Nothing here executes a command.
 //!
+//! GUI catalogs can use [`BackgroundRefresh`] to run their existing discovery
+//! policy off the UI thread. It shares immutable last-good snapshots across
+//! readers, coalesces refreshes and bounds the process to one workflow I/O
+//! worker. Consumers keep their own opening and row identities when applying
+//! a new snapshot; a library revision does not authorize an old row click.
+//!
 //! Every jterm terminal grew its own copy: anvil `src/workflows.rs` +
 //! `src/workflow_ops.rs` + `src/dialogs/workflow.rs`, forge `src/workflows.rs`,
 //! ember `src/workflows.rs` + `src/workflow_picker.rs`, frost the same pair.
@@ -171,11 +177,13 @@
 //! lookup that lives in `workflows.rs` only because it reuses the
 //! directory-search shape, and it stays in the two apps that have a notebook.
 
+mod background;
 mod discovery;
 mod loader;
 mod picker;
 mod render;
 
+pub use background::{BackgroundRefresh, RefreshSnapshot};
 pub use discovery::{search_path, DirSources, SearchPathSpec, XdgEnvDirs};
 pub use loader::{
     is_workflow_file, load_all, load_one, validate, workflow_files_in, LoadOrder, RefreshLatch,

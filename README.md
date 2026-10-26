@@ -89,8 +89,16 @@ v2 is selected only for a peer that has already advertised v2 support.
   canonical encoded cwd channel.
 - PTY input guarding, review-only command insertion, child environments,
   process-group lifecycle management, and restorable-command quoting.
+- Workflow catalogs can refresh through a shared background worker with a
+  bounded queue, coalesced requests and immutable last-good snapshots. Slow
+  directories do not block the picker, and a failed refresh retains its data.
+  Picker searches bound dynamic-programming work for long queries, reuse one
+  text buffer across candidates and sort only the displayed best matches;
+  ordinary short-query scores and library-order ties remain unchanged.
 - Private atomic snapshots, command history, jsh execution journals, pane
-  layouts, Git metadata, notifications, and host/Flatpak command routing. The
+  layouts, Git metadata, notifications, and host/Flatpak command routing.
+  Command-history appends leave already-private file modes untouched while
+  retaining their file-data and parent-directory durability barriers. The
   journal v1 version and byte/event/record ceilings are public, and its reader
   keeps jsh's JSON-escaped multiline commands plus the pre-rename version alias
   so migrated shell history and live OSC metadata resolve identically. Every
@@ -346,7 +354,9 @@ preview sequencing, life ticks and output rhythm are separate contracts.
    a save cannot redirect the commit. Shared writable parents require sticky
    semantics and temporary names include OS entropy.
 9. Git metadata subprocess output, queues, cache entries, waiters, branch
-   labels, and lifetime are bounded. Short-lived helpers are supervised under
+   labels, and lifetime are bounded. Directory checks and Git probes stay on
+   the background worker, so a slow mount cannot block the UI before its
+   bounded cache wait begins. Short-lived helpers are supervised under
    one absolute deadline; on Unix their root remains waitable until the fresh
    process group is cleared and is then synchronously reaped, including when a
    descendant retains a pipe. This ownership requires a waitable `SIGCHLD`

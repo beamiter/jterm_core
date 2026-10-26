@@ -205,7 +205,7 @@ fn worker_loop_with_probe(
     }
 }
 
-/// Resolve repo metadata without running Git on the caller's thread.
+/// Resolve repo metadata without filesystem access or Git on the caller's thread.
 ///
 /// A healthy local repository usually completes inside `UI_WAIT_BUDGET`. A slow
 /// refresh returns the cached value while the worker continues in the background.
@@ -215,12 +215,14 @@ pub fn read(cwd: &Path) -> Option<RepoMeta> {
     // cannot turn 256 otherwise-bounded cache entries into unbounded memory.
     if cwd.as_os_str().as_encoded_bytes().len() > MAX_GIT_CWD_BYTES
         || cwd.as_os_str().as_encoded_bytes().contains(&0)
-        || !cwd.is_dir()
     {
         return None;
     }
 
-    let service = service()?;
+    read_with_service(cwd, service()?)
+}
+
+fn read_with_service(cwd: &Path, service: &GitMetaService) -> Option<RepoMeta> {
     let stale = service.cached(cwd).flatten();
     let Some(reply) = service.request(cwd) else {
         return stale;
@@ -263,7 +265,7 @@ fn wait_for_fresh(reply: mpsc::Receiver<ProbeCompletion>, budget: Duration) -> P
 
 fn read_uncached(cwd: &Path) -> ProbeCompletion {
     // Filesystem work stays on the existing shared worker. In particular,
-    // read_fresh's caller cannot get stuck in a remote is_dir before its wait.
+    // neither read nor read_fresh can get stuck in a remote is_dir before its wait.
     match std::fs::metadata(cwd) {
         Ok(metadata) if !metadata.is_dir() => return Ok(None),
         Ok(_) => {}
@@ -959,6 +961,36 @@ mod fresh_read_contract_tests {
             behind: None,
         }
     }
+    #[test]
+    fn ui_read_queues_directory_checks_and_returns_cached_value_while_waiting() {
+        let (service, requests) = service(1);
+        let path = std::env::temp_dir()
+            .join(format!("git-meta-ui-{}", uuid::Uuid::new_v4()))
+            .join("not-created");
+        service
+            .cache
+            .lock()
+            .unwrap()
+            .insert(path.clone(), Some(meta()));
+
+        // Directory existence is the worker's concern: even a missing path
+        // must reach it, rather than stat-ing a potentially stalled mount on
+        // the UI thread before the bounded wait has started.
+        assert_eq!(read_with_service(&path, &service), Some(meta()));
+        assert_eq!(requests.try_recv().unwrap(), path);
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn worker_rejects_missing_paths_and_regular_files_without_running_git() {
+        let path = std::env::temp_dir().join(format!("git-meta-file-{}", uuid::Uuid::new_v4()));
+        assert_eq!(read_uncached(&path), Ok(None));
+        std::fs::write(&path, b"not a directory").unwrap();
+        let result = read_uncached(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(result, Ok(None));
+    }
+
     #[test]
     fn fresh_admission_cannot_adopt_an_older_in_flight_probe() {
         let (service, requests) = service(1);

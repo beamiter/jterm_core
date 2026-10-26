@@ -26,6 +26,9 @@ use super::MAX_WORKFLOW_FIELD_BYTES;
 /// A query is one line a person types, not a document. Bounding it bounds the
 /// per-entry fuzzy match, which is otherwise linear in query length.
 pub const MAX_PICKER_QUERY_BYTES: usize = MAX_WORKFLOW_FIELD_BYTES;
+/// Limit the dynamic-programming work for one candidate. Longer inputs still
+/// match through Skim's linear scorer, including text after a long template.
+const MAX_PICKER_SCORE_CELLS: usize = 64 * 1024;
 
 /// What this app's picker searches and how much of it it shows.
 ///
@@ -201,24 +204,42 @@ impl WorkflowPicker {
 
     /// Recompute the drawn-order index once, when the query changes.
     fn rebuild_filtered(&mut self) {
+        if self.policy.max_results == 0 {
+            self.filtered_indices.clear();
+            return;
+        }
         if self.query.is_empty() {
             self.filtered_indices = (0..self.entries.len())
                 .take(self.policy.max_results)
                 .collect();
             return;
         }
+        // Score-only Skim stores two rows, so its allocation limit alone does
+        // not bound work for a long pattern. Scale the allowed columns by the
+        // query length as well; the fallback preserves full-text matching.
+        let columns = (MAX_PICKER_SCORE_CELLS / self.query.chars().count().max(1)).max(1);
+        self.matcher = std::mem::take(&mut self.matcher).element_limit(2 * columns);
+        let mut haystack = String::new();
         let mut scored: Vec<(i64, usize)> = self
             .entries
             .iter()
             .enumerate()
             .filter_map(|(index, workflow)| {
+                self.write_haystack(workflow, &mut haystack);
                 self.matcher
-                    .fuzzy_match(&self.haystack(workflow), &self.query)
+                    .fuzzy_match(&haystack, &self.query)
                     .map(|score| (score, index))
             })
             .collect();
-        // Stable sorting retains library order for equal fuzzy scores.
-        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        // Index is the stable tie-breaker from the original full stable sort.
+        // Partition before sorting so hidden matches do not add sorting work.
+        let compare =
+            |a: &(i64, usize), b: &(i64, usize)| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1));
+        if scored.len() > self.policy.max_results {
+            scored.select_nth_unstable_by(self.policy.max_results, compare);
+            scored.truncate(self.policy.max_results);
+        }
+        scored.sort_unstable_by(compare);
         self.filtered_indices = scored
             .into_iter()
             .take(self.policy.max_results)
@@ -228,8 +249,8 @@ impl WorkflowPicker {
 
     /// Name, description and tags — plus the command template when the policy
     /// says so.
-    fn haystack(&self, workflow: &Workflow) -> String {
-        let mut haystack = String::with_capacity(workflow.name.len() + workflow.description.len());
+    fn write_haystack(&self, workflow: &Workflow, haystack: &mut String) {
+        haystack.clear();
         haystack.push_str(&workflow.name);
         if !workflow.description.is_empty() {
             haystack.push(' ');
@@ -243,7 +264,6 @@ impl WorkflowPicker {
             haystack.push(' ');
             haystack.push_str(&workflow.command);
         }
-        haystack
     }
 
     /// Move the highlight down, wrapping within the drawn rows.
@@ -350,6 +370,80 @@ mod tests {
         assert_eq!(names(&picker), ["deploy"]);
         picker.set_query("git");
         assert_eq!(names(&picker), ["rebase"]);
+    }
+
+    #[test]
+    fn bounded_ranking_keeps_short_query_scores_and_library_order_ties() {
+        let entries = (0..256)
+            .map(|index| {
+                described(
+                    &format!("workflow-{index:03}"),
+                    if index % 3 == 0 {
+                        "deploy 中文 service"
+                    } else {
+                        "development tools"
+                    },
+                    &["ops"],
+                )
+            })
+            .collect::<Vec<_>>();
+        for query in ["deploy", "dev", "中文", "ops"] {
+            let matcher = SkimMatcherV2::default();
+            let mut expected = entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, workflow)| {
+                    let text = format!(
+                        "{} {} {}",
+                        workflow.name,
+                        workflow.description,
+                        workflow.tags.join(" ")
+                    );
+                    matcher
+                        .fuzzy_match(&text, query)
+                        .map(|score| (score, index))
+                })
+                .collect::<Vec<_>>();
+            expected.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            for limit in [0, 1, 2, 15, 255, 256, 300] {
+                let mut picker =
+                    WorkflowPicker::new(entries.clone(), PickerPolicy::new(limit, false));
+                picker.set_query(query);
+                assert_eq!(
+                    picker.filtered_indices,
+                    expected
+                        .iter()
+                        .take(limit)
+                        .map(|(_, index)| *index)
+                        .collect::<Vec<_>>(),
+                    "query={query:?}, limit={limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_queries_match_the_full_template_and_keep_the_command_search_policy() {
+        for query in [
+            "ab".repeat(MAX_PICKER_QUERY_BYTES / 2),
+            "界".repeat(MAX_PICKER_QUERY_BYTES / 3),
+        ] {
+            let command = format!("echo {} {query}", "x".repeat(40_000));
+            let entries = vec![workflow("Long template", &command, &[])];
+            let mut metadata_only =
+                WorkflowPicker::new(entries.clone(), PickerPolicy::new(15, false));
+            metadata_only.set_query(query.clone());
+            assert!(metadata_only.filtered().is_empty());
+
+            let mut picker = WorkflowPicker::new(entries, PickerPolicy::new(15, true));
+            picker.set_query(query.clone());
+            assert_eq!(picker.query(), query);
+            assert_eq!(picker.selected_workflow().unwrap().command, command);
+            picker.set_query("Long");
+            assert_eq!(names(&picker), ["Long template"]);
+            picker.set_query("not-present");
+            assert!(picker.filtered().is_empty());
+        }
     }
 
     #[test]

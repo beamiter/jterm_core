@@ -282,7 +282,10 @@ returns to Vim. Refresh after creating files outside the workbench. Scanning
 is bounded to 20,000 files, 16 MiB of retained path text and 15 seconds;
 partial results and failures are reported. No recursive I/O runs in a render
 callback, snapshots share immutable file lists, and ranking is recalculated
-only when the query or index changes. Install ripgrep for Quick Open.
+only when the query or index changes. Broad queries select the best candidates
+before sorting the displayed results (at most 256), retaining the same filename
+priority and deterministic order without sorting every matching path.
+Install ripgrep for Quick Open.
 
 Quick Open also accepts `path:line[:byte-column]`, including fuzzy paths such as
 `src/mrs:42:8` and indexed absolute paths copied from a diagnostic. Enter
