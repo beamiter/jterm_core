@@ -144,12 +144,33 @@ impl CanvasMotion {
     }
 
     /// Rebase coordinates after content above the reading anchor is inserted,
-    /// removed or remeasured. Update bounds first. Moving both coordinates by
+    /// removed or remeasured within the current bounds. Moving both coordinates by
     /// the same amount preserves the on-screen anchor and ongoing trajectory.
+    /// If the bounds also change, use [`Self::rebase`] to avoid an intermediate
+    /// clamp against either the old or the new extent.
     pub fn shift(&mut self, delta: f64) {
         if !delta.is_finite() || delta == 0.0 {
             return;
         }
+        let delta = delta.clamp(-Self::MAX_COORDINATE, Self::MAX_COORDINATE);
+        self.position = self.clamp(self.position + delta);
+        self.target = self.clamp(self.target + delta);
+        self.reconcile_direction();
+    }
+
+    /// Atomically update layout bounds and rebase a reading anchor.
+    ///
+    /// Unlike `set_bounds` followed by `shift`, this translates the old
+    /// coordinates before clamping them to the new extent. Otherwise removing
+    /// a prefix near the document end can clamp first and subtract the removed
+    /// height a second time, visibly jumping away from the reading anchor.
+    /// Invalid geometry leaves the entire previous state unchanged.
+    pub fn rebase(&mut self, lower: f64, upper: f64, delta: f64) {
+        if !lower.is_finite() || !upper.is_finite() || lower > upper || !delta.is_finite() {
+            return;
+        }
+        self.lower = lower.clamp(-Self::MAX_COORDINATE, Self::MAX_COORDINATE);
+        self.upper = upper.clamp(-Self::MAX_COORDINATE, Self::MAX_COORDINATE);
         let delta = delta.clamp(-Self::MAX_COORDINATE, Self::MAX_COORDINATE);
         self.position = self.clamp(self.position + delta);
         self.target = self.clamp(self.target + delta);
@@ -349,6 +370,71 @@ mod tests {
         assert!((anchor_document_y + 200.0 - motion.position() - screen_y).abs() < 1e-10);
         assert!((motion.target() - motion.position() - pending).abs() < 1e-10);
         assert_eq!(motion.velocity(), velocity);
+    }
+
+    #[test]
+    fn prefix_removal_rebases_before_clamping_the_smaller_extent() {
+        let mut motion = bounded(9_900.25);
+        motion.set_target(9_950.5);
+        motion.advance(0.01);
+        let before = motion.position();
+        let pending = motion.target() - before;
+        let velocity = motion.velocity();
+        motion.rebase(0.0, 9_000.0, -1_000.0);
+        assert_eq!(motion.position(), before - 1_000.0);
+        assert_eq!(motion.target(), 8_950.5);
+        assert!((motion.target() - motion.position() - pending).abs() < 1e-9);
+        assert_eq!(motion.velocity(), velocity);
+    }
+
+    #[test]
+    fn prefix_insertion_rebases_into_expanded_bounds_without_old_extent_clamp() {
+        let mut motion = bounded(9_900.25);
+        motion.rebase(0.0, 11_000.0, 1_000.0);
+        assert_eq!(motion.position(), 10_900.25);
+        assert_eq!(motion.target(), 10_900.25);
+        assert!(!motion.is_animating());
+    }
+
+    #[test]
+    fn rebase_clamps_removed_anchors_and_rejects_invalid_updates_atomically() {
+        let mut motion = bounded(10.25);
+        motion.rebase(0.0, 9_000.0, -100.0);
+        assert_eq!(motion.position(), 0.0);
+        assert!(!motion.is_animating());
+        for (lower, upper, delta) in [
+            (100.0, 0.0, 10.0),
+            (f64::NAN, 1.0, 10.0),
+            (0.0, f64::INFINITY, 10.0),
+            (0.0, 1.0, f64::NAN),
+        ] {
+            motion.rebase(lower, upper, delta);
+            assert_eq!(motion.position(), 0.0);
+            assert_eq!(motion.target(), 0.0);
+        }
+        motion.jump_to(8_999.25);
+        assert_eq!(
+            motion.position(),
+            8_999.25,
+            "invalid update must retain bounds"
+        );
+    }
+
+    #[test]
+    fn rebased_animation_matches_untrimmed_trajectory_at_each_frame() {
+        let mut reference = bounded(9_000.25);
+        reference.set_target(9_700.5);
+        let mut trimmed = reference.clone();
+        for frame in 0..120 {
+            if frame == 3 {
+                trimmed.rebase(0.0, 9_000.0, -1_000.0);
+            }
+            let reference_position = reference.advance(1.0 / 120.0);
+            let trimmed_position = trimmed.advance(1.0 / 120.0);
+            let delta = if frame >= 3 { 1_000.0 } else { 0.0 };
+            assert!((reference_position - trimmed_position - delta).abs() < 1e-9);
+            assert_eq!(reference.is_animating(), trimmed.is_animating());
+        }
     }
 
     #[test]

@@ -58,7 +58,7 @@ settles the old destination instead of replaying a hidden tab's motion.
 | Precision touchpad or scrollbar | `jump_to(position + pixel_delta)` | Deliver exact pixels; do not double-apply native momentum |
 | New live output | `set_target(live_edge)` | Retarget only while following; publish changed layout |
 | Reading interruption | `cancel()` or direct input | Keep the current anchor; do not infer follow from animation lag |
-| Content above the anchor changes | `shift(delta)` | Reconcile stable row identity and bounds in layout order |
+| Content above the anchor changes | `rebase(lower, upper, delta)` | Translate the stable reading anchor before clamping to the new bounds |
 | Resize or bounded-history trimming | `set_bounds(lower, upper)` | Preserve the existing semantic anchor before clamping |
 | Desktop reduced motion | `set_reduced_motion(true)` | Observe the toolkit's preference |
 | Native frame | `advance(dt)` | Request another frame only if `is_animating()` |
@@ -68,6 +68,19 @@ unchanged target never extends the animation. `jump_to` and `cancel` retain
 fractional pixels. A reversed discrete wheel discards movement that was queued
 in the opposite direction but has not been presented. Collapsing content and
 rewritten progress lines cannot make a fast spring overshoot its new target.
+
+When trimming a prefix, retain the pre-mutation reading coordinates and call
+`rebase` with the new bounds and removed-height delta. Calling `set_bounds`
+before `shift` can clamp a reader near the old bottom and then subtract the
+removed height again. A native adjustment may already have clamped itself by
+the time widgets are removed, so adapters must capture the motion before that
+mutation. `shift` remains suitable when the bounds are unchanged.
+
+Viewport resize and font zoom retain a reading anchor's fractional row
+position, not only its integer projection. A reader less than one row above
+the live edge still owns history; a zero integer offset must not silently
+restore live following. Reflow retires obsolete wheel destinations rather
+than applying old geometry's queued movement to the new layout.
 
 ## Native adapters
 
