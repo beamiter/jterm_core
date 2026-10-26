@@ -20,8 +20,10 @@ jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", re
 crossbeam-channel = "0.5"
 # The agent_task worktree/session machinery: shared locks and the ids that
 # name isolated Codex homes and systemd scopes.
-parking_lot = "0.13"
-uuid = { version = "1", features = ["v4", "serde"] }
+# Rust 1.86 MSRV: parking_lot 0.13 / lock_api 0.5 require Rust 1.95.
+parking_lot = "0.12"
+# uuid 1.27+ requires Rust 1.89; keep the last MSRV-compatible minor.
+uuid = { version = "~1.26.0", features = ["v4", "serde"] }
 libc = "0.2.189"
 log = "0.4"
 lru = "0.19"

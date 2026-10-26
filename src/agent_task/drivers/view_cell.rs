@@ -148,4 +148,49 @@ mod tests {
         }
         assert!(first.revision() > changed);
     }
+
+    #[test]
+    fn contended_view_publication_keeps_snapshot_and_revision_consistent() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+        let view = Arc::new(ViewCell::new(CodexAppServerViewSnapshot::default()));
+        let start = Arc::new(Barrier::new(5));
+        let (done, completed) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let view = view.clone();
+            let start = start.clone();
+            let done = done.clone();
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..500 {
+                    view.lock().agent_text.push('x');
+                    std::thread::yield_now();
+                }
+                done.send(()).unwrap();
+            }));
+        }
+        start.wait();
+        let mut previous = view.snapshot();
+        for _ in 0..2000 {
+            let current = view.snapshot();
+            assert!(current.0 >= previous.0);
+            assert!(current.1.agent_text.len() >= previous.1.agent_text.len());
+            if current.1.agent_text.len() != previous.1.agent_text.len() {
+                assert!(current.0 > previous.0);
+            }
+            previous = current;
+            std::thread::yield_now();
+        }
+        for _ in 0..4 {
+            completed.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(view.snapshot().1.agent_text.len(), 2000);
+        // A replacement runtime cannot reuse the retired view's revision.
+        let replacement = ViewCell::new(view.snapshot().1);
+        assert!(replacement.revision() > view.revision());
+    }
 }

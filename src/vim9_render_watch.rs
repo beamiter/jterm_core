@@ -350,4 +350,36 @@ mod tests {
         cancel.cancel();
         assert!(worker.join().unwrap());
     }
+
+    #[test]
+    fn contended_blocking_publication_and_close_do_not_lose_wakeups() {
+        let mut publisher = Publisher::default();
+        let mut watch = publisher.subscribe(None).unwrap();
+        watch.recv();
+        let (ack, received) = std::sync::mpsc::channel();
+        let consumer = std::thread::spawn(move || {
+            for expected in 1..=1000 {
+                let update = watch.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(update.generation, expected);
+                ack.send(()).unwrap();
+            }
+            assert_eq!(
+                watch
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .generation,
+                1001
+            );
+            assert!(matches!(
+                watch.recv_timeout(Duration::from_secs(10)),
+                Err(Vim9RenderWaitError::Closed)
+            ));
+        });
+        for _ in 0..1000 {
+            dispatch(publisher.publish(None, false));
+            received.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        dispatch(publisher.publish(None, true));
+        consumer.join().unwrap();
+    }
 }
