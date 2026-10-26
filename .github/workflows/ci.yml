@@ -58,7 +58,8 @@ jobs:
           shared-key: test-${{ matrix.rust }}
       - name: Install test prerequisites
         run: sudo apt-get update && sudo apt-get install -y curl minisign vim-nox ripgrep
-      - run: cargo test --locked --all-targets
+      - run: cargo check --locked --all-targets --all-features
+      - run: cargo test --locked --all-targets --all-features
       - name: Real Vim9 editor and project workflow
         run: |
           python3 runtime/vim9/test_bridge.py

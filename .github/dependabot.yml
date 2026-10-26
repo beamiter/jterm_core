@@ -6,6 +6,12 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    # Keep MSRV-incompatible releases out of routine grouped updates.
+    ignore:
+      - dependency-name: parking_lot
+        versions: [">=0.13"]
+      - dependency-name: uuid
+        versions: [">=1.27"]
     groups:
       rust-dependencies:
         patterns:
