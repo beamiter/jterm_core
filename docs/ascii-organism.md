@@ -5,6 +5,48 @@ Native adapters report actual command lifecycle events and paint the resulting
 state. A facial expression or a quiet output stream never establishes success,
 failure, completion or a new command.
 
+## One life per GUI
+
+The companion belongs to the GUI, not to a block, split or status card. All
+native surfaces must use `organism_companion::CompanionSurface` to choose
+exactly one representation: `Body`, `Compact`, or `Hidden`. A compact glyph is
+a replacement for the body, never an additional pet. Full, Calm and Static
+motion use the same ownership rule. Ineligible/remote/read-only/alternate-screen
+hosts cannot keep a passive duplicate after losing ownership.
+
+Window life, ambient mind, voice and care clock live outside pane state.
+Pane-local reducers still track their own authoritative command and repository
+facts. Switching panes changes the companion's immediate context and geometry;
+it does not create a new personality or reset its care interval. Old surfaces
+are cleared as part of the ownership handoff, before a new one appears.
+
+Block/Chat no longer need a permanent organism status row. Detail views and
+tooltips explain the live body in text. Settings pose galleries are explicitly
+examples, and must not run a second live companion behind their modal view.
+
+## A voice and optional gentle reminders
+
+`CompanionVoice` provides four authored styles (Gentle, Curious, Playful and
+Steadfast), context-aware Hello/Company replies, three rotating short stories
+per style, and Rest replies. A stable host key can keep its style across
+restarts; no key text is retained. These are local authored replies, not an
+LLM chat service. Replies never change a command result, earn growth, dispatch
+an agent, or diagnose the human's feelings. A running command remains running
+when the user asks to rest.
+
+`CompanionCare` is optional and disabled by default. It uses the existing
+window heartbeat and sampled foreground activity, without collecting keys or
+terminal text. After 45 minutes of such activity it may offer one text prompt:
+water, a comfortable stretch, or looking away from the screen. The host only
+allows an offer in a quiet, available surface. Prompts never accumulate into a
+notification queue. A five-minute absence or long suspend resets the interval;
+Snooze postpones an offer for 20 minutes; Rest acknowledges a pause without
+claiming the user performed a health-related action. Motion preference does
+not enable reminders. The host's explicit care preference does.
+
+See [the companion evolution contract](companion-evolution.md) for the current
+GUI boundary and the future cross-terminal/JWM ownership model.
+
 ## A body with pauses and small actions
 
 Full motion uses short, weighted visual clips within the existing three-row

@@ -1,5 +1,26 @@
 # Engineering handoff
 
+## 2026-10-26 — one GUI companion, a voice and gentle care
+
+- Added toolkit-independent `organism_companion`: mutually exclusive
+  Hidden/Body/Compact presentation, four stable host-seeded authored voices,
+  context-aware Hello/Company/Story/Rest replies and optional care timing.
+- Window hosts own life, ambient mind, voice and care. Pane-local command and
+  repo reducers remain authoritative. Frontends remove duplicated Block/Chat
+  cards, gate all fallback bodies by ownership, and retain Static as a pose
+  of the same body. Inspectors use text rather than another live portrait.
+- Care defaults off, counts only sampled active foreground time, offers at
+  most one prompt per 45 minutes, supports a 20-minute snooze and resets after
+  five minutes away or a long scheduling gap. It neither reads terminal text
+  nor infers the human's health or emotions.
+- Existing organism memory formats and agent controls are unchanged. This is
+  GUI-local uniqueness; a cross-process residence coordinator and JWM host are
+  specified in `docs/companion-evolution.md`, not claimed as implemented.
+- Validation: `cargo test --locked --offline --lib organism` — 323 passed
+  (11 new companion contracts), zero failures; `cargo clippy --locked --offline
+  --all-targets -- -D warnings`, rustfmt and `git diff --check` passed. Frontend
+  rendering and toolkit acceptance are recorded in their own handoffs.
+
 ## 2026-10-26 — native pointer and guides on wrapped rows, encoder speedup
 
 - Wrapped splits keep `native_pointer`: continuation rows carry exact source

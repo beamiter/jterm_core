@@ -1861,8 +1861,8 @@ impl Default for AmbientMind {
 }
 
 impl AmbientMind {
-    /// A per-body seed so split-window bodies do not nap and pace in perfect
-    /// lockstep. Any seed works; zero is displaced so xorshift never sticks.
+    /// A companion seed, owned at GUI scope rather than independently by each
+    /// split. Any seed works; zero is displaced so xorshift never sticks.
     pub fn seeded(seed: u64) -> Self {
         Self {
             seed: (seed | 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
