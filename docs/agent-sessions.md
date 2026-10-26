@@ -86,12 +86,12 @@ It is a presentation of current evidence, not a synthetic lifecycle history or
 an action capability. Frontends may additionally display actual retained native
 turn/file history and its truncation indicators.
 
-Authored goals are retained in the running task. Existing frontend recovery
-journals intentionally omit task instructions and terminal output; this upgrade
-does not silently widen that persistence contract. To continue authored work
-after restart, re-enter the goal in a new task; recovery can still expose the
-retained worktree metadata. The session library
-continues to store organization only, never authored task goals.
+Authored goals now have private, versioned [task checkpoints](agent-task-recovery.md).
+Restart reopens the original task identity, goal and historical execution facts
+without starting a provider. Continuing work requires an explicit Start/Open and
+fresh runtime preflight. Legacy creation journals and captured-command tasks do
+not gain missing instructions retroactively. The session library still stores
+organization only, never authored task goals.
 
 ## Discovery and presentation
 

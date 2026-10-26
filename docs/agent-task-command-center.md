@@ -153,9 +153,10 @@ task operations. Wide panels show independent scrolling panes; narrow panels
 switch between the list and the selected task. Actions and current requests
 precede retained history. Hidden inspectors cannot dispatch stale task actions.
 
-This change retains the existing persistence contract. Task instructions and
-runtime transcripts are not newly written into recovery journals. See the
-project-task recovery limitations in [CLI agent sessions](agent-sessions.md).
+Authored project tasks use the shared [versioned checkpoint store](agent-task-recovery.md).
+The original goal, task identity and historical state survive restart. Runtime
+transcripts and approvals are excluded, and reopening never executes a task.
+The separate legacy creation journals retain their original schema.
 
 ## Hidden tasks and restore
 

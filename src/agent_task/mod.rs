@@ -63,6 +63,7 @@ pub mod launcher;
 pub mod native;
 pub mod pinned_dir;
 pub mod query;
+pub mod recovery;
 pub mod replay_text;
 pub mod runtime;
 pub mod task;

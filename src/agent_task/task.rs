@@ -364,6 +364,7 @@ impl AgentTask {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskError {
+    Recovery(String),
     InvalidTitle,
     InvalidBranch,
     InvalidBaseCommit,
@@ -427,6 +428,7 @@ pub enum TaskError {
 impl fmt::Display for TaskError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Recovery(message) => write!(formatter, "Task recovery: {message}"),
             Self::InvalidTitle => {
                 formatter.write_str("task title is empty, too long, or contains control characters")
             }
@@ -553,6 +555,10 @@ impl std::error::Error for TaskError {}
 /// Runtime task registry and stable task↔PTY lookup table.
 #[derive(Debug, Default)]
 pub struct TaskManager {
+    recovery_store: Option<super::recovery::TaskRecoveryStore>,
+    recovery_error: Option<String>,
+    recovery_notice: Option<String>,
+    recovery_unavailable: HashSet<TaskId>,
     tasks: Vec<AgentTask>,
     task_indices: HashMap<TaskId, usize>,
     tasks_by_terminal_session: HashMap<String, TaskId>,
@@ -573,6 +579,74 @@ struct NativeEventStreamState {
 impl TaskManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Restore private authored checkpoints as inert task rows. Does not start
+    /// any provider, validation, terminal or approval. Existing runtime gates
+    /// still require a separate user action. I/O belongs on host initialization.
+    pub fn with_recovery() -> Self {
+        let result = dirs::data_local_dir()
+            .ok_or_else(|| "Cannot locate task data directory".to_string())
+            .and_then(|directory| {
+                let root = directory.join(super::app_slug()).join("agent-tasks");
+                super::WorktreeService::new(&root).map_err(|e| e.to_string())?;
+                Self::with_recovery_at(&root)
+            });
+        result.unwrap_or_else(|error| {
+            log::error!("Task recovery unavailable: {error}");
+            Self {
+                recovery_notice: Some(error.clone()),
+                recovery_error: Some(error),
+                ..Self::default()
+            }
+        })
+    }
+
+    pub fn with_recovery_at(root: &std::path::Path) -> Result<Self, String> {
+        let store = super::recovery::TaskRecoveryStore::open(root).map_err(|e| e.to_string())?;
+        let mut manager = Self::new();
+        for record in store.records() {
+            if store.reopen(record.id, &mut manager).is_err() {
+                manager.insert_recovered(record.unavailable_projection())?;
+                manager.recovery_unavailable.insert(record.id);
+                manager.recovery_notice = Some("Some saved tasks have unavailable worktrees. Their goals are visible, but continuation is disabled.".into());
+            }
+        }
+        manager.recovery_store = Some(store);
+        Ok(manager)
+    }
+
+    pub fn take_recovery_notice(&mut self) -> Option<String> {
+        self.recovery_notice.take()
+    }
+
+    pub fn recovery_error(&self) -> Option<&str> {
+        self.recovery_error.as_deref()
+    }
+
+    /// Called by host lifecycle ticks after applying runtime events. Creation
+    /// is saved synchronously before registration; later summaries are bounded
+    /// by the host tick cadence. No terminal output is included.
+    pub fn checkpoint_recovery(&mut self) {
+        let Some(store) = self.recovery_store.as_mut() else {
+            return;
+        };
+        for task in self
+            .tasks
+            .iter()
+            .filter(|task| task.brief.is_some() && !self.recovery_unavailable.contains(&task.id))
+        {
+            if let Err(error) = store.checkpoint(task) {
+                let message = error.to_string();
+                if self.recovery_error.as_ref() != Some(&message) {
+                    log::error!("Task checkpoint failed: {message}");
+                    self.recovery_notice = Some(message.clone());
+                }
+                self.recovery_error = Some(message);
+                return;
+            }
+        }
+        self.recovery_error = None;
     }
 
     pub fn create(&mut self, new_task: NewTask) -> Result<TaskId, TaskError> {
@@ -627,6 +701,38 @@ impl TaskManager {
             updated_at_ms: now,
             archived_from: None,
         };
+        if task.brief.is_some() {
+            if let Some(error) = &self.recovery_error {
+                return Err(TaskError::Recovery(error.clone()));
+            }
+            if let Some(store) = self.recovery_store.as_mut() {
+                store
+                    .checkpoint(&task)
+                    .map_err(|error| TaskError::Recovery(error.to_string()))?;
+            }
+        }
+        self.task_indices.insert(id, self.tasks.len());
+        self.tasks.push(task);
+        Ok(id)
+    }
+
+    /// Insert a recovery projection without restoring any runtime authority.
+    /// Only the recovery module can construct this projection after verification.
+    pub(super) fn insert_recovered(&mut self, task: AgentTask) -> Result<TaskId, String> {
+        if let Some(existing) = self.get(task.id) {
+            if existing == &task {
+                return Ok(task.id);
+            }
+            return Err("Task identity is already registered with different state".into());
+        }
+        if self
+            .tasks
+            .iter()
+            .any(|old| old.worktree_path == task.worktree_path)
+        {
+            return Err("Worktree is already attached to another task".into());
+        }
+        let id = task.id;
         self.task_indices.insert(id, self.tasks.len());
         self.tasks.push(task);
         Ok(id)
@@ -1720,7 +1826,7 @@ impl TaskManager {
     }
 }
 
-fn validate_new_task(task: &NewTask) -> Result<(), TaskError> {
+pub(super) fn validate_new_task(task: &NewTask) -> Result<(), TaskError> {
     let title = task.title.trim();
     if title.is_empty() || title.len() > MAX_TASK_TITLE_BYTES || title.chars().any(char::is_control)
     {
