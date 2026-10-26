@@ -24,6 +24,10 @@
 - The opt-in native acceptance script also checks that adding a second short
   command leaves the first output at the same screen Y. Short histories grow
   from the top of the canvas; spare Chat space sits before the fixed composer.
+- Native input is paced and acknowledged by the fixture shell. Wheel dispatch
+  has no trailing 100 ms delay, so sampling includes the initial painted frames.
+  This avoids accepting a partial command history or missing the start of a
+  short animation when the software-rendering event loop is under load.
 
 ## 2026-10-26 — one GUI companion, a voice and gentle care
 

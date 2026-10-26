@@ -110,6 +110,10 @@ a frame-time benchmark.
 `scripts/native-transcript-canvas-smoke.py` additionally opens a built frontend
 in a private Xvfb display with a synthetic Bash/OSC profile, creates 18 real
 command/output pairs and injects an X11 wheel event over transcript text. It
+paces real keyboard input and waits for the shell's command sequence to finish,
+so a slow software renderer cannot silently turn the fixture into partial
+commands. Wheel press/release is dispatched without a post-event delay, keeping
+the initial animation frames inside the sampling window. It
 first checks that the first output keeps the same screen Y when the second
 short command is added, with separate screenshots of both states. It then
 samples actual displayed marker pixels through the motion, checks for at least

@@ -48,6 +48,7 @@ def main():
         RUST_LOG="warn",
         SHELL="/bin/bash",
         LANG="C.UTF-8",
+        CANVAS_PROBE_READY=str(out / "shell-ready"),
     )
     config_dir = Path(env["XDG_CONFIG_HOME"]) / args.app
     config_dir.mkdir(parents=True)
@@ -69,6 +70,9 @@ unset HISTCONTROL HISTIGNORE HISTTIMEFORMAT
 __canvas_running=0
 __canvas_ready=0
 __canvas_sequence=0
+canvas_sample() {
+    printf '\033[38;2;241;88;200mCANVAS ANCHOR %02d  continuous native transcript\033[0m\n' "$1"
+}
 __canvas_start() {
     [[ $__canvas_ready == 1 && $BASH_COMMAND != __canvas_prompt ]] || return
     __canvas_ready=0
@@ -94,6 +98,7 @@ __canvas_prompt() {
     __canvas_running=0
     printf '\e]133;A\a'
     __canvas_ready=1
+    printf '%s\n' "$__canvas_sequence" > "$CANVAS_PROBE_READY"
 }
 PROMPT_COMMAND=__canvas_prompt
 PS0=''
@@ -115,6 +120,14 @@ trap '__canvas_start' DEBUG
         if name:
             frame.save(out / (name + ".png"))
         return frame
+    def wait_for_prompt(sequence):
+        deadline = time.monotonic() + 10
+        ready = out / "shell-ready"
+        while time.monotonic() < deadline:
+            if ready.exists() and ready.read_text().strip() == str(sequence):
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"shell did not finish command {sequence}; see app.log")
     def marker_mask(frame):
         a = np.asarray(frame)[90:600, 140:940, :3].astype(np.int16)
         return ((a[:, :, 0] > 165) & (a[:, :, 2] > 120) &
@@ -160,14 +173,15 @@ trap '__canvas_start' DEBUG
         run("xdotool", "windowmove", window, "0", "0")
         run("xdotool", "windowsize", window, "1100", "760")
         run("xdotool", "windowfocus", "--sync", window)
+        wait_for_prompt(0)
         time.sleep(0.7)
         capture("startup")
         short_positions = []
         for i in range(18):
-            command = ("printf '\\033[38;2;241;88;200mCANVAS ANCHOR "
-                       f"{i:02d}  continuous native transcript\\033[0m\\n'" )
-            run("xdotool", "type", "--clearmodifiers", "--delay", "1", "--", command)
+            command = f"canvas_sample {i}"
+            run("xdotool", "type", "--clearmodifiers", "--delay", "10", "--", command)
             run("xdotool", "key", "--clearmodifiers", "Return")
+            wait_for_prompt(i + 1)
             time.sleep(0.09)
             if i < 2:
                 time.sleep(0.35)
@@ -190,7 +204,8 @@ trap '__canvas_start' DEBUG
         frames = []
         samples = []
         start = time.monotonic()
-        run("xdotool", "click", "4")
+        # xdotool click sleeps 100 ms after dispatch, hiding the first frames.
+        run("xdotool", "mousedown", "4", "mouseup", "4")
         for i in range(35):
             frame = capture()
             signature, count = marker_signature(frame)
