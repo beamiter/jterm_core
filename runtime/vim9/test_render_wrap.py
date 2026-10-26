@@ -116,7 +116,7 @@ class RenderWrapTests(unittest.TestCase):
         self.assertEqual(window["wrap_parts"][:6], [0, 0, 1, 2, 0, 0])
         self.assertEqual(window["wrap_rows"][1], 3)
         self.assertEqual(window["skipcol"], 0)
-        self.assertFalse(window["native_pointer"])
+        self.assertFalse(window["native_pointer"], "mouse= keeps clicks with Vim")
         self.assertTrue(window["native_scroll"])
         row = window["view"]["row"]
         # CursorLineNr and CursorLine cover every row of the wrapped cursor line.
@@ -128,14 +128,49 @@ class RenderWrapTests(unittest.TestCase):
         self.assertEqual(sorted({r["row"] - row for r in runs if r["text"].strip()}), [1, 2, 3])
         self.assertEqual(max(r["byte_end"] for r in runs), 70)
 
+    def test_native_pointer_targets_continuation_rows(self):
+        e = self.editor
+        e.ex("set mouse=a scrolloff=0")
+        text = "".join(f"{n:02d}界" for n in range(20))
+        self.lines("short", text, "tail")
+        frame = self.native()
+        window = self.window(frame)
+        self.assertGreater(window["wrap_rows"][1], 2)
+        self.assertTrue(window["native_pointer"], "continuation rows carry exact source bytes")
+        row = window["view"]["row"]
+        part1 = min((r for r in frame["runs"] if r["window"] == frame["window"] and r["line"] == 2
+                     and r["row"] == row + 2 and r["byte_end"] > r["byte_start"]),
+                    key=lambda r: r["column"])
+        source = {key: window[key] for key in ("window", "buffer", "changedtick")}
+        start = part1["byte_start"]
+        for phase in ("press", "release"):
+            e.request("pointer", **source, phase=phase, gesture=1, line=2, byte_column=start)
+        state = e.snapshot()
+        self.assertEqual((state["line"], state["mode"]), (2, "n"))
+        e.ex("call writefile([string(col('.') - 1)], 'pointer-col.txt')")
+        self.assertEqual(int((self.root / "pointer-col.txt").read_text()), start)
+        # A drag from the first row to the last part is Vim's own Visual mode.
+        end = len(text.encode()) - 5
+        e.request("pointer", **source, phase="press", gesture=2, line=2, byte_column=0)
+        e.request("pointer", **source, phase="drag", gesture=2, line=2, byte_column=end)
+        e.request("pointer", **source, phase="release", gesture=2, line=2, byte_column=end)
+        self.assertEqual(e.snapshot()["mode"], "v")
+        e.keys("y")
+        e.state_where(lambda state: state["mode"] == "n")
+        e.ex("call writefile([getreg('\"')], 'pointer-yank.txt')")
+        self.assertEqual((self.root / "pointer-yank.txt").read_text(encoding="utf-8").strip(),
+                         text.encode()[:end + 1].decode())
+
     def test_inactive_split_and_closed_folds_between_wrapped_lines(self):
         e = self.editor
-        e.ex("set number relativenumber cursorline")
+        e.ex("set number relativenumber cursorline mouse=a")
         self.lines("first", "abcdefghij" * 9, *[f"fold {n}" for n in range(3, 9)], "abcdefghij" * 5, "tail")
         e.ex("3,8fold | normal! gg")
         frame, screen = self.assert_screen()
         window = self.window(frame)
         self.assertIn(8, window["fold_ends"])
+        self.assertFalse(window["native_pointer"], "Vim owns clicks while fold rows are visible")
+        self.assertTrue(next(w for w in frame["windows"] if w["window"] != frame["window"])["native_pointer"])
         self.assertEqual(window["display_lines"][:6], [1, 2, 2, 2, 2, 3])
         self.assertEqual(window["wrap_parts"][5], 0)
         other = next(w for w in frame["windows"] if w["window"] != frame["window"])
@@ -267,6 +302,70 @@ class RenderWrapTests(unittest.TestCase):
         other, vim_other = self.attr_groups(frame, screen, row, range(0, 3))
         self.assertEqual(vim[0] == vim_other[0], native[0] == other[0],
                          "without cursorline the cursor row number uses LineNr")
+
+    def assert_window_partition(self, frame, screen, label, skip=()):
+        """Across the whole text area, equal Vim attributes paint equal backgrounds."""
+        window = self.window(frame)
+        view = window["view"]
+        native, vim, cells = [], [], []
+        for row in range(view["row"], view["row"] + view["rows"]):
+            columns = [c for c in range(view["column"] + window.get("textoff", 0), view["column"] + view["columns"])
+                       if (row, c) not in skip]
+            n, v = self.attr_groups(frame, screen, row, columns)
+            native += n
+            vim += v
+            cells += [(row, c) for c in columns]
+        for i in range(len(native)):
+            for j in range(i + 1, len(native)):
+                if (native[i] == native[j]) != (vim[i] == vim[j]):
+                    self.fail(f"{label}: cells {cells[i]} and {cells[j]} differ in Vim={vim[i] != vim[j]}")
+
+    def guide_highlights(self):
+        self.editor.ex("highlight ColorColumn guifg=#eeeeee guibg=#aa5500 ctermfg=15 ctermbg=9 gui=NONE cterm=NONE")
+        self.editor.ex("highlight CursorColumn guifg=#eeeeee guibg=#5500aa ctermfg=15 ctermbg=10 gui=NONE cterm=NONE")
+
+    def test_column_guides_on_wrapped_rows_match_vim(self):
+        e = self.editor
+        self.guide_highlights()
+        self.lines("short", "abcdefghij" * 7, "x" * 20, "y" * 50, "z" * 40, "wide: " + "界" * 20,
+                   "    indented words that go on and on past the edge of this window",
+                   "x" * 32 + "\tafter" + "y" * 30)
+        reset = "nolinebreak nobreakindent showbreak= breakindentopt= nonumber nocursorcolumn colorcolumn= "
+        for options in ["colorcolumn=5,40,75,100", "colorcolumn=33,34,66,67,99",
+                        "number colorcolumn=10,45,90", "colorcolumn=34,35,36,40",
+                        "cursorcolumn", "cursorcolumn colorcolumn=20,46,50",
+                        # A tab across a showbreak row keeps the compatibility view.
+                        "DELETE TAB LINE",
+                        "linebreak breakindent showbreak=>>\\  colorcolumn=29,31,34,36,38,39,70",
+                        "linebreak breakindent showbreak=>>\\  breakindentopt=sbr colorcolumn=29,31,34,36,38,39,70",
+                        "number linebreak breakindent showbreak=↪\\  colorcolumn=30,33,36,37",
+                        "linebreak showbreak=+++ cursorcolumn"]:
+            if options == "DELETE TAB LINE":
+                e.ex("$delete")
+                continue
+            e.ex("set " + reset + options + " | normal! 2G046|")
+            frame, screen = self.assert_screen()
+            self.assert_window_partition(frame, screen, options)
+
+    def test_column_guides_with_visual_search_and_smoothscroll_match_vim(self):
+        e = self.editor
+        self.guide_highlights()
+        e.ex("set hlsearch colorcolumn=3,36,40 | let @/ = 'cd'")
+        self.lines("abcdefghij" * 5, "x" * 31, "abcdefghij" * 7, "tail")
+        frame, screen = self.assert_screen()
+        self.assert_window_partition(frame, screen, "search")
+        e.keys("vj")
+        e.state_where(lambda s: s["mode"] == "v")
+        frame, screen = self.assert_screen()
+        cursor = (frame["cursor"]["row"], frame["cursor"]["column"])
+        self.assert_window_partition(frame, screen, "Visual", skip={cursor})
+        e.keys(b"\x1b")
+        e.state_where(lambda s: s["mode"] == "n")
+        e.ex("set cursorcolumn | call setline(1, map(range(1, 40), {_, n -> repeat(nr2char(97 + n % 26), 45 + n)}))")
+        e.keys("gg\x05")
+        frame = self.frame_where(lambda f: self.window(f)["skipcol"] > 0)
+        frame, screen = self.assert_screen(frame)
+        self.assert_window_partition(frame, screen, "smoothscroll")
 
     def test_older_protocols_keep_the_compatibility_view_for_wrapped_rows(self):
         self.editor.close()

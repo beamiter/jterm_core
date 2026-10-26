@@ -1,5 +1,31 @@
 # Engineering handoff
 
+## 2026-10-26 — native pointer and guides on wrapped rows, encoder speedup
+
+- Wrapped splits keep `native_pointer`: continuation rows carry exact source
+  bytes, so clicks and drags (including during a fractional touchpad scroll)
+  stay native. Only a closed fold in the visible or margin rows still hands
+  clicks to Vim; `valid()` now rejects `native_pointer` only with fold rows.
+  The bridge ships inside the core (`include_str!`), so no protocol bump.
+- `colorcolumn`/`cursorcolumn` on wrapped lines are native: every wrapped
+  row spans one text width of virtual columns, so a guide's column names its
+  row and cell. Guides also cover `showbreak` cells and `linebreak` padding,
+  never the `>` filler (Vim writes it with `multi_attr` after guides).
+  `cursorcolumn` uses `screenpos()` plus the cursor row's part.
+- End-of-buffer rows are painted across the full width in `EndOfBuffer`, as
+  `win_draw_end()` does (the native frame used to paint only the `~` cell).
+- `EmitRender` encodes each row once (`EncodeRenderRows`) and assembles the
+  keyframe and delta JSON from those strings; keyframe runs are grouped by
+  row (order within a row is kept). Guide segmentation is skipped for glyphs
+  that touch no guide column, and per-line guide data is resolved once.
+  Vim CPU per Ctrl-E: `nowrap` 13.4–14.55 → 12.8–13.7 ms, `wrap` 9.1–9.45 →
+  8.15–8.35 ms, `nowrap` + `colorcolumn=80,120 cursorcolumn` 29.65–32.1 →
+  25.4–27.9 ms.
+- Tests: `test_render_wrap.py` adds native pointer click/drag on
+  continuation rows and two screen-attribute partition tests for guides
+  (plain, numbers, wide fillers, `linebreak`/`breakindent`/`showbreak`,
+  `cursorcolumn`, Visual, search, smoothscroll).
+
 ## 2026-10-26 — native soft wrap (render protocol 9)
 
 - Wrapped continuation rows no longer force the compatibility view.

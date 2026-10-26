@@ -208,7 +208,8 @@ whole source range, while an expanded tab may show a highlighted column
 without changing its original byte range. Empty-line and end-of-line guides
 are display-only decorations; they do not become editable text or mouse
 targets. `cursorlineopt=both` also retains its line highlight. Guides on
-wrapped lines and other compatibility boundaries remain in effect. Closed fold rows
+wrapped lines are native too: each shows on the continuation row that holds
+its virtual column ([native soft wrap](vim9-native-wrap.md)). Closed fold rows
 combine guides exactly as Vim's fold line does; see
 [native closed folds](vim9-native-folds.md).
 

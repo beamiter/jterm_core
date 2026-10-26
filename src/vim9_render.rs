@@ -292,7 +292,7 @@ impl Vim9RenderWindow {
             || (!wrapped && !self.wrap_rows.is_empty())
             || self.display_lines.len() > self.view.rows
             || self.line_lengths.len() != self.display_lines.len()
-            || self.native_pointer
+            || (self.native_pointer && self.display_rows().any(|row| row.folded))
             || self.line_count == 0
         {
             return false;
@@ -1323,6 +1323,22 @@ mod tests {
             let frame: Vim9RenderFrame = serde_json::from_value(value).unwrap();
             assert!(!frame.valid(), "{pointer} must be rejected");
         }
+        // Continuation rows carry source bytes, so the native pointer may
+        // target them; a visible or margin fold row keeps clicks with Vim.
+        let mut pointer = base.clone();
+        pointer["windows"][0]["native_pointer"] = json!(true);
+        assert!(serde_json::from_value::<Vim9RenderFrame>(pointer.clone())
+            .unwrap()
+            .valid());
+        pointer["windows"][0]["overscan"][0]["fold_end"] = json!(4);
+        pointer["windows"][0]["overscan"][0]["runs"] = json!([]);
+        assert!(!serde_json::from_value::<Vim9RenderFrame>(pointer.clone())
+            .unwrap()
+            .valid());
+        pointer["windows"][0]["native_pointer"] = json!(false);
+        assert!(serde_json::from_value::<Vim9RenderFrame>(pointer)
+            .unwrap()
+            .valid());
         // A wrapped row is never a closed fold.
         let mut folded = base.clone();
         folded["windows"][0]["fold_ends"][2] = json!(6);

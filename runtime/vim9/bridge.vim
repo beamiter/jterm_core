@@ -1534,6 +1534,15 @@ enddef
 # 'showbreak' in the breakindent/showbreak head, and '>' where a wide glyph
 # did not fit. Smoothscroll's first row keeps the sign, and shows the line
 # number only with 'number' + 'relativenumber', its leading blanks as "-".
+# showbreak cells are NonText; Vim draws column guides on them too. A wrapped
+# row spans exactly one text width of virtual columns.
+def GuideCellStyle(context: dict<any>, part: number, column: number): dict<any>
+  var guides: dict<any> = get(context, 'guides', {})
+  var guide = empty(guides) ? {} : get(guides,
+    string(part * context.width + column - context.view.column - context.textoff), {})
+  return empty(guide) ? context.cursor_line : MergeRenderStyle(context.cursor_line, guide)
+enddef
+
 def RenderContinuationRows(runs: list<dict<any>>, context: dict<any>): string
   var layout = context.layout
   if empty(layout) || !get(layout, 'wrapped', false)
@@ -1573,13 +1582,15 @@ def RenderContinuationRows(runs: list<dict<any>>, context: dict<any>): string
           var glyph = strcharpart(showbreak, index, 1, true)
           var cells = strdisplaywidth(glyph)
           add(runs, {row: row, column: column, text: glyph, cells: cells,
-            line: 0, byte_start: 0, byte_end: 0, style: context.cursor_line})
+            line: 0, byte_start: 0, byte_end: 0, style: GuideCellStyle(context, part, column)})
           column += cells
         endfor
       endif
     endif
     for filler in layout.fillers
       if filler[0] == part
+        # Vim writes the filler with its own NonText attribute after guides
+        # were combined (multi_attr in win_line()), so no guide shows there.
         add(runs, {row: row, column: view.column + context.textoff + filler[1], text: '>', cells: 1,
           line: 0, byte_start: 0, byte_end: 0, style: context.cursor_line})
       endif
@@ -1794,8 +1805,10 @@ def RenderWindowFrame(margin: number = 0): dict<any>
   var textRows = empty(foldEnds) ? displayRows
     : filter(copy(displayRows), (_, lineNumber) => !has_key(foldEnds, string(lineNumber)))
   if !empty(foldEnds) || wrapped
-    # Protocol 8/9 row map. Fold and continuation rows are not addressable
-    # by the native pointer yet; source-bound scrolling counts display rows.
+    # Protocol 8/9 row map; source-bound scrolling counts display rows.
+    # Continuation rows carry exact source bytes, so the native pointer keeps
+    # working there. A closed fold row is display-only: clicks in a folded
+    # split stay with Vim, which opens folds and maps hidden lines.
     frame.display_lines = map(copy(visibleEntries), (_, entry) => entry[0])
     frame.fold_ends = map(copy(visibleEntries), (_, entry) => get(foldEnds, string(entry[0]), 0))
     if wrapped
@@ -1806,7 +1819,9 @@ def RenderWindowFrame(margin: number = 0): dict<any>
         frame.native_scroll = false
       endif
     endif
-    frame.native_pointer = false
+    if !empty(foldEnds)
+      frame.native_pointer = false
+    endif
   endif
   if renderProtocol >= 9
     frame.skipcol = savedView.skipcol
@@ -2257,21 +2272,34 @@ def RenderWindowFrame(margin: number = 0): dict<any>
     ? (get(position, 'curscol', 0) > 0
       ? position.curscol - 1 - view.column - info.textoff + savedView.leftcol
       : virtcol('.', true)[0] - 1) : -1
-  var colorColumns = empty(&colorcolumn) ? [] : RenderColorColumns(savedView.leftcol, textWidth)
+  # With 'wrap' every screen row of a line spans exactly textWidth virtual
+  # columns (showbreak/breakindent cells and linebreak padding included), so
+  # a guide's virtual column names its continuation row and cell.
+  var guideLimit = &wrap ? 1048576 : textWidth
+  if &wrap && cursorColumn >= 0 && get(position, 'curscol', 0) > 0
+      && has_key(rowOffset, string(line('.')))
+    cursorColumn += (position.row - 1 - view.row + topIndex - rowOffset[string(line('.'))]) * textWidth
+  endif
+  var colorColumns = empty(&colorcolumn) ? [] : RenderColorColumns(savedView.leftcol, guideLimit)
   var guideEnabled = !empty(colorColumns)
-    || (cursorColumn >= savedView.leftcol && cursorColumn < savedView.leftcol + textWidth)
+    || (cursorColumn >= savedView.leftcol && cursorColumn < savedView.leftcol + guideLimit)
   # With both guides disabled, retain the ordinary single paint loop: no
   # per-line guide dictionaries and no per-glyph guide segmentation calls.
   var colorStyle = RenderStyle(hlID('ColorColumn'))
   var cursorGuideStyle = RenderStyle(hlID('CursorColumn'))
   var guideRows: dict<dict<any>> = {}
   var rowStyles: dict<dict<any>> = {}
+  # Shared per frame: the color guides, and guide paint over plain Normal.
+  var colorGuides: dict<any> = {}
+  for column in colorColumns
+    colorGuides[string(column)] = colorStyle
+  endfor
+  var plainGuideStyles = {color: MergeRenderStyle(windowNormal, colorStyle),
+    cursor: MergeRenderStyle(windowNormal, cursorGuideStyle)}
   if wrapped
-    # Guides and blockwise selections address virtual columns that continue
-    # across a line's screen rows; screenline highlights one of those rows.
-    if guideEnabled
-      reason = 'Column guides on wrapped Vim lines use the compatibility view'
-    elseif visual ==# "\<C-V>"
+    # Blockwise selections address virtual columns that continue across a
+    # line's screen rows; screenline highlights one of those rows.
+    if visual ==# "\<C-V>"
       reason = 'Block selections on wrapped Vim lines use the compatibility view'
     elseif &cursorline && &cursorlineopt =~# 'screenline' && get(lineParts, string(line('.')), 1) > 1
       reason = 'A screenline cursorline on a wrapped Vim line uses the compatibility view'
@@ -2314,26 +2342,37 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       endfor
     endif
     if guideEnabled
-      var guides: dict<any> = {}
-      for column in colorColumns
-        guides[string(column)] = colorStyle
-      endfor
-      if cursorColumn >= savedView.leftcol && cursorColumn < savedView.leftcol + textWidth
+      var guides: dict<any> = copy(colorGuides)
+      if cursorColumn >= savedView.leftcol && cursorColumn < savedView.leftcol + guideLimit
           && lineNumber != current[1]
         guides[string(cursorColumn)] = cursorGuideStyle
       endif
       guideRows[string(lineNumber)] = {styles: guides, columns: map(keys(guides), (_, column) => str2nr(column))}
       # Source-free runs paint guides beyond EOL. A one-column pane uses a
       # space to avoid the empty-text/full-width Normal backdrop signature.
+      # A wrapped line shows a guide on the sampled row holding its column.
+      var guideKey = string(lineNumber)
+      var guideParts = get(lineParts, guideKey, 1)
+      var guideSampled = get(sampledParts, guideKey, [0, 0])
       for [column, guideStyle] in items(guides)
-        add(frame.runs, {row: view.row + rowOffset[string(lineNumber)],
-          column: view.column + info.textoff + str2nr(column) - savedView.leftcol,
+        var offset = str2nr(column) - savedView.leftcol
+        var part = offset / textWidth
+        if part >= guideParts || part < guideSampled[0] || part > guideSampled[1]
+          continue
+        endif
+        add(frame.runs, {row: view.row + rowOffset[guideKey] + part,
+          column: view.column + info.textoff + offset % textWidth,
           text: view.columns == 1 ? ' ' : '', cells: 1, line: 0, byte_start: 0, byte_end: 0,
-          style: MergeRenderStyle(MergeRenderStyle(windowNormal, lineStyle), guideStyle)})
+          style: !empty(lineStyle) ? MergeRenderStyle(MergeRenderStyle(windowNormal, lineStyle), guideStyle)
+            : plainGuideStyles[guideStyle is cursorGuideStyle ? 'cursor' : 'color']})
       endfor
     endif
   endfor
   var previousPlain = false
+  # Glyphs arrive grouped by line; resolve each line's guides once.
+  var guideLine = -1
+  var guideColumns: list<number> = []
+  var guideStyles: dict<any> = {}
   for baseGlyph in renderBase
     if visual ==# "\<C-V>" && strpart(getline(baseGlyph.line), baseGlyph.byte_start, baseGlyph.byte_end - baseGlyph.byte_start) ==# "\t"
       frame.supported = false
@@ -2346,12 +2385,29 @@ def RenderWindowFrame(margin: number = 0): dict<any>
       && (empty(visual) || baseGlyph.line < min([anchor[1], current[1]])
         || baseGlyph.line > max([anchor[1], current[1]]))
     if paintGuide
-      var columns = guideRows[string(baseGlyph.line)].columns
-      var pieces: list<dict<any>> = []
-      for selected in glyphs
-        extend(pieces, RenderColumnSegments(selected, columns, savedView.leftcol))
+      # Most glyphs touch no guide column: skip segmentation and lookups.
+      if baseGlyph.line != guideLine
+        guideLine = baseGlyph.line
+        var guideRow = guideRows[string(guideLine)]
+        guideColumns = guideRow.columns
+        guideStyles = guideRow.styles
+      endif
+      var columns = guideColumns
+      var guideFirst = max([baseGlyph.virtual_column, savedView.leftcol])
+      paintGuide = false
+      for column in columns
+        if column >= guideFirst && column < guideFirst + baseGlyph.cells
+          paintGuide = true
+          break
+        endif
       endfor
-      glyphs = pieces
+      if paintGuide
+        var pieces: list<dict<any>> = []
+        for selected in glyphs
+          extend(pieces, RenderColumnSegments(selected, columns, savedView.leftcol))
+        endfor
+        glyphs = pieces
+      endif
     endif
     for glyph in glyphs
       var style = glyph.paint_style
@@ -2375,7 +2431,7 @@ def RenderWindowFrame(margin: number = 0): dict<any>
         endif
       endif
       if paintGuide
-        var guide = get(guideRows[string(glyph.line)].styles, string(max([glyph.virtual_column, savedView.leftcol])), {})
+        var guide = get(guideStyles, string(max([glyph.virtual_column, savedView.leftcol])), {})
         if !empty(guide)
           style = MergeRenderStyle(style, guide)
         endif
@@ -2581,7 +2637,10 @@ def RenderWindowFrame(margin: number = 0): dict<any>
           empty(get(sign, 'numhl', '')) ? {} : RenderStyle(hlID(sign.numhl))),
         showbreak: showbreak, showbreak_first: &breakindentopt =~# 'sbr',
         non_text: nonTextStyle, cursor_line: &cursorline && cursorRow && &cursorlineopt !=# 'number'
-          ? MergeRenderStyle(nonTextStyle, cursorLineStyle) : nonTextStyle})
+          ? MergeRenderStyle(nonTextStyle, cursorLineStyle) : nonTextStyle,
+        width: textWidth, guides: !guideEnabled || (!empty(visual)
+            && lineNumber >= min([anchor[1], current[1]]) && lineNumber <= max([anchor[1], current[1]]))
+          ? {} : guideRows[rowKey].styles})
       if !empty(reason)
         frame.supported = false
         frame.fallback_reason = reason
@@ -2650,9 +2709,10 @@ def RenderWindowFrame(margin: number = 0): dict<any>
         cells: textWidth, line: 0, byte_start: 0, byte_end: 0, style: nonTextStyle})
     endfor
   else
+    # win_draw_end(): the eob glyph, then blanks, all in EndOfBuffer.
     for row in range(fillStart, fillEnd - 1)
-      add(frame.runs, {row: row, column: view.column, text: eobGlyph, cells: 1,
-        line: 0, byte_start: 0, byte_end: 0,
+      add(frame.runs, {row: row, column: view.column, text: eobGlyph .. repeat(' ', view.columns - 1),
+        cells: view.columns, line: 0, byte_start: 0, byte_end: 0,
         style: MergeRenderStyle(windowNormal, RenderStyle(hlID('EndOfBuffer')))})
     endfor
   endif
@@ -3262,6 +3322,32 @@ def RenderLayoutKey(frame: dict<any>): string
     frame.view, frame.default_style, windows])
 enddef
 
+# The frame's JSON with its runs grouped by screen row (paint order is kept
+# within a row; runs on different rows never overlap). Fills rowJson with
+# each row's encoded run list for the delta.
+def EncodeRenderRows(frame: dict<any>, rowJson: dict<string>): string
+  var rowRuns: dict<list<dict<any>>> = {}
+  for run in frame.runs
+    var key = string(run.row)
+    if !has_key(rowRuns, key)
+      rowRuns[key] = []
+    endif
+    add(rowRuns[key], run)
+  endfor
+  # Rows in screen order, so equal frames always encode to equal strings.
+  var parts: list<string> = []
+  for row in sort(map(keys(rowRuns), (_, key) => str2nr(key)), 'n')
+    var key = string(row)
+    var data = json_encode(rowRuns[key])
+    rowJson[key] = data
+    add(parts, strpart(data, 1, strlen(data) - 2))
+  endfor
+  var runs = remove(frame, 'runs')
+  var meta = json_encode(frame)
+  frame.runs = runs
+  return strpart(meta, 0, strlen(meta) - 1) .. ',"runs":[' .. join(parts, ',') .. ']}'
+enddef
+
 def EmitRender(force: bool = false)
   if !renderEnabled || !authenticated || shuttingDown || ch_status(bridge) !=# 'open'
     return
@@ -3281,12 +3367,16 @@ def EmitRender(force: bool = false)
       RefreshRenderTheme()
     endif
     var frame = RenderFrame()
-    var encoded = json_encode(frame)
+    # Delta hosts receive runs grouped by row; each row is encoded once and
+    # reused for the keyframe, the change test and the delta.
+    var rowJson: dict<string> = {}
+    var byRow = renderProtocol >= 2 && frame.supported
+    var encoded = byRow ? EncodeRenderRows(frame, rowJson) : json_encode(frame)
     if strlen(encoded) > 900000
       for window in get(frame, 'windows', [])
         window.overscan = []
       endfor
-      encoded = json_encode(frame)
+      encoded = byRow ? EncodeRenderRows(frame, rowJson) : json_encode(frame)
     endif
     if strlen(encoded) > 900000
       frame.supported = false
@@ -3295,6 +3385,7 @@ def EmitRender(force: bool = false)
       frame.completion = v:null
       frame.popups = []
       encoded = json_encode(frame)
+      rowJson = {}
     endif
     if force || encoded !=# previousRender
       previousRender = encoded
@@ -3303,29 +3394,20 @@ def EmitRender(force: bool = false)
       frame.revision = renderRevision
       var layout = renderProtocol >= 2 && frame.supported ? RenderLayoutKey(frame) : ''
       var rows: dict<string> = {}
-      var updates: list<dict<any>> = []
+      var updates: list<string> = []
       # Legacy full-frame hosts never consume row deltas. Supported keyframes
       # still seed a delta baseline; unsupported frames retire it entirely.
       if renderProtocol >= 2 && frame.supported
-        var rowRuns: dict<list<dict<any>>> = {}
-        for run in frame.runs
-          var key = string(run.row)
-          if !has_key(rowRuns, key)
-            rowRuns[key] = []
-          endif
-          add(rowRuns[key], run)
-        endfor
         # Replace complete screen rows, preserving within-row paint order.
         # This includes siblings in a vertical split and explicit empty clears.
         for row in range(frame.rows)
           var key = string(row)
-          var runs = get(rowRuns, key, [])
-          var rowData = json_encode(runs)
-          if !empty(runs)
+          var rowData = get(rowJson, key, '[]')
+          if rowData !=# '[]'
             rows[key] = rowData
           endif
           if rowData !=# get(previousRenderRows, key, '[]')
-            add(updates, {row: row, runs: runs})
+            add(updates, '{"row":' .. row .. ',"runs":' .. rowData .. '}')
           endif
         endfor
       endif
@@ -3336,9 +3418,10 @@ def EmitRender(force: bool = false)
         remove(delta, 'runs')
         delta.event = 'render_delta'
         delta.base_revision = baseRevision
-        delta.row_updates = updates
         # Scrolling a whole viewport can be cheaper as a complete keyframe.
-        var deltaJson = json_encode(delta)
+        var deltaMeta = json_encode(delta)
+        var deltaJson = strpart(deltaMeta, 0, strlen(deltaMeta) - 1)
+          .. ',"row_updates":[' .. join(updates, ',') .. ']}'
         if strlen(deltaJson) < strlen(encoded)
           SendRenderJson(deltaJson)
           sentDelta = true

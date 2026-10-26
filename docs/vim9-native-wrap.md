@@ -34,6 +34,16 @@ sources and `screenstring()`/`screenattr()` probes):
 - Visual selections, search and match highlights, `CursorLine`, syntax and
   text properties continue across continuation rows. The Visual EOL cell
   appears after the last part only.
+- `colorcolumn` and `cursorcolumn` address virtual columns, and every
+  wrapped row spans exactly one text width of them (`showbreak`/indent cells
+  and `linebreak` padding included). A guide therefore shows on the row
+  that holds its column: inside text, on `showbreak` cells, in `linebreak`
+  padding and after the end of the line on its last row, but not on the `>`
+  filler, which Vim writes with plain `NonText`. `cursorcolumn` follows the
+  cursor's own row and cell (`screenpos()`). As in Vim, lines in a Visual
+  selection and cells under a search match get no guide.
+- Rows past the end of the buffer are filled across the whole width in
+  `EndOfBuffer` after the `eob:` glyph, as Vim's `win_draw_end()` does.
 
 Relative numbers count lines, not rows, as Vim does; closed folds between
 wrapped lines still count once (protocol 8).
@@ -77,11 +87,16 @@ change, so an unrequested move retires the gesture instead of jumping.
 
 Native scrolling needs `smoothscroll` in a split that shows wrapped rows:
 without it `<C-E>` moves whole lines, so such a split scrolls through Vim's
-compatibility input (the shared vimrc sets `smoothscroll`). Pointer clicks
-and drags in a wrapped split go to Vim's own mouse handling, as in a folded
-split. Hover and card targets map to source bytes on every continuation row;
-the empty area after a line's text is its end-of-line target on the last
-part only.
+compatibility input (the shared vimrc sets `smoothscroll`).
+
+Continuation rows carry exact source bytes, so the native pointer stays on
+in a wrapped split: a click or drag on any continuation row, including one
+while a touchpad scroll is between rows, lands on that byte and drags make
+Vim's own Visual selection. The empty area after a line's text is its
+end-of-line target on the last part only; the `showbreak`/indent area and
+`>` fillers are not targets. A split that shows a closed fold, visible or in
+a margin, still sends clicks to Vim's own mouse handling. Hover and card
+targets use the same byte map.
 
 ## Compatibility
 
@@ -91,8 +106,8 @@ keeps `wrap` until the bridge reports the host's protocol and turns it off
 only for older hosts.
 
 These cases still use the compatibility view: `list` on wrapped lines,
-virtual text on a line that wraps, `colorcolumn`/`cursorcolumn` or blockwise
-Visual with wrapped lines, `cursorlineopt=screenline` on a wrapped cursor
+virtual text on a line that wraps, blockwise Visual with wrapped lines,
+a tab that crosses a row with `showbreak` or `breakindent`, `cursorlineopt=screenline` on a wrapped cursor
 line, a wrapped line taller than its window, a `skipcol` that is not a whole
 row, control or bidirectional text, zero-width or complex glyphs at a row
 edge, and lines over 16 KiB or 4,096 characters.
@@ -126,3 +141,12 @@ rounds, 200 Ctrl-E each, protocol 9, `nosmoothscroll`), Vim CPU per scroll was
 key-to-frame time, including Vim's 16 ms coalescing timer, was 27–29 ms and
 34–36 ms. A wrapped view shows fewer distinct lines, so it costs less per
 scroll than the clipped `nowrap` view of the same file.
+
+Follow-up (same day): each screen row's runs are now JSON-encoded once and
+reused for the keyframe, the change test and the row delta (previously the
+runs were encoded up to three times per frame), and glyphs that touch no
+guide column skip guide segmentation. Same file and method, two interleaved
+rounds against the previous bridge: `nowrap` 13.4–14.55 → 12.8–13.7 ms,
+`wrap` 9.1–9.45 → 8.15–8.35 ms, and `nowrap` with `colorcolumn=80,120` plus
+`cursorcolumn` 29.65–32.1 → 25.4–27.9 ms. With guides, `wrap` costs
+16–17 ms per scroll.

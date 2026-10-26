@@ -366,9 +366,9 @@ segmentation. An ordinary view with guides disabled keeps the original single
 paint loop. Render protocol 8 added the explicit display-row/source map for
 closed folds ([native closed folds](vim9-native-folds.md)) and protocol 9
 extended it to wrapped continuation rows
-([native soft wrap](vim9-native-wrap.md)). Guides on wrapped lines still use
-compatibility rendering, because they address virtual columns that continue
-across a line's rows.
+([native soft wrap](vim9-native-wrap.md)). Guides on wrapped lines are native
+as well: every wrapped row spans one text width of virtual columns, so a
+guide's column names its row and cell.
 
 ## Scratch and window-Normal coverage — 2026-10-22
 
