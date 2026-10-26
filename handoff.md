@@ -21,6 +21,9 @@
   and the systemd cgroup attachment test. They are outside the canvas paths.
   The motion tests include 30/60/90/120/144/240 Hz equivalence; this is an
   algorithm property, not a physical display frame-time measurement.
+- The opt-in native acceptance script also checks that adding a second short
+  command leaves the first output at the same screen Y. Short histories grow
+  from the top of the canvas; spare Chat space sits before the fixed composer.
 
 ## 2026-10-26 — one GUI companion, a voice and gentle care
 

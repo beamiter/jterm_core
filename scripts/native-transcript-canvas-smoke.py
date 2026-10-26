@@ -123,6 +123,14 @@ trap '__canvas_start' DEBUG
     def marker_signature(frame):
         pink = marker_mask(frame)
         return hashlib.sha256(pink.tobytes()).hexdigest(), int(pink.sum())
+    def first_marker_y(frame):
+        a = np.asarray(frame)[45:680, :1100, :3].astype(np.int16)
+        pink = ((a[:, :, 0] > 165) & (a[:, :, 2] > 120) &
+                (a[:, :, 0] - a[:, :, 1] > 65) &
+                (a[:, :, 2] - a[:, :, 1] > 40))
+        rows = np.flatnonzero(pink.sum(axis=1) >= 12)
+        assert len(rows), "first short-history output is visibly rendered"
+        return int(rows[0]) + 45
     try:
         log = (out / "xvfb.log").open("w")
         logs.append(log)
@@ -154,12 +162,22 @@ trap '__canvas_start' DEBUG
         run("xdotool", "windowfocus", "--sync", window)
         time.sleep(0.7)
         capture("startup")
+        short_positions = []
         for i in range(18):
             command = ("printf '\\033[38;2;241;88;200mCANVAS ANCHOR "
                        f"{i:02d}  continuous native transcript\\033[0m\\n'" )
             run("xdotool", "type", "--clearmodifiers", "--delay", "1", "--", command)
             run("xdotool", "key", "--clearmodifiers", "Return")
             time.sleep(0.09)
+            if i < 2:
+                time.sleep(0.35)
+                frame = capture(f"short-{i + 1}-blocks")
+                short_positions.append(first_marker_y(frame))
+        result["short_history_first_output_y"] = short_positions
+        assert short_positions[0] == short_positions[1], (
+            "adding the second short block moved the first block's canvas origin: "
+            f"{short_positions}"
+        )
         time.sleep(0.8)
         before = capture("before-wheel")
         before_signature, marker_pixels = marker_signature(before)

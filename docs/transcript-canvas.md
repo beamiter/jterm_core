@@ -17,6 +17,9 @@ state. The canvas changes how that source is presented and moved.
 - Streaming output retargets the live edge without resetting a scroll animation
   on every chunk. Reading history disables follow. New output below a reader
   does not move their position, and stopping input never rounds back to a row.
+- A short history begins at the top of the canvas and grows downward from a
+  stable origin. Chat's unused space is between the history and fixed composer;
+  adding a second short command does not push the first command upwards.
 - Content inserted, removed or remeasured above a reading anchor preserves that
   anchor's screen position. Existing stable command/raw-row identities remain
   the authority; an index in a temporary visible list is not a durable anchor.
@@ -107,6 +110,8 @@ a frame-time benchmark.
 `scripts/native-transcript-canvas-smoke.py` additionally opens a built frontend
 in a private Xvfb display with a synthetic Bash/OSC profile, creates 18 real
 command/output pairs and injects an X11 wheel event over transcript text. It
+first checks that the first output keeps the same screen Y when the second
+short command is added, with separate screenshots of both states. It then
 samples actual displayed marker pixels through the motion, checks for at least
 four different intermediate positions and a stable final position, and retains
 screenshots, a short GIF, binary SHA-256 and the sample timing in its output
