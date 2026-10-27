@@ -1,14 +1,20 @@
-//! Shared window title presentation for Anvil, Forge, Ember and Frost.
+//! Shared tab and desktop-window title policy for the four terminals.
 //!
-//! Renderers use a 32px (or font size + 12px) title row above the tab/action
-//! row. The title expands and elides before the trailing window controls;
-//! metadata disappears progressively in narrow windows. The full, sanitized
-//! context remains in a tooltip. No filesystem or process probes happen here.
+//! Session topics belong in each existing tab, without another chrome row.
+//! No filesystem or process probes happen here.
 
 use std::path::Path;
 
-pub fn height(font_size: f32) -> f32 {
-    32.0_f32.max(font_size + 12.0)
+/// A CLI's OSC 0/2 session topic takes priority over the directory fallback.
+/// Callers apply explicit rename and privacy before resolving automatic titles.
+/// Empty titles (including whitespace/controls) release title ownership.
+pub fn tab_label(reported: &str, fallback: &str) -> String {
+    let title = clean(reported, 200);
+    if title.is_empty() {
+        clean(fallback, 200)
+    } else {
+        title
+    }
 }
 
 #[derive(Default)]
@@ -127,6 +133,17 @@ pub fn sidebar_position(position: i32, window_width: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_topic_survives_cwd_updates_until_the_program_releases_it() {
+        let topic = "优化终端布局 / session title | jwm";
+        assert_eq!(tab_label(topic, "~/projects"), topic);
+        assert_eq!(tab_label(topic, "~/repo"), topic);
+        assert_eq!(tab_label("", "~/repo"), "~/repo");
+        assert_eq!(tab_label(" \n\u{202e}", "~/repo"), "~/repo");
+        assert_eq!(tab_label("\u{1b}topic\n\u{202e}", "cwd"), "topic");
+        assert!(tab_label(&"界".repeat(500), "cwd").chars().count() <= 201);
+    }
 
     #[test]
     fn private_context_never_reaches_any_title_or_tooltip() {
