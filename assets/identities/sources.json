@@ -1,0 +1,33 @@
+{
+  "purpose": "Existing product identities for the shared native shell; these are not reference-organism artwork",
+  "assets": [
+    {
+      "product": "anvil",
+      "source_repository": "beamiter/anvil",
+      "original_path": "data/io.github.beamiter.anvil-128.png",
+      "sha256": "6a808b71c6893e5f88f8f5d63322b083693eabaecd90347335f984fdb1cbe035",
+      "bytes_unchanged": true
+    },
+    {
+      "product": "forge",
+      "source_repository": "beamiter/forge",
+      "original_path": "data/io.github.beamiter.forge-128.png",
+      "sha256": "76934b85e9f95aee6809a355660322b6accb78a323cbd424b02f34594da3213e",
+      "bytes_unchanged": true
+    },
+    {
+      "product": "ember",
+      "source_repository": "beamiter/ember",
+      "original_path": "data/io.github.beamiter.ember-128.png",
+      "sha256": "8212165edb4c67df35ed6d118c89b6144ffddfe9c1bb252e3a0a016f421afb8a",
+      "bytes_unchanged": true
+    },
+    {
+      "product": "frost",
+      "source_repository": "beamiter/frost",
+      "original_path": "data/io.github.beamiter.frost-128.png",
+      "sha256": "b22df85860c4a1309219a5f856ee5912c58cb89be8d70b7f4e076848e73032f0",
+      "bytes_unchanged": true
+    }
+  ]
+}
