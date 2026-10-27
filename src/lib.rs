@@ -56,6 +56,7 @@ pub mod snapshot_file;
 pub mod supervised;
 pub mod terminal_report;
 pub mod theme;
+pub mod title_bar;
 pub mod transcript_canvas;
 pub mod vendored_script;
 pub mod vim9;
