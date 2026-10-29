@@ -12,6 +12,7 @@ pub enum Icon {
     Search,
     History,
     Grid,
+    PanelRight,
     Plus,
     Attach,
     Image,
@@ -38,6 +39,7 @@ impl Icon {
             "search" => Self::Search,
             "history" => Self::History,
             "grid" | "workspace" => Self::Grid,
+            "inspector" | "panel-right" => Self::PanelRight,
             "plus" => Self::Plus,
             "attach" => Self::Attach,
             "image" => Self::Image,
@@ -206,6 +208,10 @@ impl Icon {
                 &[(14., 4.), (20., 4.), (20., 10.), (14., 10.), (14., 4.)],
                 &[(4., 14.), (10., 14.), (10., 20.), (4., 20.), (4., 14.)],
                 &[(14., 14.), (20., 14.), (20., 20.), (14., 20.), (14., 14.)],
+            ],
+            Self::PanelRight => &[
+                &[(4., 5.), (20., 5.), (20., 19.), (4., 19.), (4., 5.)],
+                &[(14., 5.), (14., 19.)],
             ],
             Self::Plus => &[&[(12., 5.), (12., 19.)], &[(5., 12.), (19., 12.)]],
             Self::Attach => &[

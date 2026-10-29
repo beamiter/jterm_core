@@ -192,6 +192,20 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Remove only the right inspector's allocation. Its native owner retains
+    /// the panel and selected page; every central rectangle gets the space.
+    pub fn without_inspector(mut self) -> Self {
+        if self.inspector.take().is_some() {
+            self.center.width = (self.titlebar.width - self.center.x).max(0.0);
+            self.header.x = self.center.x;
+            self.header.width = self.center.width;
+            let inset = COMPOSER_INSET.min(self.center.width / 8.0);
+            self.composer.x = self.center.x + inset;
+            self.composer.width = (self.center.width - 2.0 * inset).max(0.0);
+        }
+        self
+    }
+
     pub fn for_size(width: f32, height: f32) -> Self {
         let width = if width.is_finite() {
             width.max(0.0)
@@ -271,6 +285,29 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_inspector_releases_its_width_without_moving_other_chrome() {
+        for width in [1356.0, 1078.0, 800.0, 700.0, 0.0] {
+            let shown = Layout::for_size(width, 704.0);
+            let hidden = shown.without_inspector();
+            assert!(hidden.inspector.is_none());
+            assert_eq!(hidden.titlebar, shown.titlebar);
+            assert_eq!(hidden.rail, shown.rail);
+            assert_eq!(hidden.navigation, shown.navigation);
+            assert_eq!(hidden.header.width, hidden.center.width);
+            assert_eq!(hidden.center.x + hidden.center.width, width);
+            assert_eq!(hidden.composer.y, shown.composer.y);
+            assert_eq!(hidden.composer.height, shown.composer.height);
+            assert!(hidden.composer.x >= hidden.center.x);
+            assert!(hidden.composer.x + hidden.composer.width <= width);
+            if shown.inspector.is_some() {
+                assert_eq!(hidden.center.width - shown.center.width, INSPECTOR_WIDTH);
+            } else {
+                assert_eq!(hidden, shown);
+            }
+        }
+    }
 
     #[test]
     fn reference_geometry_and_fixed_gaps_match_the_measured_contract() {
