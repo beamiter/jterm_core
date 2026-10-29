@@ -137,3 +137,35 @@ a companion per split/message. Capture the visible expanded state separately.
 The Stage 6 Anvil and Forge same-mode composer geometry has passed supervising
 pixel review. Do not restructure these accepted factories to implement menus,
 identity assets or graphical companion presentation.
+
+## Four-adapter visual closure (2026-10-28)
+
+The later Block artwork is now applied to the central native command cards,
+not to a second GTK-only global shell. `developer_workspace` re-exports the
+same 42/55/237/306/49/80 px titlebar, rail, navigation, inspector, header and
+composer contract as `reference_shell`. This supersedes its earlier
+55/53/191/298/42/68 px outer overrides. There is no toolkit requirement for
+that divergence. Dark Block content keeps its 36 px Live row, 12 px card
+inset, 10 px gap and real 12 px terminal font.
+
+At the default UI14 role scale the footer widths are Plus28, Attach62,
+Image60, Code56, Terminal76, Tools68, Send28 and Model120, with 6 px gaps.
+Footer icons are12 px and labels10 px; the popup itself retains14 px icons.
+Secondary tools collapse below564 px composer width, the model below392,
+and Terminal below304. Unavailable commands remain in the Tools menu.
+Larger requested UI fonts scale the slots and use normalized available
+width for compact behavior; DPR is handled by the native toolkit.
+
+Mode pills use52 px minimum width and28 px height. Agent activity badges
+use the shared navigation-selected blue (#283D6F) and chrome text (#DDE5F4);
+No task and Unavailable use navigation navy (#162133) with muted text
+(#90A0B9). Badge text is8 px, nominal height18 px, radius5 and padding5/2.
+These are shared reconstruction choices, not recovered editable tokens.
+An empty progress track is labelled No progress, without fabricated activity.
+
+The final text contrast pass separates proportional message roles instead of
+using headline color everywhere. Headings and authors retain CANVAS_TEXT
+(#28344C); MESSAGE_BODY is #4E5C74, MESSAGE_USER_TEXT is #35445E and
+MESSAGE_STEP_TEXT is #4E647F. All four adapters bind these same roles. These
+shared reconstruction colors correct visible cross-adapter contrast differences;
+they do not establish the unknown original JPEG font or antialiasing method.

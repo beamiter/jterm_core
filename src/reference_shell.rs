@@ -35,6 +35,23 @@ pub const COMPOSER_MODEL_MIN_WIDTH: f32 = 120.0;
 pub const MODEL_UNAVAILABLE_LABEL: &str = "Model unavailable";
 pub const MODE_CONTROL_HEIGHT: f32 = 28.0;
 pub const MODE_CONTROL_TOP: f32 = 7.0;
+pub const MODE_CONTROL_MIN_WIDTH: f32 = 52.0;
+pub const COMPOSER_PLUS_WIDTH: f32 = 28.0;
+pub const COMPOSER_ATTACH_WIDTH: f32 = 62.0;
+pub const COMPOSER_IMAGE_WIDTH: f32 = 60.0;
+pub const COMPOSER_CODE_WIDTH: f32 = 56.0;
+pub const COMPOSER_TERMINAL_WIDTH: f32 = 76.0;
+pub const COMPOSER_TOOLS_WIDTH: f32 = 68.0;
+pub const COMPOSER_SEND_WIDTH: f32 = 28.0;
+pub const COMPOSER_SECONDARY_MIN_WIDTH: f32 = 564.0;
+pub const COMPOSER_MODEL_MIN_AVAILABLE: f32 = 392.0;
+pub const COMPOSER_TERMINAL_MIN_AVAILABLE: f32 = 304.0;
+pub const INSPECTOR_BADGE_HEIGHT: f32 = 18.0;
+pub const INSPECTOR_BADGE_FONT_SIZE: f32 = 8.0;
+pub const INSPECTOR_BADGE_HORIZONTAL_PADDING: f32 = 5.0;
+pub const INSPECTOR_BADGE_VERTICAL_PADDING: f32 = 2.0;
+pub const INSPECTOR_BADGE_RADIUS: f32 = 5.0;
+pub const NO_PROGRESS_LABEL: &str = "No progress";
 pub const HEADER_ACTION_SIZE: f32 = 24.0;
 pub const HEADER_ACTION_GAP: f32 = 4.0;
 pub const INSPECTOR_TAB_WIDTH: f32 = 50.0;
@@ -101,6 +118,11 @@ pub mod color {
     pub const CHROME_TEXT: [u8; 3] = [221, 229, 244];
     pub const CHROME_MUTED: [u8; 3] = [144, 160, 185];
     pub const CANVAS_TEXT: [u8; 3] = [40, 52, 76];
+    // Message roles have different contrast needs. Do not use the headline
+    // foreground for paragraphs and make regular text appear artificially bold.
+    pub const MESSAGE_BODY: [u8; 3] = [78, 92, 116];
+    pub const MESSAGE_USER_TEXT: [u8; 3] = [53, 68, 94];
+    pub const MESSAGE_STEP_TEXT: [u8; 3] = [78, 100, 127];
     pub const CANVAS_MUTED: [u8; 3] = [111, 125, 148];
     pub const LIGHT_BORDER: [u8; 3] = [210, 221, 239];
     pub const DARK_BORDER: [u8; 3] = [43, 57, 79];

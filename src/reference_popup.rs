@@ -13,7 +13,7 @@ pub const SELECTED: [u8; 4] = [40, 61, 111, 255];
 
 /// Inner metrics for the existing, already mode-stable footer controls.
 /// These do not change the composer frame, footer baseline or action ownership.
-pub const FOOTER_ICON_SIZE: f32 = 14.0;
+pub const FOOTER_ICON_SIZE: f32 = 12.0;
 pub const FOOTER_LABEL_SIZE: f32 = 10.0;
 pub const FOOTER_ICON_LABEL_GAP: f32 = 4.0;
 pub const FOOTER_HORIZONTAL_PADDING: f32 = 6.0;
