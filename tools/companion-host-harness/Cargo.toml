@@ -1,0 +1,12 @@
+[package]
+name = "companion-host-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[workspace]
+[dependencies]
+companion-protocol = { git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+companion-core = { git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+companion-client = { git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+eva-character-atlas = { git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+uuid = { version = "~1.26.0", features = ["v4"] }

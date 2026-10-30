@@ -15,6 +15,10 @@ categories = ["command-line-utilities", "development-tools"]
 session-parity-tests = []
 
 [dependencies]
+companion-protocol = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+companion-core = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+companion-client = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
+eva-character-atlas = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
 # Pin the policy engine so a branch move cannot silently change the contract.
 jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", rev = "f269c3c6afafcf9b6d60b3cccd741649fdb74576" }
 crossbeam-channel = "0.5"

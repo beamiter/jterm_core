@@ -72,3 +72,5 @@ pub mod workflows;
 
 #[cfg(feature = "session-parity-tests")]
 pub mod session_parity;
+
+pub mod companion_host;

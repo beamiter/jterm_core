@@ -1,0 +1,29 @@
+   Compiling companion-host-harness v0.1.0 (<workspace>/jterm_core/tools/companion-host-harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running unittests src/lib.rs (eva-workspace/jterm_core/tools/companion-host-harness/target/debug/deps/companion_host_harness-6aaa480d7643f61a)
+
+running 16 tests
+test companion_host::tests::duplicate_old_grant_cannot_resurrect_retired_body ... ok
+test companion_host::tests::no_presentation_capability_never_proves_retirement ... ok
+test companion_host::tests::healthy_close_waits_for_exact_durable_retirement_ack ... ok
+test companion_host::tests::metadata_coalesces_without_dropping_ordered_controls ... ok
+test companion_host::tests::disconnect_never_falls_back ... ok
+test companion_host::tests::grant_receipt_is_not_actual_presentation ... ok
+test companion_host::tests::operation_error_does_not_disconnect_or_hide_body ... ok
+test companion_host::tests::stale_callbacks_and_grants_rejected ... ok
+test companion_host::tests::completed_retirement_allows_later_prepare_not_old_callbacks ... ok
+test companion_host::tests::reconnect_retires_old_boot_without_reviving_body ... ok
+test companion_host::tests::rejection_reconnects_and_preserves_retirement_obligation ... ok
+test companion_host::tests::restored_pane_counter_cannot_alias_an_earlier_window_task ... ok
+test companion_host::tests::persisted_scope_discovery_is_bounded_and_preserves_review_origin ... ok
+test companion_host::tests::withdrawal_ack_is_host_bound_and_new_grant_invalidates_it ... ok
+test companion_host::tests::revoked_pixels_need_later_real_frame ... ok
+test companion_host::tests::wrong_incarnation_and_surface_do_not_grant ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests companion_host_harness
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

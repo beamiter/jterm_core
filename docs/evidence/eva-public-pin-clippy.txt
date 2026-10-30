@@ -1,0 +1,2 @@
+    Checking companion-host-harness v0.1.0 (<workspace>/jterm_core/tools/companion-host-harness)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.34s
