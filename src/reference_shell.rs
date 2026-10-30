@@ -11,6 +11,13 @@ pub const TITLEBAR_HEIGHT: f32 = 42.0;
 pub const RAIL_WIDTH: f32 = 55.0;
 pub const NAVIGATION_WIDTH: f32 = 237.0;
 pub const INSPECTOR_WIDTH: f32 = 306.0;
+/// Interactive sidebars retain a usable command canvas between their handles.
+pub const SIDEBAR_DIVIDER_WIDTH: f32 = 6.0;
+pub const MIN_CENTER_WIDTH: f32 = 480.0;
+pub const MIN_NAVIGATION_WIDTH: f32 = 120.0;
+pub const MAX_NAVIGATION_WIDTH: f32 = 800.0;
+pub const MIN_INSPECTOR_WIDTH: f32 = 240.0;
+pub const MAX_INSPECTOR_WIDTH: f32 = 1200.0;
 pub const CANVAS_HEADER_HEIGHT: f32 = 49.0;
 pub const COMPOSER_HEIGHT: f32 = 80.0;
 pub const COMPOSER_INSET: f32 = 28.0;
@@ -192,6 +199,94 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Fit preferred sidebar content widths without changing those preferences.
+    /// A zero width hides that panel explicitly. The right panel collapses
+    /// before the navigation is constrained, and a temporarily narrower window
+    /// can reduce navigation to its minimum while retaining the center budget.
+    /// Each visible sidebar reserves a real, six-pixel native divider.
+    /// `for_size` remains the original noninteractive reference geometry.
+    pub fn for_size_with_sidebars(
+        width: f32,
+        height: f32,
+        navigation_width: f32,
+        inspector_width: f32,
+    ) -> Self {
+        fn preferred(value: f32, fallback: f32, minimum: f32, maximum: f32) -> f32 {
+            if !value.is_finite() {
+                fallback
+            } else if value <= 0.0 {
+                0.0
+            } else {
+                value.clamp(minimum, maximum)
+            }
+        }
+        let navigation = preferred(
+            navigation_width,
+            NAVIGATION_WIDTH,
+            MIN_NAVIGATION_WIDTH,
+            MAX_NAVIGATION_WIDTH,
+        );
+        let inspector = preferred(
+            inspector_width,
+            INSPECTOR_WIDTH,
+            MIN_INSPECTOR_WIDTH,
+            MAX_INSPECTOR_WIDTH,
+        );
+        let mut layout = Self::for_size(width, height);
+        let available = (layout.titlebar.width - layout.rail.width - MIN_CENTER_WIDTH).max(0.0);
+        let navigation_budget = navigation
+            + if navigation > 0.0 {
+                SIDEBAR_DIVIDER_WIDTH
+            } else {
+                0.0
+            };
+        let inspector_width = if inspector > 0.0
+            && available >= navigation_budget + inspector + SIDEBAR_DIVIDER_WIDTH
+        {
+            inspector
+        } else {
+            0.0
+        };
+        let inspector_budget = inspector_width
+            + if inspector_width > 0.0 {
+                SIDEBAR_DIVIDER_WIDTH
+            } else {
+                0.0
+            };
+        let navigation_available = available - inspector_budget - SIDEBAR_DIVIDER_WIDTH;
+        let navigation_width = if navigation > 0.0 && navigation_available >= MIN_NAVIGATION_WIDTH {
+            navigation.min(navigation_available)
+        } else {
+            0.0
+        };
+        layout.navigation = (navigation_width > 0.0).then_some(Rect {
+            x: layout.rail.width,
+            y: layout.center.y,
+            width: navigation_width,
+            height: layout.center.height,
+        });
+        layout.inspector = (inspector_width > 0.0).then_some(Rect {
+            x: layout.titlebar.width - inspector_width,
+            y: layout.center.y,
+            width: inspector_width,
+            height: layout.center.height,
+        });
+        layout.center.x = layout.rail.width
+            + navigation_width
+            + if navigation_width > 0.0 {
+                SIDEBAR_DIVIDER_WIDTH
+            } else {
+                0.0
+            };
+        layout.center.width = (layout.titlebar.width - layout.center.x - inspector_budget).max(0.0);
+        layout.header.x = layout.center.x;
+        layout.header.width = layout.center.width;
+        let inset = COMPOSER_INSET.min(layout.center.width / 8.0);
+        layout.composer.x = layout.center.x + inset;
+        layout.composer.width = (layout.center.width - 2.0 * inset).max(0.0);
+        layout
+    }
+
     /// Remove only the right inspector's allocation. Its native owner retains
     /// the panel and selected page; every central rectangle gets the space.
     pub fn without_inspector(mut self) -> Self {
@@ -285,6 +380,74 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_sidebars_keep_preferences_and_a_usable_center() {
+        let left = 600.0;
+        let right = 800.0;
+        let wide = Layout::for_size_with_sidebars(2400.0, 800.0, left, right);
+        assert_eq!(wide.navigation.unwrap().width, left);
+        assert_eq!(wide.inspector.unwrap().width, right);
+        assert_eq!(wide.center.x, RAIL_WIDTH + left + SIDEBAR_DIVIDER_WIDTH);
+        assert_eq!(
+            wide.center.width,
+            2400.0 - RAIL_WIDTH - left - right - 2.0 * SIDEBAR_DIVIDER_WIDTH
+        );
+        let narrow = Layout::for_size_with_sidebars(700.0, 800.0, left, right);
+        assert!(narrow.inspector.is_none());
+        assert!(narrow.navigation.unwrap().width < left);
+        assert_eq!(narrow.center.width, MIN_CENTER_WIDTH);
+        assert_eq!(
+            Layout::for_size_with_sidebars(2400.0, 800.0, left, right),
+            wide,
+            "a temporary clamp must not become a new preferred width"
+        );
+        let right_only = Layout::for_size_with_sidebars(1000.0, 800.0, 0.0, 306.0);
+        assert!(right_only.navigation.is_none());
+        assert_eq!(right_only.inspector.unwrap().width, 306.0);
+        assert_eq!(right_only.center.x, RAIL_WIDTH);
+        assert_eq!(right_only.center.width, 1000.0 - RAIL_WIDTH - 306.0 - 6.0);
+    }
+
+    #[test]
+    fn interactive_sidebars_bound_invalid_preferences_and_extreme_windows() {
+        for width in [0.0, 64.0, 320.0, 640.0, 800.0, 1000.0, 1356.0, 3000.0] {
+            for (left, right) in [
+                (0.0, 0.0),
+                (120.0, 240.0),
+                (237.0, 306.0),
+                (9000.0, 9000.0),
+                (f32::NAN, f32::INFINITY),
+                (-1.0, -1.0),
+            ] {
+                let layout = Layout::for_size_with_sidebars(width, 704.0, left, right);
+                for rect in [
+                    Some(layout.rail),
+                    layout.navigation,
+                    Some(layout.center),
+                    layout.inspector,
+                    Some(layout.composer),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    assert!(rect.x.is_finite() && rect.width.is_finite());
+                    assert!(rect.x >= 0.0 && rect.width >= 0.0);
+                    assert!(rect.x + rect.width <= width + 0.01);
+                }
+                if width >= RAIL_WIDTH + MIN_CENTER_WIDTH {
+                    assert!(layout.center.width >= MIN_CENTER_WIDTH);
+                }
+            }
+        }
+        let huge = Layout::for_size_with_sidebars(3000.0, 800.0, 9000.0, 9000.0);
+        assert_eq!(huge.navigation.unwrap().width, MAX_NAVIGATION_WIDTH);
+        assert_eq!(huge.inspector.unwrap().width, MAX_INSPECTOR_WIDTH);
+        let invalid = Layout::for_size_with_sidebars(f32::NAN, f32::INFINITY, f32::NAN, f32::NAN);
+        assert_eq!(invalid.titlebar.width, REFERENCE_WIDTH);
+        assert_eq!(invalid.navigation.unwrap().width, NAVIGATION_WIDTH);
+        assert_eq!(invalid.inspector.unwrap().width, INSPECTOR_WIDTH);
+    }
 
     #[test]
     fn hidden_inspector_releases_its_width_without_moving_other_chrome() {
