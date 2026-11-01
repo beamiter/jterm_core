@@ -340,6 +340,11 @@ mod tests {
     use super::*;
     #[test]
     fn kernel_lease_excludes_independent_open_and_releases_on_close() {
+        if super::super::isolated_lease_test(
+            "agent_workspace::ownership::tests::kernel_lease_excludes_independent_open_and_releases_on_close",
+        ) {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("jterm-lease-{}", uuid::Uuid::new_v4()));
         private_dir(&root).unwrap();
         let path = root.join("owner");

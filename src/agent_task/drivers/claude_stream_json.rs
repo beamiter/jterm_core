@@ -556,6 +556,11 @@ mod driver_tests {
 
     #[test]
     fn native_conversation_resumes_exact_id_and_holds_ownership_between_turns() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_task::drivers::claude_stream_json::driver_tests::native_conversation_resumes_exact_id_and_holds_ownership_between_turns",
+        ) {
+            return;
+        }
         let dir = TempDir::new("claude-multi-turn");
         let cli = dir.0.join("conversation.sh");
         std::fs::write(

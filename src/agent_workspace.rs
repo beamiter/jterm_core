@@ -83,3 +83,26 @@ pub fn native_profiles_directory() -> Result<std::path::PathBuf, String> {
     ownership::private_dir(&path)?;
     Ok(path)
 }
+
+/// Tests proving the final close of a kernel lease must create that lease
+/// after exec. Other parallel fixtures intentionally pause forked children
+/// before exec, where ordinary CLOEXEC descriptors are still inherited.
+#[cfg(test)]
+pub(crate) fn isolated_lease_test(name: &str) -> bool {
+    const PROBE: &str = "JTERM_ISOLATED_LEASE_TEST";
+    if std::env::var(PROBE).as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(PROBE, name)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated lease test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
+}

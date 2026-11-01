@@ -2140,6 +2140,11 @@ mod tests {
 
     #[test]
     fn persistent_profile_keeps_history_but_never_copies_login_and_is_exclusive() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_task::native::tests::persistent_profile_keeps_history_but_never_copies_login_and_is_exclusive",
+        ) {
+            return;
+        }
         let source = source_codex_home();
         let parent = private_test_directory("persistent");
         let state = parent.join("lease-state");

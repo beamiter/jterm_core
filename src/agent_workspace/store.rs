@@ -941,6 +941,11 @@ mod tests {
     }
     #[test]
     fn legacy_ids_are_namespaced_and_import_is_idempotent() {
+        if super::super::isolated_lease_test(
+            "agent_workspace::store::tests::legacy_ids_are_namespaced_and_import_is_idempotent",
+        ) {
+            return;
+        }
         let (mut s, p) = store();
         let snapshot = ConversationSnapshot::from_completed_history(
             &[
