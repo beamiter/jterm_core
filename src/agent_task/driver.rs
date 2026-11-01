@@ -461,6 +461,10 @@ pub enum ApprovalDecision {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
     Prompt(AgentPrompt),
+    /// Read a bounded provider-history page; it has no lifecycle authority.
+    History {
+        reset: bool,
+    },
     FinishSession,
     Steer {
         turn_id: AgentTurnId,
@@ -476,7 +480,7 @@ impl AgentCommand {
     pub fn validate(&self) -> Result<(), AgentDriverError> {
         let text = match self {
             Self::Prompt(prompt) => Some(prompt.text.as_str()),
-            Self::FinishSession => None,
+            Self::FinishSession | Self::History { .. } => None,
             Self::Steer { text, .. } => Some(text.as_str()),
             Self::DecideApproval {
                 decision:

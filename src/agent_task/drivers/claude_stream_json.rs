@@ -1,8 +1,9 @@
-//! Minimal Claude Code adapter using `--print` stream-json.
+//! Claude Code adapter using exact-ID `--print` stream-json turns.
 //!
 //! This is deliberately weaker than the Codex app-server path: no private home,
-//! no cgroup containment (a private process group only), and one print-mode
-//! turn per session. Failures should fall back to the opaque PTY launcher.
+//! no cgroup containment (a private process group only). Conversation mode
+//! holds a profile-bound lease across turns; each child is reaped before the
+//! next exact-ID resume. Interactive tool permissions remain a PTY capability.
 //! Process ownership and the lifecycle contract live in
 //! `super::print_stream`.
 
@@ -72,6 +73,15 @@ pub fn parse_stream_json_line(line: &str) -> ClaudeStreamSignal {
             .map(ClaudeStreamSignal::TextDelta)
             .unwrap_or(ClaudeStreamSignal::Ignored),
         "result" => {
+            if value
+                .get("permission_denials")
+                .and_then(Value::as_array)
+                .is_some_and(|denials| !denials.is_empty())
+            {
+                return ClaudeStreamSignal::Error(
+                    "Claude requires tool permissions that this print channel cannot request; continue in Terminal to review them".into(),
+                );
+            }
             let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
             let is_error = value.get("is_error").and_then(Value::as_bool) == Some(true);
             let failed = is_error || subtype.starts_with("error");
@@ -210,10 +220,30 @@ pub fn claude_print_argv(executable_argv: &[String], prompt: &str) -> Result<Vec
         "--verbose".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
-        "--dangerously-skip-permissions".to_string(),
+        "--permission-mode".to_string(),
+        "dontAsk".to_string(),
         prompt.to_string(),
     ]);
     Ok(argv)
+}
+
+/// Resume only an exact, validated conversation identity, never "latest".
+pub fn claude_resume_argv(
+    executable_argv: &[String],
+    prompt: &str,
+    session_id: &str,
+) -> Result<Vec<String>, String> {
+    if executable_argv.is_empty() {
+        return Err("Claude launch argv is empty".into());
+    }
+    let id = uuid::Uuid::parse_str(session_id)
+        .map_err(|_| "Claude resume requires an exact UUID".to_owned())?;
+    if id.to_string() != session_id {
+        return Err("Claude resume requires a canonical UUID".into());
+    }
+    let mut launch = executable_argv.to_vec();
+    launch.extend(["--resume".into(), session_id.to_owned()]);
+    claude_print_argv(&launch, prompt)
 }
 
 static CLAUDE_SPEC: PrintProviderSpec = PrintProviderSpec {
@@ -224,6 +254,7 @@ static CLAUDE_SPEC: PrintProviderSpec = PrintProviderSpec {
     // `system/init` (carrying `session_id`) is Claude's first stdout record.
     session_id_first: true,
     argv: claude_print_argv,
+    resume_argv: Some(claude_resume_argv),
     parse: claude_print_signal,
 };
 
@@ -248,7 +279,7 @@ fn claude_print_signal(line: &str) -> PrintSignal {
     }
 }
 
-/// Native Claude Code driver (print / stream-json MVP).
+/// Native Claude Code driver with bounded exact-ID conversation continuation.
 pub struct ClaudeStreamJsonDriver(PrintStreamDriver);
 
 impl ClaudeStreamJsonDriver {
@@ -258,6 +289,14 @@ impl ClaudeStreamJsonDriver {
             launch_argv,
             worktree_path,
         ))
+    }
+
+    /// Keep the native session open at review points for user follow-up turns.
+    /// The profile is resolved and pinned on the worker before any CLI starts.
+    pub fn new_conversation(launch_argv: Vec<String>, worktree_path: PathBuf) -> Self {
+        let mut driver = Self::new(launch_argv, worktree_path);
+        driver.0.enable_continuation(None);
+        driver
     }
 
     pub fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
@@ -438,9 +477,35 @@ mod tests {
                 "--verbose",
                 "--output-format",
                 "stream-json",
-                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "dontAsk",
                 "fix the build",
             ]
+        );
+    }
+
+    #[test]
+    fn resume_argv_uses_one_exact_id_and_keeps_prompt_literal() {
+        let id = "8f2c1e2a-5b7d-4c3e-9a1f-0d6e2b4c8a10";
+        let prompt = "review $(touch /tmp/not-a-shell-command)\nthen explain";
+        let argv = claude_resume_argv(&["/usr/bin/claude".into()], prompt, id).unwrap();
+        assert_eq!(&argv[1..3], &["--resume", id]);
+        assert_eq!(argv.last().map(String::as_str), Some(prompt));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg == "--continue" || arg == "--dangerously-skip-permissions"));
+        for invalid in ["latest", "--help", "../session", ""] {
+            assert!(claude_resume_argv(&["claude".into()], "review", invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn result_with_permission_denials_requires_explicit_terminal_recovery() {
+        let result = parse_stream_json_line(
+            r#"{"type":"result","subtype":"success","permission_denials":[{"tool_name":"Bash"}],"result":"I could not run the command"}"#,
+        );
+        assert!(
+            matches!(result, ClaudeStreamSignal::Error(detail) if detail.contains("continue in Terminal"))
         );
     }
 }
@@ -453,6 +518,187 @@ mod driver_tests {
     use std::time::{Duration, Instant};
 
     const SESSION: &str = "8f2c1e2a-5b7d-4c3e-9a1f-0d6e2b4c8a10";
+
+    fn drain_to_review(
+        driver: &mut ClaudeStreamJsonDriver,
+        manager: &mut crate::agent_task::TaskManager,
+        task_id: crate::agent_task::TaskId,
+        completed_turns: usize,
+    ) -> Vec<AgentEvent> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut events = Vec::new();
+        loop {
+            match driver.try_next_event().unwrap() {
+                Some(event) => {
+                    manager.apply_agent_event(event.clone()).unwrap();
+                    events.push(event);
+                }
+                None => {
+                    let view = driver.view_snapshot();
+                    if view.phase == CodexAppServerPhase::Ready
+                        && view.completed_turns == completed_turns
+                    {
+                        assert_eq!(
+                            manager.get(task_id).unwrap().status,
+                            TaskStatus::ReadyForReview
+                        );
+                        return events;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "did not reach a review point: {view:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_conversation_resumes_exact_id_and_holds_ownership_between_turns() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_task::drivers::claude_stream_json::driver_tests::native_conversation_resumes_exact_id_and_holds_ownership_between_turns",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("claude-multi-turn");
+        let cli = dir.0.join("conversation.sh");
+        std::fs::write(
+            &cli,
+            r#"id=
+mode=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id|--resume) mode="$1"; id="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s|%s\n' "$mode" "$id" >> "$CLAUDE_CONFIG_DIR/invocations"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$id"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"Reviewed."}]}}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"result":"Reviewed."}\n'
+"#,
+        )
+        .unwrap();
+        let argv = vec!["/bin/sh".into(), cli.display().to_string()];
+        let (mut manager, task_id, stream) = native_task(AgentProvider::Claude, &dir.0);
+        let mut driver = ClaudeStreamJsonDriver::new_conversation(argv.clone(), dir.0.clone());
+        driver.0.enable_continuation(Some(dir.0.clone()));
+        driver
+            .start(start_request(AgentProvider::Claude, stream, &dir.0))
+            .unwrap();
+        let mut events = drain_to_review(&mut driver, &mut manager, task_id, 1);
+        let id = driver.view_snapshot().provider_thread_id.unwrap();
+        assert!(
+            crate::agent_workspace::NativeSessionLease::acquire_at(
+                dir.0.join("workspace-test-state"),
+                crate::agent_sessions::SessionProvider::Claude,
+                &dir.0,
+                &id,
+            )
+            .is_err(),
+            "idle native conversation lost its writer lease"
+        );
+
+        let prompt = crate::agent_task::driver::AgentPrompt::new("Check the second change");
+        driver.send(AgentCommand::Prompt(prompt.clone())).unwrap();
+        assert_eq!(
+            driver.send(AgentCommand::Prompt(prompt)),
+            Err(AgentDriverError::TurnActive)
+        );
+        events.extend(drain_to_review(&mut driver, &mut manager, task_id, 2));
+        let view = driver.view_snapshot();
+        assert_eq!(view.turn_history.len(), 1);
+        assert_eq!(view.turn_history[0].agent_text, "Reviewed.");
+        assert_eq!(view.displayed_turn_ordinal, Some(2));
+        assert_eq!(
+            view.displayed_follow_up_feedback.as_deref(),
+            Some("Check the second change")
+        );
+        assert!(manager.has_active_agent_event_stream(task_id));
+        driver.send(AgentCommand::FinishSession).unwrap();
+        events.extend(drive_to_close(
+            &mut driver,
+            &mut manager,
+            Duration::from_secs(10),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !driver.join_finished_worker().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind(), AgentEventKind::SessionStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind(), AgentEventKind::TurnStarted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind(), AgentEventKind::TurnCompleted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind(), AgentEventKind::SessionEnded { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("invocations")).unwrap(),
+            format!("--session-id|{id}\n--resume|{id}\n")
+        );
+        let report = driver.take_exit_report().unwrap();
+        assert_eq!(report.outcome, AgentSessionOutcome::Clean);
+        assert!(report.process.reaped && report.process.containment_verified_empty);
+        assert!(crate::agent_workspace::NativeSessionLease::acquire_at(
+            dir.0.join("workspace-test-state"),
+            crate::agent_sessions::SessionProvider::Claude,
+            &dir.0,
+            &id,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn native_resume_rejects_wrong_provider_identity_before_any_next_turn() {
+        let dir = TempDir::new("claude-wrong-identity");
+        let cli = fake_cli(&dir.0, &recorded_success(), "exit 0");
+        let (mut manager, task_id, stream) = native_task(AgentProvider::Claude, &dir.0);
+        let mut driver =
+            ClaudeStreamJsonDriver::new_conversation(fake_cli_argv(&cli), dir.0.clone());
+        driver.0.enable_continuation(Some(dir.0.clone()));
+        let mut request = start_request(AgentProvider::Claude, stream, &dir.0);
+        request.resume_from = Some(
+            crate::agent_task::ProviderSessionId::new(
+                AgentProvider::Claude,
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap(),
+        );
+        driver.start(request).unwrap();
+        let events = drive_to_close(&mut driver, &mut manager, Duration::from_secs(15));
+        assert_eq!(manager.get(task_id).unwrap().status, TaskStatus::Failed);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.kind(), AgentEventKind::TurnCompleted { .. })));
+        assert!(driver
+            .view_snapshot()
+            .last_error
+            .unwrap()
+            .contains("different session ID"));
+    }
 
     fn recorded_success() -> String {
         [

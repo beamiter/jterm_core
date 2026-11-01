@@ -185,6 +185,8 @@ struct Utf8 {
     /// and surrogates).
     lower: u8,
     upper: u8,
+    pending: [u8; 4],
+    pending_len: usize,
 }
 
 enum Utf8Step {
@@ -219,6 +221,8 @@ impl Utf8 {
                 need,
                 lower,
                 upper,
+                pending: [byte, 0, 0, 0],
+                pending_len: 1,
             };
             return Utf8Step::Pending;
         }
@@ -227,6 +231,8 @@ impl Utf8 {
             return Utf8Step::Invalid { retry: true };
         }
         self.code = (self.code << 6) | u32::from(byte & 0x3f);
+        self.pending[self.pending_len] = byte;
+        self.pending_len += 1;
         self.need -= 1;
         self.lower = 0x80;
         self.upper = 0xbf;
@@ -251,6 +257,75 @@ pub(super) struct Parser {
 }
 
 impl Parser {
+    /// Prefix required to resume a byte split at the snapshot boundary. CSI
+    /// and UTF-8 retain exact parsing state; ignored OSC/DCS side effects are
+    /// not replayed as terminal commands during a new attachment.
+    pub(super) fn continuation(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self.state {
+            State::Ground => {}
+            State::Escape => out.push(0x1b),
+            State::EscapeIntermediate => {
+                out.push(0x1b);
+                self.append_intermediate(&mut out);
+            }
+            State::CsiEntry | State::CsiParam | State::CsiIntermediate => {
+                out.extend_from_slice(b"\x1b[");
+                if self.prefix != 0 {
+                    out.push(self.prefix);
+                }
+                let sealed = self.state == State::CsiIntermediate;
+                for i in 0..self.params.len {
+                    if self.params.values[i] >= 0 {
+                        out.extend_from_slice(self.params.values[i].to_string().as_bytes());
+                    }
+                    if !sealed || i + 1 < self.params.len {
+                        out.push(if self.params.is_nonfinal(i) {
+                            b':'
+                        } else {
+                            b';'
+                        });
+                    }
+                }
+                if !sealed && self.params.current >= 0 {
+                    out.extend_from_slice(self.params.current.to_string().as_bytes());
+                }
+                if sealed {
+                    self.append_intermediate(&mut out);
+                }
+            }
+            State::CsiIgnore => out.extend_from_slice(b"\x1b[0?"),
+            State::Osc | State::StringEscape { osc: true } => {
+                out.extend_from_slice(b"\x1b]");
+                if !self.osc_overflow
+                    && (self.osc.is_empty() || self.osc == b"8" || self.osc.starts_with(b"8;"))
+                {
+                    out.extend_from_slice(&self.osc);
+                } else {
+                    out.extend_from_slice(b"777;jterm-ignored;");
+                }
+                if matches!(self.state, State::StringEscape { .. }) {
+                    out.push(0x1b);
+                }
+            }
+            State::IgnoredString | State::StringEscape { osc: false } => {
+                out.extend_from_slice(b"\x1bP");
+                if matches!(self.state, State::StringEscape { .. }) {
+                    out.push(0x1b);
+                }
+            }
+        }
+        out.extend_from_slice(&self.utf8.pending[..self.utf8.pending_len]);
+        out
+    }
+    fn append_intermediate(&self, out: &mut Vec<u8>) {
+        match self.intermediate {
+            0 => {}
+            MULTIPLE_INTERMEDIATES => out.extend_from_slice(b"!!"),
+            byte => out.push(byte),
+        }
+    }
+
     pub(super) fn new() -> Self {
         Self {
             state: State::Ground,

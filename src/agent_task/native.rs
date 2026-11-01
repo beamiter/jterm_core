@@ -34,16 +34,205 @@ const NATIVE_CODEX_HOME_CREATE_ATTEMPTS: usize = 8;
 pub struct PreparedNativeCodexHome {
     path: PathBuf,
     credentials: Option<NativeCodexCredentials>,
+    remove_on_drop: bool,
+    resume_thread: Option<super::ProviderSessionId>,
+    profile_lease: Option<crate::agent_workspace::NativeSessionLease>,
 }
 
+/// App-owned provenance for a persisted native thread. It contains no login
+/// material and never grants authority over another profile or worktree.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NativeCodexProfile {
+    version: u32,
+    task_id: super::TaskId,
+    worktree: PathBuf,
+    #[serde(default)]
+    relative_cwd: PathBuf,
+    branch: String,
+    #[serde(default)]
+    title: String,
+    thread_id: Option<String>,
+}
+
+const NATIVE_CODEX_PROFILE_MARKER: &str = "jterm-native-profile.json";
+
 impl PreparedNativeCodexHome {
-    pub fn prepare() -> Result<Self, NativeCodexHomeError> {
-        let source_home = match std::env::var_os("CODEX_HOME") {
-            Some(path) => PathBuf::from(path),
-            None => dirs::home_dir()
-                .map(|home| home.join(".codex"))
-                .ok_or(NativeCodexHomeError::SourceHomeUnavailable)?,
+    /// Allocate an isolated profile whose provider-owned history survives
+    /// Finish and application restart. Only the access grant stays in memory.
+    pub fn prepare_persistent(
+        task: &AgentTask,
+        relative_cwd: &Path,
+    ) -> Result<Self, NativeCodexHomeError> {
+        let parent = crate::agent_workspace::native_profiles_directory()
+            .map_err(NativeCodexHomeError::Create)?;
+        let source = source_codex_home_path()?;
+        Self::prepare_persistent_from(task, relative_cwd, &source, &parent, None)
+    }
+
+    fn prepare_persistent_from(
+        task: &AgentTask,
+        relative_cwd: &Path,
+        source: &Path,
+        parent: &Path,
+        lease_state: Option<&Path>,
+    ) -> Result<Self, NativeCodexHomeError> {
+        if !task.worktree_path.is_absolute()
+            || relative_cwd.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(NativeCodexHomeError::SourceHomeUnsafe(
+                "Native profile requires a contained worktree directory".into(),
+            ));
+        }
+        let mut home = Self::prepare_from(source, parent)?;
+        let marker = NativeCodexProfile {
+            version: 1,
+            task_id: task.id,
+            worktree: task.worktree_path.clone(),
+            relative_cwd: relative_cwd.to_path_buf(),
+            branch: task.branch.clone(),
+            title: task.title.clone(),
+            thread_id: None,
         };
+        write_native_profile(&home.path, &marker)?;
+        home.profile_lease = Some(acquire_native_profile_lease(&home.path, lease_state)?);
+        home.remove_on_drop = false;
+        Ok(home)
+    }
+
+    /// Reopen only an app-created profile with matching task/worktree/branch
+    /// provenance. Credentials are freshly read from the configured login;
+    /// user configuration, trust and refresh tokens are never copied.
+    pub fn reopen_persistent(task: &AgentTask, path: &Path) -> Result<Self, NativeCodexHomeError> {
+        let parent = crate::agent_workspace::native_profiles_directory()
+            .map_err(NativeCodexHomeError::Create)?;
+        let source = source_codex_home_path()?;
+        Self::reopen_persistent_from(task, path, &source, &parent, None)
+    }
+
+    fn reopen_persistent_from(
+        task: &AgentTask,
+        path: &Path,
+        source: &Path,
+        parent: &Path,
+        lease_state: Option<&Path>,
+    ) -> Result<Self, NativeCodexHomeError> {
+        let resolved =
+            canonical_owned_directory(path).map_err(NativeCodexHomeError::SourceHomeUnsafe)?;
+        if path != resolved || resolved.parent() != Some(parent) {
+            return Err(NativeCodexHomeError::SourceHomeUnsafe(
+                "Native profile moved outside its registered directory".into(),
+            ));
+        }
+        let marker = read_native_profile(&resolved)?;
+        if marker.version != 1
+            || marker.task_id != task.id
+            || marker.worktree != task.worktree_path
+            || marker.branch != task.branch
+            || marker.relative_cwd.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(NativeCodexHomeError::SourceHomeUnsafe(
+                "Native profile no longer belongs to this exact task worktree".into(),
+            ));
+        }
+        let id = marker.thread_id.ok_or_else(|| {
+            NativeCodexHomeError::SourceHomeUnsafe("Native profile has no recorded thread".into())
+        })?;
+        let resume_thread = super::ProviderSessionId::new(super::AgentProvider::Codex, id)
+            .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+        let mut config = OpenOptions::new();
+        config.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            config.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        }
+        let config = config
+            .open(resolved.join("config.toml"))
+            .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+        let metadata = config
+            .metadata()
+            .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+                || metadata.nlink() != 1
+            {
+                return Err(NativeCodexHomeError::SourceHomeUnsafe(
+                    "Native profile configuration is not a private regular file".into(),
+                ));
+            }
+        }
+        if metadata.len() != 0 {
+            return Err(NativeCodexHomeError::SourceHomeUnsafe(
+                "Native profile configuration changed; refusing an unaudited resume".into(),
+            ));
+        }
+        let source =
+            canonical_owned_directory(source).map_err(NativeCodexHomeError::SourceHomeUnsafe)?;
+        let source = PinnedDirectory::open(&source)
+            .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+        let credentials = read_native_credentials(&source)?;
+        let lease = acquire_native_profile_lease(&resolved, lease_state)?;
+        Ok(Self {
+            path: resolved,
+            credentials: Some(credentials),
+            remove_on_drop: false,
+            resume_thread: Some(resume_thread),
+            profile_lease: Some(lease),
+        })
+    }
+
+    pub fn resume_thread(&self) -> Option<&super::ProviderSessionId> {
+        self.resume_thread.as_ref()
+    }
+    pub fn is_persistent(&self) -> bool {
+        !self.remove_on_drop
+    }
+
+    pub fn configure_child_command(
+        &self,
+        command: &mut Command,
+    ) -> Result<(), NativeCodexHomeError> {
+        if let Some(lease) = &self.profile_lease {
+            lease
+                .configure_child(command)
+                .map_err(NativeCodexHomeError::Create)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_thread(path: &Path, thread_id: &str) -> Result<(), NativeCodexHomeError> {
+        super::ProviderSessionId::new(super::AgentProvider::Codex, thread_id)
+            .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+        let mut marker = read_native_profile(path)?;
+        if marker
+            .thread_id
+            .as_deref()
+            .is_some_and(|expected| expected != thread_id)
+        {
+            return Err(NativeCodexHomeError::SourceHomeUnsafe(
+                "Provider returned a different native thread identity".into(),
+            ));
+        }
+        marker.thread_id = Some(thread_id.to_owned());
+        write_native_profile(path, &marker)
+    }
+
+    pub fn prepare() -> Result<Self, NativeCodexHomeError> {
+        let source_home = source_codex_home_path()?;
         let runtime_parent = native_codex_runtime_parent();
         Self::prepare_from(&source_home, &runtime_parent)
     }
@@ -81,6 +270,9 @@ impl PreparedNativeCodexHome {
                     prepared = Some(Self {
                         path: candidate,
                         credentials: Some(credentials),
+                        remove_on_drop: true,
+                        resume_thread: None,
+                        profile_lease: None,
                     });
                     break;
                 }
@@ -140,6 +332,14 @@ impl fmt::Debug for PreparedNativeCodexHome {
 
 impl Drop for PreparedNativeCodexHome {
     fn drop(&mut self) {
+        // Cancelled preparation has no provider history to retain. Once a
+        // thread is recorded (or its marker is unreadable), preserve the
+        // profile rather than guessing that recovery data is disposable.
+        if !self.remove_on_drop
+            && !read_native_profile(&self.path).is_ok_and(|marker| marker.thread_id.is_none())
+        {
+            return;
+        }
         let Some(name) = self.path.file_name().and_then(|name| name.to_str()) else {
             return;
         };
@@ -149,6 +349,139 @@ impl Drop for PreparedNativeCodexHome {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
+}
+
+fn source_codex_home_path() -> Result<PathBuf, NativeCodexHomeError> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .ok_or(NativeCodexHomeError::SourceHomeUnavailable)
+}
+
+fn acquire_native_profile_lease(
+    path: &Path,
+    state: Option<&Path>,
+) -> Result<crate::agent_workspace::NativeSessionLease, NativeCodexHomeError> {
+    use crate::agent_sessions::SessionProvider;
+    use crate::agent_workspace::NativeSessionLease;
+    match state {
+        Some(state) => {
+            NativeSessionLease::acquire_at(state, SessionProvider::Codex, path, "native-profile")
+        }
+        None => NativeSessionLease::acquire(SessionProvider::Codex, path, "native-profile"),
+    }
+    .map_err(NativeCodexHomeError::Create)
+}
+
+/// Bounded read-only discovery of application-owned persistent profiles. The
+/// provider transcript retains its own ID; this marker supplies the durable
+/// cwd instead of an obsolete `/proc/self/fd/N` from native containment.
+pub(crate) fn persisted_codex_profiles() -> Vec<(PathBuf, String, PathBuf, String)> {
+    let Ok(root) = crate::agent_workspace::native_profiles_directory() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut profiles = Vec::new();
+    for entry in entries.take(256).flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let home = entry.path();
+        let Ok(marker) = read_native_profile(&home) else {
+            continue;
+        };
+        let Some(id) = marker.thread_id else {
+            continue;
+        };
+        if marker.version != 1
+            || uuid::Uuid::parse_str(&id).is_err()
+            || !marker.worktree.is_absolute()
+            || marker.relative_cwd.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            continue;
+        }
+        let cwd = marker.worktree.join(marker.relative_cwd);
+        profiles.push((home, id, cwd, marker.title));
+    }
+    profiles
+}
+
+fn read_native_profile(path: &Path) -> Result<NativeCodexProfile, NativeCodexHomeError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path.join(NATIVE_CODEX_PROFILE_MARKER))
+        .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() != 1
+        {
+            return Err(NativeCodexHomeError::SourceHomeUnsafe(
+                "Native profile marker is not private".into(),
+            ));
+        }
+    }
+    if metadata.len() > 16 * 1024 {
+        return Err(NativeCodexHomeError::SourceHomeUnsafe(
+            "Native profile marker is oversized".into(),
+        ));
+    }
+    let mut data = Vec::new();
+    file.take(16 * 1024 + 1)
+        .read_to_end(&mut data)
+        .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+    crate::bounded_json::validate_no_duplicate_members(&data)
+        .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
+    serde_json::from_slice(&data)
+        .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))
+}
+
+fn write_native_profile(
+    path: &Path,
+    marker: &NativeCodexProfile,
+) -> Result<(), NativeCodexHomeError> {
+    let data = serde_json::to_vec(marker)
+        .map_err(|error| NativeCodexHomeError::Create(error.to_string()))?;
+    let temporary = path.join(format!(".jterm-profile-{}.tmp", Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path.join(NATIVE_CODEX_PROFILE_MARKER))?;
+        File::open(path)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error: io::Error| NativeCodexHomeError::Create(error.to_string()))
 }
 
 fn canonical_owned_directory(path: &Path) -> Result<PathBuf, String> {
@@ -732,7 +1065,27 @@ pub fn prepare_native_agent_workspace(
     task: &AgentTask,
     cancel: Arc<AtomicBool>,
 ) -> Result<PreparedNativeWorkspace, NativeWorkspaceError> {
-    if task.status != TaskStatus::Created {
+    prepare_native_agent_workspace_inner(task, cancel, false)
+}
+
+pub(crate) fn prepare_native_agent_workspace_for_resume(
+    task: &AgentTask,
+    cancel: Arc<AtomicBool>,
+) -> Result<PreparedNativeWorkspace, NativeWorkspaceError> {
+    prepare_native_agent_workspace_inner(task, cancel, true)
+}
+
+fn prepare_native_agent_workspace_inner(
+    task: &AgentTask,
+    cancel: Arc<AtomicBool>,
+    resume: bool,
+) -> Result<PreparedNativeWorkspace, NativeWorkspaceError> {
+    let resumable = resume
+        && task.status == TaskStatus::ReadyForReview
+        && task.runtime_kind == super::TaskRuntimeKind::Native
+        && task.terminal_session_id.is_none()
+        && task.validation.status != super::TaskValidationStatus::Running;
+    if task.status != TaskStatus::Created && !resumable {
         return Err(NativeWorkspaceError::TaskNotStartable(task.status));
     }
     let repository = std::fs::canonicalize(&task.repo_root)
@@ -1763,6 +2116,193 @@ mod tests {
         ));
         drop(prepared);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_persistent_preparation_removes_its_empty_profile() {
+        let source = source_codex_home();
+        let parent = private_test_directory("persistent-cancelled");
+        let state = parent.join("lease-state");
+        let home = PreparedNativeCodexHome::prepare_persistent_from(
+            &task(),
+            Path::new(""),
+            &source,
+            &parent,
+            Some(&state),
+        )
+        .unwrap();
+        let path = home.path().to_path_buf();
+        drop(home);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn persistent_profile_keeps_history_but_never_copies_login_and_is_exclusive() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_task::native::tests::persistent_profile_keeps_history_but_never_copies_login_and_is_exclusive",
+        ) {
+            return;
+        }
+        let source = source_codex_home();
+        let parent = private_test_directory("persistent");
+        let state = parent.join("lease-state");
+        let task = task();
+        let home = PreparedNativeCodexHome::prepare_persistent_from(
+            &task,
+            Path::new("nested"),
+            &source,
+            &parent,
+            Some(&state),
+        )
+        .unwrap();
+        let path = home.path().to_path_buf();
+        assert!(home.is_persistent());
+        assert!(home.resume_thread().is_none());
+        assert!(!path.join("auth.json").exists());
+        assert!(
+            PreparedNativeCodexHome::reopen_persistent_from(
+                &task,
+                &path,
+                &source,
+                &parent,
+                Some(&state),
+            )
+            .is_err(),
+            "an unrecorded thread must not be resumed"
+        );
+        let thread = "11111111-1111-4111-8111-111111111111";
+        PreparedNativeCodexHome::record_thread(&path, thread).unwrap();
+        assert!(
+            PreparedNativeCodexHome::reopen_persistent_from(
+                &task,
+                &path,
+                &source,
+                &parent,
+                Some(&state),
+            )
+            .is_err(),
+            "live native ownership must exclude another opener"
+        );
+        std::fs::write(path.join("provider-owned-history"), b"persisted turn").unwrap();
+        drop(home);
+        let mut resumed = PreparedNativeCodexHome::reopen_persistent_from(
+            &task,
+            &path,
+            &source,
+            &parent,
+            Some(&state),
+        )
+        .unwrap();
+        assert_eq!(resumed.resume_thread().unwrap().opaque(), thread);
+        assert_eq!(
+            resumed.take_credentials().unwrap().access_token(),
+            "secret-access-token"
+        );
+        assert_eq!(
+            std::fs::read(path.join("provider-owned-history")).unwrap(),
+            b"persisted turn"
+        );
+        assert_eq!(
+            read_native_profile(&path).unwrap().relative_cwd,
+            Path::new("nested")
+        );
+        assert!(!path.join("auth.json").exists());
+        drop(resumed);
+        assert!(path.exists());
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn persistent_profile_refuses_identity_rebinding_and_changed_configuration() {
+        let source = source_codex_home();
+        let parent = private_test_directory("persistent-provenance");
+        let state = parent.join("lease-state");
+        let task = task();
+        let home = PreparedNativeCodexHome::prepare_persistent_from(
+            &task,
+            Path::new(""),
+            &source,
+            &parent,
+            Some(&state),
+        )
+        .unwrap();
+        let path = home.path().to_path_buf();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        PreparedNativeCodexHome::record_thread(&path, thread).unwrap();
+        assert!(PreparedNativeCodexHome::record_thread(
+            &path,
+            "22222222-2222-4222-8222-222222222222",
+        )
+        .is_err());
+        assert_eq!(
+            read_native_profile(&path).unwrap().thread_id.as_deref(),
+            Some(thread)
+        );
+        drop(home);
+        for changed in ["task", "worktree", "branch"] {
+            let mut other = task.clone();
+            match changed {
+                "task" => other.id = TaskId::new(),
+                "worktree" => other.worktree_path = "/another-worktree".into(),
+                _ => other.branch = "another-branch".into(),
+            }
+            assert!(
+                PreparedNativeCodexHome::reopen_persistent_from(
+                    &other,
+                    &path,
+                    &source,
+                    &parent,
+                    Some(&state),
+                )
+                .is_err(),
+                "{changed} cannot borrow the original thread"
+            );
+        }
+        let config = path.join("config.toml");
+        std::fs::write(&config, b"trust_level = \"trusted\"").unwrap();
+        assert!(PreparedNativeCodexHome::reopen_persistent_from(
+            &task,
+            &path,
+            &source,
+            &parent,
+            Some(&state),
+        )
+        .is_err());
+        std::fs::write(&config, b"").unwrap();
+        std::fs::hard_link(&config, parent.join("config-alias")).unwrap();
+        assert!(PreparedNativeCodexHome::reopen_persistent_from(
+            &task,
+            &path,
+            &source,
+            &parent,
+            Some(&state),
+        )
+        .is_err());
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn persistent_profile_rejects_escaping_relative_directory() {
+        let source = source_codex_home();
+        let parent = private_test_directory("persistent-path");
+        let state = parent.join("lease-state");
+        for invalid in ["/absolute", "../outside", "nested/../../outside"] {
+            assert!(PreparedNativeCodexHome::prepare_persistent_from(
+                &task(),
+                Path::new(invalid),
+                &source,
+                &parent,
+                Some(&state),
+            )
+            .is_err());
+        }
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

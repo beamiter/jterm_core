@@ -757,11 +757,14 @@ mod tests {
         let (tx, _requests) = mpsc::sync_channel(64);
         let (events, rx) = mpsc::sync_channel(64);
         let mut h = SharedHost {
-            gate: active(), tx, rx,
+            gate: active(),
+            tx,
+            rx,
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed: false,
             metadata: Arc::new(std::sync::Mutex::new([None, None, None])),
-            dialogue: Default::default(), memory: Default::default(),
+            dialogue: Default::default(),
+            memory: Default::default(),
             context_access: Default::default(),
         };
         let discovery = Reply::MemoryScopes {
@@ -769,10 +772,16 @@ mod tests {
             next_after: Some("opaque-cursor".into()),
         };
         let review = Reply::MemoryScopeReview {
-            context: ContextRef { host_id: "h".into(), pane_id: "original-pane".into(),
-                task_id: None, project_id: Some("project-without-task".into()), revision: 7 },
+            context: ContextRef {
+                host_id: "h".into(),
+                pane_id: "original-pane".into(),
+                task_id: None,
+                project_id: Some("project-without-task".into()),
+                revision: 7,
+            },
             scope: MemoryScope::Project("project-without-task".into()),
-            review_id: "review".into(), digest: "exact-digest".into(),
+            review_id: "review".into(),
+            digest: "exact-digest".into(),
         };
         events.send(WorkerEvent::Reply(discovery.clone())).unwrap();
         events.send(WorkerEvent::Reply(review.clone())).unwrap();
@@ -781,7 +790,9 @@ mod tests {
         assert_eq!(h.take_memory(), Some(review));
         assert!(h.take_memory().is_none());
         assert!(h.gate.accepts_callback(&token()));
-        for _ in 0..33 { events.send(WorkerEvent::Reply(discovery.clone())).unwrap(); }
+        for _ in 0..33 {
+            events.send(WorkerEvent::Reply(discovery.clone())).unwrap();
+        }
         h.poll();
         assert!(h.failed);
         assert_eq!(h.memory.len(), 32);

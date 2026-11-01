@@ -68,6 +68,15 @@ pub struct KittyKeyboardStacks {
 }
 
 impl KittyKeyboardStacks {
+    /// Host viewport snapshots replay the complete stack, so subsequent pop
+    /// operations retain their meaning after terminal reattachment.
+    pub(crate) fn screen_stack(&self, alternate: bool) -> &[u8] {
+        if alternate {
+            &self.alt
+        } else {
+            &self.main
+        }
+    }
     pub fn new() -> Self {
         Self::default()
     }

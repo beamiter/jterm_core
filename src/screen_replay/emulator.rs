@@ -13,6 +13,7 @@ use super::grid::{
 use super::parser::{Params, Perform};
 use super::pen::{apply_sgr, Color, Pen};
 use super::tables::{CompactRoots, Tables};
+use crate::kitty_keyboard::{KittyKeyboardOp, KittyKeyboardStacks};
 use unicode_width::UnicodeWidthChar;
 
 /// Cells charged for each history row on top of its own cells: the row's
@@ -24,6 +25,9 @@ pub(super) const ROW_OVERHEAD_CELLS: usize = 8;
 
 const NORMAL: usize = 0;
 const ALTERNATE: usize = 1;
+const LIVE_MODES: [i32; 13] = [
+    1, 25, 66, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 2004, 2026, 2027,
+];
 
 /// VTE's `line_drawing_map`: DEC Special Graphics for `_` (0x5f) to `~`.
 const LINE_DRAWING: [char; 32] = [
@@ -81,9 +85,259 @@ pub(super) struct Emulator {
     last_graphic: Option<char>,
     budget: usize,
     pub(super) head_dropped: bool,
+    /// Input/visibility modes required by a live PTY attachment. These do
+    /// not affect finished Block rendering, but must survive reconnects.
+    live_modes: [bool; 13],
+    keyboard: KittyKeyboardStacks,
+    cursor_style: u8,
 }
 
 impl Emulator {
+    pub(super) fn resize(&mut self, cols: usize, rows: usize) {
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+        for screen in &mut self.screens {
+            let history = screen.history_len();
+            if rows < screen.rows {
+                screen.lines.truncate(history + rows);
+            } else {
+                screen
+                    .lines
+                    .extend((screen.rows..rows).map(|_| Row::default()));
+            }
+            for row in &mut screen.lines {
+                if row.cells.len() > cols {
+                    row.cleanup_fragments(cols, cols);
+                    row.cells.truncate(cols);
+                }
+            }
+            screen.rows = rows;
+            screen.row = screen.row.min(rows - 1);
+            screen.col = screen.col.min(cols - 1);
+            screen.saved.row = screen.saved.row.min(rows - 1);
+            screen.saved.col = screen.saved.col.min(cols - 1);
+            screen.history_cells = screen
+                .lines
+                .iter()
+                .take(history)
+                .map(|r| r.cells.len() + ROW_OVERHEAD_CELLS)
+                .sum();
+            while screen.history_len() > 0
+                && screen
+                    .history_cells
+                    .saturating_add(cols.saturating_mul(rows))
+                    > self.budget
+            {
+                if let Some(row) = screen.lines.pop_front() {
+                    screen.history_cells = screen
+                        .history_cells
+                        .saturating_sub(row.cells.len() + ROW_OVERHEAD_CELLS);
+                    self.head_dropped = true;
+                }
+            }
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.top = 0;
+        self.bottom = rows - 1;
+        let old_cols = self.tabstops.len();
+        self.tabstops.resize(cols, false);
+        for col in old_cols..cols {
+            if col % 8 == 0 {
+                self.tabstops[col] = true;
+            }
+        }
+    }
+
+    /// Serialize a live viewport without replaying untrusted historical OSC
+    /// side effects (clipboard, title, device queries). A fresh client resets
+    /// before drawing both primary and alternate screens and input modes.
+    pub(super) fn snapshot_ansi(&self) -> String {
+        self.snapshot_ansi_with_limit(usize::MAX)
+            .expect("unlimited snapshot")
+    }
+
+    pub(super) fn snapshot_ansi_with_limit(&self, limit: usize) -> Option<String> {
+        use super::pen::{write_sgr_transition, SgrScratch};
+        use std::fmt::Write as _;
+        let mut out = String::from("\x1b[?2026l\x1bc\x1b[?7l\x1b[?6l\x1b[4l");
+        let mut scratch = SgrScratch::default();
+        for index in [NORMAL, ALTERNATE] {
+            if index == ALTERNATE {
+                out.push_str("\x1b[?47h\x1b[2J");
+            }
+            out.push_str("\x1b[?6l\x1b[?7l\x1b[4l\x1b(B\x1b)B\x0f");
+            let screen = &self.screens[index];
+            for (line, row) in screen.lines.iter().skip(screen.history_len()).enumerate() {
+                let _ = write!(out, "\x1b[{};1H\x1b[0m", line + 1);
+                let mut pen = Pen::default();
+                let end = super::visible_len(&self.tables, row).min(self.cols);
+                for &cell in row.cells.iter().take(end) {
+                    if cell.is_fragment() && !cell.is_tab_head_fragment() {
+                        continue;
+                    }
+                    let next = *self.tables.pen(cell.pen);
+                    if pen.link != next.link {
+                        out.push_str("\x1b]8;");
+                        out.push_str(if next.link == 0 {
+                            ";"
+                        } else {
+                            self.tables.link(next.link)
+                        });
+                        out.push_str("\x1b\\");
+                    }
+                    write_sgr_transition(&mut out, &mut scratch, &pen, &next);
+                    pen = next;
+                    if cell.is_tab_head() || cell.is_tab_head_fragment() {
+                        out.push(' ');
+                    } else {
+                        super::push_cell_text(&mut out, &self.tables, cell);
+                    }
+                    if out.len() > limit {
+                        return None;
+                    }
+                }
+                out.push_str("\x1b]8;;\x1b\\");
+                if out.len() > limit {
+                    return None;
+                }
+            }
+            // Saved and current cursors belong to each screen independently.
+            let saved = &screen.saved;
+            self.snapshot_cursor(
+                &mut out,
+                screen,
+                saved.row,
+                saved.col,
+                saved.pen,
+                saved.origin,
+                saved.charsets,
+                saved.shift_out,
+            );
+            out.push_str("\x1b7");
+            for flags in self.keyboard.screen_stack(index == ALTERNATE) {
+                let _ = write!(out, "\x1b[>{flags}u");
+            }
+        }
+        if self.active == NORMAL {
+            out.push_str("\x1b[?47l");
+        }
+        // Restore tab stops before the final cursor, then margins and modes.
+        out.push_str("\x1b[3g");
+        for (col, set) in self.tabstops.iter().enumerate() {
+            if *set {
+                let _ = write!(out, "\x1b[1;{}H\x1bH", col + 1);
+            }
+        }
+        let _ = write!(
+            out,
+            "\x1b[{};{}r\x1b[?6{}\x1b[?7{}\x1b[4{}\x1b[?69{}",
+            self.top + 1,
+            self.bottom + 1,
+            if self.origin { 'h' } else { 'l' },
+            if self.autowrap { 'h' } else { 'l' },
+            if self.insert { 'h' } else { 'l' },
+            if self.lr_margins { 'h' } else { 'l' }
+        );
+        for (mode, set) in LIVE_MODES.iter().zip(self.live_modes) {
+            if *mode != 2026 {
+                let _ = write!(out, "\x1b[?{mode}{}", if set { 'h' } else { 'l' });
+            }
+        }
+        out.push_str(if self.live_modes[2] { "\x1b=" } else { "\x1b>" });
+        let _ = write!(out, "\x1b[{} q", self.cursor_style);
+        let screen = &self.screens[self.active];
+        self.snapshot_cursor(
+            &mut out,
+            screen,
+            screen.row,
+            screen.col,
+            self.pen,
+            self.origin,
+            self.charsets,
+            self.shift_out,
+        );
+        let _ = write!(
+            out,
+            "\x1b[?7{}\x1b[4{}",
+            if self.autowrap { 'h' } else { 'l' },
+            if self.insert { 'h' } else { 'l' }
+        );
+        // Paint the initial viewport before entering the provider's pending
+        // synchronized-update block. The next real reset ends that block.
+        if self.live_modes[11] {
+            out.push_str("\x1b[?2026h");
+        }
+        (out.len() <= limit).then_some(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_cursor(
+        &self,
+        out: &mut String,
+        screen: &Screen,
+        row: usize,
+        col: usize,
+        pen: Pen,
+        origin: bool,
+        charsets: [bool; 2],
+        shift_out: bool,
+    ) {
+        use super::pen::{write_sgr_transition, SgrScratch};
+        use std::fmt::Write as _;
+        let mut scratch = SgrScratch::default();
+        let _ = write!(
+            out,
+            "\x1b[{};{}r\x1b[?6{}\x1b[?7h\x1b[4l\x1b(B\x1b)B\x0f\x1b[0m",
+            self.top + 1,
+            self.bottom + 1,
+            if origin { 'h' } else { 'l' }
+        );
+        let display_row = if origin {
+            row.saturating_sub(self.top)
+        } else {
+            row
+        };
+        let _ = write!(
+            out,
+            "\x1b[{};{}H",
+            display_row + 1,
+            col.min(self.cols - 1) + 1
+        );
+        let mut from = Pen::default();
+        if col >= self.cols {
+            let cells = &screen.lines[screen.history_len() + row.min(screen.rows - 1)].cells;
+            let mut at = self.cols - 1;
+            while at > 0 && cells.get(at).is_some_and(|c| c.is_fragment()) {
+                at -= 1;
+            }
+            let _ = write!(out, "\x1b[{};{}H", display_row + 1, at + 1);
+            if let Some(&cell) = cells.get(at) {
+                from = *self.tables.pen(cell.pen);
+                write_sgr_transition(out, &mut scratch, &Pen::default(), &from);
+                super::push_cell_text(out, &self.tables, cell);
+            } else {
+                out.push(' ');
+            }
+        }
+        write_sgr_transition(out, &mut scratch, &from, &pen);
+        out.push_str("\x1b]8;");
+        out.push_str(if pen.link == 0 {
+            ";"
+        } else {
+            self.tables.link(pen.link)
+        });
+        out.push_str("\x1b\\");
+        let _ = write!(
+            out,
+            "\x1b({}\x1b){}{}",
+            if charsets[0] { '0' } else { 'B' },
+            if charsets[1] { '0' } else { 'B' },
+            if shift_out { '\x0e' } else { '\x0f' }
+        );
+    }
+
     pub(super) fn new(cols: usize, rows: usize, budget: usize) -> Emulator {
         Emulator {
             cols,
@@ -106,6 +360,12 @@ impl Emulator {
             last_graphic: None,
             budget,
             head_dropped: false,
+            live_modes: [
+                false, true, false, false, false, false, false, false, false, false, false, false,
+                false,
+            ],
+            keyboard: KittyKeyboardStacks::new(),
+            cursor_style: 0,
         }
     }
 
@@ -836,6 +1096,7 @@ impl Emulator {
     /// DECSET/DECRST 47, 1047 and 1049 (VTE's `set_mode_private`).
     fn alternate_screen(&mut self, mode: i32, set: bool) {
         if set {
+            self.keyboard.enter_alt_screen();
             if mode == 1049 {
                 self.save_cursor();
             }
@@ -844,6 +1105,7 @@ impl Emulator {
                 self.clear_screen();
             }
         } else {
+            self.keyboard.leave_alt_screen();
             if mode == 1047 && self.active == ALTERNATE {
                 self.clear_screen();
             }
@@ -857,6 +1119,9 @@ impl Emulator {
     fn set_private_modes(&mut self, params: &Params, set: bool) {
         let mut i = 0;
         while i < params.len() {
+            if let Some(index) = LIVE_MODES.iter().position(|mode| *mode == params.raw(i)) {
+                self.live_modes[index] = set;
+            }
             match params.raw(i) {
                 6 => {
                     self.origin = set;
@@ -913,6 +1178,10 @@ impl Emulator {
         self.top = 0;
         self.bottom = self.rows - 1;
         self.set_pen(Pen::default());
+        self.live_modes = [
+            false, true, false, false, false, false, false, false, false, false, false, false,
+            false,
+        ];
     }
 
     /// DECSTR: modes and attributes only; the screens stay, and both saved
@@ -934,6 +1203,8 @@ impl Emulator {
         self.active = NORMAL;
         self.tabstops = default_tabstops(self.cols);
         self.last_graphic = None;
+        self.keyboard.reset();
+        self.cursor_style = 0;
     }
 
     /// DECALN (VTE's `DECALN`): resets the margins, homes the cursor and
@@ -1131,6 +1402,17 @@ impl Perform for Emulator {
             (0, 0, b'r') => self.set_margins(params),
             (0, 0, b's') if !self.lr_margins => self.save_cursor(),
             (0, 0, b'u') => self.restore_cursor(),
+            (b'>', 0, b'u') => self
+                .keyboard
+                .apply(KittyKeyboardOp::Push(params.get(0, 0).clamp(0, 255) as u8)),
+            (b'<', 0, b'u') => self
+                .keyboard
+                .apply(KittyKeyboardOp::Pop(params.get(0, 1).clamp(1, 255) as u8)),
+            (b'=', 0, b'u') => self.keyboard.apply(KittyKeyboardOp::Set {
+                flags: params.get(0, 0).clamp(0, 255) as u8,
+                mode: params.get(params.next(0), 1).clamp(1, 3) as u8,
+            }),
+            (0, b' ', b'q') => self.cursor_style = params.get(0, 0).clamp(0, 6) as u8,
             (0, b'!', b'p') => self.soft_reset(),
             _ => {}
         }
@@ -1149,6 +1431,8 @@ impl Perform for Emulator {
             }
             (0, b'M') => self.reverse_index(),
             (0, b'c') => self.hard_reset(),
+            (0, b'=') => self.live_modes[2] = true,
+            (0, b'>') => self.live_modes[2] = false,
             (b'#', b'8') => self.screen_alignment(),
             (b'(', charset) => self.charsets[0] = charset == b'0',
             (b')', charset) => self.charsets[1] = charset == b'0',

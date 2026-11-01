@@ -316,9 +316,22 @@ pub struct CodexAppServerTurnHistory {
     pub dropped_updates: u64,
 }
 
+/// Read-only persisted provider history. These records never emit lifecycle
+/// events, request approvals or become input authority for the loaded turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexPersistedTurn {
+    pub provider_turn_id: String,
+    pub status: String,
+    pub user_text: String,
+    pub agent_text: String,
+}
+
 /// Cheap clone of the worker's bounded presentation state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexAppServerViewSnapshot {
+    pub persisted_history: Arc<[CodexPersistedTurn]>,
+    pub history_cursor: Option<String>,
+    pub history_loading: bool,
     pub phase: CodexAppServerPhase,
     pub provider_thread_id: Option<String>,
     pub provider_turn_id: Option<String>,
@@ -349,6 +362,9 @@ pub struct CodexAppServerViewSnapshot {
 impl Default for CodexAppServerViewSnapshot {
     fn default() -> Self {
         Self {
+            persisted_history: Arc::from([]),
+            history_cursor: None,
+            history_loading: false,
             phase: CodexAppServerPhase::Created,
             provider_thread_id: None,
             provider_turn_id: None,
@@ -539,9 +555,14 @@ impl AgentDriver for CodexAppServerDriver {
             return Err(AgentDriverError::AlreadyStarted);
         }
         request.validate_for_provider(AgentProvider::Codex)?;
-        if request.resume_from.is_some() {
+        if request.resume_from.as_ref()
+            != self
+                .native_home
+                .as_ref()
+                .and_then(PreparedNativeCodexHome::resume_thread)
+        {
             return Err(AgentDriverError::Provider(
-                "Codex app-server resume is not enabled for native task sessions".into(),
+                "Codex resume must match the verified app-owned profile checkpoint".into(),
             ));
         }
         let workspace = self
@@ -626,6 +647,23 @@ impl AgentDriver for CodexAppServerDriver {
         if self.cancellation.is_cancelled() || self.worker_is_finished() {
             return Err(AgentDriverError::Closed);
         }
+        if matches!(command, AgentCommand::History { .. }) {
+            let mut snapshot = self.view.lock();
+            if snapshot.history_loading {
+                return Err(AgentDriverError::TurnActive);
+            }
+            self.command_sender
+                .try_send(command)
+                .map_err(|error| match error {
+                    TrySendError::Full(_) => AgentDriverError::Backpressure {
+                        queued_messages: self.command_sender.len(),
+                        message_capacity: CODEX_APP_SERVER_COMMAND_CAPACITY,
+                    },
+                    TrySendError::Disconnected(_) => AgentDriverError::Closed,
+                })?;
+            snapshot.history_loading = true;
+            return Ok(());
+        }
         try_send_command(&self.command_sender, &self.view, command)
     }
 
@@ -641,7 +679,7 @@ impl AgentDriver for CodexAppServerDriver {
     }
 }
 
-fn try_send_command(
+pub(super) fn try_send_command(
     sender: &Sender<AgentCommand>,
     view: &Arc<ViewCell>,
     command: AgentCommand,
@@ -649,7 +687,9 @@ fn try_send_command(
     let reservation = match &command {
         AgentCommand::Prompt(_) => Some(CodexAppServerPhase::StartingTurn),
         AgentCommand::FinishSession => Some(CodexAppServerPhase::Stopping),
-        AgentCommand::Steer { .. } | AgentCommand::DecideApproval { .. } => None,
+        AgentCommand::Steer { .. }
+        | AgentCommand::DecideApproval { .. }
+        | AgentCommand::History { .. } => None,
     };
     let mut snapshot = reservation
         .map(|phase| {
@@ -678,7 +718,9 @@ fn try_send_command(
             Err(match error {
                 TrySendError::Full(_) => AgentDriverError::Backpressure {
                     queued_messages: sender.len(),
-                    message_capacity: CODEX_APP_SERVER_COMMAND_CAPACITY,
+                    message_capacity: sender
+                        .capacity()
+                        .unwrap_or(CODEX_APP_SERVER_COMMAND_CAPACITY),
                 },
                 TrySendError::Disconnected(_) => AgentDriverError::Closed,
             })
@@ -734,6 +776,7 @@ enum PendingClientRequest {
     ConfigRead,
     AuthLogin,
     ThreadStart,
+    History { reset: bool },
     TurnStart(AgentTurnId),
     Steer,
     Interrupt,
@@ -1792,6 +1835,14 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
     // This single native boundary performs private process-group setup,
     // descriptor-based fchdir, capability inheritance, and PDEATHSIG.
     workspace.configure_child_command(&mut command);
+    if let Err(error) = native_home.configure_child_command(&mut command) {
+        return finish_without_child(
+            &sink,
+            &view,
+            process_snapshot,
+            WorkerFailure::provider(error.to_string()),
+        );
+    }
 
     if cancellation.is_cancelled() {
         return finish_cancelled_without_child(
@@ -1849,6 +1900,13 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
         sink,
         Arc::clone(&view),
     );
+    machine.resume_thread = request
+        .resume_from
+        .as_ref()
+        .map(|id| id.opaque().to_owned());
+    machine.persistent_home = native_home
+        .is_persistent()
+        .then(|| native_home.path().to_path_buf());
     let mut writes = WireWriteQueue::default();
     let mut reader = JsonLineReader::default();
     let mut cancellation_deadline = None;
@@ -2127,6 +2185,8 @@ fn finish_report(
 }
 
 struct ProtocolMachine {
+    resume_thread: Option<String>,
+    persistent_home: Option<PathBuf>,
     wire_root: String,
     wire_cwd: String,
     expected_codex_home: String,
@@ -2166,6 +2226,8 @@ impl ProtocolMachine {
         view: Arc<ViewCell>,
     ) -> Self {
         Self {
+            resume_thread: None,
+            persistent_home: None,
             wire_root,
             wire_cwd,
             expected_codex_home: authority.expected_codex_home.to_string_lossy().into_owned(),
@@ -2310,6 +2372,28 @@ impl ProtocolMachine {
             return Ok(None);
         };
         if let Some(error) = object.get("error") {
+            if matches!(pending, PendingClientRequest::History { .. }) {
+                let finishing_startup = !self.startup_complete;
+                {
+                    let mut view = self.view.lock();
+                    view.history_loading = false;
+                    view.last_error = Some(format!(
+                        "Provider history could not be loaded: {}",
+                        compact_json(error, FIELD_MAX_BYTES)
+                    ));
+                    if finishing_startup {
+                        view.phase = CodexAppServerPhase::Ready;
+                    }
+                }
+                if finishing_startup {
+                    self.startup_complete = true;
+                    if let Some(prompt) = self.initial_prompt.take() {
+                        self.queue_turn(prompt, false, writes)?;
+                    }
+                    return self.flush_deferred(writes);
+                }
+                return Ok(None);
+            }
             return Err(WorkerFailure::provider(format!(
                 "app-server request {pending:?} failed: {}",
                 compact_json(error, FIELD_MAX_BYTES)
@@ -2388,6 +2472,10 @@ impl ProtocolMachine {
             PendingClientRequest::ThreadStart => {
                 let thread_id = required_bounded_string(result, &["thread", "id"], "thread id")?;
                 self.accept_thread_id(thread_id)?;
+                if self.resume_thread.is_some() {
+                    self.queue_history(true, writes)?;
+                    return Ok(None);
+                }
                 if let Some(prompt) = self.initial_prompt.take() {
                     self.queue_turn(prompt, false, writes)?;
                 } else {
@@ -2407,6 +2495,19 @@ impl ProtocolMachine {
                     return Err(WorkerFailure::protocol(
                         "app-server command response result is not an object",
                     ));
+                }
+            }
+            PendingClientRequest::History { reset } => {
+                self.accept_history_page(result, reset)?;
+                if !self.startup_complete {
+                    self.startup_complete = true;
+                    self.view.lock().phase = CodexAppServerPhase::Ready;
+                    if let Some(prompt) = self.initial_prompt.take() {
+                        self.queue_turn(prompt, false, writes)?;
+                    }
+                    if let Some(intent) = self.flush_deferred(writes)? {
+                        return Ok(Some(intent));
+                    }
                 }
             }
         }
@@ -2459,6 +2560,17 @@ impl ProtocolMachine {
 
     fn queue_thread_start(&mut self, writes: &mut WireWriteQueue) -> Result<(), WorkerFailure> {
         self.view.lock().phase = CodexAppServerPhase::StartingThread;
+        if let Some(thread_id) = &self.resume_thread {
+            return self.queue_request(
+                "thread/resume",
+                json!({"threadId":thread_id,"cwd":self.wire_cwd,
+                    "runtimeWorkspaceRoots":[self.wire_root],
+                    "approvalPolicy":"never","approvalsReviewer":"user",
+                    "sandbox":"read-only","excludeTurns":true}),
+                PendingClientRequest::ThreadStart,
+                writes,
+            );
+        }
         self.queue_request(
             "thread/start",
             json!({
@@ -2474,12 +2586,156 @@ impl ProtocolMachine {
                 // descriptor-bound workspaceWrite policy separately.
                 "sandbox": "read-only",
                 "serviceName": crate::agent_task::app_slug(),
-                "ephemeral": true,
+                "ephemeral": self.persistent_home.is_none(),
                 "sessionStartSource": "startup"
             }),
             PendingClientRequest::ThreadStart,
             writes,
         )
+    }
+
+    fn queue_history(
+        &mut self,
+        reset: bool,
+        writes: &mut WireWriteQueue,
+    ) -> Result<(), WorkerFailure> {
+        if self
+            .pending_requests
+            .values()
+            .any(|pending| matches!(pending, PendingClientRequest::History { .. }))
+        {
+            return Ok(());
+        }
+        let thread_id = self
+            .provider_thread_id
+            .as_ref()
+            .ok_or_else(|| WorkerFailure::protocol("History requires a loaded thread"))?;
+        let cursor = if reset {
+            None
+        } else {
+            self.view.lock().history_cursor.clone()
+        };
+        if !reset && cursor.is_none() {
+            self.view.lock().history_loading = false;
+            return Ok(());
+        }
+        self.view.lock().history_loading = true;
+        self.queue_request(
+            "thread/turns/list",
+            json!({"threadId":thread_id,"cursor":cursor,
+            "limit":8,"sortDirection":"desc","itemsView":"summary"}),
+            PendingClientRequest::History { reset },
+            writes,
+        )
+    }
+
+    fn accept_history_page(&mut self, result: &Value, reset: bool) -> Result<(), WorkerFailure> {
+        let data = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| WorkerFailure::protocol("Provider history page has no turn array"))?;
+        if data.len() > 8 {
+            return Err(WorkerFailure::protocol(
+                "Provider history page exceeds the requested limit",
+            ));
+        }
+        let cursor = result
+            .get("nextCursor")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|cursor| cursor.len() <= 8192 && !cursor.contains('\0'))
+                    .map(str::to_owned)
+                    .ok_or_else(|| WorkerFailure::protocol("Invalid provider history cursor"))
+            })
+            .transpose()?;
+        let mut page = Vec::new();
+        for turn in data.iter().rev() {
+            let provider_turn_id = required_bounded_string(turn, &["id"], "historical turn id")?;
+            let status = turn
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let mut user_text = String::new();
+            let mut agent_text = String::new();
+            let mut user_truncated = false;
+            let mut agent_truncated = false;
+            if let Some(items) = turn.get("items").and_then(Value::as_array) {
+                for item in items.iter().take(256) {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("userMessage") => {
+                            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                                for input in content.iter().take(64) {
+                                    if input.get("type").and_then(Value::as_str) == Some("text") {
+                                        if let Some(text) =
+                                            input.get("text").and_then(Value::as_str)
+                                        {
+                                            append_visible_bounded(
+                                                &mut user_text,
+                                                &mut user_truncated,
+                                                text,
+                                                16 * 1024,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some("agentMessage") => {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                append_visible_bounded(
+                                    &mut agent_text,
+                                    &mut agent_truncated,
+                                    text,
+                                    32 * 1024,
+                                );
+                            }
+                        }
+                        _ => {} // Historical tools/approvals never become live actions.
+                    }
+                }
+            }
+            if user_truncated {
+                user_text.push_str("\n[History preview truncated]");
+            }
+            if agent_truncated {
+                agent_text.push_str("\n[History preview truncated]");
+            }
+            page.push(CodexPersistedTurn {
+                provider_turn_id,
+                status: visible_bounded(status, 64).0,
+                user_text,
+                agent_text,
+            });
+        }
+        let mut view = self.view.lock();
+        if !reset {
+            let incoming: HashSet<_> = page
+                .iter()
+                .map(|turn| turn.provider_turn_id.clone())
+                .collect();
+            page.extend(
+                view.persisted_history
+                    .iter()
+                    .filter(|turn| !incoming.contains(&turn.provider_turn_id))
+                    .cloned(),
+            );
+        }
+        // Bounded inspector window, while the provider keeps complete history.
+        // Paging older retains the newly requested page rather than evicting it.
+        let mut bytes = 0usize;
+        page.retain(|turn| {
+            bytes = bytes.saturating_add(
+                turn.user_text.len() + turn.agent_text.len() + turn.provider_turn_id.len(),
+            );
+            bytes <= CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES
+        });
+        page.truncate(64);
+        view.persisted_history = Arc::from(page);
+        view.history_cursor = cursor;
+        view.history_loading = false;
+        Ok(())
     }
 
     fn handle_server_request(
@@ -2850,6 +3106,10 @@ impl ProtocolMachine {
             return Ok(None);
         }
         match command {
+            AgentCommand::History { reset } => {
+                self.queue_history(reset, writes)?;
+                Ok(None)
+            }
             AgentCommand::Prompt(prompt) => {
                 self.queue_turn(prompt, true, writes)?;
                 Ok(None)
@@ -3122,6 +3382,19 @@ impl ProtocolMachine {
     }
 
     fn accept_thread_id(&mut self, thread_id: String) -> Result<(), WorkerFailure> {
+        if self
+            .resume_thread
+            .as_ref()
+            .is_some_and(|expected| expected != &thread_id)
+        {
+            return Err(WorkerFailure::protocol(
+                "Resumed Codex thread identity differs from the requested checkpoint",
+            ));
+        }
+        if let Some(home) = &self.persistent_home {
+            PreparedNativeCodexHome::record_thread(home, &thread_id)
+                .map_err(|error| WorkerFailure::provider(error.to_string()))?;
+        }
         if let Some(current) = &self.provider_thread_id {
             if current != &thread_id {
                 return Err(WorkerFailure::protocol(
@@ -3137,7 +3410,7 @@ impl ProtocolMachine {
         self.emit_critical(
             AgentEventKind::SessionStarted {
                 provider_session_id: Some(provider_session_id),
-                resumed: false,
+                resumed: self.resume_thread.is_some(),
             },
             None,
         )
@@ -4235,6 +4508,185 @@ mod tests {
         snapshot.dropped_updates = 0;
         machine.archive_displayed_completed_turn(&mut snapshot);
         local_turn_id
+    }
+
+    #[test]
+    fn native_resume_rebinds_workspace_and_pages_history_without_replaying_actions() {
+        let (mut machine, mut writes, receiver, view) = machine(None);
+        machine.resume_thread = Some("persisted-thread".into());
+        machine.queue_thread_start(&mut writes).unwrap();
+        let resume = pop_wire(&mut writes);
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "persisted-thread");
+        assert_eq!(resume["params"]["cwd"], "/proc/self/fd/19/nested");
+        assert_eq!(
+            resume["params"]["runtimeWorkspaceRoots"],
+            json!(["/proc/self/fd/19"])
+        );
+        assert_eq!(resume["params"]["excludeTurns"], true);
+        assert_eq!(resume["params"]["sandbox"], "read-only");
+        machine
+            .handle_message(
+                json!({"id":resume["id"],"result":{"thread":{"id":"persisted-thread"}}}),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap().kind(),
+            AgentEventKind::SessionStarted { resumed: true, .. },
+        ));
+        let history = pop_wire(&mut writes);
+        assert_eq!(history["method"], "thread/turns/list");
+        assert_eq!(history["params"]["limit"], 8);
+        assert_eq!(history["params"]["sortDirection"], "desc");
+        assert!(history["params"]["cursor"].is_null());
+        machine
+            .handle_message(
+                json!({"id":history["id"],"result":{"data":[
+                {"id":"newer","status":"completed","items":[
+                    {"type":"userMessage","content":[{"type":"text","text":"Review the change"}]},
+                    {"type":"agentMessage","text":"Change reviewed"},
+                    {"type":"commandExecution","id":"old-command","command":"rm -rf /"},
+                    {"type":"fileChange","id":"old-file","changes":[]}
+                ]},
+                {"id":"older","status":"completed","items":[
+                    {"type":"agentMessage","text":"Earlier answer"}
+                ]}
+            ],"nextCursor":"opaque-page-2"}}),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        let snapshot = view.lock();
+        assert_eq!(snapshot.phase, CodexAppServerPhase::Ready);
+        assert_eq!(snapshot.persisted_history.len(), 2);
+        assert_eq!(snapshot.persisted_history[0].provider_turn_id, "older");
+        assert_eq!(snapshot.persisted_history[1].user_text, "Review the change");
+        assert_eq!(snapshot.persisted_history[1].agent_text, "Change reviewed");
+        assert_eq!(snapshot.history_cursor.as_deref(), Some("opaque-page-2"));
+        assert!(!snapshot.history_loading);
+        assert!(snapshot.commands.is_empty() && snapshot.pending_approvals.is_empty());
+        assert!(
+            receiver.try_recv().is_err(),
+            "read-only history must not emit lifecycle or tool events"
+        );
+        assert!(
+            writes.pending.is_empty(),
+            "resuming alone must not submit another goal"
+        );
+    }
+
+    #[test]
+    fn native_history_paging_deduplicates_and_neutralizes_untrusted_display_text() {
+        let (mut machine, mut writes, receiver, view) = machine(None);
+        machine.accept_thread_id("thread-history".into()).unwrap();
+        receiver.try_recv().unwrap();
+        machine.startup_complete = true;
+        machine
+            .accept_history_page(
+                &json!({"data":[
+            {"id":"turn-2","status":"completed","items":[{"type":"agentMessage","text":"new"}]}
+        ],"nextCursor":"page-2"}),
+                true,
+            )
+            .unwrap();
+        machine.queue_history(false, &mut writes).unwrap();
+        let request = pop_wire(&mut writes);
+        assert_eq!(request["params"]["cursor"], "page-2");
+        machine.queue_history(false, &mut writes).unwrap();
+        assert!(
+            writes.pending.is_empty(),
+            "only one pagination request may be outstanding"
+        );
+        machine.handle_message(
+            json!({"id":request["id"],"result":{"data":[
+                {"id":"turn-2","status":"completed","items":[{"type":"agentMessage","text":"new"}]},
+                {"id":"turn-1","status":"completed","items":[{"type":"agentMessage","text":format!("\u{1b}[2J\u{202e}{}", "界".repeat(20000))}]}
+            ],"nextCursor":null}}),
+            &mut writes, false,
+        ).unwrap();
+        let snapshot = view.lock();
+        assert_eq!(snapshot.persisted_history.len(), 2);
+        assert_eq!(snapshot.persisted_history[0].provider_turn_id, "turn-1");
+        assert_eq!(snapshot.persisted_history[1].provider_turn_id, "turn-2");
+        let text = &snapshot.persisted_history[0].agent_text;
+        assert!(text.len() < 33 * 1024);
+        assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));
+        assert!(text.ends_with("[History preview truncated]"));
+        assert!(snapshot.history_cursor.is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_resume_rejects_another_thread_and_oversized_history_pages() {
+        let (mut machine, mut writes, receiver, _) = machine(None);
+        machine.resume_thread = Some("expected-thread".into());
+        machine.queue_thread_start(&mut writes).unwrap();
+        let request = pop_wire(&mut writes);
+        assert!(machine
+            .handle_message(
+                json!({"id":request["id"],"result":{"thread":{"id":"different-thread"}}}),
+                &mut writes,
+                false,
+            )
+            .is_err());
+        assert!(receiver.try_recv().is_err());
+        assert!(machine
+            .accept_history_page(
+                &json!({"data":vec![json!({"id":"x","items":[]});9],"nextCursor":null}),
+                true,
+            )
+            .is_err());
+        assert!(machine
+            .accept_history_page(&json!({"data":[],"nextCursor":"x".repeat(8193)}), true,)
+            .is_err());
+    }
+
+    #[test]
+    fn history_failure_keeps_resumed_thread_usable_and_honors_deferred_finish() {
+        let (mut machine, mut writes, _receiver, view) = machine(None);
+        machine.resume_thread = Some("persisted-thread".into());
+        machine
+            .handle_command(AgentCommand::FinishSession, &mut writes)
+            .unwrap();
+        machine.queue_thread_start(&mut writes).unwrap();
+        let request = pop_wire(&mut writes);
+        machine
+            .handle_message(
+                json!({"id":request["id"],"result":{"thread":{"id":"persisted-thread"}}}),
+                &mut writes,
+                false,
+            )
+            .unwrap();
+        let history = pop_wire(&mut writes);
+        let finish = machine
+            .handle_message(
+                json!({"id":history["id"],"error":{"code":-32601,"message":"history unavailable"}}),
+                &mut writes,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(finish.outcome, AgentSessionOutcome::Clean);
+        let snapshot = view.lock();
+        assert!(!snapshot.history_loading);
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("history could not be loaded"));
+    }
+
+    #[test]
+    fn application_owned_native_threads_enable_provider_history_persistence() {
+        let (mut machine, mut writes, _, _) = machine(None);
+        machine.persistent_home = Some("/private/codex".into());
+        machine.queue_thread_start(&mut writes).unwrap();
+        let start = pop_wire(&mut writes);
+        assert_eq!(start["method"], "thread/start");
+        assert_eq!(start["params"]["ephemeral"], false);
+        assert_eq!(start["params"]["environments"], json!([]));
     }
 
     #[test]

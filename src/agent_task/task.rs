@@ -754,9 +754,31 @@ impl TaskManager {
         self.install_agent_event_stream(task_id, NativeAgentSessionId::new(), false)
     }
 
-    /// Test-only transport-incarnation hook. A live native Codex session may
-    /// carry several turns, but it has no production restart authority after
-    /// the stream ends.
+    /// Resume is a separate authority path from first start. The runtime has
+    /// already verified the durable profile and prior process-stop evidence;
+    /// the reducer repeats live ownership, task and validation gates here.
+    pub(crate) fn resume_agent_event_stream_after_stop(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<AgentEventStream, AgentEventError> {
+        if self.native_event_streams.contains_key(&task_id) {
+            return Err(AgentEventError::StreamAlreadyActive(task_id));
+        }
+        let task = self
+            .get(task_id)
+            .ok_or(AgentEventError::UnknownTask(task_id))?;
+        if task.status != TaskStatus::ReadyForReview || task.runtime_kind != TaskRuntimeKind::Native
+        {
+            return Err(AgentEventError::NativeStartRequiresCreated {
+                task_id,
+                status: task.status,
+            });
+        }
+        self.install_agent_event_stream(task_id, NativeAgentSessionId::new(), false)
+    }
+
+    /// Test-only transport-incarnation hook. Production resume uses the
+    /// separate checked path above after its original process has stopped.
     #[cfg(test)]
     fn replace_agent_event_stream_after_stop(
         &mut self,
@@ -930,7 +952,7 @@ impl TaskManager {
                 .map(|active| (active.active_turn, active.review_point_reached))
                 .unwrap_or((None, false))
         } else {
-            (None, false)
+            (None, status == TaskStatus::ReadyForReview)
         };
         self.native_event_streams.insert(
             task_id,
@@ -3585,6 +3607,72 @@ mod tests {
             manager.get(id).unwrap().status_detail.as_deref(),
             Some(detail.as_str())
         );
+    }
+
+    #[test]
+    fn resumed_native_stream_has_new_epoch_and_rejects_old_worker_events() {
+        let mut manager = TaskManager::new();
+        let id = manager.create(new_task("resumable work")).unwrap();
+        assert!(manager.resume_agent_event_stream_after_stop(id).is_err());
+        let stream = manager.start_agent_event_stream(id).unwrap();
+        let turn = AgentTurnId::new();
+        manager
+            .apply_agent_event(stream.event(1, session_started(), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(2, turn_started(turn), None))
+            .unwrap();
+        manager
+            .apply_agent_event(stream.event(3, turn_completed(turn), None))
+            .unwrap();
+        assert!(matches!(
+            manager.resume_agent_event_stream_after_stop(id),
+            Err(AgentEventError::StreamAlreadyActive(_)),
+        ));
+        manager
+            .finish_agent_event_stream_after_stop(&stream, AgentSessionOutcome::Clean, None)
+            .unwrap();
+        assert!(manager.start_agent_event_stream(id).is_err());
+        manager
+            .bind_validation_session(id, "resume-validation".into())
+            .unwrap();
+        assert!(matches!(
+            manager.resume_agent_event_stream_after_stop(id),
+            Err(AgentEventError::ValidationActive(_)),
+        ));
+        manager.handle_terminal_session_exit("resume-validation", Some(0));
+        let resumed = manager.resume_agent_event_stream_after_stop(id).unwrap();
+        assert_ne!(resumed, stream);
+        assert!(manager
+            .apply_agent_event(stream.event(4, turn_started(AgentTurnId::new()), None))
+            .is_err());
+        manager
+            .apply_agent_event(
+                resumed.event(
+                    1,
+                    AgentEventKind::SessionStarted {
+                        provider_session_id: Some(
+                            super::super::ProviderSessionId::new(
+                                AgentProvider::Codex,
+                                "persisted-thread",
+                            )
+                            .unwrap(),
+                        ),
+                        resumed: true,
+                    },
+                    None,
+                ),
+            )
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::ReadyForReview);
+        assert_eq!(
+            manager.get(id).unwrap().validation.status,
+            TaskValidationStatus::NotRun
+        );
+        manager
+            .apply_agent_event(resumed.event(2, turn_started(AgentTurnId::new()), None))
+            .unwrap();
+        assert_eq!(manager.get(id).unwrap().status, TaskStatus::Working);
     }
 
     #[test]

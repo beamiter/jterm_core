@@ -147,6 +147,7 @@ static KIMI_SPEC: PrintProviderSpec = PrintProviderSpec {
     // session starts immediately and the id is recorded in the view only.
     session_id_first: false,
     argv: kimi_print_argv,
+    resume_argv: None,
     parse: kimi_print_signal,
 };
 

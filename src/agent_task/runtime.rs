@@ -83,7 +83,7 @@ impl RunningCodexAgent {
 }
 
 enum NativeRunningDriver {
-    Codex(CodexAppServerDriver),
+    Codex(Box<CodexAppServerDriver>),
     Claude(ClaudeStreamJsonDriver),
     Kimi(KimiStreamJsonDriver),
 }
@@ -168,13 +168,6 @@ impl NativeRunningDriver {
             Self::Kimi(driver) => driver.send(command),
         }
     }
-
-    fn as_codex_mut(&mut self) -> Option<&mut CodexAppServerDriver> {
-        match self {
-            Self::Codex(driver) => Some(driver),
-            Self::Claude(_) | Self::Kimi(_) => None,
-        }
-    }
 }
 
 enum PreparedNativeStart {
@@ -186,7 +179,7 @@ enum PreparedNativeStart {
 struct PreparedCodexStart {
     task: AgentTask,
     workspace: PreparedNativeWorkspace,
-    prompt: AgentPrompt,
+    prompt: Option<AgentPrompt>,
     launch_argv: Vec<String>,
     native_home: PreparedNativeCodexHome,
 }
@@ -235,6 +228,7 @@ struct PendingCodexPreparation {
 /// be recreated explicitly after process restart.
 #[derive(Default)]
 pub struct AgentRuntimeManager {
+    native_codex_homes: HashMap<TaskId, std::path::PathBuf>,
     preparing: HashMap<TaskId, PendingCodexPreparation>,
     cancelled_preparations: Vec<PendingCodexPreparation>,
     running: HashMap<TaskId, RunningCodexAgent>,
@@ -487,8 +481,16 @@ impl AgentRuntimeManager {
                 NativePromptError::SharingDisabled,
             ));
         }
-        if task.status != TaskStatus::Created
-            || task.runtime_kind != TaskRuntimeKind::Unassigned
+        let resume_home = self
+            .can_resume_codex(task_id)
+            .then(|| self.native_codex_homes.get(&task_id).cloned())
+            .flatten();
+        let resume = resume_home.is_some()
+            && task.status == TaskStatus::ReadyForReview
+            && task.runtime_kind == TaskRuntimeKind::Native;
+        if (!resume
+            && (task.status != TaskStatus::Created
+                || task.runtime_kind != TaskRuntimeKind::Unassigned))
             || task.terminal_session_id.is_some()
             || task.validation.status == TaskValidationStatus::Running
             || task_manager.has_active_agent_event_stream(task_id)
@@ -513,7 +515,7 @@ impl AgentRuntimeManager {
                 crate::agent_task::app_slug()
             ))
             .spawn(move || {
-                let result = prepare_codex_start(task, policy, worker_cancel);
+                let result = prepare_codex_start(task, policy, worker_cancel, resume_home);
                 let _ = sender.send(PreparationResult { generation, result });
             })
             .map_err(|error| {
@@ -549,7 +551,13 @@ impl AgentRuntimeManager {
                 "task changed while native prerequisites were being prepared".into(),
             ));
         }
-        let stream = task_manager.start_agent_event_stream(task_id)?;
+        let resume_from = prepared.native_home.resume_thread().cloned();
+        let stream = if resume_from.is_some() {
+            task_manager.resume_agent_event_stream_after_stop(task_id)?
+        } else {
+            task_manager.start_agent_event_stream(task_id)?
+        };
+        let native_home_path = prepared.native_home.path().to_path_buf();
         let worktree_path = prepared.task.worktree_path;
         let mut driver = CodexAppServerDriver::new(
             prepared.launch_argv,
@@ -563,8 +571,8 @@ impl AgentRuntimeManager {
             // The prompt contains the policy-approved, redacted evidence. Do
             // not also hand the adapter the raw semantic snapshot.
             source_context: None,
-            initial_prompt: Some(prepared.prompt),
-            resume_from: None,
+            initial_prompt: prepared.prompt,
+            resume_from: resume_from.clone(),
         };
         if let Err(error) = driver.start(request) {
             // CodexAppServerDriver::start has a strict pre-spawn error
@@ -572,6 +580,14 @@ impl AgentRuntimeManager {
             // every later spawn/protocol/process failure asynchronously. That
             // makes this stopped-runtime rollback authoritative.
             driver.cancel();
+            if resume_from.is_some() {
+                let _ = task_manager.finish_agent_event_stream_after_stop(
+                    &stream,
+                    AgentSessionOutcome::Failed,
+                    Some(error.to_string()),
+                );
+                return Err(AgentRuntimeError::Driver(error));
+            }
             return Err(rollback_failed_start(
                 task_manager,
                 &stream,
@@ -580,10 +596,11 @@ impl AgentRuntimeManager {
         }
 
         self.retained.remove(&task_id);
+        self.native_codex_homes.insert(task_id, native_home_path);
         self.running.insert(
             task_id,
             RunningCodexAgent {
-                driver: NativeRunningDriver::Codex(driver),
+                driver: NativeRunningDriver::Codex(Box::new(driver)),
                 retained_workspace: None,
                 stream,
                 worker_joined: false,
@@ -598,8 +615,9 @@ impl AgentRuntimeManager {
 
     /// Begin preparing a Claude Code print/stream-json session without blocking.
     ///
-    /// Unlike Codex, this MVP skips private home and cgroup containment. Prefer
-    /// the opaque PTY path when stronger isolation is required.
+    /// Each turn uses an exact provider ID in the pinned profile. Between
+    /// turns, the worker retains its session lease while all tool processes
+    /// are stopped. Tool permission prompts require the interactive PTY path.
     pub fn start_claude(
         &mut self,
         task_manager: &mut TaskManager,
@@ -700,7 +718,8 @@ impl AgentRuntimeManager {
         }
         let stream = task_manager.start_agent_event_stream(task_id)?;
         let worktree_path = prepared.task.worktree_path.clone();
-        let mut driver = ClaudeStreamJsonDriver::new(prepared.launch_argv, worktree_path.clone());
+        let mut driver =
+            ClaudeStreamJsonDriver::new_conversation(prepared.launch_argv, worktree_path.clone());
         let request = AgentStartRequest {
             provider: AgentProvider::Claude,
             stream: stream.clone(),
@@ -1102,12 +1121,24 @@ impl AgentRuntimeManager {
             .map_err(AgentRuntimeError::Driver)
     }
 
-    /// Start another bounded user turn on the same loaded Codex thread.
+    /// Start another bounded user turn on the same native conversation.
     ///
     /// The task reducer and driver both repeat the idle-session gate. The
     /// driver's nonblocking command boundary reserves the idle phase before
     /// returning so duplicate UI actions cannot queue overlapping turns.
     pub fn prompt_codex(
+        &mut self,
+        task_manager: &TaskManager,
+        task_id: TaskId,
+        text: &str,
+        policy: NativePromptPolicy,
+    ) -> Result<(), AgentRuntimeError> {
+        self.prompt_native(task_manager, task_id, text, policy)
+    }
+
+    /// Submit a follow-up to an idle Codex or Claude conversation. The legacy
+    /// `prompt_codex` entry point remains source-compatible for existing hosts.
+    pub fn prompt_native(
         &mut self,
         task_manager: &TaskManager,
         task_id: TaskId,
@@ -1133,14 +1164,14 @@ impl AgentRuntimeManager {
             .running
             .get_mut(&task_id)
             .ok_or(AgentRuntimeError::NotRunning(task_id))?;
-        if runtime.driver.as_codex_mut().is_none() {
+        if matches!(runtime.driver, NativeRunningDriver::Kimi(_)) {
             return Err(AgentRuntimeError::Preparation(
-                "follow-up turns require a live Codex native session".into(),
+                "this provider does not support native follow-up turns".into(),
             ));
         }
         if runtime.pending_prompt.is_some() || runtime.finish_requested {
             return Err(AgentRuntimeError::Preparation(
-                "native Codex session already has a queued turn or finish request".into(),
+                "native session already has a queued turn or finish request".into(),
             ));
         }
         runtime
@@ -1149,6 +1180,50 @@ impl AgentRuntimeManager {
             .map_err(AgentRuntimeError::Driver)?;
         runtime.pending_prompt = Some(turn_id);
         Ok(())
+    }
+
+    /// UI capability and current readiness; sending repeats the gate atomically.
+    pub fn can_prompt_native(&self, task_id: TaskId) -> bool {
+        self.running.get(&task_id).is_some_and(|runtime| {
+            !matches!(runtime.driver, NativeRunningDriver::Kimi(_))
+                && runtime.driver.phase() == CodexAppServerPhase::Ready
+                && runtime.pending_prompt.is_none()
+                && !runtime.finish_requested
+                && !runtime.worker_joined
+        })
+    }
+
+    /// An exact app-owned Codex profile may be reopened only after the runtime
+    /// has proved its previous worker and containment stopped cleanly.
+    pub fn can_resume_codex(&self, task_id: TaskId) -> bool {
+        !self.running.contains_key(&task_id)
+            && !self.preparing.contains_key(&task_id)
+            && self.native_codex_homes.contains_key(&task_id)
+            && self.retained.get(&task_id).is_some_and(|retained| {
+                retained.effective_outcome == AgentSessionOutcome::Clean
+                    && retained.view.provider_thread_id.is_some()
+            })
+    }
+
+    /// Page provider-owned history without turning old events into new work.
+    pub fn load_native_history(
+        &mut self,
+        task_id: TaskId,
+        reset: bool,
+    ) -> Result<(), AgentRuntimeError> {
+        let runtime = self
+            .running
+            .get_mut(&task_id)
+            .ok_or(AgentRuntimeError::NotRunning(task_id))?;
+        if !matches!(runtime.driver, NativeRunningDriver::Codex(_)) {
+            return Err(AgentRuntimeError::Preparation(
+                "This provider exposes history through its Terminal view".into(),
+            ));
+        }
+        runtime
+            .driver
+            .send(AgentCommand::History { reset })
+            .map_err(AgentRuntimeError::Driver)
     }
 
     /// Finish an idle live session. Validation remains locked until the worker
@@ -1454,13 +1529,26 @@ fn prepare_codex_start(
     task: AgentTask,
     policy: NativePromptPolicy,
     cancel: Arc<AtomicBool>,
+    resume_home: Option<std::path::PathBuf>,
 ) -> Result<PreparedNativeStart, AgentRuntimeError> {
     preparation_cancelled(cancel.as_ref())?;
     // The capability owns its pinned directory descriptors. It stays in this
     // result until the UI thread either consumes it or drops a stale result.
-    let workspace = prepare_native_agent_workspace(&task, Arc::clone(&cancel))?;
+    let workspace = if resume_home.is_some() {
+        super::native::prepare_native_agent_workspace_for_resume(&task, Arc::clone(&cancel))?
+    } else {
+        prepare_native_agent_workspace(&task, Arc::clone(&cancel))?
+    };
     preparation_cancelled(cancel.as_ref())?;
-    let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
+    let prompt = if resume_home.is_some() {
+        None
+    } else {
+        Some(build_native_task_prompt(
+            &task,
+            workspace.relative_cwd(),
+            policy,
+        )?)
+    };
     preparation_cancelled(cancel.as_ref())?;
     let launch_argv = AgentLaunchSpec::resolve_native(
         AgentProvider::Codex,
@@ -1468,7 +1556,10 @@ fn prepare_codex_start(
         &task.worktree_path,
     )?;
     preparation_cancelled(cancel.as_ref())?;
-    let native_home = PreparedNativeCodexHome::prepare()?;
+    let native_home = match resume_home {
+        Some(path) => PreparedNativeCodexHome::reopen_persistent(&task, &path)?,
+        None => PreparedNativeCodexHome::prepare_persistent(&task, workspace.relative_cwd())?,
+    };
     preparation_cancelled(cancel.as_ref())?;
     Ok(PreparedNativeStart::Codex(PreparedCodexStart {
         task,

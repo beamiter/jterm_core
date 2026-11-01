@@ -96,7 +96,7 @@ pub use drivers::{
     CodexAppServerExitCause, CodexAppServerExitReport, CodexAppServerFileChange,
     CodexAppServerFileChangeView, CodexAppServerPhase, CodexAppServerProcessExit,
     CodexAppServerTurnCommandSummary, CodexAppServerTurnFileSummary, CodexAppServerTurnHistory,
-    CodexAppServerViewSnapshot, KimiStreamJsonDriver, KimiStreamSignal,
+    CodexAppServerViewSnapshot, CodexPersistedTurn, KimiStreamJsonDriver, KimiStreamSignal,
     CODEX_APP_SERVER_LIVE_TURN_MAX, CODEX_APP_SERVER_TURN_HISTORY_CAPACITY,
     CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES,
 };

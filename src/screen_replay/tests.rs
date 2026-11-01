@@ -1,6 +1,48 @@
 use super::*;
 use std::fmt::Write as _;
 
+#[test]
+fn live_snapshot_preserves_continuations_at_every_byte_boundary() {
+    let cases: [(&[u8], &[u8]); 6] = [
+        (b"12345678", b"XY"),
+        ("中文abcd".as_bytes(), "汉Z".as_bytes()),
+        (b"base\x1b[?1049h\x1b[2;2H\x1b[31mALT", b"!\x1b[?1049lN"),
+        (b"a\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b7\x1b[32mB", b"C\x1b8D"),
+        (b"\x1b[3g\x1b[1;4H\x1bH\rX\tY", b"\rQ\tZ"),
+        (b"\x1b[>1u\x1b[>0u\x1b=\x1b[?2004hK", b"\x1b[<1u!"),
+    ];
+    for (prefix, suffix) in cases {
+        let all = [prefix, suffix].concat();
+        for split in 0..=prefix.len() {
+            let mut original = ScreenReplay::new(8, 5);
+            original.feed(&all[..split]);
+            let snapshot = original.snapshot_ansi();
+            let mut restored = ScreenReplay::new(8, 5);
+            restored.feed(&snapshot);
+            original.feed(&all[split..]);
+            restored.feed(&all[split..]);
+            // Compare the current viewport and modes as well as the text.
+            assert_eq!(
+                restored.snapshot_ansi(),
+                original.snapshot_ansi(),
+                "split={split}, prefix={prefix:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn live_snapshot_resizes_without_restoring_cleared_tab_stops() {
+    let mut original = ScreenReplay::new(12, 4);
+    original.feed(b"\x1b[3g\x1b[1;4H\x1bH\rA\tB");
+    original.resize(20, 6);
+    let mut restored = ScreenReplay::new(20, 6);
+    restored.feed(&original.snapshot_ansi());
+    original.feed(b"\rC\tD");
+    restored.feed(b"\rC\tD");
+    assert_eq!(restored.snapshot_ansi(), original.snapshot_ansi());
+}
+
 const CODEX_16ROWS: &[u8] = include_bytes!("../../tests/fixtures/screen_replay/codex-16rows.bin");
 const CODEX_40_RESIZE: &[u8] =
     include_bytes!("../../tests/fixtures/screen_replay/codex-40-resize.bin");

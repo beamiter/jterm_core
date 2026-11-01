@@ -147,6 +147,11 @@ impl AgentSession {
             cwd: self.cwd.clone(),
         };
         if let Some(source_home) = self.provider_home() {
+            // Native profiles persist a descriptor-bound cwd in Codex's
+            // transcript. Rebind it to the validated durable worktree when
+            // explicitly handing that same thread to the terminal.
+            let native_codex = self.provider == SessionProvider::Codex
+                && source_home.join("jterm-native-profile.json").is_file();
             let inherited = provider_home(self.provider);
             let inherited = inherited
                 .as_ref()
@@ -166,6 +171,9 @@ impl AgentSession {
                     self.id.clone(),
                 ];
                 launch.program = "env".into();
+            }
+            if native_codex {
+                launch.args.extend(["--cd".into(), cwd.into()]);
             }
         }
         Ok(launch)
@@ -261,7 +269,27 @@ impl SessionCatalog {
                 claude.push(root);
             }
         }
-        Self::discover_roots(&codex, &claude)
+        let native_profiles = crate::agent_task::native::persisted_codex_profiles();
+        for (profile, ..) in &native_profiles {
+            if !codex.contains(profile) {
+                codex.push(profile.clone());
+            }
+        }
+        let mut catalog = Self::discover_roots(&codex, &claude);
+        for session in &mut catalog.sessions {
+            if session.provider != SessionProvider::Codex {
+                continue;
+            }
+            if let Some((_, _, cwd, title)) = native_profiles.iter().find(|(home, id, ..)| {
+                id == &session.id && session.provider_home().as_ref() == Some(home)
+            }) {
+                session.cwd = cwd.clone();
+                if !title.trim().is_empty() {
+                    session.title = safe_text(title, 256);
+                }
+            }
+        }
+        catalog
     }
     pub fn discover_with_roots(codex_home: &Path, claude_home: &Path) -> Self {
         Self::discover_roots(&[codex_home.to_path_buf()], &[claude_home.to_path_buf()])
@@ -305,7 +333,7 @@ impl SessionCatalog {
             candidates.truncate(MAX_SESSIONS);
         }
         let mut bytes_left = MAX_SCAN_BYTES;
-        let mut identities = HashMap::<(SessionProvider, String), usize>::new();
+        let mut identities = HashMap::<(SessionProvider, PathBuf, String), usize>::new();
         for candidate in &candidates {
             if bytes_left < HEAD_BYTES + TAIL_BYTES {
                 catalog
@@ -317,7 +345,13 @@ impl SessionCatalog {
                     if sampled {
                         catalog.warn("Some compressed sessions exceed the decompression budget; their last state is unknown.");
                     }
-                    let key = (session.provider, session.id.clone());
+                    let key = (
+                        session.provider,
+                        session
+                            .provider_home()
+                            .unwrap_or_else(|| session.source.clone()),
+                        session.id.clone(),
+                    );
                     if let Some(&index) = identities.get(&key) {
                         // Prefer ordinary history over archived copies, then newer evidence.
                         let prior = &catalog.sessions[index];
@@ -1585,6 +1619,45 @@ mod tests {
         assert_eq!(catalog.sessions[0].status, SessionStatus::Unknown);
         assert!(!catalog.warnings.is_empty());
     }
+    #[test]
+    fn identical_ids_in_distinct_provider_homes_remain_distinct() {
+        let f = Fixture::new();
+        f.write("codex/sessions/one.jsonl", &[f.meta(ID)]);
+        f.write("alternate/sessions/two.jsonl", &[f.meta(ID)]);
+        let catalog = SessionCatalog::discover_roots(
+            &[f.0.join("codex"), f.0.join("alternate")],
+            &[f.0.join("claude")],
+        );
+        assert_eq!(catalog.sessions.len(), 2);
+        assert_ne!(
+            catalog.sessions[0].provider_home(),
+            catalog.sessions[1].provider_home()
+        );
+        let identities: std::collections::HashSet<_> = catalog
+            .sessions
+            .iter()
+            .map(|session| {
+                crate::agent_workspace::WorkspaceRow::from_agent(session)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        assert_eq!(identities.len(), 2);
+    }
+
+    #[test]
+    fn native_codex_terminal_handoff_rebinds_original_project_directory() {
+        let f = Fixture::new();
+        f.write("codex/sessions/native.jsonl", &[f.meta(ID)]);
+        std::fs::write(f.0.join("codex/jterm-native-profile.json"), b"{}").unwrap();
+        let session = f.catalog().sessions.remove(0);
+        let launch = session.resume_launch().unwrap();
+        assert_eq!(
+            &launch.args[launch.args.len() - 2..],
+            ["--cd", session.cwd.to_str().unwrap()],
+        );
+    }
+
     #[test]
     fn multiple_provider_homes_are_scanned_together() {
         let f = Fixture::new();
