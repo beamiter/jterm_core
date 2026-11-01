@@ -1,4 +1,4 @@
-//! Shared worker for one-shot `--print` / stream-json provider CLIs.
+//! Shared worker for `--print` / stream-json provider CLIs.
 //!
 //! Claude Code and Kimi Code both run one prompt per process and report it as
 //! newline-delimited JSON on stdout. Their parsers differ; everything else
@@ -26,8 +26,9 @@ use crate::agent_task::driver::{
 };
 use crate::agent_task::drivers::codex_app_server::{
     append_visible_bounded, visible_bounded, CodexAppServerExitCause, CodexAppServerExitReport,
-    CodexAppServerPhase, CodexAppServerProcessExit, CodexAppServerViewSnapshot,
-    CODEX_APP_SERVER_AGENT_TEXT_MAX_BYTES,
+    CodexAppServerPhase, CodexAppServerProcessExit, CodexAppServerTurnHistory,
+    CodexAppServerViewSnapshot, CODEX_APP_SERVER_AGENT_TEXT_MAX_BYTES,
+    CODEX_APP_SERVER_TURN_HISTORY_CAPACITY, CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES,
 };
 use crate::agent_task::event::MAX_AGENT_EVENT_DETAIL_BYTES;
 use crate::agent_task::{
@@ -116,6 +117,8 @@ pub(super) enum PrintSignal {
     Ignored,
 }
 
+type ResumeArgv = fn(&[String], &str, &str) -> Result<Vec<String>, String>;
+
 /// Static per-provider wiring for [`PrintStreamDriver`].
 pub(super) struct PrintProviderSpec {
     pub provider: AgentProvider,
@@ -126,6 +129,8 @@ pub(super) struct PrintProviderSpec {
     /// Wait (bounded) for [`PrintSignal::SessionId`] before `SessionStarted`.
     pub session_id_first: bool,
     pub argv: fn(&[String], &str) -> Result<Vec<String>, String>,
+    /// Exact-ID continuation. None keeps the provider's one-shot contract.
+    pub resume_argv: Option<ResumeArgv>,
     pub parse: fn(&str) -> PrintSignal,
 }
 
@@ -143,6 +148,8 @@ pub(super) struct PrintStreamDriver {
     exit_report: Arc<Mutex<Option<CodexAppServerExitReport>>>,
     worker: Option<JoinHandle<()>>,
     started: bool,
+    continuation: bool,
+    provider_home: Option<PathBuf>,
 }
 
 impl PrintStreamDriver {
@@ -169,7 +176,15 @@ impl PrintStreamDriver {
             exit_report: Arc::new(Mutex::new(None)),
             worker: None,
             started: false,
+            continuation: false,
+            provider_home: None,
         }
+    }
+
+    /// Retain one event stream across bounded, individually supervised turns.
+    pub fn enable_continuation(&mut self, provider_home: Option<PathBuf>) {
+        self.continuation = self.spec.resume_argv.is_some();
+        self.provider_home = provider_home;
     }
 
     pub fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
@@ -234,8 +249,13 @@ impl PrintStreamDriver {
         if self.started {
             return Err(AgentDriverError::AlreadyStarted);
         }
+        if self.launch_argv.is_empty() {
+            return Err(AgentDriverError::Provider(format!(
+                "{label} launch argv is empty"
+            )));
+        }
         request.validate_for_provider(self.spec.provider)?;
-        if request.resume_from.is_some() {
+        if request.resume_from.is_some() && !self.continuation {
             return Err(AgentDriverError::Provider(format!(
                 "{label} stream-json resume is not enabled for native task sessions"
             )));
@@ -246,8 +266,35 @@ impl PrintStreamDriver {
         let prompt = request.initial_prompt.ok_or_else(|| {
             AgentDriverError::Provider(format!("{label} MVP requires an initial prompt"))
         })?;
-        let argv = (self.spec.argv)(&self.launch_argv, &prompt.text)
-            .map_err(AgentDriverError::Provider)?;
+        let expected_session_id = if self.continuation {
+            Some(match request.resume_from.as_ref() {
+                Some(id) => uuid::Uuid::parse_str(id.opaque())
+                    .map_err(|_| {
+                        AgentDriverError::Provider("Claude resume requires an exact UUID".into())
+                    })?
+                    .to_string(),
+                None => uuid::Uuid::new_v4().to_string(),
+            })
+        } else {
+            None
+        };
+        let argv = if let Some(id) = expected_session_id.as_deref() {
+            if request.resume_from.is_some() {
+                (self
+                    .spec
+                    .resume_argv
+                    .expect("continuation capability checked"))(
+                    &self.launch_argv, &prompt.text, id
+                )
+            } else {
+                let mut launch = self.launch_argv.clone();
+                launch.extend(["--session-id".into(), id.to_owned()]);
+                (self.spec.argv)(&launch, &prompt.text)
+            }
+        } else {
+            (self.spec.argv)(&self.launch_argv, &prompt.text)
+        }
+        .map_err(AgentDriverError::Provider)?;
         let event_sender = self.event_sender.take().ok_or(AgentDriverError::Closed)?;
         let command_receiver = self
             .command_receiver
@@ -266,6 +313,15 @@ impl PrintStreamDriver {
             view: Arc::clone(&self.view),
             turn_id,
             session_started: false,
+            turn_started: false,
+            turn_completed: false,
+            continuation: self.continuation,
+            resumed: request.resume_from.is_some(),
+            expected_session_id,
+            launch_argv: self.launch_argv.clone(),
+            provider_home: self.provider_home.clone(),
+            lease: None,
+            saw_result: false,
             fatal: None,
             cause: None,
             critical_failure: None,
@@ -296,12 +352,23 @@ impl PrintStreamDriver {
             return Err(AgentDriverError::NotStarted);
         }
         command.validate()?;
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled() || self.worker_is_finished() {
             return Err(AgentDriverError::Closed);
+        }
+        if self.continuation {
+            return match &command {
+                AgentCommand::Prompt(_) | AgentCommand::FinishSession =>
+                    super::codex_app_server::try_send_command(&self.command_sender, &self.view, command),
+                _ => Err(AgentDriverError::Provider(format!(
+                    "{} print mode has no interactive approval or steering channel; use Terminal for these actions",
+                    self.spec.label
+                ))),
+            };
         }
         match &command {
             AgentCommand::FinishSession => {}
             AgentCommand::Prompt(_)
+            | AgentCommand::History { .. }
             | AgentCommand::Steer { .. }
             | AgentCommand::DecideApproval { .. } => {
                 return Err(AgentDriverError::Provider(format!(
@@ -565,6 +632,15 @@ struct PrintWorker {
     view: Arc<ViewCell>,
     turn_id: AgentTurnId,
     session_started: bool,
+    turn_started: bool,
+    turn_completed: bool,
+    continuation: bool,
+    resumed: bool,
+    expected_session_id: Option<String>,
+    launch_argv: Vec<String>,
+    provider_home: Option<PathBuf>,
+    lease: Option<crate::agent_workspace::NativeSessionLease>,
+    saw_result: bool,
     fatal: Option<String>,
     cause: Option<CodexAppServerExitCause>,
     critical_failure: Option<String>,
@@ -605,25 +681,28 @@ impl PrintWorker {
 
     /// Emit the session's single `SessionStarted` (and its turn) exactly once.
     fn ensure_started(&mut self, provider_session_id: Option<&str>) {
-        if self.session_started {
-            return;
+        if !self.session_started {
+            self.session_started = true;
+            let provider_session_id = provider_session_id
+                .or(self.expected_session_id.as_deref())
+                .and_then(|id| ProviderSessionId::new(self.spec.provider, id).ok());
+            self.emit_critical(
+                AgentEventKind::SessionStarted {
+                    provider_session_id,
+                    resumed: self.resumed,
+                },
+                None,
+            );
         }
-        self.session_started = true;
-        let provider_session_id =
-            provider_session_id.and_then(|id| ProviderSessionId::new(self.spec.provider, id).ok());
-        self.emit_critical(
-            AgentEventKind::SessionStarted {
-                provider_session_id,
-                resumed: false,
-            },
-            None,
-        );
-        self.emit_critical(
-            AgentEventKind::TurnStarted {
-                turn_id: self.turn_id,
-            },
-            None,
-        );
+        if !self.turn_started {
+            self.turn_started = true;
+            self.emit_critical(
+                AgentEventKind::TurnStarted {
+                    turn_id: self.turn_id,
+                },
+                None,
+            );
+        }
     }
 
     fn append_text(&self, text: &str) {
@@ -656,6 +735,18 @@ impl PrintWorker {
     fn handle(&mut self, signal: PrintSignal) {
         match signal {
             PrintSignal::SessionId(session_id) => {
+                if self
+                    .expected_session_id
+                    .as_ref()
+                    .is_some_and(|expected| expected != &session_id)
+                {
+                    self.fail(
+                        CodexAppServerExitCause::ProtocolFailed,
+                        "Claude returned a different session ID than the requested conversation"
+                            .into(),
+                    );
+                    return;
+                }
                 let (visible, _) = visible_bounded(&session_id, FAILURE_DETAIL_MAX_BYTES);
                 self.view.lock().provider_thread_id = Some(visible);
                 self.ensure_started(Some(&session_id));
@@ -676,6 +767,7 @@ impl PrintWorker {
                 text,
                 detail,
             } => {
+                self.saw_result = true;
                 self.ensure_started(None);
                 if let Some(text) = text.filter(|text| !text.is_empty()) {
                     if self.view.lock().agent_text.is_empty() {
@@ -712,6 +804,12 @@ impl PrintWorker {
         for name in self.spec.env_remove {
             command.env_remove(name);
         }
+        if let Some(home) = &self.provider_home {
+            command.env("CLAUDE_CONFIG_DIR", home);
+        }
+        if let Some(lease) = &self.lease {
+            lease.configure_child(&mut command)?;
+        }
         // Private process group: Stop/Drop signal the CLI *and* every tool
         // subprocess it started, not just the leader.
         SupervisedChild::spawn(&mut command)
@@ -723,6 +821,185 @@ impl PrintWorker {
         argv: &[String],
         worktree_path: &Path,
         command_receiver: Receiver<AgentCommand>,
+        cancellation: &AgentCancellation,
+    ) -> CodexAppServerExitReport {
+        if self.continuation && !cancellation.is_cancelled() {
+            let home = self.provider_home.clone().or_else(|| {
+                std::env::var_os("CLAUDE_CONFIG_DIR")
+                    .map(PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+            });
+            let acquired = home
+                .ok_or_else(|| "Claude configuration directory is unavailable".to_owned())
+                .and_then(|home| {
+                    let home = std::fs::canonicalize(home).map_err(|error| {
+                        format!("Claude configuration directory is unavailable: {error}")
+                    })?;
+                    #[cfg(test)]
+                    let lease = crate::agent_workspace::NativeSessionLease::acquire_at(
+                        home.join("workspace-test-state"),
+                        crate::agent_sessions::SessionProvider::Claude,
+                        &home,
+                        self.expected_session_id
+                            .as_deref()
+                            .expect("continuation has an identity"),
+                    )?;
+                    #[cfg(not(test))]
+                    let lease = crate::agent_workspace::NativeSessionLease::acquire(
+                        crate::agent_sessions::SessionProvider::Claude,
+                        &home,
+                        self.expected_session_id
+                            .as_deref()
+                            .expect("continuation has an identity"),
+                    )?;
+                    Ok((home, lease))
+                });
+            match acquired {
+                Ok((home, lease)) => {
+                    self.provider_home = Some(home);
+                    self.lease = Some(lease);
+                }
+                Err(detail) => {
+                    return self.finish(
+                        CodexAppServerProcessExit::default(),
+                        AgentSessionOutcome::Failed,
+                        CodexAppServerExitCause::SpawnFailed,
+                        Some(bounded_detail(&detail)),
+                        String::new(),
+                    )
+                }
+            }
+        }
+        let mut argv = argv.to_vec();
+        loop {
+            let report = self.run_turn(&argv, worktree_path, &command_receiver, cancellation);
+            if !self.continuation || report.outcome != AgentSessionOutcome::Clean {
+                return report;
+            }
+            // There is no provider process between turns. Keep the conversation
+            // lease and event stream until an explicit Finish or cancellation.
+            let command = loop {
+                if cancellation.is_cancelled() {
+                    self.continuation = false;
+                    return self.finish(
+                        report.process,
+                        AgentSessionOutcome::Cancelled,
+                        CodexAppServerExitCause::Cancelled,
+                        None,
+                        report.stderr_tail,
+                    );
+                }
+                match command_receiver.recv_timeout(WORKER_POLL) {
+                    Ok(command) => break command,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        self.continuation = false;
+                        return self.finish(
+                            report.process,
+                            AgentSessionOutcome::Cancelled,
+                            CodexAppServerExitCause::Cancelled,
+                            None,
+                            report.stderr_tail,
+                        );
+                    }
+                }
+            };
+            match command {
+                AgentCommand::FinishSession => {
+                    self.continuation = false;
+                    return self.finish(
+                        report.process,
+                        AgentSessionOutcome::Clean,
+                        CodexAppServerExitCause::Clean,
+                        None,
+                        report.stderr_tail,
+                    );
+                }
+                AgentCommand::Prompt(prompt) => {
+                    let id = self
+                        .expected_session_id
+                        .as_deref()
+                        .expect("continuation identity");
+                    let next = (self.spec.resume_argv.expect("continuation capability"))(
+                        &self.launch_argv,
+                        &prompt.text,
+                        id,
+                    );
+                    match next {
+                        Ok(next) => {
+                            argv = next;
+                            self.begin_follow_up(prompt);
+                        }
+                        Err(detail) => {
+                            return self.finish(
+                                report.process,
+                                AgentSessionOutcome::Failed,
+                                CodexAppServerExitCause::ProtocolFailed,
+                                Some(bounded_detail(&detail)),
+                                report.stderr_tail,
+                            )
+                        }
+                    }
+                }
+                _ => {
+                    return self.finish(
+                        report.process,
+                        AgentSessionOutcome::Failed,
+                        CodexAppServerExitCause::ProtocolFailed,
+                        Some("unsupported command reached the print-session worker".into()),
+                        report.stderr_tail,
+                    );
+                }
+            }
+        }
+    }
+
+    fn begin_follow_up(&mut self, prompt: crate::agent_task::driver::AgentPrompt) {
+        let mut view = self.view.lock();
+        let mut history = view.turn_history.to_vec();
+        history.push(CodexAppServerTurnHistory {
+            ordinal: view.displayed_turn_ordinal.unwrap_or(view.completed_turns),
+            local_turn_id: self.turn_id,
+            follow_up_feedback: view.displayed_follow_up_feedback.take(),
+            agent_text: std::mem::take(&mut view.agent_text),
+            agent_text_truncated: view.agent_text_truncated,
+            commands: Vec::new(),
+            file_changes: Vec::new(),
+            dropped_updates: view.dropped_updates,
+        });
+        while history.len() > CODEX_APP_SERVER_TURN_HISTORY_CAPACITY
+            || history
+                .iter()
+                .map(|turn| {
+                    std::mem::size_of::<CodexAppServerTurnHistory>()
+                        + turn.agent_text.capacity()
+                        + turn.follow_up_feedback.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>()
+                > CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES
+        {
+            history.remove(0);
+            view.dropped_turns = view.dropped_turns.saturating_add(1);
+        }
+        view.turn_history = Arc::from(history);
+        view.agent_text_truncated = false;
+        view.dropped_updates = 0;
+        view.last_error = None;
+        view.displayed_turn_id = Some(prompt.turn_id);
+        view.displayed_turn_ordinal = Some(view.completed_turns + 1);
+        view.displayed_follow_up_feedback = Some(prompt.text);
+        view.phase = CodexAppServerPhase::Spawning;
+        self.turn_id = prompt.turn_id;
+        self.turn_started = false;
+        self.turn_completed = false;
+        self.saw_result = false;
+    }
+
+    fn run_turn(
+        &mut self,
+        argv: &[String],
+        worktree_path: &Path,
+        command_receiver: &Receiver<AgentCommand>,
         cancellation: &AgentCancellation,
     ) -> CodexAppServerExitReport {
         let label = self.spec.label;
@@ -797,7 +1074,7 @@ impl PrintWorker {
                     break;
                 }
                 let command_source = if commands_open {
-                    &commands
+                    commands
                 } else {
                     &closed_commands
                 };
@@ -851,7 +1128,6 @@ impl PrintWorker {
         }
         // Drain whatever commands are still queued; nothing more is accepted.
         while commands.try_recv().is_ok() {}
-        drop(commands);
 
         // Stop the process group. A cancelled, failed-to-deliver, or protocol-
         // broken session is terminated; a finished one gets a bounded chance to
@@ -969,7 +1245,7 @@ impl PrintWorker {
     /// Publish the terminal events (only after the process is stopped) and
     /// build the exit report.
     fn finish(
-        mut self,
+        &mut self,
         process: CodexAppServerProcessExit,
         mut outcome: AgentSessionOutcome,
         mut cause: CodexAppServerExitCause,
@@ -992,7 +1268,12 @@ impl PrintWorker {
                 ));
             }
         }
-        if stopped && outcome == AgentSessionOutcome::Clean {
+        if self.continuation && outcome == AgentSessionOutcome::Clean && !self.saw_result {
+            outcome = AgentSessionOutcome::Failed;
+            cause = CodexAppServerExitCause::ProtocolFailed;
+            detail = Some("Claude exited without a completed result for this turn".into());
+        }
+        if stopped && outcome == AgentSessionOutcome::Clean && !self.turn_completed {
             self.ensure_started(None);
             self.emit_critical(
                 AgentEventKind::TurnCompleted {
@@ -1000,6 +1281,8 @@ impl PrintWorker {
                 },
                 None,
             );
+            self.turn_completed = true;
+            self.view.lock().completed_turns += 1;
         }
         let mut critical_event_delivery_failed = false;
         if let Some(failure) = self.critical_failure.take() {
@@ -1008,7 +1291,8 @@ impl PrintWorker {
             cause = CodexAppServerExitCause::EventDeliveryFailed;
             detail = Some(bounded_detail(&failure));
         }
-        if stopped {
+        let continue_session = self.continuation && outcome == AgentSessionOutcome::Clean;
+        if stopped && !continue_session {
             if let Err(error) = self
                 .sink
                 .try_emit(AgentEventKind::SessionEnded { outcome }, detail.clone())
@@ -1026,18 +1310,18 @@ impl PrintWorker {
             let mut view = self.view.lock();
             view.phase = match outcome {
                 AgentSessionOutcome::Failed => CodexAppServerPhase::Failed,
+                AgentSessionOutcome::Clean if continue_session => CodexAppServerPhase::Ready,
                 AgentSessionOutcome::Clean | AgentSessionOutcome::Cancelled => {
                     CodexAppServerPhase::Ended
                 }
             };
-            if outcome == AgentSessionOutcome::Clean {
-                view.completed_turns = 1;
-            }
             if let Some(detail) = &detail {
                 view.last_error = Some(detail.clone());
             }
         }
-        self.sink.close();
+        if !continue_session {
+            self.sink.close();
+        }
         CodexAppServerExitReport {
             outcome,
             cause,
@@ -1082,6 +1366,7 @@ mod tests {
         env_remove: &[],
         session_id_first: false,
         argv: |argv, _| Ok(argv.to_vec()),
+        resume_argv: None,
         parse: |_| PrintSignal::Ignored,
     };
 
@@ -1095,6 +1380,15 @@ mod tests {
             view: Arc::new(ViewCell::new(CodexAppServerViewSnapshot::default())),
             turn_id: AgentTurnId::new(),
             session_started: false,
+            turn_started: false,
+            turn_completed: false,
+            continuation: false,
+            resumed: false,
+            expected_session_id: None,
+            launch_argv: Vec::new(),
+            provider_home: None,
+            lease: None,
+            saw_result: false,
             fatal: None,
             cause: None,
             critical_failure: None,

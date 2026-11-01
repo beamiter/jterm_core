@@ -156,6 +156,41 @@ impl ScreenReplay {
         self.parser.advance(&mut self.emulator, bytes);
     }
 
+    /// A reset followed by both visible terminal screens, cursor state and
+    /// input modes. Used when attaching to an already running session; raw
+    /// output tails cannot reconstruct absolute cursor operations reliably.
+    /// Scrollback, images and terminal-specific extensions are not included.
+    pub fn snapshot_ansi(&self) -> Vec<u8> {
+        let mut bytes = self.emulator.snapshot_ansi().into_bytes();
+        bytes.extend_from_slice(&self.parser.continuation());
+        bytes
+    }
+
+    /// Serialize a viewport only while it fits the explicit wire budget.
+    /// A dense screen of OSC hyperlinks can be much larger than its cell
+    /// count; reject it before allocating an unbounded escape-string frame.
+    pub fn snapshot_ansi_bounded(&self, max_bytes: usize) -> Result<Vec<u8>, String> {
+        let mut bytes = self
+            .emulator
+            .snapshot_ansi_with_limit(max_bytes)
+            .ok_or("Terminal snapshot exceeds the attachment budget")?
+            .into_bytes();
+        let continuation = self.parser.continuation();
+        if bytes.len().saturating_add(continuation.len()) > max_bytes {
+            return Err("Terminal continuation exceeds the attachment budget".into());
+        }
+        bytes.extend_from_slice(&continuation);
+        Ok(bytes)
+    }
+
+    /// Resize the captured viewport. The host also sends TIOCSWINSZ so a
+    /// full-screen provider redraws at this size. Existing rows are clipped,
+    /// never reinterpreted as if their old cursor addresses used a new width.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.emulator
+            .resize(cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS));
+    }
+
     /// Ends the stream (an unfinished trailing sequence is dropped) and
     /// returns the normal screen's history and screen.
     pub fn finish(self) -> Replay {

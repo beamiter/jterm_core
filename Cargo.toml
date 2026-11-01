@@ -39,6 +39,7 @@ dirs = "7.0"
 fuzzy-matcher = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 # The workflow library is authored in TOML or YAML; both formats deserialize
 # through the same serde derive so they cannot disagree about a field's type.
 serde_norway = "=0.9.42"

@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod agent_sessions;
 pub mod agent_task;
+pub mod agent_workspace;
 pub mod ai;
 pub mod atomic_file;
 pub mod block_contract;

@@ -5,6 +5,11 @@ index of existing Codex and Claude CLI conversations. It is separate from
 `agent_task`: creating an experimental native task is not required to find or
 resume an ordinary CLI conversation.
 
+The permanent sidebar and shared persistence/PTY runtime are documented in
+[Agent Workspace](agent-workspace.md). New frontends use its source-qualified
+identity and SQLite organization authority. The legacy SessionLibraryStore
+sections below describe the compatible import format and older integrations.
+
 ## Agent management workspace
 
 The four native managers share personal organization: give a conversation a
@@ -97,12 +102,14 @@ continues to store organization only, never authored task goals.
 
 `SessionScanner::refresh` starts one background scan. Hosts poll it from their
 event loop, keep the existing catalog while a scan runs, and replace it only
-when `poll` returns a catalog. Selection uses `(SessionProvider, id)`, not row
-position. Hosts should also use this identity to focus an already resumed,
+when `poll` returns a catalog. Selection uses provider, canonical provider home
+and native ID through `agent_workspace::session_id`, not row position or a UUID
+alone. Hosts should also use this identity to focus an already resumed,
 still-live native terminal tab instead of opening another copy.
 
 Discovery combines the default `~/.codex` and `~/.claude` homes with configured
-`CODEX_HOME` and `CLAUDE_CONFIG_DIR` homes. It reads Codex `sessions` and
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR` homes, plus persisted application-owned
+native Codex profiles. It reads Codex `sessions` and
 `archived_sessions`, and Claude `projects/*/*.jsonl`. Nested Claude subagent
 logs and sidechain records do not become independent user conversations.
 Compressed Codex `.jsonl.zst` files are supported.

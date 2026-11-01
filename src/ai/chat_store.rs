@@ -260,6 +260,145 @@ impl ChatStore {
         self.busy_policy
     }
 
+    /// Hydrate one shared-workspace conversation without replacing unrelated
+    /// requests. The database reserves IDs above 2^48, outside legacy local
+    /// collections. Replacing a busy chat is always refused, even for a store
+    /// whose archive/delete policy permits cancellation by its caller.
+    pub fn upsert_persisted_chat(&mut self, snapshot: ChatSnapshot) -> Result<u64, ChatStoreError> {
+        let id = snapshot.id();
+        if let Some(index) = self.chats.iter().position(|chat| chat.id == id) {
+            if self.chats[index].is_busy() {
+                return Err(ChatStoreError::Busy);
+            }
+            let epoch = self.chats[index].epoch.wrapping_add(1);
+            let mut chat = ChatRuntime::from_snapshot(snapshot);
+            // A restored row must not reuse an epoch held by a late callback.
+            chat.epoch = epoch;
+            self.chats[index] = chat;
+        } else {
+            if self.at_capacity() {
+                return Err(ChatStoreError::LimitReached);
+            }
+            self.chats.push(ChatRuntime::from_snapshot(snapshot));
+        }
+        self.next_id = next_available_id(&self.chats);
+        Ok(id)
+    }
+
+    /// Atomically re-key an acknowledged legacy import into its database ID.
+    /// The supplied snapshot may contain newer local edits which the caller
+    /// will subsequently save with the shared revision. No spare cache slot
+    /// is needed, and unrelated pending requests retain their exact epochs.
+    pub fn replace_imported_legacy_chat(
+        &mut self,
+        legacy_id: u64,
+        snapshot: ChatSnapshot,
+    ) -> Result<u64, ChatStoreError> {
+        let id = snapshot.id();
+        if legacy_id >= (1 << 48) || id < (1 << 48) {
+            return Err(ChatStoreError::SnapshotInvalid);
+        }
+        let old = self
+            .chats
+            .iter()
+            .find(|chat| chat.id == legacy_id)
+            .ok_or(ChatStoreError::SnapshotInvalid)?;
+        if old.is_busy() {
+            return Err(ChatStoreError::Busy);
+        }
+        let mut epoch = old.epoch;
+        if let Some(existing) = self.chats.iter().find(|chat| chat.id == id) {
+            if existing.is_busy() {
+                return Err(ChatStoreError::Busy);
+            }
+            epoch = epoch.max(existing.epoch);
+        }
+        self.chats.retain(|chat| chat.id != id);
+        let index = self
+            .chats
+            .iter()
+            .position(|chat| chat.id == legacy_id)
+            .expect("validated legacy cache row");
+        let mut replacement = ChatRuntime::from_snapshot(snapshot);
+        replacement.epoch = epoch.wrapping_add(1);
+        self.chats[index] = replacement;
+        if self.active_chat_id == legacy_id {
+            self.active_chat_id = id;
+        }
+        self.next_id = next_available_id(&self.chats);
+        Ok(id)
+    }
+
+    /// A one-chat active window for the shared durable store. This method
+    /// never mutates, switches or cancels another chat's in-flight request.
+    pub fn snapshot_chat_for_persistence(
+        &self,
+        chat_id: u64,
+        redact: bool,
+    ) -> Option<ChatSnapshot> {
+        let chat = self.chats.iter().find(|chat| chat.id == chat_id)?;
+        let mut title = chat.title.clone();
+        let mut history = chat.history.clone();
+        let mut context = durable_context(chat);
+        let (mut draft, draft_truncated) = durable_draft(chat);
+        if redact {
+            title = crate::redact::redact_secrets(&title);
+            draft = crate::redact::redact_secrets(&draft);
+            for turn in &mut history {
+                turn.text = crate::redact::redact_secrets(&turn.text);
+            }
+            if let Some(context) = context.as_mut() {
+                context.cmd = crate::redact::redact_secrets(&context.cmd);
+                context.output = crate::redact::redact_secrets(&context.output);
+                context.cwd = context
+                    .cwd
+                    .take()
+                    .map(|cwd| crate::redact::redact_secrets(&cwd));
+            }
+        }
+        Some(
+            ChatSnapshot::from_completed_history(
+                chat.id,
+                &title,
+                chat.archived,
+                &history,
+                context.as_ref(),
+                &draft,
+            )
+            .with_history_truncated(chat.history_truncated || draft_truncated),
+        )
+    }
+
+    /// Remove an inactive shared chat from the bounded GUI cache after its
+    /// save has been acknowledged. Durable deletion is a different operation.
+    pub fn evict_cached_chat(&mut self, chat_id: u64) -> Result<bool, ChatStoreError> {
+        if chat_id < (1 << 48) {
+            return Err(ChatStoreError::SnapshotInvalid);
+        }
+        self.evict_idle_chat(chat_id)
+    }
+
+    /// Retire an old per-window cache row only after ImportChats acknowledged
+    /// its migration and the caller verified it has not changed since that
+    /// snapshot. This does not delete the shared conversation or its history.
+    pub fn evict_imported_legacy_chat(&mut self, chat_id: u64) -> Result<bool, ChatStoreError> {
+        if chat_id >= (1 << 48) {
+            return Err(ChatStoreError::SnapshotInvalid);
+        }
+        self.evict_idle_chat(chat_id)
+    }
+
+    fn evict_idle_chat(&mut self, chat_id: u64) -> Result<bool, ChatStoreError> {
+        let Some(chat) = self.chats.iter().find(|chat| chat.id == chat_id) else {
+            return Ok(false);
+        };
+        if chat.is_busy() || self.active_chat_id == chat_id {
+            return Err(ChatStoreError::Busy);
+        }
+        self.chats.retain(|chat| chat.id != chat_id);
+        Ok(true)
+    }
+
     /// Compact live state to what persistence can accept, then serialise it.
     ///
     /// Takes `&mut self` deliberately: compacting first is what keeps the
@@ -351,6 +490,14 @@ impl ChatStore {
         &self.active().draft
     }
 
+    /// Current composer text only, without crash-recovery submission payload.
+    pub fn chat_draft(&self, chat_id: u64) -> Option<&str> {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.draft.as_str())
+    }
+
     /// Streamed text for the active chat's in-flight request, empty when no
     /// request is streaming.
     pub fn active_partial(&self) -> &str {
@@ -406,11 +553,20 @@ impl ChatStore {
     }
 
     pub fn set_active_draft(&mut self, draft: String) -> bool {
+        self.set_chat_draft(self.active_chat_id, draft)
+    }
+
+    /// Reconcile an acknowledged shared draft into its origin conversation
+    /// without switching the visible chat or touching request epochs.
+    pub fn set_chat_draft(&mut self, chat_id: u64, draft: String) -> bool {
         let draft = bounded_live_message(draft);
-        if self.active().draft == draft {
+        let Some(chat) = self.chat_mut(chat_id) else {
+            return false;
+        };
+        if chat.draft == draft {
             return false;
         }
-        self.active_mut().draft = draft;
+        chat.draft = draft;
         true
     }
 
@@ -819,9 +975,9 @@ impl ChatStore {
     }
 
     fn allocate_id(&mut self) -> u64 {
-        let mut candidate = self.next_id.max(1);
+        let mut candidate = (self.next_id % (1 << 48)).max(1);
         while self.chats.iter().any(|chat| chat.id == candidate) {
-            candidate = candidate.wrapping_add(1).max(1);
+            candidate = ((candidate + 1) % (1 << 48)).max(1);
         }
         self.next_id = candidate.wrapping_add(1).max(1);
         candidate
@@ -832,6 +988,7 @@ fn next_available_id(chats: &[ChatRuntime]) -> u64 {
     let mut candidate = chats
         .iter()
         .map(|chat| chat.id)
+        .filter(|id| *id < (1 << 48))
         .max()
         .unwrap_or(0)
         .wrapping_add(1)
@@ -1867,6 +2024,72 @@ mod tests {
 
         store.complete_success(first, "answer".into());
         assert_eq!(store.in_flight_tokens(), vec![second]);
+    }
+
+    #[test]
+    fn hydrating_shared_chat_preserves_other_epochs_and_local_id_namespace() {
+        let mut store = ChatStore::default();
+        let token = start(&mut store, "local request");
+        let id = (1u64 << 48) + 7;
+        let snapshot =
+            ChatSnapshot::from_completed_history(id, "Shared", false, &[], None, "draft");
+        store.upsert_persisted_chat(snapshot.clone()).unwrap();
+        assert_eq!(store.active_id(), token.chat_id);
+        assert_eq!(
+            store.complete_success(token, "local reply".into()),
+            Some(true)
+        );
+        store.select_chat(id);
+        let shared_token = start(&mut store, "shared request");
+        assert_eq!(
+            store.upsert_persisted_chat(snapshot),
+            Err(ChatStoreError::Busy)
+        );
+        assert!(store.new_chat().unwrap() < (1 << 48));
+        assert_eq!(
+            store.complete_success(shared_token, "shared reply".into()),
+            Some(false)
+        );
+        assert!(store.evict_cached_chat(id).unwrap());
+    }
+
+    #[test]
+    fn shared_draft_reconciliation_keeps_selection_and_pending_requests() {
+        let mut store = ChatStore::default();
+        let old = store.active_id();
+        let running = start(&mut store, "pending elsewhere");
+        let selected = store.new_chat().unwrap();
+        store.set_active_draft("visible draft".into());
+        assert!(store.set_chat_draft(old, "remote newer draft".into()));
+        assert_eq!(store.active_id(), selected);
+        assert_eq!(store.active_draft(), "visible draft");
+        assert_eq!(store.chat_draft(old), Some("remote newer draft"));
+        assert_eq!(store.complete_success(running, "reply".into()), Some(false));
+        assert_eq!(store.chat_draft(old), Some("remote newer draft"));
+    }
+
+    #[test]
+    fn acknowledged_import_rekeys_a_full_cache_atomically_with_latest_edits() {
+        let mut store = ChatStore::default();
+        for _ in 1..MAX_PERSISTED_CHATS {
+            store.new_chat().unwrap();
+        }
+        let legacy = store.active_id();
+        store.set_active_draft("edited while import was in flight".into());
+        let id = (1u64 << 48) + 99;
+        let snapshot = ChatSnapshot::from_completed_history(
+            id,
+            "Imported",
+            false,
+            &[],
+            None,
+            store.active_draft(),
+        );
+        assert_eq!(store.replace_imported_legacy_chat(legacy, snapshot), Ok(id));
+        assert_eq!(store.len(), MAX_PERSISTED_CHATS);
+        assert_eq!(store.active_id(), id);
+        assert_eq!(store.active_draft(), "edited while import was in flight");
+        assert!(store.chat_draft(legacy).is_none());
     }
 
     #[test]

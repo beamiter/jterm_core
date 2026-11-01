@@ -15,8 +15,9 @@ pub use codex_app_server::{
     CodexAppServerCommandView, CodexAppServerExitCause, CodexAppServerExitReport,
     CodexAppServerFileChange, CodexAppServerFileChangeView, CodexAppServerPhase,
     CodexAppServerProcessExit, CodexAppServerTurnCommandSummary, CodexAppServerTurnFileSummary,
-    CodexAppServerTurnHistory, CodexAppServerViewSnapshot, CODEX_APP_SERVER_LIVE_TURN_MAX,
-    CODEX_APP_SERVER_TURN_HISTORY_CAPACITY, CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES,
+    CodexAppServerTurnHistory, CodexAppServerViewSnapshot, CodexPersistedTurn,
+    CODEX_APP_SERVER_LIVE_TURN_MAX, CODEX_APP_SERVER_TURN_HISTORY_CAPACITY,
+    CODEX_APP_SERVER_TURN_HISTORY_MAX_BYTES,
 };
 #[allow(unused_imports)] // test-support adapter, exercised by driver tests
 pub use fake::{FakeAgentDriver, FakeAgentEvent, FakeAgentProgress};

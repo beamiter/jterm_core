@@ -79,6 +79,32 @@ fn require_waitable_sigchld() -> io::Result<()> {
 }
 
 impl SupervisedChild {
+    /// Spawn a process in a fresh Unix session with fd 0 as its controlling
+    /// PTY. Unlike process_group(0), setsid makes it a session leader before
+    /// TIOCSCTTY. The same WNOWAIT/group-before-reap ownership applies.
+    #[cfg(unix)]
+    pub fn spawn_pty_session(command: &mut Command) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        require_waitable_sigchld()?;
+        // SAFETY: this pre-exec hook performs only async-signal-safe libc
+        // calls and does not allocate or acquire Rust locks after fork.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let (child, process_group) = validate_unix_child(command.spawn()?)?;
+        Ok(Self {
+            child: Some(child),
+            process_group,
+            #[cfg(test)]
+            cached_status: None,
+        })
+    }
+
     /// Spawn `command`; on Unix, make it leader of a fresh process group.
     ///
     /// Fails with [`io::ErrorKind::Unsupported`] without spawning when the

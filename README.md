@@ -31,6 +31,14 @@ v2 is selected only for a peer that has already advertised v2 support.
 
 ## Shared surfaces
 
+- A shared [Agent Workspace](docs/agent-workspace.md) for all four native
+  frontends: persistent session navigation, source-qualified identities,
+  single-writer SQLite API chats and organization, revision-bound drafts and
+  send receipts, and a persistent PTY host with exclusive input ownership and
+  screen-snapshot reconnect. Native Codex has verified durable thread resume
+  and history paging; native Claude supports sequential exact-session turns.
+  Managed CLI PTYs can detach without stopping their provider.
+
 - Read-only Codex and Claude CLI session discovery, bounded previews and search,
   separately evidenced live process IDs, and exact-UUID resume plans for native
   new-tab launch. The shared conversation library adds local aliases, tags,
