@@ -411,6 +411,87 @@ fn two_clients_share_store_and_enforce_exact_submission_receipts() {
 }
 
 #[test]
+fn restarted_host_cannot_duplicate_or_stop_a_surviving_runtime() {
+    let mut h = Harness::new();
+    // Deliberately survive PTY hangup, so the old inherited lease remains
+    // authoritative after SIGKILL of its supervising host.
+    std::fs::write(h.root.join("bin/codex"), b"#!/bin/sh\ntrap '' HUP TERM\nprintf 'boot %s %s\\n' \"$$\" \"$$\" >> \"$JTERM_TEST_TRACE\"\nprintf 'READY %s\\n' \"$$\"\nwhile :; do sleep 1; done\n").unwrap();
+    let mut first = h.attach();
+    first.wait_for("READY");
+    let original = h.runtime();
+    h.host.kill().unwrap();
+    h.host.wait().unwrap();
+    first.wait_exit();
+    assert!(process_live(original.pid));
+
+    h.host = Command::new(HOST)
+        .arg("--jterm-session-host")
+        .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
+        .env("JTERM_TEST_TRACE", &h.trace)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                h.root.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            File::create(h.root.join("restarted-host-errors")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(WorkspaceReply::Catalog { rows }) =
+            request(&h.client(), WorkspaceCommand::Refresh)
+        {
+            if rows
+                .iter()
+                .any(|row| row.id == original.id && row.runtime == RuntimeState::Conflict)
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "surviving runtime was not reported as a conflict"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut duplicate = h.attach();
+    assert_ne!(duplicate.wait_exit(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&h.trace).unwrap().lines().count(),
+        1
+    );
+    assert!(request(
+        &h.client(),
+        WorkspaceCommand::Stop {
+            id: original.id.clone()
+        }
+    )
+    .is_err());
+    assert!(
+        process_live(original.pid),
+        "new host signalled a process it does not supervise"
+    );
+    // Kill only our still-identical synthetic provider group.
+    let args = std::fs::read(format!("/proc/{}/cmdline", original.pid)).unwrap();
+    assert!(String::from_utf8_lossy(&args).contains(h.root.to_string_lossy().as_ref()));
+    unsafe {
+        libc::kill(-(original.pid as i32), libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_live(original.pid) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn native_profile_owner_blocks_cli_handoff_until_guard_releases() {
     let h = Harness::new();
     let home = h.session.provider_home().unwrap();
