@@ -14,7 +14,7 @@ enum Pending {
     Inspect(TaskId),
     Start(TaskId),
     Attach(TaskId, Option<ws::NativeAction>),
-    Action(TaskId),
+    Action(TaskId, Option<String>),
     Detach,
 }
 pub(super) struct NativeRemote {
@@ -31,6 +31,8 @@ pub(super) struct NativeRemote {
     catalog_pending: bool,
     retry_after: Instant,
     last_policy: Option<NativePromptPolicy>,
+    attach_blocked: HashSet<TaskId>,
+    pub(super) prompt_outcomes: Vec<NativePromptOutcome>,
     handoff_requests: HashSet<TaskId>,
     ready_handoffs: Vec<(TaskId, crate::agent_sessions::AgentSession)>,
 }
@@ -53,6 +55,8 @@ impl NativeRemote {
             catalog_pending: false,
             retry_after: Instant::now(),
             last_policy: None,
+            attach_blocked: HashSet::new(),
+            prompt_outcomes: Vec::new(),
             handoff_requests: HashSet::new(),
             ready_handoffs: Vec::new(),
         }
@@ -111,6 +115,7 @@ impl NativeRemote {
         id: TaskId,
         action: ws::NativeAction,
     ) -> Result<(), AgentRuntimeError> {
+        let receipt = action_prompt_receipt(&action);
         if matches!(action, ws::NativeAction::Handoff { .. }) {
             self.handoff_requests.insert(id);
         }
@@ -125,7 +130,7 @@ impl NativeRemote {
                     operation: uuid::Uuid::new_v4().to_string(),
                     action: Box::new(action),
                 },
-                Pending::Action(id),
+                Pending::Action(id, receipt),
             )
         } else {
             self.send(
@@ -153,7 +158,7 @@ impl NativeRemote {
                 Pending::Inspect(id)
                 | Pending::Start(id)
                 | Pending::Attach(id, _)
-                | Pending::Action(id) => Some(*id),
+                | Pending::Action(id, _) => Some(*id),
                 _ => None,
             };
             if let Some(id) = task_id {
@@ -168,6 +173,19 @@ impl NativeRemote {
                     // An uncertain operation is never replayed. Catalog/Inspect
                     // are safe to repeat after reconnect and determine the state.
                     if let Some(task_id) = task_id {
+                        if let Some(cached) = self.cached.get_mut(&task_id) {
+                            cached.control = None;
+                        }
+                        if matches!(&pending, Pending::Attach(_, None)) {
+                            self.attach_blocked.insert(task_id);
+                        }
+                        if let Some(receipt) = pending_prompt_receipt(&pending) {
+                            self.prompt_outcomes.push(NativePromptOutcome {
+                                task_id,
+                                receipt,
+                                result: Err(detail.clone()),
+                            });
+                        }
                         if !matches!(pending, Pending::Inspect(_)) {
                             report.issues.push(AgentRuntimeIssue { task_id, detail });
                         }
@@ -193,10 +211,6 @@ impl NativeRemote {
                             },
                         );
                         if changed && !self.inspections.contains(&entry.task_id) {
-                            if self.cached.len() >= 128 && !self.cached.contains_key(&entry.task_id)
-                            {
-                                continue;
-                            }
                             if self
                                 .send(
                                     Command::InspectNative { id: entry.id },
@@ -212,6 +226,8 @@ impl NativeRemote {
                 Reply::Native { snapshot, control } => {
                     let id = snapshot.task.id;
                     let previous = self.cached.get(&id);
+                    let gained_control = control.is_some()
+                        && matches!(&pending, Pending::Start(_) | Pending::Attach(..));
                     let same =
                         previous.is_some_and(|c| c.snapshot.incarnation == snapshot.incarnation);
                     if let Some(previous) = previous.filter(|_| same) {
@@ -270,9 +286,54 @@ impl NativeRemote {
                             control: retained_control,
                         },
                     );
+                    if !same {
+                        self.attach_blocked.remove(&id);
+                    }
                     report.events_drained += 1;
+                    if let Pending::Action(_, Some(receipt)) = &pending {
+                        self.prompt_outcomes.push(NativePromptOutcome {
+                            task_id: id,
+                            receipt: receipt.clone(),
+                            result: Ok(()),
+                        });
+                    }
+                    if gained_control {
+                        let _ = self.action(id, ws::NativeAction::Policy { policy });
+                    }
                     if let Pending::Attach(_, Some(action)) = pending {
+                        let stale_policy = match &action {
+                            ws::NativeAction::Prompt {
+                                policy: requested, ..
+                            }
+                            | ws::NativeAction::Resume {
+                                policy: requested, ..
+                            } => *requested != policy,
+                            _ => false,
+                        };
+                        if stale_policy {
+                            let detail="Sharing settings changed before the host accepted this action. Your draft was kept.".to_string();
+                            if let Some(receipt) = action_prompt_receipt(&action) {
+                                self.prompt_outcomes.push(NativePromptOutcome {
+                                    task_id: id,
+                                    receipt,
+                                    result: Err(detail.clone()),
+                                });
+                            }
+                            report.issues.push(AgentRuntimeIssue {
+                                task_id: id,
+                                detail,
+                            });
+                            continue;
+                        }
+                        let receipt = action_prompt_receipt(&action);
                         if let Err(error) = self.action(id, action) {
+                            if let Some(receipt) = receipt {
+                                self.prompt_outcomes.push(NativePromptOutcome {
+                                    task_id: id,
+                                    receipt,
+                                    result: Err(error.to_string()),
+                                });
+                            }
                             report.issues.push(AgentRuntimeIssue {
                                 task_id: id,
                                 detail: error.to_string(),
@@ -312,36 +373,39 @@ impl NativeRemote {
                 let _ = self.action(id, ws::NativeAction::Policy { policy });
             }
         }
-        // Synchronize changes made by the ordinary task reducer only after
-        // native authority has stopped. Another live control view is excluded.
-        let updates = self
-            .cached
-            .iter()
-            .filter_map(|(id, c)| {
-                let task = tasks.get(*id)?;
-                (!c.snapshot.ownership_locked && c.control.is_some() && task != &c.snapshot.task)
-                    .then_some((*id, task.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (id, task) in updates {
-            if self
-                .action(
-                    id,
-                    ws::NativeAction::UpdateTask {
-                        task: Box::new(task.clone()),
-                    },
-                )
-                .is_ok()
-            {
-                if let Some(cached) = self.cached.get_mut(&id) {
-                    cached.snapshot.task = task;
-                }
-            }
-        }
         report
     }
     pub fn select_view(&mut self, selected: Option<TaskId>) {
+        if self.selected != selected {
+            if let Some(id) = selected {
+                self.attach_blocked.remove(&id);
+            }
+        }
         self.selected = selected;
+        if Instant::now() >= self.retry_after {
+            if let Some(id) = selected.filter(|id| {
+                !self.attach_blocked.contains(id)
+                    && !self
+                        .pending
+                        .values()
+                        .any(|p| matches!(p,Pending::Attach(task,_) if task==id))
+            }) {
+                if let Some(cached) = self
+                    .cached
+                    .get(&id)
+                    .filter(|cached| cached.control.is_none())
+                {
+                    let _ = self.send(
+                        Command::AttachNative {
+                            id: cached.snapshot.id.clone(),
+                            incarnation: cached.snapshot.incarnation.clone(),
+                            view: self.view.clone(),
+                        },
+                        Pending::Attach(id, None),
+                    );
+                }
+            }
+        }
         if let Some(id) =
             selected.filter(|id| !self.cached.contains_key(id) && !self.inspections.contains(id))
         {
@@ -466,4 +530,18 @@ fn merge_report(into: &mut AgentRuntimePollReport, report: AgentRuntimePollRepor
     into.applied_turns.extend(report.applied_turns);
     into.issues.extend(report.issues);
     into.completions.extend(report.completions);
+}
+
+fn action_prompt_receipt(action: &ws::NativeAction) -> Option<String> {
+    match action {
+        ws::NativeAction::Prompt { receipt, .. } => receipt.clone(),
+        _ => None,
+    }
+}
+fn pending_prompt_receipt(pending: &Pending) -> Option<String> {
+    match pending {
+        Pending::Action(_, receipt) => receipt.clone(),
+        Pending::Attach(_, Some(action)) => action_prompt_receipt(action),
+        _ => None,
+    }
 }

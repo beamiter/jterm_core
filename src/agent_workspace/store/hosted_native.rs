@@ -5,6 +5,8 @@ impl Store {
         &self,
         snapshot: &NativeSnapshot,
     ) -> Result<(), String> {
+        let projection = crate::agent_workspace::native::safe_snapshot_projection(snapshot);
+        let snapshot = &projection;
         let json = serde_json::to_string(snapshot).map_err(err)?;
         if json.len() > 4 * 1024 * 1024 {
             return Err("Native snapshot exceeds its durable view budget".into());
@@ -102,6 +104,13 @@ impl Store {
             let Some(mut snapshot) = self.native_snapshot(&ConversationId(id))? else {
                 continue;
             };
+            snapshot.incarnation = uuid::Uuid::new_v4().to_string();
+            snapshot.sequence = snapshot.sequence.saturating_add(1);
+            snapshot.events.clear();
+            if let Some(view) = &mut snapshot.view {
+                view.pending_approvals.clear();
+                view.history_loading = false;
+            }
             if snapshot.live
                 || snapshot.preparing
                 || snapshot.handoff_pending
@@ -125,8 +134,8 @@ impl Store {
                     view.history_loading = false;
                     view.last_error = snapshot.task.status_detail.clone();
                 }
-                self.save_native(&snapshot)?;
             }
+            self.save_native(&snapshot)?;
         }
         Ok(())
     }

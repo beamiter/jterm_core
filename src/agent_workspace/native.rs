@@ -137,6 +137,8 @@ pub enum NativeAction {
     Prompt {
         text: String,
         policy: NativePromptPolicy,
+        #[serde(default)]
+        receipt: Option<String>,
     },
     Finish,
     History {
@@ -178,6 +180,10 @@ pub struct NativeReportEvent {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeSnapshot {
+    #[serde(default = "default_redaction")]
+    pub redact_secrets: bool,
+    #[serde(default)]
+    pub validation_evidence_redacted: bool,
     pub id: ConversationId,
     pub namespace: String,
     pub incarnation: String,
@@ -242,4 +248,126 @@ pub struct NativeCatalogEntry {
     pub task_id: TaskId,
     pub incarnation: String,
     pub sequence: u64,
+}
+
+/// Durable/presentation evidence is separate from the executable evidence held
+/// only by the live host reducer. A redacted command is never marked exact.
+pub(crate) fn safe_task_projection(task: &AgentTask, policy: NativePromptPolicy) -> AgentTask {
+    let mut task = task.clone();
+    if !policy.redact_secrets {
+        return task;
+    }
+    let redact = crate::redact::redact_secrets;
+    task.title = redact(&task.title);
+    task.status_detail = task.status_detail.as_deref().map(redact);
+    task.validation.status_detail = task.validation.status_detail.as_deref().map(redact);
+    if let Some(context) = &mut task.source_context {
+        if let Some(command) = &mut context.command {
+            let safe = redact(command);
+            if safe != *command {
+                context.command_exact = false;
+            }
+            *command = safe;
+        }
+        context.output_text = redact(&context.output_text);
+    }
+    if let Some(brief) = &mut task.brief {
+        brief.goal = redact(&brief.goal);
+        if brief
+            .validation
+            .as_ref()
+            .is_some_and(|recipe| redact(&recipe.command) != recipe.command)
+        {
+            brief.validation = None;
+            task.status_detail=Some("Sensitive validation evidence is retained only by the current host. After a restart, supply a new explicit recipe or accept the work after review.".into());
+        }
+    }
+    task
+}
+pub(crate) fn safe_snapshot_projection(snapshot: &NativeSnapshot) -> NativeSnapshot {
+    let mut safe = snapshot.clone();
+    let policy = NativePromptPolicy {
+        share_command_context: false,
+        redact_secrets: snapshot.redact_secrets,
+    };
+    let projected = safe_task_projection(&safe.task, policy);
+    safe.validation_evidence_redacted |=
+        safe.task.validation_command() != projected.validation_command();
+    safe.task = projected;
+    if !policy.redact_secrets {
+        return safe;
+    }
+    fn redact_value(value: &mut serde_json::Value, key: &str) {
+        match value {
+            serde_json::Value::String(text)
+                if !matches!(
+                    key,
+                    "id" | "item_id"
+                        | "turn_id"
+                        | "local_turn_id"
+                        | "provider_thread_id"
+                        | "provider_turn_id"
+                        | "displayed_turn_id"
+                        | "approval_id"
+                ) =>
+            {
+                *text = crate::redact::redact_secrets(text)
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    redact_value(item, key)
+                }
+            }
+            serde_json::Value::Object(items) => {
+                for (key, item) in items {
+                    redact_value(item, key)
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(view) = safe.view.take() {
+        let mut encoded = serde_json::to_value(&view).unwrap_or_default();
+        redact_value(&mut encoded, "");
+        let mut projected: CodexAppServerViewSnapshot =
+            serde_json::from_value(encoded).unwrap_or_default();
+        if projected.pending_approvals != view.pending_approvals {
+            projected.pending_approvals.clear();
+            projected.last_error=Some("Sensitive approval evidence is redacted; no grant is exposed. Stop the task to inspect its exact provider history.".into());
+        }
+        for (old, item) in view.file_changes.iter().zip(&mut projected.file_changes) {
+            for (old, change) in old.changes.iter().zip(&mut item.changes) {
+                if change.path != old.path {
+                    change.path_exact = false;
+                }
+                if change.diff != old.diff {
+                    change.diff_exact = false;
+                }
+                if change.move_path != old.move_path {
+                    change.move_path_exact = false;
+                }
+            }
+        }
+        safe.view = Some(projected);
+    }
+    if let Some(exit) = &mut safe.exit {
+        exit.detail = exit.detail.as_deref().map(crate::redact::redact_secrets);
+        exit.stderr_tail = crate::redact::redact_secrets(&exit.stderr_tail);
+    }
+    for event in &mut safe.events {
+        for issue in &mut event.report.issues {
+            issue.detail = crate::redact::redact_secrets(&issue.detail);
+        }
+        for completion in &mut event.report.completions {
+            completion.detail = completion
+                .detail
+                .as_deref()
+                .map(crate::redact::redact_secrets);
+        }
+    }
+    safe
+}
+
+fn default_redaction() -> bool {
+    true
 }

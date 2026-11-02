@@ -361,6 +361,13 @@ impl From<AgentEventError> for AgentRuntimeError {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct NativePromptOutcome {
+    pub task_id: TaskId,
+    pub receipt: String,
+    pub result: Result<(), String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentRuntimeIssue {
     pub task_id: TaskId,
@@ -1283,6 +1290,47 @@ impl AgentRuntimeManager {
 
     /// Submit a follow-up to an idle Codex or Claude conversation. The legacy
     /// `prompt_codex` entry point remains source-compatible for existing hosts.
+    /// Async hosted sends are cleared by a matching host acknowledgment,
+    /// never by admission to this process's RPC queue.
+    pub fn prompt_native_tracked(
+        &mut self,
+        tasks: &TaskManager,
+        id: TaskId,
+        text: &str,
+        policy: NativePromptPolicy,
+        receipt: String,
+    ) -> Result<(), AgentRuntimeError> {
+        if uuid::Uuid::parse_str(&receipt).is_err() {
+            return Err(AgentRuntimeError::Preparation(
+                "Invalid native draft receipt".into(),
+            ));
+        }
+        if let Some(remote) = &mut self.remote {
+            let task = tasks.get(id).ok_or(AgentRuntimeError::UnknownTask(id))?;
+            if task.validation.status == TaskValidationStatus::Running {
+                return Err(AgentRuntimeError::Preparation(
+                    "Finish validation before sending a native turn".into(),
+                ));
+            }
+            build_native_follow_up_prompt(text, policy)?;
+            return remote.action(
+                id,
+                crate::agent_workspace::NativeAction::Prompt {
+                    text: text.into(),
+                    policy,
+                    receipt: Some(receipt),
+                },
+            );
+        }
+        self.prompt_native(tasks, id, text, policy)
+    }
+    pub fn take_prompt_outcomes(&mut self) -> Vec<NativePromptOutcome> {
+        self.remote
+            .as_mut()
+            .map(|r| std::mem::take(&mut r.prompt_outcomes))
+            .unwrap_or_default()
+    }
+
     pub fn prompt_native(
         &mut self,
         task_manager: &TaskManager,
@@ -1296,6 +1344,7 @@ impl AgentRuntimeManager {
                 crate::agent_workspace::NativeAction::Prompt {
                     text: text.into(),
                     policy,
+                    receipt: None,
                 },
             );
         }

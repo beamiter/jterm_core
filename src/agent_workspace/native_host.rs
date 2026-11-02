@@ -22,10 +22,12 @@ struct Job {
     tasks: TaskManager,
     runtime: AgentRuntimeManager,
     policy: NativePromptPolicy,
+    policy_origin: Option<(Owner, String)>,
     controller: Option<Controller>,
     lease: Arc<NativeSessionLease>,
     context: NativeLaunchContext,
     view_revision: Option<u64>,
+    historical: bool,
     handoff:
         Option<std::sync::mpsc::Receiver<Result<super::native_handoff::PreparedHandoff, String>>>,
     terminal_runtime: Option<super::host::RuntimeHandle>,
@@ -91,7 +93,7 @@ impl NativeManager {
             .native_snapshot(id)?
             .ok_or("No hosted native execution for this task")?;
         Ok(WorkspaceReply::Native {
-            snapshot: Box::new(snapshot),
+            snapshot: Box::new(safe_snapshot_projection(&snapshot)),
             control,
         })
     }
@@ -155,7 +157,10 @@ impl NativeManager {
             namespace: launch.namespace,
             incarnation: uuid::Uuid::new_v4().to_string(),
             sequence: 1,
-            task: launch.task,
+            task: safe_task_projection(&launch.task, launch.policy),
+            redact_secrets: launch.policy.redact_secrets,
+            validation_evidence_redacted: launch.task.validation_command()
+                != safe_task_projection(&launch.task, launch.policy).validation_command(),
             view: None,
             preparing: true,
             live: false,
@@ -208,6 +213,7 @@ impl NativeManager {
                 tasks,
                 runtime,
                 policy: launch.policy,
+                policy_origin: Some((owner.clone(), launch.view.clone())),
                 controller: Some(Controller {
                     owner,
                     view: launch.view,
@@ -216,12 +222,13 @@ impl NativeManager {
                 lease,
                 context: launch.context,
                 view_revision: None,
+                historical: false,
                 handoff: None,
                 terminal_runtime: None,
             },
         );
         Ok(WorkspaceReply::Native {
-            snapshot: Box::new(snapshot),
+            snapshot: Box::new(safe_snapshot_projection(&snapshot)),
             control: Some(control),
         })
     }
@@ -246,7 +253,7 @@ impl NativeManager {
         if let Some(controller) = &job.controller {
             if controller.owner == owner && controller.view == view {
                 return Ok(WorkspaceReply::Native {
-                    snapshot: Box::new(job.snapshot.clone()),
+                    snapshot: Box::new(safe_snapshot_projection(&job.snapshot)),
                     control: Some(controller.lease.clone()),
                 });
             }
@@ -267,7 +274,7 @@ impl NativeManager {
             lease: control.clone(),
         });
         Ok(WorkspaceReply::Native {
-            snapshot: Box::new(job.snapshot.clone()),
+            snapshot: Box::new(safe_snapshot_projection(&job.snapshot)),
             control: Some(control),
         })
     }
@@ -322,10 +329,12 @@ impl NativeManager {
                     share_command_context: false,
                     redact_secrets: true,
                 },
+                policy_origin: None,
                 controller: None,
                 lease,
                 context,
                 view_revision: None,
+                historical: true,
                 handoff: None,
                 terminal_runtime: None,
             },
@@ -387,8 +396,13 @@ impl NativeManager {
                 .runtime
                 .decide_approval(task_id, id, decision)
                 .map_err(|e| e.to_string()),
-            NativeAction::Prompt { text, policy } => {
+            NativeAction::Prompt { text, policy, .. } => {
                 job.policy = policy;
+                job.policy_origin = job
+                    .controller
+                    .as_ref()
+                    .map(|c| (c.owner.clone(), c.view.clone()));
+                job.snapshot.redact_secrets |= policy.redact_secrets;
                 job.runtime
                     .prompt_native(&job.tasks, task_id, &text, policy)
                     .map_err(|e| e.to_string())
@@ -402,7 +416,17 @@ impl NativeManager {
                 .load_native_history(task_id, reset)
                 .map_err(|e| e.to_string()),
             NativeAction::Policy { policy } => {
-                job.policy = policy;
+                // A passive observer's defaults cannot revoke a request that a
+                // different window already authorized before detaching.
+                let from_origin = job.controller.as_ref().is_some_and(|c| {
+                    job.policy_origin.as_ref() == Some(&(c.owner.clone(), c.view.clone()))
+                });
+                if from_origin {
+                    job.policy = policy;
+                }
+                // Privacy is monotonic for durable history. Never republish raw
+                // in-memory source after another window enables redaction.
+                job.snapshot.redact_secrets |= policy.redact_secrets;
                 Ok(())
             }
             NativeAction::Resume { context, policy } => {
@@ -425,7 +449,13 @@ impl NativeManager {
                 }
                 job.context = context.clone();
                 job.policy = policy;
+                job.policy_origin = job
+                    .controller
+                    .as_ref()
+                    .map(|c| (c.owner.clone(), c.view.clone()));
+                job.snapshot.redact_secrets |= policy.redact_secrets;
                 job.runtime.configure_host(context, job.lease.clone());
+                job.historical = false;
                 if job.snapshot.task.status == TaskStatus::Created
                     && job.snapshot.task.runtime_kind == TaskRuntimeKind::Unassigned
                 {
@@ -606,13 +636,59 @@ impl NativeManager {
         let _ = refresh(job, report, store);
     }
 }
+fn projection_policy(job: &Job) -> NativePromptPolicy {
+    NativePromptPolicy {
+        redact_secrets: job.snapshot.redact_secrets || job.policy.redact_secrets,
+        ..job.policy
+    }
+}
 fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Result<(), String> {
     let id = job.snapshot.task.id;
+    if job.historical {
+        let locked = job.handoff.is_some() || job.terminal_runtime.is_some();
+        let can_resume = !locked
+            && job.snapshot.task.provider == AgentProvider::Codex
+            && job.snapshot.native_home.is_some()
+            && job
+                .snapshot
+                .view
+                .as_ref()
+                .is_some_and(|view| view.provider_thread_id.is_some());
+        let can_continue = !locked
+            && job
+                .snapshot
+                .view
+                .as_ref()
+                .is_some_and(|view| view.provider_thread_id.is_some());
+        let task = safe_task_projection(
+            job.tasks.get(id).ok_or("Historical task is unavailable")?,
+            projection_policy(job),
+        );
+        if job.snapshot.ownership_locked != locked
+            || job.snapshot.can_resume != can_resume
+            || job.snapshot.can_continue_in_terminal != can_continue
+            || job.snapshot.task != task
+        {
+            job.snapshot.sequence += 1;
+            job.snapshot.task = task;
+            job.snapshot.ownership_locked = locked;
+            job.snapshot.can_resume = can_resume;
+            job.snapshot.can_continue_in_terminal = can_continue;
+            job.snapshot.redact_secrets |= job.policy.redact_secrets;
+            store.save_native(&job.snapshot)?;
+        }
+        return Ok(());
+    }
     let task = job
         .tasks
         .get(id)
         .ok_or("Native task reducer is unavailable")?
         .clone();
+    let raw_validation = task.validation_command().map(str::to_string);
+    let task = safe_task_projection(&task, projection_policy(job));
+    job.snapshot.validation_evidence_redacted |=
+        raw_validation.as_deref() != task.validation_command();
+    job.snapshot.redact_secrets |= job.policy.redact_secrets;
     let revision = job.runtime.snapshot_revision(id);
     let preparing = job.runtime.has_preparing(id);
     let live = job.runtime.has_running(id);
@@ -718,4 +794,95 @@ fn same_task_identity(a: &crate::agent_task::AgentTask, b: &crate::agent_task::A
         && a.branch == b.branch
         && a.base_commit == b.base_commit
         && a.created_at_ms == b.created_at_ms
+}
+
+#[cfg(test)]
+mod historical_projection_tests {
+    use super::*;
+    #[test]
+    fn historical_profile_survives_idle_polls_until_an_explicit_restore() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root =
+            std::env::temp_dir().join(format!("native-history-review-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let paths = Paths::at(root.join("state")).unwrap();
+        let mut store = Store::open(&paths).unwrap();
+        let mut tasks = TaskManager::new();
+        let task_id = tasks
+            .create(crate::agent_task::NewTask {
+                title: "historical fixture".into(),
+                provider: AgentProvider::Codex,
+                repo_root: root.join("repo"),
+                worktree_path: root.join("worktree"),
+                branch: "fixture/history".into(),
+                base_commit: "a".repeat(40),
+                source_context: None,
+            })
+            .unwrap();
+        let mut task = tasks.get(task_id).unwrap().clone();
+        task.status = TaskStatus::ReadyForReview;
+        task.runtime_kind = TaskRuntimeKind::Native;
+        let id = super::super::model::task_id("fixture/history", &task_id.to_string()).unwrap();
+        let home = root.join("native-profile");
+        let view = crate::agent_task::CodexAppServerViewSnapshot {
+            phase: crate::agent_task::CodexAppServerPhase::Ended,
+            provider_thread_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let snapshot = NativeSnapshot {
+            id: id.clone(),
+            namespace: "fixture/history".into(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+            sequence: 1,
+            task,
+            view: Some(view),
+            preparing: false,
+            live: false,
+            ownership_locked: false,
+            interrupted: true,
+            can_prompt: false,
+            can_resume: false,
+            can_continue_in_terminal: false,
+            exit: None,
+            events: vec![],
+            native_home: Some(home.clone()),
+            provider_home: home.clone(),
+            source_profile: root.join("source-profile"),
+            handoff_pending: false,
+            terminal: None,
+            operations: vec![],
+            redact_secrets: true,
+            validation_evidence_redacted: false,
+        };
+        store.save_native(&snapshot).unwrap();
+        let mut manager = NativeManager::new(paths);
+        let owner = (
+            std::process::id(),
+            super::super::ownership::process_start(std::process::id()).unwrap(),
+        );
+        manager
+            .attach(
+                id.clone(),
+                snapshot.incarnation,
+                "history-view".into(),
+                owner,
+                &store,
+            )
+            .unwrap();
+        let mut runtimes = HashMap::new();
+        for _ in 0..10 {
+            manager.poll(&mut store, &mut runtimes);
+        }
+        let loaded = store.native_snapshot(&id).unwrap().unwrap();
+        assert_eq!(loaded.native_home, Some(home));
+        assert!(loaded.can_resume);
+        assert!(loaded.can_continue_in_terminal);
+        assert!(!loaded.live);
+        drop(manager);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

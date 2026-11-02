@@ -1508,6 +1508,7 @@ fn native_gui_exit_reconnect_exact_turn_and_single_writer_handoff() {
         action: Box::new(NativeAction::Prompt {
             text: "second synthetic turn".into(),
             policy: launch.policy,
+            receipt: None,
         }),
     };
     request(&client, command.clone()).unwrap();
@@ -1560,7 +1561,8 @@ fn native_gui_exit_reconnect_exact_turn_and_single_writer_handoff() {
             operation: uuid::Uuid::new_v4().to_string(),
             action: Box::new(NativeAction::Prompt {
                 text: "must not race CLI".into(),
-                policy: launch.policy
+                policy: launch.policy,
+                receipt: None,
             })
         }
     )
@@ -1764,4 +1766,162 @@ fn native_gui_acceptance_fixture() {
     while Instant::now() < deadline && !stop.exists() {
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn native_redacted_source_evidence_never_enters_database_or_wal() {
+    let h = Harness::new();
+    let mut launch = native_fixture(&h);
+    let secret = "synthetic-context-secret-123456";
+    let context = launch.task.source_context.as_mut().unwrap();
+    context.command = Some(format!("API_TOKEN={secret} false"));
+    context.output_text = format!("API_TOKEN={secret}");
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let client = h.client();
+    request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch),
+        },
+    )
+    .unwrap();
+    let snapshot = wait_native(&client, &id, |s| {
+        s.view
+            .as_ref()
+            .is_some_and(|v| v.agent_text.contains("Preview 1"))
+    });
+    assert!(snapshot.validation_evidence_redacted);
+    assert!(!snapshot.task.source_context.as_ref().unwrap().command_exact);
+    for name in ["workspace.sqlite3", "workspace.sqlite3-wal"] {
+        if let Ok(bytes) = std::fs::read(h.state.join(name)) {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|part| part == secret.as_bytes()),
+                "source secret was persisted to {name}"
+            );
+        }
+    }
+}
+#[test]
+fn native_prompt_receipt_reports_host_conflict_without_dispatching() {
+    use jterm_core::agent_task::{AgentRuntimeManager, TaskManager};
+    let h = Harness::new();
+    let launch = native_fixture(&h);
+    let profile = launch.context.claude_home.clone();
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let client = h.client();
+    request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch.clone()),
+        },
+    )
+    .unwrap();
+    std::fs::write(profile.join("release-1"), "").unwrap();
+    wait_native(&client, &id, |s| s.can_prompt);
+    let mut view = AgentRuntimeManager::hosted_with_client("second-view", h.client());
+    let mut tasks = TaskManager::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while view.snapshot(launch.task.id).is_none() {
+        view.poll(&mut tasks, launch.policy);
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let receipt = uuid::Uuid::new_v4().to_string();
+    view.prompt_native_tracked(
+        &tasks,
+        launch.task.id,
+        "keep this rejected draft",
+        launch.policy,
+        receipt.clone(),
+    )
+    .unwrap();
+    loop {
+        view.poll(&mut tasks, launch.policy);
+        if let Some(outcome) = view
+            .take_prompt_outcomes()
+            .into_iter()
+            .find(|o| o.receipt == receipt)
+        {
+            assert!(outcome.result.is_err());
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(profile.join("native-invocations"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+#[test]
+fn native_delayed_attach_rechecks_current_sharing_policy() {
+    use jterm_core::agent_task::{AgentRuntimeManager, NativePromptPolicy, TaskManager};
+    let h = Harness::new();
+    let launch = native_fixture(&h);
+    let profile = launch.context.claude_home.clone();
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let client = h.client();
+    let control = match request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch.clone()),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        reply => panic!("{reply:?}"),
+    };
+    std::fs::write(profile.join("release-1"), "").unwrap();
+    wait_native(&client, &id, |s| s.can_prompt);
+    request(&client, WorkspaceCommand::DetachNative { control }).unwrap();
+    let mut view = AgentRuntimeManager::hosted_with_client("policy-view", h.client());
+    let mut tasks = TaskManager::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while view.snapshot(launch.task.id).is_none() {
+        view.poll(&mut tasks, launch.policy);
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let receipt = uuid::Uuid::new_v4().to_string();
+    view.prompt_native_tracked(
+        &tasks,
+        launch.task.id,
+        "must stay local",
+        launch.policy,
+        receipt.clone(),
+    )
+    .unwrap();
+    let revoked = NativePromptPolicy {
+        share_command_context: false,
+        redact_secrets: true,
+    };
+    loop {
+        view.poll(&mut tasks, revoked);
+        if let Some(outcome) = view
+            .take_prompt_outcomes()
+            .into_iter()
+            .find(|o| o.receipt == receipt)
+        {
+            assert!(outcome.result.is_err());
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(profile.join("native-invocations"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }

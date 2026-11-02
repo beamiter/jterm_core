@@ -123,7 +123,7 @@ pub use query::{dashboard_query_error, DashboardQuery};
 #[allow(unused_imports)]
 pub use runtime::{
     AgentRuntimeCompletion, AgentRuntimeError, AgentRuntimeIssue, AgentRuntimeManager,
-    AgentRuntimePollReport, AppliedAgentTurn,
+    AgentRuntimePollReport, AppliedAgentTurn, NativePromptOutcome,
 };
 #[allow(unused_imports)]
 pub use task::{
