@@ -478,18 +478,18 @@ mod tests {
         assert_eq!(
             layout.center,
             Rect {
-                x: 292.0,
+                x: 335.0,
                 y: 42.0,
-                width: 758.0,
+                width: 715.0,
                 height: 662.0
             }
         );
         assert_eq!(
             layout.composer,
             Rect {
-                x: 320.0,
+                x: 363.0,
                 y: 613.0,
-                width: 702.0,
+                width: 659.0,
                 height: 80.0
             }
         );

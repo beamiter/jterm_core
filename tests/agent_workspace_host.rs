@@ -1727,3 +1727,41 @@ fn native_remote_view_drop_detaches_without_stopping_the_runtime() {
         "dropping only the remote view stopped the provider"
     );
 }
+
+/// Isolated Xvfb acceptance setup. The provider is our local Python fixture;
+/// no actual provider history, credentials, network or desktop is involved.
+#[test]
+#[ignore]
+fn native_gui_acceptance_fixture() {
+    let Ok(output) = std::env::var("JTERM_GUI_NATIVE_FIXTURE") else {
+        return;
+    };
+    let h = Harness::new();
+    let launch = native_fixture(&h);
+    let profile = launch.context.claude_home.clone();
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let client = h.client();
+    let control = match request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch.clone()),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        reply => panic!("{reply:?}"),
+    };
+    std::fs::write(profile.join("release-1"), "").unwrap();
+    let ready = wait_native(&client, &id, |s| s.can_prompt);
+    request(&client, WorkspaceCommand::DetachNative { control }).unwrap();
+    std::fs::write(&output,serde_json::to_vec_pretty(&serde_json::json!({"state_dir":h.state,"profile":profile,"task_id":launch.task.id,"conversation_id":id,"thread_id":ready.view.unwrap().provider_thread_id,"repo":launch.task.repo_root,"worktree":launch.task.worktree_path})).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    let stop = PathBuf::from(format!("{output}.stop"));
+    while Instant::now() < deadline && !stop.exists() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

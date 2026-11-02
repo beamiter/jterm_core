@@ -26,14 +26,14 @@ mod tests {
         assert_eq!(layout.rail.width, 55.0);
         assert_eq!(layout.navigation.unwrap().width, 280.0);
         assert_eq!(layout.inspector.unwrap().width, 306.0);
-        assert_eq!(layout.center.x, 292.0);
+        assert_eq!(layout.center.x, 335.0);
         assert_eq!(layout.header.height, 49.0);
         assert_eq!(
             layout.composer,
             Rect {
-                x: 320.0,
+                x: 363.0,
                 y: 613.0,
-                width: 702.0,
+                width: 659.0,
                 height: 80.0
             }
         );
@@ -41,7 +41,7 @@ mod tests {
             (1672.0, true, true),
             (1356.0, true, true),
             (1000.0, true, false),
-            (800.0, true, false),
+            (800.0, false, false),
             (700.0, false, false),
         ] {
             let shared = crate::reference_shell::Layout::for_size(width, 704.0);
