@@ -1103,6 +1103,7 @@ mod historical_projection_tests {
         let job = manager.jobs.get_mut(&id).unwrap();
         let mut raw_task = job.tasks.get(task_id).unwrap().clone();
         raw_task.provider = AgentProvider::Claude;
+        job.tasks = TaskManager::new();
         job.tasks
             .project_hosted_task(raw_task.clone(), false)
             .unwrap();
