@@ -24,7 +24,7 @@ mod tests {
         let layout = Layout::for_size(1356.0, 704.0);
         assert_eq!(layout.titlebar.height, 42.0);
         assert_eq!(layout.rail.width, 55.0);
-        assert_eq!(layout.navigation.unwrap().width, 237.0);
+        assert_eq!(layout.navigation.unwrap().width, 280.0);
         assert_eq!(layout.inspector.unwrap().width, 306.0);
         assert_eq!(layout.center.x, 292.0);
         assert_eq!(layout.header.height, 49.0);

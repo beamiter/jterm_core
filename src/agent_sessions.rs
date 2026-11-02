@@ -43,7 +43,7 @@ const MAX_WARNINGS: usize = 16;
 /// a warning nobody had time to read.
 pub const SESSION_RESUME_ANYWAY_DELAY: Duration = Duration::from_millis(600);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SessionProvider {
     Codex,
     Claude,
@@ -59,7 +59,7 @@ impl SessionProvider {
         self.label()
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
     Working,
     Waiting,
@@ -81,7 +81,7 @@ impl SessionStatus {
         self.label()
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentSession {
     pub provider: SessionProvider,
     pub id: String,

@@ -7,6 +7,32 @@ pub(super) const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceCommand {
+    StartNative {
+        launch: Box<super::native::NativeLaunch>,
+    },
+    NativeCatalog {
+        after: Option<ConversationId>,
+        limit: usize,
+    },
+    InspectNative {
+        id: ConversationId,
+    },
+    AttachNative {
+        id: ConversationId,
+        incarnation: String,
+        view: String,
+    },
+    DetachNative {
+        control: super::native::NativeControlLease,
+    },
+    DetachNativeView {
+        view: String,
+    },
+    ControlNative {
+        control: super::native::NativeControlLease,
+        operation: String,
+        action: Box<super::native::NativeAction>,
+    },
     StartApi {
         launch: Box<super::api::ApiLaunch>,
     },
@@ -111,6 +137,14 @@ pub enum WorkspaceCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceReply {
+    Native {
+        snapshot: Box<super::native::NativeSnapshot>,
+        control: Option<super::native::NativeControlLease>,
+    },
+    NativeCatalog {
+        entries: Vec<super::native::NativeCatalogEntry>,
+        next_after: Option<ConversationId>,
+    },
     Api {
         snapshot: super::api::ApiSnapshot,
         control: Option<super::api::ApiControlLease>,

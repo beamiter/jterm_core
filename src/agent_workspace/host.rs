@@ -40,9 +40,9 @@ enum HostRequest {
 }
 
 #[derive(Clone)]
-struct RuntimeHandle {
+pub(super) struct RuntimeHandle {
     control: Sender<Control>,
-    snapshot: Arc<Mutex<RuntimeSnapshot>>,
+    pub(super) snapshot: Arc<Mutex<RuntimeSnapshot>>,
 }
 
 enum Control {
@@ -101,8 +101,10 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
     let clients = Arc::new(AtomicUsize::new(0));
     let mut runtimes: HashMap<ConversationId, RuntimeHandle> = HashMap::new();
     let mut api = super::api_host::ApiManager::new(paths.clone());
+    let mut native = super::native_host::NativeManager::new(paths.clone());
     loop {
         api.poll(&mut store);
+        native.poll(&mut store, &mut runtimes);
         for _ in 0..8 {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -128,6 +130,10 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                 let response = (|| {
                     store.reap_abandoned_requests()?;
                     let command = match api.handle(command, owner.clone(), &mut store) {
+                        super::api_host::Disposition::Handled(reply) => return reply,
+                        super::api_host::Disposition::Other(command) => command,
+                    };
+                    let command = match native.handle(command, owner.clone(), &mut store) {
                         super::api_host::Disposition::Handled(reply) => return reply,
                         super::api_host::Disposition::Other(command) => command,
                     };
@@ -434,10 +440,18 @@ fn validate_launch(launch: &ManagedLaunch) -> Result<(), String> {
 }
 
 fn spawn_runtime(paths: &Paths, launch: &ManagedLaunch) -> Result<RuntimeHandle, String> {
+    spawn_runtime_with_native(paths, launch, None)
+}
+pub(super) fn spawn_runtime_with_native(
+    paths: &Paths,
+    launch: &ManagedLaunch,
+    mut native: Option<super::native_handoff::NativeCliOptions>,
+) -> Result<RuntimeHandle, String> {
     // Native app-server profiles are isolated and may have an owner before
     // their first thread ID is known. The profile lease bridges that phase
     // and is released only by an acknowledged native-to-CLI handoff.
-    let profile_lease = if launch.provider == "codex"
+    let profile_lease = if native.is_none()
+        && launch.provider == "codex"
         && launch
             .provider_home
             .join("jterm-native-profile.json")
@@ -452,10 +466,29 @@ fn spawn_runtime(paths: &Paths, launch: &ManagedLaunch) -> Result<RuntimeHandle,
     } else {
         None
     };
-    let mut lease = Lease::acquire(&paths.lease(&launch.row.id))?;
+    if profile_lease.is_some() {
+        return Err("Open the native task and choose Continue in Terminal to acquire a fresh access grant for this exact thread".into());
+    }
+    let mut lease = match native
+        .as_mut()
+        .and_then(|options| options.session_lease.take())
+    {
+        Some(lease) => lease.into_lease(),
+        None => Lease::acquire(&paths.lease(&launch.row.id))?,
+    };
     let (cols, rows) = dimensions(launch.cols, launch.rows);
     let (master, slave) = open_pty(cols, rows)?;
-    let mut command = Command::new(&launch.provider);
+    let mut command = if let Some(options) = &native {
+        let first = options
+            .argv
+            .first()
+            .ok_or("Empty trusted native CLI launcher")?;
+        let mut command = Command::new(first);
+        command.args(&options.argv[1..]);
+        command
+    } else {
+        Command::new(&launch.provider)
+    };
     command
         .current_dir(&launch.cwd)
         .env("TERM", "xterm-256color");
@@ -465,7 +498,11 @@ fn spawn_runtime(paths: &Paths, launch: &ManagedLaunch) -> Result<RuntimeHandle,
                 .arg("resume")
                 .arg(&launch.native_id)
                 .env("CODEX_HOME", &launch.provider_home);
-            if profile_lease.is_some() {
+            if profile_lease.is_some()
+                || native
+                    .as_ref()
+                    .is_some_and(|options| options.profile.is_some())
+            {
                 command.arg("--cd").arg(&launch.cwd);
             }
         }
@@ -485,6 +522,28 @@ fn spawn_runtime(paths: &Paths, launch: &ManagedLaunch) -> Result<RuntimeHandle,
     if let Some(profile) = &profile_lease {
         profile.configure_child(&mut command)?;
     }
+    if let Some(options) = &native {
+        let provider = if launch.provider == "codex" {
+            crate::agent_task::AgentProvider::Codex
+        } else {
+            crate::agent_task::AgentProvider::Claude
+        };
+        options
+            .context
+            .configure_authentication(&mut command, provider);
+        options.execution_lease.configure_child(&mut command)?;
+        if let Some(profile) = &options.profile {
+            profile
+                .configure_child_command(&mut command)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(lease) = &options.session_lease {
+            lease.configure_child(&mut command)?;
+        }
+        if let Some(grant) = &options.grant {
+            grant.configure_child(&mut command);
+        }
+    }
     let child = SupervisedChild::spawn_pty_session(&mut command)
         .map_err(|e| format!("Could not start {}: {e}", launch.provider))?;
     let pid = child.process_group_id() as u32;
@@ -492,6 +551,7 @@ fn spawn_runtime(paths: &Paths, launch: &ManagedLaunch) -> Result<RuntimeHandle,
         return Err("Provider exited before a process ownership identity could be recorded".into());
     };
     let snapshot = RuntimeSnapshot {
+        cleanup_verified: false,
         id: launch.row.id.clone(),
         state: RuntimeState::Running,
         pid,
@@ -518,6 +578,7 @@ fn spawn_runtime(paths: &Paths, launch: &ManagedLaunch) -> Result<RuntimeHandle,
         .name("jterm-managed-pty".into())
         .spawn(move || {
             let _profile_lease = profile_lease;
+            let _native_options = native;
             runtime_loop(master, child, lease, record, rx, thread_view)
         })
         .map_err(|e| e.to_string())?;
@@ -738,6 +799,7 @@ fn runtime_loop(
                     }
                 };
                 let empty = wait_group_empty(group, Duration::from_secs(2));
+                record.runtime.cleanup_verified = empty;
                 record.runtime.state = RuntimeState::Exited;
                 record.runtime.exit_code = Some(
                     status

@@ -452,7 +452,7 @@ impl AgentPrompt {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ApprovalDecision {
     Approve,
     Deny { reason: Option<String> },

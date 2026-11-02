@@ -185,6 +185,33 @@ impl std::fmt::Debug for NativeSessionLease {
 }
 
 impl NativeSessionLease {
+    pub(super) fn into_lease(self) -> Lease {
+        self._lease
+    }
+    pub(super) fn acquire_task(paths: &Paths, id: ConversationId) -> Result<Self, String> {
+        let mut lease = Lease::acquire(&paths.lease(&id))?;
+        let pid = std::process::id();
+        let start = process_start(pid).ok_or("Cannot identify native host process")?;
+        lease.write(&LeaseRecord {
+            id: id.clone(),
+            host_pid: pid,
+            host_start: start.clone(),
+            runtime: RuntimeSnapshot {
+                cleanup_verified: false,
+                id: id.clone(),
+                state: super::model::RuntimeState::Running,
+                pid,
+                process_start: start,
+                epoch: uuid::Uuid::new_v4().to_string(),
+                event_sequence: 0,
+                cols: 0,
+                rows: 0,
+                exit_code: None,
+                detail: "Host-owned structured native execution".into(),
+            },
+        })?;
+        Ok(Self { _lease: lease, id })
+    }
     pub fn acquire(
         provider: crate::agent_sessions::SessionProvider,
         provider_home: &Path,
@@ -226,6 +253,7 @@ impl NativeSessionLease {
             host_pid: 0,
             host_start: String::new(),
             runtime: RuntimeSnapshot {
+                cleanup_verified: false,
                 id: id.clone(),
                 state: super::model::RuntimeState::Running,
                 pid,

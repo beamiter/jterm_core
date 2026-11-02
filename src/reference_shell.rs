@@ -9,13 +9,13 @@ pub const REFERENCE_WIDTH: f32 = 1356.0;
 pub const REFERENCE_HEIGHT: f32 = 704.0;
 pub const TITLEBAR_HEIGHT: f32 = 42.0;
 pub const RAIL_WIDTH: f32 = 55.0;
-pub const NAVIGATION_WIDTH: f32 = 237.0;
+pub const NAVIGATION_WIDTH: f32 = 280.0;
 pub const INSPECTOR_WIDTH: f32 = 306.0;
 /// Interactive sidebars retain a usable command canvas between their handles.
 pub const SIDEBAR_DIVIDER_WIDTH: f32 = 6.0;
 pub const MIN_CENTER_WIDTH: f32 = 480.0;
-pub const MIN_NAVIGATION_WIDTH: f32 = 120.0;
-pub const MAX_NAVIGATION_WIDTH: f32 = 800.0;
+pub const MIN_NAVIGATION_WIDTH: f32 = 240.0;
+pub const MAX_NAVIGATION_WIDTH: f32 = 360.0;
 pub const MIN_INSPECTOR_WIDTH: f32 = 240.0;
 pub const MAX_INSPECTOR_WIDTH: f32 = 1200.0;
 pub const CANVAS_HEADER_HEIGHT: f32 = 49.0;
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn interactive_sidebars_keep_preferences_and_a_usable_center() {
-        let left = 600.0;
+        let left = 360.0;
         let right = 800.0;
         let wide = Layout::for_size_with_sidebars(2400.0, 800.0, left, right);
         assert_eq!(wide.navigation.unwrap().width, left);
@@ -395,8 +395,8 @@ mod tests {
         );
         let narrow = Layout::for_size_with_sidebars(700.0, 800.0, left, right);
         assert!(narrow.inspector.is_none());
-        assert!(narrow.navigation.unwrap().width < left);
-        assert_eq!(narrow.center.width, MIN_CENTER_WIDTH);
+        assert!(narrow.navigation.is_none());
+        assert!(narrow.center.width >= MIN_CENTER_WIDTH);
         assert_eq!(
             Layout::for_size_with_sidebars(2400.0, 800.0, left, right),
             wide,

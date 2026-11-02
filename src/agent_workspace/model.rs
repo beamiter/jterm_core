@@ -209,6 +209,9 @@ pub struct StoredMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
+    /// True only after the provider leader is reaped and its group is empty.
+    #[serde(default)]
+    pub cleanup_verified: bool,
     pub id: ConversationId,
     pub state: RuntimeState,
     pub pid: u32,

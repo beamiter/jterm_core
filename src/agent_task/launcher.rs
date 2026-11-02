@@ -152,7 +152,7 @@ impl AgentLaunchSpec {
         )
     }
 
-    fn resolve_native_with_path(
+    pub(crate) fn resolve_native_with_path(
         provider: AgentProvider,
         repository: &Path,
         worktree: &Path,

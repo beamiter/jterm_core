@@ -87,8 +87,9 @@ from the state root.
 
 ## Shared API conversations
 
-The daemon serializes database writes. SQLite schema version 3 retains verified submission-owner process identity,
-per-view reading positions, and durable API execution snapshots; unsupported
+The daemon serializes database writes. SQLite schema version 4 retains verified submission-owner process identity,
+per-view reading positions, durable API and native execution snapshots, and
+replay-proof native operation identities; unsupported
 future schemas fail explicitly.
 
 A bounded snapshot feeds ChatStore and model context. A separate message table
@@ -199,9 +200,13 @@ Existing containment and approval gates remain enforced.
 Native profiles also appear in the CLI sidebar. The marker supplies durable
 cwd instead of the obsolete `/proc/self/fd/N` from provider history. Terminal
 launch uses the same `CODEX_HOME` and explicit `--cd`. The profile lease
-excludes simultaneous native and CLI runtimes. An isolated profile may need
-its own CLI login; native access grants are not persisted as CLI refresh
-credentials.
+excludes simultaneous native and CLI runtimes. The explicit handoff reuses
+an access-token-only credential grant in a sealed Linux memfd. The profile
+contains a descriptor link while that CLI runs; no token or refresh credential
+is written there. A guarded marker permits cleanup after a host crash without
+overwriting replacement credentials. Expired grants fail without new login or
+automatic operation replay. Native profile CLI rows require this task handoff
+when no matching managed PTY is already running.
 
 Protocol source:
 [Codex rust-v0.147.0 thread protocol](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs).
@@ -230,17 +235,32 @@ resume button.
 
 ## Lifecycle boundaries
 
-The persistent host owns managed CLI PTYs and supervised API HTTP requests.
-Updated API chat views detach on close and can reattach from another frontend.
-Structured native Task runtimes still remain frontend-owned in this revision;
-closing their frontend stops them. Task instructions and validation state are
-not silently serialized into the shared index.
+The persistent host owns managed CLI PTYs, supervised API HTTP requests, and
+structured native Task runtimes. All four GUI adapters use hosted native
+views. Closing a view detaches control; the provider and its bounded event
+reducer continue in the host. A second frontend reads the same task/view and
+may obtain a fresh control generation after the previous view detaches or its
+PID/start identity dies. Another live controller is reported as a conflict.
 
-The existing native failure recovery action **Continue in terminal** launches a
-new CLI task prompt after verified shutdown. It is not the same operation as
-selecting an indexed thread. Exact transcript continuation uses that
-source-qualified row or Codex's verified native resume. The UI must not present
-new-goal compatibility recovery as same-thread migration.
+Native launch captures the requesting process's provider profile and PATH.
+Authentication overrides cross only the private same-user socket and remain
+in memory. Durable task/view snapshots contain neither that environment nor
+API keys. Initial native admission and every control operation are reserved
+before dispatch; uncertain operations are never automatically retried. Event
+snapshots are bounded, and replay does not reactivate historical approvals.
+A host restart records an interrupted outcome. Surviving descendants retain
+the inherited kernel lease and exclude a replacement writer. An explicit
+Codex restore verifies profile provenance and the exact recorded thread, with
+no initial prompt or repeated turn.
+
+**Continue in Terminal** requires stopped native authority and verified cleanup.
+The host discovers that exact provider ID in its original profile, acquires
+its CLI lease, and starts the managed PTY before the requesting GUI attaches.
+It retains task ownership until CLI cleanup is verified. Missing history,
+changed profile/cwd, another live owner, and unconfirmed descendant cleanup
+remain readable conflicts rather than starting a new task goal. Validation
+is still a separate task workflow and is locked while native/CLI authority is
+active.
 
 Consumer ChatGPT/Claude desktop/web histories are not automatically imported or
 synchronized. Providers retain their own authentication, transcript formats and
@@ -256,7 +276,14 @@ unknown outcomes after host crash, receipt resolution and credential nonpersiste
 idempotent migration,
 source identities, complete-pair history, atomic metadata, private paths; screen
 reconstruction across partial input; actual fake-Claude processes across turns;
-and Codex resume/provenance/history/stale-stream protocol checks.
+and Codex resume/provenance/history/stale-stream protocol checks. Native host
+integration tests use actual fake-Claude processes and independent frontend
+processes: close/reconnect, stale controllers, exact second turns, durable
+operation deduplication, explicit CLI handoff, host-crash surviving-owner
+exclusion, and remote-view Drop without provider cancellation. Sealed access
+grant tests verify token nonpersistence and preservation of replacement auth.
+The managed cloud GUI evidence uses Xvfb/software rendering and local HTTP
+fixtures; it does not establish real-model, Wayland/GPU or physical IME results.
 
 Process, `/proc` and Unix-socket tests need an environment permitting those
 operations. Sandbox denial is not evidence of product success or failure. The

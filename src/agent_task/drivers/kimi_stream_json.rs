@@ -184,6 +184,14 @@ impl KimiStreamJsonDriver {
         ))
     }
 
+    pub(crate) fn configure_host(
+        &mut self,
+        context: crate::agent_workspace::NativeLaunchContext,
+        lease: std::sync::Arc<crate::agent_workspace::NativeSessionLease>,
+    ) {
+        self.0.configure_host(context, lease);
+    }
+
     pub fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
         self.0.view_snapshot()
     }

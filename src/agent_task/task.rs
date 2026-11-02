@@ -559,6 +559,7 @@ pub struct TaskManager {
     tasks_by_validation_session: HashMap<String, TaskId>,
     exited_terminal_sessions: HashSet<String>,
     native_event_streams: HashMap<TaskId, NativeEventStreamState>,
+    remote_native_active: HashSet<TaskId>,
 }
 
 #[derive(Debug)]
@@ -632,6 +633,43 @@ impl TaskManager {
         Ok(id)
     }
 
+    /// Adopt host state without installing a local provider event stream.
+    /// Remote liveness still locks validation and terminal authority changes.
+    pub(crate) fn project_hosted_task(
+        &mut self,
+        incoming: AgentTask,
+        live: bool,
+    ) -> Result<(), String> {
+        let id = incoming.id;
+        if self.native_event_streams.contains_key(&id) {
+            return Err(
+                "A local native event owner cannot be replaced by a host projection".into(),
+            );
+        }
+        if let Some(index) = self.task_indices.get(&id).copied() {
+            let current = &self.tasks[index];
+            if current.repo_root != incoming.repo_root
+                || current.worktree_path != incoming.worktree_path
+                || current.branch != incoming.branch
+                || current.base_commit != incoming.base_commit
+                || current.provider != incoming.provider
+                || current.created_at_ms != incoming.created_at_ms
+            {
+                return Err("Host task identity no longer matches the registered worktree".into());
+            }
+            self.tasks[index] = incoming;
+        } else {
+            self.task_indices.insert(id, self.tasks.len());
+            self.tasks.push(incoming);
+        }
+        if live {
+            self.remote_native_active.insert(id);
+        } else {
+            self.remote_native_active.remove(&id);
+        }
+        Ok(())
+    }
+
     pub fn tasks(&self) -> &[AgentTask] {
         &self.tasks
     }
@@ -672,6 +710,7 @@ impl TaskManager {
 
     pub fn has_active_agent_event_stream(&self, task_id: TaskId) -> bool {
         self.native_event_streams.contains_key(&task_id)
+            || self.remote_native_active.contains(&task_id)
     }
 
     /// Return the product-level attention state for one task.
@@ -714,7 +753,7 @@ impl TaskManager {
         &mut self,
         task_id: TaskId,
     ) -> Result<AgentEventStream, AgentEventError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(AgentEventError::StreamAlreadyActive(task_id));
         }
         let status = self
@@ -761,7 +800,7 @@ impl TaskManager {
         &mut self,
         task_id: TaskId,
     ) -> Result<AgentEventStream, AgentEventError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(AgentEventError::StreamAlreadyActive(task_id));
         }
         let task = self
@@ -1214,7 +1253,7 @@ impl TaskManager {
     /// every retry ownership gate currently passes. Binding repeats these
     /// checks after the replacement PTY has crossed exec.
     pub fn terminal_retry_session_id(&self, task_id: TaskId) -> Result<&str, TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
         let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
@@ -1310,7 +1349,7 @@ impl TaskManager {
     // this crate-private gate; keep it sealed despite that target-local fact.
     #[allow(dead_code)]
     pub fn native_terminal_fallback_eligible(&self, task_id: TaskId) -> Result<(), TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
         let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
@@ -1440,7 +1479,7 @@ impl TaskManager {
     /// a PTY. Binding repeats every check after spawn so future concurrent
     /// callers cannot turn this advisory result into authority.
     pub fn next_validation_attempt(&self, task_id: TaskId) -> Result<u64, TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(TaskError::NativeEventStreamActiveDuringValidation(task_id));
         }
         let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
@@ -1472,7 +1511,7 @@ impl TaskManager {
         status: TaskStatus,
         detail: Option<String>,
     ) -> Result<(), TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
         if status == TaskStatus::Completed {
@@ -1644,7 +1683,7 @@ impl TaskManager {
     /// action the manager will refuse. Execution still rechecks every gate.
     pub fn can_archive(&self, task_id: TaskId) -> Result<(), TaskError> {
         let task = self.get(task_id).ok_or(TaskError::UnknownTask(task_id))?;
-        if self.native_event_streams.contains_key(&task_id)
+        if self.has_active_agent_event_stream(task_id)
             || task.status.is_running()
             || task.validation.status == TaskValidationStatus::Running
         {
@@ -1688,7 +1727,7 @@ impl TaskManager {
 
     /// Accept a reviewed task only after its latest validation passed.
     pub fn complete_after_validation(&mut self, task_id: TaskId) -> Result<(), TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
         let task = self.task_mut(task_id)?;
@@ -1711,7 +1750,7 @@ impl TaskManager {
     /// instead of a validation command. Failed-command tasks and any task with
     /// a validation recipe can never use this path to bypass validation.
     pub fn complete_after_manual_review(&mut self, task_id: TaskId) -> Result<(), TaskError> {
-        if self.native_event_streams.contains_key(&task_id) {
+        if self.has_active_agent_event_stream(task_id) {
             return Err(TaskError::NativeEventStreamActive(task_id));
         }
         let task = self.task_mut(task_id)?;

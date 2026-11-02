@@ -37,6 +37,7 @@ pub struct PreparedNativeCodexHome {
     remove_on_drop: bool,
     resume_thread: Option<super::ProviderSessionId>,
     profile_lease: Option<crate::agent_workspace::NativeSessionLease>,
+    execution_lease: Option<Arc<crate::agent_workspace::NativeSessionLease>>,
 }
 
 /// App-owned provenance for a persisted native thread. It contains no login
@@ -67,6 +68,25 @@ impl PreparedNativeCodexHome {
             .map_err(NativeCodexHomeError::Create)?;
         let source = source_codex_home_path()?;
         Self::prepare_persistent_from(task, relative_cwd, &source, &parent, None)
+    }
+
+    pub(crate) fn prepare_persistent_with_source(
+        task: &AgentTask,
+        relative_cwd: &Path,
+        source: &Path,
+    ) -> Result<Self, NativeCodexHomeError> {
+        let parent = crate::agent_workspace::native_profiles_directory()
+            .map_err(NativeCodexHomeError::Create)?;
+        Self::prepare_persistent_from(task, relative_cwd, source, &parent, None)
+    }
+    pub(crate) fn reopen_persistent_with_source(
+        task: &AgentTask,
+        path: &Path,
+        source: &Path,
+    ) -> Result<Self, NativeCodexHomeError> {
+        let parent = crate::agent_workspace::native_profiles_directory()
+            .map_err(NativeCodexHomeError::Create)?;
+        Self::reopen_persistent_from(task, path, source, &parent, None)
     }
 
     fn prepare_persistent_from(
@@ -186,12 +206,15 @@ impl PreparedNativeCodexHome {
             .map_err(|error| NativeCodexHomeError::SourceHomeUnsafe(error.to_string()))?;
         let credentials = read_native_credentials(&source)?;
         let lease = acquire_native_profile_lease(&resolved, lease_state)?;
+        crate::agent_workspace::cleanup_cli_grant(&resolved)
+            .map_err(NativeCodexHomeError::SourceHomeUnsafe)?;
         Ok(Self {
             path: resolved,
             credentials: Some(credentials),
             remove_on_drop: false,
             resume_thread: Some(resume_thread),
             profile_lease: Some(lease),
+            execution_lease: None,
         })
     }
 
@@ -202,10 +225,22 @@ impl PreparedNativeCodexHome {
         !self.remove_on_drop
     }
 
+    pub(crate) fn hold_execution_lease(
+        &mut self,
+        lease: Arc<crate::agent_workspace::NativeSessionLease>,
+    ) {
+        self.execution_lease = Some(lease);
+    }
+
     pub fn configure_child_command(
         &self,
         command: &mut Command,
     ) -> Result<(), NativeCodexHomeError> {
+        if let Some(lease) = &self.execution_lease {
+            lease
+                .configure_child(command)
+                .map_err(NativeCodexHomeError::Create)?;
+        }
         if let Some(lease) = &self.profile_lease {
             lease
                 .configure_child(command)
@@ -273,6 +308,7 @@ impl PreparedNativeCodexHome {
                         remove_on_drop: true,
                         resume_thread: None,
                         profile_lease: None,
+                        execution_lease: None,
                     });
                     break;
                 }
@@ -766,7 +802,7 @@ impl std::error::Error for NativeCodexHomeError {}
 
 /// Explicit policy grant captured at the UI boundary before any provider
 /// process or native stream is created.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePromptPolicy {
     pub share_command_context: bool,
     pub redact_secrets: bool,

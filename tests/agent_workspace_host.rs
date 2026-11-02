@@ -494,7 +494,7 @@ fn restarted_host_cannot_duplicate_or_stop_a_surviving_runtime() {
 }
 
 #[test]
-fn native_profile_owner_blocks_cli_handoff_until_guard_releases() {
+fn native_profile_owner_excludes_cli_and_requires_explicit_access_grant_after_stop() {
     let h = Harness::new();
     let home = h.session.provider_home().unwrap();
     std::fs::write(home.join("jterm-native-profile.json"), b"{}").unwrap();
@@ -506,16 +506,13 @@ fn native_profile_owner_blocks_cli_handoff_until_guard_releases() {
     assert_ne!(denied.wait_exit(), 0);
     assert!(!h.trace.exists());
     drop(guard);
-    let mut allowed = h.attach();
-    allowed.wait_for("READY");
-    request(
-        &h.client(),
-        WorkspaceCommand::Stop {
-            id: session_id(&h.session).unwrap(),
-        },
-    )
-    .unwrap();
-    allowed.wait_exit();
+    let mut explicit = h.attach();
+    explicit.wait_for("fresh access grant");
+    assert_ne!(explicit.wait_exit(), 0);
+    assert!(
+        !h.trace.exists(),
+        "an unauthenticated legacy CLI was started"
+    );
 }
 
 struct MockApi {
@@ -1270,4 +1267,463 @@ fn api_worker_starts_after_the_running_hosts_executable_was_unlinked() {
     server.release();
     wait_api(&h, &receipt.id, ApiState::Completed);
     assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+fn native_fixture(h: &Harness) -> jterm_core::agent_workspace::NativeLaunch {
+    use jterm_core::agent_task::*;
+    let repository = h.root.join("native-repo");
+    std::fs::create_dir(&repository).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("/usr/bin/git")
+            .current_dir(&repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet"]);
+    std::fs::write(repository.join("tracked"), "fixture").unwrap();
+    git(&["add", "tracked"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "fixture",
+    ]);
+    let managed = WorktreeService::new(h.root.join("native-managed"))
+        .unwrap()
+        .create(&CreateWorktreeRequest::new(
+            &repository,
+            "hosted",
+            "app/hosted-fixture",
+            "HEAD",
+        ))
+        .unwrap();
+    let mut tasks = TaskManager::new();
+    let id = tasks
+        .create(NewTask {
+            title: "Host owned Claude".into(),
+            provider: AgentProvider::Claude,
+            repo_root: managed.repository,
+            worktree_path: managed.path,
+            branch: managed.branch,
+            base_commit: managed.head,
+            source_context: Some(SemanticCommandContext {
+                source_session_id: "fixture-source".into(),
+                source_execution_id: "fixture-execution".into(),
+                source_sequence: 1,
+                source_shell: Some("/bin/sh".into()),
+                command: Some("false".into()),
+                command_exact: true,
+                command_truncated: false,
+                cwd: Some(repository.to_string_lossy().into_owned()),
+                cwd_after: Some(repository.to_string_lossy().into_owned()),
+                exit_code: Some(1),
+                duration_ms: Some(1),
+                output_text: "fixture failure".into(),
+                output_available: true,
+                output_truncated: false,
+                output_total_bytes: 15,
+                started_at: None,
+                finished_at: None,
+            }),
+        })
+        .unwrap();
+    let profile = h.root.join("claude-profile");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&profile)
+        .unwrap();
+    let fake = h.root.join("bin/claude");
+    std::fs::write(&fake,r##"#!/usr/bin/python3
+import sys,os,pathlib,json,time
+args=sys.argv[1:];root=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR']);mode='--resume' if '--resume' in args else '--session-id';ident=args[args.index(mode)+1]
+if '-p' not in args:
+ print('EXACT_CLI:'+ident,flush=True)
+ for line in sys.stdin: print('CLI_REPLY:'+line.rstrip(),flush=True)
+ sys.exit(0)
+(root/'native-provider.pid').write_text(str(os.getpid()))
+trace=root/'native-invocations';calls=trace.read_text().splitlines() if trace.exists() else [];number=len(calls)+1
+with trace.open('a') as f:f.write(mode+'|'+ident+'\n')
+history=root/'projects'/'fixture';history.mkdir(parents=True,exist_ok=True)
+(history/(ident+'.jsonl')).write_text(json.dumps({'sessionId':ident,'cwd':os.getcwd(),'type':'user','message':{'role':'user','content':'fixture'}})+'\n')
+print(json.dumps({'type':'system','subtype':'init','session_id':ident}),flush=True)
+print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'Preview '+str(number)}]}}),flush=True)
+deadline=time.monotonic()+60
+while not (root/('release-'+str(number))).exists() and time.monotonic()<deadline:time.sleep(.02)
+print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'Reviewed '+str(number)}),flush=True)
+"##).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    NativeLaunch {namespace:"fixture:native".into(),task:tasks.get(id).unwrap().clone(),view:"frontend-a".into(),policy:NativePromptPolicy {share_command_context:true,redact_secrets:true},context:serde_json::from_value(serde_json::json!({"search_path":format!("{}:/usr/bin:/bin",h.root.join("bin").display()),"codex_home":h.root.join("unused-codex"),"claude_home":profile,"environment":[]})).unwrap()}
+}
+fn inspect_native(client: &WorkspaceClient, id: &ConversationId) -> NativeSnapshot {
+    match request(client, WorkspaceCommand::InspectNative { id: id.clone() }).unwrap() {
+        WorkspaceReply::Native { snapshot, .. } => *snapshot,
+        other => panic!("Unexpected reply: {other:?}"),
+    }
+}
+fn wait_native(
+    client: &WorkspaceClient,
+    id: &ConversationId,
+    predicate: impl Fn(&NativeSnapshot) -> bool,
+) -> NativeSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let result = request(client, WorkspaceCommand::InspectNative { id: id.clone() });
+        if let Ok(WorkspaceReply::Native { snapshot, .. }) = &result {
+            if predicate(snapshot) {
+                return snapshot.as_ref().clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Native condition timed out: {result:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+#[test]
+#[ignore]
+fn native_frontend_fixture() {
+    let Ok(state) = std::env::var("JTERM_NATIVE_FIXTURE_STATE") else {
+        return;
+    };
+    let launch: NativeLaunch =
+        serde_json::from_str(&std::env::var("JTERM_NATIVE_FIXTURE_LAUNCH").unwrap()).unwrap();
+    let client = WorkspaceClient::for_state_dir(&state);
+    let reply = request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch),
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        std::env::var("JTERM_NATIVE_FIXTURE_REPLY").unwrap(),
+        serde_json::to_vec(&reply).unwrap(),
+    )
+    .unwrap();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+#[test]
+fn native_gui_exit_reconnect_exact_turn_and_single_writer_handoff() {
+    let h = Harness::new();
+    let launch = native_fixture(&h);
+    let profile = launch.context.claude_home.clone();
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let file = h.root.join("native-front-reply");
+    let mut frontend = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "native_frontend_fixture",
+            "--nocapture",
+        ])
+        .env("JTERM_NATIVE_FIXTURE_STATE", &h.state)
+        .env(
+            "JTERM_NATIVE_FIXTURE_LAUNCH",
+            serde_json::to_string(&launch).unwrap(),
+        )
+        .env("JTERM_NATIVE_FIXTURE_REPLY", &file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            File::create(h.root.join("native-front-error")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !file.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "frontend did not admit: {}",
+            std::fs::read_to_string(h.root.join("native-front-error")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let old: WorkspaceReply = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let old_control = match old {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        other => panic!("{other:?}"),
+    };
+    let client = h.client();
+    let running = wait_native(&client, &id, |s| {
+        s.view
+            .as_ref()
+            .is_some_and(|v| v.agent_text.contains("Preview 1"))
+    });
+    assert!(running.ownership_locked);
+    frontend.kill().unwrap();
+    frontend.wait().unwrap();
+    let still = inspect_native(&client, &id);
+    assert!(still.live, "GUI exit stopped the native worker");
+    let control = match request(
+        &client,
+        WorkspaceCommand::AttachNative {
+            id: id.clone(),
+            incarnation: still.incarnation.clone(),
+            view: "frontend-b".into(),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        other => panic!("{other:?}"),
+    };
+    assert!(request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: old_control,
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Cancel)
+        }
+    )
+    .is_err());
+    std::fs::write(profile.join("release-1"), "").unwrap();
+    let ready = wait_native(&client, &id, |s| s.can_prompt);
+    assert_eq!(
+        ready.task.status,
+        jterm_core::agent_task::TaskStatus::ReadyForReview
+    );
+    let thread = ready.view.unwrap().provider_thread_id.unwrap();
+    let operation = uuid::Uuid::new_v4().to_string();
+    let command = WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation: operation.clone(),
+        action: Box::new(NativeAction::Prompt {
+            text: "second synthetic turn".into(),
+            policy: launch.policy,
+        }),
+    };
+    request(&client, command.clone()).unwrap();
+    request(&client, command).unwrap();
+    wait_native(&client, &id, |s| {
+        s.view
+            .as_ref()
+            .is_some_and(|v| v.agent_text.contains("Preview 2"))
+    });
+    std::fs::write(profile.join("release-2"), "").unwrap();
+    wait_native(&client, &id, |s| {
+        s.can_prompt && s.view.as_ref().is_some_and(|v| v.completed_turns == 2)
+    });
+    let calls = std::fs::read_to_string(profile.join("native-invocations")).unwrap();
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        vec![
+            format!("--session-id|{thread}"),
+            format!("--resume|{thread}")
+        ]
+    );
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Finish),
+        },
+    )
+    .unwrap();
+    wait_native(&client, &id, |s| !s.ownership_locked);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Handoff {
+                context: launch.context.clone(),
+            }),
+        },
+    )
+    .unwrap();
+    let terminal = wait_native(&client, &id, |s| s.terminal.is_some());
+    assert_eq!(terminal.terminal.unwrap().id, thread);
+    assert!(terminal.ownership_locked);
+    assert!(request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control,
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Prompt {
+                text: "must not race CLI".into(),
+                policy: launch.policy
+            })
+        }
+    )
+    .is_err());
+    assert_eq!(
+        std::fs::read_to_string(profile.join("native-invocations"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "handoff submitted a new native goal"
+    );
+}
+
+#[test]
+fn native_host_crash_preserves_history_and_refuses_surviving_owner() {
+    let mut h = Harness::new();
+    let launch = native_fixture(&h);
+    let profile = launch.context.claude_home.clone();
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let client = h.client();
+    request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch.clone()),
+        },
+    )
+    .unwrap();
+    let running = wait_native(&client, &id, |s| {
+        s.view
+            .as_ref()
+            .is_some_and(|v| v.agent_text.contains("Preview 1"))
+    });
+    let pid: u32 = std::fs::read_to_string(profile.join("native-provider.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    h.host.kill().unwrap();
+    h.host.wait().unwrap();
+    assert!(process_live(pid));
+    h.host = Command::new(HOST)
+        .arg("--jterm-session-host")
+        .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            File::create(h.root.join("native-restarted-host-errors")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    let client = h.client();
+    let recovered = wait_native(&client, &id, |s| s.interrupted);
+    assert!(!recovered.live);
+    assert!(!recovered.can_prompt);
+    assert!(recovered
+        .view
+        .as_ref()
+        .unwrap()
+        .pending_approvals
+        .is_empty());
+    let attach = request(
+        &client,
+        WorkspaceCommand::AttachNative {
+            id: id.clone(),
+            incarnation: running.incarnation,
+            view: "after-crash".into(),
+        },
+    );
+    assert!(
+        attach.is_err(),
+        "surviving provider was admitted as a second writer: {attach:?}"
+    );
+    request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(profile.join("native-invocations"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "host restart repeated a model request"
+    );
+    let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+    assert!(String::from_utf8_lossy(&args).contains(h.root.to_string_lossy().as_ref()));
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[test]
+fn native_remote_view_drop_detaches_without_stopping_the_runtime() {
+    use jterm_core::agent_task::{AgentRuntimeManager, TaskManager};
+    let h = Harness::new();
+    let launch = native_fixture(&h);
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let client = h.client();
+    let control = match request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch.clone()),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        reply => panic!("{reply:?}"),
+    };
+    let running = wait_native(&client, &id, |s| {
+        s.view
+            .as_ref()
+            .is_some_and(|v| v.agent_text.contains("Preview 1"))
+    });
+    request(&client, WorkspaceCommand::DetachNative { control }).unwrap();
+    let mut view = AgentRuntimeManager::hosted_with_client("observer", h.client());
+    let mut tasks = TaskManager::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while view.snapshot(launch.task.id).is_none() {
+        view.poll(&mut tasks, launch.policy);
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A control action admits a fresh lease; policy is harmless to the worker.
+    view.load_native_history(launch.task.id, false).unwrap();
+    for _ in 0..10 {
+        view.poll(&mut tasks, launch.policy);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(view);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let result = request(
+            &client,
+            WorkspaceCommand::AttachNative {
+                id: id.clone(),
+                incarnation: running.incarnation.clone(),
+                view: "after-view-drop".into(),
+            },
+        );
+        if matches!(
+            result,
+            Ok(WorkspaceReply::Native {
+                control: Some(_),
+                ..
+            })
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closed view retained its control lease: {result:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        inspect_native(&client, &id).live,
+        "dropping only the remote view stopped the provider"
+    );
 }

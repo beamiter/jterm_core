@@ -163,7 +163,7 @@ const NATIVE_CODEX_DISABLED_FEATURES: &[&str] = &[
 ];
 
 /// Coarse transport/lifecycle state intended for frame-level UI rendering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CodexAppServerPhase {
     Created,
     Spawning,
@@ -199,7 +199,7 @@ impl CodexAppServerPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CodexAppServerApprovalKind {
     Command,
     FileChange,
@@ -216,7 +216,7 @@ impl CodexAppServerApprovalKind {
 
 /// Bounded, display-safe approval information. The JSON-RPC request ID stays
 /// private in the worker and is addressed only through the app's `ApprovalId`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerApproval {
     pub id: ApprovalId,
     pub kind: CodexAppServerApprovalKind,
@@ -233,7 +233,7 @@ pub struct CodexAppServerApproval {
     pub file_changes: Vec<CodexAppServerApprovalFileChange>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerApprovalFileChange {
     pub path: String,
     pub kind: String,
@@ -241,7 +241,7 @@ pub struct CodexAppServerApprovalFileChange {
     pub move_path: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerCommandView {
     pub item_id: String,
     pub command: String,
@@ -251,7 +251,7 @@ pub struct CodexAppServerCommandView {
     pub output_truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerFileChange {
     pub path: String,
     pub path_exact: bool,
@@ -265,7 +265,7 @@ pub struct CodexAppServerFileChange {
     shape_exact: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerFileChangeView {
     pub item_id: String,
     pub status: String,
@@ -274,7 +274,7 @@ pub struct CodexAppServerFileChangeView {
 }
 
 /// Compact, non-authoritative command evidence from one completed turn.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerTurnCommandSummary {
     pub command: String,
     pub status: String,
@@ -284,7 +284,7 @@ pub struct CodexAppServerTurnCommandSummary {
 }
 
 /// Compact, non-authoritative file evidence from one completed turn.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerTurnFileSummary {
     pub status: String,
     /// First display-safe affected path, when the item reported one.
@@ -299,7 +299,7 @@ pub struct CodexAppServerTurnFileSummary {
 
 /// Bounded presentation history. These local identities and summaries never
 /// participate in provider correlation or approval authority.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerTurnHistory {
     /// Stable, one-based turn position within this live native session.
     pub ordinal: usize,
@@ -318,7 +318,7 @@ pub struct CodexAppServerTurnHistory {
 
 /// Read-only persisted provider history. These records never emit lifecycle
 /// events, request approvals or become input authority for the loaded turn.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexPersistedTurn {
     pub provider_turn_id: String,
     pub status: String,
@@ -327,7 +327,7 @@ pub struct CodexPersistedTurn {
 }
 
 /// Cheap clone of the worker's bounded presentation state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerViewSnapshot {
     pub persisted_history: Arc<[CodexPersistedTurn]>,
     pub history_cursor: Option<String>,
@@ -385,7 +385,7 @@ impl Default for CodexAppServerViewSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CodexAppServerExitCause {
     Clean,
     Cancelled,
@@ -414,7 +414,7 @@ impl CodexAppServerExitCause {
 }
 
 /// Process status is recorded only after `wait`/`try_wait` reaped the leader.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerProcessExit {
     pub spawned: bool,
     /// True only after containment was armed, the launch gate was observed
@@ -430,7 +430,7 @@ pub struct CodexAppServerProcessExit {
 /// Out-of-band terminal evidence used by the runtime when a critical event
 /// could not be delivered. For a spawned process this is published only after
 /// the process group has been stopped and its leader reaped.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerExitReport {
     pub outcome: AgentSessionOutcome,
     pub cause: CodexAppServerExitCause,

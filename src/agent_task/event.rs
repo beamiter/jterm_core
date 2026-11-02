@@ -146,7 +146,7 @@ impl fmt::Display for InvalidProviderSessionId {
 impl std::error::Error for InvalidProviderSessionId {}
 
 /// app-local identity for one logical Agent turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AgentTurnId(Uuid);
 
 impl AgentTurnId {
@@ -168,7 +168,7 @@ impl fmt::Display for AgentTurnId {
 }
 
 /// app-local claim token for one approval or permission request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalId(Uuid);
 
 impl ApprovalId {
@@ -194,7 +194,7 @@ impl fmt::Display for ApprovalId {
 /// A reconnect or replacement receives a new epoch even when the provider
 /// resumes the same stable session ID, so callbacks from the old transport
 /// cannot mutate the replacement task state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AgentEventEpoch(u64);
 
 impl AgentEventEpoch {
@@ -302,7 +302,7 @@ impl AgentEventKind {
 }
 
 /// Provider-neutral outcome reported when a native session actually ends.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentSessionOutcome {
     Clean,
     Failed,

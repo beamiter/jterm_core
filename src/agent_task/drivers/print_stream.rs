@@ -150,6 +150,8 @@ pub(super) struct PrintStreamDriver {
     started: bool,
     continuation: bool,
     provider_home: Option<PathBuf>,
+    host_context: Option<crate::agent_workspace::NativeLaunchContext>,
+    execution_lease: Option<Arc<crate::agent_workspace::NativeSessionLease>>,
 }
 
 impl PrintStreamDriver {
@@ -178,6 +180,8 @@ impl PrintStreamDriver {
             started: false,
             continuation: false,
             provider_home: None,
+            host_context: None,
+            execution_lease: None,
         }
     }
 
@@ -185,6 +189,18 @@ impl PrintStreamDriver {
     pub fn enable_continuation(&mut self, provider_home: Option<PathBuf>) {
         self.continuation = self.spec.resume_argv.is_some();
         self.provider_home = provider_home;
+    }
+
+    pub fn configure_host(
+        &mut self,
+        context: crate::agent_workspace::NativeLaunchContext,
+        lease: Arc<crate::agent_workspace::NativeSessionLease>,
+    ) {
+        if self.spec.provider == AgentProvider::Claude {
+            self.provider_home = Some(context.claude_home.clone());
+        }
+        self.host_context = Some(context);
+        self.execution_lease = Some(lease);
     }
 
     pub fn view_snapshot(&self) -> CodexAppServerViewSnapshot {
@@ -320,6 +336,8 @@ impl PrintStreamDriver {
             expected_session_id,
             launch_argv: self.launch_argv.clone(),
             provider_home: self.provider_home.clone(),
+            host_context: self.host_context.clone(),
+            execution_lease: self.execution_lease.clone(),
             lease: None,
             saw_result: false,
             fatal: None,
@@ -639,6 +657,8 @@ struct PrintWorker {
     expected_session_id: Option<String>,
     launch_argv: Vec<String>,
     provider_home: Option<PathBuf>,
+    host_context: Option<crate::agent_workspace::NativeLaunchContext>,
+    execution_lease: Option<Arc<crate::agent_workspace::NativeSessionLease>>,
     lease: Option<crate::agent_workspace::NativeSessionLease>,
     saw_result: bool,
     fatal: Option<String>,
@@ -801,6 +821,12 @@ impl PrintWorker {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(context) = &self.host_context {
+            context.configure_authentication(&mut command, self.spec.provider);
+        }
+        if let Some(lease) = &self.execution_lease {
+            lease.configure_child(&mut command)?;
+        }
         for name in self.spec.env_remove {
             command.env_remove(name);
         }
@@ -1387,6 +1413,8 @@ mod tests {
             expected_session_id: None,
             launch_argv: Vec::new(),
             provider_home: None,
+            host_context: None,
+            execution_lease: None,
             lease: None,
             saw_result: false,
             fatal: None,

@@ -65,6 +65,10 @@ mod api_host;
 mod client;
 mod host;
 mod model;
+mod native;
+mod native_handoff;
+mod native_host;
+mod native_view;
 mod ownership;
 mod protocol;
 mod store;
@@ -77,6 +81,10 @@ pub use client::{
     managed_launch, managed_session_running, run_embedded_if_requested, WorkspaceClient,
 };
 pub use model::*;
+pub use native::{
+    NativeAction, NativeCatalogEntry, NativeControlLease, NativeLaunch, NativeLaunchContext,
+    NativeReportEvent, NativeSnapshot,
+};
 pub use ownership::NativeSessionLease;
 pub use protocol::{WorkspaceCommand, WorkspaceEvent, WorkspaceReply};
 
@@ -112,4 +120,8 @@ pub(crate) fn isolated_lease_test(name: &str) -> bool {
         String::from_utf8_lossy(&output.stderr),
     );
     true
+}
+
+pub(crate) fn cleanup_cli_grant(profile: &std::path::Path) -> Result<(), String> {
+    native_handoff::cleanup_stale_grant(profile)
 }

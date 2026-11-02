@@ -5,6 +5,8 @@
 //! with an additional frame budget, and retains the adapter's bounded view
 //! after its worker has stopped. No method here waits for a running worker.
 
+#[path = "runtime_remote.rs"]
+mod remote;
 use super::drivers::claude_stream_json::ClaudeStreamJsonDriver;
 use super::drivers::codex_app_server::{
     CodexAppServerDriver, CodexAppServerExitCause, CodexAppServerExitReport, CodexAppServerPhase,
@@ -228,7 +230,11 @@ struct PendingCodexPreparation {
 /// be recreated explicitly after process restart.
 #[derive(Default)]
 pub struct AgentRuntimeManager {
+    remote: Option<Box<remote::NativeRemote>>,
+    host_context: Option<crate::agent_workspace::NativeLaunchContext>,
+    execution_lease: Option<Arc<crate::agent_workspace::NativeSessionLease>>,
     native_codex_homes: HashMap<TaskId, std::path::PathBuf>,
+    explicit_codex_restores: std::collections::HashSet<TaskId>,
     preparing: HashMap<TaskId, PendingCodexPreparation>,
     cancelled_preparations: Vec<PendingCodexPreparation>,
     running: HashMap<TaskId, RunningCodexAgent>,
@@ -355,7 +361,7 @@ impl From<AgentEventError> for AgentRuntimeError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentRuntimeIssue {
     pub task_id: TaskId,
     pub detail: String,
@@ -364,7 +370,7 @@ pub struct AgentRuntimeIssue {
 /// Lightweight turn boundary from an event accepted by TaskManager. Unlike
 /// the asynchronous presentation snapshot, this identity is aligned with the
 /// reducer's applied status. No prompt, output, provider ID or error is copied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppliedAgentTurn {
     pub task_id: TaskId,
     pub epoch: super::AgentEventEpoch,
@@ -373,7 +379,7 @@ pub struct AppliedAgentTurn {
     pub status: TaskStatus,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentRuntimePollReport {
     pub preparations_finished: usize,
     pub preparations_started: usize,
@@ -424,7 +430,7 @@ impl AgentRuntimePollReport {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentRuntimeCompletion {
     pub task_id: TaskId,
     pub outcome: AgentSessionOutcome,
@@ -435,6 +441,103 @@ pub struct AgentRuntimeCompletion {
 impl AgentRuntimeManager {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// A native view whose provider processes are owned by jterm-sessiond.
+    pub fn hosted(namespace: impl Into<String>) -> Self {
+        let mut runtime = Self::default();
+        runtime.remote = Some(Box::new(remote::NativeRemote::new(namespace.into())));
+        runtime
+    }
+    pub fn hosted_with_client(
+        namespace: impl Into<String>,
+        client: crate::agent_workspace::WorkspaceClient,
+    ) -> Self {
+        let mut runtime = Self::default();
+        runtime.remote = Some(Box::new(remote::NativeRemote::with_client(
+            namespace.into(),
+            client,
+        )));
+        runtime
+    }
+    pub fn needs_host_poll(&self) -> bool {
+        self.remote.is_some()
+    }
+    pub fn conversation_id(
+        &self,
+        task_id: TaskId,
+    ) -> Option<&crate::agent_workspace::ConversationId> {
+        self.remote.as_ref()?.state(task_id).map(|s| &s.id)
+    }
+    pub fn detach_view(&mut self, task_id: TaskId) {
+        if let Some(remote) = &mut self.remote {
+            remote.detach(task_id);
+        }
+    }
+    pub fn select_hosted_view(&mut self, selected: Option<TaskId>) {
+        if let Some(remote) = &mut self.remote {
+            remote.select_view(selected);
+        }
+    }
+    pub fn take_terminal_handoffs(&mut self) -> Vec<(TaskId, crate::agent_sessions::AgentSession)> {
+        self.remote
+            .as_mut()
+            .map(|r| r.take_handoffs())
+            .unwrap_or_default()
+    }
+    pub fn handoff_to_terminal(&mut self, task_id: TaskId) -> Result<(), AgentRuntimeError> {
+        let remote = self
+            .remote
+            .as_mut()
+            .ok_or_else(|| AgentRuntimeError::Preparation("This runtime is not hosted".into()))?;
+        let provider = remote
+            .state(task_id)
+            .ok_or(AgentRuntimeError::UnknownTask(task_id))?
+            .task
+            .provider;
+        let context = crate::agent_workspace::NativeLaunchContext::capture(provider)
+            .map_err(AgentRuntimeError::Preparation)?;
+        remote.action(
+            task_id,
+            crate::agent_workspace::NativeAction::Handoff { context },
+        )
+    }
+    pub fn hosted_terminal(&self, task_id: TaskId) -> Option<&crate::agent_sessions::AgentSession> {
+        self.remote.as_ref()?.state(task_id)?.terminal.as_ref()
+    }
+
+    /// Register an explicit historical restore after the host reacquired the
+    /// task kernel lease. Preparation still verifies profile provenance and
+    /// resumes its exact thread with no initial prompt.
+    pub(crate) fn restore_hosted_codex(
+        &mut self,
+        id: TaskId,
+        path: std::path::PathBuf,
+        mut view: CodexAppServerViewSnapshot,
+    ) {
+        view.pending_approvals.clear();
+        view.history_loading = false;
+        self.native_codex_homes.insert(id, path);
+        self.explicit_codex_restores.insert(id);
+        self.retained.insert(
+            id,
+            RetainedCodexAgent {
+                view: Arc::new(view),
+                view_revision: 1,
+                exit_report: None,
+                effective_outcome: AgentSessionOutcome::Failed,
+            },
+        );
+    }
+    pub(crate) fn configure_host(
+        &mut self,
+        context: crate::agent_workspace::NativeLaunchContext,
+        lease: Arc<crate::agent_workspace::NativeSessionLease>,
+    ) {
+        self.host_context = Some(context);
+        self.execution_lease = Some(lease);
+    }
+    pub(crate) fn native_home(&self, task_id: TaskId) -> Option<&std::path::Path> {
+        self.native_codex_homes.get(&task_id).map(|p| p.as_path())
     }
 
     /// Begin preparing a real Codex app-server session without blocking the UI.
@@ -451,6 +554,9 @@ impl AgentRuntimeManager {
         task_id: TaskId,
         policy: NativePromptPolicy,
     ) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.start(task_manager, task_id, policy);
+        }
         if self.running.contains_key(&task_id) || self.preparing.contains_key(&task_id) {
             return Err(AgentRuntimeError::AlreadyRunning(task_id));
         }
@@ -509,13 +615,22 @@ impl AgentRuntimeManager {
         let (sender, receiver) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let context = self.host_context.clone();
+        let execution_lease = self.execution_lease.clone();
         let worker = std::thread::Builder::new()
             .name(format!(
                 "{}-codex-prepare-{task_id}-{generation}",
                 crate::agent_task::app_slug()
             ))
             .spawn(move || {
-                let result = prepare_codex_start(task, policy, worker_cancel, resume_home);
+                let result = prepare_codex_start(
+                    task,
+                    policy,
+                    worker_cancel,
+                    resume_home,
+                    context,
+                    execution_lease,
+                );
                 let _ = sender.send(PreparationResult { generation, result });
             })
             .map_err(|error| {
@@ -596,6 +711,7 @@ impl AgentRuntimeManager {
         }
 
         self.retained.remove(&task_id);
+        self.explicit_codex_restores.remove(&task_id);
         self.native_codex_homes.insert(task_id, native_home_path);
         self.running.insert(
             task_id,
@@ -624,6 +740,9 @@ impl AgentRuntimeManager {
         task_id: TaskId,
         policy: NativePromptPolicy,
     ) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.start(task_manager, task_id, policy);
+        }
         if self.running.contains_key(&task_id) || self.preparing.contains_key(&task_id) {
             return Err(AgentRuntimeError::AlreadyRunning(task_id));
         }
@@ -674,13 +793,14 @@ impl AgentRuntimeManager {
         let (sender, receiver) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let context = self.host_context.clone();
         let worker = std::thread::Builder::new()
             .name(format!(
                 "{}-claude-prepare-{task_id}-{generation}",
                 crate::agent_task::app_slug()
             ))
             .spawn(move || {
-                let result = prepare_claude_start(task, policy, worker_cancel);
+                let result = prepare_claude_start(task, policy, worker_cancel, context);
                 let _ = sender.send(PreparationResult { generation, result });
             })
             .map_err(|error| {
@@ -720,6 +840,9 @@ impl AgentRuntimeManager {
         let worktree_path = prepared.task.worktree_path.clone();
         let mut driver =
             ClaudeStreamJsonDriver::new_conversation(prepared.launch_argv, worktree_path.clone());
+        if let (Some(context), Some(lease)) = (&self.host_context, &self.execution_lease) {
+            driver.configure_host(context.clone(), lease.clone());
+        }
         let request = AgentStartRequest {
             provider: AgentProvider::Claude,
             stream: stream.clone(),
@@ -764,6 +887,9 @@ impl AgentRuntimeManager {
         task_id: TaskId,
         policy: NativePromptPolicy,
     ) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.start(task_manager, task_id, policy);
+        }
         if self.running.contains_key(&task_id) || self.preparing.contains_key(&task_id) {
             return Err(AgentRuntimeError::AlreadyRunning(task_id));
         }
@@ -814,13 +940,14 @@ impl AgentRuntimeManager {
         let (sender, receiver) = mpsc::sync_channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let context = self.host_context.clone();
         let worker = std::thread::Builder::new()
             .name(format!(
                 "{}-kimi-prepare-{task_id}-{generation}",
                 crate::agent_task::app_slug()
             ))
             .spawn(move || {
-                let result = prepare_kimi_start(task, policy, worker_cancel);
+                let result = prepare_kimi_start(task, policy, worker_cancel, context);
                 let _ = sender.send(PreparationResult { generation, result });
             })
             .map_err(|error| {
@@ -859,6 +986,9 @@ impl AgentRuntimeManager {
         let stream = task_manager.start_agent_event_stream(task_id)?;
         let worktree_path = prepared.task.worktree_path.clone();
         let mut driver = KimiStreamJsonDriver::new(prepared.launch_argv, worktree_path.clone());
+        if let (Some(context), Some(lease)) = (&self.host_context, &self.execution_lease) {
+            driver.configure_host(context.clone(), lease.clone());
+        }
         let request = AgentStartRequest {
             provider: AgentProvider::Kimi,
             stream: stream.clone(),
@@ -904,6 +1034,9 @@ impl AgentRuntimeManager {
         task_manager: &mut TaskManager,
         current_policy: NativePromptPolicy,
     ) -> AgentRuntimePollReport {
+        if let Some(remote) = &mut self.remote {
+            return remote.poll(task_manager, current_policy);
+        }
         let mut report = AgentRuntimePollReport::default();
         self.reap_cancelled_preparations();
         self.poll_preparations(task_manager, current_policy, &mut report);
@@ -1085,6 +1218,9 @@ impl AgentRuntimeManager {
     }
 
     pub fn cancel(&mut self, task_id: TaskId) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.action(task_id, crate::agent_workspace::NativeAction::Cancel);
+        }
         if let Some(preparation) = self.preparing.remove(&task_id) {
             preparation.cancel.store(true, Ordering::Release);
             // Keep ownership of the receiver until the worker acknowledges
@@ -1108,6 +1244,15 @@ impl AgentRuntimeManager {
         approval_id: ApprovalId,
         decision: ApprovalDecision,
     ) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.action(
+                task_id,
+                crate::agent_workspace::NativeAction::Approval {
+                    id: approval_id,
+                    decision,
+                },
+            );
+        }
         let runtime = self
             .running
             .get_mut(&task_id)
@@ -1145,6 +1290,15 @@ impl AgentRuntimeManager {
         text: &str,
         policy: NativePromptPolicy,
     ) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.action(
+                task_id,
+                crate::agent_workspace::NativeAction::Prompt {
+                    text: text.into(),
+                    policy,
+                },
+            );
+        }
         let task = task_manager
             .get(task_id)
             .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
@@ -1184,6 +1338,9 @@ impl AgentRuntimeManager {
 
     /// UI capability and current readiness; sending repeats the gate atomically.
     pub fn can_prompt_native(&self, task_id: TaskId) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote.state(task_id).is_some_and(|s| s.can_prompt);
+        }
         self.running.get(&task_id).is_some_and(|runtime| {
             !matches!(runtime.driver, NativeRunningDriver::Kimi(_))
                 && runtime.driver.phase() == CodexAppServerPhase::Ready
@@ -1196,13 +1353,17 @@ impl AgentRuntimeManager {
     /// An exact app-owned Codex profile may be reopened only after the runtime
     /// has proved its previous worker and containment stopped cleanly.
     pub fn can_resume_codex(&self, task_id: TaskId) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote.state(task_id).is_some_and(|s| s.can_resume);
+        }
         !self.running.contains_key(&task_id)
             && !self.preparing.contains_key(&task_id)
             && self.native_codex_homes.contains_key(&task_id)
-            && self.retained.get(&task_id).is_some_and(|retained| {
-                retained.effective_outcome == AgentSessionOutcome::Clean
-                    && retained.view.provider_thread_id.is_some()
-            })
+            && (self.explicit_codex_restores.contains(&task_id)
+                || self.retained.get(&task_id).is_some_and(|retained| {
+                    retained.effective_outcome == AgentSessionOutcome::Clean
+                        && retained.view.provider_thread_id.is_some()
+                }))
     }
 
     /// Page provider-owned history without turning old events into new work.
@@ -1211,6 +1372,12 @@ impl AgentRuntimeManager {
         task_id: TaskId,
         reset: bool,
     ) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.action(
+                task_id,
+                crate::agent_workspace::NativeAction::History { reset },
+            );
+        }
         let runtime = self
             .running
             .get_mut(&task_id)
@@ -1233,6 +1400,9 @@ impl AgentRuntimeManager {
         task_manager: &TaskManager,
         task_id: TaskId,
     ) -> Result<(), AgentRuntimeError> {
+        if let Some(remote) = &mut self.remote {
+            return remote.action(task_id, crate::agent_workspace::NativeAction::Finish);
+        }
         let task = task_manager
             .get(task_id)
             .ok_or(AgentRuntimeError::UnknownTask(task_id))?;
@@ -1265,6 +1435,9 @@ impl AgentRuntimeManager {
 
     /// Return the current bounded view, or the final view retained after exit.
     pub fn snapshot(&self, task_id: TaskId) -> Option<CodexAppServerViewSnapshot> {
+        if let Some(remote) = &self.remote {
+            return remote.snapshot(task_id).map(|v| v.as_ref().clone());
+        }
         self.running
             .get(&task_id)
             .map(|runtime| runtime.driver.view_snapshot())
@@ -1279,6 +1452,9 @@ impl AgentRuntimeManager {
     /// whenever the provider view changes, never repeats for a later run, and
     /// stays fixed for a retained final view. Reading it never clones content.
     pub fn snapshot_revision(&self, task_id: TaskId) -> Option<u64> {
+        if let Some(remote) = &self.remote {
+            return remote.revision(task_id);
+        }
         self.running
             .get(&task_id)
             .map(|runtime| runtime.driver.view_revision())
@@ -1294,6 +1470,9 @@ impl AgentRuntimeManager {
     /// host can render every frame without copying assistant text, command
     /// output and file diffs each time. The content is identical to `snapshot`.
     pub fn shared_snapshot(&self, task_id: TaskId) -> Option<Arc<CodexAppServerViewSnapshot>> {
+        if let Some(remote) = &self.remote {
+            return remote.snapshot(task_id);
+        }
         if let Some(retained) = self.retained.get(&task_id) {
             if !self.running.contains_key(&task_id) {
                 self.shared_snapshots.lock().remove(&task_id);
@@ -1320,12 +1499,18 @@ impl AgentRuntimeManager {
     }
 
     pub fn exit_report(&self, task_id: TaskId) -> Option<&CodexAppServerExitReport> {
+        if let Some(remote) = &self.remote {
+            return remote.exit(task_id);
+        }
         self.retained
             .get(&task_id)
             .and_then(|retained| retained.exit_report.as_ref())
     }
 
     pub fn take_exit_report(&mut self, task_id: TaskId) -> Option<CodexAppServerExitReport> {
+        if let Some(remote) = &mut self.remote {
+            return remote.take_exit(task_id);
+        }
         self.retained
             .get_mut(&task_id)
             .and_then(|retained| retained.exit_report.take())
@@ -1336,6 +1521,11 @@ impl AgentRuntimeManager {
     /// Clean Finish remains a review/validation path, not a silent authority
     /// switch to the opaque provider CLI.
     pub fn can_continue_in_terminal(&self, task_id: TaskId) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote
+                .state(task_id)
+                .is_some_and(|s| s.can_continue_in_terminal);
+        }
         !self.running.contains_key(&task_id)
             && self.retained.get(&task_id).is_some_and(|retained| {
                 matches!(
@@ -1349,14 +1539,23 @@ impl AgentRuntimeManager {
     }
 
     pub fn has_running(&self, task_id: TaskId) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote.state(task_id).is_some_and(|s| s.live);
+        }
         self.running.contains_key(&task_id)
     }
 
     pub fn has_preparing(&self, task_id: TaskId) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote.is_preparing(task_id);
+        }
         self.preparing.contains_key(&task_id)
     }
 
     pub fn has_any_running(&self) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote.any_running();
+        }
         !self.running.is_empty()
     }
 
@@ -1366,6 +1565,9 @@ impl AgentRuntimeManager {
     /// lifecycle polling observes those phases without a high-rate loop. The
     /// host's own approval or follow-up action triggers an immediate poll.
     pub fn needs_fast_poll(&self) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote.fast_poll();
+        }
         self.running.values().any(|runtime| {
             !runtime.worker_joined
                 && !matches!(
@@ -1376,12 +1578,19 @@ impl AgentRuntimeManager {
     }
 
     pub fn has_any_activity(&self) -> bool {
+        if let Some(remote) = &self.remote {
+            return remote.active();
+        }
         !self.preparing.is_empty()
             || !self.cancelled_preparations.is_empty()
             || !self.running.is_empty()
     }
 
     pub fn clear_retained(&mut self, task_id: TaskId) {
+        if let Some(remote) = &mut self.remote {
+            remote.detach(task_id);
+            return;
+        }
         self.retained.remove(&task_id);
         self.shared_snapshots.lock().remove(&task_id);
     }
@@ -1525,11 +1734,29 @@ fn preparation_cancelled(cancel: &AtomicBool) -> Result<(), AgentRuntimeError> {
     }
 }
 
+fn resolve_host_native_argv(
+    provider: AgentProvider,
+    task: &AgentTask,
+    context: Option<&crate::agent_workspace::NativeLaunchContext>,
+) -> Result<Vec<String>, AgentLaunchError> {
+    match context {
+        Some(context) => AgentLaunchSpec::resolve_native_with_path(
+            provider,
+            &task.repo_root,
+            &task.worktree_path,
+            context.search_path.as_deref().map(std::ffi::OsStr::new),
+        ),
+        None => AgentLaunchSpec::resolve_native(provider, &task.repo_root, &task.worktree_path),
+    }
+}
+
 fn prepare_codex_start(
     task: AgentTask,
     policy: NativePromptPolicy,
     cancel: Arc<AtomicBool>,
     resume_home: Option<std::path::PathBuf>,
+    context: Option<crate::agent_workspace::NativeLaunchContext>,
+    execution_lease: Option<Arc<crate::agent_workspace::NativeSessionLease>>,
 ) -> Result<PreparedNativeStart, AgentRuntimeError> {
     preparation_cancelled(cancel.as_ref())?;
     // The capability owns its pinned directory descriptors. It stays in this
@@ -1550,16 +1777,27 @@ fn prepare_codex_start(
         )?)
     };
     preparation_cancelled(cancel.as_ref())?;
-    let launch_argv = AgentLaunchSpec::resolve_native(
-        AgentProvider::Codex,
-        &task.repo_root,
-        &task.worktree_path,
-    )?;
+    let launch_argv = resolve_host_native_argv(AgentProvider::Codex, &task, context.as_ref())?;
     preparation_cancelled(cancel.as_ref())?;
-    let native_home = match resume_home {
-        Some(path) => PreparedNativeCodexHome::reopen_persistent(&task, &path)?,
-        None => PreparedNativeCodexHome::prepare_persistent(&task, workspace.relative_cwd())?,
+    let mut native_home = match (resume_home, context.as_ref()) {
+        (Some(path), Some(context)) => PreparedNativeCodexHome::reopen_persistent_with_source(
+            &task,
+            &path,
+            &context.codex_home,
+        )?,
+        (None, Some(context)) => PreparedNativeCodexHome::prepare_persistent_with_source(
+            &task,
+            workspace.relative_cwd(),
+            &context.codex_home,
+        )?,
+        (Some(path), None) => PreparedNativeCodexHome::reopen_persistent(&task, &path)?,
+        (None, None) => {
+            PreparedNativeCodexHome::prepare_persistent(&task, workspace.relative_cwd())?
+        }
     };
+    if let Some(lease) = execution_lease {
+        native_home.hold_execution_lease(lease);
+    }
     preparation_cancelled(cancel.as_ref())?;
     Ok(PreparedNativeStart::Codex(PreparedCodexStart {
         task,
@@ -1574,17 +1812,14 @@ fn prepare_claude_start(
     task: AgentTask,
     policy: NativePromptPolicy,
     cancel: Arc<AtomicBool>,
+    context: Option<crate::agent_workspace::NativeLaunchContext>,
 ) -> Result<PreparedNativeStart, AgentRuntimeError> {
     preparation_cancelled(cancel.as_ref())?;
     let workspace = prepare_native_agent_workspace(&task, Arc::clone(&cancel))?;
     preparation_cancelled(cancel.as_ref())?;
     let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
     preparation_cancelled(cancel.as_ref())?;
-    let launch_argv = AgentLaunchSpec::resolve_native(
-        AgentProvider::Claude,
-        &task.repo_root,
-        &task.worktree_path,
-    )?;
+    let launch_argv = resolve_host_native_argv(AgentProvider::Claude, &task, context.as_ref())?;
     preparation_cancelled(cancel.as_ref())?;
     Ok(PreparedNativeStart::Claude(PreparedClaudeStart {
         task,
@@ -1598,14 +1833,14 @@ fn prepare_kimi_start(
     task: AgentTask,
     policy: NativePromptPolicy,
     cancel: Arc<AtomicBool>,
+    context: Option<crate::agent_workspace::NativeLaunchContext>,
 ) -> Result<PreparedNativeStart, AgentRuntimeError> {
     preparation_cancelled(cancel.as_ref())?;
     let workspace = prepare_native_agent_workspace(&task, Arc::clone(&cancel))?;
     preparation_cancelled(cancel.as_ref())?;
     let prompt = build_native_task_prompt(&task, workspace.relative_cwd(), policy)?;
     preparation_cancelled(cancel.as_ref())?;
-    let launch_argv =
-        AgentLaunchSpec::resolve_native(AgentProvider::Kimi, &task.repo_root, &task.worktree_path)?;
+    let launch_argv = resolve_host_native_argv(AgentProvider::Kimi, &task, context.as_ref())?;
     preparation_cancelled(cancel.as_ref())?;
     Ok(PreparedNativeStart::Kimi(PreparedKimiStart {
         task,

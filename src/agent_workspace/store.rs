@@ -7,6 +7,7 @@ use crate::ai::{ChatSnapshot, ConversationSnapshot, Role, Turn};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Duration;
 mod hosted_api;
+mod hosted_native;
 
 const MAX_MESSAGE: usize = super::api::API_RESULT_BYTES;
 const MAX_DRAFT: usize = 64 * 1024;
@@ -54,7 +55,7 @@ impl Store {
                 r.get(0)
             })
             .map_err(err)?;
-        if !(1..=3).contains(&version) {
+        if !(1..=4).contains(&version) {
             return Err(format!(
                 "Unsupported Agent Workspace database version {version}"
             ));
@@ -71,23 +72,31 @@ impl Store {
             }
         }
         db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS api_jobs (
+            "BEGIN; CREATE TABLE IF NOT EXISTS api_jobs (
             id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
             epoch INTEGER NOT NULL, nonce TEXT NOT NULL, draft_revision INTEGER NOT NULL,
             snapshot TEXT NOT NULL);
-            UPDATE schema_version SET version=3;",
+            CREATE TABLE IF NOT EXISTS native_jobs (
+                id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+                task_id TEXT NOT NULL UNIQUE, incarnation TEXT NOT NULL,
+                sequence INTEGER NOT NULL, snapshot TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS native_operations (
+                conversation_id TEXT NOT NULL REFERENCES native_jobs(id) ON DELETE CASCADE,
+                incarnation TEXT NOT NULL, operation TEXT NOT NULL,
+                PRIMARY KEY(conversation_id,incarnation,operation));
+            UPDATE schema_version SET version=4; COMMIT;",
         )
         .map_err(err)?;
-        // A restarted host cannot continue an API request owned by its old
-        // process. Revoke its epoch, preserving a newer draft exactly.
-        // API requests execute in frontend workers, which may still be alive
-        // when a host restarts. A restart alone does not revoke their lease.
+        // A restarted host records unknown outcomes without replaying model
+        // operations. Surviving worker/PTY descendants retain kernel leases;
+        // a newer draft remains independent from that previous execution.
         let store = Self {
             db,
             _writer: writer,
             paths: paths.clone(),
         };
         store.recover_api_jobs()?;
+        store.recover_native_jobs()?;
         store.reap_abandoned_requests()?;
         Ok(store)
     }
@@ -203,6 +212,11 @@ impl Store {
                         // a live process. Local task owners overlay their
                         // own runtime, and the host overlays managed PTYs.
                         row.runtime = RuntimeState::Idle;
+                        if row.kind == ConversationKind::Task
+                            && self.native_snapshot(&row.id)?.is_some()
+                        {
+                            continue;
+                        }
                         self.upsert_runtime_row(&row)?;
                     }
                     Ok(WorkspaceReply::Ack)
@@ -382,7 +396,14 @@ impl Store {
                 receipt,
                 restore_draft,
             } => self.cancel(&receipt, restore_draft),
-            WorkspaceCommand::Stop { .. }
+            WorkspaceCommand::StartNative { .. }
+            | WorkspaceCommand::NativeCatalog { .. }
+            | WorkspaceCommand::InspectNative { .. }
+            | WorkspaceCommand::AttachNative { .. }
+            | WorkspaceCommand::DetachNative { .. }
+            | WorkspaceCommand::DetachNativeView { .. }
+            | WorkspaceCommand::ControlNative { .. }
+            | WorkspaceCommand::Stop { .. }
             | WorkspaceCommand::Runtime { .. }
             | WorkspaceCommand::StartApi { .. }
             | WorkspaceCommand::InspectApi { .. }
