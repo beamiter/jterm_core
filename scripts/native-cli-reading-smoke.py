@@ -21,7 +21,7 @@ from PIL import ImageGrab
 
 COLORS = [(241, 88, 200), (240, 190, 40), (50, 200, 230)]
 FIXTURE = r'''#!PYTHON
-import json, os, select, sys, termios, tty
+import json, os, select, sys, termios, time, tty
 from pathlib import Path
 root = Path(os.environ['CLI_READING_PROBE'])
 fd = sys.stdin.fileno()
@@ -45,7 +45,32 @@ def rows(count):
         'claude_classic': os.environ.get('CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN')}))
 try:
     tty.setraw(fd)
+    if os.environ.get('CLI_READING_SESSION_SCOPE') == '1':
+        # Known inline agents may request mouse reports. Wheel history must
+        # still have the same owner and range as the host scrollbar.
+        sys.stdout.write('\033[?1000h\033[?1006h')
     rows(220)
+    if os.environ.get('CLI_READING_SESSION_SCOPE') == '1':
+        # Repaint transient UI with real synchronized-output sequences. These
+        # frames must not become copies of old composers in reading history.
+        for frame in range(3):
+            sys.stdout.write('\033[?2026h\r\033[2KOLD_REPAINT_COMPOSER_%d\033[?2026l' % frame)
+            sys.stdout.flush()
+            time.sleep(.03)
+        sys.stdout.write('\033[?2026h\r\033[2Kcodex> reading fixture (q exits)\033[?2026l')
+        sys.stdout.flush()
+        # A temporary transcript/editor screen is not part of the primary
+        # conversation. Neither synchronized snapshots nor its line transfers
+        # may reappear in the session after returning from the alternate screen.
+        sys.stdout.write('\033[?1049h\033[?2026h')
+        for number in range(900, 940):
+            sys.stdout.write('\033[38;2;241;88;200m▀▀')
+            for shift in reversed(range(10)):
+                color = '50;200;230' if number & (1 << shift) else '240;190;40'
+                sys.stdout.write('\033[38;2;' + color + 'm▀')
+            sys.stdout.write('\033[38;2;241;88;200m▀▀\033[0m ALT_COMPOSER_FRAME\r\n')
+        sys.stdout.write('\033[?2026l\033[?1049l')
+        sys.stdout.flush()
     pending = b''
     while True:
         ready, _, _ = select.select([fd, fifo], [], [], 1)
@@ -65,6 +90,18 @@ finally:
     termios.tcsetattr(fd, termios.TCSANOW, old)
     os.close(fifo)
     print('\r\nfixture finished', flush=True)
+'''
+
+PRELUDE = r'''#!PYTHON
+import sys
+for number in range(512, 640):
+    out = ['\033[38;2;241;88;200m▀▀']
+    for shift in reversed(range(10)):
+        color = '50;200;230' if number & (1 << shift) else '240;190;40'
+        out.append('\033[38;2;' + color + 'm▀')
+    out.append('\033[38;2;241;88;200m▀▀\033[0m PRE_SESSION_SHELL_%04d\n' % number)
+    sys.stdout.write(''.join(out))
+sys.stdout.flush()
 '''
 
 PROFILE = r'''export HISTFILE=/dev/null
@@ -98,7 +135,7 @@ __probe_prompt() {
     __probe_running=0
     printf '\e]133;A\a'
     __probe_ready=1
-    printf ready > "$CLI_READING_PROBE/shell-ready"
+    printf '%s\n' "$__probe_sequence" > "$CLI_READING_PROBE/shell-ready"
 }
 PROMPT_COMMAND=__probe_prompt
 PS0=''
@@ -153,6 +190,8 @@ def main():
     parser.add_argument('--provider', choices=['codex', 'claude'], default='codex')
     parser.add_argument('--direct', action='store_true',
                         help='launch exact CLI argv without an OSC-integrated shell')
+    parser.add_argument('--session-scope', action='store_true',
+                        help='verify session-only history, repaint exclusion and wheel ownership')
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -167,6 +206,9 @@ def main():
     fixture = out / ('bin/' + args.provider)
     fixture.write_text(FIXTURE.replace('#!PYTHON', '#!' + sys.executable, 1))
     fixture.chmod(0o700)
+    prelude = out / 'bin/session-prelude'
+    prelude.write_text(PRELUDE.replace('#!PYTHON', '#!' + sys.executable, 1))
+    prelude.chmod(0o700)
     os.mkfifo(out / 'control')
     for name in ['.bashrc', '.bash_profile']:
         (task_home / name).write_text(PROFILE)
@@ -180,6 +222,8 @@ def main():
                CLI_READING_PROBE=str(out), SHELL='/bin/bash', LANG='C.UTF-8',
                LIBGL_ALWAYS_SOFTWARE='1', GDK_BACKEND='x11', GSK_RENDERER='cairo',
                ICED_BACKEND='tiny-skia', RUST_LOG='warn')
+    if args.session_scope:
+        env['CLI_READING_SESSION_SCOPE'] = '1'
     # Make discovery possible before the frontend prepares the child's PATH
     # shim. A shell profile must not accidentally prepend the fixture again
     # above that shim and bypass the integration being tested.
@@ -198,6 +242,7 @@ def main():
     (config_dir / 'config.toml').write_text(config)
     (config_dir / 'config.toml').chmod(0o600)
     result = {'app': args.app, 'mode': args.mode, 'provider': args.provider, 'direct': args.direct,
+              'session_scope': args.session_scope,
               'renderer': 'Xvfb/software',
               'binary_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest()}
     processes, logs = [], []
@@ -337,6 +382,13 @@ def main():
             time.sleep(0.3)
         capture('startup')
         if not args.direct:
+            if args.session_scope:
+                xdo('type', '--clearmodifiers', '--delay', 20, '--', 'session-prelude')
+                xdo('key', '--clearmodifiers', 'Return')
+                wait_for(lambda: (out / 'shell-ready').read_text().strip() == '1',
+                         'separate shell command before the active CLI')
+                time.sleep(.3)
+                capture('before-session')
             xdo('type', '--clearmodifiers', '--delay', 30, '--', args.provider)
             xdo('key', '--clearmodifiers', 'Return')
         wait_for(lambda: (out / 'state.json').exists(), 'active raw-TTY CLI')
@@ -373,9 +425,24 @@ def main():
         # after an initial resize; its last glyph is not the rail's bottom.
         _, latest = drag_scrollbar('drag-latest', 700)
         assert latest[-1]['id'] == 243, 'dragging scrollbar to bottom reveals latest output'
+        if args.session_scope:
+            _, first = drag_scrollbar('drag-session-start', 70)
+            assert first[0]['id'] == 0, 'scrollbar top must be the active CLI session start'
+            assert all(row['id'] < 244 for row in first), 'old shell history leaked into session canvas'
+            # At the current session's upper bound, a page and wheel must
+            # remain on that same first row rather than reach shell history.
+            xdo('key', '--clearmodifiers', 'Prior')
+            xdo('mousemove', first[0]['x'] + 50, first[0]['y'] + 10)
+            xdo('mousedown', 4, 'mouseup', 4)
+            time.sleep(.5)
+            at_top = rows('session-start-after-page-wheel')
+            assert at_top[0]['id'] == 0, 'page/wheel and scrollbar disagree on session boundary'
+            drag_scrollbar('return-session-latest', 700)
         received = (out / 'received.bin').read_bytes() if (out / 'received.bin').exists() else b''
         result['received_hex'] = received.hex()
         assert b'\x1b[5' not in received and b'\x1b[6' not in received, 'local paging leaked into CLI input'
+        if args.session_scope:
+            assert b'\x1b[<64' not in received and b'\x1b[<65' not in received, 'host session wheel leaked into CLI pager'
         result['status'] = 'pass'
     except Exception as error:
         result.update(status='fail', error=str(error))

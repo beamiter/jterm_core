@@ -186,6 +186,16 @@ as used by direct task and resume launchers. The probe establishes the
 software-rendered native event path, not physical touchpad latency or arbitrary
 provider-version compatibility.
 
+Use `--session-scope` when validating a frontend's active-CLI document boundary.
+The shell path first emits an independent command with numbered pre-session
+rows, then the CLI emits its own row sequence, synchronized transient UI
+repaints, a temporary alternate-screen overlay and mouse-reporting requests.
+The diagnostic additionally requires
+the scrollbar's upper bound to reveal CLI row zero, excludes the earlier shell
+rows, checks that page/wheel input remains at that same boundary, and rejects
+mouse-wheel reports sent to a second child-side pager. This opt-in semantic
+check is separate from whether a scrollbar follows the pointer accurately.
+
 Anvil and Forge also exercise their conventional VTE attachment view with the
 display-backed `conventional_vte_pages_locally_preserves_streaming_reader_and_yields_to_alt_screen`
 test. It uses the production opt-in adapter with a real VTE and scrollbar,
