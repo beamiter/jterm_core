@@ -15,9 +15,9 @@ enum Pending {
     Start(TaskId),
     Attach(TaskId, Option<ws::NativeAction>),
     Action(TaskId, Option<String>),
-    CasPolicy {
+    Policy {
         id: TaskId,
-        action: ws::NativeAction,
+        action: Option<ws::NativeAction>,
         baseline: Box<ws::NativeSnapshot>,
         policy: NativePromptPolicy,
     },
@@ -134,6 +134,70 @@ impl NativeRemote {
             .get(&id)
             .ok_or(AgentRuntimeError::UnknownTask(id))?;
         if let Some(control) = cached.control.clone() {
+            let baseline = cached.snapshot.clone();
+            if let Some(expected_sequence) = cas_sequence(&action) {
+                if let Some(Pending::Policy {
+                    action: queued,
+                    baseline: before_policy,
+                    ..
+                }) = self.pending.values_mut().find(|pending| {
+                    matches!(pending,
+                        Pending::Policy { id: task, .. } if *task == id)
+                }) {
+                    if expected_sequence != before_policy.sequence
+                        || baseline.incarnation != before_policy.incarnation
+                        || queued.is_some()
+                    {
+                        return Err(AgentRuntimeError::Preparation(
+                            "Task or sharing settings changed before this action; wait for its acknowledgement and refresh".into(),
+                        ));
+                    }
+                    *queued = Some(action);
+                    return Ok(());
+                }
+                if let Some(policy) = self
+                    .last_policy
+                    .filter(|policy| policy.redact_secrets && !baseline.redact_secrets)
+                {
+                    return self.send(
+                        Command::ControlNative {
+                            control,
+                            operation: uuid::Uuid::new_v4().to_string(),
+                            action: Box::new(ws::NativeAction::Policy { policy }),
+                        },
+                        Pending::Policy {
+                            id,
+                            action: Some(action),
+                            baseline: Box::new(baseline),
+                            policy,
+                        },
+                    );
+                }
+            }
+            if let ws::NativeAction::Policy { policy } = &action {
+                // Keep a single policy operation in flight. Its ACK reconciles
+                // newer local settings before releasing any queued CAS action.
+                if self.pending.values().any(|pending| {
+                    matches!(pending,
+                    Pending::Policy { id: task, .. } if *task == id)
+                }) {
+                    return Ok(());
+                }
+                let policy = *policy;
+                return self.send(
+                    Command::ControlNative {
+                        control,
+                        operation: uuid::Uuid::new_v4().to_string(),
+                        action: Box::new(action),
+                    },
+                    Pending::Policy {
+                        id,
+                        action: None,
+                        baseline: Box::new(baseline),
+                        policy,
+                    },
+                );
+            }
             self.send(
                 Command::ControlNative {
                     control,
@@ -207,7 +271,7 @@ impl NativeRemote {
                 | Pending::Start(id)
                 | Pending::Attach(id, _)
                 | Pending::Action(id, _)
-                | Pending::CasPolicy { id, .. } => Some(*id),
+                | Pending::Policy { id, .. } => Some(*id),
                 _ => None,
             };
             if let Some(id) = task_id {
@@ -376,16 +440,22 @@ impl NativeRemote {
                     if gained_control && !attached_cas {
                         let _ = self.action(id, ws::NativeAction::Policy { policy });
                     }
-                    if let Pending::CasPolicy {
-                        mut action,
+                    if let Pending::Policy {
+                        action,
                         baseline,
                         policy: requested,
                         ..
                     } = pending
                     {
+                        let Some(mut action) = action else {
+                            if requested != policy {
+                                let _ = self.action(id, ws::NativeAction::Policy { policy });
+                            }
+                            continue;
+                        };
                         let current = &self.cached[&id].snapshot;
                         let mut expected = (*baseline).clone();
-                        expected.redact_secrets = true;
+                        expected.redact_secrets |= requested.redact_secrets;
                         let mut expected = ws::safe_snapshot_projection(&expected);
                         // Policy admission always adds its durable operation;
                         // refresh adds a second sequence only if its projection
@@ -404,7 +474,7 @@ impl NativeRemote {
                             _ => false,
                         };
                         let compatible = requested == policy
-                            && current.redact_secrets
+                            && current.redact_secrets == expected.redact_secrets
                             && current.sequence == expected_sequence
                             && same_projection;
                         if compatible {
@@ -422,6 +492,9 @@ impl NativeRemote {
                                 task_id: id,
                                 detail: "Task or sharing settings changed while privacy settings were being acknowledged; refresh before trying again".into(),
                             });
+                            if requested != policy {
+                                let _ = self.action(id, ws::NativeAction::Policy { policy });
+                            }
                         }
                         continue;
                     }
@@ -452,9 +525,9 @@ impl NativeRemote {
                                         operation: uuid::Uuid::new_v4().to_string(),
                                         action: Box::new(ws::NativeAction::Policy { policy }),
                                     },
-                                    Pending::CasPolicy {
+                                    Pending::Policy {
                                         id,
-                                        action,
+                                        action: Some(action),
                                         baseline: Box::new(baseline),
                                         policy,
                                     },

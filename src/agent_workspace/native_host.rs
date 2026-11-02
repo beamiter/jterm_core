@@ -202,6 +202,7 @@ impl NativeManager {
             can_prompt: false,
             can_resume: false,
             can_start_validation: false,
+            manual_review: launch.task.requires_manual_review(),
             can_continue_in_terminal: false,
             exit: None,
             events: vec![],
@@ -524,56 +525,37 @@ impl NativeManager {
                 if !policy.share_command_context {
                     return Err("Enable command-context sharing before restoring".into());
                 }
-                job.context = context.clone();
-                job.policy = policy;
-                job.policy_origin = job
-                    .controller
-                    .as_ref()
-                    .map(|c| (c.owner.clone(), c.view.clone()));
-                job.snapshot.redact_secrets |= policy.redact_secrets;
-                job.runtime.configure_host(context, job.lease.clone());
-                job.historical = false;
-                if job.snapshot.task.status == TaskStatus::Created
-                    && job.snapshot.task.runtime_kind == TaskRuntimeKind::Unassigned
-                {
-                    start_provider(
-                        &mut job.runtime,
-                        &mut job.tasks,
-                        task_id,
-                        job.snapshot.task.provider,
-                        policy,
-                    )
-                } else if job.snapshot.task.provider == AgentProvider::Codex {
-                    let home =
-                        job.snapshot.native_home.clone().ok_or(
-                            "No exact native profile is recorded; history remains readable",
-                        )?;
-                    let view = job
-                        .snapshot
-                        .view
-                        .clone()
-                        .filter(|v| v.provider_thread_id.is_some())
+                let fresh = job.snapshot.task.status == TaskStatus::Created
+                    && job.snapshot.task.runtime_kind == TaskRuntimeKind::Unassigned;
+                let restore = if fresh { None } else {
+                    if job.snapshot.task.provider != AgentProvider::Codex {
+                        return Err("Open this stopped provider conversation in Terminal to continue its exact ID".into());
+                    }
+                    let home = job.snapshot.native_home.clone().ok_or(
+                        "No exact native profile is recorded; history remains readable")?;
+                    let view = job.snapshot.view.clone()
+                        .filter(|view| view.provider_thread_id.is_some())
                         .ok_or("No exact provider thread is recorded")?;
+                    Some((home, view))
+                };
+                // Preflight is complete before touching the historical view.
+                // A rejected restore must keep its original profile and thread.
+                job.runtime.configure_host(context.clone(), job.lease.clone());
+                if let Some((home, view)) = restore {
                     job.runtime.restore_hosted_codex(task_id, home, view);
-                    let mut task = job
-                        .tasks
-                        .get(job.snapshot.task.id)
-                        .ok_or("Task is unavailable")?
-                        .clone();
-                    task.status = TaskStatus::ReadyForReview;
-                    task.status_detail=Some("Explicitly restoring the exact provider thread; previous operations are not repeated".into());
-                    job.tasks.project_hosted_task(task, false)?;
-                    job.snapshot.interrupted = false;
-                    start_provider(
-                        &mut job.runtime,
-                        &mut job.tasks,
-                        task_id,
-                        AgentProvider::Codex,
-                        policy,
-                    )
-                } else {
-                    Err("Open this stopped provider conversation in Terminal to continue its exact ID".into())
                 }
+                let result = start_provider(&mut job.runtime, &mut job.tasks, task_id,
+                    job.snapshot.task.provider, policy);
+                if result.is_ok() {
+                    job.context = context;
+                    job.policy = policy;
+                    job.policy_origin = job.controller.as_ref()
+                        .map(|c| (c.owner.clone(), c.view.clone()));
+                    job.snapshot.redact_secrets |= policy.redact_secrets;
+                    job.historical = false;
+                    job.snapshot.interrupted = false;
+                }
+                result
             }
             NativeAction::Handoff { context } => {
                 if !matches!(
@@ -910,7 +892,9 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
                 && task.runtime_kind == TaskRuntimeKind::Unassigned));
     let home = job.runtime.native_home(id).map(|p| p.to_path_buf());
     let can_validate = validation_available(job, locked);
-    let changed = job.snapshot.can_start_validation != can_validate
+    let manual_review = job.tasks.get(id).is_some_and(|task| task.requires_manual_review());
+    let changed = job.snapshot.manual_review != manual_review
+        || job.snapshot.can_start_validation != can_validate
         || job.snapshot.task != task
         || job.view_revision != revision
         || job.snapshot.preparing != preparing
@@ -938,6 +922,7 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
     job.snapshot.can_prompt = can_prompt;
     job.snapshot.can_resume = can_resume;
     job.snapshot.can_start_validation = can_validate;
+    job.snapshot.manual_review = manual_review;
     job.snapshot.exit = exit;
     job.snapshot.can_continue_in_terminal = can_continue;
     job.snapshot.native_home = home;
@@ -1051,6 +1036,7 @@ mod historical_projection_tests {
             can_prompt: false,
             can_resume: false,
             can_start_validation: false,
+            manual_review: false,
             can_continue_in_terminal: false,
             exit: None,
             events: vec![],
