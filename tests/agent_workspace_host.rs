@@ -2358,3 +2358,182 @@ fn owned_validation_descriptor_cannot_create_a_process_or_retarget_an_epoch() {
     assert_ne!(view.wait_exit(), 0);
     assert!(!h.trace.exists());
 }
+
+#[test]
+fn validation_failure_stays_unaccepted_and_rejects_unrestricted_task_overwrite() {
+    use jterm_core::agent_task::{TaskStatus, TaskValidationStatus};
+    let (_h, client, id, control, _) =
+        stopped_native_validation_fixture("printf validation-failed; false".into());
+    let before = inspect_native(&client, &id);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Validate {
+                expected_sequence: before.sequence,
+            }),
+        },
+    )
+    .unwrap();
+    let failed = wait_native(&client, &id, |s| {
+        s.task.validation.status == TaskValidationStatus::Failed && !s.ownership_locked
+    });
+    assert_eq!(failed.task.status, TaskStatus::ReadyForReview);
+    assert_eq!(failed.task.validation.exit_code, Some(1));
+    assert!(failed
+        .validation
+        .as_ref()
+        .unwrap()
+        .output
+        .contains("validation-failed"));
+    for mutation in [
+        NativeTaskMutation::Complete,
+        NativeTaskMutation::AcceptReviewed,
+    ] {
+        let current = inspect_native(&client, &id);
+        assert!(
+            request(
+                &client,
+                WorkspaceCommand::ControlNative {
+                    control: control.clone(),
+                    operation: uuid::Uuid::new_v4().to_string(),
+                    action: Box::new(NativeAction::MutateTask {
+                        expected_sequence: current.sequence,
+                        mutation,
+                    }),
+                },
+            )
+            .is_err(),
+            "validation failure was accepted via {mutation:?}"
+        );
+    }
+    let mut forged = inspect_native(&client, &id).task;
+    forged.status = TaskStatus::Completed;
+    forged.source_context.as_mut().unwrap().command = Some("true".into());
+    assert!(request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control,
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::UpdateTask {
+                task: Box::new(forged)
+            }),
+        },
+    )
+    .is_err());
+    let retained = inspect_native(&client, &id);
+    assert_eq!(retained.task.status, TaskStatus::ReadyForReview);
+    assert_eq!(
+        retained.task.validation.status,
+        TaskValidationStatus::Failed
+    );
+}
+
+#[test]
+fn host_crash_marks_validation_unknown_and_never_repeats_the_surviving_command() {
+    use jterm_core::agent_task::TaskValidationStatus;
+    let (mut h, client, id, control, launch) = stopped_native_validation_fixture(
+        "trap '' HUP TERM; printf 'boot %s %s\\n' \"$$\" \"$$\" >> FIXTURE_ROOT/trace; printf 'run\\n' >> FIXTURE_ROOT/validation-count; printf validation-survivor; while :; do sleep .05; done".into(),
+    );
+    let before = inspect_native(&client, &id);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control,
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Validate {
+                expected_sequence: before.sequence,
+            }),
+        },
+    )
+    .unwrap();
+    let running = wait_native(&client, &id, |s| {
+        s.validation
+            .as_ref()
+            .is_some_and(|v| v.terminal.is_some() && v.output.contains("validation-survivor"))
+    });
+    let terminal = running
+        .validation
+        .as_ref()
+        .unwrap()
+        .terminal
+        .clone()
+        .unwrap();
+    let runtime = match request(
+        &client,
+        WorkspaceCommand::Runtime {
+            id: terminal.id.clone(),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Runtime { snapshot } => snapshot,
+        reply => panic!("{reply:?}"),
+    };
+    h.host.kill().unwrap();
+    h.host.wait().unwrap();
+    assert!(
+        process_live(runtime.pid),
+        "synthetic validator did not retain its lease after host crash"
+    );
+    h.host = Command::new(host_executable())
+        .arg("--jterm-session-host")
+        .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            File::create(h.root.join("validation-restarted-host-errors")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    let recovered = wait_native(&h.client(), &id, |s| s.interrupted);
+    assert!(!recovered.live);
+    assert_eq!(
+        recovered.task.validation.status,
+        TaskValidationStatus::Inconclusive
+    );
+    assert_eq!(recovered.task.validation.exit_code, None);
+    assert!(recovered.validation.as_ref().unwrap().terminal.is_none());
+    assert!(!recovered.validation.as_ref().unwrap().preparing);
+    assert!(
+        request(
+            &h.client(),
+            WorkspaceCommand::AttachNative {
+                id: id.clone(),
+                incarnation: recovered.incarnation,
+                view: "after-validation-crash".into()
+            }
+        )
+        .is_err(),
+        "surviving validation admitted a second task writer"
+    );
+    let mut missing_owner = attach_owned_fixture(&h, &terminal);
+    missing_owner.wait_for("historical");
+    assert_ne!(missing_owner.wait_exit(), 0);
+    request(
+        &h.client(),
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("validation-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        process_live(runtime.pid),
+        "restarted host signalled an unowned process"
+    );
+    // Cleanup only the still-identical local fixture group. Its inherited task
+    // lease must never be mistaken for a stale timeout while it is alive.
+    let args = std::fs::read(format!("/proc/{}/cmdline", runtime.pid)).unwrap();
+    assert!(String::from_utf8_lossy(&args).contains(h.root.to_string_lossy().as_ref()));
+    unsafe {
+        libc::kill(-(runtime.pid as i32), libc::SIGKILL);
+    }
+}
