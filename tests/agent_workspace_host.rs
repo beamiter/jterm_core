@@ -2539,3 +2539,77 @@ fn host_crash_marks_validation_unknown_and_never_repeats_the_surviving_command()
         libc::kill(-(runtime.pid as i32), libc::SIGKILL);
     }
 }
+
+#[test]
+fn remote_validation_rerun_opens_only_the_newly_admitted_owned_terminal() {
+    use jterm_core::agent_task::{AgentRuntimeManager, TaskManager, TaskValidationStatus};
+    let (h, client, id, control, launch) = stopped_native_validation_fixture(
+        "printf 'run\\n' >> FIXTURE_ROOT/validation-count; printf validation-completed".into(),
+    );
+    let current = inspect_native(&client, &id);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Validate {
+                expected_sequence: current.sequence,
+            }),
+        },
+    )
+    .unwrap();
+    let previous = wait_native(&client, &id, |s| {
+        s.task.validation.status == TaskValidationStatus::Passed && !s.ownership_locked
+    });
+    let previous_terminal = previous.validation.unwrap().terminal.unwrap();
+    request(&client, WorkspaceCommand::DetachNative { control }).unwrap();
+    // Start from a fresh frontend cache, with no control lease. The first
+    // AttachNative reply still includes the previous validation descriptor.
+    let mut view = AgentRuntimeManager::hosted_with_client("validation-observer", h.client());
+    let mut tasks = TaskManager::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while view.hosted_validation_terminal(launch.task.id).is_none() {
+        view.poll(&mut tasks, launch.policy);
+        assert!(
+            Instant::now() < deadline,
+            "view never received prior validation history"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    view.start_hosted_validation(launch.task.id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let newly_admitted = loop {
+        let report = view.poll(&mut tasks, launch.policy);
+        assert!(
+            report.issues.is_empty(),
+            "remote validation was rejected: {report:?}"
+        );
+        let launches = view.take_owned_terminal_launches();
+        assert!(
+            launches
+                .iter()
+                .all(|(_, terminal)| terminal.id != previous_terminal.id),
+            "an AttachNative reply opened the previous validation terminal"
+        );
+        if let Some((task, terminal)) = launches.into_iter().next() {
+            assert_eq!(task, launch.task.id);
+            break terminal;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new validation terminal was never emitted"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_ne!(newly_admitted.epoch, previous_terminal.epoch);
+    wait_native(&client, &id, |s| {
+        s.task.validation.status == TaskValidationStatus::Passed && !s.ownership_locked
+    });
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("validation-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}

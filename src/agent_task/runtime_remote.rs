@@ -24,7 +24,7 @@ pub(super) struct NativeRemote {
     cached: HashMap<TaskId, Cached>,
     versions: HashMap<TaskId, (ws::ConversationId, String, u64)>,
     selected: Option<TaskId>,
-    validation_requests: HashSet<TaskId>,
+    validation_requests: HashMap<TaskId, Option<String>>,
     owned_launches: Vec<(TaskId, ws::OwnedTerminalDescriptor)>,
     pending: HashMap<u64, Pending>,
     inspections: HashSet<TaskId>,
@@ -50,7 +50,7 @@ impl NativeRemote {
             cached: HashMap::new(),
             versions: HashMap::new(),
             selected: None,
-            validation_requests: HashSet::new(),
+            validation_requests: HashMap::new(),
             owned_launches: Vec::new(),
             pending: HashMap::new(),
             inspections: HashSet::new(),
@@ -154,8 +154,13 @@ impl NativeRemote {
             .ok_or(AgentRuntimeError::UnknownTask(id))?
             .snapshot
             .sequence;
+        let previous_run = self.cached[&id]
+            .snapshot
+            .validation
+            .as_ref()
+            .map(|validation| validation.run_id.clone());
         self.action(id, ws::NativeAction::Validate { expected_sequence })?;
-        self.validation_requests.insert(id);
+        self.validation_requests.insert(id, previous_run);
         Ok(())
     }
     pub fn mutate_task(
@@ -263,13 +268,18 @@ impl NativeRemote {
                 }
                 Reply::Native { snapshot, control } => {
                     let id = snapshot.task.id;
-                    if self.validation_requests.contains(&id) {
+                    if let Some(previous_run) = self.validation_requests.get(&id) {
                         if let Some(validation) = &snapshot.validation {
-                            if let Some(terminal) = &validation.terminal {
-                                self.owned_launches.push((id, terminal.clone()));
-                                self.validation_requests.remove(&id);
-                            } else if !validation.preparing {
-                                self.validation_requests.remove(&id);
+                            // Acquiring a controller can return the previous
+                            // run before the queued Validate action is sent.
+                            // Only the newly admitted run may open a pane.
+                            if previous_run.as_deref() != Some(&validation.run_id) {
+                                if let Some(terminal) = &validation.terminal {
+                                    self.owned_launches.push((id, terminal.clone()));
+                                    self.validation_requests.remove(&id);
+                                } else if !validation.preparing {
+                                    self.validation_requests.remove(&id);
+                                }
                             }
                         }
                     }
