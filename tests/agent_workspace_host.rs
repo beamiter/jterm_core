@@ -2148,8 +2148,21 @@ fn stopped_native_validation_fixture(
     NativeControlLease,
     NativeLaunch,
 ) {
+    stopped_native_validation_fixture_with_redaction(command, true)
+}
+fn stopped_native_validation_fixture_with_redaction(
+    command: String,
+    redact_secrets: bool,
+) -> (
+    Harness,
+    WorkspaceClient,
+    ConversationId,
+    NativeControlLease,
+    NativeLaunch,
+) {
     let h = Harness::new();
     let mut launch = native_fixture(&h);
+    launch.policy.redact_secrets = redact_secrets;
     launch.task.source_context.as_mut().unwrap().command =
         Some(command.replace("FIXTURE_ROOT", &h.root.to_string_lossy()));
     let client = h.client();
@@ -2668,4 +2681,73 @@ fn remote_validation_reports_missing_directory_without_running_in_a_fallback_cwd
     );
     assert!(historical.validation.as_ref().unwrap().terminal.is_none());
     assert!(view.hosted_validation_snapshot(launch.task.id).is_some());
+}
+
+#[test]
+fn remote_validation_acknowledges_stricter_privacy_before_starting_the_command() {
+    use jterm_core::agent_task::{
+        AgentRuntimeManager, NativePromptPolicy, TaskManager, TaskValidationStatus,
+    };
+    let secret = "synthetic-validation-policy-secret-123456";
+    let (h, client, id, control, launch) = stopped_native_validation_fixture_with_redaction(
+        format!("printf 'API_TOKEN={secret}'; printf 'run\\n' >> FIXTURE_ROOT/validation-count"),
+        false,
+    );
+    let old = inspect_native(&client, &id);
+    assert!(!old.redact_secrets);
+    assert!(old.task.source_context.as_ref().unwrap().command_exact);
+    request(&client, WorkspaceCommand::DetachNative { control }).unwrap();
+    let policy = NativePromptPolicy {
+        redact_secrets: true,
+        ..launch.policy
+    };
+    let mut view =
+        AgentRuntimeManager::hosted_with_client("privacy-validation-observer", h.client());
+    let mut tasks = TaskManager::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while view.conversation_id(launch.task.id).is_none() {
+        view.poll(&mut tasks, policy);
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    view.start_hosted_validation(launch.task.id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let report = view.poll(&mut tasks, policy);
+        assert!(
+            report.issues.is_empty(),
+            "privacy/CAS handshake failed: {report:?}"
+        );
+        if !view.take_owned_terminal_launches().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let completed = wait_native(&client, &id, |s| {
+        s.task.validation.status == TaskValidationStatus::Passed && !s.ownership_locked
+    });
+    assert!(completed.redact_secrets);
+    assert!(completed.validation_evidence_redacted);
+    assert!(
+        !completed
+            .task
+            .source_context
+            .as_ref()
+            .unwrap()
+            .command_exact
+    );
+    assert!(!completed
+        .validation
+        .as_ref()
+        .unwrap()
+        .output
+        .contains(secret));
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("validation-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
