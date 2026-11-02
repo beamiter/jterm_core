@@ -143,3 +143,51 @@ Run separately for each frontend and `block`/`chat`. The output directory must
 be new. This pixel test does not certify hardware latency, physical touchpad
 momentum or all selection/IME interactions; the native adapter tests cover
 their own coordinate and event contracts.
+
+## Active Codex and Claude sessions
+
+The inline CLI retains native PTY input, cursor addressing and screen redraws.
+Its main-screen history uses the same pixel-motion contract while it is still
+running. PageUp/PageDown belong exclusively to the reading viewport, retain
+context between pages, and never also reach the child keyboard protocol.
+Alternate-screen applications retain their own plain page keys. Reading above
+the live edge holds a stable raw-row anchor during new output; returning the
+scrollbar to the bottom restores following. Dragging uses fractional positions
+and immediately replaces any pending wheel or page destination.
+
+This requires a CLI that emits its transcript to the primary screen. The
+frontend's child-local defaults select Codex's `--no-alt-screen` and Claude's
+classic renderer for ordinary terminal launches. The pinned workspace host's
+trusted absolute launcher for API-to-CLI continuation bypasses the PATH shim;
+its renderer defaults have not been changed or certified by this frontend
+work. An already-running provider's alternate-screen renderer is not converted
+into a primary-screen history by a viewport change.
+
+`scripts/native-cli-reading-smoke.py` tests that running-session path on a
+private Xvfb display. A synthetic raw-TTY executable named `codex` or `claude`
+renders numbered color bars and records received input; no provider account or
+network request is involved. The diagnostic decodes actual displayed rows in
+every captured frame, checks ordered adjacent content, overlapping pages,
+intermediate wheel positions, an unmoved reading anchor during appended output,
+scrollbar dragging in both directions, and absence of page-key PTY leakage.
+It retains PNGs, motion GIFs, timestamped row positions and a binary digest.
+The fixed 1100-by-760 fixture workspace has an empty sidebar; Ember's first
+terminal is selected using that fixture's visible sidebar label.
+
+```sh
+python3 scripts/native-cli-reading-smoke.py frost chat --provider claude \
+  --binary ../frost/target/debug/frost --output /tmp/frost-claude-reading
+```
+
+Run separately for each frontend and both `block` and `chat`; the output
+directory must be new. Dependencies are Python with Pillow/NumPy, Xvfb and
+xdotool. Add `--direct` to check a CLI launched without an OSC-integrated shell,
+as used by direct task and resume launchers. The probe establishes the
+software-rendered native event path, not physical touchpad latency or arbitrary
+provider-version compatibility.
+
+Anvil and Forge also exercise their conventional VTE attachment view with the
+display-backed `conventional_vte_pages_locally_preserves_streaming_reader_and_yields_to_alt_screen`
+test. It uses the production opt-in adapter with a real VTE and scrollbar,
+including output before the first motion frame, anchor retention, direct
+adjustment interruption and actual alternate-screen transitions.
