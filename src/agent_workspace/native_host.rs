@@ -1012,6 +1012,150 @@ fn same_task_identity(a: &crate::agent_task::AgentTask, b: &crate::agent_task::A
         && a.created_at_ms == b.created_at_ms
 }
 
+/// Return true while validation owns the task, independently from any view.
+fn poll_validation(
+    job: &mut Job,
+    paths: &Paths,
+    store: &Store,
+    runtimes: &mut HashMap<super::model::ConversationId, super::host::RuntimeHandle>,
+) -> bool {
+    let Some(mut validation) = job.validation.take() else {
+        return false;
+    };
+    let task_id = job.snapshot.task.id;
+    let Some(mut snapshot) = job.snapshot.validation.take() else {
+        job.validation = Some(validation);
+        return true;
+    };
+    let mut completed = false;
+    let mut changed = false;
+    if let Some(receiver) = &validation.preparing {
+        match receiver.try_recv() {
+            Ok(result) => {
+                validation.preparing = None;
+                snapshot.preparing = false;
+                changed = true;
+                let result = if validation.cancelled {
+                    Err("Validation cancelled before command startup".into())
+                } else {
+                    result
+                };
+                match result.and_then(|prepared| {
+                    if runtimes
+                        .values()
+                        .filter(|runtime| runtime.snapshot.lock().state.is_live())
+                        .count()
+                        >= 16
+                    {
+                        return Err("The session host already owns sixteen running PTYs".into());
+                    }
+                    if runtimes.len() >= 32 {
+                        runtimes.retain(|_, runtime| runtime.snapshot.lock().state.is_live());
+                    }
+                    let cwd = prepared.prepared.cwd.clone();
+                    let id = super::model::ConversationId(format!(
+                        "jterm:validation:{}:{}",
+                        task_id, snapshot.run_id
+                    ));
+                    let runtime = super::native_validation::spawn(
+                        paths,
+                        id.clone(),
+                        prepared,
+                        job.lease.clone(),
+                        job.context.search_path.as_deref(),
+                    )?;
+                    let epoch = runtime.snapshot.lock().epoch.clone();
+                    snapshot.terminal = Some(OwnedTerminalDescriptor {
+                        id: id.clone(),
+                        epoch,
+                        cwd,
+                        label: format!("Validation · {}", job.snapshot.task.title),
+                    });
+                    runtimes.insert(id, runtime.clone());
+                    validation.runtime = Some(runtime);
+                    Ok(())
+                }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        snapshot.output = crate::review_input::safe_inline_display(&error, 4096);
+                        job.tasks
+                            .handle_terminal_session_exit(&snapshot.run_id, None);
+                        completed = true;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                snapshot.preparing = false;
+                snapshot.output =
+                    "Validation preparation ended without an outcome; command was not repeated"
+                        .into();
+                job.tasks
+                    .handle_terminal_session_exit(&snapshot.run_id, None);
+                completed = true;
+                changed = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if let Some(runtime) = &validation.runtime {
+        let state = runtime.snapshot.lock().clone();
+        if validation.last_output_sequence != Some(state.event_sequence) {
+            let (output, truncated) =
+                super::native_validation::output(runtime, job.snapshot.redact_secrets);
+            validation.last_output_sequence = Some(state.event_sequence);
+            if snapshot.output != output || snapshot.output_truncated != truncated {
+                snapshot.output = output;
+                snapshot.output_truncated = truncated;
+                changed = true;
+            }
+        }
+        if !state.state.is_live() {
+            if state.cleanup_verified {
+                job.tasks
+                    .handle_terminal_session_exit(&snapshot.run_id, state.exit_code);
+                completed = true;
+                changed = true;
+            } else if !job.snapshot.interrupted {
+                job.snapshot.interrupted = true;
+                job.snapshot.can_prompt = false;
+                job.snapshot.can_resume = false;
+                snapshot.output.push_str("\nValidation cleanup is unconfirmed; ownership remains locked and no command will be repeated.");
+                changed = true;
+            }
+        }
+    }
+    job.snapshot.validation = Some(snapshot);
+    if !completed {
+        job.validation = Some(validation);
+    }
+    if changed {
+        job.snapshot.sequence += 1;
+        if let Some(task) = job.tasks.get(task_id) {
+            job.snapshot.task = safe_task_projection(task, projection_policy(job));
+        }
+        job.snapshot.ownership_locked = !completed;
+        job.snapshot.can_prompt = false;
+        job.snapshot.can_resume = false;
+        job.snapshot.can_continue_in_terminal = false;
+        let _ = store.save_native(&job.snapshot);
+    }
+    !completed
+}
+
+fn original_validation_evidence(task: &crate::agent_task::AgentTask) -> bool {
+    task.source_context.as_ref().is_some_and(|context| {
+        context.command_exact
+            && !context.command_truncated
+            && context
+                .command
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+    }) || task
+        .brief
+        .as_ref()
+        .is_some_and(|brief| brief.validation.is_some())
+}
+
 #[cfg(test)]
 mod historical_projection_tests {
     use super::*;
@@ -1158,148 +1302,4 @@ mod historical_projection_tests {
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
-}
-
-/// Return true while validation owns the task, independently from any view.
-fn poll_validation(
-    job: &mut Job,
-    paths: &Paths,
-    store: &Store,
-    runtimes: &mut HashMap<super::model::ConversationId, super::host::RuntimeHandle>,
-) -> bool {
-    let Some(mut validation) = job.validation.take() else {
-        return false;
-    };
-    let task_id = job.snapshot.task.id;
-    let Some(mut snapshot) = job.snapshot.validation.take() else {
-        job.validation = Some(validation);
-        return true;
-    };
-    let mut completed = false;
-    let mut changed = false;
-    if let Some(receiver) = &validation.preparing {
-        match receiver.try_recv() {
-            Ok(result) => {
-                validation.preparing = None;
-                snapshot.preparing = false;
-                changed = true;
-                let result = if validation.cancelled {
-                    Err("Validation cancelled before command startup".into())
-                } else {
-                    result
-                };
-                match result.and_then(|prepared| {
-                    if runtimes
-                        .values()
-                        .filter(|runtime| runtime.snapshot.lock().state.is_live())
-                        .count()
-                        >= 16
-                    {
-                        return Err("The session host already owns sixteen running PTYs".into());
-                    }
-                    if runtimes.len() >= 32 {
-                        runtimes.retain(|_, runtime| runtime.snapshot.lock().state.is_live());
-                    }
-                    let cwd = prepared.prepared.cwd.clone();
-                    let id = super::model::ConversationId(format!(
-                        "jterm:validation:{}:{}",
-                        task_id, snapshot.run_id
-                    ));
-                    let runtime = super::native_validation::spawn(
-                        paths,
-                        id.clone(),
-                        prepared,
-                        job.lease.clone(),
-                        job.context.search_path.as_deref(),
-                    )?;
-                    let epoch = runtime.snapshot.lock().epoch.clone();
-                    snapshot.terminal = Some(OwnedTerminalDescriptor {
-                        id: id.clone(),
-                        epoch,
-                        cwd,
-                        label: format!("Validation · {}", job.snapshot.task.title),
-                    });
-                    runtimes.insert(id, runtime.clone());
-                    validation.runtime = Some(runtime);
-                    Ok(())
-                }) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        snapshot.output = crate::review_input::safe_inline_display(&error, 4096);
-                        job.tasks
-                            .handle_terminal_session_exit(&snapshot.run_id, None);
-                        completed = true;
-                    }
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                snapshot.preparing = false;
-                snapshot.output =
-                    "Validation preparation ended without an outcome; command was not repeated"
-                        .into();
-                job.tasks
-                    .handle_terminal_session_exit(&snapshot.run_id, None);
-                completed = true;
-                changed = true;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-    }
-    if let Some(runtime) = &validation.runtime {
-        let state = runtime.snapshot.lock().clone();
-        if validation.last_output_sequence != Some(state.event_sequence) {
-            let (output, truncated) =
-                super::native_validation::output(runtime, job.snapshot.redact_secrets);
-            validation.last_output_sequence = Some(state.event_sequence);
-            if snapshot.output != output || snapshot.output_truncated != truncated {
-                snapshot.output = output;
-                snapshot.output_truncated = truncated;
-                changed = true;
-            }
-        }
-        if !state.state.is_live() {
-            if state.cleanup_verified {
-                job.tasks
-                    .handle_terminal_session_exit(&snapshot.run_id, state.exit_code);
-                completed = true;
-                changed = true;
-            } else if !job.snapshot.interrupted {
-                job.snapshot.interrupted = true;
-                job.snapshot.can_prompt = false;
-                job.snapshot.can_resume = false;
-                snapshot.output.push_str("\nValidation cleanup is unconfirmed; ownership remains locked and no command will be repeated.");
-                changed = true;
-            }
-        }
-    }
-    job.snapshot.validation = Some(snapshot);
-    if !completed {
-        job.validation = Some(validation);
-    }
-    if changed {
-        job.snapshot.sequence += 1;
-        if let Some(task) = job.tasks.get(task_id) {
-            job.snapshot.task = safe_task_projection(task, projection_policy(job));
-        }
-        job.snapshot.ownership_locked = !completed;
-        job.snapshot.can_prompt = false;
-        job.snapshot.can_resume = false;
-        job.snapshot.can_continue_in_terminal = false;
-        let _ = store.save_native(&job.snapshot);
-    }
-    !completed
-}
-
-fn original_validation_evidence(task: &crate::agent_task::AgentTask) -> bool {
-    task.source_context.as_ref().is_some_and(|context| {
-        context.command_exact
-            && !context.command_truncated
-            && context
-                .command
-                .as_ref()
-                .is_some_and(|text| !text.is_empty())
-    }) || task
-        .brief
-        .as_ref()
-        .is_some_and(|brief| brief.validation.is_some())
 }
