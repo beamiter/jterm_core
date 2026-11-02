@@ -616,8 +616,8 @@ pub(super) fn spawn_runtime_with_native(
     let child = SupervisedChild::spawn_pty_session(&mut command)
         .map_err(|e| format!("Could not start {}: {e}", launch.provider))?;
     let pid = child.process_group_id() as u32;
-    let Some(start) = process_start(pid) else {
-        return Err("Provider exited before a process ownership identity could be recorded".into());
+    let Some(start) = super::ownership::supervised_process_start(&child) else {
+        return Err("Could not record the owned provider process identity".into());
     };
     let snapshot = RuntimeSnapshot {
         cleanup_verified: false,

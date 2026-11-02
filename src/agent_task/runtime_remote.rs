@@ -324,16 +324,16 @@ impl NativeRemote {
                                 incarnation != &entry.incarnation || *sequence != entry.sequence
                             },
                         );
-                        if changed && !self.inspections.contains(&entry.task_id) {
-                            if self
+                        if changed
+                            && !self.inspections.contains(&entry.task_id)
+                            && self
                                 .send(
                                     Command::InspectNative { id: entry.id },
                                     Pending::Inspect(entry.task_id),
                                 )
                                 .is_ok()
-                            {
-                                self.inspections.insert(entry.task_id);
-                            }
+                        {
+                            self.inspections.insert(entry.task_id);
                         }
                     }
                 }

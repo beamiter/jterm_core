@@ -327,20 +327,30 @@ pub(super) fn lease_is_held(path: &Path) -> bool {
     )
 }
 
+/// A supervised child remains unreaped, so its zombie still anchors its PID.
+/// Peer/controller liveness must continue to use process_start instead.
+pub(super) fn supervised_process_start(
+    child: &crate::supervised::SupervisedChild,
+) -> Option<String> {
+    process_start_inner(child.process_group_id() as u32, true)
+}
 pub(super) fn process_start(pid: u32) -> Option<String> {
+    process_start_inner(pid, false)
+}
+fn process_start_inner(pid: u32, retained_child: bool) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let rest = stat.rsplit_once(')')?.1;
         let fields: Vec<_> = rest.split_whitespace().collect();
-        if fields.first().is_some_and(|s| *s == "Z") {
+        if !retained_child && fields.first().is_some_and(|s| *s == "Z") {
             return None;
         }
         fields.get(19).map(|s| (*s).to_owned())
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
+        let _ = (pid, retained_child);
         None
     }
 }

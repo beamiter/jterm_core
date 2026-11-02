@@ -91,8 +91,8 @@ pub(super) fn spawn(
     let child = SupervisedChild::spawn_pty_session(&mut command)
         .map_err(|e| format!("Could not start validation: {e}"))?;
     let pid = child.process_group_id() as u32;
-    let start =
-        process_start(pid).ok_or("Validation exited before its process identity was recorded")?;
+    let start = super::ownership::supervised_process_start(&child)
+        .ok_or("Cannot record the owned validation process identity")?;
     let snapshot = RuntimeSnapshot {
         cleanup_verified: false,
         id: id.clone(),

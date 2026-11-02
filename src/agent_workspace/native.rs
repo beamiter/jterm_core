@@ -257,13 +257,14 @@ impl NativeSnapshot {
                     }))
             {
                 RuntimeState::Conflict
-            } else if self.validation.as_ref().is_some_and(|validation| {
-                validation.preparing
-                    || self.task.validation.status
-                        == crate::agent_task::TaskValidationStatus::Running
-            }) {
-                RuntimeState::Running
-            } else if self.live || self.preparing {
+            } else if self.live
+                || self.preparing
+                || self.validation.as_ref().is_some_and(|validation| {
+                    validation.preparing
+                        || self.task.validation.status
+                            == crate::agent_task::TaskValidationStatus::Running
+                })
+            {
                 RuntimeState::Running
             } else {
                 RuntimeState::Idle
