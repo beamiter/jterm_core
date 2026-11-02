@@ -7,6 +7,27 @@ pub(super) const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceCommand {
+    StartApi {
+        launch: Box<super::api::ApiLaunch>,
+    },
+    InspectApi {
+        id: ConversationId,
+    },
+    /// Resolve an uncertain admission without ever submitting HTTP again.
+    ResolveApi {
+        receipt: SubmissionReceipt,
+    },
+    AttachApi {
+        id: ConversationId,
+        epoch: u64,
+        view: String,
+    },
+    DetachApi {
+        control: super::api::ApiControlLease,
+    },
+    CancelApi {
+        control: super::api::ApiControlLease,
+    },
     Refresh,
     /// Bounded provider discovery projection; no transcript or credentials.
     /// Existing local organization takes precedence over refreshed metadata.
@@ -90,6 +111,10 @@ pub enum WorkspaceCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceReply {
+    Api {
+        snapshot: super::api::ApiSnapshot,
+        control: Option<super::api::ApiControlLease>,
+    },
     Catalog {
         rows: Vec<WorkspaceRow>,
     },

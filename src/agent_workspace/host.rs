@@ -100,7 +100,9 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
     let (tx, rx) = bounded::<HostRequest>(64);
     let clients = Arc::new(AtomicUsize::new(0));
     let mut runtimes: HashMap<ConversationId, RuntimeHandle> = HashMap::new();
+    let mut api = super::api_host::ApiManager::new(paths.clone());
     loop {
+        api.poll(&mut store);
         for _ in 0..8 {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -125,6 +127,10 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
             Ok(HostRequest::Command(command, owner, reply)) => {
                 let response = (|| {
                     store.reap_abandoned_requests()?;
+                    let command = match api.handle(command, owner.clone(), &mut store) {
+                        super::api_host::Disposition::Handled(reply) => return reply,
+                        super::api_host::Disposition::Other(command) => command,
+                    };
                     match command {
                         WorkspaceCommand::Refresh => store.rows().map(|mut rows| {
                             for row in &mut rows {

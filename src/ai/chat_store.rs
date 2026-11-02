@@ -732,6 +732,36 @@ impl ChatStore {
         })
     }
 
+    /// Restore a local view of a host-owned request without submitting again.
+    /// This leaves selection and the independently edited draft unchanged.
+    pub fn observe_turn(
+        &mut self,
+        chat_id: u64,
+        text: String,
+    ) -> Result<RequestToken, ChatStoreError> {
+        if self.chat_mut(chat_id).is_none() {
+            return Err(ChatStoreError::SnapshotInvalid);
+        }
+        let selected = self.active_chat_id;
+        self.active_chat_id = chat_id;
+        let result = self
+            .begin_turn(text, None, "Running in session host".into(), false)
+            .map(|start| start.token);
+        self.active_chat_id = selected;
+        result
+    }
+
+    /// Replace a sequenced host preview rather than treating it as a delta.
+    pub fn replace_partial(&mut self, token: RequestToken, text: &str) -> Option<bool> {
+        let active_id = self.active_chat_id;
+        let chat = self.chat_mut(token.chat_id)?;
+        if chat.active_epoch != Some(token.epoch) {
+            return None;
+        }
+        chat.partial = bounded_live_assistant_message(text.to_owned());
+        Some(chat.id == active_id)
+    }
+
     /// Append streamed assistant text to the owning chat's partial reply.
     ///
     /// Returns `None` when the token is stale — the chat was deleted, or a
@@ -1245,6 +1275,34 @@ mod tests {
     }
 
     // ---- identity and epoch ------------------------------------------------
+
+    #[test]
+    fn external_observation_keeps_selection_draft_and_full_preview_identity() {
+        let mut store = ChatStore::default();
+        let owner = store.active_id();
+        store.set_active_draft("next independent draft".into());
+        let other = store.new_chat().unwrap();
+        let token = store
+            .observe_turn(owner, "already submitted".into())
+            .unwrap();
+        assert_eq!(store.active_id(), other);
+        assert_eq!(store.chat_draft(owner), Some("next independent draft"));
+        assert_eq!(store.replace_partial(token, "中"), Some(false));
+        assert_eq!(store.replace_partial(token, "中文"), Some(false));
+        assert_eq!(store.replace_partial(token, "中文"), Some(false));
+        store.select_chat(owner);
+        assert_eq!(store.active_partial(), "中文");
+        assert_eq!(
+            store.complete_success(token, "\ncomplete answer\n".into()),
+            Some(true)
+        );
+        assert_eq!(
+            store.active_history().last().unwrap().text,
+            "\ncomplete answer\n"
+        );
+        assert_eq!(store.active_draft(), "next independent draft");
+        assert_eq!(store.replace_partial(token, "late preview"), None);
+    }
 
     #[test]
     fn chats_keep_independent_history_drafts_and_titles() {

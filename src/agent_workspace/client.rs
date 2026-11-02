@@ -111,7 +111,7 @@ impl WorkspaceClient {
     }
 }
 
-fn command_request(
+pub(super) fn command_request(
     mut stream: UnixStream,
     command: WorkspaceCommand,
 ) -> Result<WorkspaceReply, String> {
@@ -181,6 +181,16 @@ pub fn run_embedded_if_requested() -> Option<i32> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let flag = args.next()?;
+    if flag == super::api::API_WORKER_FLAG {
+        if args.next().is_some() {
+            return Some(2);
+        }
+        return Some(if super::api::run_worker().is_ok() {
+            0
+        } else {
+            1
+        });
+    }
     if flag == HOST_FLAG {
         if args.next().is_some() {
             eprintln!("Session host does not accept additional arguments");
@@ -220,7 +230,7 @@ pub fn run_embedded_if_requested() -> Option<i32> {
     None
 }
 
-fn connect(
+pub(super) fn connect(
     paths: &Paths,
     start: bool,
     executable: Option<&std::path::Path>,

@@ -150,6 +150,12 @@ pub struct StoredChat {
     /// Older messages exist in the durable store; use History to page them.
     pub has_older: bool,
     pub read_position: Option<ReadPosition>,
+    /// Host execution metadata for restoring a view after GUI exit.
+    #[serde(default)]
+    pub api_job: Option<Box<super::api::ApiSnapshot>>,
+    /// Missing from older hosts, which must not receive a new submission.
+    #[serde(default)]
+    pub background_api_supported: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -45,7 +45,8 @@
 //! starts its provider request. Complete/Cancel accept that receipt once and
 //! never clear a newer draft. Peer credentials identify the submitting GUI;
 //! a dead owner's request is revoked without replacing a live process on a
-//! timer. Request execution still belongs to that GUI's existing API worker.
+//! timer. API execution belongs to a supervised host worker; views observe
+//! sequenced snapshots and detach independently from the transport.
 //!
 //! # Bounds and supported surface
 //!
@@ -59,6 +60,8 @@
 //! snapshots have a 2 MiB wire budget. API history is separately paged in
 //! complete user/assistant pairs and never inferred from a terminal screen.
 
+mod api;
+mod api_host;
 mod client;
 mod host;
 mod model;
@@ -66,6 +69,10 @@ mod ownership;
 mod protocol;
 mod store;
 
+pub use api::{
+    ApiControlLease, ApiLaunch, ApiObservation, ApiObservationToken, ApiRequest, ApiSnapshot,
+    ApiState, HostedApiClient,
+};
 pub use client::{
     managed_launch, managed_session_running, run_embedded_if_requested, WorkspaceClient,
 };

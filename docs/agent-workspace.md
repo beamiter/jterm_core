@@ -87,8 +87,8 @@ from the state root.
 
 ## Shared API conversations
 
-The daemon serializes database writes. SQLite schema version 2 adds verified
-submission-owner process identity and per-view reading positions; unsupported
+The daemon serializes database writes. SQLite schema version 3 retains verified submission-owner process identity,
+per-view reading positions, and durable API execution snapshots; unsupported
 future schemas fail explicitly.
 
 A bounded snapshot feeds ChatStore and model context. A separate message table
@@ -100,9 +100,25 @@ Submission is an acknowledged transaction:
 
 1. Save the exact snapshot and wait for its revision.
 2. Request `BeginSubmission` with conversation revision, draft revision and text.
-3. Start the existing provider HTTP request only after the matching receipt.
-4. Complete or cancel with the receipt's conversation, nonce, epoch and draft
-   revision.
+3. Send `StartApi` with that receipt and the resolved provider configuration.
+   The host records admission before releasing its supervised API worker.
+4. Observe sequenced previews and the result. The host commits the complete
+   user/assistant pair and terminal execution state in one SQLite transaction.
+   A lost acknowledgement is resolved by receipt; it never repeats HTTP.
+
+Closing a view drops its observation and releases its control lease. The host
+continues the request. Reopening the conversation restores the pending user
+turn and current preview without creating another submission. A live view's
+control lease cannot be taken by a second view; read-only observation is allowed.
+Stop keeps the submission reserved until transport cleanup is acknowledged.
+Controller identity includes PID, process start identity and a fresh generation.
+
+The inherited conversation lock survives in worker descendants. After a host
+crash the persisted execution is marked Interrupted with an unknown outcome;
+it is never automatically replayed. A surviving descendant keeps new execution
+locked. Historical execution state cannot activate live controls. Older hosts
+advertise no background API capability, so updated frontends retain the draft
+and request a host update before beginning a submission.
 
 An old response cannot complete a newer submission, clear a later draft, or
 write into another selected chat. The database verifies the real client PID
@@ -114,8 +130,10 @@ only when more history exists. Reading older pages does not enlarge model
 context. Rename, pin, tag, archive and delete are shared operations. Deleting
 conversation metadata does not delete original provider CLI files.
 
-API credentials remain in each frontend's existing API configuration. They are
-not read from CLI login files or sent over this protocol. An HTTP chat is not
+API credentials remain in each frontend's existing API configuration. The
+resolved request configuration crosses the private same-user socket and worker
+stdin only; it is absent from argv, Debug output and SQLite execution records.
+API credentials are not read from CLI login files. An HTTP chat is not
 presented as a consumer ChatGPT or Claude web conversation.
 
 ## Persistent CLI runtime
@@ -212,10 +230,11 @@ resume button.
 
 ## Lifecycle boundaries
 
-The persistent host owns managed CLI PTYs. API HTTP requests and structured
-native Task runtimes remain frontend-owned. Closing that frontend cancels those
-active operations; saved chat/provider history remains. Task instructions and
-validation state are not silently serialized into the shared index.
+The persistent host owns managed CLI PTYs and supervised API HTTP requests.
+Updated API chat views detach on close and can reattach from another frontend.
+Structured native Task runtimes still remain frontend-owned in this revision;
+closing their frontend stops them. Task instructions and validation state are
+not silently serialized into the shared index.
 
 The existing native failure recovery action **Continue in terminal** launches a
 new CLI task prompt after verified shutdown. It is not the same operation as
@@ -231,7 +250,10 @@ session IDs. Changing provider creates a new conversation identity.
 
 Coverage includes real host/PTY startup, killed attachment recovery to the same
 PID, duplicate writer rejection, detach and descendant cleanup; two API clients
-with exact receipts, stale owners and newer drafts; idempotent migration,
+with exact receipts, stale owners and newer drafts; real localhost HTTP workers
+surviving frontend exit, controller handover, Drop-detach, cancellation cleanup,
+unknown outcomes after host crash, receipt resolution and credential nonpersistence;
+idempotent migration,
 source identities, complete-pair history, atomic metadata, private paths; screen
 reconstruction across partial input; actual fake-Claude processes across turns;
 and Codex resume/provenance/history/stale-stream protocol checks.

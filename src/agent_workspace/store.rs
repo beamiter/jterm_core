@@ -6,14 +6,16 @@ use super::protocol::{WorkspaceCommand, WorkspaceReply};
 use crate::ai::{ChatSnapshot, ConversationSnapshot, Role, Turn};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Duration;
+mod hosted_api;
 
-const MAX_MESSAGE: usize = 256 * 1024;
+const MAX_MESSAGE: usize = super::api::API_RESULT_BYTES;
 const MAX_DRAFT: usize = 64 * 1024;
 const MAX_ROWS: usize = 4096;
 
 pub(super) struct Store {
     db: Connection,
     _writer: Lease,
+    paths: Paths,
 }
 
 impl Store {
@@ -52,7 +54,7 @@ impl Store {
                 r.get(0)
             })
             .map_err(err)?;
-        if !(1..=2).contains(&version) {
+        if !(1..=3).contains(&version) {
             return Err(format!(
                 "Unsupported Agent Workspace database version {version}"
             ));
@@ -68,6 +70,14 @@ impl Store {
                     .map_err(err)?;
             }
         }
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS api_jobs (
+            id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+            epoch INTEGER NOT NULL, nonce TEXT NOT NULL, draft_revision INTEGER NOT NULL,
+            snapshot TEXT NOT NULL);
+            UPDATE schema_version SET version=3;",
+        )
+        .map_err(err)?;
         // A restarted host cannot continue an API request owned by its old
         // process. Revoke its epoch, preserving a newer draft exactly.
         // API requests execute in frontend workers, which may still be alive
@@ -75,7 +85,9 @@ impl Store {
         let store = Self {
             db,
             _writer: writer,
+            paths: paths.clone(),
         };
+        store.recover_api_jobs()?;
         store.reap_abandoned_requests()?;
         Ok(store)
     }
@@ -97,8 +109,27 @@ impl Store {
             let (json, active) = value.map_err(err)?;
             let mut row: WorkspaceRow = serde_json::from_str(&json).map_err(err)?;
             if row.kind == ConversationKind::Api {
-                row.runtime = if active.is_some() {
-                    RuntimeState::Running
+                row.runtime = if let Some(nonce) = active {
+                    let hosted: Option<String> = self
+                        .db
+                        .query_row(
+                            "SELECT snapshot FROM api_jobs WHERE id=?1 AND nonce=?2",
+                            params![row.id.0, nonce],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(err)?;
+                    if hosted
+                        .as_deref()
+                        .map(serde_json::from_str::<super::api::ApiSnapshot>)
+                        .transpose()
+                        .map_err(err)?
+                        .is_some_and(|job| !job.state.is_live())
+                    {
+                        RuntimeState::Conflict
+                    } else {
+                        RuntimeState::Running
+                    }
                 } else {
                     RuntimeState::Idle
                 };
@@ -351,7 +382,14 @@ impl Store {
                 receipt,
                 restore_draft,
             } => self.cancel(&receipt, restore_draft),
-            WorkspaceCommand::Stop { .. } | WorkspaceCommand::Runtime { .. } => {
+            WorkspaceCommand::Stop { .. }
+            | WorkspaceCommand::Runtime { .. }
+            | WorkspaceCommand::StartApi { .. }
+            | WorkspaceCommand::InspectApi { .. }
+            | WorkspaceCommand::ResolveApi { .. }
+            | WorkspaceCommand::AttachApi { .. }
+            | WorkspaceCommand::DetachApi { .. }
+            | WorkspaceCommand::CancelApi { .. } => {
                 Err("Runtime operation must be handled by the session host".into())
             }
         }
@@ -378,6 +416,7 @@ impl Store {
             if !pid
                 .zip(start)
                 .is_some_and(|(pid, start)| process_matches(pid, &start))
+                && !super::ownership::lease_is_held(&self.paths.lease(&ConversationId(id.clone())))
             {
                 stale.push((id, nonce));
             }
@@ -521,22 +560,42 @@ impl Store {
             .and_then(|s| s.active_chat())
             .and_then(|c| c.block_context());
         let numeric = SHARED_CHAT_ID_BASE + numeric as u64;
+        let api_job = self.api_snapshot(id)?;
+        let (submitted, submitted_revision): (Option<String>, Option<i64>) = self
+            .db
+            .query_row(
+                "SELECT submitted_text,submitted_draft_revision FROM conversations WHERE id=?1",
+                [&id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(err)?;
+        let pending_draft = api_job
+            .as_ref()
+            .is_some_and(|job| job.state.is_live() && job.epoch == epoch as u64)
+            && submitted_revision == Some(draft_revision)
+            && submitted.as_deref() == Some(&draft);
+        // Hide only the acknowledged, unchanged submitted draft in the view.
+        // The database retains it until completion/cleanup; later edits have
+        // their own revision and remain visible even if their text is equal.
+        let view_draft = if pending_draft { "" } else { &draft };
         let chat = ChatSnapshot::from_completed_history(
             numeric,
             &row.title,
             row.archived,
             &turns,
             context,
-            &draft,
+            view_draft,
         )
         .with_history_truncated(truncated);
-        let has_older = count as usize > chat.turns().len();
+        let has_older = count as usize > chat.turns().len() || chat.history_truncated();
         let snapshot_json = ConversationSnapshot::from_chats(numeric, vec![chat])
             .ok_or("Invalid stored conversation")?
             .to_json()
             .map_err(err)?;
         let read_position=self.db.query_row("SELECT view,position,updated_at_ms FROM read_positions WHERE conversation_id=?1 ORDER BY updated_at_ms DESC LIMIT 1",[&id.0],|r|Ok(ReadPosition{view:r.get(0)?,position:r.get(1)?,updated_at_ms:r.get::<_,i64>(2)? as u64})).optional().map_err(err)?;
         Ok(StoredChat {
+            background_api_supported: true,
+            api_job: api_job.map(Box::new),
             row,
             revision: revision as u64,
             draft_revision: draft_revision as u64,
@@ -572,20 +631,25 @@ impl Store {
             .map_err(err)?;
         let mut messages = Vec::new();
         let mut bytes = 0;
+        let mut assistant = None;
         for message in result {
             let message = message.map_err(err)?;
-            bytes += message.text.len();
-            if bytes > 4 * 1024 * 1024 {
+            if message.role == "assistant" {
+                assistant = Some(message);
+                continue;
+            }
+            let Some(answer) = assistant.take() else {
+                continue;
+            };
+            let pair_bytes = message.text.len() + answer.text.len();
+            if !messages.is_empty() && bytes + pair_bytes > 1024 * 1024 {
                 break;
             }
+            bytes += pair_bytes;
+            messages.push(answer);
             messages.push(message);
         }
         messages.reverse();
-        // API histories always expose complete pairs. If a byte-limited page
-        // starts with an assistant, move it to the older page.
-        if messages.first().is_some_and(|m| m.role == "assistant") {
-            messages.remove(0);
-        }
         Ok(messages)
     }
 
@@ -704,54 +768,70 @@ impl Store {
         receipt: &SubmissionReceipt,
         text: &str,
     ) -> Result<WorkspaceReply, String> {
-        check_text(text, MAX_MESSAGE, "assistant message")?;
         let tx = self.db.transaction().map_err(err)?;
-        let user:Option<String>=tx.query_row("SELECT submitted_text FROM conversations WHERE id=?1 AND epoch=?2 AND active_nonce=?3 AND submitted_draft_revision=?4",params![receipt.id.0,to_i64(receipt.epoch)?,receipt.nonce,to_i64(receipt.draft_revision)?],|r|r.get(0)).optional().map_err(err)?.flatten();
-        let user = user.ok_or("Stale submission receipt: reply discarded")?;
-        append_turns(
-            &tx,
-            &receipt.id,
-            &[
-                Turn {
-                    role: Role::User,
-                    text: user,
-                },
-                Turn {
-                    role: Role::Assistant,
-                    text: text.into(),
-                },
-            ],
-        )?;
-        let row_json: String = tx
-            .query_row(
-                "SELECT row_json FROM conversations WHERE id=?1",
-                [&receipt.id.0],
-                |r| r.get(0),
-            )
-            .map_err(err)?;
-        let mut row: WorkspaceRow = serde_json::from_str(&row_json).map_err(err)?;
-        row.preview = preview(text);
-        row.updated_at_ms = now_ms();
-        tx.execute("UPDATE conversations SET row_json=?1,revision=revision+1,draft=CASE WHEN draft_revision=?2 AND draft=submitted_text THEN '' ELSE draft END,draft_revision=draft_revision+CASE WHEN draft_revision=?2 AND draft=submitted_text THEN 1 ELSE 0 END,active_nonce=NULL,submitted_text=NULL,submitted_draft_revision=NULL,owner_pid=NULL,owner_start=NULL WHERE id=?3 AND epoch=?4 AND active_nonce=?5 AND submitted_draft_revision=?2",params![serde_json::to_string(&row).map_err(err)?,to_i64(receipt.draft_revision)?,receipt.id.0,to_i64(receipt.epoch)?,receipt.nonce]).map_err(err)?;
+        complete_receipt(&tx, receipt, text)?;
         tx.commit().map_err(err)?;
         Ok(WorkspaceReply::Chat {
             chat: self.load(&receipt.id)?,
         })
     }
-
     fn cancel(
         &mut self,
         receipt: &SubmissionReceipt,
         restore: bool,
     ) -> Result<WorkspaceReply, String> {
-        let changed=self.db.execute("UPDATE conversations SET draft=CASE WHEN ?1 AND draft_revision=?2 AND (draft='' OR draft=submitted_text) THEN submitted_text ELSE draft END,draft_revision=draft_revision+CASE WHEN ?1 AND draft_revision=?2 AND (draft='' OR draft=submitted_text) THEN 1 ELSE 0 END,revision=revision+1,epoch=epoch+1,active_nonce=NULL,submitted_text=NULL,submitted_draft_revision=NULL,owner_pid=NULL,owner_start=NULL WHERE id=?3 AND epoch=?4 AND active_nonce=?5 AND submitted_draft_revision=?2",params![restore,to_i64(receipt.draft_revision)?,receipt.id.0,to_i64(receipt.epoch)?,receipt.nonce]).map_err(err)?;
-        if changed != 1 {
-            return Err("Stale submission receipt: cancellation ignored".into());
-        }
+        cancel_receipt(&self.db, receipt, restore)?;
         Ok(WorkspaceReply::Chat {
             chat: self.load(&receipt.id)?,
         })
     }
+}
+
+fn complete_receipt(
+    db: &Connection,
+    receipt: &SubmissionReceipt,
+    text: &str,
+) -> Result<(), String> {
+    check_text(text, MAX_MESSAGE, "assistant message")?;
+    let user:Option<String>=db.query_row("SELECT submitted_text FROM conversations WHERE id=?1 AND epoch=?2 AND active_nonce=?3 AND submitted_draft_revision=?4",params![receipt.id.0,to_i64(receipt.epoch)?,receipt.nonce,to_i64(receipt.draft_revision)?],|r|r.get(0)).optional().map_err(err)?.flatten();
+    let user = user.ok_or("Stale submission receipt: reply discarded")?;
+    append_turns(
+        db,
+        &receipt.id,
+        &[
+            Turn {
+                role: Role::User,
+                text: user,
+            },
+            Turn {
+                role: Role::Assistant,
+                text: text.into(),
+            },
+        ],
+    )?;
+    let row_json: String = db
+        .query_row(
+            "SELECT row_json FROM conversations WHERE id=?1",
+            [&receipt.id.0],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    let mut row: WorkspaceRow = serde_json::from_str(&row_json).map_err(err)?;
+    row.preview = preview(text);
+    row.updated_at_ms = now_ms();
+    db.execute("UPDATE conversations SET row_json=?1,revision=revision+1,draft=CASE WHEN draft_revision=?2 AND draft=submitted_text THEN '' ELSE draft END,draft_revision=draft_revision+CASE WHEN draft_revision=?2 AND draft=submitted_text THEN 1 ELSE 0 END,active_nonce=NULL,submitted_text=NULL,submitted_draft_revision=NULL,owner_pid=NULL,owner_start=NULL WHERE id=?3 AND epoch=?4 AND active_nonce=?5 AND submitted_draft_revision=?2",params![serde_json::to_string(&row).map_err(err)?,to_i64(receipt.draft_revision)?,receipt.id.0,to_i64(receipt.epoch)?,receipt.nonce]).map_err(err)?;
+    Ok(())
+}
+fn cancel_receipt(
+    db: &Connection,
+    receipt: &SubmissionReceipt,
+    restore: bool,
+) -> Result<(), String> {
+    let changed=db.execute("UPDATE conversations SET draft=CASE WHEN ?1 AND draft_revision=?2 AND (draft='' OR draft=submitted_text) THEN submitted_text ELSE draft END,draft_revision=draft_revision+CASE WHEN ?1 AND draft_revision=?2 AND (draft='' OR draft=submitted_text) THEN 1 ELSE 0 END,revision=revision+1,epoch=epoch+1,active_nonce=NULL,submitted_text=NULL,submitted_draft_revision=NULL,owner_pid=NULL,owner_start=NULL WHERE id=?3 AND epoch=?4 AND active_nonce=?5 AND submitted_draft_revision=?2",params![restore,to_i64(receipt.draft_revision)?,receipt.id.0,to_i64(receipt.epoch)?,receipt.nonce]).map_err(err)?;
+    if changed != 1 {
+        return Err("Stale submission receipt: cancellation ignored".into());
+    }
+    Ok(())
 }
 
 fn api_row(id: ConversationId, title: &str) -> WorkspaceRow {

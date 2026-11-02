@@ -10,6 +10,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const HOST: &str = env!("CARGO_BIN_EXE_jterm-sessiond");
@@ -514,4 +516,722 @@ fn native_profile_owner_blocks_cli_handoff_until_guard_releases() {
     )
     .unwrap();
     allowed.wait_exit();
+}
+
+struct MockApi {
+    url: String,
+    requests: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl MockApi {
+    fn new(answer: String) -> Self {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (count, closed, opened) = (requests.clone(), stop.clone(), gate.clone());
+        let worker = std::thread::spawn(move || {
+            let mut children = Vec::new();
+            while !closed.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let (count, closed, opened, answer) = (
+                            count.clone(),
+                            closed.clone(),
+                            opened.clone(),
+                            answer.clone(),
+                        );
+                        children.push(std::thread::spawn(move||{
+                            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                            stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                            let mut request=Vec::new();
+                            let mut chunk=[0u8;4096];
+                            loop {
+                                let Ok(n)=stream.read(&mut chunk) else {return;};
+                                if n==0 {return;}
+                                request.extend_from_slice(&chunk[..n]);
+                                if let Some(boundary)=request.windows(4).position(|w|w==b"\r\n\r\n") {
+                                    let header=String::from_utf8_lossy(&request[..boundary]).to_lowercase();
+                                    let length=header.lines().find_map(|line|line.strip_prefix("content-length:").and_then(|s|s.trim().parse::<usize>().ok())).unwrap_or(0);
+                                    if request.len()>=boundary+4+length {break;}
+                                }
+                                assert!(request.len()<2*1024*1024);
+                            }
+                            count.fetch_add(1,Ordering::SeqCst);
+                            let mut open=opened.0.lock().unwrap();
+                            while !*open && !closed.load(Ordering::SeqCst) {open=opened.1.wait_timeout(open,Duration::from_millis(20)).unwrap().0;}
+                            drop(open);
+                            let body=serde_json::json!({"message":{"role":"assistant","content":answer},"done":true}).to_string();
+                            let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                            let _=stream.write_all(response.as_bytes());
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("local mock accept failed: {e}"),
+                }
+            }
+            for child in children {
+                child.join().unwrap();
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            gate,
+            worker: Some(worker),
+        }
+    }
+    fn wait_request(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.requests.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "local mock received no request");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn release(&self) {
+        *self.gate.0.lock().unwrap() = true;
+        self.gate.1.notify_all();
+    }
+}
+impl Drop for MockApi {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.release();
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+struct ApiFrontend {
+    child: Child,
+    record: serde_json::Value,
+}
+impl ApiFrontend {
+    fn new(h: &Harness, url: &str) -> Self {
+        let config = h.root.join("api-frontend-config.json");
+        let output = h.root.join("api-frontend-record.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({"state":h.state,"url":url,"output":output}).to_string(),
+        )
+        .unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api_frontend_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("JTERM_TEST_API_FRONTEND", &config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let record = loop {
+            if let Ok(bytes) = std::fs::read(&output) {
+                if let Ok(record) = serde_json::from_slice(&bytes) {
+                    break record;
+                }
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "frontend fixture ended before admission"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "frontend fixture was not admitted"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Self { child, record }
+    }
+    fn receipt(&self) -> SubmissionReceipt {
+        serde_json::from_value(self.record["receipt"].clone()).unwrap()
+    }
+    fn control(&self) -> ApiControlLease {
+        serde_json::from_value(self.record["control"].clone()).unwrap()
+    }
+    fn exit(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+impl Drop for ApiFrontend {
+    fn drop(&mut self) {
+        self.exit();
+    }
+}
+
+#[test]
+#[ignore = "internal RPC fixture invoked by API lifecycle tests"]
+fn api_frontend_fixture() {
+    let path = std::env::var_os("JTERM_TEST_API_FRONTEND").expect("fixture configuration required");
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let client = WorkspaceClient::for_state_dir(config["state"].as_str().unwrap());
+    let receipt = begin_api(&client);
+    let launch = api_launch(receipt.clone(), config["url"].as_str().unwrap());
+    let WorkspaceReply::Api {
+        control: Some(control),
+        ..
+    } = request(
+        &client,
+        WorkspaceCommand::StartApi {
+            launch: Box::new(launch),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("controller required")
+    };
+    std::fs::write(
+        config["output"].as_str().unwrap(),
+        serde_json::json!({"receipt":receipt,"control":control}).to_string(),
+    )
+    .unwrap();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+fn begin_api(client: &WorkspaceClient) -> SubmissionReceipt {
+    let WorkspaceReply::Chat { chat } = request(
+        client,
+        WorkspaceCommand::CreateChat {
+            title: "Detached API fixture".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat required")
+    };
+    let WorkspaceReply::Chat { chat } = request(
+        client,
+        WorkspaceCommand::SetDraft {
+            id: chat.row.id.clone(),
+            expected_revision: chat.draft_revision,
+            text: "persist after GUI exit".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat required")
+    };
+    let WorkspaceReply::Submission { receipt } = request(
+        client,
+        WorkspaceCommand::BeginSubmission {
+            id: chat.row.id,
+            expected_revision: chat.revision,
+            draft_revision: chat.draft_revision,
+            text: "persist after GUI exit".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("receipt required")
+    };
+    receipt
+}
+fn api_launch(receipt: SubmissionReceipt, url: &str) -> ApiLaunch {
+    let client = jterm_core::ai::AiClient::new(
+        jterm_core::ai::Provider::Ollama,
+        None,
+        "fixture",
+        url,
+        64,
+        None,
+        false,
+    )
+    .unwrap();
+    ApiLaunch::new(
+        receipt,
+        &client,
+        None,
+        &[jterm_core::ai::Turn {
+            role: jterm_core::ai::Role::User,
+            text: "persist after GUI exit".into(),
+        }],
+        false,
+    )
+    .unwrap()
+}
+fn api_snapshot(h: &Harness, id: &ConversationId) -> ApiSnapshot {
+    let WorkspaceReply::Api { snapshot, .. } =
+        request(&h.client(), WorkspaceCommand::InspectApi { id: id.clone() }).unwrap()
+    else {
+        panic!("API snapshot required")
+    };
+    snapshot
+}
+fn wait_api(h: &Harness, id: &ConversationId, state: ApiState) -> ApiSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let snapshot = api_snapshot(h, id);
+        if snapshot.state == state {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {state:?}, got {snapshot:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+#[test]
+fn api_survives_frontend_exit_hands_control_over_and_keeps_full_history() {
+    let h = Harness::new();
+    let answer = "durable answer ".repeat(10_000);
+    let server = MockApi::new(answer.clone());
+    let mut frontend = ApiFrontend::new(&h, &server.url);
+    let receipt = frontend.receipt();
+    let old_control = frontend.control();
+    server.wait_request();
+    assert!(request(
+        &h.client(),
+        WorkspaceCommand::AttachApi {
+            id: receipt.id.clone(),
+            epoch: receipt.epoch,
+            view: "second-view".into()
+        }
+    )
+    .is_err());
+    assert!(request(
+        &h.client(),
+        WorkspaceCommand::CancelApi {
+            control: old_control.clone()
+        }
+    )
+    .is_err());
+    request(
+        &h.client(),
+        WorkspaceCommand::StartApi {
+            launch: Box::new(api_launch(receipt.clone(), &server.url)),
+        },
+    )
+    .unwrap();
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    frontend.exit();
+    let WorkspaceReply::Api {
+        control: Some(control),
+        ..
+    } = request(
+        &h.client(),
+        WorkspaceCommand::AttachApi {
+            id: receipt.id.clone(),
+            epoch: receipt.epoch,
+            view: "second-view".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("new control required")
+    };
+    assert_ne!(control.generation, old_control.generation);
+    assert!(request(
+        &h.client(),
+        WorkspaceCommand::CancelApi {
+            control: old_control
+        }
+    )
+    .is_err());
+    let WorkspaceReply::Chat { chat } = request(
+        &h.client(),
+        WorkspaceCommand::LoadChat {
+            id: receipt.id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat required")
+    };
+    request(
+        &h.client(),
+        WorkspaceCommand::SetDraft {
+            id: receipt.id.clone(),
+            expected_revision: chat.draft_revision,
+            text: "a newer independent draft".into(),
+        },
+    )
+    .unwrap();
+    server.release();
+    assert_eq!(
+        wait_api(&h, &receipt.id, ApiState::Completed)
+            .result
+            .as_deref(),
+        Some(answer.as_str())
+    );
+    request(
+        &h.client(),
+        WorkspaceCommand::CompleteSubmission {
+            receipt: receipt.clone(),
+            text: "late GUI text must not replace the durable answer".into(),
+        },
+    )
+    .unwrap();
+    let WorkspaceReply::Messages { messages, .. } = request(
+        &h.client(),
+        WorkspaceCommand::History {
+            id: receipt.id.clone(),
+            before: None,
+            limit: 2,
+        },
+    )
+    .unwrap() else {
+        panic!("history required")
+    };
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].text, answer);
+    let WorkspaceReply::Chat { chat } = request(
+        &h.client(),
+        WorkspaceCommand::LoadChat {
+            id: receipt.id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat required")
+    };
+    assert!(chat.snapshot_json.contains("a newer independent draft"));
+    assert!(chat.snapshot_json.contains(&answer));
+    assert!(!chat.has_older, "the complete pair fits in the active view");
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn api_detach_invalidates_control_and_explicit_cancel_restores_draft() {
+    let h = Harness::new();
+    let server = MockApi::new("must not commit after cancellation".into());
+    let mut frontend = ApiFrontend::new(&h, &server.url);
+    let receipt = frontend.receipt();
+    server.wait_request();
+    frontend.exit();
+    let WorkspaceReply::Api {
+        control: Some(first),
+        ..
+    } = request(
+        &h.client(),
+        WorkspaceCommand::AttachApi {
+            id: receipt.id.clone(),
+            epoch: receipt.epoch,
+            view: "first-view".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("control required")
+    };
+    request(
+        &h.client(),
+        WorkspaceCommand::DetachApi {
+            control: first.clone(),
+        },
+    )
+    .unwrap();
+    let WorkspaceReply::Api {
+        control: Some(second),
+        ..
+    } = request(
+        &h.client(),
+        WorkspaceCommand::AttachApi {
+            id: receipt.id.clone(),
+            epoch: receipt.epoch,
+            view: "replacement-view".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("replacement control required")
+    };
+    assert_ne!(first.generation, second.generation);
+    assert!(request(&h.client(), WorkspaceCommand::CancelApi { control: first }).is_err());
+    request(&h.client(), WorkspaceCommand::CancelApi { control: second }).unwrap();
+    let stopped = wait_api(&h, &receipt.id, ApiState::Cancelled);
+    assert!(stopped.result.is_none());
+    let WorkspaceReply::Chat { chat } = request(
+        &h.client(),
+        WorkspaceCommand::LoadChat {
+            id: receipt.id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat required")
+    };
+    let snapshot = jterm_core::ai::ConversationSnapshot::from_json(&chat.snapshot_json).unwrap();
+    let active = snapshot.active_chat().unwrap();
+    assert_eq!(active.draft(), "persist after GUI exit");
+    assert!(active.turns().is_empty());
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn api_host_restart_marks_unknown_outcome_without_resubmitting() {
+    let mut h = Harness::new();
+    let server = MockApi::new("late unverified answer".into());
+    let mut frontend = ApiFrontend::new(&h, &server.url);
+    let receipt = frontend.receipt();
+    server.wait_request();
+    wait_api(&h, &receipt.id, ApiState::Running);
+    h.host.kill().unwrap();
+    h.host.wait().unwrap();
+    frontend.exit();
+    h.host = Command::new(HOST)
+        .arg("--jterm-session-host")
+        .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while request(&h.client(), WorkspaceCommand::Refresh).is_err() {
+        assert!(Instant::now() < deadline, "replacement host did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let unknown = wait_api(&h, &receipt.id, ApiState::Interrupted);
+    assert!(unknown
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("will not be submitted again"));
+    let WorkspaceReply::Api { snapshot, control } = request(
+        &h.client(),
+        WorkspaceCommand::StartApi {
+            launch: Box::new(api_launch(receipt.clone(), &server.url)),
+        },
+    )
+    .unwrap() else {
+        panic!("persisted execution required")
+    };
+    assert_eq!(snapshot.state, ApiState::Interrupted);
+    assert!(control.is_none());
+    assert!(request(
+        &h.client(),
+        WorkspaceCommand::CancelApi {
+            control: frontend.control()
+        }
+    )
+    .is_err());
+    server.release();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(api_snapshot(&h, &receipt.id).state, ApiState::Interrupted);
+}
+
+#[test]
+fn dropping_api_observer_detaches_without_stopping_or_resubmitting() {
+    let h = Harness::new();
+    let server = MockApi::new("host retained the detached request".into());
+    let mut frontend = ApiFrontend::new(&h, &server.url);
+    let receipt = frontend.receipt();
+    server.wait_request();
+    frontend.exit();
+    let observation = ApiObservation::default();
+    let token = observation.token();
+    let state = h.state.clone();
+    let id = receipt.id.clone();
+    let epoch = receipt.epoch;
+    request(
+        &h.client(),
+        WorkspaceCommand::AttachApi {
+            id: receipt.id.clone(),
+            epoch,
+            view: "drop-view".into(),
+        },
+    )
+    .unwrap();
+    let (ready, watching) = std::sync::mpsc::sync_channel(1);
+    let observer = std::thread::spawn(move || {
+        HostedApiClient::for_state_dir(state).observe(
+            id,
+            epoch,
+            "drop-view".into(),
+            &token,
+            &mut |_| {
+                let _ = ready.try_send(());
+            },
+        )
+    });
+    watching
+        .recv_timeout(Duration::from_secs(5))
+        .expect("observer did not receive its snapshot");
+    drop(observation);
+    assert!(observer.join().unwrap().unwrap_err().contains("detached"));
+    let WorkspaceReply::Api {
+        snapshot,
+        control: Some(_),
+        ..
+    } = request(
+        &h.client(),
+        WorkspaceCommand::AttachApi {
+            id: receipt.id.clone(),
+            epoch,
+            view: "replacement-view".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("detached control was not released")
+    };
+    assert!(snapshot.state.is_live());
+    let WorkspaceReply::Chat { chat } = request(
+        &h.client(),
+        WorkspaceCommand::LoadChat {
+            id: receipt.id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat required")
+    };
+    assert_eq!(chat.api_job.unwrap().user_text, "persist after GUI exit");
+    server.release();
+    wait_api(&h, &receipt.id, ApiState::Completed);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn api_launch_credentials_are_not_debugged_or_persisted() {
+    let h = Harness::new();
+    let server = MockApi::new("credential fixture completed".into());
+    let receipt = begin_api(&h.client());
+    let key = "synthetic-key-kept-only-in-memory-836974";
+    let client = jterm_core::ai::AiClient::new(
+        jterm_core::ai::Provider::Ollama,
+        Some(key.into()),
+        "fixture",
+        &server.url,
+        64,
+        None,
+        true,
+    )
+    .unwrap();
+    let launch = ApiLaunch::new(
+        receipt.clone(),
+        &client,
+        Some("synthetic private system prompt".into()),
+        &[jterm_core::ai::Turn {
+            role: jterm_core::ai::Role::User,
+            text: "synthetic private prompt".into(),
+        }],
+        false,
+    )
+    .unwrap();
+    let debug = format!("{launch:?}");
+    assert!(!debug.contains(key));
+    assert!(!debug.contains("synthetic private"));
+    request(
+        &h.client(),
+        WorkspaceCommand::StartApi {
+            launch: Box::new(launch),
+        },
+    )
+    .unwrap();
+    server.wait_request();
+    server.release();
+    wait_api(&h, &receipt.id, ApiState::Completed);
+    for entry in std::fs::read_dir(&h.state).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            assert!(
+                !bytes
+                    .windows(key.len())
+                    .any(|window| window == key.as_bytes()),
+                "launch credential persisted to {:?}",
+                entry.file_name()
+            );
+        }
+    }
+    let WorkspaceReply::Api { snapshot, .. } =
+        request(&h.client(), WorkspaceCommand::ResolveApi { receipt }).unwrap()
+    else {
+        panic!("durable receipt must resolve")
+    };
+    assert_eq!(snapshot.state, ApiState::Completed);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn resolving_an_unadmitted_api_receipt_restores_only_its_pending_draft() {
+    let h = Harness::new();
+    let receipt = begin_api(&h.client());
+    let WorkspaceReply::Chat { chat } = request(
+        &h.client(),
+        WorkspaceCommand::ResolveApi {
+            receipt: receipt.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("unadmitted request should be rolled back")
+    };
+    assert!(chat.api_job.is_none());
+    let snapshot = jterm_core::ai::ConversationSnapshot::from_json(&chat.snapshot_json).unwrap();
+    assert_eq!(
+        snapshot.active_chat().unwrap().draft(),
+        "persist after GUI exit"
+    );
+    assert!(
+        request(&h.client(), WorkspaceCommand::ResolveApi { receipt }).is_err(),
+        "a resolved receipt must never acquire new authority"
+    );
+}
+
+#[test]
+fn restored_api_view_hides_only_the_acknowledged_draft_version() {
+    let h = Harness::new();
+    let server = MockApi::new("versioned draft completed".into());
+    let receipt = begin_api(&h.client());
+    request(
+        &h.client(),
+        WorkspaceCommand::StartApi {
+            launch: Box::new(api_launch(receipt.clone(), &server.url)),
+        },
+    )
+    .unwrap();
+    server.wait_request();
+    let WorkspaceReply::Chat { chat } = request(
+        &h.client(),
+        WorkspaceCommand::LoadChat {
+            id: receipt.id.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat required")
+    };
+    let snapshot = jterm_core::ai::ConversationSnapshot::from_json(&chat.snapshot_json).unwrap();
+    assert_eq!(
+        snapshot.active_chat().unwrap().draft(),
+        "",
+        "reopened view must not duplicate the submitted message in its composer"
+    );
+    let WorkspaceReply::Chat { chat } = request(
+        &h.client(),
+        WorkspaceCommand::SetDraft {
+            id: receipt.id.clone(),
+            expected_revision: chat.draft_revision,
+            text: "persist after GUI exit".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("new draft required")
+    };
+    let snapshot = jterm_core::ai::ConversationSnapshot::from_json(&chat.snapshot_json).unwrap();
+    assert_eq!(
+        snapshot.active_chat().unwrap().draft(),
+        "persist after GUI exit",
+        "equal text with a newer revision is an independent draft"
+    );
+    server.release();
+    wait_api(&h, &receipt.id, ApiState::Completed);
+    let WorkspaceReply::Chat { chat } =
+        request(&h.client(), WorkspaceCommand::LoadChat { id: receipt.id }).unwrap()
+    else {
+        panic!("chat required")
+    };
+    let snapshot = jterm_core::ai::ConversationSnapshot::from_json(&chat.snapshot_json).unwrap();
+    assert_eq!(
+        snapshot.active_chat().unwrap().draft(),
+        "persist after GUI exit"
+    );
 }
