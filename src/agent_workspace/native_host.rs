@@ -859,18 +859,20 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
                 .view
                 .as_ref()
                 .is_some_and(|view| view.provider_thread_id.is_some());
-        let task = safe_task_projection(
-            job.tasks.get(id).ok_or("Historical task is unavailable")?,
-            projection_policy(job),
-        );
+        let raw = job.tasks.get(id).ok_or("Historical task is unavailable")?;
+        let task = safe_task_projection(raw, projection_policy(job));
+        let evidence_redacted = job.snapshot.validation_evidence_redacted
+            || raw.validation_command() != task.validation_command();
         let can_validate = validation_available(job, locked);
-        if job.snapshot.can_start_validation != can_validate
+        if job.snapshot.validation_evidence_redacted != evidence_redacted
+            || job.snapshot.can_start_validation != can_validate
             || job.snapshot.ownership_locked != locked
             || job.snapshot.can_resume != can_resume
             || job.snapshot.can_continue_in_terminal != can_continue
             || job.snapshot.task != task
         {
             job.snapshot.sequence += 1;
+            job.snapshot.validation_evidence_redacted = evidence_redacted;
             job.snapshot.task = task;
             job.snapshot.ownership_locked = locked;
             job.snapshot.can_resume = can_resume;
