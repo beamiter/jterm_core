@@ -1725,6 +1725,21 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Preserve the prior exit evidence while marking a changed review point.
+    pub fn invalidate_validation_evidence(
+        &mut self,
+        task_id: TaskId,
+        detail: String,
+    ) -> Result<(), TaskError> {
+        let task = self.task_mut(task_id)?;
+        if task.validation.status == TaskValidationStatus::Passed {
+            task.validation.status = TaskValidationStatus::Inconclusive;
+            task.validation.status_detail = Some(detail);
+            task.updated_at_ms = unix_time_ms();
+        }
+        Ok(())
+    }
+
     /// Accept a reviewed task only after its latest validation passed.
     pub fn complete_after_validation(&mut self, task_id: TaskId) -> Result<(), TaskError> {
         if self.has_active_agent_event_stream(task_id) {

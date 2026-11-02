@@ -132,6 +132,7 @@ pub(super) struct PrintProviderSpec {
     /// Exact-ID continuation. None keeps the provider's one-shot contract.
     pub resume_argv: Option<ResumeArgv>,
     pub parse: fn(&str) -> PrintSignal,
+    pub usage: Option<fn(&str) -> Option<crate::agent_task::AgentUsage>>,
 }
 
 /// Shared native driver for one-shot print/stream-json CLIs.
@@ -667,6 +668,39 @@ struct PrintWorker {
 }
 
 impl PrintWorker {
+    fn handle_line(&mut self, line: &str) {
+        let signal = (self.spec.parse)(line);
+        // A print invocation has one final result. Repeated result records,
+        // even with a different provider UUID, must not add the same turn twice.
+        if let Some(mut usage) = (!self.saw_result)
+            .then(|| self.spec.usage.and_then(|parse| parse(line)))
+            .flatten()
+        {
+            let expected = self
+                .expected_session_id
+                .clone()
+                .or_else(|| self.view.lock().provider_thread_id.clone());
+            // An unrelated report cannot contaminate this session's totals.
+            if expected.is_some() && usage.provider_session_id == expected {
+                let turn = self.turn_id.to_string();
+                usage.ensure_report_id(&turn);
+                let changed = {
+                    let mut view = self.view.lock();
+                    if let Some(previous) = &mut view.usage {
+                        previous.accumulate(usage, &turn)
+                    } else {
+                        view.usage = Some(usage);
+                        true
+                    }
+                };
+                if changed {
+                    self.emit_update(AgentEventKind::UsageUpdated, None);
+                }
+            }
+        }
+        self.handle(signal);
+    }
+
     fn fail(&mut self, cause: CodexAppServerExitCause, detail: String) {
         if self.fatal.is_none() {
             self.fatal = Some(bounded_detail(&detail));
@@ -1107,7 +1141,7 @@ impl PrintWorker {
                 let mut stdout_done = false;
                 select! {
                     recv(lines) -> message => match message {
-                        Ok(StdoutMessage::Line(line)) => self.handle((self.spec.parse)(&line)),
+                        Ok(StdoutMessage::Line(line)) => self.handle_line(&line),
                         Ok(StdoutMessage::Overlong) => {
                             self.fail(
                                 CodexAppServerExitCause::ProtocolFailed,
@@ -1394,6 +1428,7 @@ mod tests {
         argv: |argv, _| Ok(argv.to_vec()),
         resume_argv: None,
         parse: |_| PrintSignal::Ignored,
+        usage: None,
     };
 
     fn test_worker(

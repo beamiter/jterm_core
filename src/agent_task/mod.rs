@@ -66,6 +66,7 @@ pub mod query;
 pub mod replay_text;
 pub mod runtime;
 pub mod task;
+pub mod usage;
 pub mod validation;
 pub mod worktree;
 
@@ -130,6 +131,7 @@ pub use task::{
     AgentProvider, AgentTask, NewTask, TaskError, TaskId, TaskManager, TaskRuntimeKind, TaskSource,
     TaskStatus, TaskTerminalRole, TaskValidationState, TaskValidationStatus,
 };
+pub use usage::{AgentUsage, AgentUsageScope, AgentUsageSource};
 #[allow(unused_imports)]
 pub use validation::{
     prepare_task_validation, PreparedTaskValidation, TaskValidationError, TaskValidationPath,

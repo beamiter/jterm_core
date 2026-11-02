@@ -6,6 +6,9 @@ work surface. CLI conversations open in a real terminal; API chats and native
 tasks use their own central views. The inspector is secondary. Inspecting a
 result does not start an Agent. Explicit activation opens that exact source.
 
+The shared v2 contracts, deployment requirements and evidence boundaries are
+documented in [Agent Workspace v2](agent-workspace-v2.md).
+
 ## User workflow
 
 1. Search the sidebar or scope it to a project, running work, or work needing
@@ -66,11 +69,23 @@ all targets before a transaction begins.
 | `store` | Single-writer SQLite transactions, migrations, history and draft ownership |
 | `ownership` | Private paths, process start identity, inherited kernel leases |
 | `host` | Persistent PTYs, terminal snapshots, attachment ownership, cleanup |
+| `projection` / `query` / `actions` | Shared status, attention, capabilities, structured queries and shortcut scope contracts |
+| `search` / `context` / `result` | Indexed text, explicit context handoffs and worktree validation evidence |
+| `queue` / `overview` | Durable dependency intent and read-only observed resource counts |
 
 Each frontend calls `run_embedded_if_requested()` before GUI initialization.
 Its installed executable can launch the host and attachment without a separately
 installed helper. The standalone `jterm-sessiond` binary is available for
 packaging and integration tests.
+
+This release uses **workspace protocol 2** and **SQLite schema 5**. Install the
+shared core, embedded host and all four frontend builds together. A protocol
+mismatch fails explicitly; updating a GUI does not authorize killing an older
+host, taking over its leases or replaying an uncertain request. Finish or stop
+active work through the currently installed version before a planned host
+restart. Closing a GUI alone does not stop a hosted provider. Older binaries
+must not open a database after its schema has been upgraded. Back up the private
+state directory before a planned downgrade; schema rollback is not automatic.
 
 `WorkspaceClient::new()` performs no filesystem/socket I/O on the UI thread.
 Its worker handles commands with bounded queues: 32 requests and 64 replies.
@@ -87,9 +102,10 @@ from the state root.
 
 ## Shared API conversations
 
-The daemon serializes database writes. SQLite schema version 4 retains verified submission-owner process identity,
+The daemon serializes database writes. SQLite schema version 5 retains verified submission-owner process identity,
 per-view reading positions, durable API and native execution snapshots, and
-replay-proof native operation identities; unsupported
+replay-proof native operation identities, and adds shared search documents,
+context revisions and dependency intent; unsupported
 future schemas fail explicitly.
 
 A bounded snapshot feeds ChatStore and model context. A separate message table

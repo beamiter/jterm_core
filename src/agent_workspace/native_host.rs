@@ -24,6 +24,12 @@ struct ValidationExecution {
     runtime: Option<super::host::RuntimeHandle>,
     cancelled: bool,
     last_output_sequence: Option<u64>,
+    finishing: Option<
+        std::sync::mpsc::Receiver<
+            Result<crate::agent_task::worktree::WorktreeReviewSnapshot, String>,
+        >,
+    >,
+    exit_code: Option<i32>,
 }
 struct Job {
     snapshot: NativeSnapshot,
@@ -212,6 +218,7 @@ impl NativeManager {
             handoff_pending: false,
             terminal: None,
             validation: None,
+            review_baseline: crate::agent_task::worktree::capture_task_review(&launch.task).ok(),
             operations: vec![],
         };
         // Durable intent precedes any preparation/provider worker release.
@@ -668,6 +675,8 @@ impl NativeManager {
                     runtime: None,
                     cancelled: false,
                     last_output_sequence: None,
+                    finishing: None,
+                    exit_code: None,
                 });
                 job.snapshot.validation = Some(HostedValidationSnapshot {
                     run_id,
@@ -675,6 +684,7 @@ impl NativeManager {
                     terminal: None,
                     output: String::new(),
                     output_truncated: false,
+                    evidence: None,
                 });
                 job.snapshot.ownership_locked = true;
                 Ok(())
@@ -697,7 +707,21 @@ impl NativeManager {
                     return Err("Stop native/CLI work and finish validation before changing the task lifecycle".into());
                 }
                 match mutation {
-                    NativeTaskMutation::Complete => job.tasks.complete_after_validation(task_id),
+                    NativeTaskMutation::Complete => {
+                        let task = job.tasks.get(task_id).ok_or("Task is unavailable")?;
+                        let current = crate::agent_task::worktree::capture_task_review(task)?;
+                        let valid = job.snapshot.validation.as_ref().and_then(|value| value.evidence.as_ref())
+                            .is_some_and(|evidence| evidence.unchanged_after_run && evidence.fingerprint == current.fingerprint
+                                && evidence.command == task.validation_command().unwrap_or("")
+                                && evidence.shell == task.validation_shell().unwrap_or(""));
+                        if !valid {
+                            let detail = "Validation evidence is stale or unbound to the current worktree. Run validation again before accepting.";
+                            job.tasks.invalidate_validation_evidence(task_id, detail.into()).map_err(|error| error.to_string())?;
+                            refresh(job, AgentRuntimePollReport::default(), store)?;
+                            return Err(detail.into());
+                        }
+                        job.tasks.complete_after_validation(task_id)
+                    }
                     NativeTaskMutation::AcceptReviewed => {
                         job.tasks.complete_after_manual_review(task_id)
                     }
@@ -1053,6 +1077,7 @@ fn poll_validation(
                         runtimes.retain(|_, runtime| runtime.snapshot.lock().state.is_live());
                     }
                     let cwd = prepared.prepared.cwd.clone();
+                    snapshot.evidence = Some(prepared.evidence.clone());
                     let id = super::model::ConversationId(format!(
                         "jterm:validation:{}:{}",
                         task_id, snapshot.run_id
@@ -1110,18 +1135,82 @@ fn poll_validation(
             }
         }
         if !state.state.is_live() {
-            if state.cleanup_verified {
-                job.tasks
-                    .handle_terminal_session_exit(&snapshot.run_id, state.exit_code);
-                completed = true;
+            if state.cleanup_verified && validation.finishing.is_none() {
+                let task = job.tasks.get(task_id).cloned();
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                if let Some(task) = task {
+                    if std::thread::Builder::new()
+                        .name("jterm-validation-evidence".into())
+                        .spawn(move || {
+                            let _ =
+                                tx.send(crate::agent_task::worktree::capture_task_review(&task));
+                        })
+                        .is_ok()
+                    {
+                        validation.finishing = Some(rx);
+                        validation.exit_code = state.exit_code;
+                    } else {
+                        job.tasks
+                            .handle_terminal_session_exit(&snapshot.run_id, None);
+                        snapshot.output.push_str(
+                            "\nValidation evidence could not be collected; result is unconfirmed.",
+                        );
+                        completed = true;
+                    }
+                } else {
+                    job.tasks
+                        .handle_terminal_session_exit(&snapshot.run_id, None);
+                    completed = true;
+                }
                 changed = true;
-            } else if !job.snapshot.interrupted {
+            } else if !state.cleanup_verified && !job.snapshot.interrupted {
                 job.snapshot.interrupted = true;
                 job.snapshot.can_prompt = false;
                 job.snapshot.can_resume = false;
                 snapshot.output.push_str("\nValidation cleanup is unconfirmed; ownership remains locked and no command will be repeated.");
                 changed = true;
             }
+        }
+    }
+    if let Some(receiver) = &validation.finishing {
+        match receiver.try_recv() {
+            Ok(result) => {
+                let unchanged = result
+                    .as_ref()
+                    .ok()
+                    .zip(snapshot.evidence.as_ref())
+                    .is_some_and(|(current, evidence)| current.fingerprint == evidence.fingerprint);
+                if let Some(evidence) = &mut snapshot.evidence {
+                    evidence.completed_at_ms = Some(super::model::now_ms());
+                    evidence.unchanged_after_run = unchanged;
+                    if !unchanged {
+                        evidence.detail = Some(result.err().unwrap_or_else(|| "Worktree changed during validation; run it again on the reviewed changes".into()));
+                    }
+                }
+                job.tasks.handle_terminal_session_exit(
+                    &snapshot.run_id,
+                    if unchanged {
+                        validation.exit_code
+                    } else {
+                        None
+                    },
+                );
+                if !unchanged {
+                    snapshot.output.push_str("\nValidation evidence is stale or unavailable; no passing result was recorded.");
+                }
+                completed = true;
+                changed = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                job.tasks
+                    .handle_terminal_session_exit(&snapshot.run_id, None);
+                snapshot
+                    .output
+                    .push_str("\nValidation evidence worker stopped; result is unconfirmed.");
+                completed = true;
+                changed = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
     job.snapshot.validation = Some(snapshot);
@@ -1219,6 +1308,7 @@ mod historical_projection_tests {
             redact_secrets: true,
             validation_evidence_redacted: false,
             validation: None,
+            review_baseline: None,
         };
         store.save_native(&snapshot).unwrap();
         let mut manager = NativeManager::new(paths);

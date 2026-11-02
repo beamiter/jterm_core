@@ -60,9 +60,11 @@
 //! snapshots have a 2 MiB wire budget. API history is separately paged in
 //! complete user/assistant pairs and never inferred from a terminal screen.
 
+mod actions;
 mod api;
 mod api_host;
 mod client;
+mod context;
 mod host;
 mod model;
 mod native;
@@ -70,10 +72,18 @@ mod native_handoff;
 mod native_host;
 mod native_validation;
 mod native_view;
+mod overview;
 mod ownership;
+mod projection;
 mod protocol;
+mod query;
+mod queue;
+mod result;
+mod search;
+mod ssh;
 mod store;
 
+pub use actions::{WorkspaceAction, WorkspaceActionDescriptor, WorkspaceInputScope};
 pub use api::{
     ApiControlLease, ApiLaunch, ApiObservation, ApiObservationToken, ApiRequest, ApiSnapshot,
     ApiState, HostedApiClient,
@@ -82,18 +92,33 @@ pub use client::{
     managed_launch, managed_session_running, owned_terminal_launch, run_embedded_if_requested,
     WorkspaceClient,
 };
+pub use context::*;
 pub use model::*;
 pub use native::{
     HostedValidationSnapshot, NativeAction, NativeCatalogEntry, NativeControlLease, NativeLaunch,
     NativeLaunchContext, NativeReportEvent, NativeSnapshot, NativeTaskMutation,
     OwnedTerminalDescriptor,
 };
+pub use overview::WorkspaceOverview;
 pub use ownership::NativeSessionLease;
+pub use projection::{
+    workspace_attention_counts, WorkspaceAttention, WorkspaceCapabilities, WorkspaceFacts,
+    WorkspacePresentation, WorkspacePrimaryAction,
+};
 pub use protocol::{WorkspaceCommand, WorkspaceEvent, WorkspaceReply};
+pub use query::{WorkspaceQuery, WorkspaceSearchIndex, WorkspaceSort, WORKSPACE_QUERY_MAX_BYTES};
+pub use queue::{
+    WorkspaceExecutionLocation, WorkspaceQueueChange, WorkspaceQueueIntent, WorkspaceQueueRow,
+    WorkspaceQueueSnapshot, WorkspaceQueueState, WorkspaceQueueUpdate, WorkspaceQueuedIntent,
+    WORKSPACE_QUEUE_DEPENDENCIES, WORKSPACE_QUEUE_LIMIT,
+};
+pub use result::*;
+pub use search::*;
+pub use ssh::WorkspaceSshHost;
 
 /// Host protocol version. Older installed frontends fail clearly instead of
 /// interpreting a newer host's records with an incompatible schema.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Worker-only location for durable, isolated native provider profiles.
 pub fn native_profiles_directory() -> Result<std::path::PathBuf, String> {

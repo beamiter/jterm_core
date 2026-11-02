@@ -256,7 +256,13 @@ static CLAUDE_SPEC: PrintProviderSpec = PrintProviderSpec {
     argv: claude_print_argv,
     resume_argv: Some(claude_resume_argv),
     parse: claude_print_signal,
+    usage: Some(claude_usage),
 };
+
+fn claude_usage(line: &str) -> Option<crate::agent_task::AgentUsage> {
+    let value = parse_json_record(line).ok().flatten()?;
+    crate::agent_task::AgentUsage::claude_result(&value)
+}
 
 fn claude_print_signal(line: &str) -> PrintSignal {
     match parse_stream_json_line(line) {
@@ -584,7 +590,8 @@ done
 printf '%s|%s\n' "$mode" "$id" >> "$CLAUDE_CONFIG_DIR/invocations"
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$id"
 printf '{"type":"assistant","message":{"content":[{"type":"text","text":"Reviewed."}]}}\n'
-printf '{"type":"result","subtype":"success","is_error":false,"result":"Reviewed."}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"result":"Reviewed.","session_id":"%s","uuid":"%s","total_cost_usd":0.01,"usage":{"input_tokens":10,"output_tokens":5}}\n' "$id" "$mode"
+printf '{"type":"result","subtype":"success","is_error":false,"result":"Reviewed.","session_id":"%s","uuid":"duplicate-%s","total_cost_usd":0.01,"usage":{"input_tokens":10,"output_tokens":5}}\n' "$id" "$mode"
 "#,
         )
         .unwrap();
@@ -617,6 +624,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"Reviewed
         events.extend(drain_to_review(&mut driver, &mut manager, task_id, 2));
         let view = driver.view_snapshot();
         assert_eq!(view.turn_history.len(), 1);
+        let usage = view
+            .usage
+            .as_ref()
+            .expect("both print-turn results retained");
+        assert_eq!(
+            usage.reports, 2,
+            "duplicate result records must not bill a turn twice"
+        );
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(10));
+        assert_eq!(usage.reported_cost_usd.as_deref(), Some("0.02"));
         assert_eq!(view.turn_history[0].agent_text, "Reviewed.");
         assert_eq!(view.displayed_turn_ordinal, Some(2));
         assert_eq!(
@@ -773,6 +791,15 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"Reviewed
         }
         let view = driver.view_snapshot();
         assert_eq!(view.provider_thread_id.as_deref(), Some(SESSION));
+        let usage = view.usage.as_ref().expect("provider result usage retained");
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(10));
+        assert_eq!(usage.total_tokens, None, "do not infer provider totals");
+        assert_eq!(usage.reported_cost_usd.as_deref(), Some("0.01"));
+        assert_eq!(usage.reports, 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.kind(), AgentEventKind::UsageUpdated)));
         assert!(view
             .agent_text
             .starts_with("I'll check the build.Fixed the import."));

@@ -120,9 +120,15 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
     let mut runtimes: HashMap<ConversationId, RuntimeHandle> = HashMap::new();
     let mut api = super::api_host::ApiManager::new(paths.clone());
     let mut native = super::native_host::NativeManager::new(paths.clone());
+    let result_workers = Arc::new(AtomicUsize::new(0));
+    let mut last_index_batch = Instant::now();
     loop {
         api.poll(&mut store);
         native.poll(&mut store, &mut runtimes);
+        if last_index_batch.elapsed() >= Duration::from_millis(500) {
+            let _ = store.advance_search_index();
+            last_index_batch = Instant::now();
+        }
         for _ in 0..8 {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -145,6 +151,40 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
         }
         match rx.recv_timeout(Duration::from_millis(15)) {
             Ok(HostRequest::Command(command, owner, reply)) => {
+                if let WorkspaceCommand::InspectResult { id } = &command {
+                    let snapshot = store.native_snapshot(id).and_then(|value| {
+                        value.ok_or_else(|| {
+                            "No hosted task result exists for this conversation".to_string()
+                        })
+                    });
+                    match snapshot {
+                        Err(error) => {
+                            let _ = reply.try_send(Err(error));
+                        }
+                        Ok(snapshot) => {
+                            if result_workers.load(Ordering::Relaxed) >= 4 {
+                                let _ = reply.try_send(Err("Result inspection is busy; retry after another review finishes".into()));
+                                continue;
+                            }
+                            result_workers.fetch_add(1, Ordering::Relaxed);
+                            let count = result_workers.clone();
+                            let worker_reply = reply.clone();
+                            if let Err(error) = std::thread::Builder::new()
+                                .name("jterm-result-review".into())
+                                .spawn(move || {
+                                    let report = super::WorkspaceResultReport::inspect(&snapshot);
+                                    count.fetch_sub(1, Ordering::Relaxed);
+                                    let _ = worker_reply
+                                        .try_send(Ok(WorkspaceReply::Result { report }));
+                                })
+                            {
+                                result_workers.fetch_sub(1, Ordering::Relaxed);
+                                let _ = reply.try_send(Err(error.to_string()));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let response = (|| {
                     store.reap_abandoned_requests()?;
                     let command = match api.handle(command, owner.clone(), &mut store) {
@@ -158,25 +198,25 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                     match command {
                         WorkspaceCommand::Refresh => store.rows().map(|mut rows| {
                             for row in &mut rows {
-                                if let Some(runtime) = runtimes.get(&row.id) {
-                                    row.runtime = runtime.snapshot.lock().state;
-                                } else if row.kind == ConversationKind::Cli {
-                                    row.runtime = if lease_is_held(&paths.lease(&row.id))
-                                        && read_lease(&paths.lease(&row.id)).is_some_and(|r| {
-                                            r.id == row.id
-                                                && process_matches(
-                                                    r.runtime.pid,
-                                                    &r.runtime.process_start,
-                                                )
-                                        }) {
-                                        RuntimeState::Conflict
-                                    } else {
-                                        RuntimeState::Idle
-                                    };
-                                }
+                                project_runtime_row(row, &runtimes, &paths);
                             }
                             WorkspaceReply::Catalog { rows }
                         }),
+                        WorkspaceCommand::CatalogPage { before, limit } => {
+                            let mut reply = store.catalog_page(before, limit)?;
+                            if let WorkspaceReply::CatalogPage { rows, .. } = &mut reply {
+                                for row in rows.iter_mut() {
+                                    project_runtime_row(row, &runtimes, &paths);
+                                }
+                            }
+                            Ok(reply)
+                        }
+                        WorkspaceCommand::Search { request } => {
+                            let page = store.search_with(&request, |row| {
+                                project_runtime_row(row, &runtimes, &paths)
+                            })?;
+                            Ok(WorkspaceReply::Search { page })
+                        }
                         WorkspaceCommand::Runtime { id } => runtimes
                             .get(&id)
                             .map(|r| WorkspaceReply::Runtime {
@@ -320,6 +360,33 @@ fn attach(
     Ok(runtime)
 }
 
+fn project_runtime_row(
+    row: &mut WorkspaceRow,
+    runtimes: &HashMap<ConversationId, RuntimeHandle>,
+    paths: &Paths,
+) {
+    if let Some(runtime) = runtimes.get(&row.id) {
+        row.runtime = runtime.snapshot.lock().state;
+        if row.kind == ConversationKind::Cli {
+            row.facts.capabilities = super::WorkspaceCapabilities::cli();
+        }
+    } else if row.kind == ConversationKind::Cli {
+        row.runtime = if lease_is_held(&paths.lease(&row.id))
+            && read_lease(&paths.lease(&row.id)).is_some_and(|record| {
+                record.id == row.id
+                    && process_matches(record.runtime.pid, &record.runtime.process_start)
+            }) {
+            RuntimeState::Conflict
+        } else {
+            RuntimeState::Idle
+        };
+        // Capability comes from a host-supported adapter, not scanned history.
+        if matches!(row.provider.as_str(), "Codex" | "Claude") {
+            row.facts.capabilities = super::WorkspaceCapabilities::cli();
+        }
+    }
+}
+
 fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -335,10 +402,15 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
             }
             let owner = peer_identity(&stream).ok_or("Cannot verify workspace client process")?;
             let (tx, rx) = bounded(1);
+            let timeout = if matches!(&command, WorkspaceCommand::InspectResult { .. }) {
+                55
+            } else {
+                8
+            };
             host.try_send(HostRequest::Command(command, owner, tx))
                 .map_err(|_| "Session host request queue is busy")?;
             let result = rx
-                .recv_timeout(Duration::from_secs(8))
+                .recv_timeout(Duration::from_secs(timeout))
                 .map_err(|_| "Workspace request timed out")?;
             write_frame(&mut stream, &Response::Reply(result))
         }

@@ -329,6 +329,8 @@ pub struct CodexPersistedTurn {
 /// Cheap clone of the worker's bounded presentation state.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexAppServerViewSnapshot {
+    #[serde(default)]
+    pub usage: Option<crate::agent_task::AgentUsage>,
     pub persisted_history: Arc<[CodexPersistedTurn]>,
     pub history_cursor: Option<String>,
     pub history_loading: bool,
@@ -362,6 +364,7 @@ pub struct CodexAppServerViewSnapshot {
 impl Default for CodexAppServerViewSnapshot {
     fn default() -> Self {
         Self {
+            usage: None,
             persisted_history: Arc::from([]),
             history_cursor: None,
             history_loading: false,
@@ -3054,6 +3057,9 @@ impl ProtocolMachine {
             }
             "thread/tokenUsage/updated" => {
                 self.require_active_correlation(params)?;
+                if let Some(usage) = crate::agent_task::AgentUsage::codex(params) {
+                    self.view.lock().usage = Some(usage);
+                }
                 self.emit_update(AgentEventKind::UsageUpdated, None)?;
             }
             "serverRequest/resolved" => {
@@ -5477,6 +5483,45 @@ mod tests {
             )
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn usage_notifications_replace_cumulative_totals_and_reject_other_threads() {
+        let (mut machine, mut writes, receiver, view, _) = active_machine();
+        let update = |thread: &str, total: u64| {
+            json!({
+                "method": "thread/tokenUsage/updated", "params": {
+                    "threadId": thread, "turnId": "turn-1", "tokenUsage": {"total": {
+                        "inputTokens": total - 20, "outputTokens": 20,
+                        "totalTokens": total, "cachedInputTokens": 40, "reasoningOutputTokens": 5
+                    }}
+                }
+            })
+        };
+        for total in [120, 150, 150] {
+            machine
+                .handle_message(update("thread-1", total), &mut writes, false)
+                .unwrap();
+        }
+        assert_eq!(view.lock().usage.as_ref().unwrap().total_tokens, Some(150));
+        assert_eq!(view.lock().usage.as_ref().unwrap().reported_cost_usd, None);
+        assert!(machine
+            .handle_message(update("another-thread", 900), &mut writes, false)
+            .is_err());
+        assert_eq!(view.lock().usage.as_ref().unwrap().total_tokens, Some(150));
+        assert_eq!(
+            (0..3)
+                .filter(|_| matches!(
+                    receiver.try_recv().unwrap().kind(),
+                    AgentEventKind::UsageUpdated
+                ))
+                .count(),
+            3
+        );
+        assert!(
+            writes.pending.is_empty(),
+            "usage observation cannot emit a provider command"
+        );
     }
 
     #[test]

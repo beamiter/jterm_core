@@ -55,6 +55,44 @@ pub enum WorkspaceCommand {
         control: super::api::ApiControlLease,
     },
     Refresh,
+    /// Stable numeric cursor, independent of changing activity timestamps.
+    CatalogPage {
+        before: Option<u64>,
+        limit: usize,
+    },
+    Search {
+        request: super::search::WorkspaceSearchRequest,
+    },
+    /// Read the exact indexed revision. This never attaches to a provider.
+    ReadSearchDocument {
+        conversation: ConversationId,
+        event_id: String,
+        revision: String,
+    },
+    /// Explicit read-only history import, with a bounded batch and provenance.
+    IndexText {
+        documents: Vec<super::search::WorkspaceTextDocument>,
+    },
+    ReadContext {
+        id: ConversationId,
+    },
+    SaveContext {
+        id: ConversationId,
+        expected_revision: u64,
+        context: super::WorkspaceContext,
+    },
+    BuildHandoff {
+        id: ConversationId,
+        expected_revision: u64,
+        target_provider: String,
+    },
+    QueueUpdate {
+        update: super::WorkspaceQueueUpdate,
+    },
+    QueueSnapshot,
+    InspectResult {
+        id: ConversationId,
+    },
     /// Bounded provider discovery projection; no transcript or credentials.
     /// Existing local organization takes precedence over refreshed metadata.
     IndexSessions {
@@ -151,6 +189,29 @@ pub enum WorkspaceReply {
     },
     Catalog {
         rows: Vec<WorkspaceRow>,
+    },
+    CatalogPage {
+        rows: Vec<WorkspaceRow>,
+        next_before: Option<u64>,
+        total: usize,
+    },
+    Search {
+        page: super::search::WorkspaceSearchPage,
+    },
+    SearchDocument {
+        document: super::search::WorkspaceTextDocument,
+    },
+    Context {
+        context: super::WorkspaceContext,
+    },
+    Handoff {
+        packet: super::WorkspaceHandoff,
+    },
+    Queue {
+        snapshot: super::WorkspaceQueueSnapshot,
+    },
+    Result {
+        report: super::WorkspaceResultReport,
     },
     Imported {
         mappings: Vec<LegacyChatMapping>,

@@ -149,6 +149,7 @@ static KIMI_SPEC: PrintProviderSpec = PrintProviderSpec {
     argv: kimi_print_argv,
     resume_argv: None,
     parse: kimi_print_signal,
+    usage: None,
 };
 
 fn kimi_print_signal(line: &str) -> PrintSignal {

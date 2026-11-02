@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub(super) struct PreparedValidation {
     pub prepared: PreparedTaskValidation,
     pub argv: Vec<String>,
+    pub evidence: super::WorkspaceValidationEvidence,
 }
 pub(super) fn prepare(task: &AgentTask) -> Result<PreparedValidation, String> {
     let prepared = prepare_task_validation(task).map_err(|e| e.to_string())?;
@@ -38,7 +39,24 @@ pub(super) fn prepare(task: &AgentTask) -> Result<PreparedValidation, String> {
         _ => return Err("Unsupported source shell for isolated validation".into()),
     }
     argv.extend(["-c".into(), prepared.command.clone()]);
-    Ok(PreparedValidation { prepared, argv })
+    let review = crate::agent_task::worktree::capture_task_review(task)?;
+    let evidence = super::WorkspaceValidationEvidence {
+        fingerprint: review.fingerprint,
+        head: review.head,
+        base_commit: review.base_commit,
+        command: prepared.command.clone(),
+        cwd: prepared.cwd.to_string_lossy().into_owned(),
+        shell: prepared.source_shell.clone(),
+        started_at_ms: review.captured_at_ms,
+        completed_at_ms: None,
+        unchanged_after_run: false,
+        detail: None,
+    };
+    Ok(PreparedValidation {
+        prepared,
+        argv,
+        evidence,
+    })
 }
 
 pub(super) fn spawn(

@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod review;
+pub use review::{capture_task_review, WorktreeReviewSnapshot};
+
 pub const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_GIT_STDOUT_BYTES: usize = 1024 * 1024;
 pub const MAX_GIT_STDERR_BYTES: usize = 64 * 1024;

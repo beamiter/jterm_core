@@ -220,12 +220,16 @@ pub struct NativeSnapshot {
     pub operations: Vec<String>,
     #[serde(default)]
     pub validation: Option<HostedValidationSnapshot>,
+    #[serde(default)]
+    pub review_baseline: Option<crate::agent_task::worktree::WorktreeReviewSnapshot>,
 }
 impl NativeSnapshot {
     pub fn task_id(&self) -> TaskId {
         self.task.id
     }
-    pub(crate) fn row(&self) -> WorkspaceRow {
+    /// Read-only catalog projection. No control lease or executable action is
+    /// transferred with this row.
+    pub fn row(&self) -> WorkspaceRow {
         use super::model::{ConversationKind, RuntimeState};
         use crate::agent_task::TaskStatus;
         WorkspaceRow {
@@ -243,6 +247,7 @@ impl NativeSnapshot {
             archived: self.task.status == TaskStatus::Archived,
             pinned: false,
             tags: vec![],
+            facts: super::WorkspaceFacts::from_native(self),
             runtime: if self.terminal.is_some() && self.ownership_locked && !self.interrupted {
                 RuntimeState::Running
             } else if self.interrupted
@@ -327,6 +332,17 @@ pub(crate) fn safe_snapshot_projection(snapshot: &NativeSnapshot) -> NativeSnaps
     if let Some(validation) = &mut safe.validation {
         if policy.redact_secrets {
             validation.output = crate::redact::redact_secrets(&validation.output);
+            if let Some(evidence) = &mut validation.evidence {
+                let command = crate::redact::redact_secrets(&evidence.command);
+                safe.validation_evidence_redacted |= command != evidence.command;
+                evidence.command = command;
+                evidence.cwd = crate::redact::redact_secrets(&evidence.cwd);
+                evidence.shell = crate::redact::redact_secrets(&evidence.shell);
+                evidence.detail = evidence
+                    .detail
+                    .as_deref()
+                    .map(crate::redact::redact_secrets);
+            }
         }
     }
     if !policy.redact_secrets {
@@ -430,4 +446,6 @@ pub struct HostedValidationSnapshot {
     pub terminal: Option<OwnedTerminalDescriptor>,
     pub output: String,
     pub output_truncated: bool,
+    #[serde(default)]
+    pub evidence: Option<super::WorkspaceValidationEvidence>,
 }

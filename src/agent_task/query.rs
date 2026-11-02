@@ -105,11 +105,11 @@ struct Term {
     negated: bool,
 }
 
-struct Token {
-    value: String,
-    negated: bool,
+pub(crate) struct Token {
+    pub(crate) value: String,
+    pub(crate) negated: bool,
     // A fully quoted term such as "status:failed" is literal text.
-    literal: bool,
+    pub(crate) literal: bool,
 }
 
 impl DashboardQuery {
@@ -278,6 +278,12 @@ pub fn dashboard_query_error(text: &str) -> Option<String> {
 }
 
 fn tokenize(text: &str) -> Result<Vec<Token>, String> {
+    tokenize_with_limit(text, MAX_TERMS)
+}
+
+/// Shared lexical rules for task and unified workspace search. Each caller
+/// retains its own byte budget and supported field validation.
+pub(crate) fn tokenize_with_limit(text: &str, max_terms: usize) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {
@@ -318,14 +324,14 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             negated,
             literal,
         });
-        if tokens.len() > MAX_TERMS {
-            return Err(format!("Use at most {MAX_TERMS} task search terms."));
+        if tokens.len() > max_terms {
+            return Err(format!("Use at most {max_terms} search terms."));
         }
     }
     Ok(tokens)
 }
 
-fn normalize(value: &str) -> String {
+pub(crate) fn normalize(value: &str) -> String {
     value
         .trim()
         .to_ascii_lowercase()
@@ -340,7 +346,7 @@ fn normalize(value: &str) -> String {
         .collect()
 }
 
-fn status(value: &str) -> Option<TaskStatus> {
+pub(crate) fn status(value: &str) -> Option<TaskStatus> {
     Some(match value {
         "created" | "not-started" => TaskStatus::Created,
         "starting" => TaskStatus::Starting,
@@ -364,7 +370,7 @@ fn provider(value: &str) -> Option<AgentProvider> {
     }
 }
 
-fn runtime(value: &str) -> Option<TaskRuntimeKind> {
+pub(crate) fn runtime(value: &str) -> Option<TaskRuntimeKind> {
     Some(match value {
         "unassigned" | "not-started" => TaskRuntimeKind::Unassigned,
         "terminal" | "pty" => TaskRuntimeKind::Terminal,
@@ -374,7 +380,7 @@ fn runtime(value: &str) -> Option<TaskRuntimeKind> {
     })
 }
 
-fn validation(value: &str) -> Option<TaskValidationStatus> {
+pub(crate) fn validation(value: &str) -> Option<TaskValidationStatus> {
     Some(match value {
         "not-run" | "none" => TaskValidationStatus::NotRun,
         "running" => TaskValidationStatus::Running,

@@ -24,6 +24,7 @@ pub struct WorkspaceClient {
     commands: Sender<(u64, WorkspaceCommand)>,
     events: Receiver<WorkspaceEvent>,
     next: Arc<AtomicU64>,
+    read_only: bool,
 }
 
 impl Default for WorkspaceClient {
@@ -42,7 +43,7 @@ impl std::fmt::Debug for WorkspaceClient {
 
 impl WorkspaceClient {
     pub fn new() -> Self {
-        Self::worker(None)
+        Self::worker(None, None)
     }
     /// Explicit endpoint/executable for packaged hosts and integration tests.
     /// Like new(), this starts no process until a command is sent.
@@ -50,20 +51,37 @@ impl WorkspaceClient {
         state_dir: impl AsRef<std::path::Path>,
         executable: impl AsRef<std::path::Path>,
     ) -> Self {
-        Self::worker(Some((
-            state_dir.as_ref().to_path_buf(),
-            executable.as_ref().to_path_buf(),
-        )))
+        Self::worker(
+            Some((
+                state_dir.as_ref().to_path_buf(),
+                executable.as_ref().to_path_buf(),
+            )),
+            None,
+        )
     }
     /// Connect only to an already-running host in an isolated state directory.
     /// Never tries to launch the test harness as a frontend executable.
     pub fn for_state_dir(state_dir: impl AsRef<std::path::Path>) -> Self {
-        Self::worker(Some((
-            state_dir.as_ref().to_path_buf(),
-            std::path::PathBuf::new(),
-        )))
+        Self::worker(
+            Some((state_dir.as_ref().to_path_buf(), std::path::PathBuf::new())),
+            None,
+        )
     }
-    fn worker(endpoint: Option<(std::path::PathBuf, std::path::PathBuf)>) -> Self {
+    /// Observe an explicitly configured remote host. No process starts until
+    /// a permitted read-only command is sent, and no operation is retried.
+    pub fn with_ssh_host(host: super::WorkspaceSshHost) -> Result<Self, String> {
+        host.validate()?;
+        Ok(Self::worker(None, Some(host)))
+    }
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn worker(
+        endpoint: Option<(std::path::PathBuf, std::path::PathBuf)>,
+        ssh: Option<super::WorkspaceSshHost>,
+    ) -> Self {
+        let read_only = ssh.is_some();
         let (commands, rx) = bounded::<(u64, WorkspaceCommand)>(32);
         let (tx, events) = bounded(64);
         std::thread::Builder::new()
@@ -71,6 +89,9 @@ impl WorkspaceClient {
             .spawn(move || {
                 for (request_id, command) in rx {
                     let result = (|| {
+                        if let Some(host) = &ssh {
+                            return host.request(command);
+                        }
                         let (paths, exe, start) = match &endpoint {
                             Some((state, exe)) => (
                                 Paths::at(state.clone())?,
@@ -97,9 +118,13 @@ impl WorkspaceClient {
             commands,
             events,
             next: Arc::new(AtomicU64::new(1)),
+            read_only,
         }
     }
     pub fn send(&self, command: WorkspaceCommand) -> Result<u64, String> {
+        if self.read_only && !super::ssh::is_read_only_command(&command) {
+            return Err("SSH Workspace is read-only; this operation was not sent".into());
+        }
         let request_id = self.next.fetch_add(1, Ordering::Relaxed);
         self.commands.try_send((request_id, command)).map_err(|_| {
             "Workspace queue is full or unavailable; retry after pending operations finish"
@@ -116,8 +141,13 @@ pub(super) fn command_request(
     mut stream: UnixStream,
     command: WorkspaceCommand,
 ) -> Result<WorkspaceReply, String> {
+    let timeout = if matches!(&command, WorkspaceCommand::InspectResult { .. }) {
+        60
+    } else {
+        10
+    };
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(timeout)))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -212,6 +242,25 @@ pub fn run_embedded_if_requested() -> Option<i32> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let flag = args.next()?;
+    if flag == super::ssh::COMMAND_STDIO_FLAG {
+        if args.next().is_some() {
+            return Some(2);
+        }
+        return Some(match super::ssh::run_stdio() {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("Remote workspace: {error}");
+                1
+            }
+        });
+    }
+    if flag == super::ssh::HOST_ID_FLAG {
+        if args.next().is_some() {
+            return Some(2);
+        }
+        println!("{}", super::local_host_id());
+        return Some(0);
+    }
     if flag == super::api::API_WORKER_FLAG {
         if args.next().is_some() {
             return Some(2);

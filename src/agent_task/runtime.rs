@@ -469,6 +469,14 @@ impl AgentRuntimeManager {
     pub fn needs_host_poll(&self) -> bool {
         self.remote.is_some()
     }
+    /// Latest host-owned catalog facts, without acquiring control or starting
+    /// execution. Prefer this to reconstructing lifecycle from rendered text.
+    pub fn workspace_row(&self, task_id: TaskId) -> Option<crate::agent_workspace::WorkspaceRow> {
+        self.remote
+            .as_ref()?
+            .state(task_id)
+            .map(|snapshot| snapshot.row())
+    }
     pub fn conversation_id(
         &self,
         task_id: TaskId,

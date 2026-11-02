@@ -6,8 +6,11 @@ use super::protocol::{WorkspaceCommand, WorkspaceReply};
 use crate::ai::{ChatSnapshot, ConversationSnapshot, Role, Turn};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Duration;
+mod context;
 mod hosted_api;
 mod hosted_native;
+mod queue;
+mod search;
 
 const MAX_MESSAGE: usize = super::api::API_RESULT_BYTES;
 const MAX_DRAFT: usize = 64 * 1024;
@@ -55,7 +58,7 @@ impl Store {
                 r.get(0)
             })
             .map_err(err)?;
-        if !(1..=4).contains(&version) {
+        if !(1..=5).contains(&version) {
             return Err(format!(
                 "Unsupported Agent Workspace database version {version}"
             ));
@@ -84,9 +87,12 @@ impl Store {
                 conversation_id TEXT NOT NULL REFERENCES native_jobs(id) ON DELETE CASCADE,
                 incarnation TEXT NOT NULL, operation TEXT NOT NULL,
                 PRIMARY KEY(conversation_id,incarnation,operation));
-            UPDATE schema_version SET version=4; COMMIT;",
+            COMMIT;",
         )
         .map_err(err)?;
+        search::migrate(&db, version)?;
+        context::migrate(&db)?;
+        queue::migrate(&db)?;
         // A restarted host records unknown outcomes without replaying model
         // operations. Surviving worker/PTY descendants retain kernel leases;
         // a newer draft remains independent from that previous execution.
@@ -105,7 +111,7 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT row_json,active_nonce FROM conversations ORDER BY numeric_id DESC LIMIT ?1",
+                "SELECT row_json,active_nonce FROM conversations ORDER BY COALESCE(json_extract(row_json,'$.pinned'),0) DESC,numeric_id DESC LIMIT ?1",
             )
             .map_err(err)?;
         let mapped = stmt
@@ -115,34 +121,9 @@ impl Store {
             .map_err(err)?;
         let mut rows = Vec::new();
         for value in mapped {
-            let (json, active) = value.map_err(err)?;
+            let (json, _active) = value.map_err(err)?;
             let mut row: WorkspaceRow = serde_json::from_str(&json).map_err(err)?;
-            if row.kind == ConversationKind::Api {
-                row.runtime = if let Some(nonce) = active {
-                    let hosted: Option<String> = self
-                        .db
-                        .query_row(
-                            "SELECT snapshot FROM api_jobs WHERE id=?1 AND nonce=?2",
-                            params![row.id.0, nonce],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .map_err(err)?;
-                    if hosted
-                        .as_deref()
-                        .map(serde_json::from_str::<super::api::ApiSnapshot>)
-                        .transpose()
-                        .map_err(err)?
-                        .is_some_and(|job| !job.state.is_live())
-                    {
-                        RuntimeState::Conflict
-                    } else {
-                        RuntimeState::Running
-                    }
-                } else {
-                    RuntimeState::Idle
-                };
-            }
+            self.hydrate_row(&mut row)?;
             rows.push(row);
         }
         rows.sort_by(|a, b| {
@@ -196,6 +177,40 @@ impl Store {
         self.reap_abandoned_requests()?;
         match command {
             WorkspaceCommand::Refresh => Ok(WorkspaceReply::Catalog { rows: self.rows()? }),
+            WorkspaceCommand::CatalogPage { before, limit } => self.catalog_page(before, limit),
+            WorkspaceCommand::Search { request } => Ok(WorkspaceReply::Search {
+                page: self.search(&request)?,
+            }),
+            WorkspaceCommand::ReadSearchDocument {
+                conversation,
+                event_id,
+                revision,
+            } => Ok(WorkspaceReply::SearchDocument {
+                document: self.read_search_document(&conversation, &event_id, &revision)?,
+            }),
+            WorkspaceCommand::IndexText { documents } => {
+                self.index_external_text(documents)?;
+                Ok(WorkspaceReply::Ack)
+            }
+            WorkspaceCommand::ReadContext { id } => Ok(WorkspaceReply::Context {
+                context: self.read_context(&id)?,
+            }),
+            WorkspaceCommand::SaveContext {
+                id,
+                expected_revision,
+                context,
+            } => Ok(WorkspaceReply::Context {
+                context: self.save_context(&id, expected_revision, context)?,
+            }),
+            WorkspaceCommand::BuildHandoff {
+                id,
+                expected_revision,
+                target_provider,
+            } => Ok(WorkspaceReply::Handoff {
+                packet: self.build_handoff(&id, expected_revision, &target_provider)?,
+            }),
+            WorkspaceCommand::QueueUpdate { update } => self.queue_update(update),
+            WorkspaceCommand::QueueSnapshot => self.queue_snapshot(),
             WorkspaceCommand::IndexSessions { sessions } => {
                 if sessions.len() > 2048 {
                     return Err("Provider index exceeds its 2048-session budget".into());
@@ -212,6 +227,7 @@ impl Store {
                         // a live process. Local task owners overlay their
                         // own runtime, and the host overlays managed PTYs.
                         row.runtime = RuntimeState::Idle;
+                        row.facts = row.facts.recorded_only();
                         if row.kind == ConversationKind::Task
                             && self.native_snapshot(&row.id)?.is_some()
                         {
@@ -397,6 +413,7 @@ impl Store {
                 restore_draft,
             } => self.cancel(&receipt, restore_draft),
             WorkspaceCommand::StartNative { .. }
+            | WorkspaceCommand::InspectResult { .. }
             | WorkspaceCommand::NativeCatalog { .. }
             | WorkspaceCommand::InspectNative { .. }
             | WorkspaceCommand::AttachNative { .. }
@@ -872,6 +889,10 @@ fn api_row(id: ConversationId, title: &str) -> WorkspaceRow {
         pinned: false,
         tags: Vec::new(),
         runtime: RuntimeState::Idle,
+        facts: super::WorkspaceFacts {
+            capabilities: super::WorkspaceCapabilities::api(),
+            ..Default::default()
+        },
     }
 }
 fn append_turns(db: &Connection, id: &ConversationId, turns: &[Turn]) -> Result<(), String> {
@@ -890,6 +911,7 @@ fn append_turns(db: &Connection, id: &ConversationId, turns: &[Turn]) -> Result<
             ],
         )
         .map_err(err)?;
+        search::index_api_message(db, id, db.last_insert_rowid(), &turn.text)?;
     }
     Ok(())
 }

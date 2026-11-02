@@ -16,7 +16,12 @@ use std::time::{Duration, Instant};
 
 const HOST: &str = env!("CARGO_BIN_EXE_jterm-sessiond");
 fn host_executable() -> PathBuf {
-    HOST.into()
+    // A root-owned checkout may be inaccessible to the unprivileged UID used
+    // to exercise automatic-helper trust policy. Test runners may copy this
+    // exact built helper to an accessible fixture directory.
+    std::env::var_os("JTERM_TEST_HOST_EXECUTABLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| HOST.into())
 }
 
 struct Harness {
@@ -54,7 +59,7 @@ impl Harness {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let host = Command::new(HOST)
+        let host = Command::new(host_executable())
             .arg("--jterm-session-host")
             .env("JTERM_WORKSPACE_STATE_DIR", &state)
             .env("JTERM_TEST_TRACE", &trace)
@@ -105,7 +110,7 @@ impl Harness {
     }
     fn attach(&self) -> Terminal {
         let launch = managed_launch(&self.session).unwrap();
-        let mut command = Command::new(HOST);
+        let mut command = Command::new(host_executable());
         command
             .args(launch.args)
             .current_dir(launch.cwd)
@@ -429,7 +434,7 @@ fn restarted_host_cannot_duplicate_or_stop_a_surviving_runtime() {
     first.wait_exit();
     assert!(process_live(original.pid));
 
-    h.host = Command::new(HOST)
+    h.host = Command::new(host_executable())
         .arg("--jterm-session-host")
         .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
         .env("JTERM_TEST_TRACE", &h.trace)
@@ -976,7 +981,7 @@ fn api_host_restart_marks_unknown_outcome_without_resubmitting() {
     h.host.kill().unwrap();
     h.host.wait().unwrap();
     frontend.exit();
-    h.host = Command::new(HOST)
+    h.host = Command::new(host_executable())
         .arg("--jterm-session-host")
         .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
         .stdin(Stdio::null())
@@ -1242,7 +1247,7 @@ fn api_worker_starts_after_the_running_hosts_executable_was_unlinked() {
     h.host.kill().unwrap();
     h.host.wait().unwrap();
     let executable = h.root.join("bin/private-session-host");
-    std::fs::copy(HOST, &executable).unwrap();
+    std::fs::copy(host_executable(), &executable).unwrap();
     h.host = Command::new(&executable)
         .arg("--jterm-session-host")
         .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
@@ -1606,7 +1611,7 @@ fn native_host_crash_preserves_history_and_refuses_surviving_owner() {
     h.host.kill().unwrap();
     h.host.wait().unwrap();
     assert!(process_live(pid));
-    h.host = Command::new(HOST)
+    h.host = Command::new(host_executable())
         .arg("--jterm-session-host")
         .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
         .stdin(Stdio::null())
@@ -1964,6 +1969,202 @@ fn stopped_native_for_validation(
     .unwrap();
     wait_native(&client, &id, |s| !s.ownership_locked);
     (launch, id, control)
+}
+
+#[test]
+fn workspace_v2_search_and_handoff_preserve_exact_evidence_without_starting_a_provider() {
+    let h = Harness::new();
+    let client = h.client();
+    let WorkspaceReply::Chat { chat } = request(
+        &client,
+        WorkspaceCommand::CreateChat {
+            title: "Unicode material".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("chat")
+    };
+    let id = chat.row.id;
+    request(
+        &client,
+        WorkspaceCommand::IndexText {
+            documents: vec![WorkspaceTextDocument {
+                conversation: id.clone(),
+                event_id: "external:fixture:1".into(),
+                revision: "fixture-r1".into(),
+                source: SearchSource::ImportedHistory,
+                message_sequence: None,
+                text: "中文 evidence for a new task".into(),
+                truncated: false,
+            }],
+        },
+    )
+    .unwrap();
+    let WorkspaceReply::Search { page } = request(
+        &client,
+        WorkspaceCommand::Search {
+            request: WorkspaceSearchRequest {
+                query: "中文".into(),
+                conversation: Some(id.clone()),
+                limit: 10,
+                ..Default::default()
+            },
+        },
+    )
+    .unwrap() else {
+        panic!("search")
+    };
+    assert_eq!(page.hits.len(), 1);
+    let hit = &page.hits[0];
+    let WorkspaceReply::SearchDocument { document } = request(
+        &client,
+        WorkspaceCommand::ReadSearchDocument {
+            conversation: id.clone(),
+            event_id: hit.anchor.event_id.clone(),
+            revision: hit.anchor.revision.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("document")
+    };
+    let mut context = WorkspaceContext::empty(id.clone());
+    context.goal = "Review the indexed evidence".into();
+    context.materials.push(WorkspaceMaterial {
+        id: "material-1".into(),
+        label: "Selected excerpt".into(),
+        kind: MaterialKind::ConversationExcerpt,
+        text: document.text,
+        source: Some(WorkspaceMaterialSource {
+            conversation: id.clone(),
+            event_id: document.event_id,
+            revision: document.revision,
+        }),
+        truncated: false,
+    });
+    let WorkspaceReply::Context { context } = request(
+        &client,
+        WorkspaceCommand::SaveContext {
+            id: id.clone(),
+            expected_revision: 0,
+            context,
+        },
+    )
+    .unwrap() else {
+        panic!("context")
+    };
+    let WorkspaceReply::Handoff { packet } = request(
+        &client,
+        WorkspaceCommand::BuildHandoff {
+            id: id.clone(),
+            expected_revision: context.revision,
+            target_provider: "Claude".into(),
+        },
+    )
+    .unwrap() else {
+        panic!("handoff")
+    };
+    assert!(packet.body.contains("Claude (new conversation)"));
+    assert!(packet.body.contains("external:fixture:1 @ fixture-r1"));
+    assert!(
+        !h.trace.exists(),
+        "Reading or preparing material started a provider"
+    );
+    let WorkspaceReply::CatalogPage { total, .. } = request(
+        &client,
+        WorkspaceCommand::CatalogPage {
+            before: None,
+            limit: 10,
+        },
+    )
+    .unwrap() else {
+        panic!("catalog")
+    };
+    assert_eq!(
+        total, 1,
+        "Handoff preview created an implicit target conversation"
+    );
+}
+
+#[test]
+fn validation_result_is_bound_to_current_worktree_and_stale_acceptance_is_rejected() {
+    use jterm_core::agent_task::{TaskStatus, TaskValidationStatus};
+    let h = Harness::new();
+    let (launch, id, control) = stopped_native_for_validation(&h, "printf validation-ok");
+    let client = h.client();
+    let start_validation = |sequence| WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation: uuid::Uuid::new_v4().to_string(),
+        action: Box::new(NativeAction::Validate {
+            expected_sequence: sequence,
+        }),
+    };
+    request(
+        &client,
+        start_validation(inspect_native(&client, &id).sequence),
+    )
+    .unwrap();
+    let passed = wait_native(&client, &id, |snapshot| {
+        snapshot.task.validation.status == TaskValidationStatus::Passed
+            && !snapshot.ownership_locked
+    });
+    assert!(
+        passed
+            .validation
+            .as_ref()
+            .unwrap()
+            .evidence
+            .as_ref()
+            .unwrap()
+            .unchanged_after_run
+    );
+    let WorkspaceReply::Result { report } =
+        request(&client, WorkspaceCommand::InspectResult { id: id.clone() }).unwrap()
+    else {
+        panic!("result")
+    };
+    assert!(report.validation_current);
+    std::fs::write(
+        launch.task.worktree_path.join("tracked"),
+        "external modification after validation",
+    )
+    .unwrap();
+    let WorkspaceReply::Result { report } =
+        request(&client, WorkspaceCommand::InspectResult { id: id.clone() }).unwrap()
+    else {
+        panic!("result")
+    };
+    assert!(!report.validation_current);
+    assert!(report
+        .current
+        .as_ref()
+        .unwrap()
+        .diff
+        .contains("external modification"));
+    let accept = |sequence| WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation: uuid::Uuid::new_v4().to_string(),
+        action: Box::new(NativeAction::MutateTask {
+            expected_sequence: sequence,
+            mutation: NativeTaskMutation::Complete,
+        }),
+    };
+    assert!(request(&client, accept(passed.sequence)).is_err());
+    let stale = inspect_native(&client, &id);
+    assert_eq!(
+        stale.task.validation.status,
+        TaskValidationStatus::Inconclusive
+    );
+    assert_eq!(stale.task.status, TaskStatus::ReadyForReview);
+    request(&client, start_validation(stale.sequence)).unwrap();
+    let passed = wait_native(&client, &id, |snapshot| {
+        snapshot.task.validation.status == TaskValidationStatus::Passed
+            && !snapshot.ownership_locked
+    });
+    request(&client, accept(passed.sequence)).unwrap();
+    assert_eq!(
+        inspect_native(&client, &id).task.status,
+        TaskStatus::Completed
+    );
 }
 
 #[test]

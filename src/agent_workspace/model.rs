@@ -74,6 +74,10 @@ pub struct WorkspaceRow {
     pub pinned: bool,
     pub tags: Vec<String>,
     pub runtime: RuntimeState,
+    /// Optional presentation evidence. Old rows remain readable without
+    /// advertising capabilities or converting historical input into actions.
+    #[serde(default)]
+    pub facts: super::WorkspaceFacts,
 }
 
 impl WorkspaceRow {
@@ -90,21 +94,16 @@ impl WorkspaceRow {
             pinned: false,
             tags: Vec::new(),
             runtime: RuntimeState::Idle,
+            facts: super::WorkspaceFacts {
+                branch: session.branch.clone(),
+                recorded_status: Some(session.status),
+                capabilities: super::WorkspaceCapabilities::cli(),
+                ..super::WorkspaceFacts::default()
+            },
         })
     }
     pub fn matches(&self, query: &str) -> bool {
-        let haystack = format!(
-            "{} {} {} {} {}",
-            self.title,
-            self.provider,
-            self.cwd,
-            self.preview,
-            self.tags.join(" ")
-        )
-        .to_lowercase();
-        query
-            .split_whitespace()
-            .all(|part| haystack.contains(&part.to_lowercase()))
+        super::WorkspaceQuery::parse(query).is_ok_and(|query| query.matches(self))
     }
 }
 
@@ -118,13 +117,24 @@ pub struct WorkspaceFilter {
 
 impl WorkspaceFilter {
     pub fn project(&self, rows: &[WorkspaceRow]) -> Vec<WorkspaceRow> {
+        self.project_checked(rows).unwrap_or_default()
+    }
+
+    pub fn query_error(&self) -> Option<String> {
+        super::WorkspaceQuery::parse(&self.query).err()
+    }
+
+    /// Parse once per query; malformed constraints cannot silently widen the
+    /// selected scope. Native adapters should retain an index for long lists.
+    pub fn project_checked(&self, rows: &[WorkspaceRow]) -> Result<Vec<WorkspaceRow>, String> {
+        let query = super::WorkspaceQuery::parse(&self.query)?;
         let mut result: Vec<_> = rows
             .iter()
             .filter(|row| {
-                (self.include_archived || !row.archived)
+                (self.include_archived || query.includes_archived() || !row.archived)
                     && self.kind.is_none_or(|kind| row.kind == kind)
                     && (!self.live_only || row.runtime.is_live())
-                    && row.matches(&self.query)
+                    && query.matches(row)
             })
             .cloned()
             .collect();
@@ -134,7 +144,7 @@ impl WorkspaceFilter {
                 .then(b.updated_at_ms.cmp(&a.updated_at_ms))
                 .then(a.id.cmp(&b.id))
         });
-        result
+        Ok(result)
     }
 }
 

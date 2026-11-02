@@ -26,6 +26,9 @@ impl Store {
                     .map_err(err)?;
             }
             self.db.execute("INSERT INTO native_jobs(id,task_id,incarnation,sequence,snapshot) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET incarnation=excluded.incarnation,sequence=excluded.sequence,snapshot=excluded.snapshot",params![snapshot.id.0,snapshot.task.id.to_string(),snapshot.incarnation,to_i64(snapshot.sequence)?,json]).map_err(err)?;
+            if !snapshot.live && !snapshot.preparing && !snapshot.handoff_pending {
+                self.index_native_text(snapshot)?;
+            }
             Ok(())
         })();
         if result.is_ok() {
