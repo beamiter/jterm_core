@@ -128,3 +128,5 @@ pub(crate) fn isolated_lease_test(name: &str) -> bool {
 pub(crate) fn cleanup_cli_grant(profile: &std::path::Path) -> Result<(), String> {
     native_handoff::cleanup_stale_grant(profile)
 }
+
+pub(crate) use native::safe_snapshot_projection;

@@ -464,15 +464,19 @@ impl NativeManager {
                 .decide_approval(task_id, id, decision)
                 .map_err(|e| e.to_string()),
             NativeAction::Prompt { text, policy, .. } => {
-                job.policy = policy;
-                job.policy_origin = job
-                    .controller
-                    .as_ref()
-                    .map(|c| (c.owner.clone(), c.view.clone()));
                 job.snapshot.redact_secrets |= policy.redact_secrets;
-                job.runtime
+                let result = job
+                    .runtime
                     .prompt_native(&job.tasks, task_id, &text, policy)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string());
+                if result.is_ok() {
+                    job.policy = policy;
+                    job.policy_origin = job
+                        .controller
+                        .as_ref()
+                        .map(|c| (c.owner.clone(), c.view.clone()));
+                }
+                result
             }
             NativeAction::Finish => job
                 .runtime
@@ -551,7 +555,11 @@ impl NativeManager {
                         .filter(|v| v.provider_thread_id.is_some())
                         .ok_or("No exact provider thread is recorded")?;
                     job.runtime.restore_hosted_codex(task_id, home, view);
-                    let mut task = job.snapshot.task.clone();
+                    let mut task = job
+                        .tasks
+                        .get(job.snapshot.task.id)
+                        .ok_or("Task is unavailable")?
+                        .clone();
                     task.status = TaskStatus::ReadyForReview;
                     task.status_detail=Some("Explicitly restoring the exact provider thread; previous operations are not repeated".into());
                     job.tasks.project_hosted_task(task, false)?;
@@ -568,6 +576,12 @@ impl NativeManager {
                 }
             }
             NativeAction::Handoff { context } => {
+                if !matches!(
+                    job.snapshot.task.status,
+                    TaskStatus::ReadyForReview | TaskStatus::Failed
+                ) {
+                    return Err("This task lifecycle cannot hand off to a provider CLI".into());
+                }
                 context.validate()?;
                 let requested = if job.snapshot.task.provider == AgentProvider::Codex {
                     &context.codex_home
@@ -696,6 +710,8 @@ impl NativeManager {
         };
         result?;
         refresh(job, AgentRuntimePollReport::default(), store)?;
+        // Consent/privacy changes must persist even when no runtime projection changed.
+        store.save_native(&job.snapshot)?;
         Self::inspect(&control.id.clone(), store, Some(control))
     }
     pub fn poll(
@@ -732,12 +748,16 @@ impl NativeManager {
                         job.terminal_runtime = Some(runtime);
                         job.snapshot.terminal = Some(prepared.session);
                         job.snapshot.can_continue_in_terminal = false;
-                        let mut task = job.snapshot.task.clone();
+                        let mut task = job
+                            .tasks
+                            .get(job.snapshot.task.id)
+                            .ok_or("Task is unavailable")?
+                            .clone();
                         task.status = TaskStatus::Working;
                         task.status_detail =
                             Some("Continuing the exact provider conversation in Terminal".into());
                         job.tasks.project_hosted_task(task.clone(), false)?;
-                        job.snapshot.task = task;
+                        job.snapshot.task = safe_task_projection(&task, projection_policy(job));
                         Ok(())
                     });
                     if let Err(error) = result {
@@ -777,7 +797,9 @@ impl NativeManager {
             job.terminal_runtime = None;
             job.snapshot.terminal = None;
             job.snapshot.ownership_locked = false;
-            let mut task = job.snapshot.task.clone();
+            let Some(mut task) = job.tasks.get(job.snapshot.task.id).cloned() else {
+                return;
+            };
             task.status = if state.exit_code == Some(0) {
                 TaskStatus::ReadyForReview
             } else {

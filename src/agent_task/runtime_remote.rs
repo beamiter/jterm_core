@@ -15,6 +15,12 @@ enum Pending {
     Start(TaskId),
     Attach(TaskId, Option<ws::NativeAction>),
     Action(TaskId, Option<String>),
+    CasPolicy {
+        id: TaskId,
+        action: ws::NativeAction,
+        baseline: Box<ws::NativeSnapshot>,
+        policy: NativePromptPolicy,
+    },
     Detach,
 }
 pub(super) struct NativeRemote {
@@ -200,7 +206,8 @@ impl NativeRemote {
                 Pending::Inspect(id)
                 | Pending::Start(id)
                 | Pending::Attach(id, _)
-                | Pending::Action(id, _) => Some(*id),
+                | Pending::Action(id, _)
+                | Pending::CasPolicy { id, .. } => Some(*id),
                 _ => None,
             };
             if let Some(id) = task_id {
@@ -364,10 +371,109 @@ impl NativeRemote {
                             result: Ok(()),
                         });
                     }
-                    if gained_control {
+                    let attached_cas = matches!(&pending,
+                        Pending::Attach(_, Some(action)) if cas_sequence(action).is_some());
+                    if gained_control && !attached_cas {
                         let _ = self.action(id, ws::NativeAction::Policy { policy });
                     }
+                    if let Pending::CasPolicy {
+                        mut action,
+                        baseline,
+                        policy: requested,
+                        ..
+                    } = pending
+                    {
+                        let current = &self.cached[&id].snapshot;
+                        let mut expected = (*baseline).clone();
+                        expected.redact_secrets = true;
+                        let mut expected = ws::safe_snapshot_projection(&expected);
+                        // Policy admission always adds its durable operation;
+                        // refresh adds a second sequence only if its projection
+                        // changed. No unrelated transition may be rebased away.
+                        let expected_sequence = baseline
+                            .sequence
+                            .saturating_add(1)
+                            .saturating_add(u64::from(expected.task != baseline.task));
+                        expected.sequence = current.sequence;
+                        expected.operations = current.operations.clone();
+                        let same_projection = match (
+                            serde_json::to_value(&expected),
+                            serde_json::to_value(current),
+                        ) {
+                            (Ok(expected), Ok(current)) => expected == current,
+                            _ => false,
+                        };
+                        let compatible = requested == policy
+                            && current.redact_secrets
+                            && current.sequence == expected_sequence
+                            && same_projection;
+                        if compatible {
+                            set_cas_sequence(&mut action, current.sequence);
+                            if let Err(error) = self.action(id, action) {
+                                self.validation_requests.remove(&id);
+                                report.issues.push(AgentRuntimeIssue {
+                                    task_id: id,
+                                    detail: error.to_string(),
+                                });
+                            }
+                        } else {
+                            self.validation_requests.remove(&id);
+                            report.issues.push(AgentRuntimeIssue {
+                                task_id: id,
+                                detail: "Task or sharing settings changed while privacy settings were being acknowledged; refresh before trying again".into(),
+                            });
+                        }
+                        continue;
+                    }
                     if let Pending::Attach(_, Some(action)) = pending {
+                        if let Some(expected_sequence) = cas_sequence(&action) {
+                            let baseline = self.cached[&id].snapshot.clone();
+                            if baseline.sequence != expected_sequence {
+                                self.validation_requests.remove(&id);
+                                report.issues.push(AgentRuntimeIssue {
+                                    task_id: id,
+                                    detail: "Task changed before its control lease was attached; refresh before trying again".into(),
+                                });
+                                continue;
+                            }
+                            let result = if policy.redact_secrets && !baseline.redact_secrets {
+                                let Some(control) = self.cached[&id].control.clone() else {
+                                    self.validation_requests.remove(&id);
+                                    report.issues.push(AgentRuntimeIssue {
+                                        task_id: id,
+                                        detail: "Attached task has no writable control lease"
+                                            .into(),
+                                    });
+                                    continue;
+                                };
+                                self.send(
+                                    Command::ControlNative {
+                                        control,
+                                        operation: uuid::Uuid::new_v4().to_string(),
+                                        action: Box::new(ws::NativeAction::Policy { policy }),
+                                    },
+                                    Pending::CasPolicy {
+                                        id,
+                                        action,
+                                        baseline: Box::new(baseline),
+                                        policy,
+                                    },
+                                )
+                            } else {
+                                // These actions do not start a provider or
+                                // change its consent; an extra passive Policy
+                                // would invalidate their own sequence guard.
+                                self.action(id, action)
+                            };
+                            if let Err(error) = result {
+                                self.validation_requests.remove(&id);
+                                report.issues.push(AgentRuntimeIssue {
+                                    task_id: id,
+                                    detail: error.to_string(),
+                                });
+                            }
+                            continue;
+                        }
                         let stale_policy = match &action {
                             ws::NativeAction::Prompt {
                                 policy: requested, ..
@@ -610,5 +716,24 @@ fn pending_prompt_receipt(pending: &Pending) -> Option<String> {
         Pending::Action(_, receipt) => receipt.clone(),
         Pending::Attach(_, Some(action)) => action_prompt_receipt(action),
         _ => None,
+    }
+}
+
+fn cas_sequence(action: &ws::NativeAction) -> Option<u64> {
+    match action {
+        ws::NativeAction::Validate { expected_sequence }
+        | ws::NativeAction::MutateTask {
+            expected_sequence, ..
+        } => Some(*expected_sequence),
+        _ => None,
+    }
+}
+fn set_cas_sequence(action: &mut ws::NativeAction, sequence: u64) {
+    match action {
+        ws::NativeAction::Validate { expected_sequence }
+        | ws::NativeAction::MutateTask {
+            expected_sequence, ..
+        } => *expected_sequence = sequence,
+        _ => {}
     }
 }

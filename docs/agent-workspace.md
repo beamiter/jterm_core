@@ -258,9 +258,23 @@ The host discovers that exact provider ID in its original profile, acquires
 its CLI lease, and starts the managed PTY before the requesting GUI attaches.
 It retains task ownership until CLI cleanup is verified. Missing history,
 changed profile/cwd, another live owner, and unconfirmed descendant cleanup
-remain readable conflicts rather than starting a new task goal. Validation
-is still a separate task workflow and is locked while native/CLI authority is
-active.
+remain readable conflicts rather than starting a new task goal.
+
+Task validation is also owned by the host: preparation verifies the original
+worktree and shell, then a supervised PTY retains the task lease through
+verified cleanup. Closing its terminal only detaches the output view. Reopening
+attaches the recorded validation ID and epoch; it cannot create a replacement
+command. A completed output view stays readable until closed. Host crashes mark
+unconfirmed validation inconclusive and never repeat it. Complete, accept,
+archive and restore require a current control lease and a checked state version.
+An arbitrary frontend task snapshot cannot overwrite the authoritative reducer.
+Redacted command evidence stays readable but cannot become executable after the
+original in-memory evidence has been lost.
+
+Each frontend has a persistent Agent Workspace group toggle, enabled by default.
+Hiding the group keeps terminal navigation, selected conversations, drafts,
+width and scroll position, and leaves background work running. Expanding it
+restores the same navigation state.
 
 Consumer ChatGPT/Claude desktop/web histories are not automatically imported or
 synchronized. Providers retain their own authentication, transcript formats and
@@ -287,9 +301,7 @@ fixtures; it does not establish real-model, Wayland/GPU or physical IME results.
 
 Process, `/proc` and Unix-socket tests need an environment permitting those
 operations. Sandbox denial is not evidence of product success or failure. The
-pre-existing cgroup test requires a functioning user cgroup manager. The
-unchanged baseline also has a Git metadata probe failure in the managed build
-container; these are recorded separately from feature regressions.
+pre-existing cgroup test requires a functioning user cgroup manager. Environment restrictions are recorded separately from feature regressions.
 
 Real provider authentication and network requests need a smoke test with the
 user's supported CLI/login. Fake-provider tests verify process/protocol behavior
