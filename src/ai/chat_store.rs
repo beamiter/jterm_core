@@ -745,7 +745,7 @@ impl ChatStore {
         let selected = self.active_chat_id;
         self.active_chat_id = chat_id;
         let result = self
-            .begin_turn(text, None, "Running in session host".into(), false)
+            .begin_turn(text, None, "Response continues in background".into(), false)
             .map(|start| start.token);
         self.active_chat_id = selected;
         result

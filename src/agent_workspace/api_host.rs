@@ -180,6 +180,7 @@ impl ApiManager {
             sequence: 0,
             state: ApiState::Starting,
             user_text: store.submission_text(&receipt)?,
+            submitted_draft_revision: receipt.draft_revision,
             preview: String::new(),
             result: None,
             error: None,
@@ -388,7 +389,9 @@ fn supervise(
         if cancel.load(Ordering::SeqCst) {
             return Ok(Some(Err("Response cancelled before startup".into())));
         }
-        let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+        // The persistent host may outlive replacement/unlink of its installed
+        // frontend executable. procfs pins this running image across upgrade.
+        let mut command = Command::new("/proc/self/exe");
         command
             .arg(API_WORKER_FLAG)
             .stdin(Stdio::piped())

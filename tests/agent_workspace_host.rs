@@ -1235,3 +1235,39 @@ fn restored_api_view_hides_only_the_acknowledged_draft_version() {
         "persist after GUI exit"
     );
 }
+
+#[test]
+fn api_worker_starts_after_the_running_hosts_executable_was_unlinked() {
+    let mut h = Harness::new();
+    h.host.kill().unwrap();
+    h.host.wait().unwrap();
+    let executable = h.root.join("bin/private-session-host");
+    std::fs::copy(HOST, &executable).unwrap();
+    h.host = Command::new(&executable)
+        .arg("--jterm-session-host")
+        .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while request(&h.client(), WorkspaceCommand::Refresh).is_err() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(&executable).unwrap();
+    let server = MockApi::new("original running image survived installation replacement".into());
+    let receipt = begin_api(&h.client());
+    request(
+        &h.client(),
+        WorkspaceCommand::StartApi {
+            launch: Box::new(api_launch(receipt.clone(), &server.url)),
+        },
+    )
+    .unwrap();
+    server.wait_request();
+    server.release();
+    wait_api(&h, &receipt.id, ApiState::Completed);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+}

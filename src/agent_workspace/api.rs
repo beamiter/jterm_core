@@ -134,6 +134,8 @@ pub struct ApiSnapshot {
     /// Plain user text for rebuilding a view, never the provider prompt envelope.
     #[serde(default)]
     pub user_text: String,
+    #[serde(default)]
+    pub submitted_draft_revision: u64,
     pub preview: String,
     pub result: Option<String>,
     pub error: Option<String>,
