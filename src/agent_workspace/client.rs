@@ -385,7 +385,7 @@ fn attach_terminal(mut launch: ManagedLaunch) -> Result<i32, String> {
         launch: Box::new(launch),
         client: client.clone(),
     };
-    attach_request(request, client, cols, rows, true)
+    attach_request(request, client, cols, rows, true, false)
 }
 fn attach_owned_terminal(terminal: super::native::OwnedTerminalDescriptor) -> Result<i32, String> {
     let (cols, rows) = terminal_size();
@@ -397,7 +397,7 @@ fn attach_owned_terminal(terminal: super::native::OwnedTerminalDescriptor) -> Re
         cols,
         rows,
     };
-    attach_request(request, client, cols, rows, false)
+    attach_request(request, client, cols, rows, false, true)
 }
 fn attach_request(
     request: Request,
@@ -405,6 +405,7 @@ fn attach_request(
     cols: u16,
     rows: u16,
     start: bool,
+    hold_exited_view: bool,
 ) -> Result<i32, String> {
     let paths = Paths::discover()?;
     let mut stream = connect(&paths, start, None)?;
@@ -458,6 +459,7 @@ fn attach_request(
     let mut size = (cols, rows);
     let mut input = [0u8; OUTPUT_CHUNK_BYTES];
     let mut result = Ok(0);
+    let mut exited = false;
     'attach: loop {
         for event in rx.try_iter().take(64) {
             match event {
@@ -480,7 +482,13 @@ fn attach_request(
                 }
                 Response::Exited { code, .. } => {
                     result = Ok(code.unwrap_or(0));
-                    break 'attach;
+                    if hold_exited_view {
+                        exited = true;
+                        let _ = writeln!(stdout, "\r\n[Validation exited: {}. Close this tab or press Ctrl+C to leave the read-only output.]\r", code.unwrap_or(0));
+                        let _ = stdout.flush();
+                    } else {
+                        break 'attach;
+                    }
                 }
                 Response::Error(error) => {
                     result = Err(error);
@@ -489,12 +497,12 @@ fn attach_request(
                 _ => {}
             }
         }
-        if rx.is_empty() && output_thread.is_finished() {
+        if !exited && rx.is_empty() && output_thread.is_finished() {
             result = Err("Session host disconnected; the provider may still be running".into());
             break;
         }
         let new_size = terminal_size();
-        if new_size != size {
+        if !exited && new_size != size {
             size = new_size;
             if let Err(error) = write_frame(
                 &mut stream,
@@ -533,6 +541,12 @@ fn attach_request(
             // Ctrl+] is an explicit detach and never reaches provider stdin.
             if input[..n as usize].contains(&0x1d) {
                 break;
+            }
+            if exited {
+                if input[..n as usize].iter().any(|byte| matches!(byte, 3 | 4)) {
+                    break;
+                }
+                continue;
             }
             if let Err(error) = write_frame(
                 &mut stream,

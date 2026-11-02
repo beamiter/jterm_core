@@ -201,6 +201,7 @@ impl NativeManager {
             interrupted: false,
             can_prompt: false,
             can_resume: false,
+            can_start_validation: false,
             can_continue_in_terminal: false,
             exit: None,
             events: vec![],
@@ -795,10 +796,22 @@ fn projection_policy(job: &Job) -> NativePromptPolicy {
         ..job.policy
     }
 }
+fn validation_available(job: &Job, locked: bool) -> bool {
+    !locked
+        && job
+            .tasks
+            .next_validation_attempt(job.snapshot.task.id)
+            .is_ok()
+        && job
+            .tasks
+            .get(job.snapshot.task.id)
+            .is_some_and(original_validation_evidence)
+}
 fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Result<(), String> {
     let id = job.snapshot.task.id;
     if job.historical {
-        let locked = job.handoff.is_some() || job.terminal_runtime.is_some();
+        let locked =
+            job.handoff.is_some() || job.terminal_runtime.is_some() || job.validation.is_some();
         let can_resume = !locked
             && matches!(
                 job.snapshot.task.status,
@@ -825,7 +838,9 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
             job.tasks.get(id).ok_or("Historical task is unavailable")?,
             projection_policy(job),
         );
-        if job.snapshot.ownership_locked != locked
+        let can_validate = validation_available(job, locked);
+        if job.snapshot.can_start_validation != can_validate
+            || job.snapshot.ownership_locked != locked
             || job.snapshot.can_resume != can_resume
             || job.snapshot.can_continue_in_terminal != can_continue
             || job.snapshot.task != task
@@ -834,6 +849,7 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
             job.snapshot.task = task;
             job.snapshot.ownership_locked = locked;
             job.snapshot.can_resume = can_resume;
+            job.snapshot.can_start_validation = can_validate;
             job.snapshot.can_continue_in_terminal = can_continue;
             job.snapshot.redact_secrets |= job.policy.redact_secrets;
             store.save_native(&job.snapshot)?;
@@ -871,7 +887,9 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
                 && task.status == TaskStatus::Created
                 && task.runtime_kind == TaskRuntimeKind::Unassigned));
     let home = job.runtime.native_home(id).map(|p| p.to_path_buf());
-    let changed = job.snapshot.task != task
+    let can_validate = validation_available(job, locked);
+    let changed = job.snapshot.can_start_validation != can_validate
+        || job.snapshot.task != task
         || job.view_revision != revision
         || job.snapshot.preparing != preparing
         || job.snapshot.live != live
@@ -897,6 +915,7 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
     job.snapshot.ownership_locked = locked;
     job.snapshot.can_prompt = can_prompt;
     job.snapshot.can_resume = can_resume;
+    job.snapshot.can_start_validation = can_validate;
     job.snapshot.exit = exit;
     job.snapshot.can_continue_in_terminal = can_continue;
     job.snapshot.native_home = home;
@@ -1009,6 +1028,7 @@ mod historical_projection_tests {
             interrupted: true,
             can_prompt: false,
             can_resume: false,
+            can_start_validation: false,
             can_continue_in_terminal: false,
             exit: None,
             events: vec![],

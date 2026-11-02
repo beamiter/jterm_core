@@ -205,6 +205,8 @@ pub struct NativeSnapshot {
     pub interrupted: bool,
     pub can_prompt: bool,
     pub can_resume: bool,
+    #[serde(default)]
+    pub can_start_validation: bool,
     pub can_continue_in_terminal: bool,
     pub exit: Option<CodexAppServerExitReport>,
     pub events: Vec<NativeReportEvent>,

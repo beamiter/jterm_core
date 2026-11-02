@@ -493,6 +493,12 @@ impl AgentRuntimeManager {
     }
     /// Request an explicit validation in the host. Success here means queued;
     /// the accepted task snapshot and terminal descriptor arrive through poll.
+    pub fn can_start_hosted_validation(&self, id: TaskId) -> bool {
+        self.remote
+            .as_ref()
+            .and_then(|remote| remote.state(id))
+            .is_some_and(|state| state.can_start_validation)
+    }
     pub fn start_hosted_validation(&mut self, id: TaskId) -> Result<(), AgentRuntimeError> {
         self.remote
             .as_mut()
