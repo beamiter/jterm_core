@@ -491,6 +491,44 @@ impl AgentRuntimeManager {
             .map(|r| r.take_handoffs())
             .unwrap_or_default()
     }
+    /// Request an explicit validation in the host. Success here means queued;
+    /// the accepted task snapshot and terminal descriptor arrive through poll.
+    pub fn start_hosted_validation(&mut self, id: TaskId) -> Result<(), AgentRuntimeError> {
+        self.remote
+            .as_mut()
+            .ok_or_else(|| AgentRuntimeError::Preparation("This task is not hosted".into()))?
+            .start_validation(id)
+    }
+    pub fn mutate_hosted_task(
+        &mut self,
+        id: TaskId,
+        mutation: crate::agent_workspace::NativeTaskMutation,
+    ) -> Result<(), AgentRuntimeError> {
+        self.remote
+            .as_mut()
+            .ok_or_else(|| AgentRuntimeError::Preparation("This task is not hosted".into()))?
+            .mutate_task(id, mutation)
+    }
+    pub fn take_owned_terminal_launches(
+        &mut self,
+    ) -> Vec<(TaskId, crate::agent_workspace::OwnedTerminalDescriptor)> {
+        self.remote
+            .as_mut()
+            .map(|r| r.take_owned_launches())
+            .unwrap_or_default()
+    }
+    pub fn hosted_validation_terminal(
+        &self,
+        id: TaskId,
+    ) -> Option<&crate::agent_workspace::OwnedTerminalDescriptor> {
+        self.remote
+            .as_ref()?
+            .state(id)?
+            .validation
+            .as_ref()?
+            .terminal
+            .as_ref()
+    }
     pub fn handoff_to_terminal(&mut self, task_id: TaskId) -> Result<(), AgentRuntimeError> {
         let remote = self
             .remote

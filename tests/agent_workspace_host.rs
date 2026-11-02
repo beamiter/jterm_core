@@ -15,6 +15,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const HOST: &str = env!("CARGO_BIN_EXE_jterm-sessiond");
+fn host_executable() -> PathBuf {
+    HOST.into()
+}
 
 struct Harness {
     root: PathBuf,
@@ -1924,4 +1927,434 @@ fn native_delayed_attach_rechecks_current_sharing_policy() {
             .count(),
         1
     );
+}
+
+fn stopped_native_for_validation(
+    h: &Harness,
+    command: &str,
+) -> (NativeLaunch, ConversationId, NativeControlLease) {
+    let mut launch = native_fixture(h);
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    launch.task.source_context.as_mut().unwrap().command = Some(command.into());
+    let client = h.client();
+    let control = match request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch.clone()),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        reply => panic!("{reply:?}"),
+    };
+    std::fs::write(launch.context.claude_home.join("release-1"), "").unwrap();
+    wait_native(&client, &id, |s| s.can_prompt);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Finish),
+        },
+    )
+    .unwrap();
+    wait_native(&client, &id, |s| !s.ownership_locked);
+    (launch, id, control)
+}
+
+#[test]
+fn hosted_validation_detaches_replays_output_and_requires_controlled_acceptance() {
+    use jterm_core::agent_task::{TaskStatus, TaskValidationStatus};
+    let h = Harness::new();
+    let gate = h.root.join("allow-validation-finish");
+    let command=format!("printf validation-started; while ! test -f '{}'; do sleep 0.02; done; printf validation-finished",gate.display());
+    let (_launch, id, control) = stopped_native_for_validation(&h, &command);
+    let client = h.client();
+    let snapshot = inspect_native(&client, &id);
+    let operation = uuid::Uuid::new_v4().to_string();
+    let start = WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation,
+        action: Box::new(NativeAction::Validate {
+            expected_sequence: snapshot.sequence,
+        }),
+    };
+    request(&client, start.clone()).unwrap();
+    request(&client, start).unwrap();
+    let running = wait_native(&client, &id, |s| {
+        s.validation
+            .as_ref()
+            .is_some_and(|v| v.terminal.is_some() && v.output.contains("validation-started"))
+    });
+    assert!(running.ownership_locked);
+    assert_eq!(
+        running.task.validation.status,
+        TaskValidationStatus::Running
+    );
+    let terminal = running.validation.unwrap().terminal.unwrap();
+    let runtime = match request(
+        &client,
+        WorkspaceCommand::Runtime {
+            id: terminal.id.clone(),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Runtime { snapshot } => snapshot,
+        reply => panic!("{reply:?}"),
+    };
+    let attach = |terminal: &OwnedTerminalDescriptor| {
+        let mut command = Command::new(host_executable());
+        command
+            .args([
+                "--jterm-owned-attach",
+                &serde_json::to_string(terminal).unwrap(),
+            ])
+            .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
+            .current_dir(&terminal.cwd);
+        Terminal::spawn(command)
+    };
+    let mut view = attach(&terminal);
+    view.wait_for("validation-started");
+    view.child.terminate_group().unwrap();
+    view.wait_exit();
+    let after = inspect_native(&client, &id);
+    assert_eq!(after.task.validation.status, TaskValidationStatus::Running);
+    let same = match request(
+        &client,
+        WorkspaceCommand::Runtime {
+            id: terminal.id.clone(),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Runtime { snapshot } => snapshot,
+        _ => unreachable!(),
+    };
+    assert_eq!(same.pid, runtime.pid);
+    assert!(request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: after.sequence,
+                mutation: NativeTaskMutation::Complete
+            })
+        }
+    )
+    .is_err());
+    std::fs::write(&gate, "").unwrap();
+    let done = wait_native(&client, &id, |s| {
+        s.task.validation.status == TaskValidationStatus::Passed && !s.ownership_locked
+    });
+    assert!(done
+        .validation
+        .as_ref()
+        .unwrap()
+        .output
+        .contains("validation-finished"));
+    let mut replay = attach(&terminal);
+    replay.wait_for("validation-finished");
+    assert_eq!(replay.wait_exit(), 0);
+    let mut stale = terminal.clone();
+    stale.epoch = uuid::Uuid::new_v4().to_string();
+    let mut rejected = attach(&stale);
+    rejected.wait_for("Stale owned runtime epoch");
+    assert_ne!(rejected.wait_exit(), 0);
+    let accepted = request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: done.sequence,
+                mutation: NativeTaskMutation::Complete,
+            }),
+        },
+    )
+    .unwrap();
+    let sequence = match accepted {
+        WorkspaceReply::Native { snapshot, .. } => {
+            assert_eq!(snapshot.task.status, TaskStatus::Completed);
+            snapshot.sequence
+        }
+        _ => unreachable!(),
+    };
+    assert!(
+        request(
+            &client,
+            WorkspaceCommand::ControlNative {
+                control: control.clone(),
+                operation: uuid::Uuid::new_v4().to_string(),
+                action: Box::new(NativeAction::MutateTask {
+                    expected_sequence: done.sequence,
+                    mutation: NativeTaskMutation::Archive
+                })
+            }
+        )
+        .is_err(),
+        "stale lifecycle CAS was accepted"
+    );
+    let current = inspect_native(&client, &id);
+    assert!(current.sequence >= sequence);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: current.sequence,
+                mutation: NativeTaskMutation::Archive,
+            }),
+        },
+    )
+    .unwrap();
+    let rows = match request(&client, WorkspaceCommand::Refresh).unwrap() {
+        WorkspaceReply::Catalog { rows } => rows,
+        _ => unreachable!(),
+    };
+    assert!(rows.iter().find(|row| row.id == id).unwrap().archived);
+    let archived = inspect_native(&client, &id);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control,
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: archived.sequence,
+                mutation: NativeTaskMutation::Restore,
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        inspect_native(&client, &id).task.status,
+        TaskStatus::Completed
+    );
+}
+
+fn stopped_native_validation_fixture(
+    command: String,
+) -> (
+    Harness,
+    WorkspaceClient,
+    ConversationId,
+    NativeControlLease,
+    NativeLaunch,
+) {
+    let h = Harness::new();
+    let mut launch = native_fixture(&h);
+    launch.task.source_context.as_mut().unwrap().command =
+        Some(command.replace("FIXTURE_ROOT", &h.root.to_string_lossy()));
+    let client = h.client();
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
+    let control = match request(
+        &client,
+        WorkspaceCommand::StartNative {
+            launch: Box::new(launch.clone()),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        reply => panic!("{reply:?}"),
+    };
+    std::fs::write(launch.context.claude_home.join("release-1"), "").unwrap();
+    wait_native(&client, &id, |s| s.can_prompt);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::Finish),
+        },
+    )
+    .unwrap();
+    wait_native(&client, &id, |s| !s.ownership_locked);
+    (h, client, id, control, launch)
+}
+fn attach_owned_fixture(h: &Harness, terminal: &OwnedTerminalDescriptor) -> Terminal {
+    let mut command = Command::new(host_executable());
+    command
+        .args([
+            "--jterm-owned-attach",
+            &serde_json::to_string(terminal).unwrap(),
+        ])
+        .current_dir(&h.root)
+        .env("JTERM_WORKSPACE_STATE_DIR", &h.state);
+    Terminal::spawn(command)
+}
+#[test]
+fn hosted_validation_detaches_reattaches_once_and_commits_controlled_task_mutations() {
+    use jterm_core::agent_task::{TaskStatus, TaskValidationStatus};
+    let(h,client,id,control,_) = stopped_native_validation_fixture("printf 'run\\n' >> FIXTURE_ROOT/validation-count; printf validation-started; while ! test -f FIXTURE_ROOT/validation-gate; do sleep .02; done; printf validation-final".into());
+    let before = inspect_native(&client, &id);
+    let operation = uuid::Uuid::new_v4().to_string();
+    let start = WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation: operation.clone(),
+        action: Box::new(NativeAction::Validate {
+            expected_sequence: before.sequence,
+        }),
+    };
+    request(&client, start.clone()).unwrap();
+    let running = wait_native(&client, &id, |s| {
+        s.validation
+            .as_ref()
+            .is_some_and(|v| v.terminal.is_some() && v.output.contains("validation-started"))
+    });
+    let terminal = running.validation.unwrap().terminal.unwrap();
+    let mut view = attach_owned_fixture(&h, &terminal);
+    view.wait_for("validation-started");
+    view.child.terminate_group().unwrap();
+    view.wait_exit();
+    request(&client, WorkspaceCommand::DetachNative { control }).unwrap();
+    let current = inspect_native(&client, &id);
+    let control = match request(
+        &client,
+        WorkspaceCommand::AttachNative {
+            id: id.clone(),
+            incarnation: current.incarnation,
+            view: "validation-second-view".into(),
+        },
+    )
+    .unwrap()
+    {
+        WorkspaceReply::Native {
+            control: Some(control),
+            ..
+        } => control,
+        reply => panic!("{reply:?}"),
+    };
+    assert_eq!(
+        inspect_native(&client, &id).task.validation.status,
+        TaskValidationStatus::Running
+    );
+    let mut second = attach_owned_fixture(&h, &terminal);
+    second.wait_for("validation-started");
+    let state = inspect_native(&client, &id);
+    assert!(request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: state.sequence,
+                mutation: NativeTaskMutation::Complete
+            })
+        }
+    )
+    .is_err());
+    // A repeated admission after reattachment uses the original operation ID;
+    // it may return its current snapshot but must not start a second command.
+    let replay = WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation,
+        action: Box::new(NativeAction::Validate {
+            expected_sequence: before.sequence,
+        }),
+    };
+    request(&client, replay).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("validation-count"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    std::fs::write(h.root.join("validation-gate"), "").unwrap();
+    second.wait_exit();
+    let passed = wait_native(&client, &id, |s| {
+        s.task.validation.status == TaskValidationStatus::Passed && !s.ownership_locked
+    });
+    assert!(passed
+        .validation
+        .as_ref()
+        .unwrap()
+        .output
+        .contains("validation-final"));
+    let complete = WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation: uuid::Uuid::new_v4().to_string(),
+        action: Box::new(NativeAction::MutateTask {
+            expected_sequence: passed.sequence,
+            mutation: NativeTaskMutation::Complete,
+        }),
+    };
+    request(&client, complete.clone()).unwrap();
+    request(&client, complete).unwrap();
+    assert_eq!(
+        inspect_native(&client, &id).task.status,
+        TaskStatus::Completed
+    );
+    assert!(request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: passed.sequence,
+                mutation: NativeTaskMutation::Archive
+            })
+        }
+    )
+    .is_err());
+    let completed = inspect_native(&client, &id);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control: control.clone(),
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: completed.sequence,
+                mutation: NativeTaskMutation::Archive,
+            }),
+        },
+    )
+    .unwrap();
+    let archived = inspect_native(&client, &id);
+    assert_eq!(archived.task.status, TaskStatus::Archived);
+    let rows = match request(&client, WorkspaceCommand::Refresh).unwrap() {
+        WorkspaceReply::Catalog { rows } => rows,
+        reply => panic!("{reply:?}"),
+    };
+    assert!(rows.iter().find(|r| r.id == id).unwrap().archived);
+    request(
+        &client,
+        WorkspaceCommand::ControlNative {
+            control,
+            operation: uuid::Uuid::new_v4().to_string(),
+            action: Box::new(NativeAction::MutateTask {
+                expected_sequence: archived.sequence,
+                mutation: NativeTaskMutation::Restore,
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        inspect_native(&client, &id).task.status,
+        TaskStatus::Completed
+    );
+}
+#[test]
+fn owned_validation_descriptor_cannot_create_a_process_or_retarget_an_epoch() {
+    let h = Harness::new();
+    let descriptor = OwnedTerminalDescriptor {
+        id: ConversationId("jterm:validation:missing".into()),
+        epoch: uuid::Uuid::new_v4().to_string(),
+        cwd: h.root.clone(),
+        label: "not an executable".into(),
+    };
+    let mut view = attach_owned_fixture(&h, &descriptor);
+    view.wait_for("historical");
+    assert_ne!(view.wait_exit(), 0);
+    assert!(!h.trace.exists());
 }

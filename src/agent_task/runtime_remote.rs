@@ -24,6 +24,8 @@ pub(super) struct NativeRemote {
     cached: HashMap<TaskId, Cached>,
     versions: HashMap<TaskId, (ws::ConversationId, String, u64)>,
     selected: Option<TaskId>,
+    validation_requests: HashSet<TaskId>,
+    owned_launches: Vec<(TaskId, ws::OwnedTerminalDescriptor)>,
     pending: HashMap<u64, Pending>,
     inspections: HashSet<TaskId>,
     last_catalog: Instant,
@@ -48,6 +50,8 @@ impl NativeRemote {
             cached: HashMap::new(),
             versions: HashMap::new(),
             selected: None,
+            validation_requests: HashSet::new(),
+            owned_launches: Vec::new(),
             pending: HashMap::new(),
             inspections: HashSet::new(),
             last_catalog: Instant::now() - Duration::from_secs(5),
@@ -143,6 +147,39 @@ impl NativeRemote {
             )
         }
     }
+    pub fn start_validation(&mut self, id: TaskId) -> Result<(), AgentRuntimeError> {
+        let expected_sequence = self
+            .cached
+            .get(&id)
+            .ok_or(AgentRuntimeError::UnknownTask(id))?
+            .snapshot
+            .sequence;
+        self.action(id, ws::NativeAction::Validate { expected_sequence })?;
+        self.validation_requests.insert(id);
+        Ok(())
+    }
+    pub fn mutate_task(
+        &mut self,
+        id: TaskId,
+        mutation: ws::NativeTaskMutation,
+    ) -> Result<(), AgentRuntimeError> {
+        let expected_sequence = self
+            .cached
+            .get(&id)
+            .ok_or(AgentRuntimeError::UnknownTask(id))?
+            .snapshot
+            .sequence;
+        self.action(
+            id,
+            ws::NativeAction::MutateTask {
+                expected_sequence,
+                mutation,
+            },
+        )
+    }
+    pub fn take_owned_launches(&mut self) -> Vec<(TaskId, ws::OwnedTerminalDescriptor)> {
+        std::mem::take(&mut self.owned_launches)
+    }
     pub fn poll(
         &mut self,
         tasks: &mut TaskManager,
@@ -186,6 +223,7 @@ impl NativeRemote {
                                 result: Err(detail.clone()),
                             });
                         }
+                        self.validation_requests.remove(&task_id);
                         if !matches!(pending, Pending::Inspect(_)) {
                             report.issues.push(AgentRuntimeIssue { task_id, detail });
                         }
@@ -225,6 +263,17 @@ impl NativeRemote {
                 }
                 Reply::Native { snapshot, control } => {
                     let id = snapshot.task.id;
+                    if self.validation_requests.contains(&id) {
+                        if let Some(validation) = &snapshot.validation {
+                            if let Some(terminal) = &validation.terminal {
+                                self.owned_launches.push((id, terminal.clone()));
+                                self.validation_requests.remove(&id);
+                            } else if !validation.preparing {
+                                self.validation_requests.remove(&id);
+                            }
+                        }
+                    }
+
                     let previous = self.cached.get(&id);
                     let gained_control = control.is_some()
                         && matches!(&pending, Pending::Start(_) | Pending::Attach(..));

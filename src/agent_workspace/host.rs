@@ -24,6 +24,10 @@ const MAX_RUNTIMES: usize = 16;
 const MAX_CLIENTS: usize = 64;
 const MAX_INPUT: usize = 64 * 1024;
 
+enum AttachTarget {
+    Provider(Box<ManagedLaunch>),
+    Owned(super::native::OwnedTerminalDescriptor, u16, u16),
+}
 enum HostRequest {
     Command(
         WorkspaceCommand,
@@ -31,7 +35,7 @@ enum HostRequest {
         Sender<Result<WorkspaceReply, String>>,
     ),
     Attach(
-        Box<ManagedLaunch>,
+        AttachTarget,
         String,
         Sender<Response>,
         Arc<AtomicBool>,
@@ -41,11 +45,25 @@ enum HostRequest {
 
 #[derive(Clone)]
 pub(super) struct RuntimeHandle {
-    control: Sender<Control>,
+    pub(super) control: Sender<Control>,
     pub(super) snapshot: Arc<Mutex<RuntimeSnapshot>>,
+    pub(super) output: Arc<Mutex<RuntimeOutput>>,
+}
+#[derive(Default)]
+pub(super) struct RuntimeOutput {
+    pub raw: VecDeque<u8>,
+    pub screen: Vec<u8>,
+    pub truncated: bool,
+}
+impl RuntimeHandle {
+    pub(super) fn stop(&self) -> Result<(), String> {
+        self.control
+            .try_send(Control::Stop)
+            .map_err(|_| "Runtime is busy or already stopped".into())
+    }
 }
 
-enum Control {
+pub(super) enum Control {
     Attach {
         client: String,
         output: Sender<Response>,
@@ -200,13 +218,35 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                 })();
                 let _ = reply.try_send(response);
             }
-            Ok(HostRequest::Attach(launch, client, output, closed, reply)) => {
+            Ok(HostRequest::Attach(target, client, output, closed, reply)) => {
                 let result = (|| {
+                    let launch = match target {
+                        AttachTarget::Provider(launch) => launch,
+                        AttachTarget::Owned(terminal, cols, rows) => {
+                            if !terminal.id.0.starts_with("jterm:validation:")
+                                || uuid::Uuid::parse_str(&terminal.epoch).is_err()
+                            {
+                                return Err("Invalid owned runtime identity".into());
+                            }
+                            let runtime=runtimes.get(&terminal.id).ok_or("This validation runtime is historical; its outcome is available in the task view and no process was restarted")?.clone();
+                            if runtime.snapshot.lock().epoch != terminal.epoch {
+                                return Err("Stale owned runtime epoch".into());
+                            }
+                            return attach(runtime, cols, rows, client, output, closed);
+                        }
+                    };
                     validate_launch(&launch)?;
                     let id = launch.row.id.clone();
                     if let Some(runtime) = runtimes.get(&id) {
                         if runtime.snapshot.lock().state.is_live() {
-                            return attach(runtime.clone(), &launch, client, output, closed);
+                            return attach(
+                                runtime.clone(),
+                                launch.cols,
+                                launch.rows,
+                                client,
+                                output,
+                                closed,
+                            );
                         }
                     }
                     if runtimes
@@ -228,7 +268,7 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                     store.upsert_runtime_row(&launch.row)?;
                     let runtime = spawn_runtime(&paths, &launch)?;
                     runtimes.insert(id, runtime.clone());
-                    attach(runtime, &launch, client, output, closed)
+                    attach(runtime, launch.cols, launch.rows, client, output, closed)
                 })();
                 let _ = reply.try_send(result);
             }
@@ -240,11 +280,29 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
 
 fn attach(
     runtime: RuntimeHandle,
-    launch: &ManagedLaunch,
+    cols: u16,
+    rows: u16,
     client: String,
     output: Sender<Response>,
     closed: Arc<AtomicBool>,
 ) -> Result<RuntimeHandle, String> {
+    let snapshot = runtime.snapshot.lock().clone();
+    if !snapshot.state.is_live() {
+        output
+            .try_send(Response::Attached {
+                snapshot: snapshot.clone(),
+                screen: runtime.output.lock().screen.clone(),
+                truncated: true,
+            })
+            .map_err(|_| "Attachment closed")?;
+        output
+            .try_send(Response::Exited {
+                sequence: snapshot.event_sequence,
+                code: snapshot.exit_code,
+            })
+            .map_err(|_| "Attachment closed")?;
+        return Ok(runtime);
+    }
     let (ack, rx) = bounded(1);
     runtime
         .control
@@ -252,8 +310,8 @@ fn attach(
             client,
             output,
             closed,
-            cols: launch.cols,
-            rows: launch.rows,
+            cols,
+            rows,
             ack,
         })
         .map_err(|_| "Runtime is busy or has exited")?;
@@ -284,11 +342,22 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
                 .map_err(|_| "Workspace request timed out")?;
             write_frame(&mut stream, &Response::Reply(result))
         }
-        Request::Attach {
-            version,
-            launch,
-            client,
-        } => {
+        request @ (Request::Attach { .. } | Request::AttachOwned { .. }) => {
+            let (version, target, client) = match request {
+                Request::Attach {
+                    version,
+                    launch,
+                    client,
+                } => (version, AttachTarget::Provider(launch), client),
+                Request::AttachOwned {
+                    version,
+                    terminal,
+                    client,
+                    cols,
+                    rows,
+                } => (version, AttachTarget::Owned(terminal, cols, rows), client),
+                _ => unreachable!(),
+            };
             if version != PROTOCOL_VERSION || client.len() > 128 {
                 return write_frame(
                     &mut stream,
@@ -300,7 +369,7 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
             let writer_closed = Arc::new(AtomicBool::new(false));
             let _close_attachment = CloseAttachment(writer_closed.clone());
             host.try_send(HostRequest::Attach(
-                launch,
+                target,
                 client.clone(),
                 output,
                 writer_closed.clone(),
@@ -573,18 +642,21 @@ pub(super) fn spawn_runtime_with_native(
     lease.write(&record)?;
     let view = Arc::new(Mutex::new(snapshot));
     let (control, rx) = bounded(128);
+    let output = Arc::new(Mutex::new(RuntimeOutput::default()));
+    let thread_output = output.clone();
     let thread_view = view.clone();
     std::thread::Builder::new()
         .name("jterm-managed-pty".into())
         .spawn(move || {
             let _profile_lease = profile_lease;
             let _native_options = native;
-            runtime_loop(master, child, lease, record, rx, thread_view)
+            runtime_loop(master, child, lease, record, rx, thread_view, thread_output)
         })
         .map_err(|e| e.to_string())?;
     Ok(RuntimeHandle {
         control,
         snapshot: view,
+        output,
     })
 }
 
@@ -592,7 +664,7 @@ fn dimensions(cols: u16, rows: u16) -> (u16, u16) {
     (cols.clamp(1, 400), rows.clamp(1, 120))
 }
 
-fn open_pty(cols: u16, rows: u16) -> Result<(File, File), String> {
+pub(super) fn open_pty(cols: u16, rows: u16) -> Result<(File, File), String> {
     let mut master = -1;
     let mut slave = -1;
     let winsize = libc::winsize {
@@ -629,13 +701,14 @@ fn open_pty(cols: u16, rows: u16) -> Result<(File, File), String> {
     Ok((master, slave))
 }
 
-fn runtime_loop(
+pub(super) fn runtime_loop(
     mut master: File,
     mut child: SupervisedChild,
     mut lease: Lease,
     mut record: LeaseRecord,
     controls: Receiver<Control>,
     view: Arc<Mutex<RuntimeSnapshot>>,
+    output: Arc<Mutex<RuntimeOutput>>,
 ) {
     let mut screen = ScreenReplay::with_budget(
         record.runtime.cols as usize,
@@ -757,6 +830,15 @@ fn runtime_loop(
                 Ok(0) => break,
                 Ok(n) => {
                     screen.feed(&bytes[..n]);
+                    {
+                        let mut capture = output.lock();
+                        capture.raw.extend(&bytes[..n]);
+                        if capture.raw.len() > 128 * 1024 {
+                            let excess = capture.raw.len() - 128 * 1024;
+                            capture.raw.drain(..excess);
+                            capture.truncated = true;
+                        }
+                    }
                     record.runtime.event_sequence = record.runtime.event_sequence.saturating_add(1);
                     if let Some((_, output, _)) = &owner {
                         if output
@@ -794,6 +876,9 @@ fn runtime_loop(
                         record.runtime.state = RuntimeState::Failed;
                         record.runtime.detail = format!("Could not stop provider group: {error}");
                         detach_with_error(&mut owner, &record.runtime.detail);
+                        output.lock().screen = screen
+                            .snapshot_ansi_bounded(2 * 1024 * 1024)
+                            .unwrap_or_default();
                         *view.lock() = record.runtime;
                         return;
                     }
@@ -817,6 +902,9 @@ fn runtime_loop(
                     });
                 }
                 let _ = lease.write(&record);
+                output.lock().screen = screen
+                    .snapshot_ansi_bounded(2 * 1024 * 1024)
+                    .unwrap_or_default();
                 *view.lock() = record.runtime;
                 return;
             }
@@ -826,6 +914,9 @@ fn runtime_loop(
                 record.runtime.detail = format!("Could not observe provider exit: {error}");
                 detach_with_error(&mut owner, &record.runtime.detail);
                 let _ = lease.write(&record);
+                output.lock().screen = screen
+                    .snapshot_ansi_bounded(2 * 1024 * 1024)
+                    .unwrap_or_default();
                 *view.lock() = record.runtime;
                 return;
             }

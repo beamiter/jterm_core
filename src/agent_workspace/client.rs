@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 const HOST_FLAG: &str = "--jterm-session-host";
 const ATTACH_FLAG: &str = "--jterm-session-attach";
+const OWNED_ATTACH_FLAG: &str = "--jterm-owned-attach";
 
 /// A bounded asynchronous interface. Constructing this object performs no
 /// filesystem/socket access and starts no daemon. Commands are handled on a
@@ -157,6 +158,36 @@ pub fn managed_launch(session: &AgentSession) -> Result<SessionLaunch, String> {
     })
 }
 
+/// Build a view attachment to an already admitted host runtime. The server
+/// never starts a process from this descriptor, including after host restart.
+pub fn owned_terminal_launch(
+    terminal: &super::native::OwnedTerminalDescriptor,
+) -> Result<SessionLaunch, String> {
+    if !terminal.cwd.is_absolute()
+        || uuid::Uuid::parse_str(&terminal.epoch).is_err()
+        || !terminal.id.0.starts_with("jterm:validation:")
+    {
+        return Err("Invalid owned terminal identity".into());
+    }
+    let program = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "Frontend executable path is not UTF-8")?;
+    Ok(SessionLaunch {
+        program,
+        args: vec![
+            OWNED_ATTACH_FLAG.into(),
+            serde_json::to_string(terminal).map_err(|e| e.to_string())?,
+        ],
+        cwd: if terminal.cwd.is_dir() {
+            terminal.cwd.clone()
+        } else {
+            std::path::PathBuf::from("/")
+        },
+    })
+}
+
 /// A cheap ownership hint for an existing scanner conflict gate. The host
 /// still enforces the kernel lease and input owner at attachment time.
 pub fn managed_session_running(session: &AgentSession) -> bool {
@@ -200,6 +231,28 @@ pub fn run_embedded_if_requested() -> Option<i32> {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("Session host: {error}");
+                1
+            }
+        });
+    }
+    if flag == OWNED_ATTACH_FLAG {
+        let result = (|| {
+            let payload = args
+                .next()
+                .and_then(|s| s.into_string().ok())
+                .ok_or("Missing owned terminal descriptor")?;
+            if payload.len() > 65536 || args.next().is_some() {
+                return Err("Invalid owned terminal arguments".into());
+            }
+            let terminal: super::native::OwnedTerminalDescriptor =
+                serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+            owned_terminal_launch(&terminal)?;
+            attach_owned_terminal(terminal)
+        })();
+        return Some(match result {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("\r\nOwned terminal could not be attached: {error}\r");
                 1
             }
         });
@@ -323,26 +376,45 @@ fn terminal_size() -> (u16, u16) {
 }
 
 fn attach_terminal(mut launch: ManagedLaunch) -> Result<i32, String> {
+    let (cols, rows) = terminal_size();
+    launch.cols = cols;
+    launch.rows = rows;
+    let client = uuid::Uuid::new_v4().to_string();
+    let request = Request::Attach {
+        version: PROTOCOL_VERSION,
+        launch: Box::new(launch),
+        client: client.clone(),
+    };
+    attach_request(request, client, cols, rows, true)
+}
+fn attach_owned_terminal(terminal: super::native::OwnedTerminalDescriptor) -> Result<i32, String> {
+    let (cols, rows) = terminal_size();
+    let client = uuid::Uuid::new_v4().to_string();
+    let request = Request::AttachOwned {
+        version: PROTOCOL_VERSION,
+        terminal,
+        client: client.clone(),
+        cols,
+        rows,
+    };
+    attach_request(request, client, cols, rows, false)
+}
+fn attach_request(
+    request: Request,
+    client: String,
+    cols: u16,
+    rows: u16,
+    start: bool,
+) -> Result<i32, String> {
     let paths = Paths::discover()?;
-    let mut stream = connect(&paths, true, None)?;
+    let mut stream = connect(&paths, start, None)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
         .map_err(|e| e.to_string())?;
-    let (cols, rows) = terminal_size();
-    launch.cols = cols;
-    launch.rows = rows;
-    let client = uuid::Uuid::new_v4().to_string();
-    write_frame(
-        &mut stream,
-        &Request::Attach {
-            version: PROTOCOL_VERSION,
-            launch: Box::new(launch),
-            client: client.clone(),
-        },
-    )?;
+    write_frame(&mut stream, &request)?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let (snapshot, screen) =
         match read_frame::<Response>(&mut reader)?.ok_or("Session host closed the attachment")? {

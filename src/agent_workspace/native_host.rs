@@ -17,6 +17,14 @@ struct Controller {
     view: String,
     lease: NativeControlLease,
 }
+struct ValidationExecution {
+    preparing: Option<
+        std::sync::mpsc::Receiver<Result<super::native_validation::PreparedValidation, String>>,
+    >,
+    runtime: Option<super::host::RuntimeHandle>,
+    cancelled: bool,
+    last_output_sequence: Option<u64>,
+}
 struct Job {
     snapshot: NativeSnapshot,
     tasks: TaskManager,
@@ -31,6 +39,7 @@ struct Job {
     handoff:
         Option<std::sync::mpsc::Receiver<Result<super::native_handoff::PreparedHandoff, String>>>,
     terminal_runtime: Option<super::host::RuntimeHandle>,
+    validation: Option<ValidationExecution>,
 }
 pub(super) struct NativeManager {
     paths: Paths,
@@ -51,6 +60,30 @@ impl NativeManager {
         owner: Owner,
         store: &mut Store,
     ) -> Disposition {
+        if let WorkspaceCommand::Archive { id, .. } | WorkspaceCommand::Delete { id } = &command {
+            match store.native_snapshot(id) {
+                Ok(Some(_)) => {
+                    return Disposition::Handled(Err(
+                        "Use the controlled task Hide/Restore action for this hosted task".into(),
+                    ))
+                }
+                Err(error) => return Disposition::Handled(Err(error)),
+                Ok(None) => {}
+            }
+        }
+        if let WorkspaceCommand::Organize { changes } = &command {
+            for change in changes.iter().filter(|change| change.archived.is_some()) {
+                match store.native_snapshot(&change.id) {
+                    Ok(Some(_)) => {
+                        return Disposition::Handled(Err(
+                            "A task archive batch requires controlled task actions".into(),
+                        ))
+                    }
+                    Err(error) => return Disposition::Handled(Err(error)),
+                    Ok(None) => {}
+                }
+            }
+        }
         let result = match command {
             WorkspaceCommand::StartNative { launch } => self.start(*launch, owner, store),
             WorkspaceCommand::NativeCatalog { after, limit } => {
@@ -176,6 +209,7 @@ impl NativeManager {
             source_profile,
             handoff_pending: false,
             terminal: None,
+            validation: None,
             operations: vec![],
         };
         // Durable intent precedes any preparation/provider worker release.
@@ -225,6 +259,7 @@ impl NativeManager {
                 historical: false,
                 handoff: None,
                 terminal_runtime: None,
+                validation: None,
             },
         );
         Ok(WorkspaceReply::Native {
@@ -293,13 +328,19 @@ impl NativeManager {
         snapshot.preparing = false;
         snapshot.ownership_locked = false;
         snapshot.can_prompt = false;
-        snapshot.can_resume = snapshot.task.provider == AgentProvider::Codex
+        snapshot.can_resume = matches!(
+            snapshot.task.status,
+            TaskStatus::ReadyForReview | TaskStatus::Failed
+        ) && snapshot.task.provider == AgentProvider::Codex
             && snapshot.native_home.is_some()
             && snapshot
                 .view
                 .as_ref()
                 .is_some_and(|v| v.provider_thread_id.is_some());
-        snapshot.can_continue_in_terminal = snapshot
+        snapshot.can_continue_in_terminal = matches!(
+            snapshot.task.status,
+            TaskStatus::ReadyForReview | TaskStatus::Failed
+        ) && snapshot
             .view
             .as_ref()
             .is_some_and(|v| v.provider_thread_id.is_some());
@@ -337,6 +378,7 @@ impl NativeManager {
                 historical: true,
                 handoff: None,
                 terminal_runtime: None,
+                validation: None,
             },
         );
         Ok(())
@@ -374,8 +416,21 @@ impl NativeManager {
         if uuid::Uuid::parse_str(&operation).is_err() {
             return Err("Invalid native operation identity".into());
         }
+        if matches!(action, NativeAction::Validate { .. })
+            && self
+                .jobs
+                .values()
+                .filter(|job| job.snapshot.ownership_locked)
+                .count()
+                >= 8
+        {
+            return Err(
+                "The session host already owns eight active native/validation executions".into(),
+            );
+        }
         let paths = self.paths.clone();
         let job = self.owned(&control, owner)?;
+        let before_sequence = job.snapshot.sequence;
         if !store.reserve_native_operation(
             &job.snapshot.id,
             &job.snapshot.incarnation,
@@ -391,7 +446,18 @@ impl NativeManager {
         store.save_native(&job.snapshot)?;
         let task_id = job.snapshot.task.id;
         let result = match action {
-            NativeAction::Cancel => job.runtime.cancel(task_id).map_err(|e| e.to_string()),
+            NativeAction::Cancel => {
+                if let Some(validation) = &mut job.validation {
+                    validation.cancelled = true;
+                    if let Some(runtime) = &validation.runtime {
+                        runtime.stop()
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    job.runtime.cancel(task_id).map_err(|e| e.to_string())
+                }
+            }
             NativeAction::Approval { id, decision } => job
                 .runtime
                 .decide_approval(task_id, id, decision)
@@ -430,6 +496,12 @@ impl NativeManager {
                 Ok(())
             }
             NativeAction::Resume { context, policy } => {
+                if !matches!(
+                    job.snapshot.task.status,
+                    TaskStatus::ReadyForReview | TaskStatus::Failed | TaskStatus::Created
+                ) {
+                    return Err("This task lifecycle cannot be resumed".into());
+                }
                 context.validate()?;
                 let requested = if job.snapshot.task.provider == AgentProvider::Codex {
                     &context.codex_home
@@ -535,13 +607,91 @@ impl NativeManager {
                 job.snapshot.ownership_locked = true;
                 Ok(())
             }
-            NativeAction::UpdateTask { task } => {
-                if job.snapshot.ownership_locked || !same_task_identity(&job.snapshot.task, &task) {
-                    Err("Cannot change a running native task identity".into())
-                } else {
-                    job.tasks.project_hosted_task(*task, false)
+            NativeAction::Validate { expected_sequence } => {
+                if job.snapshot.validation_evidence_redacted
+                    && !original_validation_evidence(
+                        job.tasks.get(task_id).ok_or("Task is unavailable")?,
+                    )
+                {
+                    return Err("Provide the original validation recipe again; redacted evidence cannot be executed".into());
                 }
+                if expected_sequence != before_sequence {
+                    return Err(
+                        "Task changed before validation admission; refresh it before trying again"
+                            .into(),
+                    );
+                }
+                if job.snapshot.ownership_locked || job.validation.is_some() {
+                    return Err("Finish the native/CLI execution before running validation".into());
+                }
+                job.tasks
+                    .next_validation_attempt(task_id)
+                    .map_err(|e| e.to_string())?;
+                // Only raw evidence still held by the authoritative runtime may
+                // become an executable recipe; persisted redacted evidence is
+                // deliberately ineligible after host restart.
+                let task = job.tasks.get(task_id).ok_or("Task is unavailable")?.clone();
+                let run_id = format!("validation-{}", uuid::Uuid::new_v4());
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name("jterm-validation-prepare".into())
+                    .spawn(move || {
+                        let _ = tx.send(super::native_validation::prepare(&task));
+                    })
+                    .map_err(|e| e.to_string())?;
+                // Preparation cannot execute the command. Bind only after the
+                // worker exists so thread creation failure cannot leave a task
+                // permanently recorded as validating.
+                job.tasks
+                    .bind_validation_session(task_id, run_id.clone())
+                    .map_err(|e| e.to_string())?;
+                job.validation = Some(ValidationExecution {
+                    preparing: Some(rx),
+                    runtime: None,
+                    cancelled: false,
+                    last_output_sequence: None,
+                });
+                job.snapshot.validation = Some(HostedValidationSnapshot {
+                    run_id,
+                    preparing: true,
+                    terminal: None,
+                    output: String::new(),
+                    output_truncated: false,
+                });
+                job.snapshot.ownership_locked = true;
+                Ok(())
             }
+            NativeAction::MutateTask {
+                expected_sequence,
+                mutation,
+            } => {
+                if mutation == NativeTaskMutation::AcceptReviewed
+                    && job.snapshot.validation_evidence_redacted
+                {
+                    return Err("Original validation evidence was redacted; provide its original recipe before accepting this task".into());
+                }
+                if expected_sequence != before_sequence {
+                    return Err(
+                        "Task changed before this action; refresh it before trying again".into(),
+                    );
+                }
+                if job.snapshot.ownership_locked || job.validation.is_some() {
+                    return Err("Stop native/CLI work and finish validation before changing the task lifecycle".into());
+                }
+                match mutation {
+                    NativeTaskMutation::Complete => job.tasks.complete_after_validation(task_id),
+                    NativeTaskMutation::AcceptReviewed => {
+                        job.tasks.complete_after_manual_review(task_id)
+                    }
+                    NativeTaskMutation::Archive => job.tasks.archive(task_id),
+                    NativeTaskMutation::Restore => job.tasks.restore(task_id),
+                }
+                .map_err(|e| e.to_string())
+            }
+            NativeAction::UpdateTask { .. } => Err(
+                "Hosted task lifecycle is authoritative in the host; use a controlled task action"
+                    .into(),
+            ),
         };
         result?;
         refresh(job, AgentRuntimePollReport::default(), store)?;
@@ -562,6 +712,9 @@ impl NativeManager {
         let Some(job) = self.jobs.get_mut(&ids[index]) else {
             return;
         };
+        if poll_validation(job, &self.paths, store, runtimes) {
+            return;
+        }
         if let Some(receiver) = &job.handoff {
             match receiver.try_recv() {
                 Ok(result) => {
@@ -647,6 +800,10 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
     if job.historical {
         let locked = job.handoff.is_some() || job.terminal_runtime.is_some();
         let can_resume = !locked
+            && matches!(
+                job.snapshot.task.status,
+                TaskStatus::ReadyForReview | TaskStatus::Failed
+            )
             && job.snapshot.task.provider == AgentProvider::Codex
             && job.snapshot.native_home.is_some()
             && job
@@ -655,6 +812,10 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
                 .as_ref()
                 .is_some_and(|view| view.provider_thread_id.is_some());
         let can_continue = !locked
+            && matches!(
+                job.snapshot.task.status,
+                TaskStatus::ReadyForReview | TaskStatus::Failed
+            )
             && job
                 .snapshot
                 .view
@@ -692,17 +853,20 @@ fn refresh(job: &mut Job, report: AgentRuntimePollReport, store: &Store) -> Resu
     let revision = job.runtime.snapshot_revision(id);
     let preparing = job.runtime.has_preparing(id);
     let live = job.runtime.has_running(id);
-    let mut locked =
-        job.runtime.has_any_activity() || job.handoff.is_some() || job.terminal_runtime.is_some();
+    let mut locked = job.runtime.has_any_activity()
+        || job.handoff.is_some()
+        || job.terminal_runtime.is_some()
+        || job.validation.is_some();
     let exit = job.runtime.exit_report(id).cloned();
     if exit.as_ref().is_some_and(|exit| {
         exit.process.spawned && !(exit.process.reaped && exit.process.containment_verified_empty)
     }) {
         locked = true;
     }
-    let can_prompt = job.runtime.can_prompt_native(id);
+    let can_prompt = job.validation.is_none() && job.runtime.can_prompt_native(id);
     let can_resume = !locked
-        && (job.runtime.can_resume_codex(id)
+        && ((matches!(task.status, TaskStatus::ReadyForReview | TaskStatus::Failed)
+            && job.runtime.can_resume_codex(id))
             || (!locked
                 && task.status == TaskStatus::Created
                 && task.runtime_kind == TaskRuntimeKind::Unassigned));
@@ -856,6 +1020,7 @@ mod historical_projection_tests {
             operations: vec![],
             redact_secrets: true,
             validation_evidence_redacted: false,
+            validation: None,
         };
         store.save_native(&snapshot).unwrap();
         let mut manager = NativeManager::new(paths);
@@ -885,4 +1050,148 @@ mod historical_projection_tests {
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// Return true while validation owns the task, independently from any view.
+fn poll_validation(
+    job: &mut Job,
+    paths: &Paths,
+    store: &Store,
+    runtimes: &mut HashMap<super::model::ConversationId, super::host::RuntimeHandle>,
+) -> bool {
+    let Some(mut validation) = job.validation.take() else {
+        return false;
+    };
+    let task_id = job.snapshot.task.id;
+    let Some(mut snapshot) = job.snapshot.validation.take() else {
+        job.validation = Some(validation);
+        return true;
+    };
+    let mut completed = false;
+    let mut changed = false;
+    if let Some(receiver) = &validation.preparing {
+        match receiver.try_recv() {
+            Ok(result) => {
+                validation.preparing = None;
+                snapshot.preparing = false;
+                changed = true;
+                let result = if validation.cancelled {
+                    Err("Validation cancelled before command startup".into())
+                } else {
+                    result
+                };
+                match result.and_then(|prepared| {
+                    if runtimes
+                        .values()
+                        .filter(|runtime| runtime.snapshot.lock().state.is_live())
+                        .count()
+                        >= 16
+                    {
+                        return Err("The session host already owns sixteen running PTYs".into());
+                    }
+                    if runtimes.len() >= 32 {
+                        runtimes.retain(|_, runtime| runtime.snapshot.lock().state.is_live());
+                    }
+                    let cwd = prepared.prepared.cwd.clone();
+                    let id = super::model::ConversationId(format!(
+                        "jterm:validation:{}:{}",
+                        task_id, snapshot.run_id
+                    ));
+                    let runtime = super::native_validation::spawn(
+                        paths,
+                        id.clone(),
+                        prepared,
+                        job.lease.clone(),
+                        job.context.search_path.as_deref(),
+                    )?;
+                    let epoch = runtime.snapshot.lock().epoch.clone();
+                    snapshot.terminal = Some(OwnedTerminalDescriptor {
+                        id: id.clone(),
+                        epoch,
+                        cwd,
+                        label: format!("Validation · {}", job.snapshot.task.title),
+                    });
+                    runtimes.insert(id, runtime.clone());
+                    validation.runtime = Some(runtime);
+                    Ok(())
+                }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        snapshot.output = crate::review_input::safe_inline_display(&error, 4096);
+                        job.tasks
+                            .handle_terminal_session_exit(&snapshot.run_id, None);
+                        completed = true;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                snapshot.preparing = false;
+                snapshot.output =
+                    "Validation preparation ended without an outcome; command was not repeated"
+                        .into();
+                job.tasks
+                    .handle_terminal_session_exit(&snapshot.run_id, None);
+                completed = true;
+                changed = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if let Some(runtime) = &validation.runtime {
+        let state = runtime.snapshot.lock().clone();
+        if validation.last_output_sequence != Some(state.event_sequence) {
+            let (output, truncated) =
+                super::native_validation::output(runtime, job.snapshot.redact_secrets);
+            validation.last_output_sequence = Some(state.event_sequence);
+            if snapshot.output != output || snapshot.output_truncated != truncated {
+                snapshot.output = output;
+                snapshot.output_truncated = truncated;
+                changed = true;
+            }
+        }
+        if !state.state.is_live() {
+            if state.cleanup_verified {
+                job.tasks
+                    .handle_terminal_session_exit(&snapshot.run_id, state.exit_code);
+                completed = true;
+                changed = true;
+            } else if !job.snapshot.interrupted {
+                job.snapshot.interrupted = true;
+                job.snapshot.can_prompt = false;
+                job.snapshot.can_resume = false;
+                snapshot.output.push_str("\nValidation cleanup is unconfirmed; ownership remains locked and no command will be repeated.");
+                changed = true;
+            }
+        }
+    }
+    job.snapshot.validation = Some(snapshot);
+    if !completed {
+        job.validation = Some(validation);
+    }
+    if changed {
+        job.snapshot.sequence += 1;
+        if let Some(task) = job.tasks.get(task_id) {
+            job.snapshot.task = safe_task_projection(task, projection_policy(job));
+        }
+        job.snapshot.ownership_locked = !completed;
+        job.snapshot.can_prompt = false;
+        job.snapshot.can_resume = false;
+        job.snapshot.can_continue_in_terminal = false;
+        let _ = store.save_native(&job.snapshot);
+    }
+    !completed
+}
+
+fn original_validation_evidence(task: &crate::agent_task::AgentTask) -> bool {
+    task.source_context.as_ref().is_some_and(|context| {
+        context.command_exact
+            && !context.command_truncated
+            && context
+                .command
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+    }) || task
+        .brief
+        .as_ref()
+        .is_some_and(|brief| brief.validation.is_some())
 }

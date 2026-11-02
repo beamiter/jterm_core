@@ -68,6 +68,7 @@ mod model;
 mod native;
 mod native_handoff;
 mod native_host;
+mod native_validation;
 mod native_view;
 mod ownership;
 mod protocol;
@@ -78,12 +79,14 @@ pub use api::{
     ApiState, HostedApiClient,
 };
 pub use client::{
-    managed_launch, managed_session_running, run_embedded_if_requested, WorkspaceClient,
+    managed_launch, managed_session_running, owned_terminal_launch, run_embedded_if_requested,
+    WorkspaceClient,
 };
 pub use model::*;
 pub use native::{
-    NativeAction, NativeCatalogEntry, NativeControlLease, NativeLaunch, NativeLaunchContext,
-    NativeReportEvent, NativeSnapshot,
+    HostedValidationSnapshot, NativeAction, NativeCatalogEntry, NativeControlLease, NativeLaunch,
+    NativeLaunchContext, NativeReportEvent, NativeSnapshot, NativeTaskMutation,
+    OwnedTerminalDescriptor,
 };
 pub use ownership::NativeSessionLease;
 pub use protocol::{WorkspaceCommand, WorkspaceEvent, WorkspaceReply};

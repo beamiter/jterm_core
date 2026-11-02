@@ -14,6 +14,17 @@ impl Store {
         self.db.execute_batch("BEGIN IMMEDIATE").map_err(err)?;
         let result = (|| {
             self.upsert_runtime_row(&snapshot.row())?;
+            // Task lifecycle archive/restore is a host reducer transition, not
+            // an independent catalog decoration. Preserve its pins and title.
+            if let Some(mut row) = self.row(&snapshot.id)? {
+                row.archived = snapshot.task.status == crate::agent_task::TaskStatus::Archived;
+                self.db
+                    .execute(
+                        "UPDATE conversations SET row_json=?1 WHERE id=?2",
+                        params![serde_json::to_string(&row).map_err(err)?, snapshot.id.0],
+                    )
+                    .map_err(err)?;
+            }
             self.db.execute("INSERT INTO native_jobs(id,task_id,incarnation,sequence,snapshot) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET incarnation=excluded.incarnation,sequence=excluded.sequence,snapshot=excluded.snapshot",params![snapshot.id.0,snapshot.task.id.to_string(),snapshot.incarnation,to_i64(snapshot.sequence)?,json]).map_err(err)?;
             Ok(())
         })();
@@ -121,6 +132,21 @@ impl Store {
                 snapshot.preparing = false;
                 snapshot.handoff_pending = false;
                 snapshot.terminal = None;
+                if let Some(validation) = &mut snapshot.validation {
+                    validation.preparing = false;
+                    validation.terminal = None;
+                    if snapshot.task.validation.status
+                        == crate::agent_task::TaskValidationStatus::Running
+                    {
+                        snapshot.task.validation.status =
+                            crate::agent_task::TaskValidationStatus::Inconclusive;
+                        snapshot.task.validation.exit_code = None;
+                        snapshot.task.validation.status_detail = Some(
+                            "Host restarted before validation completion; no command was repeated"
+                                .into(),
+                        );
+                    }
+                }
                 snapshot.interrupted = true;
                 snapshot.can_prompt = false;
                 snapshot.can_resume = false;

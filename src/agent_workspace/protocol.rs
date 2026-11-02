@@ -190,6 +190,13 @@ pub(super) enum Request {
         launch: Box<ManagedLaunch>,
         client: String,
     },
+    AttachOwned {
+        version: u32,
+        terminal: super::native::OwnedTerminalDescriptor,
+        client: String,
+        cols: u16,
+        rows: u16,
+    },
     Input {
         client: String,
         epoch: String,

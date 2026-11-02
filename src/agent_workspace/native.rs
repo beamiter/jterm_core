@@ -154,6 +154,13 @@ pub enum NativeAction {
     Policy {
         policy: NativePromptPolicy,
     },
+    Validate {
+        expected_sequence: u64,
+    },
+    MutateTask {
+        expected_sequence: u64,
+        mutation: NativeTaskMutation,
+    },
     UpdateTask {
         task: Box<AgentTask>,
     },
@@ -170,6 +177,8 @@ impl std::fmt::Debug for NativeAction {
             Self::Resume { .. } => "Resume",
             Self::Policy { .. } => "Policy",
             Self::UpdateTask { .. } => "UpdateTask",
+            Self::Validate { .. } => "Validate",
+            Self::MutateTask { .. } => "MutateTask",
         })
     }
 }
@@ -205,6 +214,8 @@ pub struct NativeSnapshot {
     pub handoff_pending: bool,
     pub terminal: Option<crate::agent_sessions::AgentSession>,
     pub operations: Vec<String>,
+    #[serde(default)]
+    pub validation: Option<HostedValidationSnapshot>,
 }
 impl NativeSnapshot {
     pub fn task_id(&self) -> TaskId {
@@ -231,9 +242,23 @@ impl NativeSnapshot {
             runtime: if self.terminal.is_some() && self.ownership_locked && !self.interrupted {
                 RuntimeState::Running
             } else if self.interrupted
-                || (self.ownership_locked && !self.live && !self.preparing && !self.handoff_pending)
+                || (self.ownership_locked
+                    && !self.live
+                    && !self.preparing
+                    && !self.handoff_pending
+                    && !self.validation.as_ref().is_some_and(|v| {
+                        v.preparing
+                            || self.task.validation.status
+                                == crate::agent_task::TaskValidationStatus::Running
+                    }))
             {
                 RuntimeState::Conflict
+            } else if self.validation.as_ref().is_some_and(|validation| {
+                validation.preparing
+                    || self.task.validation.status
+                        == crate::agent_task::TaskValidationStatus::Running
+            }) {
+                RuntimeState::Running
             } else if self.live || self.preparing {
                 RuntimeState::Running
             } else {
@@ -294,6 +319,11 @@ pub(crate) fn safe_snapshot_projection(snapshot: &NativeSnapshot) -> NativeSnaps
     safe.validation_evidence_redacted |=
         safe.task.validation_command() != projected.validation_command();
     safe.task = projected;
+    if let Some(validation) = &mut safe.validation {
+        if policy.redact_secrets {
+            validation.output = crate::redact::redact_secrets(&validation.output);
+        }
+    }
     if !policy.redact_secrets {
         return safe;
     }
@@ -370,4 +400,29 @@ pub(crate) fn safe_snapshot_projection(snapshot: &NativeSnapshot) -> NativeSnaps
 
 fn default_redaction() -> bool {
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeTaskMutation {
+    Complete,
+    AcceptReviewed,
+    Archive,
+    Restore,
+}
+/// Attach capability for an existing host-owned PTY. It contains no executable,
+/// command, credentials, or permission to create a replacement process.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedTerminalDescriptor {
+    pub id: ConversationId,
+    pub epoch: String,
+    pub cwd: PathBuf,
+    pub label: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostedValidationSnapshot {
+    pub run_id: String,
+    pub preparing: bool,
+    pub terminal: Option<OwnedTerminalDescriptor>,
+    pub output: String,
+    pub output_truncated: bool,
 }
