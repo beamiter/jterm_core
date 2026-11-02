@@ -278,6 +278,14 @@ impl NativeRemote {
                                     self.owned_launches.push((id, terminal.clone()));
                                     self.validation_requests.remove(&id);
                                 } else if !validation.preparing {
+                                    report.issues.push(AgentRuntimeIssue {
+                                        task_id: id,
+                                        detail: if validation.output.is_empty() {
+                                            "Validation preparation ended without starting a command".into()
+                                        } else {
+                                            validation.output.clone()
+                                        },
+                                    });
                                     self.validation_requests.remove(&id);
                                 }
                             }

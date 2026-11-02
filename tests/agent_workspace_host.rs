@@ -2613,3 +2613,59 @@ fn remote_validation_rerun_opens_only_the_newly_admitted_owned_terminal() {
         2
     );
 }
+
+#[test]
+fn remote_validation_reports_missing_directory_without_running_in_a_fallback_cwd() {
+    use jterm_core::agent_task::{AgentRuntimeManager, TaskManager, TaskValidationStatus};
+    let (h, client, id, control, launch) = stopped_native_validation_fixture(
+        "printf forbidden-fallback >> FIXTURE_ROOT/validation-count".into(),
+    );
+    std::fs::rename(&launch.task.worktree_path, h.root.join("moved-worktree")).unwrap();
+    request(&client, WorkspaceCommand::DetachNative { control }).unwrap();
+    let mut view =
+        AgentRuntimeManager::hosted_with_client("missing-directory-observer", h.client());
+    let mut tasks = TaskManager::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while view.conversation_id(launch.task.id).is_none() {
+        view.poll(&mut tasks, launch.policy);
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    view.start_hosted_validation(launch.task.id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let issue = loop {
+        let report = view.poll(&mut tasks, launch.policy);
+        assert!(
+            view.take_owned_terminal_launches().is_empty(),
+            "missing cwd created a terminal"
+        );
+        if let Some(issue) = report
+            .issues
+            .into_iter()
+            .find(|issue| issue.task_id == launch.task.id)
+        {
+            break issue;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "validation preflight failure was never reported to the view"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        issue.detail.contains("worktree"),
+        "missing directory repair detail lost: {issue:?}"
+    );
+    assert!(
+        !h.root.join("validation-count").exists(),
+        "validation ran in a fallback directory"
+    );
+    let historical = inspect_native(&client, &id);
+    assert!(!historical.ownership_locked);
+    assert_eq!(
+        historical.task.validation.status,
+        TaskValidationStatus::Inconclusive
+    );
+    assert!(historical.validation.as_ref().unwrap().terminal.is_none());
+    assert!(view.hosted_validation_snapshot(launch.task.id).is_some());
+}

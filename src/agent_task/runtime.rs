@@ -527,13 +527,15 @@ impl AgentRuntimeManager {
         &self,
         id: TaskId,
     ) -> Option<&crate::agent_workspace::OwnedTerminalDescriptor> {
-        self.remote
-            .as_ref()?
-            .state(id)?
-            .validation
-            .as_ref()?
-            .terminal
-            .as_ref()
+        self.hosted_validation_snapshot(id)?.terminal.as_ref()
+    }
+    /// Bounded, policy-redacted validation output remains readable after its
+    /// PTY view detaches or the persistent host restarts.
+    pub fn hosted_validation_snapshot(
+        &self,
+        id: TaskId,
+    ) -> Option<&crate::agent_workspace::HostedValidationSnapshot> {
+        self.remote.as_ref()?.state(id)?.validation.as_ref()
     }
     pub fn handoff_to_terminal(&mut self, task_id: TaskId) -> Result<(), AgentRuntimeError> {
         let remote = self
