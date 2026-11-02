@@ -1094,10 +1094,63 @@ mod historical_projection_tests {
             manager.poll(&mut store, &mut runtimes);
         }
         let loaded = store.native_snapshot(&id).unwrap().unwrap();
-        assert_eq!(loaded.native_home, Some(home));
+        assert_eq!(loaded.native_home, Some(home.clone()));
         assert!(loaded.can_resume);
         assert!(loaded.can_continue_in_terminal);
         assert!(!loaded.live);
+        // Unsupported historical resume is rejected before changing runtime
+        // mode; its exact transcript/profile must survive later idle polls.
+        let job = manager.jobs.get_mut(&id).unwrap();
+        let mut raw_task = job.tasks.get(task_id).unwrap().clone();
+        raw_task.provider = AgentProvider::Claude;
+        job.tasks
+            .project_hosted_task(raw_task.clone(), false)
+            .unwrap();
+        job.snapshot.task = raw_task;
+        store.save_native(&job.snapshot).unwrap();
+        let controller = job.controller.as_ref().unwrap();
+        let control = controller.lease.clone();
+        let owner = controller.owner.clone();
+        let context = job.context.clone();
+        let policy = NativePromptPolicy {
+            share_command_context: true,
+            redact_secrets: true,
+        };
+        assert!(manager
+            .control(
+                control.clone(),
+                uuid::Uuid::new_v4().to_string(),
+                NativeAction::Resume {
+                    context: context.clone(),
+                    policy
+                },
+                &owner,
+                &mut store
+            )
+            .is_err());
+        for _ in 0..10 {
+            manager.poll(&mut store, &mut runtimes);
+        }
+        let rejected = store.native_snapshot(&id).unwrap().unwrap();
+        assert_eq!(rejected.native_home, Some(home));
+        assert!(rejected.view.as_ref().unwrap().provider_thread_id.is_some());
+        assert!(manager.jobs[&id].historical);
+        for status in [TaskStatus::Completed, TaskStatus::Archived] {
+            let job = manager.jobs.get_mut(&id).unwrap();
+            job.snapshot.task.status = status;
+            assert!(manager
+                .control(
+                    control.clone(),
+                    uuid::Uuid::new_v4().to_string(),
+                    NativeAction::Handoff {
+                        context: context.clone()
+                    },
+                    &owner,
+                    &mut store
+                )
+                .is_err());
+            assert!(manager.jobs[&id].handoff.is_none());
+        }
         drop(manager);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();

@@ -2060,6 +2060,7 @@ fn hosted_validation_detaches_replays_output_and_requires_controlled_acceptance(
         .contains("validation-finished"));
     let mut replay = attach(&terminal);
     replay.wait_for("validation-finished");
+    replay.wait_for("Validation exited:");
     replay.input(b"\x04");
     assert_eq!(replay.wait_exit(), 0);
     let mut stale = terminal.clone();
@@ -2285,6 +2286,7 @@ fn hosted_validation_detaches_reattaches_once_and_commits_controlled_task_mutati
         1
     );
     std::fs::write(h.root.join("validation-gate"), "").unwrap();
+    second.wait_for("Validation exited:");
     second.input(b"\x04");
     second.wait_exit();
     let passed = wait_native(&client, &id, |s| {
