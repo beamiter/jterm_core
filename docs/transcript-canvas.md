@@ -189,7 +189,8 @@ provider-version compatibility.
 Use `--session-scope` when validating a frontend's active-CLI document boundary.
 The shell path first emits an independent command with numbered pre-session
 rows, then the CLI emits its own row sequence, synchronized transient UI
-repaints, a temporary alternate-screen overlay and mouse-reporting requests.
+repaints, a temporary alternate-screen overlay (including its clear-history
+request) and mouse-reporting requests.
 The diagnostic additionally requires
 the scrollbar's upper bound to reveal CLI row zero, excludes the earlier shell
 rows, checks that page/wheel input remains at that same boundary, and rejects

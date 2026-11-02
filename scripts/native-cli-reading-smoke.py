@@ -69,7 +69,7 @@ try:
                 color = '50;200;230' if number & (1 << shift) else '240;190;40'
                 sys.stdout.write('\033[38;2;' + color + 'm▀')
             sys.stdout.write('\033[38;2;241;88;200m▀▀\033[0m ALT_COMPOSER_FRAME\r\n')
-        sys.stdout.write('\033[?2026l\033[?1049l')
+        sys.stdout.write('\033[?2026l\033[3J\033[?1049l')
         sys.stdout.flush()
     pending = b''
     while True:
@@ -347,6 +347,11 @@ def main():
         number = server.stdout.readline().strip()
         assert number.isdigit(), 'Xvfb display number'
         env['DISPLAY'] = ':' + number
+        # displayfd can become readable just before the X socket accepts its
+        # first client. Wait for an actual connection before winit starts.
+        wait_for(lambda: server.poll() is None and
+                 run('xdotool', 'getdisplaygeometry', check=False).returncode == 0,
+                 'Xvfb client connection', 10)
         log = (out / 'app.log').open('w')
         logs.append(log)
         app = subprocess.Popen([str(args.binary.resolve())], env=env, cwd=out, stdout=log, stderr=log)
