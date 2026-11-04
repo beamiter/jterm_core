@@ -842,6 +842,7 @@ impl WorktreeService {
             archive_root: managed_root.join(ARCHIVE_DIRECTORY),
             managed_root,
             timeout: GIT_COMMAND_TIMEOUT,
+            deadline: None,
             cancel: None,
         })
     }

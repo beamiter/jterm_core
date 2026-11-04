@@ -114,7 +114,9 @@ impl Store {
                 previous.evidence_after_ms
             }
         };
-        mission.revision = expected.checked_add(1).ok_or("Mission revision exhausted")?;
+        mission.revision = expected
+            .checked_add(1)
+            .ok_or("Mission revision exhausted")?;
         mission.updated_at_ms = now_ms();
         let json = serde_json::to_string(&mission).map_err(err)?;
         let changed = if expected == 0 {
@@ -157,10 +159,13 @@ impl Store {
         if json.len() > REPORT_BYTES {
             return Err("Mission inspection exceeds its evidence budget".into());
         }
-        let changed = self.db.execute(
-            "UPDATE workspace_missions SET report_json=?1 WHERE id=?2 AND revision=?3",
-            params![json, mission.id, to_i64(mission.revision)?],
-        ).map_err(err)?;
+        let changed = self
+            .db
+            .execute(
+                "UPDATE workspace_missions SET report_json=?1 WHERE id=?2 AND revision=?3",
+                params![json, mission.id, to_i64(mission.revision)?],
+            )
+            .map_err(err)?;
         if changed != 1 {
             return Err("Mission changed during inspection; inspect the current revision".into());
         }
@@ -177,11 +182,9 @@ mod tests {
 
     #[test]
     fn mission_cas_survives_reopen_without_creating_runtime_jobs() {
-        let paths = Paths::at(std::env::temp_dir().join(format!(
-            "jterm-mission-{}",
-            uuid::Uuid::new_v4()
-        )))
-        .unwrap();
+        let paths =
+            Paths::at(std::env::temp_dir().join(format!("jterm-mission-{}", uuid::Uuid::new_v4())))
+                .unwrap();
         let mut store = Store::open(&paths).unwrap();
         let mission = WorkspaceMission::new("Release", "Review exact candidates");
         let first = store.save_mission(0, mission.clone()).unwrap();
@@ -192,14 +195,27 @@ mod tests {
         assert_eq!(saved.revision, 1);
         let mut stale_report = saved.project(&[]);
         stale_report.revision = 0;
-        assert!(store.record_mission_report(saved.clone(), stale_report).is_err());
+        assert!(store
+            .record_mission_report(saved.clone(), stale_report)
+            .is_err());
         assert_eq!(
-            store.db.query_row("SELECT count(*) FROM native_jobs", [], |row| row.get::<_, i64>(0)).unwrap(),
+            store
+                .db
+                .query_row("SELECT count(*) FROM native_jobs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
             0
         );
         drop(store);
         let mut store = Store::open(&paths).unwrap();
-        assert_eq!(store.db.query_row("SELECT version FROM schema_version", [], |row| row.get::<_, i64>(0)).unwrap(), 6);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT version FROM schema_version", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
         assert_eq!(store.read_mission(&saved.id).unwrap().revision, 1);
         assert!(store.save_mission(0, mission).is_err());
         store.save_mission(1, saved).unwrap();

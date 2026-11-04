@@ -191,8 +191,16 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                                 .spawn(move || {
                                     let report = super::mission_host::inspect(&mission, &snapshots);
                                     count.fetch_sub(1, Ordering::Relaxed);
-                                    if let Err(error) = completion.try_send(HostRequest::MissionInspected(mission, report, worker_reply.clone())) {
-                                        let _ = worker_reply.try_send(Err(format!("Mission inspection could not be persisted: {error}")));
+                                    if let Err(error) =
+                                        completion.try_send(HostRequest::MissionInspected(
+                                            mission,
+                                            report,
+                                            worker_reply.clone(),
+                                        ))
+                                    {
+                                        let _ = worker_reply.try_send(Err(format!(
+                                            "Mission inspection could not be persisted: {error}"
+                                        )));
                                     }
                                 })
                             {

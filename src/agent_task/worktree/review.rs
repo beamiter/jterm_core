@@ -234,15 +234,26 @@ impl WorktreeService {
         // Detect metadata or tracked-content movement during capture. The
         // evidence is still a point-in-time observation, not a filesystem lock.
         if head != self.resolve_head(&path)?
-            || branch != self.git_text(
-                git_command(&self.git, &path, ["rev-parse", "--abbrev-ref", "HEAD"]),
-                "review branch recheck",
-            )?
+            || branch
+                != self.git_text(
+                    git_command(&self.git, &path, ["rev-parse", "--abbrev-ref", "HEAD"]),
+                    "review branch recheck",
+                )?
             || index != capture(&["ls-files", "--stage", "-z"], "review index recheck")?
-            || staged != capture(
-                &["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "HEAD", "--"],
-                "review staged recheck",
-            )?
+            || staged
+                != capture(
+                    &[
+                        "diff",
+                        "--cached",
+                        "--binary",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--ignore-submodules=none",
+                        "HEAD",
+                        "--",
+                    ],
+                    "review staged recheck",
+                )?
             || status
                 != capture(
                     &[
@@ -326,7 +337,11 @@ pub fn capture_repository_review(
             "repository branch",
         )
         .map_err(|error| error.to_string())?;
-    let baseline = if baseline.is_empty() { "HEAD" } else { baseline };
+    let baseline = if baseline.is_empty() {
+        "HEAD"
+    } else {
+        baseline
+    };
     service
         .capture_review(&root, baseline, &branch)
         .map_err(|error| error.to_string())

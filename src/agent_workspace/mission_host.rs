@@ -1,6 +1,7 @@
 //! Worker-side facts. Neither a plan nor provider output can supply receipts.
 use super::*;
 use crate::agent_task::worktree::{capture_repository_review, inspect_repository_delivery};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 pub(super) fn inspect(
@@ -9,6 +10,7 @@ pub(super) fn inspect(
 ) -> WorkspaceMissionReport {
     let started = Instant::now();
     let mut evidence = Vec::new();
+    let mut stale_checks = HashSet::new();
     for repository in &mission.repositories {
         let mut observed = WorkspaceMissionRepositoryEvidence {
             identity: repository.identity.clone(),
@@ -38,7 +40,10 @@ pub(super) fn inspect(
             // Never combine an earlier worktree with later dependency facts.
             let after = capture_repository_review(&repository.path, &repository.baseline)?;
             if current.fingerprint != after.fingerprint {
-                return Err("Repository changed during Mission inspection; stop writers and inspect again".into());
+                return Err(
+                    "Repository changed during Mission inspection; stop writers and inspect again"
+                        .into(),
+                );
             }
             observed.local = Some(WorkspaceMissionLocalEvidence {
                 baseline: current.base_commit.clone(),
@@ -85,10 +90,14 @@ pub(super) fn inspect(
                     observed.error = Some("Linked task belongs to a different worktree; select that checkout to bind its validation".into());
                     continue;
                 }
-                let report = WorkspaceResultReport::inspect_with_current(snapshot, Ok(current.clone()));
-                if report.validation.as_ref().is_some_and(|validation| {
-                    validation.started_at_ms <= mission.evidence_after_ms
-                }) {
+                let report =
+                    WorkspaceResultReport::inspect_with_current(snapshot, Ok(current.clone()));
+                if report
+                    .validation
+                    .as_ref()
+                    .is_some_and(|validation| validation.started_at_ms <= mission.evidence_after_ms)
+                {
+                    stale_checks.insert(repository.identity.full_name.clone());
                     observed.error = Some("Validation predates this acceptance contract; validate again after saving the plan and candidates".into());
                     continue;
                 }
@@ -102,6 +111,9 @@ pub(super) fn inspect(
                 ) {
                     Ok(validation) => observed.validations.push(validation),
                     Err(error) => {
+                        if report.validation.is_some() && !report.validation_current {
+                            stale_checks.insert(repository.identity.full_name.clone());
+                        }
                         if snapshot.validation.is_some() {
                             observed.error = Some(error);
                         }
@@ -115,31 +127,63 @@ pub(super) fn inspect(
         }
         evidence.push(observed);
     }
-    mission.project(&evidence)
+    let mut report = mission.project(&evidence);
+    for repository in &mut report.repositories {
+        if stale_checks.contains(&repository.identity.full_name) {
+            for check in &mut repository.checks {
+                if check.check_name == "validation" {
+                    check.status = WorkspaceMissionCheckStatus::Stale;
+                    check.detail = Some("The recorded validation does not cover this acceptance contract and current worktree".into());
+                }
+            }
+        }
+    }
+    report
 }
 
-fn dependency_pins(manifest: &str, lockfile: &str) -> Result<(Option<String>, Option<String>), String> {
+fn dependency_pins(
+    manifest: &str,
+    lockfile: &str,
+) -> Result<(Option<String>, Option<String>), String> {
     let manifest: toml::Value = toml::from_str(manifest)
         .map_err(|error| format!("Candidate Cargo.toml cannot be inspected: {error}"))?;
     let lockfile: toml::Value = toml::from_str(lockfile)
         .map_err(|error| format!("Candidate Cargo.lock cannot be inspected: {error}"))?;
-    let dependency = manifest.get("dependencies")
+    let dependency = manifest
+        .get("dependencies")
         .and_then(|dependencies| dependencies.get("jterm_core"));
-    let source = dependency.and_then(|dependency| dependency.get("git"))
+    let source = dependency
+        .and_then(|dependency| dependency.get("git"))
         .and_then(toml::Value::as_str);
-    let expected_source = source.is_some_and(|source| matches!(source,
-        "https://github.com/beamiter/jterm_core" | "https://github.com/beamiter/jterm_core.git"));
-    let manifest_pin = dependency.filter(|_| expected_source)
+    let expected_source = source.is_some_and(|source| {
+        matches!(
+            source,
+            "https://github.com/beamiter/jterm_core" | "https://github.com/beamiter/jterm_core.git"
+        )
+    });
+    let manifest_pin = dependency
+        .filter(|_| expected_source)
         .and_then(|dependency| dependency.get("rev"))
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
     let packages = lockfile.get("package").and_then(toml::Value::as_array);
-    let pins: Vec<_> = packages.into_iter().flatten()
+    let pins: Vec<_> = packages
+        .into_iter()
+        .flatten()
         .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some("jterm_core"))
         .filter_map(|package| package.get("source").and_then(toml::Value::as_str))
-        .filter(|source| source.strip_prefix("git+").and_then(|source| source.split_once('?'))
-            .is_some_and(|(repository, _)| matches!(repository,
-                "https://github.com/beamiter/jterm_core" | "https://github.com/beamiter/jterm_core.git")))
+        .filter(|source| {
+            source
+                .strip_prefix("git+")
+                .and_then(|source| source.split_once('?'))
+                .is_some_and(|(repository, _)| {
+                    matches!(
+                        repository,
+                        "https://github.com/beamiter/jterm_core"
+                            | "https://github.com/beamiter/jterm_core.git"
+                    )
+                })
+        })
         .filter_map(|source| source.rsplit_once('#').map(|(_, sha)| sha.to_owned()))
         .collect();
     if pins.len() > 1 {
@@ -154,9 +198,13 @@ mod tests {
 
     #[test]
     fn manifest_and_lock_are_observed_independently() {
-        let manifest = "[dependencies.jterm_core]\ngit='https://github.com/beamiter/jterm_core'\nrev='aaa'";
+        let manifest =
+            "[dependencies.jterm_core]\ngit='https://github.com/beamiter/jterm_core'\nrev='aaa'";
         let lockfile = "[[package]]\nname='jterm_core'\nsource='git+https://github.com/beamiter/jterm_core?rev=bbb#bbb'";
-        assert_eq!(dependency_pins(manifest, lockfile).unwrap(), (Some("aaa".into()), Some("bbb".into())));
+        assert_eq!(
+            dependency_pins(manifest, lockfile).unwrap(),
+            (Some("aaa".into()), Some("bbb".into()))
+        );
         assert!(dependency_pins("invalid toml [", lockfile).is_err());
     }
 }
