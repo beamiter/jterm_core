@@ -240,6 +240,7 @@ fn ipc(path: &std::path::Path, kind: &str, name: &str, args: Value) -> io::Resul
         return Err(io::Error::other("unsafe_wm_endpoint"));
     }
     let mut stream = connect(path)?;
+    verify_connected_peer(&stream)?;
     let timeout = Some(Duration::from_millis(500));
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
@@ -277,6 +278,42 @@ fn ipc(path: &std::path::Path, kind: &str, name: &str, args: Value) -> io::Resul
         return Err(io::Error::other("wm_refused_session_request"));
     }
     Ok(reply["data"].clone())
+}
+fn validate_peer_uid(
+    length: libc::socklen_t,
+    uid: libc::uid_t,
+    expected: libc::uid_t,
+) -> io::Result<()> {
+    if length as usize != std::mem::size_of::<libc::ucred>() || uid != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unverified_wm_peer",
+        ));
+    }
+    Ok(())
+}
+/// Authenticate the connected socket before sending any window/session data.
+/// A prior pathname UID check cannot fence replacement in a writable parent.
+fn verify_connected_peer(stream: &UnixStream) -> io::Result<()> {
+    let mut credential = libc::ucred {
+        pid: 0,
+        uid: libc::uid_t::MAX,
+        gid: libc::gid_t::MAX,
+    };
+    let mut length = std::mem::size_of_val(&credential) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credential as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    validate_peer_uid(length, credential.uid, unsafe { libc::geteuid() })
 }
 fn connect(path: &std::path::Path) -> io::Result<UnixStream> {
     use std::os::unix::ffi::OsStrExt;
@@ -364,6 +401,35 @@ mod bridge_tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+    #[test]
+    fn connected_socket_authenticates_same_uid_and_rejects_unverified_credentials() {
+        let directory =
+            std::env::temp_dir().join(format!("jterm-desktop-peer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("peer.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let peer = std::thread::spawn(move || listener.accept().unwrap().0);
+        let client = connect(&socket).unwrap();
+        verify_connected_peer(&client).unwrap();
+        let accepted = peer.join().unwrap();
+        verify_connected_peer(&accepted).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        assert_eq!(
+            validate_peer_uid(size, uid.wrapping_add(1), uid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            validate_peer_uid(0, uid, uid).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(client);
+        drop(accepted);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn worker_registers_live_pane_and_requires_gui_receipt_for_completion() {
         let directory =
