@@ -29,6 +29,11 @@ enum AttachTarget {
     Owned(super::native::OwnedTerminalDescriptor, u16, u16),
 }
 enum HostRequest {
+    MissionInspected(
+        super::WorkspaceMission,
+        super::WorkspaceMissionReport,
+        Sender<Result<WorkspaceReply, String>>,
+    ),
     Command(
         WorkspaceCommand,
         (u32, String),
@@ -150,7 +155,54 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
             }
         }
         match rx.recv_timeout(Duration::from_millis(15)) {
+            Ok(HostRequest::MissionInspected(mission, report, reply)) => {
+                let result = store.record_mission_report(mission, report);
+                let _ = reply.try_send(result);
+            }
             Ok(HostRequest::Command(command, owner, reply)) => {
+                if let WorkspaceCommand::InspectMission { id } = &command {
+                    let inputs = (|| {
+                        let mission = store.read_mission(id)?;
+                        let mut snapshots = Vec::new();
+                        for repository in &mission.repositories {
+                            for task in &repository.tasks {
+                                if let Some(snapshot) = store.native_snapshot(&task.conversation)? {
+                                    snapshots.push(snapshot);
+                                }
+                            }
+                        }
+                        Ok::<_, String>((mission, snapshots))
+                    })();
+                    match inputs {
+                        Err(error) => {
+                            let _ = reply.try_send(Err(error));
+                        }
+                        Ok((mission, snapshots)) => {
+                            if result_workers.load(Ordering::Relaxed) >= 4 {
+                                let _ = reply.try_send(Err("Evidence inspection is busy; retry when another review finishes".into()));
+                                continue;
+                            }
+                            result_workers.fetch_add(1, Ordering::Relaxed);
+                            let count = result_workers.clone();
+                            let completion = tx.clone();
+                            let worker_reply = reply.clone();
+                            if let Err(error) = std::thread::Builder::new()
+                                .name("jterm-mission-review".into())
+                                .spawn(move || {
+                                    let report = super::mission_host::inspect(&mission, &snapshots);
+                                    count.fetch_sub(1, Ordering::Relaxed);
+                                    if let Err(error) = completion.try_send(HostRequest::MissionInspected(mission, report, worker_reply.clone())) {
+                                        let _ = worker_reply.try_send(Err(format!("Mission inspection could not be persisted: {error}")));
+                                    }
+                                })
+                            {
+                                result_workers.fetch_sub(1, Ordering::Relaxed);
+                                let _ = reply.try_send(Err(error.to_string()));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let WorkspaceCommand::InspectResult { id } = &command {
                     let snapshot = store.native_snapshot(id).and_then(|value| {
                         value.ok_or_else(|| {
@@ -402,7 +454,9 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
             }
             let owner = peer_identity(&stream).ok_or("Cannot verify workspace client process")?;
             let (tx, rx) = bounded(1);
-            let timeout = if matches!(&command, WorkspaceCommand::InspectResult { .. }) {
+            let timeout = if matches!(&command, WorkspaceCommand::InspectMission { .. }) {
+                115
+            } else if matches!(&command, WorkspaceCommand::InspectResult { .. }) {
                 55
             } else {
                 8

@@ -141,7 +141,9 @@ pub(super) fn command_request(
     mut stream: UnixStream,
     command: WorkspaceCommand,
 ) -> Result<WorkspaceReply, String> {
-    let timeout = if matches!(&command, WorkspaceCommand::InspectResult { .. }) {
+    let timeout = if matches!(&command, WorkspaceCommand::InspectMission { .. }) {
+        120
+    } else if matches!(&command, WorkspaceCommand::InspectResult { .. }) {
         60
     } else {
         10

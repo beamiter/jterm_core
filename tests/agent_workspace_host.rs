@@ -15,6 +15,36 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const HOST: &str = env!("CARGO_BIN_EXE_jterm-sessiond");
+
+#[test]
+fn missions_are_shared_revisioned_plans_without_execution() {
+    let harness = Harness::new();
+    let first = harness.client();
+    let second = harness.client();
+    let plan = WorkspaceMission::new("Coordinated release", "Verify each declared candidate");
+    let WorkspaceReply::Mission { mission: saved, report } = request(
+        &first,
+        WorkspaceCommand::SaveMission { expected_revision: 0, mission: plan.clone() },
+    ).unwrap() else { panic!("Mission reply"); };
+    assert_eq!(saved.revision, 1);
+    assert!(report.is_none());
+    assert!(request(&second, WorkspaceCommand::SaveMission {
+        expected_revision: 0, mission: plan,
+    }).is_err());
+    let WorkspaceReply::Mission { mission, .. } = request(&second,
+        WorkspaceCommand::ReadMission { id: saved.id.clone() }).unwrap()
+    else { panic!("shared Mission"); };
+    assert_eq!(mission, saved);
+    let WorkspaceReply::Mission { report: Some(report), .. } = request(&second,
+        WorkspaceCommand::InspectMission { id: saved.id }).unwrap()
+    else { panic!("inspected Mission"); };
+    assert_eq!(report.state, WorkspaceMissionState::Draft);
+    let WorkspaceReply::Catalog { rows } = request(&first, WorkspaceCommand::Refresh).unwrap()
+    else { panic!("catalog"); };
+    assert!(rows.is_empty(), "Mission reads must not create or start a task");
+    assert!(!harness.trace.exists(), "Mission inspection launched a provider");
+}
+
 fn host_executable() -> PathBuf {
     // A root-owned checkout may be inaccessible to the unprivileged UID used
     // to exercise automatic-helper trust policy. Test runners may copy this

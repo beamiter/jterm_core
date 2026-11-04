@@ -90,6 +90,19 @@ pub enum WorkspaceCommand {
         update: super::WorkspaceQueueUpdate,
     },
     QueueSnapshot,
+    /// Bounded catalog of saved delivery plans; no execution is started.
+    MissionList,
+    ReadMission {
+        id: String,
+    },
+    /// Plan-only compare-and-swap. Inspection evidence is host-owned.
+    SaveMission {
+        expected_revision: u64,
+        mission: super::WorkspaceMission,
+    },
+    InspectMission {
+        id: String,
+    },
     InspectResult {
         id: ConversationId,
     },
@@ -209,6 +222,13 @@ pub enum WorkspaceReply {
     },
     Queue {
         snapshot: super::WorkspaceQueueSnapshot,
+    },
+    Missions {
+        missions: Vec<super::WorkspaceMission>,
+    },
+    Mission {
+        mission: super::WorkspaceMission,
+        report: Option<super::WorkspaceMissionReport>,
     },
     Result {
         report: super::WorkspaceResultReport,

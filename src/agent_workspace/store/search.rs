@@ -44,7 +44,7 @@ pub(super) fn migrate(db: &Connection, old_version: i64) -> Result<(), String> {
             INSERT INTO workspace_index_pending SELECT new.id WHERE NOT EXISTS(SELECT 1 FROM workspace_index_pending WHERE conversation_id=new.id); END;
         CREATE TRIGGER IF NOT EXISTS workspace_message_delete AFTER DELETE ON messages BEGIN
             DELETE FROM workspace_text WHERE message_sequence=old.sequence; END;
-        UPDATE schema_version SET version=5; COMMIT;").map_err(err)?;
+        UPDATE schema_version SET version=5 WHERE version<5; COMMIT;").map_err(err)?;
     if old_version < 5 {
         db.execute(
             "INSERT OR IGNORE INTO workspace_index_pending SELECT id FROM conversations",

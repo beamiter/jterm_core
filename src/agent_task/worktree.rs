@@ -15,8 +15,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod delivery;
 mod review;
-pub use review::{capture_task_review, WorktreeReviewSnapshot};
+pub use delivery::{inspect_repository_delivery, RepositoryDeliveryObservation};
+pub use review::{capture_repository_review, capture_task_review, WorktreeReviewSnapshot};
 
 pub const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_GIT_STDOUT_BYTES: usize = 1024 * 1024;
@@ -164,6 +166,7 @@ pub struct WorktreeService {
     managed_root: PathBuf,
     archive_root: PathBuf,
     timeout: Duration,
+    deadline: Option<Instant>,
     cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -177,6 +180,7 @@ impl WorktreeService {
             archive_root: managed_root.join(ARCHIVE_DIRECTORY),
             managed_root,
             timeout: GIT_COMMAND_TIMEOUT,
+            deadline: None,
             cancel: None,
         })
     }
@@ -760,12 +764,25 @@ impl WorktreeService {
                 detail: "operation was cancelled".to_string(),
             });
         }
+        let timeout = match self.deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(WorktreeError::GitCommand {
+                        operation: operation.to_string(),
+                        detail: "evidence inspection exceeded its total time budget".into(),
+                    });
+                }
+                self.timeout.min(remaining)
+            }
+            None => self.timeout,
+        };
         run_command_with_timeout(
             command,
             operation,
             stdout_limit,
             MAX_GIT_STDERR_BYTES,
-            self.timeout,
+            timeout,
             self.cancel.as_deref(),
         )
         .map_err(|detail| WorktreeError::GitCommand {
@@ -1283,6 +1300,8 @@ fn configure_git_environment(
         .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", NULL_DEVICE)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_LITERAL_PATHSPECS", "1")
         .env("GIT_PAGER", "cat")

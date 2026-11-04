@@ -66,6 +66,9 @@ mod api_host;
 mod client;
 mod context;
 mod host;
+mod mission;
+mod mission_host;
+mod mission_workbench;
 mod model;
 mod native;
 mod native_handoff;
@@ -93,6 +96,8 @@ pub use client::{
     WorkspaceClient,
 };
 pub use context::*;
+pub use mission::*;
+pub use mission_workbench::MissionWorkbench;
 pub use model::*;
 pub use native::{
     HostedValidationSnapshot, NativeAction, NativeCatalogEntry, NativeControlLease, NativeLaunch,
@@ -116,8 +121,10 @@ pub use result::*;
 pub use search::*;
 pub use ssh::WorkspaceSshHost;
 
-/// Host protocol version. Older installed frontends fail clearly instead of
-/// interpreting a newer host's records with an incompatible schema.
+/// Host wire version. Mission commands are additive: legacy commands remain
+/// usable with a live V2 host, which does not know the new command variants.
+/// Mission clients surface that capability error without restarting a host or
+/// replaying a write. SQLite schema 6 prevents an older host opening new data.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Worker-only location for durable, isolated native provider profiles.

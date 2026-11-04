@@ -9,6 +9,7 @@ use std::time::Duration;
 mod context;
 mod hosted_api;
 mod hosted_native;
+mod mission;
 mod queue;
 mod search;
 
@@ -58,7 +59,7 @@ impl Store {
                 r.get(0)
             })
             .map_err(err)?;
-        if !(1..=5).contains(&version) {
+        if !(1..=6).contains(&version) {
             return Err(format!(
                 "Unsupported Agent Workspace database version {version}"
             ));
@@ -93,6 +94,7 @@ impl Store {
         search::migrate(&db, version)?;
         context::migrate(&db)?;
         queue::migrate(&db)?;
+        mission::migrate(&db)?;
         // A restarted host records unknown outcomes without replaying model
         // operations. Surviving worker/PTY descendants retain kernel leases;
         // a newer draft remains independent from that previous execution.
@@ -211,6 +213,12 @@ impl Store {
             }),
             WorkspaceCommand::QueueUpdate { update } => self.queue_update(update),
             WorkspaceCommand::QueueSnapshot => self.queue_snapshot(),
+            WorkspaceCommand::MissionList => self.mission_list(),
+            WorkspaceCommand::ReadMission { id } => self.read_mission_reply(&id),
+            WorkspaceCommand::SaveMission {
+                expected_revision,
+                mission,
+            } => self.save_mission(expected_revision, mission),
             WorkspaceCommand::IndexSessions { sessions } => {
                 if sessions.len() > 2048 {
                     return Err("Provider index exceeds its 2048-session budget".into());
@@ -414,6 +422,7 @@ impl Store {
             } => self.cancel(&receipt, restore_draft),
             WorkspaceCommand::StartNative { .. }
             | WorkspaceCommand::InspectResult { .. }
+            | WorkspaceCommand::InspectMission { .. }
             | WorkspaceCommand::NativeCatalog { .. }
             | WorkspaceCommand::InspectNative { .. }
             | WorkspaceCommand::AttachNative { .. }

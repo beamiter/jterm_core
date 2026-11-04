@@ -36,7 +36,14 @@ pub struct WorkspaceResultReport {
 impl WorkspaceResultReport {
     /// Read-only worker entrypoint. It neither runs tests nor accepts a task.
     pub fn inspect(snapshot: &NativeSnapshot) -> Self {
-        let (current, error) = match capture_task_review(&snapshot.task) {
+        Self::inspect_with_current(snapshot, capture_task_review(&snapshot.task))
+    }
+
+    pub(super) fn inspect_with_current(
+        snapshot: &NativeSnapshot,
+        captured: Result<WorktreeReviewSnapshot, String>,
+    ) -> Self {
+        let (current, error) = match captured {
             Ok(current) => (Some(current), None),
             Err(error) => (None, Some(error)),
         };

@@ -40,8 +40,18 @@ impl WorktreeService {
             &task.branch,
         )?;
         self.reject_external_checkout_filters(&task.repo_root)?;
+        self.capture_review(&root, &task.base_commit, &task.branch)
+    }
+
+    fn capture_review(
+        &self,
+        root: &crate::agent_task::pinned_dir::PinnedDirectory,
+        baseline: &str,
+        branch: &str,
+    ) -> Result<WorktreeReviewSnapshot, WorktreeError> {
+        let path = root.proc_path();
         let head = self.resolve_head(&path)?;
-        let baseline = self.resolve_commit(&path, &task.base_commit)?;
+        let baseline = self.resolve_commit(&path, baseline)?;
         let capture = |args: &[&str], operation: &str| -> Result<Vec<u8>, WorktreeError> {
             let mut command = base_git_command(&self.git, &path);
             command.args(args);
@@ -118,7 +128,7 @@ impl WorktreeService {
         for bytes in [
             head.as_bytes(),
             baseline.as_bytes(),
-            task.branch.as_bytes(),
+            branch.as_bytes(),
             status.as_slice(),
             tracked.as_slice(),
             staged.as_slice(),
@@ -224,6 +234,15 @@ impl WorktreeService {
         // Detect metadata or tracked-content movement during capture. The
         // evidence is still a point-in-time observation, not a filesystem lock.
         if head != self.resolve_head(&path)?
+            || branch != self.git_text(
+                git_command(&self.git, &path, ["rev-parse", "--abbrev-ref", "HEAD"]),
+                "review branch recheck",
+            )?
+            || index != capture(&["ls-files", "--stage", "-z"], "review index recheck")?
+            || staged != capture(
+                &["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "HEAD", "--"],
+                "review staged recheck",
+            )?
             || status
                 != capture(
                     &[
@@ -274,7 +293,7 @@ impl WorktreeService {
         }
         Ok(WorktreeReviewSnapshot {
             head,
-            branch: task.branch.clone(),
+            branch: branch.to_owned(),
             base_commit: baseline,
             fingerprint: format!("sha256:{:x}", hash.finalize()),
             status: crate::review_input::safe_multiline_display(&status_text, 16 * 1024),
@@ -290,6 +309,27 @@ impl WorktreeService {
             attribution,
         })
     }
+}
+
+/// Inspect an explicitly selected checkout using the same bounded evidence
+/// capture as task worktrees. No managed directory or branch is created.
+pub fn capture_repository_review(
+    repository: &Path,
+    baseline: &str,
+) -> Result<WorktreeReviewSnapshot, String> {
+    let service = super::delivery::read_only_service()?;
+    let root = super::delivery::pin_repository(&service, repository)?;
+    let path = root.proc_path();
+    let branch = service
+        .git_text(
+            git_command(&service.git, &path, ["rev-parse", "--abbrev-ref", "HEAD"]),
+            "repository branch",
+        )
+        .map_err(|error| error.to_string())?;
+    let baseline = if baseline.is_empty() { "HEAD" } else { baseline };
+    service
+        .capture_review(&root, baseline, &branch)
+        .map_err(|error| error.to_string())
 }
 
 pub fn capture_task_review(
