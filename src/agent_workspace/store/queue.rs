@@ -196,6 +196,11 @@ mod tests {
     }
     #[test]
     fn queue_survives_reopen_rejects_stale_writes_and_never_creates_runtime_jobs() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_workspace::store::queue::tests::queue_survives_reopen_rejects_stale_writes_and_never_creates_runtime_jobs",
+        ) {
+            return;
+        }
         let (mut store, paths) = fixture();
         let a = task(&store, "a");
         let b = task(&store, "b");

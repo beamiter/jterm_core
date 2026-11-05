@@ -185,6 +185,11 @@ mod tests {
 
     #[test]
     fn mission_cas_survives_reopen_without_creating_runtime_jobs() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_workspace::store::mission::tests::mission_cas_survives_reopen_without_creating_runtime_jobs",
+        ) {
+            return;
+        }
         let paths =
             Paths::at(std::env::temp_dir().join(format!("jterm-mission-{}", uuid::Uuid::new_v4())))
                 .unwrap();
@@ -228,6 +233,11 @@ mod tests {
 
     #[test]
     fn saved_report_reopen_keeps_history_without_claiming_current_evidence() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_workspace::store::mission::tests::saved_report_reopen_keeps_history_without_claiming_current_evidence",
+        ) {
+            return;
+        }
         let paths =
             Paths::at(std::env::temp_dir().join(format!("jterm-mission-{}", uuid::Uuid::new_v4())))
                 .unwrap();
