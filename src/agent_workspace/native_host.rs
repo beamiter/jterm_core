@@ -69,11 +69,11 @@ impl NativeManager {
         if let WorkspaceCommand::Archive { id, .. } | WorkspaceCommand::Delete { id } = &command {
             match store.native_snapshot(id) {
                 Ok(Some(_)) => {
-                    return Disposition::Handled(Err(
+                    return Disposition::Handled(Box::new(Err(
                         "Use the controlled task Hide/Restore action for this hosted task".into(),
-                    ))
+                    )))
                 }
-                Err(error) => return Disposition::Handled(Err(error)),
+                Err(error) => return Disposition::Handled(Box::new(Err(error))),
                 Ok(None) => {}
             }
         }
@@ -81,11 +81,11 @@ impl NativeManager {
             for change in changes.iter().filter(|change| change.archived.is_some()) {
                 match store.native_snapshot(&change.id) {
                     Ok(Some(_)) => {
-                        return Disposition::Handled(Err(
+                        return Disposition::Handled(Box::new(Err(
                             "A task archive batch requires controlled task actions".into(),
-                        ))
+                        )))
                     }
-                    Err(error) => return Disposition::Handled(Err(error)),
+                    Err(error) => return Disposition::Handled(Box::new(Err(error))),
                     Ok(None) => {}
                 }
             }
@@ -121,7 +121,7 @@ impl NativeManager {
             } => self.control(control, operation, *action, &owner, store),
             other => return Disposition::Other(other),
         };
-        Disposition::Handled(result)
+        Disposition::Handled(Box::new(result))
     }
     fn inspect(
         id: &super::model::ConversationId,

@@ -323,7 +323,9 @@ impl MissionWorkbench {
             Pending::Catalog => match result {
                 Ok(WorkspaceReply::Missions { missions }) => {
                     if let Some(selected) = &self.selected {
-                        if let Some(current) = missions.iter().find(|mission| mission.id == selected.id) {
+                        if let Some(current) =
+                            missions.iter().find(|mission| mission.id == selected.id)
+                        {
                             if current.revision != selected.revision {
                                 self.selected = Some(current.clone());
                                 self.report = None;
@@ -331,7 +333,9 @@ impl MissionWorkbench {
                             }
                         } else if selected.revision > 0 {
                             self.report = None;
-                            self.notice = Some("The selected Mission is absent from the current catalog".into());
+                            self.notice = Some(
+                                "The selected Mission is absent from the current catalog".into(),
+                            );
                         }
                     }
                     self.reports.retain(|id, report| {
@@ -550,7 +554,12 @@ mod tests {
         mission.revision = 2;
         mission.goal = "Changed acceptance".into();
         state.pending.insert(1, Pending::Catalog);
-        state.receive(1, Ok(WorkspaceReply::Missions { missions: vec![mission.clone()] }));
+        state.receive(
+            1,
+            Ok(WorkspaceReply::Missions {
+                missions: vec![mission.clone()],
+            }),
+        );
         assert_eq!(state.selected, Some(mission));
         assert!(state.report.is_none());
     }

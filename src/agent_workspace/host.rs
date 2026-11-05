@@ -234,8 +234,9 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                                 .spawn(move || {
                                     let report = super::WorkspaceResultReport::inspect(&snapshot);
                                     count.fetch_sub(1, Ordering::Relaxed);
-                                    let _ = worker_reply
-                                        .try_send(Ok(WorkspaceReply::Result { report }));
+                                    let _ = worker_reply.try_send(Ok(WorkspaceReply::Result {
+                                        report: Box::new(report),
+                                    }));
                                 })
                             {
                                 result_workers.fetch_sub(1, Ordering::Relaxed);
@@ -248,11 +249,11 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                 let response = (|| {
                     store.reap_abandoned_requests()?;
                     let command = match api.handle(command, owner.clone(), &mut store) {
-                        super::api_host::Disposition::Handled(reply) => return reply,
+                        super::api_host::Disposition::Handled(reply) => return *reply,
                         super::api_host::Disposition::Other(command) => command,
                     };
                     let command = match native.handle(command, owner.clone(), &mut store) {
-                        super::api_host::Disposition::Handled(reply) => return reply,
+                        super::api_host::Disposition::Handled(reply) => return *reply,
                         super::api_host::Disposition::Other(command) => command,
                     };
                     match command {
@@ -474,7 +475,7 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
             let result = rx
                 .recv_timeout(Duration::from_secs(timeout))
                 .map_err(|_| "Workspace request timed out")?;
-            write_frame(&mut stream, &Response::Reply(result))
+            write_frame(&mut stream, &Response::Reply(Box::new(result)))
         }
         request @ (Request::Attach { .. } | Request::AttachOwned { .. }) => {
             let (version, target, client) = match request {

@@ -231,7 +231,7 @@ pub enum WorkspaceReply {
         report: Option<super::WorkspaceMissionReport>,
     },
     Result {
-        report: super::WorkspaceResultReport,
+        report: Box<super::WorkspaceResultReport>,
     },
     Imported {
         mappings: Vec<LegacyChatMapping>,
@@ -297,7 +297,7 @@ pub(super) enum Request {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum Response {
-    Reply(Result<WorkspaceReply, String>),
+    Reply(Box<Result<WorkspaceReply, String>>),
     Attached {
         snapshot: RuntimeSnapshot,
         screen: Vec<u8>,
@@ -354,5 +354,45 @@ pub(super) fn read_frame<T: serde::de::DeserializeOwned>(
                 .map(Some)
                 .map_err(|e| format!("Invalid workspace frame: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boxed_result_replies_preserve_the_legacy_wire_frame() {
+        // Protocol 2 clients must still read result replies from a new host.
+        let legacy = serde_json::json!({"Reply": {"Ok": {"Result": {"report": {
+            "conversation": "task:00000000-0000-4000-8000-000000000001",
+            "task_id": "00000000-0000-4000-8000-000000000001",
+            "run_id": "run-1",
+            "source_sequence": 7,
+            "baseline": null,
+            "current": null,
+            "validation": null,
+            "validation_current": false,
+            "validation_status": "Not run",
+            "validation_output": "",
+            "validation_output_truncated": false,
+            "error": null
+        }}}}});
+        let mut frame = serde_json::to_vec(&legacy).unwrap();
+        frame.push(b'\n');
+        let response: Response = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        let Response::Reply(result) = &response else {
+            panic!("legacy result reply was not recognized");
+        };
+        let Ok(WorkspaceReply::Result { report }) = result.as_ref() else {
+            panic!("legacy result evidence was not recognized");
+        };
+        assert_eq!(report.source_sequence, 7);
+        let mut emitted = Vec::new();
+        write_frame(&mut emitted, &response).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&emitted).unwrap(),
+            legacy
+        );
     }
 }

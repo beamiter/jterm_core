@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 type Owner = (u32, String);
 pub(super) enum Disposition {
-    Handled(Result<WorkspaceReply, String>),
+    Handled(Box<Result<WorkspaceReply, String>>),
     Other(WorkspaceCommand),
 }
 struct Controller {
@@ -140,7 +140,7 @@ impl ApiManager {
             }
             other => return Disposition::Other(other),
         };
-        Disposition::Handled(result)
+        Disposition::Handled(Box::new(result))
     }
     fn inspect(
         &self,

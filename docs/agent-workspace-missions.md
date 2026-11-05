@@ -6,8 +6,10 @@ host remains the sole SQLite writer and execution owner.
 
 ## Native workflow
 
-Open **Missions** from the Agent Workspace. Anvil and Forge open the native
-workspace canvas; Ember and Frost use their native inspection surfaces.
+The shared core supplies the Mission protocol and controller. The current
+frontend candidate adds **Missions** to Frost's Agent Workspace inspector.
+Anvil, Forge and Ember still require their corresponding frontend integrations;
+publishing this core alone does not add a Mission surface to those applications.
 
 1. Create a five-repository plan with the absolute top-level checkout paths
    for `jterm_core`, `anvil`, `forge`, `ember`, and `frost`.

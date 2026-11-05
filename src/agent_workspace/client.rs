@@ -164,7 +164,7 @@ pub(super) fn command_request(
     match read_frame::<Response>(&mut BufReader::new(stream))?
         .ok_or("Session host closed its response")?
     {
-        Response::Reply(result) => result,
+        Response::Reply(result) => *result,
         Response::Error(error) => Err(error),
         _ => Err("Unexpected workspace response".into()),
     }
