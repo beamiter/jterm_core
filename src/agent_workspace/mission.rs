@@ -16,6 +16,9 @@ pub const WORKSPACE_MISSION_REPOSITORIES: usize = 16;
 pub const WORKSPACE_MISSION_CHECKS: usize = 32;
 pub const WORKSPACE_MISSION_TASK_REFS: usize = 32;
 
+pub(super) const REINSPECTION_DETAIL: &str =
+    "Saved observation requires reinspection of the current candidate, dependencies and target ref";
+
 /// Repository IDs are hints for detecting mismatches, not proof of authority.
 pub const FOUR_TERMINAL_REPOSITORIES: [(&str, u64); 5] = [
     ("beamiter/jterm_core", 1_312_049_979),
@@ -666,7 +669,7 @@ impl WorkspaceMissionReport {
     /// Preserve the observation and receipt links, but require a fresh read
     /// before presenting any delivery gate as currently satisfied.
     pub fn require_reinspection(&mut self) {
-        const DETAIL: &str = "Saved observation requires reinspection of the current candidate, dependencies and target ref";
+        const DETAIL: &str = REINSPECTION_DETAIL;
         if !self.repositories.is_empty() {
             self.state = WorkspaceMissionState::NeedsAttention;
         }
@@ -916,6 +919,48 @@ fn project_repository(
             check_report.status = WorkspaceMissionCheckStatus::Blocked;
             check_report.detail = observed.error.clone();
         }
+        // Retain the receipt that explains a non-success state as well. Never
+        // link an arbitrary attempt when simultaneous receipts disagree. A
+        // historical receipt is navigation context, not a current pass.
+        if check_report.receipt_id.is_none() {
+            let relevant: Vec<_> = matching
+                .iter()
+                .copied()
+                .filter(|check| check.validate().is_ok())
+                .filter(|check| match check_report.status {
+                    WorkspaceMissionCheckStatus::Stale => true,
+                    WorkspaceMissionCheckStatus::Failed => {
+                        current.contains(check) && check.status == TaskValidationStatus::Failed
+                    }
+                    WorkspaceMissionCheckStatus::Blocked => {
+                        current.contains(check)
+                            && if pending {
+                                check.completed_at_ms.is_none()
+                                    || matches!(
+                                        check.status,
+                                        TaskValidationStatus::Running
+                                            | TaskValidationStatus::NotRun
+                                    )
+                            } else {
+                                check.status != TaskValidationStatus::Passed
+                            }
+                    }
+                    WorkspaceMissionCheckStatus::NotRun => {
+                        current.contains(check) && check.status == TaskValidationStatus::NotRun
+                    }
+                    WorkspaceMissionCheckStatus::Passed => false,
+                })
+                .collect();
+            let latest = relevant.iter().map(|check| check.completed_at_ms).max();
+            let receipts: BTreeSet<_> = relevant
+                .iter()
+                .filter(|check| Some(check.completed_at_ms) == latest)
+                .map(|check| check.receipt_id.as_str())
+                .collect();
+            if receipts.len() == 1 {
+                check_report.receipt_id = receipts.first().map(|receipt| (*receipt).into());
+            }
+        }
         report.checks.push(check_report);
     }
     report
@@ -1082,6 +1127,185 @@ mod tests {
             })
             .collect();
         (mission, evidence)
+    }
+
+    #[test]
+    fn mission_attention_complete_and_uninspected_are_distinct() {
+        use crate::agent_workspace::WorkspaceMissionAttentionKind as Kind;
+        let (mission, evidence) = fixture(true);
+        assert!(mission
+            .attention_items(Some(&mission.project(&evidence)))
+            .is_empty());
+        let items = mission.attention_items(None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, Kind::Inspect);
+        let empty = WorkspaceMission::new("Empty", "Declare input");
+        assert_eq!(empty.attention_items(None)[0].kind, Kind::EditPlan);
+    }
+
+    #[test]
+    fn mission_attention_saved_or_wrong_revision_requests_only_reinspection() {
+        use crate::agent_workspace::WorkspaceMissionAttentionKind as Kind;
+        let (mission, evidence) = fixture(true);
+        let mut report = mission.project(&evidence);
+        report.require_reinspection();
+        let items = mission.attention_items(Some(&report));
+        assert_eq!(
+            items.len(),
+            1,
+            "do not suggest redundant validation or publication"
+        );
+        assert_eq!(items[0].kind, Kind::Inspect);
+        report.revision += 1;
+        assert_eq!(
+            mission.attention_items(Some(&report))[0].kind,
+            Kind::Inspect
+        );
+    }
+
+    #[test]
+    fn mission_attention_prerequisites_suppress_cascading_missing_gates() {
+        use crate::agent_workspace::WorkspaceMissionAttentionKind as Kind;
+        for (change, expected) in [
+            Kind::RepositoryUnavailable,
+            Kind::SelectCandidate,
+            Kind::ReviewCandidate,
+            Kind::DependencyPin,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut mission, mut evidence) = fixture(true);
+            match change {
+                0 => evidence[1].local = None,
+                1 => mission.repositories[1].candidate = None,
+                2 => evidence[1].local.as_mut().unwrap().dirty = true,
+                _ => evidence[1].local.as_mut().unwrap().lock_core_pin = None,
+            }
+            let items = mission.attention_items(Some(&mission.project(&evidence)));
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].kind, expected);
+            assert_eq!(
+                items[0].repository.as_ref().unwrap(),
+                &mission.repositories[1].identity
+            );
+        }
+    }
+
+    #[test]
+    fn mission_attention_order_and_ids_do_not_depend_on_repository_order() {
+        use crate::agent_workspace::WorkspaceMissionAttentionKind as Kind;
+        let (mut mission, mut evidence) = fixture(true);
+        evidence[0].validations[0].status = TaskValidationStatus::Failed;
+        evidence[1].validations.clear();
+        evidence[2].pushed = None;
+        let items = mission.attention_items(Some(&mission.project(&evidence)));
+        assert_eq!(items[0].kind, Kind::ValidationFailed);
+        assert_eq!(items[0].receipt_id.as_deref(), Some("host-ci-run:123"));
+        mission.repositories.reverse();
+        evidence.reverse();
+        assert_eq!(
+            items,
+            mission.attention_items(Some(&mission.project(&evidence)))
+        );
+        mission.revision += 1;
+        let revised = mission.attention_items(Some(&mission.project(&evidence)));
+        assert_eq!(items[0].id, revised[0].id);
+        assert_ne!(
+            items[0], revised[0],
+            "stable IDs alone cannot authorize stale callbacks"
+        );
+    }
+
+    #[test]
+    fn mission_attention_links_only_unambiguous_receipt_runs() {
+        let (mut mission, mut evidence) = fixture(false);
+        let task_id = TaskId::new();
+        let linked = WorkspaceMissionTaskRef {
+            conversation: ConversationId(format!(
+                "jterm:task:v1:{}",
+                serde_json::to_string(&("host", "namespace", task_id.to_string())).unwrap()
+            )),
+            task_id,
+            run_id: "run-with:colon".into(),
+            source_sequence: 7,
+        };
+        mission.repositories[0].tasks.push(linked.clone());
+        let check = &mut evidence[0].validations[0];
+        check.status = TaskValidationStatus::Failed;
+        check.source = WorkspaceMissionValidationSource::Workspace;
+        check.task = Some(linked.clone());
+        check.receipt_id = "workspace:run-with:colon:7".into();
+        let report = mission.project(&evidence);
+        let items = mission.attention_items(Some(&report));
+        assert_eq!(items[0].task.as_ref(), Some(&linked));
+        assert_eq!(items[0].check_name.as_deref(), Some("validation"));
+        for receipt in [
+            "workspace:other-run:7",
+            "workspace:run-with:colon:6",
+            "workspace:run-with:colon:7:extra",
+        ] {
+            let mut report = report.clone();
+            report.repositories[0].checks[0].receipt_id = Some(receipt.into());
+            assert!(mission.attention_items(Some(&report))[0].task.is_none());
+        }
+        let mut ambiguous = linked;
+        ambiguous.conversation.0 = ambiguous.conversation.0.replace("namespace", "other");
+        mission.repositories[0].tasks.push(ambiguous);
+        assert!(mission.attention_items(Some(&report))[0].task.is_none());
+    }
+
+    #[test]
+    fn mission_check_failure_receipt_is_latest_and_ambiguity_has_no_shortcut() {
+        let (mission, mut evidence) = fixture(false);
+        let mut failure = evidence[0].validations[0].clone();
+        failure.receipt_id = "failed-receipt".into();
+        failure.status = TaskValidationStatus::Failed;
+        failure.completed_at_ms = Some(11);
+        evidence[0].validations.push(failure.clone());
+        let report = mission.project(&evidence);
+        assert_eq!(
+            report.repositories[0].checks[0].receipt_id.as_deref(),
+            Some("failed-receipt")
+        );
+        failure.receipt_id = "simultaneous-failure".into();
+        evidence[0].validations.push(failure);
+        assert!(mission.project(&evidence).repositories[0].checks[0]
+            .receipt_id
+            .is_none());
+    }
+
+    #[test]
+    fn mission_pending_receipt_does_not_link_an_older_failed_attempt() {
+        let (mission, mut evidence) = fixture(false);
+        evidence[0].validations[0].status = TaskValidationStatus::Failed;
+        let mut pending = evidence[0].validations[0].clone();
+        pending.status = TaskValidationStatus::Running;
+        pending.completed_at_ms = None;
+        pending.receipt_id = "pending-receipt".into();
+        evidence[0].validations.push(pending);
+        let report = mission.project(&evidence);
+        assert_eq!(
+            report.repositories[0].checks[0].status,
+            WorkspaceMissionCheckStatus::Blocked
+        );
+        assert_eq!(
+            report.repositories[0].checks[0].receipt_id.as_deref(),
+            Some("pending-receipt")
+        );
+    }
+
+    #[test]
+    fn mission_check_stale_receipt_remains_navigation_only() {
+        use crate::agent_workspace::WorkspaceMissionAttentionKind as Kind;
+        let (mission, mut evidence) = fixture(false);
+        evidence[0].validations[0].fingerprint = "old-input".into();
+        let report = mission.project(&evidence);
+        assert!(!report.repositories[0].validated);
+        let items = mission.attention_items(Some(&report));
+        assert_eq!(items[0].kind, Kind::ValidationStale);
+        assert_eq!(items[0].receipt_id.as_deref(), Some("host-ci-run:123"));
+        assert!(items[0].task.is_none());
     }
 
     #[test]
@@ -1444,7 +1668,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt.status, TaskValidationStatus::Failed);
-        assert_eq!(receipt.task.unwrap().task_id, task_id);
+        assert_eq!(receipt.task.as_ref().unwrap().task_id, task_id);
+        let (mut mission, mut evidence) = fixture(false);
+        mission.repositories[0]
+            .tasks
+            .push(receipt.task.clone().unwrap());
+        evidence[0].local.as_mut().unwrap().fingerprint = receipt.fingerprint.clone();
+        evidence[0].validations = vec![receipt];
+        let item = mission
+            .attention_items(Some(&mission.project(&evidence)))
+            .remove(0);
+        assert!(item.matches_result(&result));
+        for change in 0..4 {
+            let mut changed = result.clone();
+            match change {
+                0 => changed.source_sequence += 1,
+                1 => changed.run_id = "another-run".into(),
+                2 => changed.conversation.0 = "another-conversation".into(),
+                _ => changed.task_id = TaskId::new(),
+            }
+            assert!(!item.matches_result(&changed));
+        }
         result.current.as_mut().unwrap().fingerprint = "edited-after-validation".into();
         assert!(WorkspaceMissionValidationEvidence::from_result(
             "validation",

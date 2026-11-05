@@ -86,3 +86,26 @@ replays a model request to complete an upgrade.
 The saved catalog is bounded to 64 Missions, 128 KiB per plan and 512 KiB per
 inspection. All UI updates run through the shared asynchronous `MissionWorkbench`;
 Git observation workers never write SQLite or block the host event loop.
+
+## Reasoned Needs-you queue
+
+`MissionWorkbench::attention_items()` and `WorkspaceMission::attention_items`
+project a deterministic queue from the saved plan and its exact report revision.
+Each entry keeps a stable identity, Mission revision, repository/candidate and,
+when applicable, check name, environment and receipt. The queue distinguishes
+failed, blocked, stale and not-run checks from candidate, dependency and remote
+publication gaps. Missing or reopened observations produce one inspection
+request, rather than implying that every repository should be run or pushed again.
+
+Failed and stale checks retain their unambiguous receipt lookup key. A task
+shortcut is exposed only when that key matches one linked source-qualified run.
+Native views compare the complete queue entry before accepting a callback and use
+`matches_result` before displaying a result capture. A changed run or event cannot
+replace the requested receipt. Ambiguous/missing receipts remain visible without
+an invented shortcut. Loading a receipt is read-only; the queue never starts an
+Agent, validates, pushes, merges or accepts a task.
+
+This is not a continuous filesystem watcher. Explicit inspection remains needed
+after external checkout or dependency changes. CI/GPU/IME receipt import is not
+introduced by the queue. Existing protocol 2, schema 6 and report struct shapes
+are unchanged; the projection is additive and does not persist another lifecycle.

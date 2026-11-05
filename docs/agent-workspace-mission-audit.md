@@ -61,10 +61,10 @@ The added report helper and observation configuration fields are additive.
   `local`. The CI enum is a data-contract option, not an implemented trusted CI
   importer. Declaring arbitrary CI, GPU, Wayland or IME checks cannot produce a
   pass. Review, screenshot and richer environment receipt ingestion remain open.
-- Needs-you currently exposes incomplete Mission/repository flags and counts.
-  The existing task command center has specific approval, reply, validation,
-  review and failure queues. A shared reasoned Mission queue with exact task,
-  log and diff navigation still needs frontend integration and acceptance.
+- The shared Needs-you projection now supplies stable reasoned entries and
+  exact check/receipt/run bindings, including failed receipts. Native frontend
+  integrations and acceptance of those receipt views remain separate gates.
+  The projection does not automatically watch filesystem changes or run work.
 - Four native frontends must independently expose the same Mission state and
   preserve selection, drafts and existing task identities. Publishing the core
   does not complete those integrations.
@@ -120,3 +120,20 @@ remain visible, but the shared `can_adopt_candidates()` gate and action reject
 their reuse, dirty or missing observations and empty repository sets. The updated
 Mission-filter test run passed all 49 tests, with Clippy, rustfmt and rustdoc
 passing. This is still not a continuous filesystem lock or watcher.
+
+### Reasoned attention projection verification
+
+The additive Needs-you change passed 57 tests selected by `cargo test --locked
+--lib mission` (the filter also matches submission/admission tests), rustfmt,
+Clippy over all targets/features, rustdoc with warnings denied and Rust 1.86
+`cargo check --locked --lib`. New regressions cover stable ordering/identities,
+reopened and wrong-revision reports, prerequisite suppression, latest failed and
+pending receipts, ambiguous task bindings and exact run/event matching.
+
+The cloud all-target/all-feature run reached 2026 passed, 45 failed and 5 ignored
+in the library stage; later target executables were not reached. The failure set
+is confined to environment-sensitive Git trust, PTY/socket/process and shell
+fixtures, including the already documented three Cargo-config Git fixtures.
+This is not a full-suite pass or native desktop acceptance. Normal Linux CI must
+verify the published commit; separate frontend receipt-view tests and real input,
+provider and display coverage remain required.

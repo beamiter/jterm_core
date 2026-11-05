@@ -360,6 +360,18 @@ impl MissionWorkbench {
             .filter(|report| report.id == id && report.revision == mission.revision)
     }
 
+    /// A deterministic, read-only queue over the same saved plan revisions as
+    /// `report_for`. No inspection, task execution or validation is dispatched.
+    pub fn attention_items(&self) -> Vec<WorkspaceMissionAttention> {
+        let mut items: Vec<_> = self
+            .missions
+            .iter()
+            .flat_map(|mission| mission.attention_items(self.report_for(&mission.id)))
+            .collect();
+        items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        items
+    }
+
     /// Uninspected plans stay visible as requiring review, never presumed done.
     pub fn needs_attention(&self) -> usize {
         self.missions

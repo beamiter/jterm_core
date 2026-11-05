@@ -67,6 +67,7 @@ mod client;
 mod context;
 mod host;
 mod mission;
+mod mission_attention;
 mod mission_host;
 mod mission_workbench;
 mod model;
@@ -97,6 +98,7 @@ pub use client::{
 };
 pub use context::*;
 pub use mission::*;
+pub use mission_attention::*;
 pub use mission_workbench::MissionWorkbench;
 pub use model::*;
 pub use native::{
