@@ -21,6 +21,7 @@ enum Pending {
     Inspect {
         id: String,
         generation: u64,
+        evidence_generation: u64,
     },
     Link {
         id: ConversationId,
@@ -36,6 +37,7 @@ pub struct MissionWorkbench {
     client: WorkspaceClient,
     pending: HashMap<u64, Pending>,
     generation: u64,
+    evidence_generation: u64,
     reports: HashMap<String, WorkspaceMissionReport>,
     pub missions: Vec<WorkspaceMission>,
     pub selected: Option<WorkspaceMission>,
@@ -60,6 +62,7 @@ impl MissionWorkbench {
             client,
             pending: HashMap::new(),
             generation: 0,
+            evidence_generation: 0,
             reports: HashMap::new(),
             missions: Vec::new(),
             selected: None,
@@ -80,6 +83,16 @@ impl MissionWorkbench {
     }
 
     pub fn refresh(&mut self) {
+        self.evidence_generation = self.evidence_generation.wrapping_add(1);
+        // A catalog reload is not an observation of the repositories. Do not
+        // let an unchanged plan revision keep an externally changed candidate
+        // green in the attention count or the selected report.
+        for report in self.reports.values_mut() {
+            report.require_reinspection();
+        }
+        if let Some(report) = &mut self.report {
+            report.require_reinspection();
+        }
         if !self
             .pending
             .values()
@@ -189,6 +202,7 @@ impl MissionWorkbench {
             Pending::Inspect {
                 id,
                 generation: self.generation,
+                evidence_generation: self.evidence_generation,
             },
         );
     }
@@ -295,15 +309,23 @@ impl MissionWorkbench {
         self.save(mission);
     }
 
+    /// Read a cached observation for this exact saved revision. The report's
+    /// gates already reflect refresh/reopen invalidation; this never inspects
+    /// repositories, starts a host or changes the stable selected Mission.
+    pub fn report_for(&self, id: &str) -> Option<&WorkspaceMissionReport> {
+        let mission = self.missions.iter().find(|mission| mission.id == id)?;
+        self.reports
+            .get(id)
+            .filter(|report| report.id == id && report.revision == mission.revision)
+    }
+
     /// Uninspected plans stay visible as requiring review, never presumed done.
     pub fn needs_attention(&self) -> usize {
         self.missions
             .iter()
             .filter(|mission| {
-                self.reports.get(&mission.id).is_none_or(|report| {
-                    report.revision != mission.revision
-                        || report.state != WorkspaceMissionState::Completed
-                })
+                self.report_for(&mission.id)
+                    .is_none_or(WorkspaceMissionReport::needs_you)
             })
             .count()
     }
@@ -319,6 +341,12 @@ impl MissionWorkbench {
         let Some(pending) = self.pending.remove(&request_id) else {
             return;
         };
+        if matches!(&pending, Pending::Inspect { evidence_generation, .. }
+            if *evidence_generation != self.evidence_generation)
+        {
+            return;
+        }
+        let saved_read = matches!(&pending, Pending::Read { .. } | Pending::Reconcile { .. });
         match pending {
             Pending::Catalog => match result {
                 Ok(WorkspaceReply::Missions { missions }) => {
@@ -347,12 +375,22 @@ impl MissionWorkbench {
                 }
                 other => self.unexpected(other),
             },
-            Pending::Read { id, generation } | Pending::Inspect { id, generation } => {
+            Pending::Read { id, generation } | Pending::Inspect { id, generation, .. } => {
                 if generation != self.generation {
                     return;
                 }
                 match result {
-                    Ok(WorkspaceReply::Mission { mission, report }) if mission.id == id => {
+                    Ok(WorkspaceReply::Mission {
+                        mission,
+                        mut report,
+                    }) if mission.id == id => {
+                        // An already-running older host may still replay its
+                        // saved report. The updated client must also fail closed.
+                        if saved_read {
+                            if let Some(report) = &mut report {
+                                report.require_reinspection();
+                            }
+                        }
                         self.apply(mission, report)
                     }
                     other => self.unexpected(other),
@@ -391,7 +429,13 @@ impl MissionWorkbench {
                     return;
                 }
                 match result {
-                    Ok(WorkspaceReply::Mission { mission, report }) if mission.id == attempt.id => {
+                    Ok(WorkspaceReply::Mission {
+                        mission,
+                        mut report,
+                    }) if mission.id == attempt.id => {
+                        if let Some(report) = &mut report {
+                            report.require_reinspection();
+                        }
                         self.apply(mission, report);
                         self.notice = Some("Saved revision reloaded. Compare it with your draft before saving again; no write was replayed.".into());
                         self.refresh();
@@ -562,5 +606,101 @@ mod tests {
         );
         assert_eq!(state.selected, Some(mission));
         assert!(state.report.is_none());
+    }
+
+    #[test]
+    fn catalog_refresh_is_a_barrier_to_an_older_inspection_reply() {
+        let mut state = workbench();
+        let mut mission = WorkspaceMission::new("Release", "Acceptance");
+        mission.revision = 1;
+        let mut completed = mission.project(&[]);
+        completed.state = WorkspaceMissionState::Completed;
+        state.selected = Some(mission.clone());
+        state.missions = vec![mission.clone()];
+        state.pending.insert(
+            100,
+            Pending::Inspect {
+                id: mission.id.clone(),
+                generation: state.generation,
+                evidence_generation: state.evidence_generation,
+            },
+        );
+        // An existing catalog request prevents this unit test from sending
+        // another host request; refresh must still advance the evidence epoch.
+        state.pending.insert(101, Pending::Catalog);
+        state.refresh();
+        state.receive(
+            100,
+            Ok(WorkspaceReply::Mission {
+                mission,
+                report: Some(completed),
+            }),
+        );
+        assert!(state.report.is_none());
+        assert!(state.reports.is_empty());
+        assert_eq!(state.needs_attention(), 1);
+    }
+
+    #[test]
+    fn old_host_saved_reads_cannot_restore_current_success() {
+        for reconcile in [false, true] {
+            let mut state = workbench();
+            let mut mission = WorkspaceMission::new("Release", "Acceptance");
+            mission.revision = 1;
+            mission
+                .repositories
+                .push(WorkspaceMissionRepository::new("example/repo", "/tmp/repo").unwrap());
+            let mut saved = mission.project(&[]);
+            saved.state = WorkspaceMissionState::Completed;
+            saved.repositories[0].validated = true;
+            saved.repositories[0].checks[0].status = WorkspaceMissionCheckStatus::Passed;
+            state.selected = Some(mission.clone());
+            let pending = if reconcile {
+                Pending::Reconcile {
+                    mission: mission.clone(),
+                    generation: state.generation,
+                }
+            } else {
+                Pending::Read {
+                    id: mission.id.clone(),
+                    generation: state.generation,
+                }
+            };
+            state.pending.insert(100, pending);
+            state.pending.insert(101, Pending::Catalog);
+            state.receive(
+                100,
+                Ok(WorkspaceReply::Mission {
+                    mission,
+                    report: Some(saved),
+                }),
+            );
+            let report = state.report.as_ref().unwrap();
+            assert_eq!(report.state, WorkspaceMissionState::NeedsAttention);
+            assert!(!report.repositories[0].validated);
+            assert_eq!(
+                report.repositories[0].checks[0].status,
+                WorkspaceMissionCheckStatus::Stale
+            );
+            assert_eq!(state.needs_attention(), 1);
+        }
+    }
+
+    #[test]
+    fn per_mission_reports_require_the_catalog_revision_without_changing_selection() {
+        let mut state = workbench();
+        let mut mission = WorkspaceMission::new("Release", "Acceptance");
+        mission.revision = 1;
+        state.missions.push(mission.clone());
+        state
+            .reports
+            .insert(mission.id.clone(), mission.project(&[]));
+        assert!(state.report_for(&mission.id).is_some());
+        assert!(state.report_for("missing").is_none());
+        assert!(state.selected.is_none());
+        state.missions[0].revision = 2;
+        assert!(state.report_for(&mission.id).is_none());
+        assert!(state.pending.is_empty());
+        assert_eq!(state.needs_attention(), 1);
     }
 }

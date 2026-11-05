@@ -68,9 +68,12 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(err)?;
-        let report = json
+        let mut report = json
             .map(|value| serde_json::from_str::<WorkspaceMissionReport>(&value).map_err(err))
             .transpose()?;
+        if let Some(report) = &mut report {
+            report.require_reinspection();
+        }
         Ok(WorkspaceReply::Mission { mission, report })
     }
 
@@ -219,6 +222,69 @@ mod tests {
         assert_eq!(store.read_mission(&saved.id).unwrap().revision, 1);
         assert!(store.save_mission(0, mission).is_err());
         store.save_mission(1, saved).unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(paths.state);
+    }
+
+    #[test]
+    fn saved_report_reopen_keeps_history_without_claiming_current_evidence() {
+        let paths =
+            Paths::at(std::env::temp_dir().join(format!("jterm-mission-{}", uuid::Uuid::new_v4())))
+                .unwrap();
+        let mut store = Store::open(&paths).unwrap();
+        let mut mission = WorkspaceMission::new("Release", "Review exact candidates");
+        mission.repositories.push(
+            crate::agent_workspace::WorkspaceMissionRepository::new("example/repo", "/tmp/repo")
+                .unwrap(),
+        );
+        let WorkspaceReply::Mission { mission, .. } = store.save_mission(0, mission).unwrap()
+        else {
+            panic!("Mission reply");
+        };
+        let mut historical = mission.project(&[]);
+        historical.state = crate::agent_workspace::WorkspaceMissionState::Completed;
+        historical.repositories[0].validated = true;
+        historical.repositories[0].checks[0].status =
+            crate::agent_workspace::WorkspaceMissionCheckStatus::Passed;
+        historical.repositories[0].checks[0].receipt_id = Some("saved-receipt".into());
+        store
+            .record_mission_report(mission.clone(), historical.clone())
+            .unwrap();
+        drop(store);
+        let store = Store::open(&paths).unwrap();
+        let WorkspaceReply::Mission {
+            report: Some(report),
+            ..
+        } = store.read_mission_reply(&mission.id).unwrap()
+        else {
+            panic!("saved Mission report");
+        };
+        assert_eq!(
+            report.state,
+            crate::agent_workspace::WorkspaceMissionState::NeedsAttention
+        );
+        assert!(!report.repositories[0].validated);
+        assert_eq!(
+            report.repositories[0].checks[0].status,
+            crate::agent_workspace::WorkspaceMissionCheckStatus::Stale
+        );
+        assert_eq!(
+            report.repositories[0].checks[0].receipt_id.as_deref(),
+            Some("saved-receipt")
+        );
+        let json: String = store
+            .db
+            .query_row(
+                "SELECT report_json FROM workspace_missions WHERE id=?1",
+                [&mission.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkspaceMissionReport>(&json).unwrap(),
+            historical,
+            "a read must not overwrite the historical observation"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(paths.state);
     }

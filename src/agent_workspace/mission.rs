@@ -619,6 +619,11 @@ pub struct WorkspaceMissionRepositoryReport {
     pub committed: bool,
     pub pushed: bool,
     pub integrated: bool,
+    /// Dated host observations remain available after current gates expire.
+    #[serde(default)]
+    pub pushed_observation: Option<WorkspaceMissionRemoteEvidence>,
+    #[serde(default)]
+    pub integration_observation: Option<WorkspaceMissionIntegrationEvidence>,
     pub validated: bool,
     pub pins_current: bool,
     #[serde(default)]
@@ -656,6 +661,39 @@ pub struct WorkspaceMissionReport {
 }
 
 impl WorkspaceMissionReport {
+    /// Saved reports are dated observations. Reopening them cannot establish
+    /// that another process has not changed a checkout, source or remote ref.
+    /// Preserve the observation and receipt links, but require a fresh read
+    /// before presenting any delivery gate as currently satisfied.
+    pub fn require_reinspection(&mut self) {
+        const DETAIL: &str = "Saved observation requires reinspection of the current candidate, dependencies and target ref";
+        if !self.repositories.is_empty() {
+            self.state = WorkspaceMissionState::NeedsAttention;
+        }
+        for repository in &mut self.repositories {
+            repository.committed = false;
+            repository.pushed = false;
+            repository.integrated = false;
+            repository.validated = false;
+            repository.pins_current = false;
+            repository.covered_checks.clear();
+            repository.missing_checks = repository
+                .checks
+                .iter()
+                .map(|check| check.check_name.clone())
+                .collect();
+            for check in &mut repository.checks {
+                if check.status != WorkspaceMissionCheckStatus::NotRun {
+                    check.status = WorkspaceMissionCheckStatus::Stale;
+                    check.detail = Some(DETAIL.into());
+                }
+            }
+            if !repository.errors.iter().any(|error| error == DETAIL) {
+                repository.errors.push(DETAIL.into());
+            }
+        }
+    }
+
     pub fn needs_you(&self) -> bool {
         !self.errors.is_empty()
             || self.repositories.is_empty()
@@ -683,6 +721,8 @@ fn project_repository(
         committed: false,
         pushed: false,
         integrated: false,
+        pushed_observation: None,
+        integration_observation: None,
         validated: false,
         pins_current: repo.required_core_pin.is_none(),
         covered_checks: Vec::new(),
@@ -759,6 +799,7 @@ fn project_repository(
         }
     }
     if let Some(remote) = &observed.pushed {
+        report.pushed_observation = Some(remote.clone());
         let reachable = observed.integrated.as_ref().is_some_and(|integrated| {
             integrated.remote == *remote
                 && integrated.candidate == candidate
@@ -773,6 +814,7 @@ fn project_repository(
         }
     }
     if let Some(integrated) = &observed.integrated {
+        report.integration_observation = Some(integrated.clone());
         report.integrated = remote_matches(&repo.identity, &integrated.remote)
             && integrated.remote.ref_name == repo.target_ref
             && integrated.candidate == candidate
@@ -1051,6 +1093,56 @@ mod tests {
                 WorkspaceMissionState::Completed
             );
         }
+    }
+
+    #[test]
+    fn reloaded_observations_preserve_receipts_but_never_replay_current_success() {
+        let (mission, evidence) = fixture(true);
+        let mut report = mission.project(&evidence);
+        assert_eq!(report.state, WorkspaceMissionState::Completed);
+        report.require_reinspection();
+        assert_eq!(report.state, WorkspaceMissionState::NeedsAttention);
+        assert!(report.needs_you());
+        for repository in &report.repositories {
+            assert!(repository.observed.is_some());
+            assert!(!repository.committed && !repository.pushed && !repository.integrated);
+            assert!(!repository.validated && !repository.pins_current);
+            assert_eq!(
+                repository.pushed_observation.as_ref().unwrap().head,
+                sha('b')
+            );
+            let integrated = repository.integration_observation.as_ref().unwrap();
+            assert_eq!(integrated.candidate, sha('b'));
+            assert_eq!(integrated.remote.ref_name, "refs/heads/master");
+            assert_eq!(integrated.remote.observed_at_ms, 20);
+            assert!(repository.covered_checks.is_empty());
+            assert_eq!(repository.missing_checks, ["validation"]);
+            assert_eq!(
+                repository.checks[0].status,
+                WorkspaceMissionCheckStatus::Stale
+            );
+            assert_eq!(
+                repository.checks[0].receipt_id.as_deref(),
+                Some("host-ci-run:123")
+            );
+        }
+        let once = report.clone();
+        report.require_reinspection();
+        assert_eq!(report, once, "repeated refresh must not duplicate errors");
+    }
+
+    #[test]
+    fn legacy_repository_reports_without_remote_receipts_still_decode() {
+        let (mission, evidence) = fixture(false);
+        let report = mission.project(&evidence);
+        let mut value = serde_json::to_value(&report.repositories[0]).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("pushed_observation");
+        object.remove("integration_observation");
+        let legacy: WorkspaceMissionRepositoryReport = serde_json::from_value(value).unwrap();
+        assert!(legacy.pushed_observation.is_none());
+        assert!(legacy.integration_observation.is_none());
+        assert_eq!(legacy.identity, report.repositories[0].identity);
     }
 
     #[test]

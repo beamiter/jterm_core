@@ -37,6 +37,12 @@ the same stable Mission ID and is never automatically resubmitted.
   is a dated observation, not a filesystem lock or attribution of edits.
 - Manifest and lockfile pins are read from the observed commit independently.
   A source override or another repository is not proof of the required core pin.
+  Both committed `.cargo/config` variants are inspected as source input. Core
+  patches, replacements, Cargo path overrides and source replacement cannot
+  satisfy the exact-core gate merely by retaining a Git SHA in the lockfile.
+  This is candidate-source inspection, not a claim to have reproduced Cargo's
+  entire environment: ancestor/global config, environment overrides and build
+  commands still need separately controlled validation evidence.
 - Public GitHub target refs are observed through a fixed HTTPS read. No push,
   fetch, credential import, branch creation or merge happens during inspection.
   Private/offline targets remain unverified. An advanced target is accepted
@@ -47,8 +53,18 @@ the same stable Mission ID and is never automatically resubmitted.
 - Historical validation cannot validate a changed candidate, dependency set,
   baseline, task run or acceptance contract. A later failure is not hidden by
   an older pass. Missing checks remain incomplete.
+- Reopening a saved report or refreshing the Mission catalog marks its gates
+  as needing reinspection. Receipt links and dated local observations remain
+  available, but saved success cannot masquerade as a current filesystem or
+  remote-ref check. **Inspect** produces a fresh report; the view is not a
+  continuous filesystem watcher and changes made while it remains open require
+  another inspection.
 - Multi-repository delivery is not atomic. Partial integration remains visible;
   inspecting or editing a Mission never resets or rolls back other repositories.
+  Repository reports expose `pushed_observation` and `integration_observation`
+  with the exact remote repository, ref, head, observation time and candidate
+  ancestry result. These dated receipts survive reinspection invalidation;
+  their presence is not a current validation pass for a later target version.
 
 This release records and inspects delivery. It does not add an unattended
 multi-repository push/merge executor, remote Agent execution, cloud dispatch

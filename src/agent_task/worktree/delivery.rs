@@ -4,6 +4,8 @@ use super::*;
 pub struct RepositoryDeliveryObservation {
     pub manifest: String,
     pub lockfile: String,
+    /// Committed Cargo configuration is source input, not merely UI metadata.
+    pub cargo_configs: Vec<(String, String)>,
     pub remote_head: Option<String>,
     pub target_contains_candidate: bool,
     pub remote_error: Option<String>,
@@ -73,10 +75,11 @@ pub fn inspect_repository_delivery(
     if head != candidate {
         return Err("Delivery candidate is not the exact commit object".into());
     }
-    let (manifest, lockfile) = read_dependency_files(&service, &path, &head)?;
+    let dependencies = read_dependency_files(&service, &path, &head)?;
     let mut observation = RepositoryDeliveryObservation {
-        manifest,
-        lockfile,
+        manifest: dependencies.manifest,
+        lockfile: dependencies.lockfile,
+        cargo_configs: dependencies.cargo_configs,
         remote_head: None,
         target_contains_candidate: false,
         remote_error: None,
@@ -94,11 +97,54 @@ pub fn inspect_repository_delivery(
     Ok(observation)
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+struct CandidateDependencyFiles {
+    manifest: String,
+    lockfile: String,
+    cargo_configs: Vec<(String, String)>,
+}
+
 fn read_dependency_files(
     service: &WorktreeService,
     repository: &Path,
     head: &str,
-) -> Result<(String, String), String> {
+) -> Result<CandidateDependencyFiles, String> {
+    // A directory symlink does not appear when ls-tree selects only paths
+    // beneath it. Check the directory itself without following its target.
+    let output = service
+        .run(
+            git_command(
+                &service.git,
+                repository,
+                ["ls-tree", "-z", head, "--", ".cargo"],
+            ),
+            "candidate Cargo configuration directory",
+            16 * 1024,
+        )
+        .and_then(|output| {
+            service.require_success("candidate Cargo configuration directory", output)
+        })
+        .map_err(|error| error.to_string())?;
+    if output.stdout.truncated {
+        return Err("Candidate Cargo configuration directory exceeds the evidence budget".into());
+    }
+    let directory = std::str::from_utf8(&output.stdout.bytes)
+        .map_err(|_| "Candidate Cargo configuration directory is not UTF-8")?;
+    if !directory.is_empty() {
+        let entry = directory
+            .strip_suffix('\0')
+            .ok_or("Malformed Cargo configuration directory")?;
+        let (metadata, name) = entry
+            .split_once('\t')
+            .ok_or("Malformed Cargo configuration directory")?;
+        let fields: Vec<_> = metadata.split(' ').collect();
+        if name != ".cargo" || fields.len() != 3 || fields[0] != "040000" || fields[1] != "tree" {
+            return Err(
+                "Candidate .cargo must be a committed directory, not a symlink or submodule".into(),
+            );
+        }
+        validate_object_id(fields[2].to_owned()).map_err(|error| error.to_string())?;
+    }
     let command = git_command(
         &service.git,
         repository,
@@ -110,6 +156,8 @@ fn read_dependency_files(
             "--",
             "Cargo.toml",
             "Cargo.lock",
+            ".cargo/config",
+            ".cargo/config.toml",
         ],
     );
     let output = service
@@ -123,6 +171,8 @@ fn read_dependency_files(
         .map_err(|_| "Candidate dependency entries are not UTF-8")?;
     let mut manifest = None;
     let mut lockfile = None;
+    let mut legacy_config = None;
+    let mut config = None;
     for entry in entries.split('\0').filter(|entry| !entry.is_empty()) {
         let (metadata, name) = entry
             .split_once('\t')
@@ -138,6 +188,8 @@ fn read_dependency_files(
         let slot = match name {
             "Cargo.toml" => &mut manifest,
             "Cargo.lock" => &mut lockfile,
+            ".cargo/config" => &mut legacy_config,
+            ".cargo/config.toml" => &mut config,
             _ => return Err("Unexpected dependency tree entry".into()),
         };
         if slot.is_some() {
@@ -158,7 +210,17 @@ fn read_dependency_files(
                 .map_err(|_| "Candidate dependency manifest is not UTF-8")?,
         );
     }
-    Ok((manifest.unwrap_or_default(), lockfile.unwrap_or_default()))
+    Ok(CandidateDependencyFiles {
+        manifest: manifest.unwrap_or_default(),
+        lockfile: lockfile.unwrap_or_default(),
+        cargo_configs: [
+            (".cargo/config", legacy_config),
+            (".cargo/config.toml", config),
+        ]
+        .into_iter()
+        .filter_map(|(name, content)| content.map(|content| (name.into(), content)))
+        .collect(),
+    })
 }
 
 fn verify_ancestry(
@@ -392,7 +454,11 @@ mod tests {
         fs::write(fixture.repo.join("Cargo.toml"), "replacement").unwrap();
         assert_eq!(
             read_dependency_files(&fixture.service, &pinned.proc_path(), &head).unwrap(),
-            (manifest.into(), lockfile.into())
+            CandidateDependencyFiles {
+                manifest: manifest.into(),
+                lockfile: lockfile.into(),
+                cargo_configs: Vec::new(),
+            }
         );
     }
 
@@ -402,7 +468,56 @@ mod tests {
         let pinned = pin_repository(&fixture.service, &fixture.repo).unwrap();
         assert_eq!(
             read_dependency_files(&fixture.service, &pinned.proc_path(), &fixture.head()).unwrap(),
-            (String::new(), String::new())
+            CandidateDependencyFiles::default()
+        );
+    }
+
+    #[test]
+    fn cargo_configuration_is_read_from_the_exact_candidate() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.repo.join(".cargo")).unwrap();
+        let config =
+            "[patch.'https://github.com/beamiter/jterm_core']\njterm_core={path='../core'}\n";
+        fs::write(fixture.repo.join(".cargo/config.toml"), config).unwrap();
+        fs::write(fixture.repo.join(".cargo/config"), "[build]\njobs=2\n").unwrap();
+        fixture.commit();
+        let head = fixture.head();
+        fs::write(fixture.repo.join(".cargo/config.toml"), "[build]\njobs=1\n").unwrap();
+        let pinned = pin_repository(&fixture.service, &fixture.repo).unwrap();
+        let files = read_dependency_files(&fixture.service, &pinned.proc_path(), &head).unwrap();
+        assert_eq!(
+            files.cargo_configs,
+            vec![
+                (".cargo/config".into(), "[build]\njobs=2\n".into()),
+                (".cargo/config.toml".into(), config.into()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_cargo_config_symlink_is_not_source_evidence() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.repo.join(".cargo")).unwrap();
+        std::os::unix::fs::symlink("../README", fixture.repo.join(".cargo/config.toml")).unwrap();
+        fixture.commit();
+        let pinned = pin_repository(&fixture.service, &fixture.repo).unwrap();
+        assert!(
+            read_dependency_files(&fixture.service, &pinned.proc_path(), &fixture.head()).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_cargo_directory_symlink_cannot_hide_source_overrides() {
+        let fixture = Fixture::new();
+        std::os::unix::fs::symlink("../external-cargo", fixture.repo.join(".cargo")).unwrap();
+        fixture.commit();
+        let pinned = pin_repository(&fixture.service, &fixture.repo).unwrap();
+        assert!(
+            read_dependency_files(&fixture.service, &pinned.proc_path(), &fixture.head())
+                .unwrap_err()
+                .contains("Candidate .cargo must be a committed directory")
         );
     }
 
