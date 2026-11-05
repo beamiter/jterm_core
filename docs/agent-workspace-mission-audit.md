@@ -80,6 +80,8 @@ remote execution service or model gateway is introduced by this change.
 
 ## Local verification (2026-11-05)
 
+The measurements below describe the initial corrective tree published as
+`6260d0c1ac99c544b19b4b6d0e4d1cb8e6111f10`.
 The cloud execution container used official Rust 1.99.1. Its filesystem ownership
 and restricted Unix socket/process facilities differ from a normal Linux desktop.
 
@@ -104,3 +106,17 @@ and restricted Unix socket/process facilities differ from a normal Linux desktop
 The full suite therefore has **not** passed locally. Normal Linux CI must execute
 the Git fixtures and host integration gates for the published commit. These
 results do not establish MSRV, native frontend, physical display or IME coverage.
+
+Subsequent hardening keeps the runtime lease contract unchanged: queue and
+Mission reopen tests use the existing isolated-process lease harness, because
+parallel tests intentionally hold forked children before exec. All 17 store
+tests and Clippy passed for that test-only change. Commit `8853247` then passed
+both Rust stable and 1.86 CI suites and the Real Vim pixel workflow.
+
+Candidate adoption now additionally requires an explicit successful inspection
+of the current selected revision. Refresh, reads, selection and saves revoke
+eligibility; older inspection replies cannot restore it. Historical observations
+remain visible, but the shared `can_adopt_candidates()` gate and action reject
+their reuse, dirty or missing observations and empty repository sets. The updated
+Mission-filter test run passed all 49 tests, with Clippy, rustfmt and rustdoc
+passing. This is still not a continuous filesystem lock or watcher.

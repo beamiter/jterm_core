@@ -38,6 +38,7 @@ pub struct MissionWorkbench {
     pending: HashMap<u64, Pending>,
     generation: u64,
     evidence_generation: u64,
+    candidate_inspection: Option<(String, u64)>,
     reports: HashMap<String, WorkspaceMissionReport>,
     pub missions: Vec<WorkspaceMission>,
     pub selected: Option<WorkspaceMission>,
@@ -63,6 +64,7 @@ impl MissionWorkbench {
             pending: HashMap::new(),
             generation: 0,
             evidence_generation: 0,
+            candidate_inspection: None,
             reports: HashMap::new(),
             missions: Vec::new(),
             selected: None,
@@ -83,6 +85,7 @@ impl MissionWorkbench {
     }
 
     pub fn refresh(&mut self) {
+        self.candidate_inspection = None;
         self.evidence_generation = self.evidence_generation.wrapping_add(1);
         // A catalog reload is not an observation of the repositories. Do not
         // let an unchanged plan revision keep an externally changed candidate
@@ -103,6 +106,7 @@ impl MissionWorkbench {
     }
 
     pub fn select(&mut self, id: &str) {
+        self.candidate_inspection = None;
         self.generation = self.generation.wrapping_add(1);
         self.selected = self
             .missions
@@ -121,6 +125,7 @@ impl MissionWorkbench {
     }
 
     pub fn create(&mut self, title: &str, goal: &str, roots: &[(String, PathBuf)]) {
+        self.candidate_inspection = None;
         if self
             .selected
             .as_ref()
@@ -162,6 +167,8 @@ impl MissionWorkbench {
     }
 
     pub fn save(&mut self, mission: WorkspaceMission) {
+        self.candidate_inspection = None;
+        self.evidence_generation = self.evidence_generation.wrapping_add(1);
         if self
             .pending
             .values()
@@ -189,6 +196,7 @@ impl MissionWorkbench {
     }
 
     pub fn inspect(&mut self) {
+        self.candidate_inspection = None;
         let Some(mission) = &self.selected else {
             return;
         };
@@ -210,11 +218,20 @@ impl MissionWorkbench {
     /// Explicit user action: freeze observed commits, preserving the original
     /// baseline after its first capture. Changing candidates invalidates reports.
     pub fn adopt_candidates(&mut self) {
+        let inspection = self.candidate_inspection.take();
         let (Some(mut mission), Some(report)) = (self.selected.clone(), self.report.as_ref())
         else {
             return;
         };
         if self.busy || report.id != mission.id || report.revision != mission.revision {
+            return;
+        }
+        if mission.repositories.is_empty() {
+            self.notice = Some("Add repositories before freezing delivery candidates".into());
+            return;
+        }
+        if inspection.as_ref() != Some(&(mission.id.clone(), mission.revision)) {
+            self.notice = Some("Inspect the current Mission before freezing candidates; saved observations are historical, not permission to adopt them".into());
             return;
         }
         for repository in &mut mission.repositories {
@@ -264,7 +281,30 @@ impl MissionWorkbench {
         self.save(mission);
     }
 
+    /// Only a successful Inspect reply since the latest selection, read,
+    /// refresh or save can offer candidates. This is a dated observation, not
+    /// a filesystem lock; callers must not infer authority from a saved report.
+    pub fn can_adopt_candidates(&self) -> bool {
+        let (Some(mission), Some(report)) = (&self.selected, &self.report) else {
+            return false;
+        };
+        !self.busy
+            && report.id == mission.id
+            && report.revision == mission.revision
+            && self.candidate_inspection.as_ref() == Some(&(mission.id.clone(), mission.revision))
+            && !mission.repositories.is_empty()
+            && mission.repositories.iter().all(|repository| {
+                report
+                    .repositories
+                    .iter()
+                    .find(|entry| entry.identity.matches(&repository.identity))
+                    .and_then(|entry| entry.observed.as_ref())
+                    .is_some_and(|observed| !observed.dirty)
+            })
+    }
+
     pub fn link_conversation(&mut self, id: &ConversationId) {
+        self.candidate_inspection = None;
         let Some(mission) = &self.selected else {
             return;
         };
@@ -282,6 +322,7 @@ impl MissionWorkbench {
     }
 
     pub fn link_result(&mut self, report: &WorkspaceResultReport) {
+        self.candidate_inspection = None;
         let Some(mut mission) = self.selected.clone() else {
             return;
         };
@@ -355,11 +396,13 @@ impl MissionWorkbench {
                             missions.iter().find(|mission| mission.id == selected.id)
                         {
                             if current.revision != selected.revision {
+                                self.candidate_inspection = None;
                                 self.selected = Some(current.clone());
                                 self.report = None;
                                 self.notice = Some("The saved plan changed in another view. Review the current revision; your local draft remains separate.".into());
                             }
                         } else if selected.revision > 0 {
+                            self.candidate_inspection = None;
                             self.report = None;
                             self.notice = Some(
                                 "The selected Mission is absent from the current catalog".into(),
@@ -387,11 +430,23 @@ impl MissionWorkbench {
                         // An already-running older host may still replay its
                         // saved report. The updated client must also fail closed.
                         if saved_read {
+                            self.evidence_generation = self.evidence_generation.wrapping_add(1);
                             if let Some(report) = &mut report {
                                 report.require_reinspection();
                             }
                         }
-                        self.apply(mission, report)
+                        let inspected = if saved_read {
+                            None
+                        } else {
+                            report
+                                .as_ref()
+                                .filter(|report| {
+                                    report.id == mission.id && report.revision == mission.revision
+                                })
+                                .map(|_| (mission.id.clone(), mission.revision))
+                        };
+                        self.apply(mission, report);
+                        self.candidate_inspection = inspected;
                     }
                     other => self.unexpected(other),
                 }
@@ -433,6 +488,7 @@ impl MissionWorkbench {
                         mission,
                         mut report,
                     }) if mission.id == attempt.id => {
+                        self.evidence_generation = self.evidence_generation.wrapping_add(1);
                         if let Some(report) = &mut report {
                             report.require_reinspection();
                         }
@@ -490,6 +546,7 @@ impl MissionWorkbench {
     }
 
     fn apply(&mut self, mission: WorkspaceMission, report: Option<WorkspaceMissionReport>) {
+        self.candidate_inspection = None;
         if let Some(report) = &report {
             self.reports.insert(mission.id.clone(), report.clone());
         } else {
@@ -575,6 +632,7 @@ mod tests {
         };
         mission.repositories.push(repository);
         state.report = Some(mission.project(&[evidence]));
+        state.candidate_inspection = Some((mission.id.clone(), mission.revision));
         state.selected = Some(mission);
         state.adopt_candidates();
         assert!(state.notice.as_ref().unwrap().contains("dirty input"));
@@ -702,5 +760,152 @@ mod tests {
         assert!(state.report_for(&mission.id).is_none());
         assert!(state.pending.is_empty());
         assert_eq!(state.needs_attention(), 1);
+    }
+
+    fn clean_candidate() -> (WorkspaceMission, WorkspaceMissionReport) {
+        let mut mission = WorkspaceMission::new("Release", "Acceptance");
+        mission.revision = 1;
+        let repository = WorkspaceMissionRepository::new("example/repo", "/tmp/repo").unwrap();
+        let evidence = WorkspaceMissionRepositoryEvidence {
+            identity: repository.identity.clone(),
+            path: repository.path.clone(),
+            local: Some(WorkspaceMissionLocalEvidence {
+                baseline: "a".repeat(40),
+                head: "b".repeat(40),
+                fingerprint: "clean-input".into(),
+                modified: true,
+                dirty: false,
+                manifest_core_pin: None,
+                lock_core_pin: None,
+                observed_at_ms: 1,
+            }),
+            pushed: None,
+            integrated: None,
+            validations: Vec::new(),
+            error: None,
+        };
+        mission.repositories.push(repository);
+        let report = mission.project(&[evidence]);
+        (mission, report)
+    }
+
+    fn inspection(state: &MissionWorkbench, mission: &WorkspaceMission) -> Pending {
+        Pending::Inspect {
+            id: mission.id.clone(),
+            generation: state.generation,
+            evidence_generation: state.evidence_generation,
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_current_inspection_can_offer_candidate_adoption() {
+        let mut empty = workbench();
+        let mission = WorkspaceMission::new("Empty", "Acceptance");
+        let report = mission.project(&[]);
+        empty.pending.insert(100, inspection(&empty, &mission));
+        empty.receive(
+            100,
+            Ok(WorkspaceReply::Mission {
+                mission,
+                report: Some(report),
+            }),
+        );
+        assert!(!empty.can_adopt_candidates());
+        empty.adopt_candidates();
+        assert!(
+            empty.pending.is_empty(),
+            "an empty Mission must not be saved by adoption"
+        );
+
+        let mut state = workbench();
+        let (mission, report) = clean_candidate();
+        assert_eq!(report.state, WorkspaceMissionState::NeedsAttention);
+        state.apply(mission.clone(), Some(report.clone()));
+        assert!(!state.can_adopt_candidates());
+        state.adopt_candidates();
+        assert!(state
+            .notice
+            .as_ref()
+            .unwrap()
+            .contains("Inspect the current Mission"));
+        assert!(state.pending.is_empty());
+        state.pending.insert(100, inspection(&state, &mission));
+        state.receive(
+            100,
+            Ok(WorkspaceReply::Mission {
+                mission,
+                report: Some(report),
+            }),
+        );
+        assert!(
+            state.can_adopt_candidates(),
+            "a fresh pre-freeze report legitimately needs attention"
+        );
+        state.adopt_candidates();
+        assert!(!state.can_adopt_candidates());
+        assert!(state
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Write { mission, .. }
+            if mission.repositories[0].candidate.as_deref() == Some("b".repeat(40).as_str()))));
+    }
+
+    #[test]
+    fn refresh_select_save_and_read_revoke_adoption_and_prior_inspection_replies() {
+        for action in 0..4 {
+            let mut state = workbench();
+            let (mission, report) = clean_candidate();
+            state.pending.insert(100, inspection(&state, &mission));
+            state.receive(
+                100,
+                Ok(WorkspaceReply::Mission {
+                    mission: mission.clone(),
+                    report: Some(report.clone()),
+                }),
+            );
+            assert!(state.can_adopt_candidates());
+            state.pending.insert(101, inspection(&state, &mission));
+            match action {
+                0 => {
+                    state.pending.insert(102, Pending::Catalog);
+                    state.refresh();
+                }
+                1 => state.select(&mission.id),
+                2 => {
+                    let mut invalid = mission.clone();
+                    invalid.title.clear();
+                    state.save(invalid);
+                }
+                _ => {
+                    state.pending.insert(
+                        102,
+                        Pending::Read {
+                            id: mission.id.clone(),
+                            generation: state.generation,
+                        },
+                    );
+                    state.receive(
+                        102,
+                        Ok(WorkspaceReply::Mission {
+                            mission: mission.clone(),
+                            report: Some(report.clone()),
+                        }),
+                    );
+                }
+            }
+            assert!(!state.can_adopt_candidates());
+            state.receive(
+                101,
+                Ok(WorkspaceReply::Mission {
+                    mission: mission.clone(),
+                    report: Some(report.clone()),
+                }),
+            );
+            assert!(
+                state.candidate_inspection.is_none(),
+                "an older Inspect reply cannot restore adoption after action {action}"
+            );
+            assert!(!state.can_adopt_candidates());
+        }
     }
 }

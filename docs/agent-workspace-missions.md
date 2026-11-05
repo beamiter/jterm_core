@@ -20,6 +20,10 @@ publishing this core alone does not add a Mission surface to those applications.
 4. Use **Use current candidates** to explicitly freeze clean observed HEADs.
    This preserves the initial baseline and updates the four frontend core-pin
    requirements to the selected core candidate. It does not modify Cargo files.
+   The controller requires a successful explicit **Inspect** response for the
+   currently selected revision. Reloaded historical observations cannot grant
+   adoption, and refresh, selection, read or save revokes earlier eligibility.
+   Frontends use `can_adopt_candidates()` for the same button and handler gate.
 5. Link existing hosted tasks whose exact worktree paths match the plan.
    Continue, validate and accept tasks using their existing task controls.
 6. Inspect again to view committed, pushed, integrated, validated and pin
