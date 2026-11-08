@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "purpose": "Source baseline for self-owned terminal engine extraction; not a release compatibility claim",
+  "repositories": {
+    "jterm_core": "e8bd7a2b3edd48d7a0f8f0304fa3d8c864dab40e",
+    "ember": "d6d8637f63cc27eb58fb20cf505bca4492dba516",
+    "anvil": "3db22c310b4611b0671874930416d5e2fa73410d",
+    "jagent": "ed03819213d8253be7687500487993233d13b1a5",
+    "forge": "feb14502e98f53f2a6f3222d6ae6025a1dad0951",
+    "frost": "4c1196f57249ca6b3f82b7837e4db97c03b4361e"
+  },
+  "engine_status": "Incremental extraction candidate; no complete shared VT engine yet",
+  "release_pins": "Existing jterm_core pins remain unchanged; use family-cargo local overrides for candidates",
+  "validated_immutable_dependencies": {
+    "jagent": "f269c3c6afafcf9b6d60b3cccd741649fdb74576",
+    "jcompanion": "9aa569540091524d637a7115b64c587b9177a55b"
+  },
+  "validation_note": "Core validation used pinned jagent/companion dependencies, not the optional local jagent checkout. Frontend checks used local jterm_core and original vendor patches in private manifest/lock mirrors."
+}

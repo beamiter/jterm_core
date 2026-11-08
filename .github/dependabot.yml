@@ -17,6 +17,13 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: cargo
+    directory: /crates/jterm_engine
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

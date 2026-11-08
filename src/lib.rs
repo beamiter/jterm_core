@@ -60,6 +60,7 @@ pub mod reference_organism;
 pub mod reference_popup;
 pub mod reference_shell;
 pub mod review_input;
+pub mod runtime_wake;
 pub mod screen_replay;
 pub mod snapshot_file;
 pub mod supervised;

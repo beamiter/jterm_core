@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 
-PROJECTS = ("jagent", "jterm_core", "jsh", "anvil", "ember", "forge", "frost")
+PROJECTS = ("jterm_engine", "jagent", "jterm_core", "jsh", "anvil", "ember", "forge", "frost")
 
 
 def mirror(source: Path, destination: Path) -> None:
@@ -73,39 +73,60 @@ def main() -> int:
             parser.error(f"{argument} is managed by this runner")
 
     family = Path(__file__).resolve().parents[2]
+    sources = {project: family / project for project in PROJECTS}
+    # Canonical publication lives in the existing core repository. Retain the
+    # legacy sibling layout for older local family checkouts only.
+    nested_engine = sources["jterm_core"] / "crates" / "jterm_engine"
+    if (nested_engine / "Cargo.toml").is_file():
+        sources["jterm_engine"] = nested_engine
     selected = PROJECTS if args.project == "all" else (args.project,)
-    required = set(selected) | {"jagent"}
-    if any(project not in {"jagent", "jsh"} for project in selected):
+    required = set(selected)
+    if any(project != "jterm_engine" for project in selected):
+        required.add("jagent")
+    if any(project not in {"jterm_engine", "jagent", "jsh"} for project in selected):
         required.add("jterm_core")
+    if any(project in {"ember", "frost"} for project in selected):
+        required.add("jterm_engine")
     for project in sorted(required):
-        if not (family / project / "Cargo.toml").is_file():
-            parser.error(f"missing sibling checkout: {family / project}")
+        if not (sources[project] / "Cargo.toml").is_file():
+            parser.error(f"missing family checkout: {sources[project]}")
 
     failures = []
     with tempfile.TemporaryDirectory(prefix="jterm-family-") as directory:
         root = Path(directory)
         for project in sorted(required):
-            mirror(family / project, root / project)
-        patches = [
-            "--config",
-            'patch."https://github.com/beamiter/jagent.git".jagent.path='
-            + json.dumps(str(root / "jagent")),
-        ]
+            mirror(sources[project], root / project)
+        patches = []
+        if "jagent" in required:
+            patches += [
+                "--config",
+                'patch."https://github.com/beamiter/jagent.git".jagent.path='
+                + json.dumps(str(root / "jagent")),
+            ]
         if "jterm_core" in required:
             patches += [
                 "--config",
                 'patch."https://github.com/beamiter/jterm_core.git".jterm_core.path='
                 + json.dumps(str(root / "jterm_core")),
             ]
+        if "jterm_engine" in required and "jterm_core" in required:
+            patches += [
+                "--config",
+                'patch."https://github.com/beamiter/jterm_core.git".jterm_engine.path='
+                + json.dumps(str(root / "jterm_engine")),
+            ]
         for project in selected:
             print(f"\n[{project}] local family sources, private Cargo.lock", flush=True)
             environment = os.environ.copy()
             # Keep the existing cache unless the caller selected another one.
-            environment.setdefault("CARGO_TARGET_DIR", str(family / project / "target"))
+            environment.setdefault("CARGO_TARGET_DIR", str(sources[project] / "target"))
             environment["CARGO_TARGET_DIR"] = str(Path(environment["CARGO_TARGET_DIR"]).resolve())
             if cargo_args[0] == "test":
-                native_test_runner(root, family / project, environment)
-            command = ["cargo", *patches, "--offline", *cargo_args]
+                native_test_runner(root, sources[project], environment)
+            # External Cargo subcommands (notably clippy) must receive the
+            # overrides themselves; global flags before the subcommand can
+            # be lost when cargo-clippy launches its inner cargo check.
+            command = ["cargo", cargo_args[0], *patches, "--offline", *cargo_args[1:]]
             result = subprocess.run(command, cwd=root / project, env=environment)
             if result.returncode:
                 failures.append(project)

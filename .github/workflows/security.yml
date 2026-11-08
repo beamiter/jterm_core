@@ -8,17 +8,21 @@ on:
       - Cargo.lock
       - tools/companion-host-harness/Cargo.toml
       - tools/companion-host-harness/Cargo.lock
+      - crates/jterm_engine/Cargo.toml
+      - crates/jterm_engine/Cargo.lock
       - scripts/security-audit.sh
       - scripts/test-security-audit.py
       - .cargo/audit.toml
       - .github/workflows/security.yml
   push:
-    branches: [master]
+    branches: [master, dev/shared-terminal-engine-20261108]
     paths:
       - Cargo.toml
       - Cargo.lock
       - tools/companion-host-harness/Cargo.toml
       - tools/companion-host-harness/Cargo.lock
+      - crates/jterm_engine/Cargo.toml
+      - crates/jterm_engine/Cargo.lock
       - scripts/security-audit.sh
       - scripts/test-security-audit.py
       - .cargo/audit.toml
@@ -75,5 +79,5 @@ jobs:
           cargo audit --version | grep -Eq \
             "[[:space:]]${CARGO_AUDIT_VERSION}$"
 
-      - name: Audit both locked dependency graphs
+      - name: Audit all locked dependency graphs
         run: bash scripts/security-audit.sh

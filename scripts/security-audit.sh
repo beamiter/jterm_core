@@ -38,3 +38,4 @@ audit_lockfile() {
 audit_lockfile Cargo.lock
 # Independent workspace and lockfile; do not disable its index fetch.
 audit_lockfile tools/companion-host-harness/Cargo.lock
+audit_lockfile crates/jterm_engine/Cargo.lock

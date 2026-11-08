@@ -425,6 +425,17 @@ python3 scripts/family-cargo.py jsh test --lib
 python3 scripts/family-cargo.py all check --all-targets
 ```
 
+The independent `jterm_engine` crate lives in `crates/jterm_engine` in this
+repository. It retains its own workspace, Cargo.lock and Rust 1.86 minimum;
+it does not depend on `jterm_core` or join its dependency graph. Test it with
+`cargo test --locked --manifest-path crates/jterm_engine/Cargo.toml`.
+Ember and Frost consume both crates from the same exact Git revision. A standalone
+frontend checkout needs no sibling engine directory. The family runner resolves
+the nested crate first, while supporting the older sibling layout for local work.
+See [development-branch packaging](docs/architecture/development-branch-packaging.md)
+for the publication boundary and remaining validation limits.
+
+
 The runner patches both shared crates to the sibling source trees in temporary
 package directories. It copies manifests and lockfiles there, reuses each
 project's target cache, and runs Cargo offline. Original release pins and

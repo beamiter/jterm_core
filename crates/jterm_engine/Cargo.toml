@@ -1,0 +1,15 @@
+[package]
+name = "jterm_engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "UI-independent terminal storage, parser, frame and publication primitives"
+readme = "README.md"
+repository = "https://github.com/beamiter/jterm_core"
+
+[dependencies]
+smallvec = "1.15"
+
+[workspace]
