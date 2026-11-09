@@ -151,3 +151,16 @@ consumers. It must also mirror the engine sibling for consumers with path deps.
    and real display tests. Anvil remains unchanged in this initial candidate.
 
 Do not describe steps 2–7 as complete merely because initial primitives compile.
+
+## Ember reset/query ownership
+
+`semantics::dispatch_local` now owns Ember DECSTR and DECRQSS, with ordered
+`GlobalBackground` and `Reply` effects applied before the next parser event.
+Only no-prefix CSI with exactly `!` and final `p`, and DCS beginning exactly
+`$q`, enter these handlers; other events retain transactional fallback. Legacy
+DECSTR parameters remain ignored. The Ember policy retains cursor/grids/alternate
+state, unrelated modes, Kitty state and host synchronized-output lifecycle.
+Frost's distinct soft reset is not migrated and parser profile choice does not
+make this dispatcher safe for Frost. RIS and host policy remain in the adapter.
+Independent pre-extraction production snapshots remain immutable, including
+per-partition search revisions; engine differential tests supplement them.

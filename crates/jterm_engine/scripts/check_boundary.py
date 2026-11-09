@@ -59,6 +59,18 @@ class BoundaryTests(unittest.TestCase):
             source = (ENGINE / 'src' / name).read_text()
             self.assertNotRegex(source, r'\b(?:Instant|SystemTime|TerminalState|ProjectedViewport|KittyGraphics)\b')
 
+    def test_ember_reset_query_has_one_production_owner(self):
+        host = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
+        for name in ('soft_reset', 'handle_decrqss', 'decrqss_sgr_payload',
+                     'sgr_color_params', 'handle_dcs_payload'):
+            self.assertNotRegex(host, rf'fn {name}\b')
+        engine = (ENGINE / 'src/semantics.rs').read_text()
+        self.assertIn('soft_reset(screen, protocol)', engine)
+        self.assertIn('Effect::Reply(decrqss_reply(screen, &payload[2..]))', engine)
+        frost = (FAMILY / 'frost/src/terminal.rs').read_text()
+        self.assertIn('fn soft_reset(', frost)
+        self.assertNotIn('dispatch_local(', frost)
+
     def test_live_parser_has_one_owner_and_ordered_dispatch(self):
         host = (FAMILY / 'ember/src/terminal/mod.rs').read_text().split('pub struct TerminalState {', 1)[1].split('\n}', 1)[0]
         self.assertEqual(host.count('parser: jterm_engine::parser::Parser,'), 1)

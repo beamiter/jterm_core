@@ -131,7 +131,7 @@ return before any state mutation or effect; mode lists containing host hooks are
 not split or reordered.
 
 Host policy still owns structural orchestration, printable width/composition,
-OSC/graphics/clipboard/command lifecycle, identity/theme replies, reset and mode
+OSC/graphics/clipboard/command lifecycle, identity/theme replies, hard reset and mode
 hooks. Existing permissive syntax handling, protected SGR resets, background
 sidecar behavior and pending-wrap query/erase behavior are intentionally retained.
 Frost does not consume this Ember-compatible semantic dispatcher yet.
@@ -187,3 +187,13 @@ Latest aggregate: 90 stable/MSRV tests, Clippy/fmt and 11 source boundaries pass
 This remains a partial architecture upgrade, not a Tauri GUI or complete shared
 spawn/session runtime. See family validation documentation for native suite
 results and independently reproduced environmental Git-trust failures.
+
+### Ember soft reset and status strings
+
+The live Ember dispatcher also owns DECSTR (`CSI ! p`, no private prefix) and
+DECRQSS (`DCS $q`). DECSTR returns an ordered background effect and preserves
+grids, cursor, alternate screen, unrelated modes, Kitty state and host sync
+lifecycle. DECRQSS returns exact legacy reply bytes, including unknown selectors.
+This semantic policy is Ember-specific: parser profiles do not select it, and
+Frost must not call it as a substitute for its distinct soft reset policy.
+RIS, mode hooks, device identity, OSC, graphics and clipboard remain host-owned.

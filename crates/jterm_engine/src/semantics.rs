@@ -1,6 +1,6 @@
 //! Local VT semantics. Host-dependent commands are returned without mutation.
 use crate::{
-    parser::Event,
+    parser::{Event, StringKind},
     protocol_state::ProtocolState,
     screen::{Charset, RowMutation, ScreenState},
     Color, CursorShape, StyleFlags, UnderlineStyle,
@@ -22,6 +22,8 @@ pub enum Dispatch {
     Handled(Effects),
 }
 
+/// Ember-compatible semantics, including its DECSTR policy (not Frost soft reset).
+/// Frost parser profiles do not select or authorize this semantic policy.
 /// Dispatch exactly one event. Apply returned effects before the next event.
 /// Unhandled is transactional: screen, protocol and host are all untouched.
 pub fn dispatch_local(
@@ -31,6 +33,22 @@ pub fn dispatch_local(
 ) -> Dispatch {
     let mut effects = Effects::new();
     match event {
+        Event::Csi {
+            private_prefix: None,
+            intermediates,
+            final_byte: b'p',
+            ..
+        } if intermediates == b"!" => {
+            soft_reset(screen, protocol);
+            effects.push(Effect::GlobalBackground(Color::Default));
+        }
+        Event::String {
+            kind: StringKind::Dcs,
+            payload,
+            ..
+        } if payload.starts_with(b"$q") => {
+            effects.push(Effect::Reply(decrqss_reply(screen, &payload[2..])));
+        }
         Event::Control(byte) if matches!(byte, 7 | 8 | 9 | 13 | 14 | 15) => match byte {
             7 => effects.push(Effect::Bell),
             8 => {
@@ -510,4 +528,137 @@ pub fn reported_cursor_position(screen: &ScreenState) -> (usize, usize) {
         screen.cursor_col.saturating_add(1)
     };
     (row.max(1), col.max(1))
+}
+
+/// DECSTR (`CSI ! p`): soft reset of the modes and drawing state DECSTR
+/// is defined to touch, leaving the screen and cursor position alone.
+fn soft_reset(screen: &mut ScreenState, protocol: &mut ProtocolState) {
+    screen.current_fg = Color::Default;
+    screen.current_bg = Color::Default;
+    screen.current_flags = StyleFlags::default();
+    screen.g0_charset = Charset::Ascii;
+    screen.g1_charset = Charset::Ascii;
+    screen.active_charset = Charset::Ascii;
+    screen.scroll_region_top = 0;
+    screen.scroll_region_bottom = screen.grid.rows().saturating_sub(1);
+    screen.saved_state = None;
+    screen.origin_mode = false;
+    screen.insert_mode = false;
+    // DECTCEM and DECAWM on, DECCKM (application cursor keys) off,
+    // DECKPAM (application keypad) off. Alternate Scroll returns to the
+    // xterm-resource default (enabled).
+    protocol.modes_mut().insert(25);
+    protocol.modes_mut().insert(7);
+    protocol.modes_mut().insert(1007);
+    protocol.modes_mut().remove(&1);
+    protocol.modes_mut().remove(&66);
+    screen.pending_wrap = false;
+}
+
+fn decrqss_reply(screen: &ScreenState, pt: &[u8]) -> Vec<u8> {
+    let reply = match pt {
+        b" q" => {
+            let n = match screen.cursor_shape {
+                CursorShape::Underline => 4,
+                CursorShape::Beam => 6,
+                _ => 2,
+            };
+            format!("\x1bP1$r{n} q\x1b\\")
+        }
+        b"r" => format!(
+            "\x1bP1$r{};{}r\x1b\\",
+            screen.scroll_region_top + 1,
+            screen.scroll_region_bottom + 1
+        ),
+        b"\"q" => {
+            let n = if screen.current_flags.protected() {
+                1
+            } else {
+                0
+            };
+            format!("\x1bP1$r{n}\"q\x1b\\")
+        }
+        b"m" => format!("\x1bP1$r{}\x1b\\", decrqss_sgr_payload(screen)),
+        b"\"p" => "\x1bP1$r65;1\"p\x1b\\".to_string(),
+        _ => "\x1bP0$r\x1b\\".to_string(),
+    };
+    reply.into_bytes()
+}
+
+fn decrqss_sgr_payload(screen: &ScreenState) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if screen.current_flags.bold() {
+        params.push("1".into());
+    }
+    if screen.current_flags.dim() {
+        params.push("2".into());
+    }
+    if screen.current_flags.italic() {
+        params.push("3".into());
+    }
+    match screen.current_flags.underline() {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => params.push("4".into()),
+        UnderlineStyle::Double => params.push("21".into()),
+        UnderlineStyle::Curly => params.push("4:3".into()),
+        UnderlineStyle::Dotted => params.push("4:4".into()),
+        UnderlineStyle::Dashed => params.push("4:5".into()),
+    }
+    if screen.current_flags.blink() {
+        params.push("5".into());
+    }
+    if screen.current_flags.inverse() {
+        params.push("7".into());
+    }
+    if screen.current_flags.strikethrough() {
+        params.push("9".into());
+    }
+    params.extend(sgr_color_params(screen.current_fg, true));
+    params.extend(sgr_color_params(screen.current_bg, false));
+    if params.is_empty() {
+        "0m".into()
+    } else {
+        format!("{}m", params.join(";"))
+    }
+}
+
+fn sgr_color_params(color: Color, foreground: bool) -> Vec<String> {
+    let named = |n: u8| {
+        vec![if foreground {
+            n.to_string()
+        } else {
+            (n + 10).to_string()
+        }]
+    };
+    match color {
+        Color::Default => Vec::new(),
+        Color::Black => named(30),
+        Color::Red => named(31),
+        Color::Green => named(32),
+        Color::Yellow => named(33),
+        Color::Blue => named(34),
+        Color::Magenta => named(35),
+        Color::Cyan => named(36),
+        Color::White => named(37),
+        Color::BrightBlack => named(90),
+        Color::BrightRed => named(91),
+        Color::BrightGreen => named(92),
+        Color::BrightYellow => named(93),
+        Color::BrightBlue => named(94),
+        Color::BrightMagenta => named(95),
+        Color::BrightCyan => named(96),
+        Color::BrightWhite => named(97),
+        Color::Indexed(index) => vec![
+            if foreground { "38" } else { "48" }.into(),
+            "5".into(),
+            index.to_string(),
+        ],
+        Color::Rgb(red, green, blue) => vec![
+            if foreground { "38" } else { "48" }.into(),
+            "2".into(),
+            red.to_string(),
+            green.to_string(),
+            blue.to_string(),
+        ],
+    }
 }
