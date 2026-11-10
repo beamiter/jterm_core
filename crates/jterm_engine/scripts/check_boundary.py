@@ -62,10 +62,14 @@ class BoundaryTests(unittest.TestCase):
     def test_ember_reset_query_has_one_production_owner(self):
         host = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
         for name in ('soft_reset', 'handle_decrqss', 'decrqss_sgr_payload',
-                     'sgr_color_params', 'handle_dcs_payload'):
+                     'sgr_color_params', 'handle_dcs_payload',
+                     'decrqm_private_mode_state', 'decrqm_ansi_mode_state'):
             self.assertNotRegex(host, rf'fn {name}\b')
         engine = (ENGINE / 'src/semantics.rs').read_text()
         self.assertIn('soft_reset(screen, protocol)', engine)
+        self.assertIn('decrqm_private_mode_state(screen, protocol, mode)', engine)
+        self.assertIn('decrqm_ansi_mode_state(screen, mode)', engine)
+        self.assertNotIn('[DECRQM]', host)
         self.assertIn('Effect::Reply(decrqss_reply(screen, &payload[2..]))', engine)
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
         self.assertIn('fn soft_reset(', frost)

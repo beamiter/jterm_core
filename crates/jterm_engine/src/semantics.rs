@@ -34,6 +34,25 @@ pub fn dispatch_local(
     let mut effects = Effects::new();
     match event {
         Event::Csi {
+            params,
+            private_prefix,
+            intermediates,
+            final_byte: b'p',
+            ..
+        } if intermediates == b"$" && matches!(private_prefix, None | Some(b'?')) => {
+            let mode = params.first().copied().unwrap_or(0);
+            let response = match private_prefix {
+                Some(b'?') => format!(
+                    "\x1b[?{};{}$y",
+                    mode,
+                    decrqm_private_mode_state(screen, protocol, mode)
+                ),
+                None => format!("\x1b[{};{}$y", mode, decrqm_ansi_mode_state(screen, mode)),
+                _ => unreachable!(),
+            };
+            effects.push(Effect::Reply(response.into_bytes()));
+        }
+        Event::Csi {
             private_prefix: None,
             intermediates,
             final_byte: b'p',
@@ -660,5 +679,42 @@ fn sgr_color_params(color: Color, foreground: bool) -> Vec<String> {
             green.to_string(),
             blue.to_string(),
         ],
+    }
+}
+
+// Ember mode-query compatibility policy. Unsupported modes stay unrecognized.
+fn decrqm_private_mode_state(screen: &ScreenState, protocol: &ProtocolState, mode: u16) -> u8 {
+    let set = match mode {
+        6 => screen.origin_mode,
+        1
+        | 7
+        | 12
+        | 25
+        | 47
+        | 66
+        | 1000..=1007
+        | 1015
+        | 1034
+        | 1036
+        | 1047..=1049
+        | 2004
+        | 2026
+        | 2031
+        | 5522 => protocol.modes().contains(&mode),
+        _ => return 0,
+    };
+    if set {
+        1
+    } else {
+        2
+    }
+}
+
+fn decrqm_ansi_mode_state(screen: &ScreenState, mode: u16) -> u8 {
+    match mode {
+        4 if screen.insert_mode => 1,
+        4 => 2,
+        20 => 4,
+        _ => 0,
     }
 }

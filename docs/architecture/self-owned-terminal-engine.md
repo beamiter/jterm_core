@@ -164,3 +164,20 @@ Frost's distinct soft reset is not migrated and parser profile choice does not
 make this dispatcher safe for Frost. RIS and host policy remain in the adapter.
 Independent pre-extraction production snapshots remain immutable, including
 per-partition search revisions; engine differential tests supplement them.
+
+## Ember mode-query ownership
+
+The same Ember-compatible dispatcher now handles DECRQM: final `p`, exactly `$`
+as intermediate, and no prefix or `?`. It reads the original first/default-zero
+parameter and emits the existing ordered `Reply` effect. Origin/insert booleans,
+permanently-reset ANSI 20, and the legacy private-mode recognition table remain
+unchanged. Other prefixes/intermediates/finals remain transactional fallback.
+Frost policy is not selected implicitly, and no other consumer needs a repin.
+
+Before extraction, Ember captured 67,944 actual production per-feed snapshots
+from 75 inputs and four rich primary/alternate, sync-active/inactive seeds. The
+immutable lossless golden, exact raw-byte hash, original lookup bodies and source
+provenance are retained in its tests. Engine tests independently compare every
+u16 mode and mutation controls exercise real candidate source. Host lifecycle,
+clipboard authorization, graphics, RIS and mode effects stay with the adapter.
+The unchanged original reset/query fixtures remain part of the acceptance gates.
