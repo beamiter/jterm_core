@@ -57,6 +57,33 @@ pub enum RegionDirection {
     Down,
 }
 
+/// Physical vertical operations. LF also covers VT, FF, IND and NEL's
+/// second half. Wrap is admitted by the existing printable-output path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerticalMotion {
+    LineFeed,
+    ReverseIndex,
+    Wrap,
+}
+
+/// Original departure coordinates, captured before any physical row shift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerticalDeparture {
+    pub row_id: RawRowId,
+    pub row: usize,
+    pub width: usize,
+}
+
+/// One synchronous physical operation, not an event queue. Consume `region`
+/// completely before hard-LF ownership or initial-wrap rebasing. RI has no
+/// departure ownership notification. Host archive admission and all revisions,
+/// graphics, history, viewport and output ownership remain outside the engine.
+#[derive(Clone, Debug)]
+pub struct VerticalMutation {
+    pub departure: Option<VerticalDeparture>,
+    pub region: Option<RegionMutation>,
+}
+
 /// A physical row removed by a completed region operation. The original identity
 /// is retained even when untracked. Captured content belongs to this removed row,
 /// not to a still-live snapshot. Capturing it does not decide to archive it.
@@ -152,6 +179,70 @@ pub struct ScreenState {
 }
 
 impl ScreenState {
+    /// NEL's first stage. The host must notify cursor reposition immediately
+    /// after this call, BEFORE running LineFeed. Pending wrap is deliberately
+    /// retained until that second stage; no action can span protocol events.
+    pub fn begin_next_line(&mut self) {
+        self.cursor_col = 0;
+    }
+
+    /// Apply the actual physical motion and (when needed) one region shift.
+    /// `capture_outgoing` is host-selected archive eligibility, not a policy
+    /// decision. The allocator contract is the same as `scroll_region_one`:
+    /// exactly one call for a valid replacement and none for a no-op.
+    ///
+    /// Consume returned region effects synchronously in host order: identity,
+    /// graphics, dirty, captured history. Only THEN compute LF's next boundary
+    /// using the updated history counter, or rebase an initial autowrap. The
+    /// host snapshots its history counter before calling for LF's departure.
+    pub fn vertical_motion(
+        &mut self,
+        motion: VerticalMotion,
+        capture_outgoing: bool,
+        allocate_id: impl FnMut() -> RawRowId,
+    ) -> VerticalMutation {
+        if motion != VerticalMotion::Wrap {
+            self.pending_wrap = false;
+        }
+        let departure = (motion != VerticalMotion::ReverseIndex).then(|| VerticalDeparture {
+            row_id: self.grid.row_id(self.cursor_row),
+            row: self.cursor_row,
+            width: self.grid.row_len(),
+        });
+        if motion == VerticalMotion::Wrap {
+            self.grid.row_wrapped[self.cursor_row] = true;
+            self.cursor_col = 0;
+        }
+        let region = if motion == VerticalMotion::ReverseIndex {
+            if self.cursor_row == self.scroll_region_top {
+                self.scroll_region_one(
+                    RegionDirection::Down,
+                    self.scroll_region_top,
+                    self.scroll_region_bottom,
+                    false,
+                    allocate_id,
+                )
+            } else {
+                self.cursor_row = self.cursor_row.saturating_sub(1);
+                None
+            }
+        } else if self.cursor_row == self.scroll_region_bottom {
+            self.scroll_region_one(
+                RegionDirection::Up,
+                self.scroll_region_top,
+                self.scroll_region_bottom,
+                capture_outgoing,
+                allocate_id,
+            )
+        } else {
+            if self.cursor_row + 1 < self.grid.rows() {
+                self.cursor_row += 1;
+            }
+            None
+        };
+        VerticalMutation { departure, region }
+    }
+
     /// ED2: fill every physical active cell with a BCE blank, including protected
     /// cells and wide pairs. This is not printable output or a row replacement:
     /// identities, row wraps, margins, cursor, drawing state and the inactive

@@ -59,6 +59,26 @@ class BoundaryTests(unittest.TestCase):
             source = (ENGINE / 'src' / name).read_text()
             self.assertNotRegex(source, r'\b(?:Instant|SystemTime|TerminalState|ProjectedViewport|KittyGraphics)\b')
 
+    def test_vertical_motion_owns_real_physical_scroll(self):
+        engine = (ENGINE / 'src/screen.rs').read_text()
+        body = engine.split('pub fn vertical_motion(', 1)[1].split('    /// ED2:', 1)[0]
+        self.assertIn('self.scroll_region_one(', body)
+        self.assertIn('self.cursor_row == self.scroll_region_bottom', body)
+        host = (FAMILY / 'ember/src/terminal/state.rs').read_text()
+        wrap = host.split('pub(super) fn wrap_to_next_line(', 1)[1].split('pub(super) fn create_blank_cell', 1)[0]
+        self.assertIn('apply_vertical_motion(VerticalMotion::Wrap)', wrap)
+        self.assertNotIn('self.screen.cursor_row +=', wrap)
+        self.assertRegex(wrap, r'self\s*\.screen\s*\.vertical_motion\(')
+        parser = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
+        lf = parser.split('fn line_feed(', 1)[1].split('fn handle_esc_dispatch', 1)[0]
+        self.assertIn('apply_vertical_motion(VerticalMotion::LineFeed)', lf)
+        self.assertNotIn('scroll_region_up(', lf)
+        self.assertNotIn('self.screen.cursor_row +=', lf)
+        nel = parser.split("b'E' => {", 1)[1].split('}', 1)[0]
+        self.assertLess(nel.index('begin_next_line'), nel.index('note_output_cursor_reposition'))
+        self.assertLess(nel.index('note_output_cursor_reposition'), nel.index('line_feed'))
+        self.assertIn('apply_vertical_motion(VerticalMotion::ReverseIndex)', parser)
+
     def test_ember_reset_query_has_one_production_owner(self):
         host = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
         for name in ('soft_reset', 'handle_decrqss', 'decrqss_sgr_payload',

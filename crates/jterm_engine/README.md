@@ -229,3 +229,23 @@ order. ED2 also retains its host pre-invalidation latch clear for hook prestate;
 the engine independently clears the latch for standalone callers. ED0/1/3,
 selective erase, parser admission and alternate transitions are unchanged.
 Other frontends are not repinned or switched to these methods by this change.
+
+### Vertical-motion slice
+
+`ScreenState::vertical_motion` owns physical LF/VT/FF/IND, RI and admitted
+pending-autowrap movement, including real one-row region shifts. It returns
+original departure coordinates and a `RegionMutation`; it is not a delayed
+protocol queue. LF scrolls only at the exact bottom margin, RI clears pending
+wrap even for invalid margins, and wrap marks the departed row and zeros the
+column before scrolling. NEL uses `begin_next_line`, the host's immediate
+reposition notification, and then LF.
+
+Ember still admits output and chooses archive eligibility. It consumes identity,
+Kitty, dirty and captured-history effects synchronously, then computes LF's next
+boundary using the updated history counter or rebases an initial wrap. History,
+provenance, revisions, viewport policy and allocator ownership remain host-owned.
+The independent physical reference test covers valid and invalid margins,
+original captured identities, allocator counts, full screen state and NEL's
+pre-hook boundary. Ember additionally replays the immutable original-production
+vertical corpus. This is a narrow milestone-2 extraction, not a completed engine
+or a change to Frost's vertical semantics.
