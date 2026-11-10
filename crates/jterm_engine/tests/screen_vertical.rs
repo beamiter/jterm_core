@@ -116,6 +116,22 @@ fn snapshot(s: &ScreenState) -> String {
     )
 }
 
+// StyleFlags::Debug omits wide and wide-continuation bits. Keep the broad
+// metadata snapshot, but compare both physical grids with TerminalCell::Eq.
+fn assert_state(actual: &ScreenState, expected: &ScreenState, context: &str) {
+    assert_eq!(
+        actual.grid.to_vec(),
+        expected.grid.to_vec(),
+        "live cells: {context}"
+    );
+    assert_eq!(
+        actual.alt_grid.to_vec(),
+        expected.alt_grid.to_vec(),
+        "inactive cells: {context}"
+    );
+    assert_eq!(snapshot(actual), snapshot(expected), "state: {context}");
+}
+
 #[derive(Debug)]
 struct OriginalRegion {
     direction: RegionDirection,
@@ -349,11 +365,7 @@ fn vertical_motion_matches_frozen_physical_algorithms_exhaustively() {
                                         "allocation: {context}"
                                     );
                                     assert_effect(&effect, &region, departure, &context);
-                                    assert_eq!(
-                                        snapshot(&actual),
-                                        snapshot(&expected),
-                                        "state: {context}"
-                                    );
+                                    assert_state(&actual, &expected, &context);
                                 }
                             }
                         }
@@ -382,7 +394,7 @@ fn nel_pre_hook_sees_only_column_reset_before_lf() {
                         actual.begin_next_line();
                         // This is exactly the host reposition-hook observation:
                         // no LF, wrap clearing, departure or row shift yet.
-                        assert_eq!(snapshot(&actual), snapshot(&expected));
+                        assert_state(&actual, &expected, "NEL boundary");
                         let departure = Some((expected.grid.row_id(row), row, cols));
                         let mut expected_calls = 0;
                         let region = original_lf(&mut expected, true, &mut expected_calls);
@@ -394,7 +406,7 @@ fn nel_pre_hook_sees_only_column_reset_before_lf() {
                         });
                         assert_eq!(calls, expected_calls);
                         assert_effect(&effect, &region, departure, "NEL second stage");
-                        assert_eq!(snapshot(&actual), snapshot(&expected));
+                        assert_state(&actual, &expected, "NEL second stage");
                     }
                 }
             }
