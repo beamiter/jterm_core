@@ -1120,6 +1120,24 @@ impl ChildProcessGuard {
         Ok(())
     }
 
+    fn cleanup_failed_attachment_with_stderr(
+        &mut self,
+        stderr_tail: &mut String,
+    ) -> Result<(), WorkerFailure> {
+        // Cleanup removes the Child, so retain only its diagnostic pipe first.
+        // Do not delay or change kill/reap to collect output from a failed gate.
+        let stderr = self.child.as_mut().and_then(|child| child.stderr.take());
+        let cleanup = self.cleanup_failed_attachment();
+        if let Some(mut stderr) = stderr {
+            // A descendant may still hold the pipe open. Never wait for EOF,
+            // and preserve the original cleanup result if diagnostics fail.
+            if set_nonblocking(stderr.as_raw_fd()).is_ok() {
+                drain_stderr(&mut stderr, stderr_tail);
+            }
+        }
+        cleanup
+    }
+
     fn child_mut(&mut self) -> Result<&mut Child, WorkerFailure> {
         self.child
             .as_mut()
@@ -1873,7 +1891,9 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
         // scope attachment. Kill both the known unit and private PGID, then
         // reap before publishing the setup failure.
         let mut intent = TerminalIntent::failed(failure);
-        if let Err(cleanup_failure) = process.cleanup_failed_attachment() {
+        if let Err(cleanup_failure) =
+            process.cleanup_failed_attachment_with_stderr(&mut stderr_tail)
+        {
             intent = TerminalIntent::failed(cleanup_failure);
         }
         return finish_report(&sink, &view, process_snapshot, intent, stderr_tail);
@@ -6445,6 +6465,82 @@ mod tests {
         assert!(!snapshot.provider_released);
         assert!(snapshot.reaped);
         assert!(snapshot.containment_verified_empty);
+    }
+
+    #[test]
+    fn failed_launch_gate_preserves_stderr_without_releasing_provider() {
+        for diagnostic in ["", "launch gate diagnostic"] {
+            let mut command = Command::new(SYSTEM_SHELL);
+            command
+                .arg("-c")
+                .arg("printf '%s' \"$1\" >&2; exit 125")
+                .arg("failed-gate")
+                .arg(diagnostic)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            command.process_group(0);
+            let child = command.spawn().unwrap();
+            let failure = wait_for_launch_gate_stop(child.id()).unwrap_err();
+            assert_eq!(failure.cause, CodexAppServerExitCause::SpawnFailed);
+            let snapshot = Arc::new(Mutex::new(CodexAppServerProcessExit::default()));
+            let mut guard = ChildProcessGuard::new(
+                child,
+                Arc::clone(&snapshot),
+                "unused-failed-gate.scope".into(),
+            );
+            let mut stderr_tail = String::new();
+            guard
+                .cleanup_failed_attachment_with_stderr(&mut stderr_tail)
+                .unwrap();
+            assert_eq!(stderr_tail, diagnostic);
+            let snapshot = *snapshot.lock();
+            assert!(snapshot.spawned);
+            assert!(!snapshot.provider_released);
+            assert!(snapshot.reaped);
+            assert!(snapshot.containment_verified_empty);
+            assert_eq!(snapshot.code, Some(125));
+        }
+    }
+
+    #[test]
+    fn failed_launch_gate_stderr_does_not_wait_for_eof() {
+        let mut command = Command::new(SYSTEM_SHELL);
+        command.arg("-c").arg("exit 125").stderr(Stdio::piped());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        wait_for_launch_gate_stop(child.id()).unwrap_err();
+        // Keep a pipe writer open independently of the reaped wrapper. A
+        // blocking read-to-end would hang rather than return the diagnostic.
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(b"held-open diagnostic").unwrap();
+        child.stderr = Some(ChildStderr::from(std::os::fd::OwnedFd::from(reader)));
+        let snapshot = Arc::new(Mutex::new(CodexAppServerProcessExit::default()));
+        let mut guard =
+            ChildProcessGuard::new(child, snapshot, "unused-open-diagnostic.scope".into());
+        let mut tail = String::new();
+        guard
+            .cleanup_failed_attachment_with_stderr(&mut tail)
+            .unwrap();
+        assert_eq!(tail, "held-open diagnostic");
+        drop(writer);
+    }
+
+    #[test]
+    fn failed_launch_gate_stderr_respects_read_and_tail_budgets() {
+        let path = std::env::temp_dir().join(format!("app-gate-stderr-{}", Uuid::new_v4()));
+        std::fs::write(&path, vec![b'x'; READ_BYTES_PER_TICK + 1]).unwrap();
+        let file = File::open(&path).unwrap();
+        let mut stderr = ChildStderr::from(std::os::fd::OwnedFd::from(file));
+        set_nonblocking(stderr.as_raw_fd()).unwrap();
+        let mut tail = String::new();
+        drain_stderr(&mut stderr, &mut tail);
+        assert_eq!(tail, "x".repeat(STDERR_TAIL_MAX_BYTES));
+        let mut remaining = Vec::new();
+        stderr.read_to_end(&mut remaining).unwrap();
+        assert_eq!(remaining, b"x");
+        drop(stderr);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
