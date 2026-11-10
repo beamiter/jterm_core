@@ -425,6 +425,9 @@ python3 scripts/family-cargo.py jsh test --lib
 python3 scripts/family-cargo.py all check --all-targets
 ```
 
+The root `jterm_core` package requires Rust 1.89 or later for the patched bundled
+SQLite dependency. See [the SQLite security update](docs/sqlite-security-2026-0459.md).
+
 The independent `jterm_engine` crate lives in `crates/jterm_engine` in this
 repository. It retains its own workspace, Cargo.lock and Rust 1.86 minimum;
 it does not depend on `jterm_core` or join its dependency graph. Test it with

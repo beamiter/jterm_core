@@ -1,5 +1,9 @@
 # PR #8: preserve Rust 1.86
 
+Historical record: the later [SQLite security update](sqlite-security-2026-0459.md)
+raises the root core minimum to Rust 1.89. The PR #8 results below describe
+the earlier dependency repair; independent jterm_engine still supports 1.86.
+
 The manifest's Rust 1.86 support remains unchanged. This is a dependency
 compatibility repair, not an MSRV upgrade.
 

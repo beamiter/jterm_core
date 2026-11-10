@@ -616,7 +616,7 @@ impl Assembled {
         let mut rgba = Vec::new();
         rgba.try_reserve_exact(layout.rgba_bytes)
             .map_err(|_| Error::TooLarge)?;
-        for pixel in self.bytes.chunks_exact(3) {
+        for pixel in self.bytes.as_chunks::<3>().0 {
             rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xFF]);
         }
         debug_assert_eq!(rgba.len(), layout.rgba_bytes);

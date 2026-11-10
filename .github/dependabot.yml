@@ -6,7 +6,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
-    # Keep MSRV-incompatible releases out of routine grouped updates.
+    # Keep Rust 1.95-only parking_lot out of grouped updates. Retain the
+    # validated uuid line separately from the SQLite security/MSRV change.
     ignore:
       - dependency-name: parking_lot
         versions: [">=0.13"]

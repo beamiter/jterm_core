@@ -999,6 +999,21 @@ fn err(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bundled_sqlite_is_patched_and_preserves_unsigned_row_decoding() {
+        // RUSTSEC-2026-0459 is fixed by SQLite 3.54.0. Check the linked
+        // runtime, not just Cargo's selected wrapper version.
+        assert!(rusqlite::version_number() >= 3_054_000);
+        let db = Connection::open_in_memory().unwrap();
+        let max: u64 = db
+            .query_row("SELECT 9223372036854775807", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(max, i64::MAX as u64);
+        assert!(db
+            .query_row("SELECT -1", [], |row| row.get::<_, u64>(0))
+            .is_err());
+    }
+
     fn store() -> (Store, Paths) {
         let p =
             Paths::at(std::env::temp_dir().join(format!("jterm-store-{}", uuid::Uuid::new_v4())))

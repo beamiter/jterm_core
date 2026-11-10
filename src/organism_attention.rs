@@ -177,8 +177,8 @@ impl AttentionArbiter {
     /// A stale timestamp is clamped just as in [`Self::offer`].
     pub fn can_offer(&self, cue: AttentionCue, now: Duration) -> bool {
         let now = self.observed_at.map_or(now, |previous| previous.max(now));
-        !self.admitted_at[cue.index()]
-            .is_some_and(|previous| now.saturating_sub(previous) < self.policy.cooldown(cue))
+        self.admitted_at[cue.index()]
+            .is_none_or(|previous| now.saturating_sub(previous) >= self.policy.cooldown(cue))
             && !self.active.is_some_and(|active| {
                 now.saturating_sub(active.admitted_at) < self.policy.focus_window(active.cue)
                     && active.cue.rank() >= cue.rank()

@@ -2,7 +2,7 @@
 name = "jterm_core"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.89"
 description = "Shared UI-independent core for the jterm family of terminal emulators"
 readme = "README.md"
 repository = "https://github.com/beamiter/jterm_core"
@@ -24,9 +24,10 @@ jagent = { version = "0.7.0", git = "https://github.com/beamiter/jagent.git", re
 crossbeam-channel = "0.5"
 # The agent_task worktree/session machinery: shared locks and the ids that
 # name isolated Codex homes and systemd scopes.
-# Rust 1.86 MSRV: parking_lot 0.13 / lock_api 0.5 require Rust 1.95.
+# parking_lot 0.13 / lock_api 0.5 require Rust 1.95, above our Rust 1.89 MSRV.
 parking_lot = "0.12"
-# uuid 1.27+ requires Rust 1.89; keep the last MSRV-compatible minor.
+# Retain the previously validated uuid minor; the SQLite security upgrade
+# does not require unrelated dependency updates.
 uuid = { version = "~1.26.0", features = ["v4", "serde"] }
 libc = "0.2.189"
 log = "0.4"
@@ -39,7 +40,8 @@ dirs = "7.0"
 fuzzy-matcher = "0.3"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+# SQLite >=3.54 fixes RUSTSEC-2026-0459; fallible_uint preserves u64 row decoding.
+rusqlite = { version = "=0.41.0", features = ["bundled", "fallible_uint"] }
 sha2 = "0.10"
 # The workflow library is authored in TOML or YAML; both formats deserialize
 # through the same serde derive so they cannot disagree about a field's type.

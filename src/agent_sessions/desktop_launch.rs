@@ -219,7 +219,7 @@ fn nvm_directories(home: &Path) -> Vec<PathBuf> {
             default
                 .as_deref()
                 .is_some_and(|name| name.starts_with("lts/"))
-                && version[0] % 2 == 0
+                && version[0].is_multiple_of(2)
         }
     };
     versions.sort_by(|(a, _), (b, _)| preferred(b).cmp(&preferred(a)).then_with(|| b.cmp(a)));

@@ -1347,7 +1347,7 @@ fn completed_history(history: &[Turn]) -> (Vec<Turn>, bool) {
 }
 
 fn validate_turns(turns: &[Turn]) -> Result<(), ConversationSnapshotError> {
-    if turns.len() > MAX_PERSISTED_TURNS || turns.len() % 2 != 0 {
+    if turns.len() > MAX_PERSISTED_TURNS || !turns.len().is_multiple_of(2) {
         return Err(ConversationSnapshotError::InvalidTurnSequence);
     }
 

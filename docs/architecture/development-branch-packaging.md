@@ -7,7 +7,9 @@ The earlier milestone reports retain their original local-only validation scope.
 
 ## Source layout and dependency identity
 
-- `jterm_core` remains the root package, version 0.2.0 and Rust 1.86 minimum.
+- `jterm_core` remains the root package, version 0.2.0 and Rust 1.89 minimum.
+  The SQLite security update requires this higher minimum; see
+  [the dependency security note](../sqlite-security-2026-0459.md).
 - `crates/jterm_engine` is a separately locked, independent Cargo workspace,
   version 0.1.0 and Rust 1.86 minimum. Its only external dependency is smallvec.
   It has no core, GUI, PTY, Agent, filesystem, network or executor dependency.

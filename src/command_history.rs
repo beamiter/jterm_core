@@ -891,7 +891,7 @@ pub fn append(
     let append_number = APPEND_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     let oversized = file.metadata()?.len() > MAX_FILE_BYTES as u64;
     drop(file);
-    if oversized || append_number % COMPACT_EVERY == 0 {
+    if oversized || append_number.is_multiple_of(COMPACT_EVERY) {
         compact_locked(path, max_entries.max(1))?;
     }
     Ok(())
