@@ -211,3 +211,21 @@ Focus (1004), alternate/save-restore (47/1047/1048/1049), synchronized output
 direction. The frontend performs these hooks in parameter order, retaining its
 observer cadence and malformed-prefix/intermediate admission behavior. The
 policy is Ember-specific; other terminals are not repinned by this extraction.
+
+### Physical active-grid fills
+
+`ScreenState::erase_screen` owns the ED2 physical fill: every active cell becomes
+an unprotected, unlinked BCE blank with default foreground/style. It clears the
+pending-wrap latch without moving the cursor or changing margins. DECALN's
+`screen_alignment_test` fills default-style `E` cells (not BCE), resets margins,
+homes the cursor and clears pending wrap while retaining origin mode. Neither
+operation changes row identities/wrap metadata, drawing/saved state, the last
+printed character, or the inactive grid. These are in-place edits, not output
+ownership events or row replacements.
+
+Ember invalidates provenance before calling either method and retains all
+history, dirty/revision, cursor-reposition and graphics hooks in their original
+order. ED2 also retains its host pre-invalidation latch clear for hook prestate;
+the engine independently clears the latch for standalone callers. ED0/1/3,
+selective erase, parser admission and alternate transitions are unchanged.
+Other frontends are not repinned or switched to these methods by this change.

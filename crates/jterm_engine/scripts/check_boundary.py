@@ -215,6 +215,25 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn('screen.pending_wrap =', pure)
         self.assertNotIn('mode_mutation::', (FAMILY / 'frost/src/terminal.rs').read_text())
 
+    def test_fullscreen_fill_authority_and_host_order(self):
+        host = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
+        ed = host.split('pub(super) fn erase_screen(&mut self) {', 1)[1].split('\n    }', 1)[0]
+        dec = host.split('fn screen_alignment_test(&mut self) {', 1)[1].split('\n    }', 1)[0]
+        for body, method in [(ed, 'erase_screen'), (dec, 'screen_alignment_test')]:
+            self.assertIn('self.screen.' + method + '();', body)
+            self.assertNotIn('iter_mut()', body)
+            self.assertNotIn('TerminalCell {', body)
+            self.assertLess(body.index('invalidate_grid_mutation_spans'), body.index('self.screen.' + method + '();'))
+            self.assertLess(body.index('self.screen.' + method + '();'), body.index('self.dirty_region.mark_all'))
+        # ED2's pre-invalidation latch clear is retained for host hook prestate;
+        # the engine independently guarantees its standalone clear contract.
+        self.assertLess(ed.index('self.screen.pending_wrap = false'), ed.index('invalidate_grid_mutation_spans'))
+        self.assertLess(ed.index('mark_rows_dirty'), ed.index('kitty_graphics.clear_placements'))
+        self.assertLess(dec.index('screen_alignment_test();'), dec.index('note_output_cursor_reposition(true)'))
+        self.assertLess(dec.index('note_output_cursor_reposition(true)'), dec.index('self.dirty_region.mark_all'))
+        self.assertNotIn('kitty_graphics', dec)
+        self.assertNotIn('archive_visible_screen', dec)
+
     def test_storage_vectors_remain_private(self):
         text = (ENGINE / 'src/grid.rs').read_text()
         self.assertIn('cells: Vec<TerminalCell>', text)

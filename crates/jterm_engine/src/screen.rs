@@ -152,6 +152,34 @@ pub struct ScreenState {
 }
 
 impl ScreenState {
+    /// ED2: fill every physical active cell with a BCE blank, including protected
+    /// cells and wide pairs. This is not printable output or a row replacement:
+    /// identities, row wraps, margins, cursor, drawing state and the inactive
+    /// grid are retained. Host provenance must be invalidated before this call;
+    /// dirty bookkeeping, history policy and graphics remain with the host.
+    pub fn erase_screen(&mut self) {
+        self.pending_wrap = false;
+        let blank = self.create_blank_cell();
+        self.grid.cells_mut().fill(blank);
+    }
+
+    /// DECALN: fill the physical active grid with default-style E cells, reset
+    /// margins and home the cursor. Unlike ED2 this deliberately does not use
+    /// the current background. Origin mode and all other drawing/saved state,
+    /// row metadata and the inactive grid are retained. The host invalidates
+    /// provenance first and owns reposition notification and dirty bookkeeping.
+    pub fn screen_alignment_test(&mut self) {
+        self.grid.cells_mut().fill(TerminalCell {
+            character: 'E',
+            ..TerminalCell::default()
+        });
+        self.scroll_region_top = 0;
+        self.scroll_region_bottom = self.grid.rows().saturating_sub(1);
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.pending_wrap = false;
+    }
+
     /// Swap the actual grids and enter the alternate screen. DECSET 47 uses
     /// (false, false), 1047 uses (false, true), and 1049 uses (true, true).
     /// Repeated entry is a complete no-op, including saved slots and clears.
