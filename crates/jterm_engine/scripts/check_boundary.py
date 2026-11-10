@@ -202,6 +202,19 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('if !local {', semantic)
         self.assertIn('return Dispatch::Unhandled;', semantic)
 
+        # Pure Ember mode mutations have one production owner; admission,
+        # parameter order and lifecycle hooks remain in the frontend.
+        modes = host.split('pub(super) fn set_mode(', 1)[1]
+        self.assertEqual(modes.count('apply_ember_mode('), 4)
+        for field in ('origin_mode', 'insert_mode', 'pending_wrap'):
+            self.assertNotIn('self.screen.' + field + ' =', modes)
+        self.assertNotIn('modes_mut().insert(mode)', modes)
+        self.assertNotIn('modes_mut().remove(&mode)', modes)
+        pure = (ENGINE / 'src/mode_mutation.rs').read_text()
+        self.assertIn('1004 | 47 | 1047 | 1048 | 1049 | 2026 | 5522 => return false', pure)
+        self.assertNotIn('screen.pending_wrap =', pure)
+        self.assertNotIn('mode_mutation::', (FAMILY / 'frost/src/terminal.rs').read_text())
+
     def test_storage_vectors_remain_private(self):
         text = (ENGINE / 'src/grid.rs').read_text()
         self.assertIn('cells: Vec<TerminalCell>', text)

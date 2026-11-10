@@ -197,3 +197,17 @@ lifecycle. DECRQSS returns exact legacy reply bytes, including unknown selectors
 This semantic policy is Ember-specific: parser profiles do not select it, and
 Frost must not call it as a substitute for its distinct soft reset policy.
 RIS, mode hooks, device identity, OSC, graphics and clipboard remain host-owned.
+
+### Ember per-parameter modes
+
+`mode_mutation::apply_ember_mode` owns Ember's pure ANSI IRM and DEC origin,
+wrap, cursor, keypad and recognized input/mouse mode mutations. It deliberately
+preserves pending wrap on origin changes and distinguishes ANSI 4 from private
+4. Unknown modes remain absent. The explicit namespace is supplied by Ember's
+unchanged outer CSI dispatcher; this function never parses or reorders a list.
+
+Focus (1004), alternate/save-restore (47/1047/1048/1049), synchronized output
+(2026), and paste grants (5522) return unhandled with no changes in either
+direction. The frontend performs these hooks in parameter order, retaining its
+observer cadence and malformed-prefix/intermediate admission behavior. The
+policy is Ember-specific; other terminals are not repinned by this extraction.
