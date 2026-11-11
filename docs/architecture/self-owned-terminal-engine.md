@@ -211,3 +211,24 @@ Anvil are not claimed migrated. Clipboard authorization, graphics, command
 metadata/lifecycle, non-color OSC behavior, renderer presentation and other host
 effects remain adapter-owned. Standalone unit tests supplement, not replace,
 Ember's immutable pre-extraction per-feed full-state golden and frontend tests.
+
+### Ember title-owner candidate boundary
+
+`jterm_engine::titles::TitleState` is the sole candidate owner for Ember's
+`window_title`, `icon_title` and `title_stack`, preserving their string/optional
+pair values and Debug representation. OSC 0/1/2 setters accept host-sanitized
+text and retain the 200-scalar cap. XTWINOPS 22 saves up to 16 entries (oldest
+entry evicted); 23 always pops before selective restoration. Target 1 is icon,
+2 is window, every other target selects both. XTWINOPS 20/21 replies retain
+fixed ST and the original control/bidi filter via ordered `Effect::Reply`.
+
+The host retains the `review_input` visual-spoofing sanitizer before admission,
+parser framing, effect delivery, title display and window geometry. Operations
+11/13/14/16/18/19 are intentionally not implemented by this owner. No reverse
+engine dependency on `jterm_core`, GUI or host security policy is introduced.
+
+Rust 1.86 and 1.89 each pass 118 engine tests, including six title tests, with
+strict all-target Clippy and formatting checks. Original-production baseline
+sealing and the consumer adapter remain separate acceptance requirements;
+this core candidate alone does not establish Ember end-to-end parity or migrate
+Frost, Forge or Anvil.

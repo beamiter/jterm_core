@@ -271,3 +271,24 @@ this owner.
 This is an Ember-compatible lane, not a migration of all four applications.
 Clipboard authorization, graphics, command lifecycle, non-color OSC handling,
 parser admission, rendering and host effects remain outside this module.
+
+## Ember title-owner candidate
+
+`titles::TitleState` owns the window title, icon title and bounded title stack.
+It accepts **already host-sanitized** text for OSC 0/1/2, caps it at 200 Unicode
+scalars, and provides XTWINOPS 20/21 reports and 22/23 save/restore. The stack
+retains 16 entries, evicting the oldest on overflow. Target 1 selects icon, 2
+window, all others both; restore consumes the top entry even when that entry
+contains no selected field. Replies are ordered `Effect::Reply` values with
+fixed ST framing and the original control/bidi report filter.
+
+This API does not replace Ember's `review_input`-based incoming trusted-chrome
+sanitizer. The host must sanitize before calling `set_osc` and immediately deliver
+reply effects at the existing dispatch position. Geometry operations and GUI
+presentation remain host-owned. Public fields preserve original observer/debug
+values; they do not make raw incoming strings safe to admit.
+
+The core candidate passes 118 engine tests on Rust 1.86 and 1.89, including six
+title tests. Independent original-production capture and consumer migration are
+separate gates, not established by these unit tests. This is not a completed
+four-application migration.

@@ -24,3 +24,5 @@ pub mod publication;
 pub mod mode_mutation;
 
 pub mod colors;
+
+pub mod titles;
