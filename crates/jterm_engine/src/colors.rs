@@ -26,21 +26,67 @@ impl Default for TerminalDefaultColors {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ColorState {
-    pub default_colors: TerminalDefaultColors,
+/// Override storage shared across frontends; defaults and protocol policy stay profiled.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProfiledColorState<D> {
+    pub default_colors: D,
     pub dynamic_fg: Option<Rgb>,
     pub dynamic_bg: Option<Rgb>,
     pub dynamic_cursor_color: Option<Rgb>,
     pub dynamic_palette: DynamicColorPalette,
 }
-impl Default for ColorState {
-    fn default() -> Self {
-        Self::new(TerminalDefaultColors::default())
+/// Ember colors retain their original API and debug representation.
+pub type ColorState = ProfiledColorState<TerminalDefaultColors>;
+/// Overrides only. The host owns parsing, defaults, query and reset policy.
+///
+/// Ember parsing is intentionally unavailable on this profile.
+/// ```compile_fail
+/// use jterm_engine::colors::DynamicColorState;
+/// DynamicColorState::parse_color_spec("rgb:8/8/8");
+/// ```
+/// ```compile_fail
+/// use jterm_engine::colors::DynamicColorState;
+/// DynamicColorState::default().apply_ember_osc("10", "?", b"\x07");
+/// ```
+/// The owner is deliberately not Copy; saved-primary snapshots use explicit clone.
+/// ```compile_fail
+/// use jterm_engine::colors::DynamicColorState;
+/// fn requires_copy<T: Copy>() {}
+/// requires_copy::<DynamicColorState>();
+/// ```
+/// ```compile_fail
+/// use jterm_engine::colors::DynamicColorState;
+/// DynamicColorState::default().effective_foreground();
+/// ```
+/// ```compile_fail
+/// use jterm_engine::colors::{DynamicColorState, TerminalDefaultColors};
+/// DynamicColorState::default().set_theme(TerminalDefaultColors::default(), true);
+/// ```
+/// Ember also remains non-Copy.
+/// ```compile_fail
+/// use jterm_engine::colors::ColorState;
+/// fn requires_copy<T: Copy>() {}
+/// requires_copy::<ColorState>();
+/// ```
+pub type DynamicColorState = ProfiledColorState<()>;
+impl<D: core::fmt::Debug> core::fmt::Debug for ProfiledColorState<D> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ColorState")
+            .field("default_colors", &self.default_colors)
+            .field("dynamic_fg", &self.dynamic_fg)
+            .field("dynamic_bg", &self.dynamic_bg)
+            .field("dynamic_cursor_color", &self.dynamic_cursor_color)
+            .field("dynamic_palette", &self.dynamic_palette)
+            .finish()
     }
 }
-impl ColorState {
-    pub fn new(default_colors: TerminalDefaultColors) -> Self {
+impl<D: Default> Default for ProfiledColorState<D> {
+    fn default() -> Self {
+        Self::new(D::default())
+    }
+}
+impl<D> ProfiledColorState<D> {
+    pub fn new(default_colors: D) -> Self {
         Self {
             default_colors,
             dynamic_fg: None,
@@ -48,9 +94,6 @@ impl ColorState {
             dynamic_cursor_color: None,
             dynamic_palette: [None; 256],
         }
-    }
-    pub fn defaults(&self) -> TerminalDefaultColors {
-        self.default_colors
     }
     pub fn foreground_override(&self) -> Option<Rgb> {
         self.dynamic_fg
@@ -63,6 +106,18 @@ impl ColorState {
     }
     pub fn palette_overrides(&self) -> &DynamicColorPalette {
         &self.dynamic_palette
+    }
+    /// Clear overrides only; the host decides when this is appropriate.
+    pub fn reset_dynamic(&mut self) {
+        self.dynamic_fg = None;
+        self.dynamic_bg = None;
+        self.dynamic_cursor_color = None;
+        self.dynamic_palette = [None; 256];
+    }
+}
+impl ColorState {
+    pub fn defaults(&self) -> TerminalDefaultColors {
+        self.default_colors
     }
     pub fn effective_foreground(&self) -> Rgb {
         self.dynamic_fg.unwrap_or(self.default_colors.foreground)
@@ -82,13 +137,6 @@ impl ColorState {
                 .copied()
                 .unwrap_or_else(|| Self::default_256_color(idx))
         })
-    }
-    /// RIS clears overrides but retains the host theme, without notifications.
-    pub fn reset_dynamic(&mut self) {
-        self.dynamic_fg = None;
-        self.dynamic_bg = None;
-        self.dynamic_cursor_color = None;
-        self.dynamic_palette = [None; 256];
     }
     /// Only a host theme update emits a subscribed color-scheme change.
     pub fn set_theme(&mut self, colors: TerminalDefaultColors, subscribed_2031: bool) -> Effects {
