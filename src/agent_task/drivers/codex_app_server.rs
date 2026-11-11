@@ -1705,6 +1705,79 @@ fn launch_gate_script() -> String {
     )
 }
 
+fn systemd_scope_expansion_switch_supported() -> Result<bool, WorkerFailure> {
+    let mut probe = Command::new(SYSTEMD_RUN);
+    probe
+        .env_clear()
+        .env("PATH", TRUSTED_PATH)
+        .env("LC_ALL", "C")
+        .arg("--version");
+    systemd_scope_expansion_switch_from_command(&mut probe)
+}
+
+fn systemd_scope_expansion_switch_from_command(probe: &mut Command) -> Result<bool, WorkerFailure> {
+    let output = crate::helper::bounded_command_output(
+        probe,
+        FIELD_MAX_BYTES,
+        FIELD_MAX_BYTES,
+        Duration::from_secs(2),
+    )
+    .map_err(|error| {
+        WorkerFailure::spawn(format!("cannot inspect systemd-run version: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(WorkerFailure::spawn("systemd-run version probe failed"));
+    }
+    systemd_scope_expansion_switch_from_version(&output.stdout)
+}
+
+fn systemd_scope_expansion_switch_from_version(output: &[u8]) -> Result<bool, WorkerFailure> {
+    let version = std::str::from_utf8(output)
+        .ok()
+        .and_then(|text| text.lines().next())
+        .and_then(|line| line.strip_prefix("systemd "))
+        .and_then(|line| line.split_ascii_whitespace().next())
+        .filter(|version| !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|version| version.parse::<u32>().ok())
+        .filter(|version| *version > 0)
+        .ok_or_else(|| WorkerFailure::spawn("unrecognized systemd-run version"))?;
+    // Before v254, scope argv was always literal and the switch did not exist.
+    // Since v254 request literal argv explicitly, independent of defaults.
+    Ok(version >= 254)
+}
+
+fn launch_gate_command(scope_unit: &str, expansion_switch_supported: bool) -> Command {
+    let mut command = Command::new(SYSTEMD_RUN);
+    command
+        .env_clear()
+        .env("PATH", TRUSTED_PATH)
+        .arg("--user")
+        .arg("--scope");
+    // systemd >= 258 expands scope argv by default, including $$ -> $.
+    // The shell, not systemd, must interpret the trusted gate script.
+    if expansion_switch_supported {
+        command.arg("--expand-environment=no");
+    }
+    command
+        .arg("--quiet")
+        .arg("--collect")
+        .arg(format!("--unit={scope_unit}"))
+        .arg("--property=KillMode=control-group")
+        .arg("--property=TimeoutStopSec=500ms")
+        .arg("--")
+        .arg(SYSTEM_SHELL)
+        .arg("-c")
+        .arg(launch_gate_script())
+        .arg(format!(
+            "{}-codex-launch-gate",
+            crate::agent_task::app_slug()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
     let WorkerContext {
         launch_argv,
@@ -1776,6 +1849,10 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
             "Native Codex was cancelled before credential handoff",
         );
     }
+    let expansion_switch_supported = match systemd_scope_expansion_switch_supported() {
+        Ok(supported) => supported,
+        Err(failure) => return finish_without_child(&sink, &view, process_snapshot, failure),
+    };
     let executable = launch_argv
         .first()
         .map(PathBuf::from)
@@ -1812,28 +1889,7 @@ fn run_worker(context: WorkerContext) -> CodexAppServerExitReport {
         Ok(environment) => environment,
         Err(failure) => return finish_without_child(&sink, &view, process_snapshot, failure),
     };
-    let mut command = Command::new(SYSTEMD_RUN);
-    command
-        .env_clear()
-        .env("PATH", TRUSTED_PATH)
-        .arg("--user")
-        .arg("--scope")
-        .arg("--quiet")
-        .arg("--collect")
-        .arg(format!("--unit={scope_unit}"))
-        .arg("--property=KillMode=control-group")
-        .arg("--property=TimeoutStopSec=500ms")
-        .arg("--")
-        .arg(SYSTEM_SHELL)
-        .arg("-c")
-        .arg(launch_gate_script())
-        .arg(format!(
-            "{}-codex-launch-gate",
-            crate::agent_task::app_slug()
-        ))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = launch_gate_command(&scope_unit, expansion_switch_supported);
     for argument in &launch_argv {
         command.arg(argument);
     }
@@ -6504,6 +6560,157 @@ mod tests {
     }
 
     #[test]
+    fn launch_scope_disables_systemd_expansion_before_shell_payload() {
+        let command = launch_gate_command("test-launch.scope", true);
+        assert_eq!(command.get_program(), OsStr::new(SYSTEMD_RUN));
+        let args: Vec<_> = command.get_args().collect();
+        let boundary = args.iter().position(|arg| *arg == "--").unwrap();
+        assert!(args[..boundary].contains(&OsStr::new("--scope")));
+        assert!(args[..boundary].contains(&OsStr::new("--expand-environment=no")));
+        assert_eq!(args[boundary + 1], SYSTEM_SHELL);
+        assert_eq!(args[boundary + 2], "-c");
+        assert_eq!(args[boundary + 3], launch_gate_script().as_str());
+    }
+
+    #[test]
+    fn launch_scope_version_policy_preserves_old_and_new_systemd_argv() {
+        for (version, expected) in [
+            (252, false),
+            (253, false),
+            (254, true),
+            (257, true),
+            (259, true),
+        ] {
+            let output = format!("systemd {version} ({version}.9-vendor)\n+PAM +AUDIT\n");
+            let supported = systemd_scope_expansion_switch_from_version(output.as_bytes()).unwrap();
+            assert_eq!(supported, expected);
+            let command = launch_gate_command("literal.scope", supported);
+            let args: Vec<_> = command.get_args().collect();
+            let boundary = args.iter().position(|arg| *arg == "--").unwrap();
+            assert_eq!(
+                args[..boundary].contains(&OsStr::new("--expand-environment=no")),
+                expected
+            );
+            assert_eq!(args[boundary + 3], launch_gate_script().as_str());
+            assert!(args[..boundary].contains(&OsStr::new("--property=KillMode=control-group")));
+            assert!(args[..boundary].contains(&OsStr::new("--property=TimeoutStopSec=500ms")));
+        }
+        for invalid in [
+            b"".as_slice(),
+            b"other 252",
+            b"systemd 0",
+            b"systemd -252",
+            b"systemd +252",
+            b"systemd 259rc1",
+            b"systemd 999999999999999999999999999999",
+            b" systemd 252",
+            b"systemd \xff",
+        ] {
+            assert_eq!(
+                systemd_scope_expansion_switch_from_version(invalid)
+                    .unwrap_err()
+                    .cause,
+                CodexAppServerExitCause::SpawnFailed
+            );
+        }
+    }
+
+    #[test]
+    fn launch_scope_version_probe_is_bounded_and_fails_closed() {
+        for (script, expected) in [
+            ("printf 'systemd 252 (252.1)\\n'", Some(false)),
+            ("printf 'systemd 254 (254.1)\\n'", Some(true)),
+            ("printf 'systemd 259 (259.1)\\n'", Some(true)),
+            ("printf 'systemd 259\\n'; exit 1", None),
+            ("printf 'unknown version\\n'", None),
+            ("printf '%5000s' x", None),
+            ("printf '%5000s' x >&2", None),
+            ("exec /bin/sleep 10", None),
+        ] {
+            let mut command = Command::new(SYSTEM_SHELL);
+            command.env_clear().arg("-c").arg(script);
+            let started = Instant::now();
+            let result = systemd_scope_expansion_switch_from_command(&mut command);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected),
+                None => assert_eq!(
+                    result.unwrap_err().cause,
+                    CodexAppServerExitCause::SpawnFailed
+                ),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "probe exceeded bounded deadline: {script}"
+            );
+        }
+        let mut missing = Command::new("/nonexistent/ember-systemd-probe");
+        assert_eq!(
+            systemd_scope_expansion_switch_from_command(&mut missing)
+                .unwrap_err()
+                .cause,
+            CodexAppServerExitCause::SpawnFailed
+        );
+    }
+
+    #[test]
+    fn launch_gate_shell_stops_then_preserves_literal_payload_arguments() {
+        let payload = "literal $$ ${HOME} $HOME spaces ' and quotes";
+        let mut command = Command::new(SYSTEM_SHELL);
+        command
+            .arg("-c")
+            .arg(launch_gate_script())
+            .arg("gate")
+            .arg(SYSTEM_SHELL)
+            .arg("-c")
+            .arg("printf '%s' \"$1\"")
+            .arg("payload")
+            .arg(payload)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let snapshot = Arc::new(Mutex::new(CodexAppServerProcessExit::default()));
+        let mut guard = ChildProcessGuard::new(child, snapshot, "unused-shell-test.scope".into());
+        wait_for_launch_gate_stop(pid).unwrap();
+        // This isolated test has no provider or user data. Only after proving
+        // STOP do we release the shell to run the fixed printf fixture.
+        release_launch_gate(pid as i32).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !guard.leader_has_exited().unwrap() {
+            assert!(Instant::now() < deadline, "shell fixture did not exit");
+            thread::sleep(IO_POLL_INTERVAL);
+        }
+        let mut stdout = guard.child_mut().unwrap().stdout.take().unwrap();
+        let mut diagnostics = String::new();
+        guard
+            .cleanup_failed_attachment_with_stderr(&mut diagnostics)
+            .unwrap();
+        let mut actual = String::new();
+        stdout.read_to_string(&mut actual).unwrap();
+        assert_eq!(actual, payload);
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn launch_gate_double_dollar_collapse_reproduces_exit_125() {
+        // systemd replace_env collapses $$ to $ before sh sees the script
+        // when scope argument expansion is enabled (the default since v258).
+        let collapsed = launch_gate_script().replace("$$", "$");
+        let output = Command::new(SYSTEM_SHELL)
+            .arg("-c")
+            .arg(collapsed)
+            .arg("collapsed-gate")
+            .arg("/bin/false")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(125));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains('$'), "{stderr}");
+        assert!(!output.status.success());
+    }
+
+    #[test]
     fn failed_launch_gate_stderr_does_not_wait_for_eof() {
         let mut command = Command::new(SYSTEM_SHELL);
         command.arg("-c").arg("exit 125").stderr(Stdio::piped());
@@ -6548,12 +6755,14 @@ mod tests {
         if !std::path::Path::new(SYSTEMD_RUN).is_file() {
             return;
         }
+        let expansion_switch_supported = systemd_scope_expansion_switch_supported().unwrap();
         let scope_unit = format!("app-codex-test-{}.scope", Uuid::new_v4());
         let mut command = Command::new(SYSTEMD_RUN);
-        command
-            .arg("--user")
-            .arg("--scope")
-            .arg("--quiet")
+        command.arg("--user").arg("--scope");
+        if expansion_switch_supported {
+            command.arg("--expand-environment=no");
+        }
+        command.arg("--quiet")
             .arg("--collect")
             .arg(format!("--unit={scope_unit}"))
             .arg("--property=KillMode=control-group")
