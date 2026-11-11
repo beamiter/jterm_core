@@ -249,3 +249,25 @@ original captured identities, allocator counts, full screen state and NEL's
 pre-hook boundary. Ember additionally replays the immutable original-production
 vertical corpus. This is a narrow milestone-2 extraction, not a completed engine
 or a change to Frost's vertical semantics.
+
+## Ember dynamic-color ownership slice
+
+The `colors` module provides the live `ColorState` owner for Ember's OSC
+4/104/10/11/12/110/111/112 state and replies. `TerminalDefaultColors` contains
+host-supplied theme RGB defaults; foreground/background/cursor overrides and
+all 256 palette overrides live in this owner, not in a host mirror. Renderers
+borrow overrides and keep GUI conversion, opacity, bold/dim policy and theme
+presentation in the host.
+
+Color replies use the existing ordered `Effect::Reply`; the adapter delivers
+them immediately at the original dispatch position and supplies each OSC's
+BEL/ST terminator. Only a host theme update with mode 2031 subscribed and a
+changed effective-background classification produces a color-scheme notice.
+OSC 11/111 themselves do not broadcast it. The protocol owner retains mode
+2031; the color owner does not duplicate that bit. RIS may clear overrides
+while retaining theme defaults without notifications; DECSTR does not reset
+this owner.
+
+This is an Ember-compatible lane, not a migration of all four applications.
+Clipboard authorization, graphics, command lifecycle, non-color OSC handling,
+parser admission, rendering and host effects remain outside this module.

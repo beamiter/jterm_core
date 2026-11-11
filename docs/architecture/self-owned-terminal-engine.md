@@ -181,3 +181,33 @@ provenance are retained in its tests. Engine tests independently compare every
 u16 mode and mutation controls exercise real candidate source. Host lifecycle,
 clipboard authorization, graphics, RIS and mode effects stay with the adapter.
 The unchanged original reset/query fixtures remain part of the acceptance gates.
+
+## Ember dynamic-color ownership
+
+The next narrow Ember lane is `colors::ColorState`: theme RGB defaults,
+foreground/background/cursor overrides, and the full 256-entry dynamic palette
+have one live owner. It implements the existing OSC 4/104/10/11/12/110/111/112
+behavior, color parsing, palette fallback and effective-background classification.
+The host pushes `TerminalDefaultColors`, borrows owner overrides for rendering,
+and does not retain a second mutable terminal-color mirror. Host GUI theme
+objects and application-wide theme configuration remain host concerns.
+
+OSC 4 pairs execute in input order, including queries between mutations.
+Replies reuse `semantics::Effect::Reply` and are appended at the original
+dispatch point before subsequent parser events. BEL/ST is supplied for each
+OSC, not cached again inside the color owner. The existing host OSC terminator
+also serves non-color protocols and remains in the adapter.
+
+Mode 2031 remains owned by `ProtocolState`. A host theme update supplies the
+current subscription bit and emits a notice only when the effective background
+changes dark/light classification. OSC 11 sets and OSC 111 resets do not emit
+that notice, nor does merely enabling 2031. DSR 996 reads current classification.
+RIS clears dynamic overrides while preserving theme defaults without invoking
+theme-update notification; DECSTR and primary/alternate switching do not clear
+color state.
+
+This lane is Ember-only. Frost policy is not implicitly changed, and Forge and
+Anvil are not claimed migrated. Clipboard authorization, graphics, command
+metadata/lifecycle, non-color OSC behavior, renderer presentation and other host
+effects remain adapter-owned. Standalone unit tests supplement, not replace,
+Ember's immutable pre-extraction per-feed full-state golden and frontend tests.
