@@ -292,3 +292,21 @@ The core candidate passes 118 engine tests on Rust 1.86 and 1.89, including six
 title tests. Independent original-production capture and consumer migration are
 separate gates, not established by these unit tests. This is not a completed
 four-application migration.
+
+## Ember printable-ASCII step candidate
+
+`ScreenState::step_ascii_write` wraps the existing pending-wrap admission and
+single-row ASCII overwrite primitive. `AsciiWriteStep::NeedsWrap` consumes no
+input and requires the host to complete wrap, history/identity effects and
+active-output rebase before retrying. `Written` returns the original one-row
+batch; apply its mutation immediately before advancing input or calling again.
+`Stopped` retains the original no-progress case. Empty input does not clear the
+wrap latch; nonempty input clears it even with autowrap disabled.
+
+The host reads autowrap once per run. Eligibility is parser-produced printable
+bytes 0x20..=0x7e, ASCII active charset and non-insert mode, not arbitrary
+`is_ascii()` input. No Unicode width, charset translation, insert, REP dispatch,
+geometry, takeover cadence or history policy moves into this API. In particular,
+DECAWM-off writes at the last column remain individual one-byte row mutations.
+This is an Ember lane candidate; independent frozen production replay and
+consumer verification remain required before claiming integration parity.

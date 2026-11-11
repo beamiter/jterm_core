@@ -232,3 +232,23 @@ strict all-target Clippy and formatting checks. Original-production baseline
 sealing and the consumer adapter remain separate acceptance requirements;
 this core candidate alone does not establish Ember end-to-end parity or migrate
 Frost, Forge or Anvil.
+
+### Ember ASCII-run step candidate
+
+The engine's `AsciiWriteStep` exposes one live operation boundary, not an effect
+queue or another cursor owner. `step_ascii_write` checks empty input first, then
+uses the existing pending-wrap and ASCII row writer without modifying either
+primitive. The host completes each `NeedsWrap` through its existing vertical
+motion/history/rebase chain; after `Written` it applies the exact `RowMutation`
+before consuming more input. Autowrap is one run-level read of the protocol owner.
+
+No row batching is replaced by per-character output and no parser takeover
+observations are inserted between row steps. Only printable ASCII under ASCII
+charset without insert mode uses the seam. Unicode/combining, translated charset,
+insert and REP keep their original paths. Nonempty DECAWM-off admission still
+clears a pending latch; empty admission leaves it untouched. The original
+no-progress cursor behavior is retained, not silently clamped or generalized to
+zero-sized grids. Differential core tests compare the explicit original
+orchestration at every immediate host wrap/row checkpoint; they supplement, not
+replace, immutable original-production consumer evidence. Other terminals are
+not claimed migrated by this candidate.

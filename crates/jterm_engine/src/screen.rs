@@ -51,6 +51,20 @@ pub struct RowMutation {
     pub printed: Option<Range<usize>>,
 }
 
+/// One printable-ASCII overwrite step, never an accumulated effect batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AsciiWriteStep {
+    /// No bytes consumed. Complete host wrap/scroll/rebase before retrying.
+    NeedsWrap,
+    /// Apply this row mutation immediately, then advance by `consumed` bytes.
+    Written {
+        consumed: usize,
+        mutation: RowMutation,
+    },
+    /// Empty input or the original row writer's no-progress result.
+    Stopped,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionDirection {
     Up,
@@ -934,6 +948,28 @@ impl ScreenState {
             }
         }
         effect
+    }
+
+    /// One step of Ember's printable ASCII, ASCII-charset, non-insert lane.
+    /// The parser/host guarantees printable bytes (0x20..=0x7e), ASCII charset
+    /// and no insert mode. Unicode, charset translation and REP stay elsewhere.
+    /// Read autowrap once per run. On NeedsWrap, finish host vertical/history/
+    /// identity/provenance effects before calling again with the same input.
+    /// On Written, consume the mutation before advancing input or taking another
+    /// step. Never aggregate row effects or add per-row takeover observations.
+    /// Empty input leaves the latch alone; nonempty input clears it even when
+    /// autowrap is disabled. Cursor bounds/no-progress retain the row contract.
+    pub fn step_ascii_write(&mut self, bytes: &[u8], autowrap: bool) -> AsciiWriteStep {
+        if bytes.is_empty() {
+            return AsciiWriteStep::Stopped;
+        }
+        if self.take_pending_wrap(autowrap) {
+            return AsciiWriteStep::NeedsWrap;
+        }
+        match self.write_ascii_in_row(bytes, autowrap) {
+            Some((consumed, mutation)) => AsciiWriteStep::Written { consumed, mutation },
+            None => AsciiWriteStep::Stopped,
+        }
     }
 
     /// The bounded ASCII overwrite fast path. The host resolves wrap between chunks.
