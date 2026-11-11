@@ -272,26 +272,34 @@ This is an Ember-compatible lane, not a migration of all four applications.
 Clipboard authorization, graphics, command lifecycle, non-color OSC handling,
 parser admission, rendering and host effects remain outside this module.
 
-## Ember title-owner candidate
+## Profiled title ownership: Ember and Frost
 
-`titles::TitleState` owns the window title, icon title and bounded title stack.
-It accepts **already host-sanitized** text for OSC 0/1/2, caps it at 200 Unicode
-scalars, and provides XTWINOPS 20/21 reports and 22/23 save/restore. The stack
-retains 16 entries, evicting the oldest on overflow. Target 1 selects icon, 2
-window, all others both; restore consumes the top entry even when that entry
-contains no selected field. Replies are ordered `Effect::Reply` values with
-fixed ST framing and the original control/bidi report filter.
+`titles::TitleState` remains the source-compatible Ember owner, now a concrete
+alias of `ProfiledTitleState<200>`. `FrostTitleState` selects the 256-Unicode-scalar
+profile. Each frontend stores one owner for window title, icon title and stack;
+there is no host mirror. Existing Ember default construction, struct literals,
+public fields, methods and `TitleState` Debug representation remain compatible.
 
-This API does not replace Ember's `review_input`-based incoming trusted-chrome
-sanitizer. The host must sanitize before calling `set_osc` and immediately deliver
-reply effects at the existing dispatch position. Geometry operations and GUI
-presentation remain host-owned. Public fields preserve original observer/debug
-values; they do not make raw incoming strings safe to admit.
+Both profiles accept **already host-admitted** text through OSC 0/1/2 setters
+and share the same 16-entry stack: overflow evicts the oldest entry; target 1
+selects icon, 2 window, all others both; restore consumes the top entry even if
+no selected field was saved. Restoration does not re-sanitize or re-truncate.
+Only the 200-scalar Ember profile exposes `apply_window_op` and `reportable_title`:
+its XTWINOPS 20/21 use ordered `Effect::Reply`, fixed ST and the original
+control/bidi filter. Frost cannot accidentally invoke that outbound policy.
 
-The core candidate passes 118 engine tests on Rust 1.86 and 1.89, including six
-title tests. Independent original-production capture and consumer migration are
-separate gates, not established by these unit tests. This is not a completed
-four-application migration.
+Hosts retain admission, outbound filtering/formatting, reset decisions, parser
+framing, geometry and presentation. In particular Frost retains its rejection of
+U+FFFD after sanitizing/truncating to 256 scalars, its own outbound sanitizer and
+fixed-ST replies, and its existing RIS retention of titles and stack. Ember's
+incoming trusted-chrome sanitizer and reset behavior remain unchanged. Raw public
+fields are not permission to bypass either host's security policy.
+
+The profile candidate passes 126 runtime tests plus one compile-fail doc test on
+Rust 1.86 and 1.89. Unchanged Ember title golden and the 493-test terminal suite
+also pass against the candidate. Frost's independently sealed original-production
+baseline and candidate replay remain separate release gates. This shared title
+lane does not migrate Forge or Anvil, or complete the four-terminal engine.
 
 ## Ember printable-ASCII step candidate
 

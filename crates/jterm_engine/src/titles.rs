@@ -1,25 +1,49 @@
-//! Ember title ownership. Hosts sanitize incoming text before admitting it here;
+//! Profiled title ownership. Hosts sanitize incoming text before admitting it here;
 //! application chrome policy and window geometry are deliberately not engine state.
 use crate::semantics::{Effect, Effects};
 
 pub const MAX_WINDOW_TITLE_CHARS: usize = 200;
 pub const MAX_TITLE_STACK_DEPTH: usize = 16;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct TitleState {
+#[derive(Default, Clone, PartialEq, Eq)]
+/// Shared bounded title storage and stack operations; no host ingest policy.
+pub struct ProfiledTitleState<const LIMIT: usize> {
     pub window_title: String,
     pub icon_title: String,
     pub title_stack: Vec<(Option<String>, Option<String>)>,
 }
 
-impl TitleState {
+/// Source-compatible Ember owner, including its existing query filtering.
+pub type TitleState = ProfiledTitleState<MAX_WINDOW_TITLE_CHARS>;
+/// Frost's 256-scalar storage owner. Admission and outbound sanitization remain
+/// host-owned, as does the decision to retain this owner during RIS.
+/// Ember query formatting is deliberately unavailable on this profile.
+///
+/// ```compile_fail
+/// use jterm_engine::titles::FrostTitleState;
+/// let mut titles = FrostTitleState::default();
+/// titles.apply_window_op(&[21]);
+/// ```
+pub type FrostTitleState = ProfiledTitleState<256>;
+// Preserve the original Ember Debug representation used by full-state oracles.
+impl<const LIMIT: usize> std::fmt::Debug for ProfiledTitleState<LIMIT> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TitleState")
+            .field("window_title", &self.window_title)
+            .field("icon_title", &self.icon_title)
+            .field("title_stack", &self.title_stack)
+            .finish()
+    }
+}
+
+impl<const LIMIT: usize> ProfiledTitleState<LIMIT> {
     /// Accept host-sanitized OSC 0/1/2 text, bounded by Unicode scalar count.
     /// The host retains its trusted-chrome sanitization policy.
     pub fn set_osc(&mut self, command: &str, sanitized: &str) {
         if !matches!(command, "0" | "1" | "2") {
             return;
         }
-        let value: String = sanitized.chars().take(MAX_WINDOW_TITLE_CHARS).collect();
+        let value: String = sanitized.chars().take(LIMIT).collect();
         if command != "1" {
             self.window_title.clone_from(&value);
         }
@@ -59,7 +83,9 @@ impl TitleState {
             }
         }
     }
+}
 
+impl ProfiledTitleState<200> {
     /// Only title-related XTWINOPS are handled. Geometry remains host-owned.
     /// Reports always use ST, independent of the most recent OSC terminator.
     pub fn apply_window_op(&mut self, params: &[u16]) -> Effects {

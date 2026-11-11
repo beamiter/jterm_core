@@ -212,26 +212,34 @@ metadata/lifecycle, non-color OSC behavior, renderer presentation and other host
 effects remain adapter-owned. Standalone unit tests supplement, not replace,
 Ember's immutable pre-extraction per-feed full-state golden and frontend tests.
 
-### Ember title-owner candidate boundary
+### Profiled title-owner boundary
 
-`jterm_engine::titles::TitleState` is the sole candidate owner for Ember's
-`window_title`, `icon_title` and `title_stack`, preserving their string/optional
-pair values and Debug representation. OSC 0/1/2 setters accept host-sanitized
-text and retain the 200-scalar cap. XTWINOPS 22 saves up to 16 entries (oldest
-entry evicted); 23 always pops before selective restoration. Target 1 is icon,
-2 is window, every other target selects both. XTWINOPS 20/21 replies retain
-fixed ST and the original control/bidi filter via ordered `Effect::Reply`.
+`jterm_engine::titles::TitleState` is the concrete Ember alias of
+`ProfiledTitleState<200>`; `FrostTitleState` selects `<256>`. These aliases keep
+existing Ember inference, struct literals and methods intact. The shared owner
+preserves field names, optional stack pairs and the original `TitleState` Debug
+representation, without duplicate host storage.
 
-The host retains the `review_input` visual-spoofing sanitizer before admission,
-parser framing, effect delivery, title display and window geometry. Operations
-11/13/14/16/18/19 are intentionally not implemented by this owner. No reverse
-engine dependency on `jterm_core`, GUI or host security policy is introduced.
+OSC 0/1/2 setters cap host-admitted text by Unicode scalar count. Both profiles
+share the 16-entry oldest-eviction stack and unconditional pop before selective
+restore: target 1 icon, 2 window, all others both. Restored values are not
+re-filtered. Only the Ember profile exposes XTWINOPS query helpers, preserving
+ordered reply effects, fixed ST and its existing control/bidi filter. No default
+Ember query filter is available to the Frost profile.
 
-Rust 1.86 and 1.89 each pass 118 engine tests, including six title tests, with
-strict all-target Clippy and formatting checks. Original-production baseline
-sealing and the consumer adapter remain separate acceptance requirements;
-this core candidate alone does not establish Ember end-to-end parity or migrate
-Frost, Forge or Anvil.
+The host still owns admission, outbound policy, reset lifecycle, parser framing,
+effect delivery, title display and geometry. Frost rejects U+FFFD after its own
+256-scalar sanitization, applies its own outbound sanitizer, and retains titles
+and stack on RIS. Ember's existing admission/reset policy is unchanged. Geometry
+operations 11/13/14/16/18/19 are not owner methods. No GUI, `jterm_core` or host
+security-policy dependency is added to the engine.
+
+Rust 1.86 and 1.89 each pass 126 runtime tests and one compile-fail doc test;
+formatting and strict Clippy pass. The unchanged Ember title golden and all 493
+terminal tests pass with this profile candidate. Frost must separately seal its
+original production observations and replay them against the consumer candidate
+before publication. Forge and Anvil are not title-owner consumers in this slice;
+shared titles do not establish complete four-application runtime migration.
 
 ### Ember ASCII-run step candidate
 
