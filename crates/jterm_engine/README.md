@@ -318,3 +318,42 @@ geometry, takeover cadence or history policy moves into this API. In particular,
 DECAWM-off writes at the last column remain individual one-byte row mutations.
 This is an Ember lane candidate; independent frozen production replay and
 consumer verification remain required before claiming integration parity.
+
+## Opt-in strict parser resource policy
+
+`Parser::with_bounded_profile(limits, profile)` is the security-oriented entry
+point. Unlike the legacy constructors, its string payload limit applies equally
+to complete and split OSC, DCS, APC, SOS and PM. Oversized strings are discarded
+through their terminator or explicit CAN/SUB cancellation, not released back into
+printable text or executable escape sequences. A fixed `Boundary` event and
+saturating rejection counter report rejection without reflecting payload bytes.
+ESC intermediates are independently bounded to at most eight bytes.
+
+This is an explicit opt-in semantic change. `Parser::new` and `with_profile` keep
+historical Ember/Frost framing behavior for existing frozen compatibility callers;
+merely upgrading the dependency does **not** enable hardening in those callers.
+Hosts must choose the bounded constructor and validate their adapters before
+claiming protection. Oversize Kitty APC no longer generates a payload-derived
+legacy recovery response in bounded mode.
+
+The parser exposes one event at a time and owns no event queue. Hosts must still
+bound PTY/read chunk size, dispatched events per scheduling turn, reply queues and
+any retained event copies. An ASCII event can borrow the supplied input slice;
+`next` is not a CPU scheduling budget. For example, a host can use 64 KiB reads and
+stop after a fixed number of events, retaining the unconsumed slice for the next
+turn rather than dropping bytes. `consumed == 0` pending events still count toward
+that scheduling quota. Diagnostic snapshots allocate copies and are not a runtime
+history store. This parser policy does not bound images, titles, scrollback or
+other application-owned resources.
+
+The configured cap is a payload-length/retained-content bound, not an exact heap
+allocation-byte guarantee: `Vec` capacity growth and an optional pending ESC add
+bounded overhead. CSI keeps its existing fixed parameter/intermediate bounds and
+legacy truncation semantics; this change is not a claim that every VT command or
+host side effect is validated. Bounded discard retains the existing
+`PendingKind::String(kind)` or `Escape` category without adding public enum variants; `rejected_count()` identifies resource
+rejection. Legacy `DiscardApc` remains specific to the historical APC path.
+
+Bounded-mode termination/cancellation emits a boundary before following public
+text so rejected private payload never becomes a Frost capture token. This is
+part of the new contract; legacy capture oracle behavior is unchanged.

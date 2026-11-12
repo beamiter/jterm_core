@@ -176,6 +176,11 @@ pub struct Step<'a> {
 #[derive(Debug)]
 enum State {
     Ground,
+    DiscardString {
+        kind: StringKind,
+        previous_escape: bool,
+    },
+    DiscardEscape,
     Escape(Vec<u8>),
     Charset(u8),
     Csi {
@@ -204,6 +209,8 @@ pub struct Parser {
     string_carried: bool,
     capture: Option<OpenCapture>,
     ascii_batching: bool,
+    bounded: bool,
+    rejected: u64,
 }
 
 /// Allocating diagnostic view for compatibility tests, never a second parser owner.
@@ -240,7 +247,35 @@ impl Parser {
             string_carried: false,
             capture: None,
             ascii_batching: true,
+            bounded: false,
+            rejected: 0,
         }
+    }
+    /// Opt-in hard bounds, independent of legacy feed-partition behavior.
+    /// `pending_bytes` bounds string payload (1..=16 MiB). ESC intermediates
+    /// have a separate cap of min(pending_bytes, 8). Rejections emit Boundary,
+    /// not Kitty recovery replies. Discard ignores embedded ESC controls until
+    /// ST, OSC BEL, CAN or SUB.
+    /// A pending ST prefix may retain one additional ESC byte. CSI retains its
+    /// existing fixed caps. No event queue is allocated by this parser.
+    pub fn with_bounded_profile(
+        limits: ParserLimits,
+        profile: ParserProfile,
+    ) -> Result<Self, &'static str> {
+        const MAX: usize = 16 * 1024 * 1024;
+        if limits.pending_bytes == 0
+            || limits.pending_bytes > MAX
+            || limits.kitty_recovery_bytes > MAX
+        {
+            return Err("bounded parser limits must be within 1..=16 MiB (recovery may be zero)");
+        }
+        let mut parser = Self::with_profile(limits, profile);
+        parser.bounded = true;
+        Ok(parser)
+    }
+    /// Lifetime count of resource rejections. Reset clears parser state, not this counter.
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected
     }
     fn frost(&self) -> bool {
         self.profile == ParserProfile::FrostLegacyV1
@@ -266,6 +301,8 @@ impl Parser {
             State::Csi { .. } => PendingKind::Csi,
             State::String { kind, .. } => PendingKind::String(kind),
             State::DiscardApc { .. } => PendingKind::DiscardApc,
+            State::DiscardString { kind, .. } => PendingKind::String(kind),
+            State::DiscardEscape => PendingKind::Escape,
         }
     }
     fn open_capture(&mut self, state: &State, at: usize) -> bool {
@@ -295,7 +332,10 @@ impl Parser {
                 prefix.extend(intermediates);
             }
             State::Charset(bank) => prefix.extend([0x1b, *bank]),
-            State::String { .. } | State::DiscardApc { .. } => private = true,
+            State::String { .. }
+            | State::DiscardApc { .. }
+            | State::DiscardString { .. }
+            | State::DiscardEscape => private = true,
             State::Ground => {}
         }
         self.capture = Some(OpenCapture {
@@ -361,6 +401,7 @@ impl Parser {
                 target.extend([0x1b, intro]);
                 target.extend(data);
             }
+            State::DiscardString { .. } | State::DiscardEscape => {}
             State::DiscardApc { previous_escape } => {
                 result.discarding_oversized_apc = true;
                 result.discarding_apc_prev_escape = *previous_escape;
@@ -382,7 +423,13 @@ impl Parser {
     }
     /// Matches Ember's watcher predicate, deliberately excluding UTF-8 and discard.
     pub fn legacy_pending_control(&self) -> bool {
-        !matches!(self.state, State::Ground | State::DiscardApc { .. })
+        !matches!(
+            self.state,
+            State::Ground
+                | State::DiscardApc { .. }
+                | State::DiscardString { .. }
+                | State::DiscardEscape
+        )
     }
     /// Bytes retained as scanner carry, excluding returned events/capture spans.
     /// Frost's legacy OSC/DCS policy can retain an over-limit crossing feed.
@@ -421,7 +468,8 @@ impl Parser {
         let mut started = false;
         let feed_start = std::mem::take(&mut self.feed_start);
         // Frost only drops an over-limit nF prefix at the following feed.
-        if self.frost()
+        if !self.bounded
+            && self.frost()
             && feed_start
             && matches!(&self.state, State::Escape(v) if v.len() + 1 > self.limits.pending_bytes)
         {
@@ -463,6 +511,94 @@ impl Parser {
                 started |= self.open_capture(&state, at);
             }
             match state {
+                State::DiscardString {
+                    kind,
+                    mut previous_escape,
+                } => {
+                    let mut ended = false;
+                    while let Some(&byte) = input.get(at) {
+                        at += 1;
+                        if (previous_escape && byte == b'\\')
+                            || (kind == StringKind::Osc && byte == 7)
+                            || matches!(byte, 0x18 | 0x1a)
+                        {
+                            ended = true;
+                            break;
+                        }
+                        previous_escape = byte == 0x1b;
+                    }
+                    if !ended {
+                        self.state = State::DiscardString {
+                            kind,
+                            previous_escape,
+                        };
+                        abandon!(None);
+                    }
+                    abandon!(Some(Event::Boundary));
+                }
+                State::DiscardEscape => {
+                    let mut ended = false;
+                    while let Some(&byte) = input.get(at) {
+                        at += 1;
+                        if matches!(byte, 0x30..=0x7e | 0x18 | 0x1a) {
+                            ended = true;
+                            break;
+                        }
+                    }
+                    if !ended {
+                        self.state = State::DiscardEscape;
+                        abandon!(None);
+                    }
+                    abandon!(Some(Event::Boundary));
+                }
+                State::String { kind, mut data } if self.bounded => {
+                    let Some(&byte) = input.get(at) else {
+                        self.state = State::String { kind, data };
+                        abandon!(None);
+                    };
+                    let previous_escape = data.last() == Some(&0x1b);
+                    if previous_escape && byte == b'\\' {
+                        data.pop();
+                        at += 1;
+                        if matches!(kind, StringKind::Sos | StringKind::Pm) {
+                            abandon!(Some(Event::Boundary));
+                        }
+                        emit!(Event::String {
+                            kind,
+                            payload: Cow::Owned(data),
+                            bel_terminated: false
+                        });
+                    }
+                    if matches!(byte, 0x18 | 0x1a) {
+                        at += 1;
+                        abandon!(Some(Event::Boundary));
+                    }
+                    if previous_escape {
+                        // Before overflow, preserve normal fresh-ESC restart.
+                        self.state = State::Escape(Vec::new());
+                        abandon!(Some(Event::Boundary));
+                    }
+                    if kind == StringKind::Osc && byte == 7 {
+                        at += 1;
+                        emit!(Event::String {
+                            kind,
+                            payload: Cow::Owned(data),
+                            bel_terminated: true
+                        });
+                    }
+                    if byte != 0x1b && data.len() >= self.limits.pending_bytes {
+                        at += 1;
+                        self.rejected = self.rejected.saturating_add(1);
+                        self.state = State::DiscardString {
+                            kind,
+                            previous_escape: false,
+                        };
+                        abandon!(Some(Event::Boundary));
+                    }
+                    data.push(byte);
+                    at += 1;
+                    self.state = State::String { kind, data };
+                }
                 State::String { kind, mut data } => {
                     let remaining = &input[at..];
                     let previous_escape = data.last() == Some(&0x1b);
@@ -778,9 +914,18 @@ impl Parser {
                     }
                     match byte {
                         0x20..=0x2f => {
+                            if self.bounded
+                                && intermediates.len() >= self.limits.pending_bytes.min(8)
+                            {
+                                at += 1;
+                                self.rejected = self.rejected.saturating_add(1);
+                                self.state = State::DiscardEscape;
+                                abandon!(Some(Event::Boundary));
+                            }
                             intermediates.push(byte);
                             at += 1;
-                            if !self.frost()
+                            if !self.bounded
+                                && !self.frost()
                                 && intermediates.len() + 1 > self.limits.pending_bytes
                                 && at == input.len()
                             {
