@@ -552,6 +552,35 @@ impl Parser {
                     abandon!(Some(Event::Boundary));
                 }
                 State::String { kind, mut data } if self.bounded => {
+                    // Borrow a complete fresh payload only after scanning its
+                    // first framing-sensitive byte inside the exact payload
+                    // bound. Cancellation, fresh ESC, split ST and overflow
+                    // still use the scalar state machine below unchanged.
+                    // This avoids per-byte state moves/allocations for common
+                    // short OSC titles without accepting any unchecked tail.
+                    if data.is_empty() {
+                        let remaining = &input[at..];
+                        let scan_len = remaining.len().min(self.limits.pending_bytes + 1);
+                        if let Some(end) = remaining[..scan_len].iter().position(|&byte| {
+                            matches!(byte, 0x1b | 0x18 | 0x1a)
+                                || (kind == StringKind::Osc && byte == 7)
+                        }) {
+                            let bel = kind == StringKind::Osc && remaining[end] == 7;
+                            let st =
+                                remaining[end] == 0x1b && remaining.get(end + 1) == Some(&b'\\');
+                            if bel || st {
+                                at += end + if bel { 1 } else { 2 };
+                                if matches!(kind, StringKind::Sos | StringKind::Pm) {
+                                    abandon!(Some(Event::Boundary));
+                                }
+                                emit!(Event::String {
+                                    kind,
+                                    payload: Cow::Borrowed(&remaining[..end]),
+                                    bel_terminated: bel
+                                });
+                            }
+                        }
+                    }
                     let Some(&byte) = input.get(at) else {
                         self.state = State::String { kind, data };
                         abandon!(None);

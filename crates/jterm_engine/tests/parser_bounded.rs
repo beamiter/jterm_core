@@ -311,3 +311,41 @@ fn bel_does_not_terminate_non_osc_discard() {
         }
     }
 }
+
+#[test]
+fn fresh_borrow_fast_path_respects_exact_payload_and_first_special_byte() {
+    use std::borrow::Cow;
+    for profile in [ParserProfile::EmberV1, ParserProfile::FrostLegacyV1] {
+        for (intro, terminator) in [
+            (b']', b"\x07".as_slice()),
+            (b']', b"\x1b\\"),
+            (b'P', b"\x1b\\"),
+            (b'_', b"\x1b\\"),
+        ] {
+            for len in [0, 1, 127, 128] {
+                let mut p = parser(profile, 128);
+                let mut input = vec![27, intro];
+                input.extend(vec![b'a'; len]);
+                input.extend(terminator);
+                p.begin_feed();
+                let step = p.next(&input);
+                assert_eq!(step.consumed, input.len());
+                assert!(
+                    matches!(step.event, Some(Event::String { payload: Cow::Borrowed(bytes), .. }) if bytes.len() == len)
+                );
+                assert_eq!(p.rejected_count(), 0);
+            }
+        }
+        // A later terminator cannot override an earlier cancel or fresh ESC.
+        for input in [
+            b"\x1b]title\x18ignored\x07Z".as_slice(),
+            b"\x1b]title\x1b[31mX\x07Z",
+            b"\x1bPpayload\x1aignored\x1b\\Z",
+        ] {
+            let expected = trace(profile, input, 0);
+            for cut in 0..=input.len() {
+                assert_eq!(trace(profile, input, cut), expected, "cut={cut}");
+            }
+        }
+    }
+}
