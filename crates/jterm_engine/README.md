@@ -357,3 +357,12 @@ rejection. Legacy `DiscardApc` remains specific to the historical APC path.
 Bounded-mode termination/cancellation emits a boundary before following public
 text so rejected private payload never becomes a Frost capture token. This is
 part of the new contract; legacy capture oracle behavior is unchanged.
+
+For bounded APC cancellation (CAN/SUB or a fresh ESC restart) and overflow,
+`Step::abandoned_apc` is true on the abandoning boundary only. Hosts **must**
+consume this payload-free signal to silently clear unfinished graphics assembly
+and pending transfer identity/placements, while preserving completed images.
+No error response should be reconstructed from rejected bytes. Ordinary
+boundaries, valid APC completion and the remaining discarded tail leave this
+flag false. A resource rejection counter alone is insufficient: cancellation
+does not increment it. Legacy parser behavior and `RejectApc` remain unchanged.

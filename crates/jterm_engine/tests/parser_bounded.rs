@@ -349,3 +349,62 @@ fn fresh_borrow_fast_path_respects_exact_payload_and_first_special_byte() {
         }
     }
 }
+
+fn abort_steps(p: &mut Parser, input: &[u8]) -> usize {
+    p.begin_feed();
+    let mut at = 0;
+    let mut aborts = 0;
+    loop {
+        let step = p.next(&input[at..]);
+        at += step.consumed;
+        if step.abandoned_apc {
+            aborts += 1;
+            assert!(matches!(step.event, Some(Event::Boundary)));
+        }
+        if step.event.is_none() {
+            assert_eq!(at, input.len());
+            return aborts;
+        }
+    }
+}
+
+#[test]
+fn bounded_apc_abort_is_payload_free_exactly_once_at_every_cut() {
+    for profile in [ParserProfile::EmberV1, ParserProfile::FrostLegacyV1] {
+        for input in [
+            b"\x1b_Gm=0;data\x18Z".to_vec(),
+            b"\x1b_Gm=0;data\x1aZ".to_vec(),
+            b"\x1b_Gm=0;data\x1b[31mZ".to_vec(),
+            [b"\x1b_".as_slice(), &[b'x'; 129], b"\x1b\\Z"].concat(),
+        ] {
+            for cut in 0..=input.len() {
+                let mut p = parser(profile, 128);
+                let count = abort_steps(&mut p, &input[..cut]) + abort_steps(&mut p, &input[cut..]);
+                assert_eq!(count, 1, "cut={cut} input={input:?}");
+                assert_eq!(abort_steps(&mut p, b"Z"), 0);
+            }
+        }
+        for intro in *b"]PX^" {
+            for ending in [b"\x18".as_slice(), b"\x1a", b"\x1b[31m", b"\x1b\\"] {
+                let mut input = vec![27, intro];
+                input.extend(vec![b'x'; 129]);
+                input.extend(ending);
+                for cut in 0..=input.len() {
+                    let mut p = parser(profile, 128);
+                    assert_eq!(
+                        abort_steps(&mut p, &input[..cut]) + abort_steps(&mut p, &input[cut..]),
+                        0
+                    );
+                }
+            }
+        }
+        let normal = b"\x1b_Gm=1;data\x1b\\";
+        for cut in 0..=normal.len() {
+            let mut p = parser(profile, 128);
+            assert_eq!(
+                abort_steps(&mut p, &normal[..cut]) + abort_steps(&mut p, &normal[cut..]),
+                0
+            );
+        }
+    }
+}

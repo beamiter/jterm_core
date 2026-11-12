@@ -171,6 +171,10 @@ pub struct Step<'a> {
     pub consumed: usize,
     pub event: Option<Event<'a>>,
     pub capture: Option<CaptureStep>,
+    /// The bounded scanner abandoned an APC. Hosts must silently discard
+    /// in-flight graphics assembly, without reflecting rejected input or
+    /// removing already-completed images. False for ordinary boundaries.
+    pub abandoned_apc: bool,
 }
 
 #[derive(Debug)]
@@ -466,6 +470,7 @@ impl Parser {
     pub fn next<'a>(&mut self, input: &'a [u8]) -> Step<'a> {
         let mut at = 0;
         let mut started = false;
+        let mut abandoned_apc = false;
         let feed_start = std::mem::take(&mut self.feed_start);
         // Frost only drops an over-limit nF prefix at the following feed.
         if !self.bounded
@@ -483,6 +488,7 @@ impl Parser {
                     consumed: at,
                     event: $event,
                     capture,
+                    abandoned_apc,
                 };
             }};
         }
@@ -599,10 +605,12 @@ impl Parser {
                         });
                     }
                     if matches!(byte, 0x18 | 0x1a) {
+                        abandoned_apc = kind == StringKind::Apc;
                         at += 1;
                         abandon!(Some(Event::Boundary));
                     }
                     if previous_escape {
+                        abandoned_apc = kind == StringKind::Apc;
                         // Before overflow, preserve normal fresh-ESC restart.
                         self.state = State::Escape(Vec::new());
                         abandon!(Some(Event::Boundary));
@@ -616,6 +624,7 @@ impl Parser {
                         });
                     }
                     if byte != 0x1b && data.len() >= self.limits.pending_bytes {
+                        abandoned_apc = kind == StringKind::Apc;
                         at += 1;
                         self.rejected = self.rejected.saturating_add(1);
                         self.state = State::DiscardString {
