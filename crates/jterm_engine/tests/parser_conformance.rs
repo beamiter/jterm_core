@@ -346,3 +346,98 @@ fn local_policy_discard_prevents_embedded_commands() {
         }
     }
 }
+
+// RFC 3629 section 3 / Unicode scalar boundaries, not a host-renderer oracle.
+#[test]
+fn unicode_scalar_encoding_boundaries_are_preserved() {
+    check(
+        b"~\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf\xf0\x90\x80\x80\xf4\x8f\xbf\xbf",
+        vec![
+            Token::Print('~'), Token::Print('\u{80}'), Token::Print('\u{7ff}'),
+            Token::Print('\u{800}'), Token::Print('\u{d7ff}'), Token::Print('\u{e000}'),
+            Token::Print('\u{ffff}'), Token::Print('\u{10000}'), Token::Print('\u{10ffff}'),
+        ],
+        128, 0, 0,
+    );
+}
+
+#[test]
+fn unicode_cluster_components_are_not_normalized_or_dropped() {
+    // Combining accent, VS16, ZWJ emoji and regional indicators remain scalars.
+    // This does NOT assert grapheme segmentation, cell width or presentation.
+    check(
+        b"e\xcc\x81\xe2\x9d\xa4\xef\xb8\x8f\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb\xf0\x9f\x87\xa8\xf0\x9f\x87\xb3",
+        vec![
+            Token::Print('e'), Token::Print('\u{301}'), Token::Print('\u{2764}'),
+            Token::Print('\u{fe0f}'), Token::Print('\u{1f469}'), Token::Print('\u{200d}'),
+            Token::Print('\u{1f4bb}'), Token::Print('\u{1f1e8}'), Token::Print('\u{1f1f3}'),
+        ],
+        128, 0, 0,
+    );
+}
+
+#[test]
+fn tui_lifecycle_unicode_and_query_survive_every_two_cut_partition() {
+    // Hand-authored TUI syntax: alternate screen, hide cursor, CUP, Unicode text,
+    // SGR, CPR query, restore cursor and primary screen. Not a captured Vim trace.
+    let bytes = b"\x1b[?1049h\x1b[?25l\x1b[2;3H\xe7\x95\x8ce\xcc\x81\x1b[31mX\x1b[0m\x1b[6n\x1b[?25h\x1b[?1049l";
+    let expected = Trace {
+        tokens: vec![
+            csi(b"1049", &[1049], Some(b'?'), b"", b'h'),
+            csi(b"25", &[25], Some(b'?'), b"", b'l'),
+            csi(b"2;3", &[2, 3], None, b"", b'H'),
+            Token::Print('\u{754c}'),
+            Token::Print('e'),
+            Token::Print('\u{301}'),
+            csi(b"31", &[31], None, b"", b'm'),
+            Token::Print('X'),
+            csi(b"0", &[0], None, b"", b'm'),
+            csi(b"6", &[6], None, b"", b'n'),
+            csi(b"25", &[25], Some(b'?'), b"", b'h'),
+            csi(b"1049", &[1049], Some(b'?'), b"", b'l'),
+        ],
+        rejected: 0,
+        abandoned_apc: 0,
+    };
+    for profile in [ParserProfile::EmberV1, ParserProfile::FrostLegacyV1] {
+        check_profile(profile, bytes, &expected, 128);
+        for first in 0..=bytes.len() {
+            for second in first..=bytes.len() {
+                assert_eq!(
+                    run(profile, bytes, &[first, second], 128),
+                    expected,
+                    "{profile:?} two-cut partition {first}, {second}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn utf8_encoded_c1_scalars_do_not_reenter_control_parser() {
+    // XTerm Control Bytes: C1 obtained by UTF-8 decoding is not reprocessed.
+    // These are encoded Unicode scalars, not the single-byte C1 control form.
+    check(
+        b"\xc2\x9b31mX\xc2\x9d2;title\xc2\x9cZ",
+        vec![
+            Token::Print('\u{9b}'),
+            Token::Print('3'),
+            Token::Print('1'),
+            Token::Print('m'),
+            Token::Print('X'),
+            Token::Print('\u{9d}'),
+            Token::Print('2'),
+            Token::Print(';'),
+            Token::Print('t'),
+            Token::Print('i'),
+            Token::Print('t'),
+            Token::Print('l'),
+            Token::Print('e'),
+            Token::Print('\u{9c}'),
+            Token::Print('Z'),
+        ],
+        128,
+        0,
+        0,
+    );
+}

@@ -73,3 +73,28 @@ invalid UTF-8 replacement policy, arbitrary parameter saturation, semantic
 screen state, grapheme rendering, terminal replies or application interoperability.
 The existing real Vim workbench tests and the separate Tauri PTY Vim smoke remain
 complementary integration evidence, not the source of these expected tokens.
+
+## Unicode and TUI framing extension
+
+RFC 3629 section 3/4 (https://www.rfc-editor.org/rfc/rfc3629.txt) supplies
+independent UTF-8 byte/range expectations. Explicit byte literals are paired with
+handwritten scalar literals at U+0080, U+07FF/U+0800, U+D7FF/U+E000,
+U+FFFF/U+10000 and U+10FFFF. U+FFFF is a noncharacter but has a well-formed UTF-8
+encoding; this framing test does not promise a displayed glyph. Surrogates and
+malformed sequences remain outside this valid-input slice.
+
+Combining accents, variation selector 16, ZWJ emoji components and regional
+indicators must survive as their original ordered scalars, without normalization,
+composition or deletion. This asserts neither UAX #29 grapheme clustering nor
+terminal cell widths or font rendering. XTerm's Control Bytes discussion says
+UTF-8-decoded C1 values must not be processed a second time: encoded U+009B,
+U+009D and U+009C therefore remain scalar tokens next to CSI/OSC-looking text.
+This is distinct from raw eight-bit C1 control support, still excluded above.
+
+A hand-authored TUI-like lifecycle uses DEC private modes 1049/25, CUP, Chinese
+and combining text, SGR, CPR query, then cursor/primary-screen restoration syntax.
+For both profiles it compares **every pair of ordered feed cuts**, as well as
+single cuts and bytewise/empty feeds, directly with the handwritten tokens. No
+whole-feed run supplies expected data. This tests syntax across mode-like and
+UTF-8 boundaries, not actual alternate-screen mutation, replies, rendering or
+real Vim execution. Existing real Vim CI remains separate integration evidence.
