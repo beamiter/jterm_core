@@ -39,6 +39,8 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path crates/jterm_engine/Cargo.toml --locked --no-deps
           python3 crates/jterm_engine/scripts/check_boundary.py --engine-only
           python3 scripts/test-family-engine.py
+      - name: Terminal performance probe transport tests (not host measurements)
+        run: python3 -m unittest discover -s scripts/terminal-performance -p 'test_terminal_baseline.py' -v
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo doc --locked --no-deps
