@@ -460,8 +460,8 @@ impl ScreenState {
         if cols != self.tab_stops.len() {
             let old_len = self.tab_stops.len();
             self.tab_stops.resize(cols, false);
-            for col in old_len..cols {
-                self.tab_stops[col] = col % 8 == 0;
+            for (col, stop) in self.tab_stops.iter_mut().enumerate().skip(old_len) {
+                *stop = col % 8 == 0;
             }
         }
         if let Some(saved) = self.saved_state.as_mut() {

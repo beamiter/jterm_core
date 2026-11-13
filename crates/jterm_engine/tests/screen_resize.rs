@@ -144,8 +144,10 @@ fn original_resize(
     if cols != s.tab_stops.len() {
         let old_len = s.tab_stops.len();
         s.tab_stops.resize(cols, false);
-        for c in old_len..cols {
+        let mut c = old_len;
+        while c < cols {
             s.tab_stops[c] = c % 8 == 0;
+            c += 1;
         }
     }
     if let Some(saved) = s.saved_state.as_mut() {

@@ -143,10 +143,8 @@ impl Emulator {
         self.bottom = rows - 1;
         let old_cols = self.tabstops.len();
         self.tabstops.resize(cols, false);
-        for col in old_cols..cols {
-            if col % 8 == 0 {
-                self.tabstops[col] = true;
-            }
+        for (col, stop) in self.tabstops.iter_mut().enumerate().skip(old_cols) {
+            *stop = col % 8 == 0;
         }
     }
 
