@@ -48,6 +48,70 @@ def rss_kib(pid, identity):
     return int(match[1])
 
 
+def proc_record(pid, proc=Path('/proc')):
+    """Read identity and parent from stat; comm can contain spaces or ')'."""
+    fields = (proc / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+    return (int(fields[1]), fields[19])  # PPID, starttime
+
+
+def process_tree_rss(pid, identity, proc=Path('/proc'), exclude_pid=None):
+    """Conservative sampled descendant RSS, not atomic physical memory or peak.
+
+    Membership and identities must agree before/after the RSS reads. Fail on
+    observable churn rather than returning a successful partial measurement.
+    Ephemeral children entirely between scans cannot be observed.
+    """
+    exclude_pid = os.getpid() if exclude_pid is None else exclude_pid
+    if pid == exclude_pid:
+        raise RuntimeError('process-tree host must not be the measurement process')
+
+    def members():
+        records = {}
+        for path in proc.iterdir():
+            if not path.name.isdecimal():
+                continue
+            if len(records) >= 65536:
+                raise RuntimeError('process census exceeds safety limit')
+            try:
+                records[int(path.name)] = proc_record(int(path.name), proc)
+            except FileNotFoundError:
+                continue  # disappearing unselected processes are not members
+        if pid not in records or records[pid][1] != identity['start_ticks']:
+            raise RuntimeError('host exited or PID was reused')
+        children = {}
+        for child, (parent, _) in records.items():
+            children.setdefault(parent, []).append(child)
+        selected = {}
+        pending = [pid]
+        while pending:
+            child = pending.pop()
+            if child == exclude_pid or child in selected:
+                continue  # exclude this measuring process and its subtree only
+            selected[child] = records[child]
+            if len(selected) > 4096:
+                raise RuntimeError('host process tree exceeds safety limit')
+            pending.extend(children.get(child, ()))
+        return selected
+
+    before = members()
+    samples = []
+    for child, expected in sorted(before.items()):
+        if proc_record(child, proc) != expected:
+            raise RuntimeError('process tree changed before RSS read')
+        status = (proc / str(child) / 'status').read_text()
+        match = re.search(r'^VmRSS:\s+(\d+) kB$', status, re.M)
+        if not match:
+            raise RuntimeError('process tree RSS unavailable; no fabricated zero')
+        if proc_record(child, proc) != expected:
+            raise RuntimeError('process tree changed during RSS read')
+        samples.append(dict(pid=child, parent_pid=expected[0],
+                            start_ticks=expected[1], rss_kib=int(match[1])))
+    if members() != before:
+        raise RuntimeError('process tree membership changed during RSS census')
+    return dict(total_rss_kib=sum(p['rss_kib'] for p in samples),
+                processes=samples)
+
+
 def exchange(fd, payload, timeout):
     """Bound all writes and reads by one deadline; reject extraneous input."""
     end = time.monotonic() + timeout
@@ -81,7 +145,9 @@ def exchange(fd, payload, timeout):
         raise RuntimeError('extra input after DSR reply')
 
 
-def measure(fd, pid, samples, timeout):
+def measure(fd, pid, samples, timeout, rss_scope='single-process'):
+    if rss_scope not in ('single-process', 'process-tree'):
+        raise ValueError('invalid RSS scope')
     identity = process_identity(pid)
     size = os.get_terminal_size(fd)
     old = termios.tcgetattr(fd)
@@ -96,22 +162,26 @@ def measure(fd, pid, samples, timeout):
         for i in range(samples):
             if os.get_terminal_size(fd) != size:
                 raise RuntimeError('terminal resized during measurement')
-            before = rss_kib(pid, identity)
+            tree_before = process_tree_rss(pid, identity) if rss_scope == 'process-tree' else None
+            before = tree_before['total_rss_kib'] if tree_before else rss_kib(pid, identity)
             started = time.perf_counter_ns()
             exchange(fd, WORKLOAD, timeout)
             elapsed = time.perf_counter_ns() - started
             if os.get_terminal_size(fd) != size:
                 raise RuntimeError('terminal resized during measurement')
-            after = rss_kib(pid, identity)
+            tree_after = process_tree_rss(pid, identity) if rss_scope == 'process-tree' else None
+            after = tree_after['total_rss_kib'] if tree_after else rss_kib(pid, identity)
             raw.append(dict(sample=i, bytes=len(WORKLOAD), elapsed_ns=elapsed,
                             rss_before_kib=before, rss_after_kib=after))
+            if tree_before:
+                raw[-1].update(tree_before=tree_before, tree_after=tree_after)
         if process_identity(pid) != identity:
             raise RuntimeError('host executable identity changed')
     finally:
         termios.tcsetattr(fd, termios.TCSANOW, old)
         os.set_blocking(fd, blocking)
     latencies = [s['elapsed_ns'] / 1e6 for s in raw]
-    return dict(host=identity, columns=size.columns, rows=size.lines,
+    return dict(host=identity, rss_scope=rss_scope, columns=size.columns, rows=size.lines,
                 workload_sha256=hashlib.sha256(WORKLOAD).hexdigest(), samples=raw,
                 barrier_p95_ms=percentile95(latencies),
                 barrier_median_ms=statistics.median(latencies),
@@ -125,6 +195,8 @@ def main():
     parser.add_argument('--host', required=True, choices=['ember', 'frost', 'forge', 'anvil'])
     parser.add_argument('--revision', required=True)
     parser.add_argument('--host-pid', required=True, type=int)
+    parser.add_argument('--rss-scope', choices=['single-process', 'process-tree'],
+                        default='single-process')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--samples', type=int, default=100)
     parser.add_argument('--timeout', type=float, default=10)
@@ -135,16 +207,17 @@ def main():
         parser.error('samples must be 20..10000; timeout must be (0,120]')
     # Never clobber an earlier report, even on a failed attempt.
     with args.output.open('x') as output:
-        report = dict(schema=1, host_label=args.host, declared_revision=args.revision,
+        report = dict(schema=2, host_label=args.host, declared_revision=args.revision,
                       utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                       kernel=platform.release(), machine=platform.machine(),
                       boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                       load_before=list(os.getloadavg()), python=platform.python_version(),
                       script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                      scope='PTY/parser DSR barrier; no pixel or keyboard latency; single host PID sampled RSS')
+                      scope='PTY/parser DSR barrier; no pixel or keyboard latency; sampled RSS',
+                      rss_scope=args.rss_scope)
         try:
             with open('/dev/tty', 'rb+', buffering=0) as terminal:
-                report.update(measure(terminal.fileno(), args.host_pid, args.samples, args.timeout))
+                report.update(measure(terminal.fileno(), args.host_pid, args.samples, args.timeout, args.rss_scope))
             report['status'] = 'ok'
         except (Exception, KeyboardInterrupt) as error:
             report.update(status='failed', error=f'{type(error).__name__}: {error}')

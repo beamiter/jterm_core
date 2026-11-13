@@ -20,9 +20,9 @@ settings, CPU model/governor, system RAM and display/compositor versions with th
 results. Use the exact executable built from the declared full commit, verify that
 build separately, and pass its actual process PID (not the shell or probe PID).
 The executable digest and PID start time are recorded; the declared revision is
-operator metadata, **not automatically proven source provenance**. For multiprocess
-hosts this first slice excludes renderer/helper RSS; supply a complete process-tree
-accountant before comparing total memory.
+operator metadata, **not automatically proven source provenance**. The default `--rss-scope single-process` excludes renderer/helper RSS.
+Use `--rss-scope process-tree` for the explicitly limited descendant accounting
+below; neither mode measures total physical memory or a high-water mark.
 
 Within that terminal, run (replace all example values):
 
@@ -66,12 +66,43 @@ latency, same-machine real Vim workloads, process-tree high-water memory, resize
 reflow workloads and sustained natural flood response. Do not replace these with
 controlled-stall correctness tests or this DSR proxy.
 
+## Optional descendant RSS census (schema 2)
+
+Pass `--rss-scope process-tree` to sample the host and its current descendants
+before/after each DSR batch. The default remains `single-process`. Each successful
+sample retains PID, parent PID, start ticks and RSS for every selected process,
+alongside the sum. The measurement process and its descendants are excluded; its
+shell and other host descendants are included. Compare only the same scope and
+matching shell/workload setup. The host PID must not be this measuring process.
+
+This is **summed RSS**, not distinct physical memory: shared pages can be counted
+in multiple processes. It does not include a helper launched by a pre-existing
+external service or a daemon reparented away from the host, and cannot observe
+short-lived children entirely between scans. It is not peak RSS, process-tree
+high-water memory, PSS, or proof of a resource ceiling. No four-host measurements
+have been made by adding this option.
+
+The census checks parent/start identity around each RSS read, then rescans tree
+membership. Observed PID reuse, reparenting, child birth/exit during a census,
+missing RSS and access errors fail the entire run rather than fabricate zero or
+publish a partial success. `/proc` must expose the same host PID namespace and
+readable process metadata; hidden processes can invalidate the declared scope.
+These checks detect observable races, not an atomic OS snapshot. A new child
+between completed samples is allowed and recorded in the next sample. Persistent
+process churn can make this conservative mode unusable; retain the failure rather
+than silently fall back to a smaller memory scope.
+
+The census is outside timed intervals but can perturb pacing; it scans `/proc`
+twice per sample boundary and has safety caps of 65,536 census records and 4,096
+selected processes. Keep raw membership in reports and report these limits.
+
 ## Harness verification
 
 ```sh
 python3 -m unittest discover -s . -p 'test_terminal_baseline.py' -v
 ```
 
-Tests cover full payload/backpressure, fragmented replies, timeout, extraneous
+Tests cover descendant selection, real parent/child sampling, PID reuse, census
+churn, missing RSS, full payload/backpressure, fragmented replies, timeout, extraneous
 input, terminal restoration, PID reuse, RSS and metric sample plumbing. They install
 nothing and do not launch or impersonate any of the four terminal applications.
