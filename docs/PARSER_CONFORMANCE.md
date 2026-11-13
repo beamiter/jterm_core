@@ -98,3 +98,27 @@ single cuts and bytewise/empty feeds, directly with the handwritten tokens. No
 whole-feed run supplies expected data. This tests syntax across mode-like and
 UTF-8 boundaries, not actual alternate-screen mutation, replies, rendering or
 real Vim execution. Existing real Vim CI remains separate integration evidence.
+
+## CSI storage and numeric compatibility boundaries
+
+The `local_policy_csi_*` cases specify bounded-parser compatibility behavior for
+both profiles, separately where necessary. These are implementation policy
+contracts, not standard-mandated acceptance or rejection rules:
+
+* Raw CSI parameter storage retains at most 256 bytes for EmberV1 or 128 bytes
+  for FrostLegacyV1; a leading private prefix occupies one of those bytes.
+  Tests cover cap-minus-one, exact cap, cap-plus-one and longer input. Excess
+  bytes are consumed rather than becoming printable text. This truncation is
+  **not** a whole-sequence rejection: `rejected_count` stays zero.
+* Eight intermediate bytes are retained. A subsequent valid query must be
+  separate after the full final byte; no truncated sequence bytes leak into it.
+* Each numeric field saturates at 65535 independently, including colon fields;
+  empty fields remain zero, and colon flags are preserved.
+* CAN, SUB and a fresh ESC after an over-cap parameter stream discard the old
+  sequence and allow the next query. All single split points and bytewise feeds
+  (including empty feeds) are checked with independent expected tokens.
+
+These checks cover shared parser primitives, not consumer integration or the
+five terminals' host behavior. They do not make silently truncating arbitrary
+CSI inputs a universal security policy; downstream command semantics remain
+separate, and unsupported syntax behavior is outside these fixtures.

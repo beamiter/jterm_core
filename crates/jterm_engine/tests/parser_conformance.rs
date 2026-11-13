@@ -65,6 +65,13 @@ fn run(profile: ParserProfile, bytes: &[u8], cuts: &[usize], limit: usize) -> Tr
             at += step.consumed;
             trace.abandoned_apc += usize::from(step.abandoned_apc);
             assert!(parser.retained_bytes() <= limit + 3);
+            if parser.pending_kind() == PendingKind::Csi {
+                let cap = match profile {
+                    ParserProfile::EmberV1 => 256,
+                    ParserProfile::FrostLegacyV1 => 128,
+                };
+                assert!(parser.retained_bytes() <= cap + 8 + 2);
+            }
             match step.event {
                 Some(Event::Ascii(run)) => trace
                     .tokens
@@ -440,4 +447,149 @@ fn utf8_encoded_c1_scalars_do_not_reenter_control_parser() {
         0,
         0,
     );
+}
+
+// These bounds/saturation are compatibility API policy, not ECMA-48 mandates.
+#[test]
+fn local_policy_csi_parameter_storage_caps_are_profile_specific() {
+    for (profile, cap) in [
+        (ParserProfile::EmberV1, 256),
+        (ParserProfile::FrostLegacyV1, 128),
+    ] {
+        for length in [cap - 1, cap, cap + 1, cap + 17] {
+            let mut input = b"\x1b[".to_vec();
+            input.extend(vec![b';'; length]);
+            input.extend_from_slice(b"mZ\x1b[2J");
+            let retained = length.min(cap);
+            let expected = Trace {
+                tokens: vec![
+                    csi(
+                        &vec![b';'; retained],
+                        &vec![0; retained + 1],
+                        None,
+                        b"",
+                        b'm',
+                    ),
+                    Token::Print('Z'),
+                    csi(b"2", &[2], None, b"", b'J'),
+                ],
+                rejected: 0,
+                abandoned_apc: 0,
+            };
+            check_profile(profile, &input, &expected, 1024);
+        }
+    }
+}
+
+#[test]
+fn local_policy_csi_prefix_uses_one_storage_byte() {
+    for (profile, cap) in [
+        (ParserProfile::EmberV1, 256),
+        (ParserProfile::FrostLegacyV1, 128),
+    ] {
+        let mut input = b"\x1b[?".to_vec();
+        input.extend(vec![b'0'; cap - 1]);
+        // This nonzero sentinel is beyond the cap. It must not change zero to nine.
+        input.extend_from_slice(b"9hQ");
+        check_profile(
+            profile,
+            &input,
+            &Trace {
+                tokens: vec![
+                    csi(&vec![b'0'; cap - 1], &[0], Some(b'?'), b"", b'h'),
+                    Token::Print('Q'),
+                ],
+                rejected: 0,
+                abandoned_apc: 0,
+            },
+            1024,
+        );
+    }
+}
+
+#[test]
+fn local_policy_csi_intermediate_cap_preserves_next_sequence() {
+    for count in [7usize, 8, 9, 25] {
+        let mut input = b"\x1b[2".to_vec();
+        input.extend(vec![b' '; count.min(8)]);
+        input.extend(vec![b'!'; count.saturating_sub(8)]);
+        input.extend_from_slice(b"qR\x1b[6n");
+        check(
+            &input,
+            vec![
+                csi(b"2", &[2], None, &vec![b' '; count.min(8)], b'q'),
+                Token::Print('R'),
+                csi(b"6", &[6], None, b"", b'n'),
+            ],
+            1024,
+            0,
+            0,
+        );
+    }
+}
+
+#[test]
+fn local_policy_csi_numeric_saturation_is_per_field() {
+    check(
+        b"\x1b[65534;65535;65536;99999999999999999999;1m",
+        vec![csi(
+            b"65534;65535;65536;99999999999999999999;1",
+            &[65534, 65535, 65535, 65535, 1],
+            None,
+            b"",
+            b'm',
+        )],
+        1024,
+        0,
+        0,
+    );
+    check(
+        b"\x1b[38:2::65536:1:2m",
+        vec![Token::Csi(
+            b"38:2::65536:1:2".to_vec(),
+            vec![38, 2, 0, 65535, 1, 2],
+            vec![false, true, true, true, true, true],
+            None,
+            vec![],
+            b'm',
+        )],
+        1024,
+        0,
+        0,
+    );
+}
+
+#[test]
+fn local_policy_csi_at_capacity_cancels_and_restarts() {
+    for (profile, cap) in [
+        (ParserProfile::EmberV1, 256),
+        (ParserProfile::FrostLegacyV1, 128),
+    ] {
+        for terminator in [b"\x18".as_slice(), b"\x1a", b"\x1b"] {
+            let mut input = b"\x1b[".to_vec();
+            input.extend(vec![b';'; cap + 17]);
+            input.extend_from_slice(terminator);
+            // Fresh ESC cancels the full CSI. CAN/SUB leave ground; ESC starts an escape.
+            input.extend_from_slice(if terminator == b"\x1b" {
+                b"[6nZ"
+            } else {
+                b"Q\x1b[6nZ"
+            });
+            let mut expected = Vec::new();
+            if terminator != b"\x1b" {
+                expected.push(Token::Print('Q'));
+            }
+            expected.extend([csi(b"6", &[6], None, b"", b'n'), Token::Print('Z')]);
+            check_profile(
+                profile,
+                &input,
+                &Trace {
+                    tokens: expected,
+                    rejected: 0,
+                    abandoned_apc: 0,
+                },
+                1024,
+            );
+        }
+    }
 }
