@@ -41,14 +41,20 @@ impl TerminalModes {
         vec![b'\x1b', b'[', b'M', button_byte, col_byte, row_byte]
     }
 
-    /// Mode 1005 keeps the X10 frame but writes each coordinate+32 as a UTF-8
-    /// scalar, which lifts the 223-column cap to xterm's 2015.
+    /// Mode 1005 keeps the X10 frame but writes button+32 and each coordinate+32
+    /// as UTF-8 scalars, lifting the 223-column cap to xterm's 2015.
     fn utf8_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
         let mut output = Vec::with_capacity(12);
         output.extend_from_slice(b"\x1b[M");
-        output.push(button.saturating_add(32));
-        for value in [col, row] {
-            let codepoint = 32 + value.saturating_add(1).min(2015) as u32;
+        // Mode 1005 encodes Cb as UTF-8 too, not just the coordinates.
+        // Extended buttons can exceed ASCII; a raw byte would be invalid UTF-8.
+        // Widen before adding the protocol offset so high button codes do not
+        // saturate or wrap and silently alias a different event.
+        for codepoint in [
+            u32::from(button) + 32,
+            32 + col.saturating_add(1).min(2015) as u32,
+            32 + row.saturating_add(1).min(2015) as u32,
+        ] {
             if let Some(ch) = char::from_u32(codepoint) {
                 let mut buf = [0u8; 4];
                 output.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -158,7 +164,7 @@ mod tests {
         modes.insert(1005);
         assert_eq!(
             modes.get_mouse_report(255, usize::MAX, 0),
-            Some([b"\x1b[M\xff".as_slice(), "\u{7ff}!".as_bytes()].concat())
+            Some("\x1b[M\u{11f}\u{7ff}!".as_bytes().to_vec())
         );
         assert_eq!(
             modes.get_mouse_release_report(255, usize::MAX, 0),
