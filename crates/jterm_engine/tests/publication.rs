@@ -114,3 +114,90 @@ fn sequence_exhaustion_never_wraps_and_new_epoch_is_explicit() {
     assert_eq!(new.next_revision(), Ok((8, 1)));
     assert!(Sequence::new(0).is_err());
 }
+
+fn sized_frame(revision: u64, layout: u64, cols: usize, rows: usize) -> CellFrame {
+    let original = frame(1, revision);
+    CellFrame::new(
+        Stamp {
+            layout,
+            ..original.stamp()
+        },
+        cols,
+        vec![
+            Row {
+                cells: vec![TerminalCell::default(); cols].into(),
+                wrapped: false,
+            };
+            rows
+        ]
+        .into(),
+        original.cursor(),
+        Limits {
+            max_rows: 2,
+            max_cols: 2,
+            max_cells: 4,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn unchanged_layout_rejects_resize_without_losing_pending_frame() {
+    for (cols, rows) in [(2, 1), (1, 2)] {
+        let mut subscriber = Subscriber::new(1).unwrap();
+        let mut receiver = Receiver::new(1);
+        let first = frame(1, 1);
+        subscriber.offer(first.clone()).unwrap();
+        subscriber.take().unwrap();
+        receiver.full(first.clone()).unwrap();
+        subscriber.acknowledge(first.stamp()).unwrap();
+        subscriber.offer(frame(1, 2)).unwrap();
+        let invalid = sized_frame(3, 1, cols, rows);
+        assert_eq!(receiver.full(invalid.clone()), Err(Error::Layout));
+        assert_eq!(subscriber.offer(invalid), Err(publication::Error::Layout));
+        assert_eq!(subscriber.retained_frames(), 2);
+        let Update::Delta(delta) = subscriber.take().unwrap() else {
+            panic!("valid pending publication must survive rejection");
+        };
+        assert_eq!(delta.next.revision, 2);
+        receiver
+            .delta(
+                &delta,
+                Limits {
+                    max_rows: 2,
+                    max_cols: 2,
+                    max_cells: 4,
+                },
+            )
+            .unwrap();
+        subscriber.acknowledge(delta.next).unwrap();
+        // Rejection must not consume revision 3. A real layout advance is valid.
+        let resized = sized_frame(3, 2, cols, rows);
+        subscriber.offer(resized.clone()).unwrap();
+        let Update::Full(full) = subscriber.take().unwrap() else {
+            panic!("resize requires a full frame");
+        };
+        receiver.full(full).unwrap();
+        assert_eq!(receiver.frame(), Some(&resized));
+    }
+}
+
+#[test]
+fn layout_dimensions_survive_flight_rejection_and_coalescing() {
+    let mut subscriber = Subscriber::new(1).unwrap();
+    subscriber.offer(frame(1, 1)).unwrap();
+    let first = subscriber.take().unwrap();
+    subscriber.reject(first.stamp()).unwrap();
+    assert_eq!(subscriber.retained_frames(), 0);
+    assert_eq!(
+        subscriber.offer(sized_frame(2, 1, 2, 1)),
+        Err(publication::Error::Layout)
+    );
+    subscriber.offer(sized_frame(2, 2, 2, 1)).unwrap();
+    // Compare against the latest offer, even before it is sent or acknowledged.
+    assert_eq!(
+        subscriber.offer(sized_frame(3, 2, 1, 1)),
+        Err(publication::Error::Layout)
+    );
+    assert_eq!(subscriber.take().unwrap().stamp().revision, 2);
+}

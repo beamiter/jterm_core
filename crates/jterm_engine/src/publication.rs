@@ -49,7 +49,9 @@ impl Update {
 /// No queue grows with PTY throughput. All cell rows are immutable/shared.
 pub struct Subscriber {
     epoch: u64,
-    latest_stamp: Option<Stamp>,
+    // Retain geometry even after rejection drops every frame: one layout
+    // identifies one size for the entire publication stream.
+    latest: Option<(Stamp, usize, usize)>,
     base: Option<CellFrame>,
     flight: Option<CellFrame>,
     desired: Option<CellFrame>,
@@ -61,7 +63,7 @@ impl Subscriber {
         }
         Ok(Self {
             epoch,
-            latest_stamp: None,
+            latest: None,
             base: None,
             flight: None,
             desired: None,
@@ -72,15 +74,18 @@ impl Subscriber {
         if stamp.epoch != self.epoch {
             return Err(Error::Epoch);
         }
-        if let Some(old) = self.latest_stamp {
+        if let Some((old, cols, rows)) = self.latest {
             if stamp.revision <= old.revision {
                 return Err(Error::Stale);
             }
-            if stamp.layout < old.layout {
+            if stamp.layout < old.layout
+                || (stamp.layout == old.layout
+                    && (frame.cols() != cols || frame.rows().len() != rows))
+            {
                 return Err(Error::Layout);
             }
         }
-        self.latest_stamp = Some(stamp);
+        self.latest = Some((stamp, frame.cols(), frame.rows().len()));
         self.desired = Some(frame);
         Ok(())
     }
