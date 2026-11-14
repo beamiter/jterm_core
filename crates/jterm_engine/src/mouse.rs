@@ -74,23 +74,26 @@ impl TerminalModes {
         .into_bytes()
     }
 
+    /// `button` is the encoded Cb value, including Shift/Meta/Control bits.
+    /// Legacy releases discard button/motion/extension bits, retaining modifiers.
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         if !self.contains(&1000) && !self.contains(&1002) && !self.contains(&1003) {
             return None;
         }
 
+        let legacy_release = 3 | (button & 0x1c);
         if self.contains(&1006) {
             // SGR format: lowercase 'm' for release
             let x = col.saturating_add(1);
             let y = row.saturating_add(1);
             Some(format!("\x1b[<{};{};{}m", button, x, y).into_bytes())
         } else if self.contains(&1015) {
-            // Legacy encodings cannot name the released button: it is 3.
-            Some(Self::urxvt_mouse_report(3, col, row))
+            // Legacy Cb: release=3 in the low bits, Shift/Meta/Control above.
+            Some(Self::urxvt_mouse_report(legacy_release, col, row))
         } else if self.contains(&1005) {
-            Some(Self::utf8_mouse_report(3, col, row))
+            Some(Self::utf8_mouse_report(legacy_release, col, row))
         } else {
-            Some(Self::x10_mouse_report(3, col, row))
+            Some(Self::x10_mouse_report(legacy_release, col, row))
         }
     }
 
@@ -151,7 +154,7 @@ mod tests {
                     modes
                         .get_mouse_release_report(button, coord, coord)
                         .unwrap()[3],
-                    35
+                    35 + (button & 0x1c)
                 );
             }
         }
@@ -168,7 +171,7 @@ mod tests {
         );
         assert_eq!(
             modes.get_mouse_release_report(255, usize::MAX, 0),
-            Some("\x1b[M#\u{7ff}!".as_bytes().to_vec())
+            Some("\x1b[M?\u{7ff}!".as_bytes().to_vec())
         );
         modes.insert(1015);
         assert_eq!(
@@ -177,7 +180,7 @@ mod tests {
         );
         assert_eq!(
             modes.get_mouse_release_report(255, usize::MAX, 300),
-            Some(format!("\x1b[35;{};301M", usize::MAX).into_bytes())
+            Some(format!("\x1b[63;{};301M", usize::MAX).into_bytes())
         );
         modes.insert(1006);
         assert_eq!(
