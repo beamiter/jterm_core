@@ -143,13 +143,23 @@ impl CellFrame {
         }
         Ok(())
     }
-    /// Validation precedes allocation or mutation; rejection leaves the original intact.
+    /// Budget checks precede scratch/copy allocation; rejection leaves the original intact.
     pub fn apply(&self, delta: &Delta, limits: Limits) -> Result<Self, Error> {
         if delta.base != self.stamp {
             return Err(Error::Base);
         }
         self.check_next(delta.next)?;
-        if delta.rows.len() > self.rows.len() {
+        // The base may have been admitted under a larger budget. Check the
+        // current budget before allocating either the seen table or copied rows.
+        if self.cols > limits.max_cols
+            || self.rows.len() > limits.max_rows
+            || self
+                .rows
+                .len()
+                .checked_mul(self.cols)
+                .is_none_or(|n| n > limits.max_cells)
+            || delta.rows.len() > self.rows.len()
+        {
             return Err(Error::Bounds);
         }
         let mut seen = vec![false; self.rows.len()];
