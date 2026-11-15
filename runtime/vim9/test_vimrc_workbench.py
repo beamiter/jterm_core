@@ -19,6 +19,7 @@ import time
 import unittest
 
 from test_bridge import Editor, VIM
+from capture_diagnostics import capture_failure_metadata
 
 
 CHECKOUT_PARENT = Path(__file__).resolve().parents[3]
@@ -149,7 +150,8 @@ for line in sys.stdin:
                 # writefile creates the file before filling it; a zero-byte
                 # result is not an acknowledgement of the requested value.
                 e.pump(0.02)
-        self.fail("Vim did not finish capture: " + expression)
+        self.fail("Vim did not finish capture; metadata=" + json.dumps(
+            capture_failure_metadata(e, output), sort_keys=True))
 
     def workbench(self, e: Editor, command: str, *, state=None, ok=True):
         source = state or e.snapshot()
