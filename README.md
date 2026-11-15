@@ -410,20 +410,27 @@ cargo test --doc
 cargo doc --no-deps
 ```
 
-When changing a shared API, validate all four terminal consumers and jsh in a
+When changing a shared API, validate all five terminal consumers and jsh in a
 coordinated change. Git dependencies should be pinned to an audited revision;
 do not make a consumer depend on a new local API until that revision is
 available to a clean checkout.
 
 For coordinated changes before publishing new dependency revisions, keep the
-seven repositories as siblings and use the local-source runner:
+eight repositories as siblings and use the local-source runner:
 
 ```sh
 python3 scripts/family-cargo.py jagent test --lib
 python3 scripts/family-cargo.py jterm_core test --lib organism
 python3 scripts/family-cargo.py jsh test --lib
+python3 scripts/family-cargo.py aether check --all-targets
 python3 scripts/family-cargo.py all check --all-targets
 ```
+
+The Aether target runs Cargo in `aether/src-tauri` and mirrors its sibling
+`bridge` and `session` manifests/locks privately while using the candidate
+`jterm_engine`. It does not pull in `jterm_core` or `jagent` when run alone.
+This is candidate build routing, not a release-pin update or native GUI
+acceptance; the routing tests deliberately mock Cargo.
 
 The root `jterm_core` package requires Rust 1.89 or later for the patched bundled
 SQLite dependency. See [the SQLite security update](docs/sqlite-security-2026-0459.md).

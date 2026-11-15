@@ -12,17 +12,19 @@ import sys
 import tempfile
 
 
-PROJECTS = ("jterm_engine", "jagent", "jterm_core", "jsh", "anvil", "ember", "forge", "frost")
+PROJECTS = ("jterm_engine", "jagent", "jterm_core", "jsh", "anvil", "ember", "forge", "frost", "aether")
 
 
-def mirror(source: Path, destination: Path) -> None:
+def mirror(source: Path, destination: Path, nested_crates: bool = False) -> None:
     """Keep Cargo-owned manifests/locks private; compile the real source files."""
     destination.mkdir()
     for entry in source.iterdir():
         if entry.name in {".git", "target"}:
             continue
         target = destination / entry.name
-        if entry.name in {"Cargo.toml", "Cargo.lock"}:
+        if nested_crates and entry.name in {"src-tauri", "bridge", "session"}:
+            mirror(entry, target)
+        elif entry.name in {"Cargo.toml", "Cargo.lock"}:
             shutil.copyfile(entry, target)
         else:
             target.symlink_to(entry, target_is_directory=entry.is_dir())
@@ -81,21 +83,22 @@ def main() -> int:
         sources["jterm_engine"] = nested_engine
     selected = PROJECTS if args.project == "all" else (args.project,)
     required = set(selected)
-    if any(project != "jterm_engine" for project in selected):
+    if any(project not in {"jterm_engine", "aether"} for project in selected):
         required.add("jagent")
-    if any(project not in {"jterm_engine", "jagent", "jsh"} for project in selected):
+    if any(project not in {"jterm_engine", "jagent", "jsh", "aether"} for project in selected):
         required.add("jterm_core")
-    if any(project in {"ember", "frost"} for project in selected):
+    if any(project in {"ember", "frost", "aether"} for project in selected):
         required.add("jterm_engine")
     for project in sorted(required):
-        if not (sources[project] / "Cargo.toml").is_file():
+        manifest_root = sources[project] / "src-tauri" if project == "aether" else sources[project]
+        if not (manifest_root / "Cargo.toml").is_file():
             parser.error(f"missing family checkout: {sources[project]}")
 
     failures = []
     with tempfile.TemporaryDirectory(prefix="jterm-family-") as directory:
         root = Path(directory)
         for project in sorted(required):
-            mirror(sources[project], root / project)
+            mirror(sources[project], root / project, nested_crates=project == "aether")
         patches = []
         if "jagent" in required:
             patches += [
@@ -109,7 +112,7 @@ def main() -> int:
                 'patch."https://github.com/beamiter/jterm_core.git".jterm_core.path='
                 + json.dumps(str(root / "jterm_core")),
             ]
-        if "jterm_engine" in required and "jterm_core" in required:
+        if "jterm_engine" in required and any(project != "jterm_engine" for project in selected):
             patches += [
                 "--config",
                 'patch."https://github.com/beamiter/jterm_core.git".jterm_engine.path='
@@ -117,17 +120,19 @@ def main() -> int:
             ]
         for project in selected:
             print(f"\n[{project}] local family sources, private Cargo.lock", flush=True)
+            original = sources[project] / "src-tauri" if project == "aether" else sources[project]
+            cargo_root = root / project / "src-tauri" if project == "aether" else root / project
             environment = os.environ.copy()
             # Keep the existing cache unless the caller selected another one.
-            environment.setdefault("CARGO_TARGET_DIR", str(sources[project] / "target"))
+            environment.setdefault("CARGO_TARGET_DIR", str(original / "target"))
             environment["CARGO_TARGET_DIR"] = str(Path(environment["CARGO_TARGET_DIR"]).resolve())
             if cargo_args[0] == "test":
-                native_test_runner(root, sources[project], environment)
+                native_test_runner(root, original, environment)
             # External Cargo subcommands (notably clippy) must receive the
             # overrides themselves; global flags before the subcommand can
             # be lost when cargo-clippy launches its inner cargo check.
             command = ["cargo", cargo_args[0], *patches, "--offline", *cargo_args[1:]]
-            result = subprocess.run(command, cwd=root / project, env=environment)
+            result = subprocess.run(command, cwd=cargo_root, env=environment)
             if result.returncode:
                 failures.append(project)
     if failures:
