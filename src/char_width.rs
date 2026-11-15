@@ -84,6 +84,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn halfwidth_katakana_marks_keep_width_on_cache_hits() {
+        clear_width_cache();
+        for _ in 0..2 {
+            assert_eq!(cached_char_width('\u{ff9e}'), 1);
+            assert_eq!(cached_char_width('\u{ff9f}'), 1);
+            assert_eq!("ﾊﾟｸﾞ".chars().map(cached_char_width).sum::<usize>(), 4);
+        }
+        assert_eq!(get_cache_stats().0, 4);
+    }
+
+    #[test]
     fn test_ascii_width() {
         assert_eq!(cached_char_width('A'), 1);
         assert_eq!(cached_char_width('a'), 1);

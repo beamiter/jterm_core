@@ -47,5 +47,5 @@ sha2 = "0.10"
 # through the same serde derive so they cannot disagree about a field's type.
 serde_norway = "=0.9.42"
 toml = "1.1"
-unicode-width = "0.2"
+unicode-width = "0.2.3"
 zstd = "0.14"
