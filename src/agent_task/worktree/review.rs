@@ -306,7 +306,7 @@ impl WorktreeService {
             head,
             branch: branch.to_owned(),
             base_commit: baseline,
-            fingerprint: format!("sha256:{:x}", hash.finalize()),
+            fingerprint: format!("sha256:{}", crate::digest_hex::encode(&hash.finalize())),
             status: crate::review_input::safe_multiline_display(&status_text, 16 * 1024),
             diff: crate::review_input::safe_multiline_display(&diff_text, 128 * 1024),
             diff_truncated,

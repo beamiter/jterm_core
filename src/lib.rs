@@ -23,6 +23,7 @@ pub mod command_history;
 pub mod cross_block_search;
 pub mod desktop_sessions;
 pub mod developer_workspace;
+mod digest_hex;
 pub mod execution_journal;
 pub mod exit_status;
 pub mod git_meta;

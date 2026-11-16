@@ -63,7 +63,10 @@ pub(super) fn migrate(db: &Connection, old_version: i64) -> Result<(), String> {
 /// Stable content revision, only an equality marker; never a permission token.
 fn revision(text: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("text-sha256:{:x}", Sha256::digest(text.as_bytes()))
+    format!(
+        "text-sha256:{}",
+        crate::digest_hex::encode(&Sha256::digest(text.as_bytes()))
+    )
 }
 
 fn bounded_text(text: &str) -> (String, bool) {
@@ -736,5 +739,17 @@ mod tests {
         assert_eq!(page.hits[0].row.id.0, "jterm:api:scale-0");
         drop(store);
         let _ = std::fs::remove_dir_all(paths.state);
+    }
+}
+
+#[cfg(test)]
+mod digest_compatibility_tests {
+    #[test]
+    fn text_revision_preserves_prefix_and_digest() {
+        assert_eq!(
+            super::revision("abc"),
+            "text-sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(super::revision("abc"), super::revision("abc\n"));
     }
 }
