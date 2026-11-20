@@ -247,6 +247,14 @@ fn read_only_kind(command: &WorkspaceCommand) -> Option<ReadOnlyKind> {
     })
 }
 pub(super) fn is_read_only_command(command: &WorkspaceCommand) -> bool {
+    // Irreversible deletion is never transported by the read-only SSH bridge.
+    if matches!(
+        command,
+        WorkspaceCommand::DeleteLocalConversation { .. }
+            | WorkspaceCommand::PrepareDeleteLocalConversation { .. }
+    ) {
+        return false;
+    }
     read_only_kind(command).is_some()
 }
 

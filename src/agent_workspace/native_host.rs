@@ -66,7 +66,11 @@ impl NativeManager {
         owner: Owner,
         store: &mut Store,
     ) -> Disposition {
-        if let WorkspaceCommand::Archive { id, .. } | WorkspaceCommand::Delete { id } = &command {
+        if let WorkspaceCommand::Archive { id, .. }
+        | WorkspaceCommand::PrepareDeleteLocalConversation { id }
+        | WorkspaceCommand::DeleteLocalConversation { id, .. }
+        | WorkspaceCommand::Delete { id } = &command
+        {
             match store.native_snapshot(id) {
                 Ok(Some(_)) => {
                     return Disposition::Handled(Box::new(Err(

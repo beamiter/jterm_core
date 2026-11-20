@@ -151,6 +151,17 @@ pub enum WorkspaceCommand {
     Organize {
         changes: Vec<WorkspaceOrganization>,
     },
+    /// Local-only preparation read. Never an authorization to delete.
+    PrepareDeleteLocalConversation {
+        id: ConversationId,
+    },
+    /// Irreversible local-owned deletion, after exact snapshot confirmation.
+    DeleteLocalConversation {
+        id: ConversationId,
+        expected_numeric_id: u64,
+        expected_revision: u64,
+        expected_draft_revision: u64,
+    },
     Delete {
         id: ConversationId,
     },
@@ -191,8 +202,24 @@ pub enum WorkspaceCommand {
     },
 }
 
+/// Authoritative, scoped local preparation. Error means ineligible.
+/// The frontend must confirm this exact snapshot; mutation rechecks all fields.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalConversationDeletionSnapshot {
+    pub id: ConversationId,
+    pub numeric_id: u64,
+    pub revision: u64,
+    pub draft_revision: u64,
+    pub title: String,
+    pub message_count: u64,
+    pub draft_bytes: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceReply {
+    LocalConversationDeletion {
+        snapshot: LocalConversationDeletionSnapshot,
+    },
     Native {
         snapshot: Box<super::native::NativeSnapshot>,
         control: Option<super::native::NativeControlLease>,

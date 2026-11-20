@@ -323,7 +323,9 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                             Some(_) => Ok(WorkspaceReply::Ack),
                             None => Err("This process is not owned by the session host".into()),
                         },
-                        WorkspaceCommand::Delete { ref id }
+                        WorkspaceCommand::PrepareDeleteLocalConversation { ref id }
+                        | WorkspaceCommand::DeleteLocalConversation { ref id, .. }
+                        | WorkspaceCommand::Delete { ref id }
                         | WorkspaceCommand::Archive { ref id, .. }
                             if runtimes
                                 .get(id)
