@@ -10,6 +10,7 @@ mod context;
 mod deleted_cli;
 mod hosted_api;
 mod hosted_native;
+mod local_delete;
 mod mission;
 mod queue;
 mod search;
@@ -99,6 +100,7 @@ impl Store {
         context::migrate(&db)?;
         queue::migrate(&db)?;
         mission::migrate(&db)?;
+        local_delete::migrate(&db)?;
         // A restarted host records unknown outcomes without replaying model
         // operations. Surviving worker/PTY descendants retain kernel leases;
         // a newer draft remains independent from that previous execution.
@@ -267,7 +269,7 @@ impl Store {
                 check_text(&title, 256, "title")?;
                 let id = ConversationId(format!("jterm:api:{}", uuid::Uuid::new_v4()));
                 let row = api_row(id.clone(), &title);
-                self.upsert_runtime_row(&row)?;
+                self.insert_local_chat(&row)?;
                 Ok(WorkspaceReply::Chat {
                     chat: self.load(&id)?,
                 })
@@ -379,6 +381,22 @@ impl Store {
                 }
                 result
             }
+            WorkspaceCommand::PrepareDeleteLocalConversation { id } => {
+                self.prepare_delete_local_conversation(&id)
+            }
+            WorkspaceCommand::DeleteLocalConversation {
+                id,
+                expected_numeric_id,
+                expected_revision,
+                expected_draft_revision,
+                expected_context_revision,
+            } => self.delete_local_conversation(
+                &id,
+                expected_numeric_id,
+                expected_revision,
+                expected_draft_revision,
+                expected_context_revision,
+            ),
             WorkspaceCommand::Delete { id } => {
                 self.ensure_idle(&id)?;
                 self.db
@@ -425,6 +443,7 @@ impl Store {
                 restore_draft,
             } => self.cancel(&receipt, restore_draft),
             WorkspaceCommand::StartNative { .. }
+            | WorkspaceCommand::ProbeLocalConversationDeletion
             | WorkspaceCommand::DeleteCliSession { .. }
             | WorkspaceCommand::InspectResult { .. }
             | WorkspaceCommand::InspectMission { .. }

@@ -112,7 +112,10 @@ pub use projection::{
     workspace_attention_counts, WorkspaceAttention, WorkspaceCapabilities, WorkspaceFacts,
     WorkspacePresentation, WorkspacePrimaryAction,
 };
-pub use protocol::{WorkspaceCommand, WorkspaceEvent, WorkspaceReply};
+pub use protocol::{
+    LocalConversationDeletionSnapshot, WorkspaceCommand, WorkspaceEvent, WorkspaceReply,
+    LOCAL_CONVERSATION_DELETION_VERSION,
+};
 pub use query::{WorkspaceQuery, WorkspaceSearchIndex, WorkspaceSort, WORKSPACE_QUERY_MAX_BYTES};
 pub use queue::{
     WorkspaceExecutionLocation, WorkspaceQueueChange, WorkspaceQueueIntent, WorkspaceQueueRow,

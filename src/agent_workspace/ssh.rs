@@ -247,6 +247,15 @@ fn read_only_kind(command: &WorkspaceCommand) -> Option<ReadOnlyKind> {
     })
 }
 pub(super) fn is_read_only_command(command: &WorkspaceCommand) -> bool {
+    // The local-only Delete capability and operations never travel over SSH.
+    if matches!(
+        command,
+        WorkspaceCommand::ProbeLocalConversationDeletion
+            | WorkspaceCommand::DeleteLocalConversation { .. }
+            | WorkspaceCommand::PrepareDeleteLocalConversation { .. }
+    ) {
+        return false;
+    }
     read_only_kind(command).is_some()
 }
 
@@ -477,6 +486,10 @@ mod tests {
             assert!(WorkspaceSshHost::new("host", executable, "fixture").is_err());
         }
         assert!(WorkspaceSshHost::new("host", "/bin/jterm-sessiond", "host\nother").is_err());
+        assert!(!is_read_only_command(
+            &WorkspaceCommand::ProbeLocalConversationDeletion
+        ));
+        assert!(read_only_kind(&WorkspaceCommand::ProbeLocalConversationDeletion).is_none());
         assert!(!is_read_only_command(&WorkspaceCommand::CreateChat {
             title: "No".into()
         }));

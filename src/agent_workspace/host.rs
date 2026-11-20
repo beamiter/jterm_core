@@ -323,7 +323,9 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                             Some(_) => Ok(WorkspaceReply::Ack),
                             None => Err("This process is not owned by the session host".into()),
                         },
-                        WorkspaceCommand::Delete { ref id }
+                        WorkspaceCommand::PrepareDeleteLocalConversation { ref id }
+                        | WorkspaceCommand::DeleteLocalConversation { ref id, .. }
+                        | WorkspaceCommand::Delete { ref id }
                         | WorkspaceCommand::Archive { ref id, .. }
                             if runtimes
                                 .get(id)
@@ -500,6 +502,19 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
                 return write_frame(&mut stream,&Response::Error("Session host version mismatch; restart the host after updating all frontends".into()));
             }
             let owner = peer_identity(&stream).ok_or("Cannot verify workspace client process")?;
+            // Serve this feature probe without touching the database or
+            // triggering command-queue maintenance on the writer thread.
+            if matches!(&command, WorkspaceCommand::ProbeLocalConversationDeletion) {
+                return write_frame(
+                    &mut stream,
+                    &Response::Reply(Box::new(Ok(
+                        WorkspaceReply::LocalConversationDeletionCapability {
+                            version: super::LOCAL_CONVERSATION_DELETION_VERSION,
+                        },
+                    ))),
+                );
+            }
+
             let (tx, rx) = bounded(1);
             let timeout = if matches!(&command, WorkspaceCommand::InspectMission { .. }) {
                 115
@@ -1284,4 +1299,37 @@ fn external_owner(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod local_delete_capability_tests {
+    use super::*;
+
+    #[test]
+    fn capability_probe_does_not_enter_the_host_writer_queue() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (tx, rx) = bounded(1);
+        write_frame(
+            &mut client,
+            &Request::Command {
+                version: PROTOCOL_VERSION,
+                command: WorkspaceCommand::ProbeLocalConversationDeletion,
+            },
+        )
+        .unwrap();
+        connection(server, tx).unwrap();
+        let response = read_frame::<Response>(&mut BufReader::new(client))
+            .unwrap()
+            .unwrap();
+        let Response::Reply(reply) = response else {
+            panic!("expected feature probe response");
+        };
+        assert!(matches!(
+            *reply,
+            Ok(WorkspaceReply::LocalConversationDeletionCapability {
+                version: super::super::LOCAL_CONVERSATION_DELETION_VERSION
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 }
