@@ -247,10 +247,11 @@ fn read_only_kind(command: &WorkspaceCommand) -> Option<ReadOnlyKind> {
     })
 }
 pub(super) fn is_read_only_command(command: &WorkspaceCommand) -> bool {
-    // Irreversible deletion is never transported by the read-only SSH bridge.
+    // The local-only Delete capability and operations never travel over SSH.
     if matches!(
         command,
-        WorkspaceCommand::DeleteLocalConversation { .. }
+        WorkspaceCommand::ProbeLocalConversationDeletion
+            | WorkspaceCommand::DeleteLocalConversation { .. }
             | WorkspaceCommand::PrepareDeleteLocalConversation { .. }
     ) {
         return false;
@@ -485,6 +486,10 @@ mod tests {
             assert!(WorkspaceSshHost::new("host", executable, "fixture").is_err());
         }
         assert!(WorkspaceSshHost::new("host", "/bin/jterm-sessiond", "host\nother").is_err());
+        assert!(!is_read_only_command(
+            &WorkspaceCommand::ProbeLocalConversationDeletion
+        ));
+        assert!(read_only_kind(&WorkspaceCommand::ProbeLocalConversationDeletion).is_none());
         assert!(!is_read_only_command(&WorkspaceCommand::CreateChat {
             title: "No".into()
         }));

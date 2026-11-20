@@ -12,6 +12,32 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     .map_err(err)
 }
 
+/// Only an absent or semantically empty saved Handoff is eligible. The
+/// persisted revision distinguishes absent, untouched blank, and save/clear ABA.
+fn empty_context_revision(db: &Connection, id: &ConversationId) -> Result<u64, String> {
+    let saved: Option<(u64, String)> = db
+        .query_row(
+            "SELECT revision,context_json FROM workspace_context WHERE conversation_id=?1",
+            [&id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(err)?;
+    let Some((revision, json)) = saved else {
+        return Ok(0);
+    };
+    // Compare the saved document against the canonical empty shape, not a
+    // lossy decode that could ignore future fields holding user data.
+    let actual: serde_json::Value =
+        serde_json::from_str(&json).map_err(|_| "Saved Handoff cannot be verified".to_owned())?;
+    let mut empty = super::super::WorkspaceContext::empty(id.clone());
+    empty.revision = revision;
+    if revision == 0 || actual != serde_json::to_value(empty).map_err(err)? {
+        return Err("Saved Handoff is nonempty or cannot be verified".into());
+    }
+    Ok(revision)
+}
+
 impl Store {
     pub(super) fn insert_local_chat(&mut self, row: &WorkspaceRow) -> Result<(), String> {
         let row_json = serde_json::to_string(row).map_err(err)?;
@@ -72,14 +98,14 @@ impl Store {
              WHERE c.id=?1 AND c.active_nonce IS NULL
              AND NOT EXISTS(SELECT 1 FROM legacy_imports WHERE conversation_id=c.id)
              AND NOT EXISTS(SELECT 1 FROM native_jobs WHERE id=c.id)
-             AND NOT EXISTS(SELECT 1 FROM workspace_context WHERE conversation_id=c.id)
              AND NOT EXISTS(SELECT 1 FROM workspace_queue WHERE id=c.id)",
             [&id.0], |r| Ok((r.get::<_,u64>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?,r.get::<_,u64>(4)?,r.get::<_,u64>(5)?)))
-            .optional().map_err(err)?.ok_or("Conversation is active, is not locally owned, or has saved materials or a queue entry")?;
+            .optional().map_err(err)?.ok_or("Conversation is active, is not locally owned, or has a queue entry")?;
         let row: WorkspaceRow = serde_json::from_str(&snapshot.3).map_err(err)?;
         if row.kind != ConversationKind::Api || row.id != *id {
             return Err("Only locally created workbench conversations can be deleted here".into());
         }
+        let context_revision = empty_context_revision(&tx, id)?;
         tx.commit().map_err(err)?;
         Ok(WorkspaceReply::LocalConversationDeletion {
             snapshot: super::super::protocol::LocalConversationDeletionSnapshot {
@@ -89,6 +115,7 @@ impl Store {
                 draft_revision: snapshot.2,
                 title: row.title,
                 draft_bytes: snapshot.4,
+                context_revision,
                 message_count: snapshot.5,
             },
         })
@@ -99,6 +126,7 @@ impl Store {
         numeric: u64,
         revision: u64,
         draft_revision: u64,
+        expected_context_revision: u64,
     ) -> Result<WorkspaceReply, String> {
         let numeric = to_i64(numeric)?;
         let revision = to_i64(revision)?;
@@ -116,15 +144,17 @@ impl Store {
              WHERE c.id=?1 AND c.numeric_id=?2 AND c.revision=?3 AND c.draft_revision=?4 AND c.active_nonce IS NULL
              AND NOT EXISTS(SELECT 1 FROM legacy_imports WHERE conversation_id=c.id)
              AND NOT EXISTS(SELECT 1 FROM native_jobs WHERE id=c.id)
-             AND NOT EXISTS(SELECT 1 FROM workspace_context WHERE conversation_id=c.id)
              AND NOT EXISTS(SELECT 1 FROM workspace_queue WHERE id=c.id)",
             params![id.0,numeric,revision,draft_revision], |r| r.get(0)).optional().map_err(err)?;
-        let row: WorkspaceRow = serde_json::from_str(
-            &row.ok_or("Conversation changed, is active, is not locally owned, or has saved materials or a queue entry")?,
-        )
+        let row: WorkspaceRow = serde_json::from_str(&row.ok_or(
+            "Conversation changed, is active, is not locally owned, or has a queue entry",
+        )?)
         .map_err(err)?;
         if row.kind != ConversationKind::Api || row.id != *id {
             return Err("Only locally created workbench conversations can be deleted here".into());
+        }
+        if empty_context_revision(&tx, id)? != expected_context_revision {
+            return Err("Saved Handoff changed; confirm deletion again".into());
         }
         let changed = tx.execute("DELETE FROM conversations WHERE id=?1 AND numeric_id=?2 AND revision=?3 AND draft_revision=?4 AND active_nonce IS NULL",params![id.0,numeric,revision,draft_revision]).map_err(err)?;
         if changed != 1 {
@@ -138,6 +168,82 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confirmed_delete_binds_empty_saved_handoff_revision() {
+        use super::super::super::WorkspaceContext;
+        let paths = Paths::at(
+            std::env::temp_dir().join(format!("jterm-empty-handoff-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let mut store = Store::open(&paths).unwrap();
+        let id = match store
+            .command(WorkspaceCommand::CreateChat {
+                title: "fixture".into(),
+            })
+            .unwrap()
+        {
+            WorkspaceReply::Chat { chat } => chat.row.id,
+            _ => panic!("expected chat"),
+        };
+        let prepare = |s: &mut Store| {
+            s.command(WorkspaceCommand::PrepareDeleteLocalConversation { id: id.clone() })
+        };
+        let delete =
+            |s: &mut Store, snapshot: super::super::super::LocalConversationDeletionSnapshot| {
+                s.command(WorkspaceCommand::DeleteLocalConversation {
+                    id: snapshot.id,
+                    expected_numeric_id: snapshot.numeric_id,
+                    expected_revision: snapshot.revision,
+                    expected_draft_revision: snapshot.draft_revision,
+                    expected_context_revision: snapshot.context_revision,
+                })
+            };
+        let preview = |reply| match reply {
+            WorkspaceReply::LocalConversationDeletion { snapshot } => snapshot,
+            _ => panic!("expected preview"),
+        };
+        let save = |s: &mut Store, context: WorkspaceContext| match s
+            .command(WorkspaceCommand::SaveContext {
+                id: id.clone(),
+                expected_revision: context.revision,
+                context,
+            })
+            .unwrap()
+        {
+            WorkspaceReply::Context { context } => context,
+            _ => panic!("expected context"),
+        };
+        let absent = preview(prepare(&mut store).unwrap());
+        assert_eq!(absent.context_revision, 0);
+        let mut blank = save(&mut store, WorkspaceContext::empty(id.clone()));
+        assert_eq!(blank.revision, 1);
+        assert!(delete(&mut store, absent).is_err());
+
+        let stale_blank = preview(prepare(&mut store).unwrap());
+        assert_eq!(stale_blank.context_revision, 1);
+        blank.goal = "newer important material".into();
+        let mut edited = save(&mut store, blank);
+        assert!(prepare(&mut store).is_err());
+        assert!(delete(&mut store, stale_blank.clone()).is_err());
+        assert_eq!(
+            store.read_context(&id).unwrap().goal,
+            "newer important material"
+        );
+
+        edited.goal.clear();
+        assert_eq!(save(&mut store, edited).revision, 3);
+        assert!(delete(&mut store, stale_blank).is_err());
+        let fresh = preview(prepare(&mut store).unwrap());
+        assert_eq!(fresh.context_revision, 3);
+        assert!(matches!(
+            delete(&mut store, fresh).unwrap(),
+            WorkspaceReply::Ack
+        ));
+        assert!(store.row(&id).unwrap().is_none());
+        drop(store);
+        std::fs::remove_dir_all(paths.state).unwrap();
+    }
+
     #[test]
     fn confirmed_delete_removes_durable_chat_copies_after_reopen() {
         let paths = Paths::at(
@@ -224,6 +330,7 @@ mod tests {
                     expected_numeric_id: prepared.numeric_id,
                     expected_revision: prepared.revision,
                     expected_draft_revision: prepared.draft_revision,
+                    expected_context_revision: prepared.context_revision,
                 })
                 .unwrap(),
             WorkspaceReply::Ack
@@ -279,7 +386,9 @@ mod tests {
         let b = create(&mut store);
         let missing = ConversationId(format!("jterm:api:{}", uuid::Uuid::new_v4()));
         assert!(store.prepare_delete_local_conversation(&missing).is_err());
-        assert!(store.delete_local_conversation(&missing, 1, 0, 0).is_err());
+        assert!(store
+            .delete_local_conversation(&missing, 1, 0, 0, 0)
+            .is_err());
         assert!(!paths.lease(&missing).exists());
         let imported = api_row(missing.clone(), "older unmarked chat");
         store.upsert_runtime_row(&imported).unwrap();
@@ -321,7 +430,8 @@ mod tests {
                     &a,
                     prepared.numeric_id,
                     prepared.revision,
-                    prepared.draft_revision
+                    prepared.draft_revision,
+                    prepared.context_revision
                 )
                 .is_err());
             assert!(store.row(&a).unwrap().is_some());
@@ -333,7 +443,8 @@ mod tests {
                 &a,
                 prepared.numeric_id + SHARED_CHAT_ID_BASE,
                 prepared.revision,
-                prepared.draft_revision
+                prepared.draft_revision,
+                prepared.context_revision
             )
             .is_err());
         assert!(store
@@ -341,7 +452,8 @@ mod tests {
                 &a,
                 prepared.numeric_id,
                 prepared.revision,
-                prepared.draft_revision + 1
+                prepared.draft_revision + 1,
+                prepared.context_revision
             )
             .is_err());
         let owner = Lease::acquire(&paths.lease(&a)).unwrap();
@@ -351,7 +463,8 @@ mod tests {
                 &a,
                 prepared.numeric_id,
                 prepared.revision,
-                prepared.draft_revision
+                prepared.draft_revision,
+                prepared.context_revision
             )
             .is_err());
         drop(owner);
@@ -374,7 +487,7 @@ mod tests {
             )
             .unwrap();
         assert!(store
-            .delete_local_conversation(&a, numeric as u64, revision as u64 + 1, 0)
+            .delete_local_conversation(&a, numeric as u64, revision as u64 + 1, 0, 0)
             .is_err());
         store
             .db
@@ -384,7 +497,7 @@ mod tests {
             )
             .unwrap();
         assert!(store
-            .delete_local_conversation(&a, numeric as u64, revision as u64, 0)
+            .delete_local_conversation(&a, numeric as u64, revision as u64, 0, 0)
             .is_err());
         store
             .db
@@ -394,7 +507,7 @@ mod tests {
             )
             .unwrap();
         store
-            .delete_local_conversation(&a, numeric as u64, revision as u64, 0)
+            .delete_local_conversation(&a, numeric as u64, revision as u64, 0, 0)
             .unwrap();
         assert!(store.row(&a).unwrap().is_none());
         assert!(store.row(&b).unwrap().is_some());
@@ -408,7 +521,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
         assert!(store
-            .delete_local_conversation(&a, numeric as u64, revision as u64, 0)
+            .delete_local_conversation(&a, numeric as u64, revision as u64, 0, 0)
             .is_err());
         store
             .db
@@ -423,7 +536,7 @@ mod tests {
             )
             .unwrap();
         assert!(store
-            .delete_local_conversation(&b, bn as u64, 0, 0)
+            .delete_local_conversation(&b, bn as u64, 0, 0, 0)
             .is_err());
     }
 }

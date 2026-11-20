@@ -5,6 +5,9 @@ use std::io::{BufRead, Write};
 pub(super) const MAX_FRAME_BYTES: usize = 12 * 1024 * 1024;
 pub(super) const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
+/// Exact local owned-chat deletion contract with mandatory context revision.
+pub const LOCAL_CONVERSATION_DELETION_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceCommand {
     StartNative {
@@ -151,7 +154,9 @@ pub enum WorkspaceCommand {
     Organize {
         changes: Vec<WorkspaceOrganization>,
     },
-    /// Local-only preparation read. Never an authorization to delete.
+    /// Local-only capability discovery. Never an authorization to delete.
+    ProbeLocalConversationDeletion,
+    /// Verify that one exact local chat can be reviewed for deletion.
     PrepareDeleteLocalConversation {
         id: ConversationId,
     },
@@ -161,6 +166,7 @@ pub enum WorkspaceCommand {
         expected_numeric_id: u64,
         expected_revision: u64,
         expected_draft_revision: u64,
+        expected_context_revision: u64,
     },
     Delete {
         id: ConversationId,
@@ -213,10 +219,15 @@ pub struct LocalConversationDeletionSnapshot {
     pub title: String,
     pub message_count: u64,
     pub draft_bytes: u64,
+    /// Zero means no saved context; positive values bind a blank saved context.
+    pub context_revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceReply {
+    LocalConversationDeletionCapability {
+        version: u32,
+    },
     LocalConversationDeletion {
         snapshot: LocalConversationDeletionSnapshot,
     },

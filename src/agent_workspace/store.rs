@@ -389,11 +389,13 @@ impl Store {
                 expected_numeric_id,
                 expected_revision,
                 expected_draft_revision,
+                expected_context_revision,
             } => self.delete_local_conversation(
                 &id,
                 expected_numeric_id,
                 expected_revision,
                 expected_draft_revision,
+                expected_context_revision,
             ),
             WorkspaceCommand::Delete { id } => {
                 self.ensure_idle(&id)?;
@@ -441,6 +443,7 @@ impl Store {
                 restore_draft,
             } => self.cancel(&receipt, restore_draft),
             WorkspaceCommand::StartNative { .. }
+            | WorkspaceCommand::ProbeLocalConversationDeletion
             | WorkspaceCommand::DeleteCliSession { .. }
             | WorkspaceCommand::InspectResult { .. }
             | WorkspaceCommand::InspectMission { .. }
