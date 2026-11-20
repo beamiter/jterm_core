@@ -141,6 +141,11 @@ pub(super) fn command_request(
     mut stream: UnixStream,
     command: WorkspaceCommand,
 ) -> Result<WorkspaceReply, String> {
+    let missing_reply = if matches!(&command, WorkspaceCommand::DeleteCliSession { .. }) {
+        "Session host closed without confirming deletion. Update an older session host and retry."
+    } else {
+        "Session host closed its response"
+    };
     let timeout = if matches!(&command, WorkspaceCommand::InspectMission { .. }) {
         120
     } else if matches!(&command, WorkspaceCommand::InspectResult { .. }) {
@@ -161,9 +166,7 @@ pub(super) fn command_request(
             command,
         },
     )?;
-    match read_frame::<Response>(&mut BufReader::new(stream))?
-        .ok_or("Session host closed its response")?
-    {
+    match read_frame::<Response>(&mut BufReader::new(stream))?.ok_or(missing_reply)? {
         Response::Reply(result) => *result,
         Response::Error(error) => Err(error),
         _ => Err("Unexpected workspace response".into()),

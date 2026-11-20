@@ -7,11 +7,14 @@ use crate::ai::{ChatSnapshot, ConversationSnapshot, Role, Turn};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::Duration;
 mod context;
+mod deleted_cli;
 mod hosted_api;
 mod hosted_native;
 mod mission;
 mod queue;
 mod search;
+
+pub(crate) use deleted_cli::filter_deleted_cli_sessions;
 
 const MAX_MESSAGE: usize = super::api::API_RESULT_BYTES;
 const MAX_DRAFT: usize = 64 * 1024;
@@ -92,6 +95,7 @@ impl Store {
         )
         .map_err(err)?;
         search::migrate(&db, version)?;
+        deleted_cli::migrate(&db)?;
         context::migrate(&db)?;
         queue::migrate(&db)?;
         mission::migrate(&db)?;
@@ -421,6 +425,7 @@ impl Store {
                 restore_draft,
             } => self.cancel(&receipt, restore_draft),
             WorkspaceCommand::StartNative { .. }
+            | WorkspaceCommand::DeleteCliSession { .. }
             | WorkspaceCommand::InspectResult { .. }
             | WorkspaceCommand::InspectMission { .. }
             | WorkspaceCommand::NativeCatalog { .. }

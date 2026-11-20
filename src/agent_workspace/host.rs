@@ -257,6 +257,36 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                         super::api_host::Disposition::Other(command) => command,
                     };
                     match command {
+                        WorkspaceCommand::DeleteCliSession { id, session } => {
+                            if session_id(&session)? != id {
+                                return Err("The provider session source changed. Refresh before deleting it.".into());
+                            }
+                            if runtimes
+                                .get(&id)
+                                .is_some_and(|r| r.snapshot.lock().state.is_live())
+                            {
+                                return Err(
+                                    "Stop the running CLI session before deleting it.".into()
+                                );
+                            }
+                            let _lease = Lease::acquire(&paths.lease(&id))?;
+                            let home = session
+                                .provider_home()
+                                .ok_or("Cannot identify the original provider home")?;
+                            if external_owner(
+                                &session.provider.label().to_ascii_lowercase(),
+                                &session.id,
+                                &home,
+                                &session.source,
+                            )
+                            .is_some()
+                            {
+                                return Err(
+                                    "Stop the running provider session before deleting it.".into(),
+                                );
+                            }
+                            store.delete_cli_session(&id)
+                        }
                         WorkspaceCommand::Refresh => store.rows().map(|mut rows| {
                             for row in &mut rows {
                                 project_runtime_row(row, &runtimes, &paths);
@@ -338,6 +368,9 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                     };
                     validate_launch(&launch)?;
                     let id = launch.row.id.clone();
+                    if store.cli_session_deleted(&id)? {
+                        return Err("This session was deleted from Agent Workspace.".into());
+                    }
                     if let Some(runtime) = runtimes.get(&id) {
                         if runtime.snapshot.lock().state.is_live() {
                             return attach(
@@ -363,7 +396,12 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                     if runtimes.len() >= MAX_RUNTIMES * 2 {
                         runtimes.retain(|_, r| r.snapshot.lock().state.is_live());
                     }
-                    if let Some(pid) = external_owner(&launch) {
+                    if let Some(pid) = external_owner(
+                        &launch.provider,
+                        &launch.native_id,
+                        &launch.provider_home,
+                        &launch.source,
+                    ) {
                         return Err(format!("External process {pid} owns this exact provider session. Close or stop it before resuming here."));
                     }
                     store.upsert_runtime_row(&launch.row)?;
@@ -1133,9 +1171,14 @@ fn resize(
 
 /// Provider CLI processes outside the host cannot be attached safely. Match
 /// exact argv IDs and provider homes, or an open authoritative history file.
-fn external_owner(launch: &ManagedLaunch) -> Option<u32> {
+fn external_owner(
+    provider: &str,
+    native_id: &str,
+    provider_home: &std::path::Path,
+    source: &std::path::Path,
+) -> Option<u32> {
     let entries = std::fs::read_dir("/proc").ok()?;
-    let canonical_source = launch.source.canonicalize().ok()?;
+    let canonical_source = source.canonicalize().ok();
     let mut fd_budget = 4096;
     for entry in entries.take(32768).flatten() {
         let name = entry.file_name();
@@ -1179,7 +1222,7 @@ fn external_owner(launch: &ManagedLaunch) -> Option<u32> {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        let provider_matches = if launch.provider == "codex" {
+        let provider_matches = if provider == "codex" {
             matches!(name, "codex" | "codex.js")
         } else {
             name == "claude" || (name == "cli.js" && program.contains("@anthropic-ai/claude-code/"))
@@ -1189,7 +1232,7 @@ fn external_owner(launch: &ManagedLaunch) -> Option<u32> {
         }
         let flags = &args[cli + 1..];
         let exact = flags.windows(2).any(|pair| {
-            pair[1] == launch.native_id
+            pair[1] == native_id
                 && (pair[0] == "resume"
                     || pair[0] == "--resume"
                     || pair[0] == "-r"
@@ -1201,7 +1244,7 @@ fn external_owner(launch: &ManagedLaunch) -> Option<u32> {
                 .ok()
                 .and_then(|f| f.take(128 * 1024).read_to_end(&mut env).ok())
                 .and_then(|_| {
-                    let variable = if launch.provider == "codex" {
+                    let variable = if provider == "codex" {
                         "CODEX_HOME="
                     } else {
                         "CLAUDE_CONFIG_DIR="
@@ -1214,7 +1257,7 @@ fn external_owner(launch: &ManagedLaunch) -> Option<u32> {
                         .find_map(|v| v.strip_prefix(variable).map(std::path::PathBuf::from))
                         .or_else(|| {
                             envs.iter().find_map(|v| v.strip_prefix("HOME=")).map(|h| {
-                                std::path::PathBuf::from(h).join(if launch.provider == "codex" {
+                                std::path::PathBuf::from(h).join(if provider == "codex" {
                                     ".codex"
                                 } else {
                                     ".claude"
@@ -1222,18 +1265,18 @@ fn external_owner(launch: &ManagedLaunch) -> Option<u32> {
                             })
                         })
                 });
-            if home.is_none_or(|home| home.canonicalize().unwrap_or(home) == launch.provider_home) {
+            if home.is_none_or(|home| home.canonicalize().unwrap_or(home) == provider_home) {
                 return Some(pid);
             }
         }
-        if fd_budget > 0 {
+        if fd_budget > 0 && canonical_source.is_some() {
             if let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) {
                 for fd in fds.take(256).flatten() {
                     if fd_budget == 0 {
                         break;
                     }
                     fd_budget -= 1;
-                    if std::fs::read_link(fd.path()).ok().as_ref() == Some(&canonical_source) {
+                    if std::fs::read_link(fd.path()).ok() == canonical_source {
                         return Some(pid);
                     }
                 }

@@ -154,6 +154,11 @@ pub enum WorkspaceCommand {
     Delete {
         id: ConversationId,
     },
+    /// Remove local workspace evidence for one source-qualified CLI session.
+    DeleteCliSession {
+        id: ConversationId,
+        session: Box<crate::agent_sessions::AgentSession>,
+    },
     History {
         id: ConversationId,
         before: Option<u64>,

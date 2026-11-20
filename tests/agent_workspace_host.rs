@@ -335,6 +335,45 @@ fn process_live(pid: u32) -> bool {
 }
 
 #[test]
+fn cli_deletion_checks_identity_and_refuses_a_running_runtime() {
+    let h = Harness::new();
+    let client = h.client();
+    let row = WorkspaceRow::from_agent(&h.session).unwrap();
+    let delete = |id| WorkspaceCommand::DeleteCliSession {
+        id,
+        session: Box::new(h.session.clone()),
+    };
+    request(
+        &client,
+        WorkspaceCommand::IndexSessions {
+            sessions: vec![row.clone()],
+        },
+    )
+    .unwrap();
+    assert!(request(&client, delete(ConversationId("different source".into()))).is_err());
+    let mut terminal = h.attach();
+    terminal.wait_for("READY");
+    assert!(request(&client, delete(row.id.clone()))
+        .unwrap_err()
+        .contains("running CLI session"));
+    request(&client, WorkspaceCommand::Stop { id: row.id.clone() }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while h.runtime().state.is_live() {
+        assert!(Instant::now() < deadline, "runtime did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    terminal.wait_exit();
+    assert!(matches!(
+        request(&client, delete(row.id)).unwrap(),
+        WorkspaceReply::Ack
+    ));
+    let mut stale = h.attach();
+    stale.wait_for("deleted from Agent Workspace");
+    assert_ne!(stale.wait_exit(), 0);
+    assert_eq!(std::fs::read(&h.session.source).unwrap(), b"{}\n");
+}
+
+#[test]
 fn real_host_survives_client_exit_reattaches_once_and_stops_descendants() {
     let h = Harness::new();
     let mut first = h.attach();

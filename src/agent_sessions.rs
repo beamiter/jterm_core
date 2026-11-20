@@ -289,6 +289,9 @@ impl SessionCatalog {
                 }
             }
         }
+        if crate::agent_workspace::filter_deleted_cli_sessions(&mut catalog.sessions).is_err() {
+            catalog.warn("Workspace session deletions could not be read. Refresh to try again.");
+        }
         catalog
     }
     pub fn discover_with_roots(codex_home: &Path, claude_home: &Path) -> Self {

@@ -122,6 +122,7 @@ pub use queue::{
 pub use result::*;
 pub use search::*;
 pub use ssh::WorkspaceSshHost;
+pub(crate) use store::filter_deleted_cli_sessions;
 
 /// Host wire version. Mission commands are additive: legacy commands remain
 /// usable with a live V2 host, which does not know the new command variants.

@@ -144,8 +144,11 @@ recovered while the host remains alive; PID reuse alone grants no ownership.
 
 Older-history pages contain complete user/assistant pairs. Cursors are returned
 only when more history exists. Reading older pages does not enlarge model
-context. Rename, pin, tag, archive and delete are shared operations. Deleting
-conversation metadata does not delete original provider CLI files.
+context. Rename, pin, tag, archive and delete are shared operations. Deleting a
+CLI session removes its local workspace entry, context and indexed history. A
+source-qualified removal keeps it out of future discovery in all four
+frontends. Its original Codex or Claude history remains on disk. A live
+session or a retained runtime lease must be stopped before deletion.
 
 API credentials remain in each frontend's existing API configuration. The
 resolved request configuration crosses the private same-user socket and worker
