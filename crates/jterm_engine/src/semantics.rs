@@ -336,14 +336,11 @@ pub fn dispatch_local(
                         effects.push(Effect::Reply(b"\x1b[0n".to_vec()));
                     } else {
                         let (row, col) = reported_cursor_position(screen);
-                        let prefix = if *private_prefix == Some(b'?') {
-                            "?"
-                        } else {
-                            ""
-                        };
-                        effects.push(Effect::Reply(
-                            format!("\x1b[{prefix}{row};{col}R").into_bytes(),
-                        ));
+                        effects.push(Effect::Reply(cursor_position_wire(
+                            row,
+                            col,
+                            *private_prefix == Some(b'?'),
+                        )));
                     }
                 }
                 _ => unreachable!(),
@@ -529,6 +526,32 @@ fn handle_sgr(
         }
         i += 1;
     }
+}
+
+fn cursor_position_wire(row: usize, col: usize, private: bool) -> Vec<u8> {
+    let prefix = if private { "?" } else { "" };
+    format!("\x1b[{prefix}{row};{col}R").into_bytes()
+}
+
+/// Format a cursor reply under FrostLegacyV1. Frost reports the absolute,
+/// occupied cell even with DECOM or deferred wrap. Preserve the historical
+/// u16 narrowing for public CPR but not private DECXCPR. Coordinates are
+/// zero based and come from Frost's bounded screen. The caller keeps DSR
+/// admission, ordering and other host queries.
+pub fn frost_legacy_cursor_position_reply(
+    cursor_row: usize,
+    cursor_col: usize,
+    private: bool,
+) -> Vec<u8> {
+    let (row, col) = if private {
+        (cursor_row.saturating_add(1), cursor_col.saturating_add(1))
+    } else {
+        (
+            (cursor_row as u16).wrapping_add(1) as usize,
+            (cursor_col as u16).wrapping_add(1) as usize,
+        )
+    };
+    cursor_position_wire(row, col, private)
 }
 
 /// Cursor position reported on the wire, including the Last Column Flag.
