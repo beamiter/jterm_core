@@ -1,6 +1,14 @@
 use super::hyperlink::HyperlinkId;
 use smallvec::SmallVec;
 
+#[derive(Clone, Copy)]
+enum MarginOrigin {
+    /// A newly allocated right cell with exact default attributes.
+    VirginDefault,
+    Unknown,
+    WideGap,
+}
+
 /// 连续内存网格存储 - 优化内存局部性和缓存命中率
 /// 内存布局：`cells[row * cols + col]` 对应 `grid[row][col]`。
 #[derive(Clone)]
@@ -8,10 +16,13 @@ pub struct TerminalGrid {
     cells: Vec<TerminalCell>,
     rows: usize,
     cols: usize,
+    /// Legacy wrap bits. Hosts opting into certified archive gaps must use
+    /// engine structural edits, not rewrite these bits independently of cells.
     pub row_wrapped: Vec<bool>,
     /// Stable identity travels with retained physical rows across structural
     /// moves. `UNTRACKED` is fail-closed after allocator exhaustion.
     row_ids: Vec<RawRowId>,
+    margin_origin: Vec<MarginOrigin>,
 }
 
 impl TerminalGrid {
@@ -22,11 +33,13 @@ impl TerminalGrid {
             cols,
             row_wrapped: vec![false; rows],
             row_ids: vec![RawRowId::UNTRACKED; rows],
+            margin_origin: vec![MarginOrigin::VirginDefault; rows],
         }
     }
 
     /// Flat cells with a fixed length. Hosts must preserve wide-cell invariants.
     pub fn cells_mut(&mut self) -> &mut [TerminalCell] {
+        self.margin_origin.fill(MarginOrigin::Unknown);
         &mut self.cells
     }
 
@@ -48,6 +61,9 @@ impl TerminalGrid {
 
     #[inline]
     pub fn get_mut(&mut self, row: usize, col: usize) -> &mut TerminalCell {
+        if col == self.cols.saturating_sub(1) {
+            self.margin_origin[row] = MarginOrigin::Unknown;
+        }
         &mut self.cells[row * self.cols + col]
     }
 
@@ -75,6 +91,76 @@ impl TerminalGrid {
             .unwrap_or(RawRowId::UNTRACKED)
     }
 
+    /// Record exactly one wrap departure. An ordinary or ambiguous wrap must
+    /// not carry an earlier proof through a new logical row relationship.
+    pub(crate) fn record_wrap_margin(&mut self, row: usize, col: usize, early_wide: bool) {
+        self.margin_origin[row] = if early_wide
+            && self.cols >= 2
+            && u16::try_from(self.cols).is_ok()
+            && col == self.cols - 1
+            && matches!(self.margin_origin[row], MarginOrigin::VirginDefault)
+            && *self.get(row, col) == TerminalCell::default()
+        {
+            MarginOrigin::WideGap
+        } else {
+            MarginOrigin::Unknown
+        };
+    }
+
+    pub(crate) fn row_cells_mut(
+        &mut self,
+        row: usize,
+        cols: std::ops::Range<usize>,
+    ) -> &mut [TerminalCell] {
+        if cols.end == self.cols && !cols.is_empty() {
+            self.margin_origin[row] = MarginOrigin::Unknown;
+        }
+        let base = row * self.cols;
+        &mut self.cells[base + cols.start..base + cols.end]
+    }
+
+    pub(crate) fn archive_row(&self, row: usize, allow_margin: bool) -> ScrollbackLine {
+        let wrapped = self.row_wrapped[row];
+        let mut line = ScrollbackLine::compress(&self[row], wrapped);
+        line.set_raw_row_id(self.row_id(row));
+        if allow_margin && wrapped && matches!(self.margin_origin[row], MarginOrigin::WideGap) {
+            line.synthetic_margin_gap = true;
+        }
+        line
+    }
+
+    pub(crate) fn copy_region_rows(
+        &mut self,
+        source: std::ops::Range<usize>,
+        target: usize,
+        preserve_margin: bool,
+    ) {
+        self.cells.copy_within(
+            source.start * self.cols..source.end * self.cols,
+            target * self.cols,
+        );
+        if preserve_margin {
+            self.margin_origin.copy_within(source, target);
+        }
+    }
+
+    pub(crate) fn fill_region_rows(&mut self, rows: std::ops::Range<usize>, blank: TerminalCell) {
+        self.cells[rows.start * self.cols..rows.end * self.cols].fill(blank);
+        self.margin_origin[rows].fill(Self::new_margin_origin(blank));
+    }
+
+    pub(crate) fn forget_region_margins(&mut self, rows: std::ops::Range<usize>) {
+        self.margin_origin[rows].fill(MarginOrigin::Unknown);
+    }
+
+    fn new_margin_origin(blank: TerminalCell) -> MarginOrigin {
+        if blank == TerminalCell::default() {
+            MarginOrigin::VirginDefault
+        } else {
+            MarginOrigin::Unknown
+        }
+    }
+
     /// 获取所有行为 `Vec<Vec<_>>`（用于兼容旧代码）。
     pub fn to_vec(&self) -> Vec<Vec<TerminalCell>> {
         self.cells
@@ -88,6 +174,7 @@ impl TerminalGrid {
         if row >= self.rows || col >= self.cols {
             return;
         }
+        self.margin_origin[row] = MarginOrigin::Unknown;
         let start = row * self.cols;
         self.cells
             .copy_within(start + col..start + self.cols - 1, start + col + 1);
@@ -99,6 +186,7 @@ impl TerminalGrid {
         if row >= self.rows || col >= self.cols {
             return;
         }
+        self.margin_origin[row] = MarginOrigin::Unknown;
         let start = row * self.cols;
         self.cells
             .copy_within(start + col + 1..start + self.cols, start + col);
@@ -118,6 +206,7 @@ impl TerminalGrid {
         }
         let last = row * self.cols + self.cols - 1;
         if self.cells[last].flags.wide() {
+            self.margin_origin[row] = MarginOrigin::Unknown;
             self.cells[last] = blank;
         }
     }
@@ -146,6 +235,17 @@ impl TerminalGrid {
         let mut new_row_ids = vec![RawRowId::UNTRACKED; new_rows];
         new_row_ids[..copy_rows].copy_from_slice(&self.row_ids[..copy_rows]);
         self.row_ids = new_row_ids;
+        if self.cols != new_cols {
+            // Width changes invalidate both the old margin coordinate and proof
+            // for the new last cell; do not infer provenance from its value.
+            self.margin_origin = vec![MarginOrigin::Unknown; new_rows];
+        } else {
+            self.margin_origin
+                .resize(new_rows, Self::new_margin_origin(default_cell));
+            if new_rows < self.rows && new_rows > 0 {
+                self.margin_origin[new_rows - 1] = MarginOrigin::Unknown;
+            }
+        }
         self.rows = new_rows;
         self.cols = new_cols;
     }
@@ -158,6 +258,7 @@ impl TerminalGrid {
         }
         if n >= self.rows {
             self.cells.fill(blank);
+            self.margin_origin.fill(Self::new_margin_origin(blank));
             for w in self.row_wrapped.iter_mut() {
                 *w = false;
             }
@@ -168,6 +269,8 @@ impl TerminalGrid {
         self.cells.copy_within(n * cols.., 0);
         let keep = (self.rows - n) * cols;
         self.cells[keep..].fill(blank);
+        self.margin_origin.copy_within(n.., 0);
+        self.margin_origin[self.rows - n..].fill(Self::new_margin_origin(blank));
         self.row_wrapped.copy_within(n.., 0);
         for w in self.row_wrapped[self.rows - n..].iter_mut() {
             *w = false;
@@ -178,6 +281,7 @@ impl TerminalGrid {
 
     /// 获取mut访问所有行
     pub fn iter_mut(&mut self) -> std::slice::ChunksMut<'_, TerminalCell> {
+        self.margin_origin.fill(MarginOrigin::Unknown);
         self.cells.chunks_mut(self.cols)
     }
 
@@ -197,6 +301,7 @@ impl std::ops::Index<usize> for TerminalGrid {
 
 impl std::ops::IndexMut<usize> for TerminalGrid {
     fn index_mut(&mut self, row: usize) -> &mut [TerminalCell] {
+        self.margin_origin[row] = MarginOrigin::Unknown;
         let start = row * self.cols;
         &mut self.cells[start..start + self.cols]
     }
@@ -454,6 +559,7 @@ impl RawRowId {
 pub struct ScrollbackLine {
     data: CompressedLineData,
     pub is_wrapped: bool,
+    synthetic_margin_gap: bool,
     cols: u16,
     /// Number of cells retained when historical soft-wrapped rows are joined
     /// before being split at the current terminal width.  Computing this when
@@ -527,6 +633,7 @@ impl ScrollbackLine {
             ScrollbackLine {
                 data: CompressedLineData::Plain(text, trailing_blanks as u16),
                 is_wrapped,
+                synthetic_margin_gap: false,
                 cols,
                 reflow_content_len,
                 reflow_wide_continuations,
@@ -537,11 +644,22 @@ impl ScrollbackLine {
             ScrollbackLine {
                 data: CompressedLineData::Encoded(encoded),
                 is_wrapped,
+                synthetic_margin_gap: false,
                 cols,
                 reflow_content_len,
                 reflow_wide_continuations,
                 raw_row_id: RawRowId::UNTRACKED,
             }
+        }
+    }
+
+    /// Physical column certified as a synthetic early-wide-wrap gap.
+    /// Unlike the projection reflow estimate, no visible-cell heuristic is used.
+    pub fn synthetic_margin_gap(&self) -> Option<usize> {
+        if self.synthetic_margin_gap && self.is_wrapped {
+            self.columns().checked_sub(1)
+        } else {
+            None
         }
     }
 

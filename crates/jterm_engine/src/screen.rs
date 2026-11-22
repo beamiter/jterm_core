@@ -215,6 +215,37 @@ impl ScreenState {
         capture_outgoing: bool,
         allocate_id: impl FnMut() -> RawRowId,
     ) -> VerticalMutation {
+        self.vertical_motion_impl(motion, capture_outgoing, allocate_id, false)
+    }
+
+    /// Perform an early wrap and attach archive-only proof when it leaves a
+    /// virgin margin in a full-height region. Opt-in callers must pass the
+    /// width of the admitted printable after resolving deferred wrap and
+    /// checking DECAWM via `prepare_character_width`. Consume returned region
+    /// effects in order, then write that printable to the next row before
+    /// handling another input event. Host history admission is unchanged.
+    pub fn vertical_early_wide_wrap(
+        &mut self,
+        width: usize,
+        capture_outgoing: bool,
+        allocate_id: impl FnMut() -> RawRowId,
+    ) -> VerticalMutation {
+        let margin_candidate = width == 2 && !self.pending_wrap;
+        self.vertical_motion_impl(
+            VerticalMotion::Wrap,
+            capture_outgoing,
+            allocate_id,
+            margin_candidate,
+        )
+    }
+
+    fn vertical_motion_impl(
+        &mut self,
+        motion: VerticalMotion,
+        capture_outgoing: bool,
+        allocate_id: impl FnMut() -> RawRowId,
+        margin_candidate: bool,
+    ) -> VerticalMutation {
         if motion != VerticalMotion::Wrap {
             self.pending_wrap = false;
         }
@@ -224,6 +255,17 @@ impl ScreenState {
             width: self.grid.row_len(),
         });
         if motion == VerticalMotion::Wrap {
+            let next_row_exists = self.cursor_row + 1 < self.grid.rows();
+            let scrolls = self.cursor_row == self.scroll_region_bottom
+                && self.scroll_region_top <= self.scroll_region_bottom
+                && self.scroll_region_bottom < self.grid.rows();
+            let full_region = self.scroll_region_top == 0
+                && self.scroll_region_bottom == self.grid.rows().saturating_sub(1);
+            self.grid.record_wrap_margin(
+                self.cursor_row,
+                self.cursor_col,
+                margin_candidate && full_region && (next_row_exists || scrolls),
+            );
             self.grid.row_wrapped[self.cursor_row] = true;
             self.cursor_col = 0;
         }
@@ -421,13 +463,10 @@ impl ScreenState {
             self.scroll_region_top == 0 && self.scroll_region_bottom >= old_rows.saturating_sub(1);
         let blank = self.create_blank_cell();
         let hidden_blank = TerminalCell::default();
+        let preserve_margin =
+            self.scroll_region_top == 0 && self.scroll_region_bottom == old_rows - 1;
         let transferred = (0..transfer_top)
-            .map(|row| {
-                let mut line =
-                    ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
-                line.set_raw_row_id(self.grid.row_id(row));
-                line
-            })
+            .map(|row| self.grid.archive_row(row, preserve_margin))
             .collect();
         self.grid.scroll_up_by(transfer_top, blank);
         self.cursor_row -= transfer_top;
@@ -559,15 +598,13 @@ impl ScreenState {
             RegionDirection::Up => top..top + count,
             RegionDirection::Down => end - count..end,
         };
+        let preserve_margin =
+            move_wraps && direction == RegionDirection::Up && top == 0 && end == self.grid.rows();
         let removed = removed_rows
             .map(|row| {
                 let row_id = self.grid.row_id(row);
-                let captured = capture_outgoing.then(|| {
-                    let mut line =
-                        ScrollbackLine::compress(&self.grid[row], self.grid.row_wrapped[row]);
-                    line.set_raw_row_id(row_id);
-                    line
-                });
+                let captured =
+                    capture_outgoing.then(|| self.grid.archive_row(row, preserve_margin));
                 RemovedRow {
                     original_row: row,
                     row_id,
@@ -576,14 +613,12 @@ impl ScreenState {
             })
             .collect();
 
-        let cols = self.grid.cols();
         let blank = self.create_blank_cell();
         let blank_rows = match direction {
             RegionDirection::Up => {
                 if count < height {
                     self.grid
-                        .cells_mut()
-                        .copy_within((top + count) * cols..end * cols, top * cols);
+                        .copy_region_rows(top + count..end, top, preserve_margin);
                     if move_wraps {
                         self.grid.row_wrapped.copy_within(top + count..end, top);
                     }
@@ -594,8 +629,7 @@ impl ScreenState {
             RegionDirection::Down => {
                 if count < height {
                     self.grid
-                        .cells_mut()
-                        .copy_within(top * cols..(end - count) * cols, (top + count) * cols);
+                        .copy_region_rows(top..end - count, top + count, preserve_margin);
                     if move_wraps {
                         self.grid
                             .row_wrapped
@@ -608,7 +642,11 @@ impl ScreenState {
                 top..top + count
             }
         };
-        self.grid.cells_mut()[blank_rows.start * cols..blank_rows.end * cols].fill(blank);
+        self.grid.fill_region_rows(blank_rows.clone(), blank);
+        if !preserve_margin {
+            // IL/DL and partial/moved boundaries can break logical adjacency.
+            self.grid.forget_region_margins(top.saturating_sub(1)..end);
+        }
         if move_wraps {
             self.grid.row_wrapped[blank_rows.clone()].fill(false);
         }
@@ -993,7 +1031,9 @@ impl ScreenState {
         let mut flags = self.current_flags;
         flags.set_wide(false);
         flags.set_wide_continuation(false);
-        for (cell, &byte) in self.grid[row][col..col + count]
+        for (cell, &byte) in self
+            .grid
+            .row_cells_mut(row, col..col + count)
             .iter_mut()
             .zip(&bytes[..count])
         {
