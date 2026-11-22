@@ -4,7 +4,8 @@ use super::model::*;
 use super::ownership::{private_file, process_matches, Lease, Paths};
 use super::protocol::{WorkspaceCommand, WorkspaceReply};
 use crate::ai::{ChatSnapshot, ConversationSnapshot, Role, Turn};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::path::Path;
 use std::time::Duration;
 mod context;
 mod deleted_cli;
@@ -26,11 +27,56 @@ pub(super) struct Store {
     paths: Paths,
 }
 
+fn workspace_schema_version(path: &Path) -> Result<i64, String> {
+    // The caller holds the writer lease. Inspect the live SQLite view, including
+    // any committed WAL frames, before opening a writable SQLite connection.
+    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+    db.busy_timeout(Duration::from_secs(2)).map_err(err)?;
+    let has_version: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='schema_version' COLLATE NOCASE)",
+            [], |row| row.get(0),
+        )
+        .map_err(err)?;
+    if has_version {
+        let mut statement = db
+            .prepare("SELECT version FROM schema_version LIMIT 2")
+            .map_err(err)?;
+        let mut rows = statement.query([]).map_err(err)?;
+        if let Some(row) = rows.next().map_err(err)? {
+            let version: i64 = row.get(0).map_err(err)?;
+            if !(1..=6).contains(&version) {
+                return Err(format!(
+                    "Unsupported Agent Workspace database version {version}"
+                ));
+            }
+            if rows.next().map_err(err)?.is_some() {
+                return Err("Ambiguous Agent Workspace database version".into());
+            }
+            return Ok(version);
+        }
+    }
+    // A new database can be empty or interrupted between creating the version
+    // table and inserting its first row. Every initialized workspace has a version.
+    let empty: bool = db
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE type<>'table' OR name<>'schema_version' COLLATE NOCASE)",
+            [], |row| row.get(0),
+        )
+        .map_err(err)?;
+    if empty {
+        Ok(1)
+    } else {
+        Err("Missing Agent Workspace database version".into())
+    }
+}
+
 impl Store {
     pub fn open(paths: &Paths) -> Result<Self, String> {
         let writer = Lease::acquire(&paths.state.join("writer.lock"))?;
         let path = paths.state.join("workspace.sqlite3");
         drop(private_file(&path)?);
+        let version = workspace_schema_version(&path)?;
         let db = Connection::open(&path).map_err(err)?;
         db.busy_timeout(Duration::from_secs(2)).map_err(err)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -57,16 +103,6 @@ impl Store {
                 conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                 view TEXT NOT NULL, position REAL NOT NULL, updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY(conversation_id,view));").map_err(err)?;
-        let version: i64 = db
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
-                r.get(0)
-            })
-            .map_err(err)?;
-        if !(1..=6).contains(&version) {
-            return Err(format!(
-                "Unsupported Agent Workspace database version {version}"
-            ));
-        }
         if version == 1 {
             let has_owner = db
                 .prepare("SELECT owner_pid FROM conversations LIMIT 0")
@@ -1016,6 +1052,81 @@ fn err(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unknown_workspace_schemas_without_modifying_the_database() {
+        let version_table = "CREATE TABLE schema_version(version INTEGER NOT NULL);";
+        for (schema, reason) in [
+            (
+                format!("{version_table} INSERT INTO schema_version VALUES(7)"),
+                "database version 7",
+            ),
+            (
+                format!("{version_table} INSERT INTO schema_version VALUES(1),(6)"),
+                "Ambiguous",
+            ),
+            (version_table.to_string(), "Missing"),
+            (String::new(), "Missing"),
+        ] {
+            let paths =
+                Paths::at(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap();
+            let path = paths.state.join("workspace.sqlite3");
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE retained(data); INSERT INTO retained VALUES('keep');")
+                .unwrap();
+            db.execute_batch(&schema).unwrap();
+            drop(db);
+            let before = std::fs::read(&path).unwrap();
+            let error = Store::open(&paths).err().unwrap();
+            assert!(error.contains(reason), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!paths.state.join("workspace.sqlite3-wal").exists());
+            std::fs::remove_dir_all(paths.state).unwrap();
+        }
+    }
+
+    #[test]
+    fn reads_the_schema_from_uncheckpointed_wal_frames() {
+        let paths = Paths::at(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap();
+        let path = paths.state.join("workspace.sqlite3");
+        let wal = paths.state.join("workspace.sqlite3-wal");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE schema_version(version INTEGER NOT NULL); INSERT INTO schema_version VALUES(6);
+            PRAGMA wal_checkpoint(TRUNCATE); UPDATE schema_version SET version=7;").unwrap();
+        let before = (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap());
+        assert!(!before.1.is_empty());
+        let error = Store::open(&paths).err().unwrap();
+        assert!(error.contains("database version 7"), "{error}");
+        assert_eq!(
+            (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap()),
+            before
+        );
+        drop(db);
+        std::fs::remove_dir_all(paths.state).unwrap();
+    }
+
+    #[test]
+    fn resumes_first_initialization_after_creating_the_version_table() {
+        let paths = Paths::at(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())).unwrap();
+        let db = Connection::open(paths.state.join("workspace.sqlite3")).unwrap();
+        db.execute_batch("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            .unwrap();
+        drop(db);
+        let mut store = Store::open(&paths).unwrap();
+        create(&mut store);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT version FROM schema_version", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        drop(store);
+        std::fs::remove_dir_all(paths.state).unwrap();
+    }
+
     #[test]
     fn bundled_sqlite_is_patched_and_preserves_unsigned_row_decoding() {
         // RUSTSEC-2026-0459 is fixed by SQLite 3.54.0. Check the linked

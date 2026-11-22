@@ -692,11 +692,11 @@ impl NativeManager {
                 }
                 let task = job.tasks.get(task_id).ok_or("Saved task is unavailable")?;
                 let current = crate::agent_task::worktree::capture_task_review(task)?;
-                if !job
+                if job
                     .snapshot
                     .review_baseline
                     .as_ref()
-                    .is_some_and(|baseline| baseline.fingerprint == current.fingerprint)
+                    .is_none_or(|baseline| baseline.fingerprint != current.fingerprint)
                 {
                     return Err("The saved draft worktree changed. Restore its inspected contents or prepare a new draft.".into());
                 }
