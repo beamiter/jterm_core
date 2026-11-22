@@ -1,5 +1,54 @@
 use super::hyperlink::HyperlinkId;
+use crate::graphemes::{RowClusters, MAX_CLUSTER_BYTES};
 use smallvec::SmallVec;
+use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionDirection {
+    Up,
+    Down,
+}
+
+/// How a physical row shift treats the legacy wrap flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionWrapPolicy {
+    MoveWithRows,
+    KeepPhysicalIndices,
+}
+
+/// Wide-cell compatibility when a character edit changes row coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WideCellEditPolicy {
+    /// Repair pairs split by the affected range or the edge of the row.
+    RepairSplitPairs,
+    /// Clear a complete pair when either edit boundary touches it.
+    ClearBoundaryPairs,
+}
+
+/// Edge repair and metadata rules for an in-row ASCII overwrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsciiOverwritePolicy {
+    /// Inspect adjacent cells and preserve untouched row metadata.
+    SharedScreen,
+    /// Inspect the overwritten edge cells and invalidate the mutable row view.
+    FrostLegacy,
+}
+
+/// Source of the selective-erase protection bit on a wide continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WideContinuationProtection {
+    FromLead,
+    FromBlank,
+}
+
+/// Explicit underline color for a half-open range of physical columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnderlineColorRun {
+    pub start: u16,
+    pub end: u16,
+    pub color: Color,
+}
 
 #[derive(Clone, Copy)]
 enum MarginOrigin {
@@ -7,6 +56,27 @@ enum MarginOrigin {
     VirginDefault,
     Unknown,
     WideGap,
+}
+
+/// Reversible footprint of a glyph whose presentation can change as bytes arrive.
+pub(crate) struct PrintCheckpoint {
+    cols: Range<usize>,
+    cells: SmallVec<[TerminalCell; 4]>,
+    colors: SmallVec<[Color; 4]>,
+    clusters: Option<Arc<RowClusters>>,
+    margin_origin: MarginOrigin,
+}
+
+pub(crate) struct WrapCheckpoint {
+    row: usize,
+    wrapped: bool,
+    margin_origin: MarginOrigin,
+}
+
+impl PrintCheckpoint {
+    pub(crate) fn cluster_row(&self) -> Option<&RowClusters> {
+        self.clusters.as_deref()
+    }
 }
 
 /// 连续内存网格存储 - 优化内存局部性和缓存命中率
@@ -23,6 +93,10 @@ pub struct TerminalGrid {
     /// moves. `UNTRACKED` is fail-closed after allocator exhaustion.
     row_ids: Vec<RawRowId>,
     margin_origin: Vec<MarginOrigin>,
+    // Allocate the row table on first colored output, and allocate cells only
+    // for rows with explicit decoration. The base cell stays 16 bytes.
+    underline_colors: Vec<Option<Vec<Color>>>,
+    clusters: Vec<Option<Arc<RowClusters>>>,
 }
 
 impl TerminalGrid {
@@ -34,12 +108,16 @@ impl TerminalGrid {
             row_wrapped: vec![false; rows],
             row_ids: vec![RawRowId::UNTRACKED; rows],
             margin_origin: vec![MarginOrigin::VirginDefault; rows],
+            underline_colors: Vec::new(),
+            clusters: Vec::new(),
         }
     }
 
     /// Flat cells with a fixed length. Hosts must preserve wide-cell invariants.
     pub fn cells_mut(&mut self) -> &mut [TerminalCell] {
         self.margin_origin.fill(MarginOrigin::Unknown);
+        self.underline_colors = Vec::new();
+        self.clusters = Vec::new();
         &mut self.cells
     }
 
@@ -64,7 +142,168 @@ impl TerminalGrid {
         if col == self.cols.saturating_sub(1) {
             self.margin_origin[row] = MarginOrigin::Unknown;
         }
+        self.set_underline_color(row, col..col + 1, Color::Default);
+        self.erase_clusters(row, col..col + 1);
         &mut self.cells[row * self.cols + col]
+    }
+
+    pub(crate) fn cluster_row(&self, row: usize) -> Option<&Arc<RowClusters>> {
+        self.clusters.get(row)?.as_ref()
+    }
+
+    pub(crate) fn cluster_text(&self, row: usize, col: usize) -> Option<&str> {
+        self.cluster_row(row)?.text(col)
+    }
+
+    pub(crate) fn set_cluster_text(
+        &mut self,
+        row: usize,
+        col: usize,
+        text: &str,
+    ) -> Option<Arc<str>> {
+        if text.len() > MAX_CLUSTER_BYTES
+            || self
+                .cluster_row(row)
+                .is_some_and(|line| !line.can_store(col, text.len()))
+        {
+            return None;
+        }
+        self.clusters.resize_with(self.rows, || None);
+        let line = self.clusters[row].get_or_insert_with(Arc::default);
+        let text: Arc<str> = Arc::from(text);
+        Arc::make_mut(line).set(col, text.clone());
+        Some(text)
+    }
+
+    fn edit_clusters(&mut self, row: usize, edit: impl FnOnce(&mut RowClusters)) {
+        let Some(slot) = self.clusters.get_mut(row) else {
+            return;
+        };
+        let Some(line) = slot else { return };
+        let line = Arc::make_mut(line);
+        edit(line);
+        if line.is_empty() {
+            *slot = None;
+        }
+    }
+
+    pub(crate) fn erase_clusters(&mut self, row: usize, cols: Range<usize>) {
+        if self
+            .cluster_row(row)
+            .is_some_and(|line| line.end() > cols.start)
+        {
+            self.edit_clusters(row, |line| line.erase(cols));
+        }
+    }
+
+    pub(crate) fn checkpoint_print(
+        &self,
+        row: usize,
+        col: usize,
+        width: usize,
+        insert: bool,
+    ) -> PrintCheckpoint {
+        // Insert mode may drop old suffix cells or clear a split wide pair at
+        // either edge, so its reversible footprint includes the complete row.
+        let cols = if insert {
+            0..self.cols
+        } else {
+            self.expanded_wide_span(row, col..col + width)
+        };
+        let cells = SmallVec::from_slice(&self[row][cols.clone()]);
+        let colors = self
+            .underline_colors(row)
+            .get(cols.clone())
+            .map_or_else(SmallVec::new, SmallVec::from_slice);
+        PrintCheckpoint {
+            cols,
+            cells,
+            colors,
+            clusters: self.cluster_row(row).cloned(),
+            margin_origin: self.margin_origin[row],
+        }
+    }
+
+    pub(crate) fn restore_print(&mut self, row: usize, checkpoint: PrintCheckpoint) {
+        let start = row * self.cols + checkpoint.cols.start;
+        self.cells[start..start + checkpoint.cells.len()].copy_from_slice(&checkpoint.cells);
+        if let Some(Some(colors)) = self.underline_colors.get_mut(row) {
+            if checkpoint.colors.is_empty() {
+                colors[checkpoint.cols].fill(Color::Default);
+            } else {
+                colors[checkpoint.cols].copy_from_slice(&checkpoint.colors);
+            }
+        }
+        // The live row table persists after an empty row's last cluster dies.
+        if let Some(slot) = self.clusters.get_mut(row) {
+            *slot = checkpoint.clusters;
+        }
+        self.margin_origin[row] = checkpoint.margin_origin;
+    }
+
+    pub(crate) fn checkpoint_wrap(&self, row: usize) -> WrapCheckpoint {
+        WrapCheckpoint {
+            row,
+            wrapped: self.row_wrapped[row],
+            margin_origin: self.margin_origin[row],
+        }
+    }
+
+    pub(crate) fn restore_wrap(&mut self, checkpoint: WrapCheckpoint) {
+        self.row_wrapped[checkpoint.row] = checkpoint.wrapped;
+        self.margin_origin[checkpoint.row] = checkpoint.margin_origin;
+    }
+
+    pub(crate) fn underline_colors(&self, row: usize) -> &[Color] {
+        self.underline_colors
+            .get(row)
+            .and_then(Option::as_deref)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn underline_color_runs(
+        &self,
+        row: usize,
+    ) -> impl Iterator<Item = UnderlineColorRun> + '_ {
+        self.underline_colors(row)
+            .chunk_by(|left, right| left == right)
+            .scan(0, |column, cells| {
+                let start = *column;
+                *column += cells.len();
+                Some((start, *column, cells[0]))
+            })
+            .filter_map(|(start, end, color)| {
+                (color != Color::Default).then_some(UnderlineColorRun {
+                    start: start as u16,
+                    end: end as u16,
+                    color,
+                })
+            })
+    }
+
+    pub(crate) fn set_underline_color(&mut self, row: usize, cols: Range<usize>, color: Color) {
+        if color != Color::Default {
+            debug_assert!(u16::try_from(self.cols).is_ok());
+            self.underline_colors.resize_with(self.rows, || None);
+            self.underline_colors[row].get_or_insert_with(|| vec![Color::Default; self.cols])[cols]
+                .fill(color);
+        } else if let Some(Some(line)) = self.underline_colors.get_mut(row) {
+            line[cols].fill(Color::Default);
+        }
+    }
+
+    fn shift_underline_colors(&mut self, row: usize, col: usize, count: usize, insert: bool) {
+        if let Some(Some(line)) = self.underline_colors.get_mut(row) {
+            let tail = &mut line[col..];
+            let retained = tail.len() - count;
+            if insert {
+                tail.copy_within(..retained, count);
+                tail[..count].fill(Color::Default);
+            } else {
+                tail.copy_within(count.., 0);
+                tail[retained..].fill(Color::Default);
+            }
+        }
     }
 
     #[inline]
@@ -119,9 +358,90 @@ impl TerminalGrid {
         &mut self.cells[base + cols.start..base + cols.end]
     }
 
+    /// Write printable ASCII to a physical row span. Hosts handle cursor
+    /// movement, wraps and their own effects before and after this write.
+    ///
+    /// The caller provides a valid row and a span that fits within it.
+    #[inline]
+    pub fn overwrite_ascii(
+        &mut self,
+        row: usize,
+        col: usize,
+        bytes: &[u8],
+        mut rendition: TerminalCell,
+        blank: TerminalCell,
+        policy: AsciiOverwritePolicy,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        assert!(row < self.rows && bytes.len() <= self.cols.saturating_sub(col));
+        let end = col + bytes.len();
+        debug_assert!(bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)));
+        let target = match policy {
+            AsciiOverwritePolicy::SharedScreen => {
+                self.repair_wide_edges(row, col..end, blank);
+                self.erase_clusters(row, col..end);
+                self.row_cells_mut(row, col..end)
+            }
+            AsciiOverwritePolicy::FrostLegacy => {
+                if col > 0 && self.get(row, col).flags.wide_continuation() {
+                    *self.get_mut(row, col - 1) = blank;
+                }
+                if end < self.cols && self.get(row, end - 1).flags.wide() {
+                    *self.get_mut(row, end) = blank;
+                }
+                &mut self[row][col..end]
+            }
+        };
+        rendition.flags.set_wide(false);
+        rendition.flags.set_wide_continuation(false);
+        for (cell, &byte) in target.iter_mut().zip(bytes) {
+            rendition.character = char::from(byte);
+            *cell = rendition;
+        }
+    }
+
+    /// Replace a glyph at a valid row and column. The caller has already
+    /// resolved wrapping and any insert-mode shift.
+    ///
+    /// The full display width determines which old pairs need edge repair.
+    /// A width of two writes a lead and a continuation if it fits. Other
+    /// positive widths write only the lead, preserving the host's width policy.
+    pub fn overwrite_graphic(
+        &mut self,
+        row: usize,
+        col: usize,
+        width: usize,
+        mut rendition: TerminalCell,
+        blank: TerminalCell,
+        protection: WideContinuationProtection,
+    ) {
+        assert!(row < self.rows && col < self.cols && width > 0);
+        self.repair_wide_edges(row, col..col.saturating_add(width), blank);
+        rendition.flags.set_wide(width == 2);
+        rendition.flags.set_wide_continuation(false);
+        *self.get_mut(row, col) = rendition;
+        if width == 2 && col + 1 < self.cols {
+            let mut continuation = blank;
+            continuation.hyperlink_id = rendition.hyperlink_id;
+            continuation.flags.set_wide_continuation(true);
+            if protection == WideContinuationProtection::FromLead {
+                continuation
+                    .flags
+                    .set_protected(rendition.flags.protected());
+            }
+            *self.get_mut(row, col + 1) = continuation;
+        }
+    }
+
     pub(crate) fn archive_row(&self, row: usize, allow_margin: bool) -> ScrollbackLine {
         let wrapped = self.row_wrapped[row];
         let mut line = ScrollbackLine::compress(&self[row], wrapped);
+        line.attach_decorations(
+            self.underline_color_runs(row).collect(),
+            self.cluster_row(row).cloned(),
+        );
         line.set_raw_row_id(self.row_id(row));
         if allow_margin && wrapped && matches!(self.margin_origin[row], MarginOrigin::WideGap) {
             line.synthetic_margin_gap = true;
@@ -129,12 +449,7 @@ impl TerminalGrid {
         line
     }
 
-    pub(crate) fn copy_region_rows(
-        &mut self,
-        source: std::ops::Range<usize>,
-        target: usize,
-        preserve_margin: bool,
-    ) {
+    fn copy_region_rows(&mut self, source: Range<usize>, target: usize, preserve_margin: bool) {
         self.cells.copy_within(
             source.start * self.cols..source.end * self.cols,
             target * self.cols,
@@ -144,13 +459,92 @@ impl TerminalGrid {
         }
     }
 
-    pub(crate) fn fill_region_rows(&mut self, rows: std::ops::Range<usize>, blank: TerminalCell) {
+    fn fill_region_rows(&mut self, rows: Range<usize>, blank: TerminalCell) {
         self.cells[rows.start * self.cols..rows.end * self.cols].fill(blank);
+        if !self.underline_colors.is_empty() {
+            self.underline_colors[rows.clone()].fill(None);
+        }
+        if !self.clusters.is_empty() {
+            self.clusters[rows.clone()].fill(None);
+        }
         self.margin_origin[rows].fill(Self::new_margin_origin(blank));
     }
 
-    pub(crate) fn forget_region_margins(&mut self, rows: std::ops::Range<usize>) {
+    fn forget_region_margins(&mut self, rows: Range<usize>) {
         self.margin_origin[rows].fill(MarginOrigin::Unknown);
+    }
+
+    pub(crate) fn preserves_shift_margin(
+        &self,
+        direction: RegionDirection,
+        region: &RangeInclusive<usize>,
+        wrap_policy: RegionWrapPolicy,
+    ) -> bool {
+        wrap_policy == RegionWrapPolicy::MoveWithRows
+            && direction == RegionDirection::Up
+            && *region.start() == 0
+            && region.end().checked_add(1) == Some(self.rows())
+    }
+
+    /// Shift rows in an inclusive physical range, returning the dirty rows.
+    /// Counts are capped to the region height. Retained cells and IDs travel
+    /// together. The infallible allocator fills blank rows in ascending
+    /// destination order, returning a fresh ID or `RawRowId::UNTRACKED`.
+    /// Capture outgoing content before calling if the host archives it.
+    pub fn shift_rows(
+        &mut self,
+        direction: RegionDirection,
+        region: RangeInclusive<usize>,
+        count: usize,
+        blank: TerminalCell,
+        wrap_policy: RegionWrapPolicy,
+        mut allocate_id: impl FnMut() -> RawRowId,
+    ) -> Option<Range<usize>> {
+        let (top, bottom) = (*region.start(), *region.end());
+        if region.is_empty() || bottom >= self.rows() || count == 0 {
+            return None;
+        }
+        let end = bottom + 1;
+        let height = end - top;
+        let count = count.min(height);
+        let move_wraps = wrap_policy == RegionWrapPolicy::MoveWithRows;
+        let preserve_margin = self.preserves_shift_margin(direction, &region, wrap_policy);
+        let (source, target, blank_rows) = match direction {
+            RegionDirection::Up => (top + count..end, top, end - count..end),
+            RegionDirection::Down => (top..end - count, top + count, top..top + count),
+        };
+        if count < height && !self.underline_colors.is_empty() {
+            let rows = &mut self.underline_colors[top..end];
+            match direction {
+                RegionDirection::Up => rows.rotate_left(count),
+                RegionDirection::Down => rows.rotate_right(count),
+            }
+        }
+        if count < height && !self.clusters.is_empty() {
+            let rows = &mut self.clusters[top..end];
+            match direction {
+                RegionDirection::Up => rows.rotate_left(count),
+                RegionDirection::Down => rows.rotate_right(count),
+            }
+        }
+        if count < height {
+            self.copy_region_rows(source.clone(), target, preserve_margin);
+            if move_wraps {
+                self.row_wrapped.copy_within(source.clone(), target);
+            }
+            self.row_ids.copy_within(source, target);
+        }
+        self.fill_region_rows(blank_rows.clone(), blank);
+        if !preserve_margin {
+            self.forget_region_margins(top.saturating_sub(1)..end);
+        }
+        if move_wraps {
+            self.row_wrapped[blank_rows.clone()].fill(false);
+        }
+        for row in blank_rows {
+            self.row_ids[row] = allocate_id();
+        }
+        Some(top..end)
     }
 
     fn new_margin_origin(blank: TerminalCell) -> MarginOrigin {
@@ -179,6 +573,9 @@ impl TerminalGrid {
         self.cells
             .copy_within(start + col..start + self.cols - 1, start + col + 1);
         self.cells[start + col] = cell;
+        self.shift_underline_colors(row, col, 1, true);
+        let cols = self.cols;
+        self.edit_clusters(row, |line| line.insert_columns(col, 1, cols));
     }
 
     /// 删除行内指定列的cell，右侧cell左移，末尾补blank
@@ -192,6 +589,8 @@ impl TerminalGrid {
             .copy_within(start + col + 1..start + self.cols, start + col);
         // Fill last cell with default
         self.cells[start + self.cols - 1] = TerminalCell::default();
+        self.shift_underline_colors(row, col, 1, false);
+        self.edit_clusters(row, |line| line.delete_columns(col, 1));
     }
 
     /// Clear a double-width character left holding only its lead half at the
@@ -208,7 +607,142 @@ impl TerminalGrid {
         if self.cells[last].flags.wide() {
             self.margin_origin[row] = MarginOrigin::Unknown;
             self.cells[last] = blank;
+            self.set_underline_color(row, self.cols - 1..self.cols, Color::Default);
+            self.erase_clusters(row, self.cols - 1..self.cols);
         }
+    }
+
+    /// Expand a valid overwrite span to include any adjacent wide partners.
+    pub fn expanded_wide_span(&self, row: usize, cols: Range<usize>) -> Range<usize> {
+        let mut start = cols.start.min(self.cols);
+        let mut end = cols.end.min(self.cols);
+        if row >= self.rows || start >= end {
+            return start..end;
+        }
+        if start > 0 && self.get(row, start - 1).flags.wide() {
+            start -= 1;
+        }
+        if end < self.cols && self.get(row, end).flags.wide_continuation() {
+            end += 1;
+        }
+        start..end
+    }
+
+    /// Blank the partners left outside an overwrite span.
+    pub fn repair_wide_edges(&mut self, row: usize, cols: Range<usize>, blank: TerminalCell) {
+        let start = cols.start;
+        let end = cols.end.min(self.cols);
+        if row >= self.rows || start >= end {
+            return;
+        }
+        let affected = self.expanded_wide_span(row, start..end);
+        if affected.start < start {
+            *self.get_mut(row, affected.start) = blank;
+        }
+        if affected.end > end {
+            *self.get_mut(row, end) = blank;
+        }
+    }
+
+    fn erase_wide_pair_touching(&mut self, row: usize, col: usize, blank: TerminalCell) {
+        if col < self.cols && self.get(row, col).flags.wide_continuation() && col > 0 {
+            *self.get_mut(row, col - 1) = blank;
+            *self.get_mut(row, col) = blank;
+        } else if col + 1 < self.cols && self.get(row, col).flags.wide() {
+            *self.get_mut(row, col) = blank;
+            *self.get_mut(row, col + 1) = blank;
+        } else if col > 0 && self.get(row, col - 1).flags.wide() {
+            *self.get_mut(row, col - 1) = blank;
+            if col < self.cols {
+                *self.get_mut(row, col) = blank;
+            }
+        }
+    }
+
+    /// Insert up to the remaining row width. Returns whether cells were edited.
+    pub fn insert_blank_cells(
+        &mut self,
+        row: usize,
+        col: usize,
+        count: usize,
+        blank: TerminalCell,
+        policy: WideCellEditPolicy,
+    ) -> bool {
+        let count = count.min(self.cols.saturating_sub(col));
+        if row >= self.rows || count == 0 {
+            return false;
+        }
+        match policy {
+            WideCellEditPolicy::RepairSplitPairs => {
+                if self.get(row, col).flags.wide_continuation() {
+                    self.erase_cells(row, col..col + 1, blank);
+                }
+            }
+            WideCellEditPolicy::ClearBoundaryPairs => {
+                self.erase_wide_pair_touching(row, col, blank);
+            }
+        }
+        let line = self.row_cells_mut(row, col..self.cols);
+        line.copy_within(..line.len() - count, count);
+        line[..count].fill(blank);
+        self.shift_underline_colors(row, col, count, true);
+        let cols = self.cols;
+        self.edit_clusters(row, |line| line.insert_columns(col, count, cols));
+        self.clear_dangling_wide_at_row_end(row, blank);
+        true
+    }
+
+    /// Delete up to the remaining row width and fill the vacated cells.
+    pub fn delete_cells(
+        &mut self,
+        row: usize,
+        col: usize,
+        count: usize,
+        blank: TerminalCell,
+        policy: WideCellEditPolicy,
+    ) -> bool {
+        let count = count.min(self.cols.saturating_sub(col));
+        if row >= self.rows || count == 0 {
+            return false;
+        }
+        match policy {
+            WideCellEditPolicy::RepairSplitPairs => {
+                self.repair_wide_edges(row, col..col + count, blank);
+            }
+            WideCellEditPolicy::ClearBoundaryPairs => {
+                self.erase_wide_pair_touching(row, col, blank);
+                self.erase_wide_pair_touching(row, col + count, blank);
+            }
+        }
+        let line = self.row_cells_mut(row, col..self.cols);
+        line.copy_within(count.., 0);
+        let retained = line.len() - count;
+        line[retained..].fill(blank);
+        self.shift_underline_colors(row, col, count, false);
+        self.edit_clusters(row, |line| line.delete_columns(col, count));
+        true
+    }
+
+    /// Erase a row span and its wide partners. Callers select any protected runs.
+    pub fn erase_cells(&mut self, row: usize, cols: Range<usize>, blank: TerminalCell) {
+        if row >= self.rows {
+            return;
+        }
+        for col in cols.start..cols.end.min(self.cols) {
+            let flags = self.get(row, col).flags;
+            if col > 0 && flags.wide_continuation() {
+                *self.get_mut(row, col - 1) = blank;
+            }
+            if col + 1 < self.cols && flags.wide() {
+                *self.get_mut(row, col + 1) = blank;
+            }
+            *self.get_mut(row, col) = blank;
+        }
+    }
+
+    /// Fill the physical grid while preserving row IDs and wrap flags.
+    pub fn fill_cells(&mut self, cell: TerminalCell) {
+        self.cells_mut().fill(cell);
     }
 
     /// 是否为空
@@ -235,6 +769,20 @@ impl TerminalGrid {
         let mut new_row_ids = vec![RawRowId::UNTRACKED; new_rows];
         new_row_ids[..copy_rows].copy_from_slice(&self.row_ids[..copy_rows]);
         self.row_ids = new_row_ids;
+        if !self.underline_colors.is_empty() {
+            self.underline_colors.resize_with(new_rows, || None);
+            for colors in self.underline_colors.iter_mut().flatten() {
+                colors.resize(new_cols, Color::Default);
+            }
+        }
+        if !self.clusters.is_empty() {
+            self.clusters.resize_with(new_rows, || None);
+            if new_cols < self.cols {
+                for row in 0..copy_rows {
+                    self.erase_clusters(row, new_cols..self.cols);
+                }
+            }
+        }
         if self.cols != new_cols {
             // Width changes invalidate both the old margin coordinate and proof
             // for the new last cell; do not infer provenance from its value.
@@ -253,35 +801,21 @@ impl TerminalGrid {
     /// 向上滚动 n 行:丢弃顶部 n 行,其余行上移,底部补 blank。缩小高度前调用,
     /// 把底部内容(光标行/近期输出)上移保留;调用方负责把被丢弃的顶部行存入 scrollback。
     pub fn scroll_up_by(&mut self, n: usize, blank: TerminalCell) {
-        if n == 0 {
-            return;
-        }
-        if n >= self.rows {
-            self.cells.fill(blank);
-            self.margin_origin.fill(Self::new_margin_origin(blank));
-            for w in self.row_wrapped.iter_mut() {
-                *w = false;
-            }
-            self.row_ids.fill(RawRowId::UNTRACKED);
-            return;
-        }
-        let cols = self.cols;
-        self.cells.copy_within(n * cols.., 0);
-        let keep = (self.rows - n) * cols;
-        self.cells[keep..].fill(blank);
-        self.margin_origin.copy_within(n.., 0);
-        self.margin_origin[self.rows - n..].fill(Self::new_margin_origin(blank));
-        self.row_wrapped.copy_within(n.., 0);
-        for w in self.row_wrapped[self.rows - n..].iter_mut() {
-            *w = false;
-        }
-        self.row_ids.copy_within(n.., 0);
-        self.row_ids[self.rows - n..].fill(RawRowId::UNTRACKED);
+        self.shift_rows(
+            RegionDirection::Up,
+            0..=self.rows.saturating_sub(1),
+            n,
+            blank,
+            RegionWrapPolicy::MoveWithRows,
+            || RawRowId::UNTRACKED,
+        );
     }
 
     /// 获取mut访问所有行
     pub fn iter_mut(&mut self) -> std::slice::ChunksMut<'_, TerminalCell> {
         self.margin_origin.fill(MarginOrigin::Unknown);
+        self.underline_colors = Vec::new();
+        self.clusters = Vec::new();
         self.cells.chunks_mut(self.cols)
     }
 
@@ -302,6 +836,12 @@ impl std::ops::Index<usize> for TerminalGrid {
 impl std::ops::IndexMut<usize> for TerminalGrid {
     fn index_mut(&mut self, row: usize) -> &mut [TerminalCell] {
         self.margin_origin[row] = MarginOrigin::Unknown;
+        if let Some(colors) = self.underline_colors.get_mut(row) {
+            *colors = None;
+        }
+        if let Some(line) = self.clusters.get_mut(row) {
+            *line = None;
+        }
         let start = row * self.cols;
         &mut self.cells[start..start + self.cols]
     }
@@ -578,6 +1118,32 @@ pub struct ScrollbackLine {
 enum CompressedLineData {
     Plain(String, u16),
     Encoded(Vec<u8>),
+    Decorated(Box<DecoratedLineData>),
+}
+
+#[derive(Clone, Debug)]
+struct DecoratedLineData {
+    base: CompressedLineData,
+    underline_colors: Box<[UnderlineColorRun]>,
+    clusters: Option<Arc<RowClusters>>,
+}
+
+impl CompressedLineData {
+    fn content(&self) -> ScrollbackContent<'_> {
+        match self {
+            Self::Plain(text, trailing) => ScrollbackContent::Plain(text, *trailing),
+            Self::Encoded(bytes) => ScrollbackContent::Encoded(bytes),
+            Self::Decorated(data) => data.base.content(),
+        }
+    }
+}
+
+/// Borrowed compressed content for history search, accounting and replay.
+/// A plain row holds narrow text and the count of implicit trailing blanks.
+#[derive(Clone, Copy, Debug)]
+pub enum ScrollbackContent<'a> {
+    Plain(&'a str, u16),
+    Encoded(&'a [u8]),
 }
 
 impl ScrollbackLine {
@@ -587,6 +1153,16 @@ impl ScrollbackLine {
     }
 
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
+        Self::compress_with_style(cells, is_wrapped, false)
+    }
+
+    /// Preserve blink for history profiles that already retain it. The legacy
+    /// default codec drops blink while preserving all its other encoded flags.
+    pub fn compress_preserving_blink(cells: &[TerminalCell], is_wrapped: bool) -> Self {
+        Self::compress_with_style(cells, is_wrapped, true)
+    }
+
+    fn compress_with_style(cells: &[TerminalCell], is_wrapped: bool, preserve_blink: bool) -> Self {
         let cols = cells.len() as u16;
         let reflow_content_len = cells
             .iter()
@@ -603,7 +1179,7 @@ impl ScrollbackLine {
                 }
             })
             .collect();
-        let reflow_content_len = reflow_content_len as u16;
+        let reflow_content_len = u16::try_from(reflow_content_len).unwrap_or(u16::MAX);
         let trailing_blanks = cells
             .iter()
             .rev()
@@ -640,7 +1216,7 @@ impl ScrollbackLine {
                 raw_row_id: RawRowId::UNTRACKED,
             }
         } else {
-            let encoded = Self::encode_cells(&cells[..active_len]);
+            let encoded = Self::encode_cells(&cells[..active_len], preserve_blink);
             ScrollbackLine {
                 data: CompressedLineData::Encoded(encoded),
                 is_wrapped,
@@ -683,9 +1259,45 @@ impl ScrollbackLine {
         self.raw_row_id = id;
     }
 
-    pub fn decompress(&self) -> Vec<TerminalCell> {
+    fn attach_decorations(
+        &mut self,
+        colors: Vec<UnderlineColorRun>,
+        clusters: Option<Arc<RowClusters>>,
+    ) {
+        if !colors.is_empty() || clusters.is_some() {
+            if let Some(clusters) = &clusters {
+                self.reflow_content_len = self.reflow_content_len.max(clusters.end() as u16);
+            }
+            let base = std::mem::replace(&mut self.data, CompressedLineData::Encoded(Vec::new()));
+            self.data = CompressedLineData::Decorated(Box::new(DecoratedLineData {
+                base,
+                underline_colors: colors.into_boxed_slice(),
+                clusters,
+            }));
+        }
+    }
+
+    pub(crate) fn underline_color_runs(&self) -> &[UnderlineColorRun] {
         match &self.data {
-            CompressedLineData::Plain(text, trailing) => {
+            CompressedLineData::Decorated(data) => &data.underline_colors,
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn cluster_row(&self) -> Option<&Arc<RowClusters>> {
+        match &self.data {
+            CompressedLineData::Decorated(data) => data.clusters.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn content(&self) -> ScrollbackContent<'_> {
+        self.data.content()
+    }
+
+    pub fn decompress(&self) -> Vec<TerminalCell> {
+        match self.content() {
+            ScrollbackContent::Plain(text, trailing) => {
                 let mut cells: Vec<TerminalCell> = text
                     .chars()
                     .map(|ch| TerminalCell {
@@ -693,18 +1305,53 @@ impl ScrollbackLine {
                         ..Default::default()
                     })
                     .collect();
-                cells.resize(cells.len() + *trailing as usize, TerminalCell::default());
+                cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
                 cells
             }
-            CompressedLineData::Encoded(data) => Self::decode_cells(data, self.cols as usize),
+            ScrollbackContent::Encoded(data) => Self::decode_cells(data, self.cols as usize),
+        }
+    }
+
+    /// Visit retained cells in column order without materializing the row.
+    /// Implicit trailing blanks are omitted and runs are capped at its width.
+    pub fn visit_search_cells(&self, mut visit: impl FnMut(usize, TerminalCell)) {
+        match self.content() {
+            ScrollbackContent::Plain(text, _) => {
+                for (column, character) in text.chars().enumerate() {
+                    visit(
+                        column,
+                        TerminalCell {
+                            character,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            ScrollbackContent::Encoded(data) => {
+                Self::visit_encoded_cells(data, self.columns(), visit);
+            }
+        }
+    }
+
+    fn visit_encoded_cells(data: &[u8], cols: usize, mut visit: impl FnMut(usize, TerminalCell)) {
+        let mut column = 0;
+        let mut pos = 0;
+        while column < cols {
+            let Some((cell, run)) = Self::decode_run(data, &mut pos) else {
+                break;
+            };
+            for _ in 0..run.min(cols - column) {
+                visit(column, cell);
+                column += 1;
+            }
         }
     }
 
     /// Search-only admission cost. Reading it does not decode or scan text.
     pub fn search_encoded_bytes(&self) -> usize {
-        match &self.data {
-            CompressedLineData::Plain(text, _) => text.len(),
-            CompressedLineData::Encoded(data) => data.len(),
+        match self.content() {
+            ScrollbackContent::Plain(text, _) => text.len(),
+            ScrollbackContent::Encoded(data) => data.len(),
         }
     }
 
@@ -724,8 +1371,8 @@ impl ScrollbackLine {
             return None;
         }
         let mut cells = Vec::with_capacity(cols);
-        match &self.data {
-            CompressedLineData::Plain(text, trailing) => {
+        match self.content() {
+            ScrollbackContent::Plain(text, trailing) => {
                 for character in text.chars() {
                     if cells.len() == cols {
                         return None;
@@ -735,11 +1382,11 @@ impl ScrollbackLine {
                         ..Default::default()
                     });
                 }
-                if cells.len().checked_add(*trailing as usize)? != cols {
+                if cells.len().checked_add(usize::from(trailing))? != cols {
                     return None;
                 }
             }
-            CompressedLineData::Encoded(data) => {
+            ScrollbackContent::Encoded(data) => {
                 let mut pos = 0;
                 while pos < data.len() {
                     let ch_len = *data.get(pos)? as usize;
@@ -763,6 +1410,7 @@ impl ScrollbackLine {
                     pos += 1;
                     flags.set_wide(wide & 1 != 0);
                     flags.set_wide_continuation(wide & 2 != 0);
+                    flags.set_blink(wide & 4 != 0);
                     let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
                         *data.get(pos)?,
                         *data.get(pos + 1)?,
@@ -797,13 +1445,11 @@ impl ScrollbackLine {
     /// - Encoded 行解码后与活动网格行走同一条 `searchable_line_text` 路径,
     ///   列映射跳过宽字符续接单元。
     pub fn search_text(&self) -> (std::borrow::Cow<'_, str>, Option<Vec<usize>>, usize) {
-        match &self.data {
-            CompressedLineData::Plain(text, _) => (
-                std::borrow::Cow::Borrowed(text.as_str()),
-                None,
-                text.chars().count(),
-            ),
-            CompressedLineData::Encoded(_) => {
+        match self.content() {
+            ScrollbackContent::Plain(text, _) => {
+                (std::borrow::Cow::Borrowed(text), None, text.chars().count())
+            }
+            ScrollbackContent::Encoded(_) => {
                 let cells = self.decompress();
                 let (text, col_map, total_cols) = searchable_line_text(&cells);
                 (std::borrow::Cow::Owned(text), Some(col_map), total_cols)
@@ -931,7 +1577,7 @@ impl ScrollbackLine {
         flags
     }
 
-    fn encode_cells(cells: &[TerminalCell]) -> Vec<u8> {
+    fn encode_cells(cells: &[TerminalCell], preserve_blink: bool) -> Vec<u8> {
         let mut buf = Vec::with_capacity(cells.len() * 3);
         let mut i = 0;
         while i < cells.len() {
@@ -956,16 +1602,21 @@ impl ScrollbackLine {
             }
 
             // Format: [char_len:1][char_bytes][fg][bg][flags:1]
-            //         [wide_bits:1][hyperlink_id:2][run:1]
+            //         [extra_flags:1][hyperlink_id:2][run:1]
             buf.push(ch_bytes.len() as u8);
             buf.extend_from_slice(ch_bytes);
             Self::encode_color(&cell.foreground, &mut buf);
             Self::encode_color(&cell.background, &mut buf);
             let f = Self::encode_flags(&cell.flags);
             buf.push(f);
-            let wide_bits = if cell.flags.wide() { 1u8 } else { 0 }
-                | if cell.flags.wide_continuation() { 2 } else { 0 };
-            buf.push(wide_bits);
+            let extra_flags = if cell.flags.wide() { 1u8 } else { 0 }
+                | if cell.flags.wide_continuation() { 2 } else { 0 }
+                | if preserve_blink && cell.flags.blink() {
+                    4
+                } else {
+                    0
+                };
+            buf.push(extra_flags);
             buf.extend_from_slice(&cell.hyperlink_id.as_raw().to_le_bytes());
             buf.push(run);
 
@@ -977,43 +1628,7 @@ impl ScrollbackLine {
     fn decode_cells(data: &[u8], cols: usize) -> Vec<TerminalCell> {
         let mut cells = Vec::with_capacity(cols);
         let mut pos = 0;
-        while pos < data.len() {
-            let ch_len = data[pos] as usize;
-            pos += 1;
-            if pos + ch_len > data.len() {
-                break;
-            }
-            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
-                .ok()
-                .and_then(|s| s.chars().next())
-                .unwrap_or(' ');
-            pos += ch_len;
-
-            let fg = Self::decode_color(data, &mut pos);
-            let bg = Self::decode_color(data, &mut pos);
-            let f = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let wide_bits = data.get(pos).copied().unwrap_or(0);
-            pos += 1;
-            let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
-                data.get(pos).copied().unwrap_or(0),
-                data.get(pos + 1).copied().unwrap_or(0),
-            ]));
-            pos += 2;
-            let run = data.get(pos).copied().unwrap_or(1).max(1);
-            pos += 1;
-
-            let mut flags = Self::decode_flags(f);
-            flags.set_wide(wide_bits & 1 != 0);
-            flags.set_wide_continuation(wide_bits & 2 != 0);
-
-            let cell = TerminalCell {
-                character: ch,
-                foreground: fg,
-                background: bg,
-                flags,
-                hyperlink_id,
-            };
+        while let Some((cell, run)) = Self::decode_run(data, &mut pos) {
             for _ in 0..run {
                 cells.push(cell);
             }
@@ -1021,6 +1636,44 @@ impl ScrollbackLine {
         // Pad to cols
         cells.resize(cols, TerminalCell::default());
         cells
+    }
+
+    fn decode_run(data: &[u8], pos: &mut usize) -> Option<(TerminalCell, usize)> {
+        let ch_len = usize::from(*data.get(*pos)?);
+        *pos += 1;
+        let ch = std::str::from_utf8(data.get(*pos..*pos + ch_len)?)
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or(' ');
+        *pos += ch_len;
+
+        let foreground = Self::decode_color(data, pos);
+        let background = Self::decode_color(data, pos);
+        let mut flags = Self::decode_flags(data.get(*pos).copied().unwrap_or(0));
+        *pos += 1;
+        let extra_flags = data.get(*pos).copied().unwrap_or(0);
+        *pos += 1;
+        flags.set_wide(extra_flags & 1 != 0);
+        flags.set_wide_continuation(extra_flags & 2 != 0);
+        flags.set_blink(extra_flags & 4 != 0);
+        let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
+            data.get(*pos).copied().unwrap_or(0),
+            data.get(*pos + 1).copied().unwrap_or(0),
+        ]));
+        *pos += 2;
+        let run = usize::from(data.get(*pos).copied().unwrap_or(1).max(1));
+        *pos += 1;
+
+        Some((
+            TerminalCell {
+                character: ch,
+                foreground,
+                background,
+                flags,
+                hyperlink_id,
+            },
+            run,
+        ))
     }
 }
 
@@ -1173,5 +1826,258 @@ mod search_chunk_decode_tests {
         assert_eq!(line.columns(), 1024);
         assert!(line.decode_search_row(1000, 4096).is_none());
         assert_eq!(line.decode_search_row(1024, 4096).unwrap().len(), 1024);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ascii_overwrite_preserves_each_profiles_margin_and_decoration_invalidation() {
+    for (policy, retained) in [
+        (AsciiOverwritePolicy::SharedScreen, true),
+        (AsciiOverwritePolicy::FrostLegacy, false),
+    ] {
+        let mut grid = TerminalGrid::new(1, 6);
+        grid.set_cluster_text(0, 0, " \u{301}").unwrap();
+        grid.set_underline_color(0, 0..1, Color::Red);
+        let blank = TerminalCell::default();
+        grid.overwrite_ascii(0, 2, b"AB", blank, blank, policy);
+        grid.row_wrapped[0] = true;
+        grid.record_wrap_margin(0, 5, true);
+        let archived = grid.archive_row(0, true);
+        assert_eq!(archived.synthetic_margin_gap(), retained.then_some(5));
+        assert_eq!(archived.cluster_row().is_some(), retained);
+        assert_eq!(!archived.underline_color_runs().is_empty(), retained);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn graphic_overwrite_repairs_both_partners_with_bce_and_preserves_archive_provenance() {
+    let background = Color::Blue;
+    let blank = TerminalCell {
+        background,
+        ..TerminalCell::default()
+    };
+    let mut protected = StyleFlags::default();
+    protected.set_protected(true);
+    let rendition = TerminalCell {
+        character: '界',
+        foreground: Color::Red,
+        background,
+        flags: protected,
+        hyperlink_id: HyperlinkId::from_raw(7),
+    };
+
+    for (policy, protects_continuation) in [
+        (WideContinuationProtection::FromLead, true),
+        (WideContinuationProtection::FromBlank, false),
+    ] {
+        let mut grid = TerminalGrid::new(1, 7);
+        let row_id = RawRowId::new(11);
+        grid.row_ids_mut()[0] = row_id;
+        grid.overwrite_graphic(0, 1, 2, rendition, blank, policy);
+        grid.overwrite_graphic(0, 3, 2, rendition, blank, policy);
+        grid.set_cluster_text(0, 1, "界\u{301}").unwrap();
+        grid.set_cluster_text(0, 3, "界\u{301}").unwrap();
+        grid.set_cluster_text(0, 5, " \u{301}").unwrap();
+        grid.set_underline_color(0, 1..6, Color::Red);
+        grid.row_wrapped[0] = true;
+        grid.record_wrap_margin(0, 6, true);
+
+        grid.overwrite_graphic(0, 2, 2, rendition, blank, policy);
+
+        assert_eq!(*grid.get(0, 1), blank);
+        let mut expected_lead = rendition;
+        expected_lead.flags.set_wide(true);
+        assert_eq!(*grid.get(0, 2), expected_lead);
+        let mut expected_continuation = blank;
+        expected_continuation.hyperlink_id = rendition.hyperlink_id;
+        expected_continuation.flags.set_wide_continuation(true);
+        expected_continuation
+            .flags
+            .set_protected(protects_continuation);
+        assert_eq!(*grid.get(0, 3), expected_continuation);
+        assert_eq!(*grid.get(0, 4), blank);
+        let archived = grid.archive_row(0, true);
+        assert_eq!(archived.raw_row_id(), row_id);
+        assert_eq!(archived.synthetic_margin_gap(), Some(6));
+        let archived_clusters = archived.cluster_row().unwrap();
+        assert_eq!(archived_clusters.text(1), None);
+        assert_eq!(archived_clusters.text(3), None);
+        assert_eq!(archived_clusters.text(5), Some(" \u{301}"));
+        assert_eq!(
+            archived.underline_color_runs(),
+            [UnderlineColorRun {
+                start: 5,
+                end: 6,
+                color: Color::Red,
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn archived_underline_colors_keep_the_original_row_payload_and_size() {
+    assert_eq!(std::mem::size_of::<TerminalCell>(), 16);
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(std::mem::size_of::<ScrollbackLine>(), 72);
+    for style in [UnderlineStyle::None, UnderlineStyle::Curly] {
+        let mut grid = TerminalGrid::new(2, 6);
+        grid[0][1].character = 'é';
+        grid[0][1].flags.set_underline(style);
+        let original = grid.archive_row(0, false);
+        grid.set_underline_color(0, 1..3, Color::Rgb(1, 2, 3));
+        let decorated = grid.archive_row(0, false);
+        assert_eq!(
+            format!("{:?}", original.content()),
+            format!("{:?}", decorated.content())
+        );
+        assert_eq!(
+            original.search_encoded_bytes(),
+            decorated.search_encoded_bytes()
+        );
+        assert_eq!(original.decompress(), decorated.decompress());
+        assert_eq!(
+            decorated.underline_color_runs(),
+            [UnderlineColorRun {
+                start: 1,
+                end: 3,
+                color: Color::Rgb(1, 2, 3)
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn archived_cluster_preserves_the_codec_and_counts_decorated_space_as_content() {
+    let mut grid = TerminalGrid::new(1, 6);
+    grid[0][1].character = 'a';
+    let original = grid.archive_row(0, false);
+    grid.set_cluster_text(0, 1, "a\u{301}").unwrap();
+    grid.set_cluster_text(0, 5, " \u{300}").unwrap();
+    let decorated = grid.archive_row(0, false);
+    assert!(matches!(
+        original.content(),
+        ScrollbackContent::Plain(" a", 4)
+    ));
+    assert!(matches!(
+        decorated.content(),
+        ScrollbackContent::Plain(" a", 4)
+    ));
+    assert_eq!(original.decompress(), decorated.decompress());
+    assert_eq!(original.reflow_content_len(), 2);
+    assert_eq!(decorated.reflow_content_len(), 6);
+    assert_eq!(decorated.cluster_row().unwrap().text(5), Some(" \u{300}"));
+    grid.erase_cells(0, 0..6, TerminalCell::default());
+    assert!(grid.cluster_row(0).is_none());
+    assert_eq!(decorated.cluster_row().unwrap().text(1), Some("a\u{301}"));
+}
+
+// Regression oracle pinned to fb477d1c; deliberately independent of the streaming visitor.
+#[cfg(test)]
+impl ScrollbackLine {
+    fn pinned_decode_cells(data: &[u8], cols: usize) -> Vec<TerminalCell> {
+        let mut cells = Vec::with_capacity(cols);
+        let mut pos = 0;
+        while pos < data.len() {
+            let ch_len = data[pos] as usize;
+            pos += 1;
+            if pos + ch_len > data.len() {
+                break;
+            }
+            let ch = std::str::from_utf8(&data[pos..pos + ch_len])
+                .ok()
+                .and_then(|s| s.chars().next())
+                .unwrap_or(' ');
+            pos += ch_len;
+
+            let fg = Self::decode_color(data, &mut pos);
+            let bg = Self::decode_color(data, &mut pos);
+            let f = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let extra_flags = data.get(pos).copied().unwrap_or(0);
+            pos += 1;
+            let hyperlink = u16::from_le_bytes([
+                data.get(pos).copied().unwrap_or(0),
+                data.get(pos + 1).copied().unwrap_or(0),
+            ]);
+            pos += 2;
+            let run = data.get(pos).copied().unwrap_or(1).max(1);
+            pos += 1;
+
+            let mut flags = Self::decode_flags(f);
+            flags.set_wide(extra_flags & 1 != 0);
+            flags.set_wide_continuation(extra_flags & 2 != 0);
+            flags.set_blink(extra_flags & 4 != 0);
+
+            let cell = TerminalCell {
+                character: ch,
+                foreground: fg,
+                background: bg,
+                flags,
+                hyperlink_id: HyperlinkId::from_raw(hyperlink),
+            };
+            for _ in 0..run {
+                cells.push(cell);
+            }
+        }
+        // Pad to cols
+        cells.resize(cols, TerminalCell::default());
+        cells
+    }
+}
+
+#[cfg(test)]
+mod decoder_parity {
+    use super::*;
+    #[test]
+    fn stored_decoder_rle_boundary_clipping_parity() {
+        let cell = TerminalCell {
+            character: 'İ',
+            foreground: Color::Rgb(1, 2, 3),
+            hyperlink_id: HyperlinkId::from_raw(65535),
+            ..Default::default()
+        };
+        for n in [0, 1, 254, 255, 256, 510, 511, 600] {
+            let bytes = ScrollbackLine::encode_cells(&vec![cell; n], true);
+            for cols in [0, 1, 17, 254, 255, 256, 511, 601] {
+                for length in 0..=bytes.len() {
+                    let mut streamed = Vec::new();
+                    ScrollbackLine::visit_encoded_cells(&bytes[..length], cols, |_, cell| {
+                        streamed.push(cell)
+                    });
+                    streamed.resize(cols, TerminalCell::default());
+                    assert_eq!(
+                        streamed,
+                        ScrollbackLine::pinned_decode_cells(&bytes[..length], cols)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn stored_decoder_matches_pinned_oracle_on_truncation_and_runs() {
+        let mut seed = 0xdefaced_u64;
+        for length in 0..128 {
+            for _ in 0..64 {
+                let mut bytes = Vec::new();
+                for _ in 0..length {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    bytes.push(seed as u8);
+                }
+                for cols in [0, 1, 2, 17, 255, 512] {
+                    let mut streamed = Vec::new();
+                    ScrollbackLine::visit_encoded_cells(&bytes, cols, |_, cell| {
+                        streamed.push(cell)
+                    });
+                    streamed.resize(cols, TerminalCell::default());
+                    assert_eq!(streamed, ScrollbackLine::pinned_decode_cells(&bytes, cols));
+                }
+            }
+        }
     }
 }

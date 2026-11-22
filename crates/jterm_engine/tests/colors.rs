@@ -1,5 +1,5 @@
 use jterm_engine::{
-    colors::{ColorState, TerminalDefaultColors},
+    colors::{ColorState, DynamicColorState, TerminalDefaultColors},
     semantics::{Effect, Effects},
 };
 
@@ -118,6 +118,65 @@ fn malformed_and_unknown_commands_leave_owner_unchanged() {
         assert!(c.apply_ember_osc(cmd, val, b"\x07").is_empty());
         assert_eq!(c, before);
     }
+}
+
+#[test]
+fn frost_rgb_retains_first_component_scaling_and_mixed_widths() {
+    for (spec, frost, ember) in [
+        ("rgb:8/4/c", Some((8, 4, 12)), Some((136, 68, 204))),
+        ("rgb:0100/ffff/0100", Some((0, 255, 0)), Some((1, 255, 1))),
+        ("rgb:8080/400/c", Some((128, 3, 0)), None),
+        ("rgb:+1/ff/100", Some((1, 255, 0)), None),
+        ("rgb:00000/00/ff", Some((0, 0, 255)), None),
+        ("rgb:1/2/3/", None, None),
+        ("#aéabc", None, None),
+    ] {
+        assert_eq!(
+            DynamicColorState::parse_frost_color_spec(spec),
+            frost,
+            "{spec}"
+        );
+        assert_eq!(ColorState::parse_color_spec(spec), ember, "{spec}");
+    }
+}
+
+#[test]
+fn frost_palette_and_default_color_operations_reply_in_input_order() {
+    let mut c = DynamicColorState::default();
+    let mut defaults = TerminalDefaultColors {
+        foreground: (1, 2, 3),
+        background: (4, 5, 6),
+        cursor: (7, 8, 9),
+        ..Default::default()
+    };
+    defaults.ansi[7] = (0x15, 0x26, 0x37);
+    assert_eq!(
+        replies(c.apply_frost_osc("4", "7;?;7;rgb:8/4/c;7;?;bad;?;232;?", b"\x07", defaults,)),
+        [
+            b"\x1b]4;7;rgb:1515/2626/3737\x07".to_vec(),
+            b"\x1b]4;7;rgb:0808/0404/0c0c\x07".to_vec(),
+            b"\x1b]4;232;rgb:0808/0808/0808\x07".to_vec(),
+        ]
+    );
+    assert!(c
+        .apply_frost_osc("104", "7;256;;", b"\x1b\\", defaults)
+        .is_empty());
+    assert_eq!(c.palette_overrides()[7], None);
+    assert!(c
+        .apply_frost_osc("11", "rgb:0100/ffff/0100", b"\x07", defaults)
+        .is_empty());
+    assert_eq!(
+        replies(c.apply_frost_osc("11", "?", b"\x1b\\", defaults)),
+        [b"\x1b]11;rgb:0000/ffff/0000\x1b\\".to_vec()]
+    );
+    assert!(c
+        .apply_frost_osc("111", "ignored", b"\x07", defaults)
+        .is_empty());
+    assert_eq!(
+        replies(c.apply_frost_osc("11", "?", b"\x07", defaults)),
+        [b"\x1b]11;rgb:0404/0505/0606\x07".to_vec()]
+    );
+    assert_eq!(c, DynamicColorState::default());
 }
 
 #[test]

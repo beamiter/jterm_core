@@ -1,6 +1,11 @@
-//! Immutable raw-cell paint values. No projection, transport or resource ownership.
-use crate::grid::{CursorShape, TerminalCell};
-use std::{num::NonZeroU64, sync::Arc};
+//! Immutable raw-cell paint values and their referenced style metadata.
+use crate::{
+    graphemes::RowClusters,
+    grid::{Color, CursorShape, TerminalCell, UnderlineColorRun},
+    hyperlink::{resolve_resource, retain_resources, HyperlinkResources},
+    HyperlinkId,
+};
+use std::{fmt, num::NonZeroU64, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -86,12 +91,56 @@ pub struct Row {
     pub cells: Arc<[TerminalCell]>,
     pub wrapped: bool,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CellFrame {
     stamp: AdmittedStamp,
     cols: usize,
     rows: Arc<[Row]>,
     cursor: Cursor,
+    underline_colors: Option<UnderlineRows>,
+    hyperlinks: Option<HyperlinkResources>,
+    clusters: Option<ClusterRows>,
+}
+
+impl fmt::Debug for CellFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CellFrame");
+        debug
+            .field("stamp", &self.stamp)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("cursor", &self.cursor);
+        if let Some(underline_colors) = &self.underline_colors {
+            debug.field("underline_colors", underline_colors);
+        }
+        if let Some(hyperlinks) = &self.hyperlinks {
+            debug.field("hyperlink_count", &hyperlinks.len());
+        }
+        if let Some(clusters) = &self.clusters {
+            debug.field("clusters", clusters);
+        }
+        debug.finish()
+    }
+}
+
+pub(crate) type UnderlineRows = Arc<[Option<Arc<[UnderlineColorRun]>>]>;
+pub(crate) type ClusterRows = Arc<[Option<Arc<RowClusters>>]>;
+
+pub(crate) fn underline_color_at(runs: &[UnderlineColorRun], col: usize) -> Option<Color> {
+    let run = runs.get(runs.partition_point(|run| usize::from(run.end) <= col))?;
+    (usize::from(run.start) <= col).then_some(run.color)
+}
+
+fn valid_underline_colors(runs: &[UnderlineColorRun], cols: usize) -> bool {
+    let mut previous_end = 0;
+    runs.iter().all(|run| {
+        let valid = run.start >= previous_end
+            && run.start < run.end
+            && usize::from(run.end) <= cols
+            && run.color != Color::Default;
+        previous_end = run.end;
+        valid
+    })
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -114,6 +163,30 @@ pub struct Delta {
     pub next: Stamp,
     pub cursor: Cursor,
     pub rows: Vec<(usize, Row)>,
+    underline_colors: Vec<(usize, Arc<[UnderlineColorRun]>)>,
+    hyperlinks: HyperlinkDelta,
+    clusters: Vec<(usize, Arc<RowClusters>)>,
+}
+
+#[derive(Clone, Debug)]
+enum HyperlinkDelta {
+    Inherit,
+    Snapshot(Option<HyperlinkResources>),
+}
+
+impl Delta {
+    /// Construct raw cell changes without explicit text or underline decoration.
+    pub fn new(base: Stamp, next: Stamp, cursor: Cursor, rows: Vec<(usize, Row)>) -> Self {
+        Self {
+            base,
+            next,
+            cursor,
+            rows,
+            underline_colors: Vec::new(),
+            hyperlinks: HyperlinkDelta::Inherit,
+            clusters: Vec::new(),
+        }
+    }
 }
 impl CellFrame {
     pub fn new(
@@ -122,6 +195,17 @@ impl CellFrame {
         rows: Arc<[Row]>,
         cursor: Cursor,
         limits: Limits,
+    ) -> Result<Self, Error> {
+        Self::new_with_underline_colors(stamp, cols, rows, cursor, limits, None)
+    }
+
+    pub(crate) fn new_with_underline_colors(
+        stamp: Stamp,
+        cols: usize,
+        rows: Arc<[Row]>,
+        cursor: Cursor,
+        limits: Limits,
+        underline_colors: Option<UnderlineRows>,
     ) -> Result<Self, Error> {
         let stamp = stamp.try_into()?;
         if cols == 0
@@ -139,11 +223,23 @@ impl CellFrame {
         if cursor.row >= rows.len() || cursor.col >= cols {
             return Err(Error::Cursor);
         }
+        if underline_colors.as_ref().is_some_and(|colors| {
+            colors.len() != rows.len()
+                || colors
+                    .iter()
+                    .flatten()
+                    .any(|runs| !valid_underline_colors(runs, cols))
+        }) {
+            return Err(Error::Bounds);
+        }
         Ok(Self {
             stamp,
             cols,
             rows,
             cursor,
+            underline_colors,
+            hyperlinks: None,
+            clusters: None,
         })
     }
     pub fn stamp(&self) -> Stamp {
@@ -164,6 +260,63 @@ impl CellFrame {
     pub fn cursor(&self) -> Cursor {
         self.cursor
     }
+
+    pub(crate) fn with_hyperlinks(mut self, hyperlinks: Option<HyperlinkResources>) -> Self {
+        self.hyperlinks = hyperlinks;
+        self
+    }
+
+    pub(crate) fn shared_hyperlinks(&self) -> Option<HyperlinkResources> {
+        self.hyperlinks.clone()
+    }
+
+    /// Resolve a validated target referenced by this immutable frame.
+    pub fn hyperlink_target(&self, id: HyperlinkId) -> Option<&str> {
+        resolve_resource(&self.hyperlinks, id)
+    }
+
+    /// Complete text at a multi-scalar grapheme head. Single-scalar and
+    /// continuation cells remain represented by `rows()`.
+    pub fn cluster_text(&self, row: usize, column: usize) -> Option<&str> {
+        self.cluster_row(row)?.text(column)
+    }
+
+    pub(crate) fn cluster_row(&self, row: usize) -> Option<&Arc<RowClusters>> {
+        self.clusters.as_ref()?.get(row)?.as_ref()
+    }
+
+    pub(crate) fn shared_clusters(&self) -> Option<ClusterRows> {
+        self.clusters.clone()
+    }
+
+    pub(crate) fn with_clusters(mut self, clusters: Option<ClusterRows>) -> Self {
+        debug_assert!(clusters.as_ref().is_none_or(|clusters| {
+            clusters.len() == self.rows.len()
+                && clusters
+                    .iter()
+                    .zip(self.rows.iter())
+                    .all(|(line, row)| line.as_ref().is_none_or(|line| line.valid_for(&row.cells)))
+        }));
+        self.clusters = clusters;
+        self
+    }
+
+    /// Explicit underline color at an original physical viewport coordinate.
+    pub fn underline_color(&self, row: usize, col: usize) -> Option<Color> {
+        underline_color_at(self.underline_color_runs(row), col)
+    }
+
+    pub fn underline_color_runs(&self, row: usize) -> &[UnderlineColorRun] {
+        self.underline_row(row).map_or(&[], Arc::as_ref)
+    }
+
+    pub(crate) fn underline_row(&self, row: usize) -> Option<&Arc<[UnderlineColorRun]>> {
+        self.underline_colors.as_ref()?.get(row)?.as_ref()
+    }
+
+    pub(crate) fn shared_underline_rows(&self) -> Option<UnderlineRows> {
+        self.underline_colors.clone()
+    }
     /// Fresh publication in the same stream. Screen/layout changes require a full frame.
     pub fn delta_to(&self, next: &Self) -> Result<Delta, Error> {
         let next_stamp = next.stamp();
@@ -171,19 +324,23 @@ impl CellFrame {
         if self.cols != next.cols || self.rows.len() != next.rows.len() {
             return Err(Error::Layout);
         }
-        Ok(Delta {
-            base: self.stamp(),
-            next: next_stamp,
-            cursor: next.cursor,
-            rows: self
-                .rows
-                .iter()
-                .zip(next.rows.iter())
-                .enumerate()
-                .filter(|(_, (a, b))| a != b)
-                .map(|(i, (_, r))| (i, r.clone()))
-                .collect(),
-        })
+        let mut delta = Delta::new(self.stamp(), next_stamp, next.cursor, Vec::new());
+        delta.hyperlinks = HyperlinkDelta::Snapshot(next.shared_hyperlinks());
+        for (index, (before, after)) in self.rows.iter().zip(next.rows.iter()).enumerate() {
+            if before != after
+                || self.underline_color_runs(index) != next.underline_color_runs(index)
+                || self.cluster_row(index) != next.cluster_row(index)
+            {
+                delta.rows.push((index, after.clone()));
+                if let Some(runs) = next.underline_row(index) {
+                    delta.underline_colors.push((index, runs.clone()));
+                }
+                if let Some(line) = next.cluster_row(index) {
+                    delta.clusters.push((index, line.clone()));
+                }
+            }
+        }
+        Ok(delta)
     }
     fn admit_delta_stamp(&self, next: Stamp) -> Result<AdmittedStamp, Error> {
         // Keep malformed raw-delta error precedence: a mismatched stream or
@@ -233,10 +390,71 @@ impl CellFrame {
         if delta.cursor.row >= self.rows.len() || delta.cursor.col >= self.cols {
             return Err(Error::Cursor);
         }
+        if delta.underline_colors.iter().any(|(index, runs)| {
+            !seen.get(*index).copied().unwrap_or(false) || !valid_underline_colors(runs, self.cols)
+        }) {
+            return Err(Error::Bounds);
+        }
+        if delta.clusters.iter().any(|(index, line)| {
+            !delta
+                .rows
+                .iter()
+                .any(|(row, cells)| row == index && line.valid_for(&cells.cells))
+        }) {
+            return Err(Error::Bounds);
+        }
         let mut rows = self.rows.to_vec();
         for (index, row) in &delta.rows {
             rows[*index] = row.clone();
         }
+        let underline_colors = if delta.rows.is_empty() {
+            self.shared_underline_rows()
+        } else if self.underline_colors.is_some() || !delta.underline_colors.is_empty() {
+            let mut colors = self
+                .underline_colors
+                .as_ref()
+                .map_or_else(|| vec![None; rows.len()], |current| current.to_vec());
+            for (index, _) in &delta.rows {
+                colors[*index] = None;
+            }
+            for (index, runs) in &delta.underline_colors {
+                colors[*index] = Some(runs.clone());
+            }
+            colors.iter().any(Option::is_some).then(|| colors.into())
+        } else {
+            None
+        };
+        let clusters = if delta.rows.is_empty() {
+            self.shared_clusters()
+        } else if self.clusters.is_some() || !delta.clusters.is_empty() {
+            let mut clusters = self
+                .clusters
+                .as_ref()
+                .map_or_else(|| vec![None; rows.len()], |current| current.to_vec());
+            for (index, _) in &delta.rows {
+                clusters[*index] = None;
+            }
+            for (index, line) in &delta.clusters {
+                clusters[*index] = Some(line.clone());
+            }
+            clusters
+                .iter()
+                .any(Option::is_some)
+                .then(|| clusters.into())
+        } else {
+            None
+        };
+        let resources = match &delta.hyperlinks {
+            HyperlinkDelta::Inherit => &self.hyperlinks,
+            HyperlinkDelta::Snapshot(resources) => resources,
+        };
+        let hyperlinks = resources.as_ref().and_then(|resources| {
+            retain_resources(
+                resources,
+                rows.iter()
+                    .flat_map(|row| row.cells.iter().map(|cell| cell.hyperlink_id)),
+            )
+        });
         // The admitted base and validated edit set already establish all
         // invariants, including row widths. Do not rescan cloned rows.
         Ok(Self {
@@ -244,6 +462,9 @@ impl CellFrame {
             cols: self.cols,
             rows: rows.into(),
             cursor: delta.cursor,
+            underline_colors,
+            hyperlinks,
+            clusters,
         })
     }
 }

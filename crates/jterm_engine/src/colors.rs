@@ -1,4 +1,4 @@
-//! Ember-compatible dynamic color ownership, independent of UI and PTY.
+//! Profiled dynamic color ownership, independent of UI and PTY.
 //! Replies are returned in operation order for immediate host delivery.
 use crate::semantics::{Effect, Effects};
 
@@ -37,7 +37,7 @@ pub struct ProfiledColorState<D> {
 }
 /// Ember colors retain their original API and debug representation.
 pub type ColorState = ProfiledColorState<TerminalDefaultColors>;
-/// Overrides only. The host owns parsing, defaults, query and reset policy.
+/// Frost override storage. The host supplies defaults for each operation.
 ///
 /// Ember parsing is intentionally unavailable on this profile.
 /// ```compile_fail
@@ -115,6 +115,170 @@ impl<D> ProfiledColorState<D> {
         self.dynamic_palette = [None; 256];
     }
 }
+#[derive(Clone, Copy)]
+enum OscColorProfile {
+    Ember,
+    Frost,
+}
+
+impl OscColorProfile {
+    fn parse(self, spec: &str) -> Option<Rgb> {
+        if let Some(hex) = spec.strip_prefix('#') {
+            if hex.len() != 6 || !hex.is_ascii() {
+                return None;
+            }
+            return Some((
+                u8::from_str_radix(&hex[0..2], 16).ok()?,
+                u8::from_str_radix(&hex[2..4], 16).ok()?,
+                u8::from_str_radix(&hex[4..6], 16).ok()?,
+            ));
+        }
+
+        let mut components = spec.strip_prefix("rgb:")?.split('/');
+        let (r, g, b) = (components.next()?, components.next()?, components.next()?);
+        if components.next().is_some() {
+            return None;
+        }
+        let digits = r.len();
+        if matches!(self, Self::Ember)
+            && (!(1..=4).contains(&digits) || g.len() != digits || b.len() != digits)
+        {
+            return None;
+        }
+        let r = u16::from_str_radix(r, 16).ok()?;
+        let g = u16::from_str_radix(g, 16).ok()?;
+        let b = u16::from_str_radix(b, 16).ok()?;
+        match self {
+            Self::Ember => {
+                let max = (1u32 << (digits * 4)) - 1;
+                let scaled = |component| ((u32::from(component) * 255 + max / 2) / max) as u8;
+                Some((scaled(r), scaled(g), scaled(b)))
+            }
+            Self::Frost => {
+                // The original parser keys every channel's scale to the first
+                // channel's raw length and accepts mixed component widths.
+                let scale = if digits == 4 { 257 } else { 1 };
+                Some(((r / scale) as u8, (g / scale) as u8, (b / scale) as u8))
+            }
+        }
+    }
+}
+
+fn color_reply(
+    command: std::fmt::Arguments<'_>,
+    (r, g, b): Rgb,
+    terminator: &[u8],
+    effects: &mut Effects,
+) {
+    let (r, g, b) = (u16::from(r) * 257, u16::from(g) * 257, u16::from(b) * 257);
+    let mut reply = format!("\x1b]{command};rgb:{r:04x}/{g:04x}/{b:04x}").into_bytes();
+    reply.extend_from_slice(terminator);
+    effects.push(Effect::Reply(reply));
+}
+
+impl<D> ProfiledColorState<D> {
+    fn apply_color_osc(
+        &mut self,
+        command: &str,
+        value: &str,
+        terminator: &[u8],
+        defaults: TerminalDefaultColors,
+        profile: OscColorProfile,
+    ) -> Effects {
+        let mut effects = Effects::new();
+        match command {
+            "4" => self.osc_palette(value, terminator, defaults, profile, &mut effects),
+            "104" => self.reset_osc_palette(value),
+            "10" | "11" | "12" => {
+                self.osc_color(command, value, terminator, defaults, profile, &mut effects);
+            }
+            "110" | "111" | "112" => self.reset_osc_color(command),
+            _ => {}
+        }
+        effects
+    }
+
+    fn osc_color(
+        &mut self,
+        command: &str,
+        value: &str,
+        terminator: &[u8],
+        defaults: TerminalDefaultColors,
+        profile: OscColorProfile,
+        effects: &mut Effects,
+    ) {
+        let (slot, fallback) = match command {
+            "10" => (&mut self.dynamic_fg, defaults.foreground),
+            "11" => (&mut self.dynamic_bg, defaults.background),
+            "12" => (&mut self.dynamic_cursor_color, defaults.cursor),
+            _ => return,
+        };
+        if value == "?" {
+            color_reply(
+                format_args!("{command}"),
+                slot.unwrap_or(fallback),
+                terminator,
+                effects,
+            );
+        } else if let Some(rgb) = profile.parse(value) {
+            *slot = Some(rgb);
+        }
+    }
+
+    pub fn reset_osc_color(&mut self, command: &str) {
+        match command {
+            "110" => self.dynamic_fg = None,
+            "111" => self.dynamic_bg = None,
+            "112" => self.dynamic_cursor_color = None,
+            _ => {}
+        }
+    }
+
+    fn osc_palette(
+        &mut self,
+        value: &str,
+        terminator: &[u8],
+        defaults: TerminalDefaultColors,
+        profile: OscColorProfile,
+        effects: &mut Effects,
+    ) {
+        let mut parts = value.split(';');
+        while let (Some(index), Some(spec)) = (parts.next(), parts.next()) {
+            let Ok(index) = index.parse::<u8>() else {
+                continue;
+            };
+            if spec == "?" {
+                let color = self.palette_color_with_defaults(index, defaults);
+                color_reply(format_args!("4;{index}"), color, terminator, effects);
+            } else if let Some(rgb) = profile.parse(spec) {
+                self.dynamic_palette[usize::from(index)] = Some(rgb);
+            }
+        }
+    }
+
+    pub fn reset_osc_palette(&mut self, value: &str) {
+        if value.is_empty() {
+            self.dynamic_palette = [None; 256];
+            return;
+        }
+        for index in value.split(';').filter(|s| !s.is_empty()) {
+            if let Ok(index) = index.parse::<u8>() {
+                self.dynamic_palette[usize::from(index)] = None;
+            }
+        }
+    }
+
+    fn palette_color_with_defaults(&self, index: u8, defaults: TerminalDefaultColors) -> Rgb {
+        self.dynamic_palette[usize::from(index)].unwrap_or_else(|| {
+            defaults
+                .ansi
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or_else(|| ColorState::default_256_color(index))
+        })
+    }
+}
+
 impl ColorState {
     pub fn defaults(&self) -> TerminalDefaultColors {
         self.default_colors
@@ -130,13 +294,7 @@ impl ColorState {
             .unwrap_or(self.default_colors.cursor)
     }
     pub fn palette_color(&self, idx: u8) -> Rgb {
-        self.dynamic_palette[idx as usize].unwrap_or_else(|| {
-            self.default_colors
-                .ansi
-                .get(idx as usize)
-                .copied()
-                .unwrap_or_else(|| Self::default_256_color(idx))
-        })
+        self.palette_color_with_defaults(idx, self.default_colors)
     }
     /// Only a host theme update emits a subscribed color-scheme change.
     pub fn set_theme(&mut self, colors: TerminalDefaultColors, subscribed_2031: bool) -> Effects {
@@ -150,18 +308,15 @@ impl ColorState {
         }
         effects
     }
-    /// Apply only Ember color OSC commands. Unknown commands are inert.
-    /// The terminator is supplied by the current OSC, never retained as state.
+    /// The terminator is supplied by the current OSC.
     pub fn apply_ember_osc(&mut self, command: &str, value: &str, terminator: &[u8]) -> Effects {
-        let mut effects = Effects::new();
-        match command {
-            "4" => self.handle_osc_palette(value, terminator, &mut effects),
-            "104" => self.reset_osc_palette(value),
-            "10" | "11" | "12" => self.handle_osc_color(command, value, terminator, &mut effects),
-            "110" | "111" | "112" => self.reset_osc_color(command),
-            _ => {}
-        }
-        effects
+        self.apply_color_osc(
+            command,
+            value,
+            terminator,
+            self.default_colors,
+            OscColorProfile::Ember,
+        )
     }
     pub fn effective_default_background(&self) -> (u8, u8, u8) {
         self.dynamic_bg.unwrap_or(self.default_colors.background)
@@ -182,97 +337,23 @@ impl ColorState {
         terminator: &[u8],
         effects: &mut Effects,
     ) {
-        if value == "?" {
-            // Query: report what is painted — the OSC override if one is set,
-            // else the theme default the app pushed in.
-            let color = match command {
-                "10" => self.dynamic_fg.unwrap_or(self.default_colors.foreground),
-                "11" => self.effective_default_background(),
-                "12" => self
-                    .dynamic_cursor_color
-                    .unwrap_or(self.default_colors.cursor),
-                _ => return,
-            };
-            let response = format!(
-                "\x1b]{};rgb:{:04x}/{:04x}/{:04x}",
-                command,
-                (color.0 as u16) * 257,
-                (color.1 as u16) * 257,
-                (color.2 as u16) * 257,
-            );
-            let mut reply = response.into_bytes();
-            reply.extend_from_slice(terminator);
-            effects.push(Effect::Reply(reply));
-        } else if let Some(rgb) = Self::parse_color_spec(value) {
-            match command {
-                "10" => self.dynamic_fg = Some(rgb),
-                "11" => self.dynamic_bg = Some(rgb),
-                "12" => self.dynamic_cursor_color = Some(rgb),
-                _ => {}
-            }
-        }
-    }
-    pub fn reset_osc_color(&mut self, command: &str) {
-        match command {
-            "110" => self.dynamic_fg = None,
-            "111" => self.dynamic_bg = None,
-            "112" => self.dynamic_cursor_color = None,
-            _ => {}
-        }
+        self.osc_color(
+            command,
+            value,
+            terminator,
+            self.default_colors,
+            OscColorProfile::Ember,
+            effects,
+        );
     }
     pub fn handle_osc_palette(&mut self, value: &str, terminator: &[u8], effects: &mut Effects) {
-        let mut parts = value.split(';');
-        while let Some(idx_s) = parts.next() {
-            let Some(color_s) = parts.next() else {
-                break;
-            };
-            let Ok(idx) = idx_s.parse::<u8>() else {
-                continue;
-            };
-            if color_s == "?" {
-                let color = self.dynamic_palette[idx as usize].unwrap_or_else(|| {
-                    // The 16 ANSI slots are theme colours; the cube and
-                    // grey ramp are not themed.
-                    self.default_colors
-                        .ansi
-                        .get(idx as usize)
-                        .copied()
-                        .unwrap_or_else(|| Self::default_256_color(idx))
-                });
-                self.append_osc_palette_response(idx, color, terminator, effects);
-            } else if let Some(rgb) = Self::parse_color_spec(color_s) {
-                self.dynamic_palette[idx as usize] = Some(rgb);
-            }
-        }
-    }
-    pub fn reset_osc_palette(&mut self, value: &str) {
-        if value.is_empty() {
-            self.dynamic_palette = [None; 256];
-            return;
-        }
-        for idx_s in value.split(';').filter(|s| !s.is_empty()) {
-            if let Ok(idx) = idx_s.parse::<u8>() {
-                self.dynamic_palette[idx as usize] = None;
-            }
-        }
-    }
-    fn append_osc_palette_response(
-        &mut self,
-        idx: u8,
-        color: (u8, u8, u8),
-        terminator: &[u8],
-        effects: &mut Effects,
-    ) {
-        let response = format!(
-            "\x1b]4;{};rgb:{:04x}/{:04x}/{:04x}",
-            idx,
-            (color.0 as u16) * 257,
-            (color.1 as u16) * 257,
-            (color.2 as u16) * 257,
+        self.osc_palette(
+            value,
+            terminator,
+            self.default_colors,
+            OscColorProfile::Ember,
+            effects,
         );
-        let mut reply = response.into_bytes();
-        reply.extend_from_slice(terminator);
-        effects.push(Effect::Reply(reply));
     }
     pub fn default_256_color(idx: u8) -> (u8, u8, u8) {
         const ANSI: [(u8, u8, u8); 16] = [
@@ -309,46 +390,24 @@ impl ColorState {
             }
         }
     }
-    pub fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
-        // Parse rgb:RR/GG/BB / rgb:RRRR/GGGG/BBBB / rgb:R/G/B / rgb:RRR/GGG/BBB / #RRGGBB
-        // Per XParseColor, each component is 1..=4 hex digits and is left-aligned
-        // into a 16-bit field (i.e. component value * (2^16-1) / (2^bits-1)),
-        // then truncated to 8 bits. The previous scale=1 fallback for 1/3-digit
-        // components produced a u8 cast of e.g. 0xFFF=4095, which wraps to 255
-        // for full-on but is wrong for any partial value.
-        fn scale_to_u8(value: u16, hex_digits: usize) -> u8 {
-            // Range of n hex digits is [0, 16^n - 1].
-            let max_n: u32 = (1u32 << (hex_digits * 4)).saturating_sub(1).max(1);
-            // Scale value to 0..=255, rounding to nearest.
-            (((value as u32) * 255 + max_n / 2) / max_n) as u8
-        }
-        if let Some(hex) = spec.strip_prefix('#') {
-            // OSC payloads are UTF-8, not necessarily ASCII. Reject non-ASCII
-            // before byte slicing so a six-byte malformed color cannot panic.
-            if hex.len() == 6 && hex.is_ascii() {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                return Some((r, g, b));
-            }
-        } else if let Some(rgb) = spec.strip_prefix("rgb:") {
-            let parts: Vec<&str> = rgb.split('/').collect();
-            if parts.len() == 3
-                && (1..=4).contains(&parts[0].len())
-                && parts[0].len() == parts[1].len()
-                && parts[1].len() == parts[2].len()
-            {
-                let digits = parts[0].len();
-                let r = u16::from_str_radix(parts[0], 16).ok()?;
-                let g = u16::from_str_radix(parts[1], 16).ok()?;
-                let b = u16::from_str_radix(parts[2], 16).ok()?;
-                return Some((
-                    scale_to_u8(r, digits),
-                    scale_to_u8(g, digits),
-                    scale_to_u8(b, digits),
-                ));
-            }
-        }
-        None
+    pub fn parse_color_spec(spec: &str) -> Option<Rgb> {
+        OscColorProfile::Ember.parse(spec)
+    }
+}
+
+impl DynamicColorState {
+    /// Apply the Frost legacy OSC color rules with host-supplied theme fallbacks.
+    pub fn apply_frost_osc(
+        &mut self,
+        command: &str,
+        value: &str,
+        terminator: &[u8],
+        defaults: TerminalDefaultColors,
+    ) -> Effects {
+        self.apply_color_osc(command, value, terminator, defaults, OscColorProfile::Frost)
+    }
+
+    pub fn parse_frost_color_spec(spec: &str) -> Option<Rgb> {
+        OscColorProfile::Frost.parse(spec)
     }
 }

@@ -39,6 +39,8 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path crates/jterm_engine/Cargo.toml --locked --no-deps
           python3 crates/jterm_engine/scripts/check_boundary.py --engine-only
           python3 scripts/test-family-engine.py
+          python3 scripts/test-terminal-family-product-catalog.py
+          python3 scripts/test-terminal-family-release.py
       - name: Terminal performance probe transport tests (not host measurements)
         run: python3 -m unittest discover -s scripts/terminal-performance -p 'test_terminal_baseline.py' -v
       - run: cargo fmt --all -- --check
@@ -69,6 +71,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y curl minisign vim-nox ripgrep
       - name: Test independent engine with its own lockfile
         run: cargo test --manifest-path crates/jterm_engine/Cargo.toml --locked --all-targets
+      - name: Test the JWM helper client with its own lockfile
+        run: cargo test --manifest-path crates/jterm_remote_client/Cargo.toml --locked --all-targets
+      - name: Test terminal wire contracts with their own lockfile
+        run: cargo test --manifest-path crates/jterm_protocol/Cargo.toml --locked --all-targets
       - run: cargo check --locked --all-targets --all-features
       - run: cargo test --locked --all-targets --all-features
       - name: Real Vim9 editor and project workflow

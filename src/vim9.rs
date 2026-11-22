@@ -163,7 +163,7 @@ pub struct Vim9Buffer {
     pub current: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9Diagnostic {
     pub filename: String,
@@ -173,7 +173,7 @@ pub struct Vim9Diagnostic {
     pub kind: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9Build {
     pub running: bool,
@@ -185,7 +185,7 @@ pub struct Vim9Build {
     pub truncated: usize,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9Search {
     pub running: bool,
@@ -230,7 +230,7 @@ pub struct Vim9Navigation {
 
 /// Identity of Vim's current quickfix list. The combined diagnostics may also
 /// contain entries from a window location list or language server.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9Quickfix {
     pub source: String,

@@ -10,10 +10,19 @@ no xterm.js dependency or alternative VT parser in the WebView.
 new candidates are releasable together. Preserve each consumer's release pin
 until the shared candidate is published and the exact consumer revision passes.
 
+`family-release-2026-11-22.json` captures the post-plan Git baseline, all
+tracked Cargo lock hashes and the seven production lock graphs. Verify the
+baseline with `python3 scripts/terminal-family-release.py --verify
+docs/architecture/family-release-2026-11-22.json`. Run with
+`--require-common-core` to require every production lock graph to resolve to
+the recorded core commit. The checker reads committed Git objects. Native
+tests, platform coverage and upgrade evidence are separate release inputs.
+
 | Component | Retained responsibility |
 | --- | --- |
 | jterm_engine | Extracted pure terminal primitives; eventually incremental VT state, modes, input encoding and ordered effects |
-| jterm_core | Runtime policy, process lifecycle, application records, Agent Workspace, persistence, Vim9 |
+| jterm_runtime | Wake, process observation, and Unix termination and reaping primitives |
+| jterm_core | Product policy, application records, Agent Workspace, persistence, Vim9 |
 | Ember/Frost adapters | Current live parser and business integration until each extracted lane is verified |
 | Forge/Anvil adapters | Existing GTK/VTE path until a shared-view GTK widget is separately validated |
 | Frontend renderer | Paint, platform input, IME placement, focus and UI-local caches |
@@ -125,6 +134,10 @@ Suggested local commands (dependencies must already be cached; runner is offline
 
 ```
 python scripts/family-cargo.py jterm_engine test
+python scripts/family-cargo.py jterm_runtime test --features linux-pty,session-actor
+python scripts/family-cargo.py aether-session test
+python scripts/family-cargo.py aether-bridge test
+python scripts/family-cargo.py aether test
 python scripts/family-cargo.py jterm_core test --lib runtime_wake
 python scripts/family-cargo.py ember test --lib terminal
 python scripts/family-cargo.py ember test --lib shell

@@ -65,6 +65,7 @@ impl NativeManager {
         command: WorkspaceCommand,
         owner: Owner,
         store: &mut Store,
+        project_row: impl FnMut(&mut super::WorkspaceRow),
     ) -> Disposition {
         if let WorkspaceCommand::Archive { id, .. } | WorkspaceCommand::Delete { id } = &command {
             match store.native_snapshot(id) {
@@ -91,6 +92,7 @@ impl NativeManager {
             }
         }
         let result = match command {
+            WorkspaceCommand::SaveNativeDraft { draft } => Self::save_draft(*draft, store),
             WorkspaceCommand::StartNative { launch } => self.start(*launch, owner, store),
             WorkspaceCommand::NativeCatalog { after, limit } => {
                 store.native_catalog(after.as_ref(), limit)
@@ -118,11 +120,72 @@ impl NativeManager {
                 control,
                 operation,
                 action,
-            } => self.control(control, operation, *action, &owner, store),
+            } => self.control(control, operation, *action, &owner, store, project_row),
             other => return Disposition::Other(other),
         };
         Disposition::Handled(Box::new(result))
     }
+    fn save_draft(draft: NativeDraft, store: &Store) -> Result<WorkspaceReply, String> {
+        let task = &draft.task;
+        if !draft.source_profile.is_absolute()
+            || draft.source_profile.to_string_lossy().len() > 8192
+            || draft.source_profile.to_string_lossy().contains('\0')
+            || !matches!(
+                task.provider,
+                AgentProvider::Codex | AgentProvider::Claude | AgentProvider::Kimi
+            )
+            || task.brief.is_none()
+            || task.source.is_some()
+            || task.source_context.is_some()
+            || task.status != TaskStatus::Created
+            || task.runtime_kind != TaskRuntimeKind::Unassigned
+            || task.terminal_session_id.is_some()
+            || task.validation != Default::default()
+            || serde_json::to_vec(task).map_err(|e| e.to_string())?.len() > 2 * 1024 * 1024
+        {
+            return Err("Save a bounded authored task before launching its provider".into());
+        }
+        task.brief.as_ref().expect("authored draft").validate()?;
+        let id = super::model::task_id(&draft.namespace, &task.id.to_string())?;
+        if let Some(previous) = store.native_snapshot(&id)? {
+            if !same_task_identity(&previous.task, task)
+                || previous.task.title != task.title
+                || previous.task.brief != task.brief
+                || previous.source_profile != draft.source_profile
+            {
+                return Err("Native draft identity changed".into());
+            }
+            return Self::inspect(&id, store, None);
+        }
+        if store.native_draft_count()? >= super::WORKSPACE_QUEUE_LIMIT {
+            return Err("The workspace holds at most 256 saved native drafts".into());
+        }
+        let policy = NativePromptPolicy {
+            share_command_context: false,
+            redact_secrets: true,
+        };
+        let safe = safe_task_projection(task, policy);
+        if safe.title != task.title || safe.brief != task.brief {
+            return Err(
+                "Remove credentials from the task title, goal or verification recipe before saving"
+                    .into(),
+            );
+        }
+        TaskManager::new().project_hosted_task(task.clone(), false)?;
+        let baseline = crate::agent_task::worktree::capture_task_review(task)?;
+        let snapshot = initial_snapshot(
+            id.clone(),
+            draft.namespace,
+            task,
+            draft.source_profile,
+            policy,
+            Some(baseline),
+            true,
+        );
+        store.save_native(&snapshot)?;
+        Self::inspect(&id, store, None)
+    }
+
     fn inspect(
         id: &super::model::ConversationId,
         store: &Store,
@@ -191,36 +254,15 @@ impl NativeManager {
             AgentProvider::Codex => launch.context.codex_home.clone(),
             _ => launch.context.claude_home.clone(),
         };
-        let mut snapshot = NativeSnapshot {
-            id: id.clone(),
-            namespace: launch.namespace,
-            incarnation: uuid::Uuid::new_v4().to_string(),
-            sequence: 1,
-            task: safe_task_projection(&launch.task, launch.policy),
-            redact_secrets: launch.policy.redact_secrets,
-            validation_evidence_redacted: launch.task.validation_command()
-                != safe_task_projection(&launch.task, launch.policy).validation_command(),
-            view: None,
-            preparing: true,
-            live: false,
-            ownership_locked: true,
-            interrupted: false,
-            can_prompt: false,
-            can_resume: false,
-            can_start_validation: false,
-            manual_review: launch.task.requires_manual_review(),
-            can_continue_in_terminal: false,
-            exit: None,
-            events: vec![],
-            native_home: None,
-            provider_home: source_profile.clone(),
+        let mut snapshot = initial_snapshot(
+            id.clone(),
+            launch.namespace,
+            &launch.task,
             source_profile,
-            handoff_pending: false,
-            terminal: None,
-            validation: None,
-            review_baseline: crate::agent_task::worktree::capture_task_review(&launch.task).ok(),
-            operations: vec![],
-        };
+            launch.policy,
+            crate::agent_task::worktree::capture_task_review(&launch.task).ok(),
+            false,
+        );
         // Durable intent precedes any preparation/provider worker release.
         store.save_native(&snapshot)?;
         let started = start_provider(
@@ -421,6 +463,7 @@ impl NativeManager {
         action: NativeAction,
         owner: &Owner,
         store: &mut Store,
+        mut project_row: impl FnMut(&mut super::WorkspaceRow),
     ) -> Result<WorkspaceReply, String> {
         if uuid::Uuid::parse_str(&operation).is_err() {
             return Err("Invalid native operation identity".into());
@@ -437,6 +480,12 @@ impl NativeManager {
                 "The session host already owns eight active native/validation executions".into(),
             );
         }
+        let launch_capacity = self
+            .jobs
+            .values()
+            .filter(|job| job.snapshot.ownership_locked)
+            .count()
+            < 8;
         let paths = self.paths.clone();
         let job = self.owned(&control, owner)?;
         let before_sequence = job.snapshot.sequence;
@@ -509,6 +558,9 @@ impl NativeManager {
                 Ok(())
             }
             NativeAction::Resume { context, policy } => {
+                if job.snapshot.saved_draft {
+                    return Err("Start this saved draft through the task queue".into());
+                }
                 if !matches!(
                     job.snapshot.task.status,
                     TaskStatus::ReadyForReview | TaskStatus::Failed | TaskStatus::Created
@@ -584,6 +636,106 @@ impl NativeManager {
                     job.tasks.project_hosted_task(previous_task, false)?;
                 }
                 result
+            }
+            NativeAction::LaunchDraft {
+                expected_sequence,
+                expected_queue_revision,
+                context,
+                policy,
+            } => {
+                admit_task_mutation(job, expected_sequence, before_sequence)?;
+                if !job.snapshot.saved_draft
+                    || job.snapshot.task.status != TaskStatus::Created
+                    || job.snapshot.task.runtime_kind != TaskRuntimeKind::Unassigned
+                    || job.snapshot.interrupted
+                {
+                    return Err("This exact task is no longer a launchable saved draft".into());
+                }
+                if !launch_capacity {
+                    return Err(
+                        "The session host already owns eight active native executions".into(),
+                    );
+                }
+                if !policy.share_command_context || !policy.redact_secrets {
+                    return Err(
+                        "Confirm sharing the saved draft before starting its native provider"
+                            .into(),
+                    );
+                }
+                context.validate()?;
+                let source_profile = match job.snapshot.task.provider {
+                    AgentProvider::Codex => &context.codex_home,
+                    _ => &context.claude_home,
+                };
+                if source_profile != &job.snapshot.source_profile {
+                    return Err(
+                        "Open the original provider profile before starting this saved draft"
+                            .into(),
+                    );
+                }
+                let queue = store.queue_value()?;
+                if queue.revision != expected_queue_revision {
+                    return Err(
+                        "The task queue changed before launch; refresh and review its readiness"
+                            .into(),
+                    );
+                }
+                let mut rows = store.complete_queue_catalog()?;
+                rows.iter_mut().for_each(&mut project_row);
+                let ready = queue
+                    .project(&rows)
+                    .into_iter()
+                    .find(|row| row.id == job.snapshot.id)
+                    .ok_or("Add this saved task to the queue before starting it")?;
+                if ready.state != super::WorkspaceQueueState::Ready {
+                    return Err(ready.reason.unwrap_or_else(|| ready.state.label().into()));
+                }
+                let task = job.tasks.get(task_id).ok_or("Saved task is unavailable")?;
+                let current = crate::agent_task::worktree::capture_task_review(task)?;
+                if !job
+                    .snapshot
+                    .review_baseline
+                    .as_ref()
+                    .is_some_and(|baseline| baseline.fingerprint == current.fingerprint)
+                {
+                    return Err("The saved draft worktree changed. Restore its inspected contents or prepare a new draft.".into());
+                }
+                let mut admission = job.snapshot.clone();
+                admission.saved_draft = false;
+                admission.preparing = true;
+                admission.ownership_locked = true;
+                // A lost host after this write records an interrupted outcome,
+                // never a draft that can release the provider a second time.
+                store.save_native(&admission)?;
+                job.snapshot = admission;
+                job.runtime
+                    .configure_host(context.clone(), job.lease.clone());
+                job.context = context;
+                job.policy = policy;
+                job.policy_origin = job
+                    .controller
+                    .as_ref()
+                    .map(|c| (c.owner.clone(), c.view.clone()));
+                job.historical = false;
+                if let Err(error) = start_provider(
+                    &mut job.runtime,
+                    &mut job.tasks,
+                    task_id,
+                    job.snapshot.task.provider,
+                    policy,
+                ) {
+                    let mut task = job
+                        .tasks
+                        .get(task_id)
+                        .ok_or("Saved task is unavailable")?
+                        .clone();
+                    task.status = TaskStatus::Failed;
+                    task.status_detail = Some(error);
+                    job.tasks.project_hosted_task(task, false)?;
+                    job.snapshot.preparing = false;
+                    job.snapshot.ownership_locked = false;
+                }
+                Ok(())
             }
             NativeAction::Handoff { context } => {
                 if !matches!(
@@ -689,6 +841,20 @@ impl NativeManager {
                 job.snapshot.ownership_locked = true;
                 Ok(())
             }
+            NativeAction::AcceptReviewedAt {
+                expected_sequence,
+                fingerprint,
+            } => {
+                admit_task_mutation(job, expected_sequence, before_sequence)?;
+                let task = job.tasks.get(task_id).ok_or("Task is unavailable")?;
+                let current = crate::agent_task::worktree::capture_task_review(task)?;
+                if current.fingerprint != fingerprint {
+                    return Err("Worktree changed after inspection. Inspect the current diff before accepting.".into());
+                }
+                job.tasks
+                    .complete_after_manual_review(task_id)
+                    .map_err(|error| error.to_string())
+            }
             NativeAction::MutateTask {
                 expected_sequence,
                 mutation,
@@ -698,14 +864,7 @@ impl NativeManager {
                 {
                     return Err("Original validation evidence was redacted; provide its original recipe before accepting this task".into());
                 }
-                if expected_sequence != before_sequence {
-                    return Err(
-                        "Task changed before this action; refresh it before trying again".into(),
-                    );
-                }
-                if job.snapshot.ownership_locked || job.validation.is_some() {
-                    return Err("Stop native/CLI work and finish validation before changing the task lifecycle".into());
-                }
+                admit_task_mutation(job, expected_sequence, before_sequence)?;
                 match mutation {
                     NativeTaskMutation::Complete => {
                         let task = job.tasks.get(task_id).ok_or("Task is unavailable")?;
@@ -839,6 +998,60 @@ impl NativeManager {
         let _ = refresh(job, report, store);
     }
 }
+fn initial_snapshot(
+    id: super::ConversationId,
+    namespace: String,
+    task: &crate::agent_task::AgentTask,
+    source_profile: std::path::PathBuf,
+    policy: NativePromptPolicy,
+    review_baseline: Option<crate::agent_task::worktree::WorktreeReviewSnapshot>,
+    saved_draft: bool,
+) -> NativeSnapshot {
+    let projected = safe_task_projection(task, policy);
+    NativeSnapshot {
+        saved_draft,
+        id,
+        namespace,
+        incarnation: uuid::Uuid::new_v4().to_string(),
+        sequence: 1,
+        validation_evidence_redacted: task.validation_command() != projected.validation_command(),
+        task: projected,
+        redact_secrets: policy.redact_secrets,
+        view: None,
+        preparing: !saved_draft,
+        live: false,
+        ownership_locked: !saved_draft,
+        interrupted: false,
+        can_prompt: false,
+        can_resume: false,
+        can_start_validation: false,
+        manual_review: task.requires_manual_review(),
+        can_continue_in_terminal: false,
+        exit: None,
+        events: vec![],
+        native_home: None,
+        provider_home: source_profile.clone(),
+        source_profile,
+        handoff_pending: false,
+        terminal: None,
+        validation: None,
+        review_baseline,
+        operations: vec![],
+    }
+}
+
+fn admit_task_mutation(job: &Job, expected: u64, current: u64) -> Result<(), String> {
+    if expected != current {
+        return Err("Task changed before this action; refresh it before trying again".into());
+    }
+    if job.snapshot.ownership_locked || job.validation.is_some() {
+        return Err(
+            "Stop native/CLI work and finish validation before changing the task lifecycle".into(),
+        );
+    }
+    Ok(())
+}
+
 fn projection_policy(job: &Job) -> NativePromptPolicy {
     NativePromptPolicy {
         redact_secrets: job.snapshot.redact_secrets || job.policy.redact_secrets,
@@ -1282,6 +1495,7 @@ mod historical_projection_tests {
             ..Default::default()
         };
         let snapshot = NativeSnapshot {
+            saved_draft: false,
             id: id.clone(),
             namespace: "fixture/history".into(),
             incarnation: uuid::Uuid::new_v4().to_string(),
@@ -1362,7 +1576,8 @@ mod historical_projection_tests {
                     policy
                 },
                 &owner,
-                &mut store
+                &mut store,
+                |_| {},
             )
             .is_err());
         for _ in 0..10 {
@@ -1383,7 +1598,8 @@ mod historical_projection_tests {
                         context: context.clone()
                     },
                     &owner,
-                    &mut store
+                    &mut store,
+                    |_| {},
                 )
                 .is_err());
             assert!(manager.jobs[&id].handoff.is_none());

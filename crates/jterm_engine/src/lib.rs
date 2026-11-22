@@ -1,6 +1,8 @@
-//! Extracted terminal primitives, not yet a complete terminal emulator.
+//! Shared terminal semantics, storage, frames and publication.
 //! No GUI, PTY, Agent, application identity or host side effects belong here.
+pub mod archived_text;
 pub mod framing;
+mod graphemes;
 pub mod grid;
 pub mod hyperlink;
 pub use grid::*;
@@ -26,3 +28,10 @@ pub mod mode_mutation;
 pub mod colors;
 
 pub mod titles;
+
+pub mod terminal;
+
+pub mod authenticated_boundaries;
+pub mod block_contract;
+pub mod command_blocks;
+pub mod shell_markers;

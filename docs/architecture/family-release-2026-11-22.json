@@ -1,0 +1,114 @@
+{
+  "common_core_mismatches": {
+    "aether/bridge/Cargo.lock": "a9a52c41f478d18ec365d5c9d016d4829920b9f4",
+    "aether/session/Cargo.lock": "a9a52c41f478d18ec365d5c9d016d4829920b9f4",
+    "aether/src-tauri/Cargo.lock": "a9a52c41f478d18ec365d5c9d016d4829920b9f4",
+    "anvil/Cargo.lock": "f0107afaf631d29d06358abec3997f1b5712b627",
+    "ember/Cargo.lock": "f0107afaf631d29d06358abec3997f1b5712b627",
+    "forge/Cargo.lock": "f0107afaf631d29d06358abec3997f1b5712b627",
+    "frost/Cargo.lock": "c8d7933352930e5097ee210e22997d6ab7eb1051"
+  },
+  "repositories": {
+    "aether": {
+      "app_core_pins": {
+        "bridge/Cargo.lock": {
+          "jterm_engine": "a9a52c41f478d18ec365d5c9d016d4829920b9f4"
+        },
+        "session/Cargo.lock": {
+          "jterm_engine": "a9a52c41f478d18ec365d5c9d016d4829920b9f4"
+        },
+        "src-tauri/Cargo.lock": {
+          "jterm_engine": "a9a52c41f478d18ec365d5c9d016d4829920b9f4"
+        }
+      },
+      "commit": "5598a27dd7729a895c3632b96b4a3c759112244e",
+      "lock_sha256": {
+        "bridge/Cargo.lock": "d5e63067582d64b7b2adbf30406fae911a0f79ff03b05012ef44d5ad10524a25",
+        "session/Cargo.lock": "876a5ae8447aa5f5e10f859a7a950abd83f0dbb4681bed46c675e1c6ba22c315",
+        "src-tauri/Cargo.lock": "95d7544952c0459d4770d2728f568dd1e3e9601c22d6d9dc9e8d51e665ad9741"
+      }
+    },
+    "anvil": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "f0107afaf631d29d06358abec3997f1b5712b627"
+        }
+      },
+      "commit": "62e9ea88b8f6e26ab904a65596f01dc2538c0c76",
+      "lock_sha256": {
+        "Cargo.lock": "e9d9011a4967338558f71c78c34214d56cc6a2d2e4f49889e04c062db4fcfd36",
+        "scripts/link-recovery/Cargo.lock": "829240b18fc69fc8836e402ec5547e263439ba520a063da35d0f5bafe6b652bc"
+      }
+    },
+    "ember": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "f0107afaf631d29d06358abec3997f1b5712b627",
+          "jterm_engine": "f0107afaf631d29d06358abec3997f1b5712b627"
+        }
+      },
+      "commit": "c346b792d3b3941d326bb5ad53f92c96b990ac0a",
+      "lock_sha256": {
+        "Cargo.lock": "03ba9d26d29191ba7ebd87eca711bb47525fa05147ba31c7aa8423df981b3d0f",
+        "font-group-harness/Cargo.lock": "ab9c4e45c2ad72687999c4aaac38728396fcc2c03c17d26d09b6241aa3a598d7",
+        "tools/eva-render-harness/Cargo.lock": "df7b1b0b5a74003c4efaedc6a07474ac89f4b30cad821a5d99f49cd98a926cc1",
+        "tools/native-feedback-harness/Cargo.lock": "e015e232d6ddb3b84cbcb74008c20cf0d4cd019f172f211421656c5b2923b875",
+        "vendor/eframe/Cargo.lock": "19f7d98a0e65f84bc5ea3b95d5dac091ae5c5a460dd75af15a4e1f47758cd770",
+        "vendor/egui-wgpu/Cargo.lock": "9a36e580750555cc488a9293a651009b3721fc840a553ce862f63f44552628c7",
+        "vendor/egui-winit/Cargo.lock": "64b3f04fca38fd8577898619b61cae5ae376355ba1754099b0c397f9d3c69332",
+        "vendor/smithay-clipboard/Cargo.lock": "67e58ea42a92f2ea5e182ee7644b4ed640839a03966aae39421f8f254d52f118",
+        "vendor/wgpu-hal/Cargo.lock": "c4da0b85155fcc10a596cfc7deb55a7e5c6ae2c8cbbdb80a7e7bf083f9e7b74c",
+        "vendor/winit/Cargo.lock": "b6183ac90e9aabac21f3fd993380cd8d8f7a28c7b7b67f8ae5549e95bedc205f"
+      }
+    },
+    "forge": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "f0107afaf631d29d06358abec3997f1b5712b627"
+        }
+      },
+      "commit": "07a0b33d16c1d114f6297871aad538d89c86749f",
+      "lock_sha256": {
+        "Cargo.lock": "84bf74f3c7d345212c543572c5cb3e9247856be242eb367e17188b2581722b4a",
+        "prototypes/ascii-organism/Cargo.lock": "a64ef4f10604631b0b0e7c4167802250a5de7970742832f24d377216520c73e2",
+        "scripts/mission-acceptance/harness/Cargo.lock": "4b9c4c5e2a32e1951ac6f48749e96ec6b5cd2afa9a94c6ed28025fa043aa8686",
+        "scripts/pr19-gtk-cellframe/Cargo.lock": "5fd7de902720b2197ba6f7b4a42f71c8d19d54b97d7948654d3f93db2b59e4fb",
+        "tools/eva-native-render/Cargo.lock": "cccb1760041331eff84208a29433b5ad3c815a5e810030632dbbafb52f768d77"
+      }
+    },
+    "frost": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "c8d7933352930e5097ee210e22997d6ab7eb1051",
+          "jterm_engine": "c8d7933352930e5097ee210e22997d6ab7eb1051"
+        }
+      },
+      "commit": "59125d229ee39f2c49277087a23dea3aa5cb8a1f",
+      "lock_sha256": {
+        "Cargo.lock": "9baead9b081924dcb460725b4fd037762d82c1435619f8fdc582a74cdff1a893",
+        "scripts/provider-acceptance/Cargo.lock": "ca787fccdb384c3f8560b8c235af4849d52a2082e29af88ad15371a4b7975d22",
+        "tools/native-feedback-harness/Cargo.lock": "e74e8a53ebb72734ae90788868b7f4109f3eac1177e9a0ebe2942f8c94c4ab15",
+        "vendor/clipboard_x11/Cargo.lock": "8bdd797e584214d7794e7462730c063303bd6f9800c4c25f5a1d2652fe4b911a",
+        "vendor/iced_futures/Cargo.lock": "8305114c4dc354e0d21e73c15435c595b78f9ddf282785aefce7602553652c9b",
+        "vendor/iced_winit/Cargo.lock": "e5c7caef014e9e48b9c3ac1aed216c004425648dcf9144da358fd94100d0ede3",
+        "vendor/smithay-clipboard/Cargo.lock": "67e58ea42a92f2ea5e182ee7644b4ed640839a03966aae39421f8f254d52f118",
+        "vendor/wasmtimer/Cargo.lock": "76c1ea0d306651336927d72385a65271ac706ae6199d73d12288fcb7b80e0821",
+        "vendor/wayland-client/Cargo.lock": "74804d2dae5953bda810645a487dc6516d0602812556c0d10fde481efbb5673f",
+        "vendor/wgpu-hal/Cargo.lock": "45fc44d45ce69fa1420d367969799c71f262dd2ed88bbd659af025ef22e89b6f",
+        "vendor/window_clipboard/Cargo.lock": "7eb91904452ec34dde8313863abeec23b42983705657e0b0c1930cc140796246",
+        "vendor/winit/Cargo.lock": "b6183ac90e9aabac21f3fd993380cd8d8f7a28c7b7b67f8ae5549e95bedc205f"
+      }
+    },
+    "jterm_core": {
+      "app_core_pins": {},
+      "commit": "7e30d95d304a20d7820ae2afcd740e813cf4e786",
+      "lock_sha256": {
+        "Cargo.lock": "8bed243e568069ea632147324ea086a4d000390681b33ba767025ccb5162c441",
+        "crates/jterm_engine/Cargo.lock": "e6becbd43088af8bfd738b5214b97593d6a076ce43887328c97e75ab6d0c52ad",
+        "crates/jterm_runtime/Cargo.lock": "343e96fb823867273b635d657206781661b180c809389734bd64d763ed522e23",
+        "tools/companion-host-harness/Cargo.lock": "40191027e60cd99f8da2743610778ff6419d07ba1f67107984ab78506c8099f8"
+      }
+    }
+  },
+  "schema": 1
+}

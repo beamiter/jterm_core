@@ -163,9 +163,13 @@ pub(super) fn output(runtime: &RuntimeHandle, redact: bool) -> (String, bool) {
     let capture = runtime.output.lock();
     let raw = capture.raw.iter().copied().collect::<Vec<_>>();
     let mut replay = ScreenReplay::with_budget(100, 30, 64 * 1024);
-    replay.feed(resync_ring_head(&raw));
-    let mut text = replay.finish().to_plain();
     let mut truncated = capture.truncated;
+    replay.feed(if truncated {
+        resync_ring_head(&raw)
+    } else {
+        &raw
+    });
+    let mut text = replay.finish().to_plain();
     if redact {
         text = crate::redact::redact_secrets(&text);
     }

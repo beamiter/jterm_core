@@ -150,6 +150,42 @@ fn rgb(r: i32, g: i32, b: i32) -> Option<Color> {
     ))
 }
 
+/// The SGR subset with an exact representation in a GTK archive tag.
+pub(super) fn supported_archive_sgr(params: &Params) -> bool {
+    let mut i = 0;
+    while i < params.len() {
+        match params.raw(i) {
+            38 | 48 | 58 => {
+                if parse_color(params, &mut i).is_none() {
+                    return false;
+                }
+            }
+            4 if params.is_nonfinal(i) => {
+                if params.next(i) != i + 2 || !matches!(params.get(i + 1, 1), 0..=3) {
+                    return false;
+                }
+            }
+            -1
+            | 0
+            | 1
+            | 3
+            | 4
+            | 9
+            | 21..=24
+            | 29..=37
+            | 39..=47
+            | 49
+            | 59
+            | 90..=97
+            | 100..=107
+                if !params.is_nonfinal(i) => {}
+            _ => return false,
+        }
+        i = params.next(i);
+    }
+    true
+}
+
 /// Applies an SGR parameter list the way VTE's `Terminal::SGR` does
 /// (including its reading of an omitted parameter as 0, and `4:n` underline
 /// styles). The hyperlink survives `SGR 0`, as in VTE.

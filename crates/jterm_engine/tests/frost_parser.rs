@@ -92,12 +92,12 @@ fn feed(parser: &mut Parser, host: &mut Reference, bytes: &[u8]) {
                 }
                 Event::Csi {
                     raw_params,
+                    params,
                     private_prefix,
                     intermediates,
                     final_byte,
                     ..
                 } => {
-                    let params = Reference::parse_csi_params(&raw_params);
                     host.handle_escape_sequence(
                         &params,
                         &raw_params,

@@ -3,8 +3,25 @@ name = "jterm_runtime"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-description = "Low-level, UI-independent terminal runtime helpers"
+description = "UI-independent terminal runtime and process helpers"
 license = "MIT"
 publish = false
+
+[dependencies]
+log = "0.4"
+
+[features]
+linux-pty = ["dep:jterm_engine", "dep:portable-pty", "session-actor"]
+session-actor = ["dep:crossbeam-channel", "dep:parking_lot"]
+session-actor-test-hooks = ["session-actor"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+crossbeam-channel = { version = "0.5", optional = true }
+parking_lot = { version = "0.12", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+jterm_engine = { version = "0.1.0", path = "../jterm_engine", optional = true }
+portable-pty = { version = "0.9", optional = true }
 
 [workspace]

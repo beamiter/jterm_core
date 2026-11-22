@@ -539,6 +539,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn installer_check_stdout_is_bounded_before_json_parsing() {
         fn run(script: &str, max_bytes: u64) -> (io::Result<Vec<u8>>, i32) {
@@ -548,7 +549,7 @@ mod tests {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             let mut child = crate::supervised::SupervisedChild::spawn(&mut command).unwrap();
-            let pid = child.id() as i32;
+            let pid = child.process_group_id();
             let stdout = child.take_stdout().unwrap();
             (
                 collect_bounded_command_stdout(

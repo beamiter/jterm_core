@@ -217,7 +217,7 @@ impl WorkspaceQueueSnapshot {
                 } else if let Some(worktree) = row.facts.worktree.as_deref()
                     .and_then(|value| super::query::normalized_absolute(std::path::Path::new(value))) {
                     let occupied = rows.iter().any(|other| {
-                        if other.id == row.id || !other.runtime.is_live() { return false; }
+                        if other.id == row.id || (!other.runtime.is_live() && other.runtime != RuntimeState::Conflict) { return false; }
                         let other_root = other.facts.worktree.as_deref()
                             .or_else(|| (other.kind == ConversationKind::Cli).then_some(other.cwd.as_str()))
                             .and_then(|value| super::query::normalized_absolute(std::path::Path::new(value)));
@@ -225,7 +225,7 @@ impl WorkspaceQueueSnapshot {
                     });
                     if occupied {
                         projected.state = WorkspaceQueueState::Blocked;
-                        projected.reason = Some("Another observed execution uses this task worktree".into());
+                        projected.reason = Some("This worktree has another observed execution or ownership conflict".into());
                     } else {
                         projected.state = WorkspaceQueueState::Ready;
                     }

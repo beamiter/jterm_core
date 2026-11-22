@@ -49,3 +49,28 @@ fn old_argv_probe_keeps_the_independent_runtime_api() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn old_child_lifecycle_paths_keep_runtime_type_identity() {
+    use jterm_core::process::{
+        exit_code_from_wait_status, ChildLifecycle, EscalationPolicy, ProcessRef, ReapOwner,
+    };
+    use jterm_runtime::child_lifecycle as runtime;
+    use std::{io, sync::Arc};
+
+    let _: fn(i32) -> io::Result<runtime::ProcessRef> = ProcessRef::open;
+    let _: fn(i32, runtime::ReapOwner) -> io::Result<Arc<runtime::ChildLifecycle>> =
+        ChildLifecycle::new;
+    let _: runtime::EscalationPolicy = EscalationPolicy::SESSION_DRAIN;
+    let _: runtime::ReapOwner = ReapOwner::Foreign;
+    assert_eq!(exit_code_from_wait_status(23 << 8), Some(23));
+}
+
+#[test]
+fn old_supervised_path_uses_the_runtime_child() {
+    let _: fn(
+        &mut std::process::Command,
+    ) -> std::io::Result<jterm_runtime::supervised::SupervisedChild> =
+        jterm_core::supervised::SupervisedChild::spawn;
+}

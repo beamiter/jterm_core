@@ -106,6 +106,19 @@ impl Params {
         }
     }
 
+    pub(super) fn archive_sgr(input: &[u8]) -> Option<Self> {
+        let mut params = Self::new();
+        for &byte in input {
+            match byte {
+                b'0'..=b'9' => params.push_digit(byte - b'0'),
+                b';' | b':' if params.len < MAX_PARAMS - 1 => params.finish_param(byte == b':'),
+                _ => return None,
+            }
+        }
+        params.seal();
+        Some(params)
+    }
+
     /// Number of parameters, counting omitted ones (VTE's `seq.size()`).
     pub(super) fn len(&self) -> usize {
         self.len

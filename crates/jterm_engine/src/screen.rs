@@ -4,8 +4,10 @@
 //! graphics. Public fields are an explicit transitional orchestration boundary,
 //! not a mirrored screen or a Deref facade. Every row operation returns bounded
 //! effects which the host must consume before the next protocol command.
+pub use crate::grid::RegionDirection;
 use crate::grid::{
-    Color, CursorShape, RawRowId, ScrollbackLine, StyleFlags, TerminalCell, TerminalGrid,
+    AsciiOverwritePolicy, Color, CursorShape, RawRowId, RegionWrapPolicy, ScrollbackLine,
+    StyleFlags, TerminalCell, TerminalGrid, WideCellEditPolicy, WideContinuationProtection,
 };
 use crate::hyperlink::HyperlinkId;
 use crate::protocol_state::ProtocolState;
@@ -17,6 +19,43 @@ pub enum Charset {
     #[default]
     Ascii,
     DecSpecialGraphics,
+}
+
+impl Charset {
+    /// Map a graphic character under the selected DEC character set.
+    pub fn translate(self, ch: char) -> char {
+        match self {
+            Charset::Ascii => ch,
+            Charset::DecSpecialGraphics => match ch {
+                '`' => '◆',
+                'a' => '▒',
+                'f' => '°',
+                'g' => '±',
+                'j' => '┘',
+                'k' => '┐',
+                'l' => '┌',
+                'm' => '└',
+                'n' => '┼',
+                'o' => '⎺',
+                'p' => '⎻',
+                'q' => '─',
+                'r' => '⎼',
+                's' => '⎽',
+                't' => '├',
+                'u' => '┤',
+                'v' => '┴',
+                'w' => '┬',
+                'x' => '│',
+                'y' => '≤',
+                'z' => '≥',
+                '{' => 'π',
+                '|' => '≠',
+                '}' => '£',
+                '~' => '·',
+                _ => ch,
+            },
+        }
+    }
 }
 
 /// DECSC/DECRC 保存的完整光标状态(含 SGR 属性、字符集、模式),
@@ -38,6 +77,63 @@ pub struct SavedCursorState {
     // 经 CSI u/ESC 8 恢复光标到 prompt 之后,下一字符(如 zsh-autosuggestions 的
     // ghost 文本)会立刻触发换行,在屏底触发滚动,光标看似下移一行。
     pub pending_wrap: bool,
+}
+
+/// A borrow of the active cursor, pen and character set. The DECSC slot and
+/// the hidden primary screen both use the same snapshot representation.
+pub struct CursorDrawing<'a> {
+    pub position: (&'a mut usize, &'a mut usize),
+    pub fg: &'a mut Color,
+    pub bg: &'a mut Color,
+    pub flags: &'a mut StyleFlags,
+    pub g0: &'a mut Charset,
+    pub g1: &'a mut Charset,
+    pub active: &'a mut Charset,
+    pub origin_mode: &'a mut bool,
+    pub pending_wrap: &'a mut bool,
+}
+
+impl CursorDrawing<'_> {
+    pub fn snapshot(&self, autowrap: bool) -> SavedCursorState {
+        SavedCursorState {
+            row: *self.position.0,
+            col: *self.position.1,
+            fg: *self.fg,
+            bg: *self.bg,
+            flags: *self.flags,
+            g0: *self.g0,
+            g1: *self.g1,
+            active: *self.active,
+            origin_mode: *self.origin_mode,
+            autowrap,
+            pending_wrap: *self.pending_wrap,
+        }
+    }
+
+    fn restore_pen(&mut self, saved: &SavedCursorState) {
+        *self.fg = saved.fg;
+        *self.bg = saved.bg;
+        *self.flags = saved.flags;
+        *self.g0 = saved.g0;
+        *self.g1 = saved.g1;
+        *self.active = saved.active;
+        *self.origin_mode = saved.origin_mode;
+    }
+
+    /// DECRC clamps saved coordinates to the current geometry. The caller owns
+    /// protocol mode 7 and chooses whether to restore the snapshot's value.
+    pub fn restore(&mut self, saved: Option<&SavedCursorState>, rows: usize, cols: usize) {
+        if let Some(saved) = saved {
+            *self.position.0 = saved.row.min(rows.saturating_sub(1));
+            *self.position.1 = saved.col.min(cols.saturating_sub(1));
+            self.restore_pen(saved);
+            *self.pending_wrap = saved.pending_wrap;
+        } else {
+            *self.position.0 = 0;
+            *self.position.1 = 0;
+            *self.pending_wrap = false;
+        }
+    }
 }
 
 /// A completed, nonstructural edit of one physical row. `changed` includes
@@ -63,12 +159,6 @@ pub enum AsciiWriteStep {
     },
     /// Empty input or the original row writer's no-progress result.
     Stopped,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RegionDirection {
-    Up,
-    Down,
 }
 
 /// Physical vertical operations. LF also covers VT, FF, IND and NEL's
@@ -155,6 +245,251 @@ pub struct AlternateExit {
     pub dirty_rows: Range<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlternateRestorePolicy {
+    /// Preserve Ember's prior 47/1047 behavior and the 1049 cursor save.
+    Standard { restore_position: bool },
+    /// Frost historically restores position and the last-column latch for all
+    /// three alternate modes, and keeps the live DECAWM protocol flag.
+    Frost,
+}
+
+/// Live buffer pair with matching dimensions. The grid type includes any host
+/// row metadata that accompanies the grid during the swap. History admission,
+/// screen clearing, cursor shape, colors outside the cursor pen, hyperlinks and
+/// keyboard state are applied by the caller in its original event order.
+pub struct AlternateScreenControls<'a, Grid> {
+    pub grid: &'a mut Grid,
+    pub alt_grid: &'a mut Grid,
+    pub use_alt_buffer: &'a mut bool,
+    pub cursor: CursorDrawing<'a>,
+    pub primary_position: (&'a mut usize, &'a mut usize),
+    pub alternate_position: (&'a mut usize, &'a mut usize),
+    pub saved_primary: &'a mut Option<SavedCursorState>,
+    pub margins: (&'a mut usize, &'a mut usize),
+    pub rows: usize,
+}
+
+impl<Grid> AlternateScreenControls<'_, Grid> {
+    fn reset_margins(&mut self) {
+        *self.margins.0 = 0;
+        *self.margins.1 = self.rows.saturating_sub(1);
+    }
+
+    /// Record the primary cursor if requested and swap the actual grid pair.
+    /// The alternate cursor slot records the pre-clear cursor at entry.
+    pub fn enter(&mut self, save_cursor: bool, autowrap: bool) -> bool {
+        if *self.use_alt_buffer {
+            return false;
+        }
+        if save_cursor {
+            *self.primary_position.0 = *self.cursor.position.0;
+            *self.primary_position.1 = *self.cursor.position.1;
+            *self.saved_primary = Some(self.cursor.snapshot(autowrap));
+        }
+        std::mem::swap(self.grid, self.alt_grid);
+        *self.alternate_position.0 = *self.cursor.position.0;
+        *self.alternate_position.1 = *self.cursor.position.1;
+        *self.use_alt_buffer = true;
+        self.reset_margins();
+        true
+    }
+
+    /// A successful swap yields the optional DECAWM setting to apply after the
+    /// host switches its protocol screen. No saved cursor is consumed on no-op.
+    pub fn leave(&mut self, policy: AlternateRestorePolicy) -> Option<AlternateExit> {
+        if !*self.use_alt_buffer {
+            return None;
+        }
+        let frost = policy == AlternateRestorePolicy::Frost;
+        *self.alternate_position.0 = *self.cursor.position.0;
+        *self.alternate_position.1 = *self.cursor.position.1;
+        std::mem::swap(self.grid, self.alt_grid);
+        if frost
+            || matches!(
+                policy,
+                AlternateRestorePolicy::Standard {
+                    restore_position: true
+                }
+            )
+        {
+            *self.cursor.position.0 = *self.primary_position.0;
+            *self.cursor.position.1 = *self.primary_position.1;
+        }
+        *self.use_alt_buffer = false;
+        self.reset_margins();
+        *self.cursor.pending_wrap = false;
+        let restore_autowrap = if let Some(saved) = self.saved_primary.take() {
+            self.cursor.restore_pen(&saved);
+            *self.cursor.pending_wrap = frost && saved.pending_wrap;
+            (!frost).then_some(saved.autowrap)
+        } else {
+            *self.cursor.fg = Color::Default;
+            *self.cursor.bg = Color::Default;
+            *self.cursor.flags = StyleFlags::default();
+            if frost {
+                *self.cursor.origin_mode = false;
+            }
+            None
+        };
+        Some(AlternateExit {
+            global_background: *self.cursor.bg,
+            restore_autowrap,
+            dirty_rows: 0..self.rows,
+        })
+    }
+}
+
+/// Tab stops at columns 8, 16, and so on. The engine and Frost retain their
+/// respective initial flag at column zero, which is also the backward fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabStopOrigin {
+    Set,
+    Clear,
+}
+
+pub fn default_tab_stops(cols: usize, origin: TabStopOrigin) -> Vec<bool> {
+    let mut stops = Vec::new();
+    resize_tab_stops(&mut stops, cols, origin);
+    stops
+}
+
+/// Preserve customized stops in retained columns and initialize only new ones.
+pub fn resize_tab_stops(stops: &mut Vec<bool>, cols: usize, origin: TabStopOrigin) {
+    let old_len = stops.len();
+    stops.resize(cols, false);
+    for (col, stop) in stops.iter_mut().enumerate().skip(old_len) {
+        *stop = col % 8 == 0 && (col != 0 || origin == TabStopOrigin::Set);
+    }
+}
+
+fn next_tab_stop(stops: &[bool], cols: usize, col: usize) -> usize {
+    let mut next = col.saturating_add(1);
+    while next < cols {
+        if stops.get(next).copied().unwrap_or(false) {
+            return next;
+        }
+        next += 1;
+    }
+    cols.saturating_sub(1)
+}
+
+fn previous_tab_stop(stops: &[bool], cols: usize, col: usize) -> usize {
+    let mut prev = col.min(cols);
+    while prev > 0 {
+        prev -= 1;
+        if stops.get(prev).copied().unwrap_or(false) {
+            return prev;
+        }
+    }
+    0
+}
+
+/// Mutate the actual live cursor and margin state for VT controls. Both screen
+/// hosts borrow their existing state here, so no cursor copy needs reconciling.
+/// These operations never scroll physical rows and require a nonempty grid.
+pub struct CursorControls<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    pub row: &'a mut usize,
+    pub col: &'a mut usize,
+    pub top: &'a mut usize,
+    pub bottom: &'a mut usize,
+    pub origin_mode: &'a mut bool,
+    pub pending_wrap: &'a mut bool,
+    pub tab_stops: &'a mut [bool],
+}
+
+impl CursorControls<'_> {
+    pub fn move_up(&mut self, count: usize) {
+        *self.pending_wrap = false;
+        let limit = if *self.row >= *self.top { *self.top } else { 0 };
+        *self.row = self.row.saturating_sub(count).max(limit);
+    }
+
+    pub fn move_down(&mut self, count: usize) {
+        *self.pending_wrap = false;
+        let limit = if *self.row <= *self.bottom {
+            *self.bottom
+        } else {
+            self.rows - 1
+        };
+        *self.row = self.row.saturating_add(count).min(limit);
+    }
+
+    pub fn move_forward(&mut self, count: usize) {
+        *self.pending_wrap = false;
+        *self.col = self.col.saturating_add(count).min(self.cols - 1);
+    }
+
+    pub fn move_backward(&mut self, count: usize) {
+        *self.pending_wrap = false;
+        *self.col = self.col.saturating_sub(count);
+    }
+
+    pub fn set_column(&mut self, one_based: usize) {
+        *self.pending_wrap = false;
+        *self.col = one_based.saturating_sub(1).min(self.cols - 1);
+    }
+
+    pub fn set_row(&mut self, one_based: usize) {
+        *self.pending_wrap = false;
+        let row = one_based.saturating_sub(1);
+        *self.row = if *self.origin_mode {
+            self.top.saturating_add(row).min(*self.bottom)
+        } else {
+            row.min(self.rows - 1)
+        };
+    }
+
+    pub fn set_position(&mut self, row: usize, col: usize) {
+        self.set_row(row);
+        self.set_column(col);
+    }
+
+    pub fn tab_forward(&mut self, count: usize) {
+        *self.pending_wrap = false;
+        for _ in 0..count.min(self.cols) {
+            *self.col = next_tab_stop(self.tab_stops, self.cols, *self.col);
+        }
+    }
+
+    pub fn tab_backward(&mut self, count: usize) {
+        *self.pending_wrap = false;
+        for _ in 0..count.min(self.cols) {
+            *self.col = previous_tab_stop(self.tab_stops, self.cols, *self.col);
+        }
+    }
+
+    pub fn set_tab_stop(&mut self, enabled: bool) {
+        if let Some(stop) = self.tab_stops.get_mut(*self.col) {
+            *stop = enabled;
+        }
+    }
+
+    pub fn clear_all_tab_stops(&mut self) {
+        self.tab_stops.fill(false);
+    }
+
+    /// DECSTBM uses the page limits when the requested bounds are reversed.
+    /// The caller resolves default parameters before setting the margins.
+    pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+        let last_row = self.rows - 1;
+        *self.top = top.saturating_sub(1).min(last_row);
+        *self.bottom = bottom.saturating_sub(1).min(last_row);
+        if *self.top > *self.bottom {
+            *self.top = 0;
+            *self.bottom = last_row;
+        }
+        self.set_position(1, 1);
+    }
+
+    pub fn set_origin_mode(&mut self, enabled: bool) {
+        *self.origin_mode = enabled;
+        self.set_position(1, 1);
+    }
+}
+
 /// Sole live owner of the active and inactive grids and their drawing state.
 /// Autowrap is deliberately absent: ProtocolState mode 7 is authoritative.
 ///
@@ -193,6 +528,45 @@ pub struct ScreenState {
 }
 
 impl ScreenState {
+    fn alternate_screen_controls(&mut self) -> AlternateScreenControls<'_, TerminalGrid> {
+        let rows = self.grid.rows();
+        AlternateScreenControls {
+            grid: &mut self.grid,
+            alt_grid: &mut self.alt_grid,
+            use_alt_buffer: &mut self.use_alt_buffer,
+            cursor: CursorDrawing {
+                position: (&mut self.cursor_row, &mut self.cursor_col),
+                fg: &mut self.current_fg,
+                bg: &mut self.current_bg,
+                flags: &mut self.current_flags,
+                g0: &mut self.g0_charset,
+                g1: &mut self.g1_charset,
+                active: &mut self.active_charset,
+                origin_mode: &mut self.origin_mode,
+                pending_wrap: &mut self.pending_wrap,
+            },
+            primary_position: (&mut self.saved_cursor_row, &mut self.saved_cursor_col),
+            alternate_position: (&mut self.alt_cursor_row, &mut self.alt_cursor_col),
+            saved_primary: &mut self.saved_primary_screen_state,
+            margins: (&mut self.scroll_region_top, &mut self.scroll_region_bottom),
+            rows,
+        }
+    }
+
+    pub fn cursor_controls(&mut self) -> CursorControls<'_> {
+        CursorControls {
+            rows: self.grid.rows(),
+            cols: self.grid.cols(),
+            row: &mut self.cursor_row,
+            col: &mut self.cursor_col,
+            top: &mut self.scroll_region_top,
+            bottom: &mut self.scroll_region_bottom,
+            origin_mode: &mut self.origin_mode,
+            pending_wrap: &mut self.pending_wrap,
+            tab_stops: &mut self.tab_stops,
+        }
+    }
+
     /// NEL's first stage. The host must notify cursor reposition immediately
     /// after this call, BEFORE running LineFeed. Pending wrap is deliberately
     /// retained until that second stage; no action can span protocol events.
@@ -239,6 +613,22 @@ impl ScreenState {
         )
     }
 
+    /// Destination of a wrap and whether its row will be replaced by a blank.
+    /// Used to admit a late graphic before committing its one real wrap.
+    pub(crate) fn wrap_target(&self) -> (usize, bool) {
+        if self.cursor_row == self.scroll_region_bottom {
+            (self.cursor_row, self.wrap_scrolls_region())
+        } else {
+            ((self.cursor_row + 1).min(self.grid.rows() - 1), false)
+        }
+    }
+
+    fn wrap_scrolls_region(&self) -> bool {
+        self.cursor_row == self.scroll_region_bottom
+            && self.scroll_region_top <= self.scroll_region_bottom
+            && self.scroll_region_bottom < self.grid.rows()
+    }
+
     fn vertical_motion_impl(
         &mut self,
         motion: VerticalMotion,
@@ -256,9 +646,7 @@ impl ScreenState {
         });
         if motion == VerticalMotion::Wrap {
             let next_row_exists = self.cursor_row + 1 < self.grid.rows();
-            let scrolls = self.cursor_row == self.scroll_region_bottom
-                && self.scroll_region_top <= self.scroll_region_bottom
-                && self.scroll_region_bottom < self.grid.rows();
+            let scrolls = self.wrap_scrolls_region();
             let full_region = self.scroll_region_top == 0
                 && self.scroll_region_bottom == self.grid.rows().saturating_sub(1);
             self.grid.record_wrap_margin(
@@ -307,7 +695,7 @@ impl ScreenState {
     pub fn erase_screen(&mut self) {
         self.pending_wrap = false;
         let blank = self.create_blank_cell();
-        self.grid.cells_mut().fill(blank);
+        self.grid.fill_cells(blank);
     }
 
     /// DECALN: fill the physical active grid with default-style E cells, reset
@@ -316,7 +704,7 @@ impl ScreenState {
     /// row metadata and the inactive grid are retained. The host invalidates
     /// provenance first and owns reposition notification and dirty bookkeeping.
     pub fn screen_alignment_test(&mut self) {
-        self.grid.cells_mut().fill(TerminalCell {
+        self.grid.fill_cells(TerminalCell {
             character: 'E',
             ..TerminalCell::default()
         });
@@ -342,34 +730,14 @@ impl ScreenState {
         clear: bool,
         protocol: &ProtocolState,
     ) -> Option<AlternateEntry> {
-        if self.use_alt_buffer {
+        if !self
+            .alternate_screen_controls()
+            .enter(save_cursor, protocol.modes().contains(&7))
+        {
             return None;
         }
-        if save_cursor {
-            self.saved_cursor_row = self.cursor_row;
-            self.saved_cursor_col = self.cursor_col;
-            self.saved_primary_screen_state = Some(SavedCursorState {
-                row: self.cursor_row,
-                col: self.cursor_col,
-                fg: self.current_fg,
-                bg: self.current_bg,
-                flags: self.current_flags,
-                g0: self.g0_charset,
-                g1: self.g1_charset,
-                active: self.active_charset,
-                origin_mode: self.origin_mode,
-                autowrap: protocol.modes().contains(&7),
-                pending_wrap: self.pending_wrap,
-            });
-        }
         self.saved_primary_cursor_shape = Some(self.cursor_shape);
-        std::mem::swap(&mut self.grid, &mut self.alt_grid);
-        self.alt_cursor_row = self.cursor_row;
-        self.alt_cursor_col = self.cursor_col;
-        self.use_alt_buffer = true;
         self.current_hyperlink = HyperlinkId::NONE;
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = self.grid.rows() - 1;
         let cleared_rows = clear.then(|| {
             let blank = self.create_blank_cell();
             self.grid.cells_mut().fill(blank);
@@ -388,44 +756,16 @@ impl ScreenState {
     /// if saved. Exit cancels pending wrap, even when the saved snapshot had it.
     /// Repeated exit is a complete no-op. No row identity is allocated or lost.
     pub fn leave_alternate_screen(&mut self, restore_cursor: bool) -> Option<AlternateExit> {
-        if !self.use_alt_buffer {
-            return None;
-        }
-        self.alt_cursor_row = self.cursor_row;
-        self.alt_cursor_col = self.cursor_col;
-        std::mem::swap(&mut self.grid, &mut self.alt_grid);
-        if restore_cursor {
-            self.cursor_row = self.saved_cursor_row;
-            self.cursor_col = self.saved_cursor_col;
-        }
-        self.use_alt_buffer = false;
+        let effect = self
+            .alternate_screen_controls()
+            .leave(AlternateRestorePolicy::Standard {
+                restore_position: restore_cursor,
+            })?;
         if let Some(shape) = self.saved_primary_cursor_shape.take() {
             self.cursor_shape = shape;
         }
         self.current_hyperlink = HyperlinkId::NONE;
-        self.scroll_region_top = 0;
-        self.scroll_region_bottom = self.grid.rows() - 1;
-        let restore_autowrap = if let Some(saved) = self.saved_primary_screen_state.take() {
-            self.current_fg = saved.fg;
-            self.current_bg = saved.bg;
-            self.current_flags = saved.flags;
-            self.g0_charset = saved.g0;
-            self.g1_charset = saved.g1;
-            self.active_charset = saved.active;
-            self.origin_mode = saved.origin_mode;
-            Some(saved.autowrap)
-        } else {
-            self.current_fg = Color::Default;
-            self.current_bg = Color::Default;
-            self.current_flags = StyleFlags::default();
-            None
-        };
-        self.pending_wrap = false;
-        Some(AlternateExit {
-            global_background: self.current_bg,
-            restore_autowrap,
-            dirty_rows: 0..self.grid.rows(),
-        })
+        Some(effect)
     }
 
     /// Resize both actual grids without reflow. The host chooses how many top
@@ -496,13 +836,7 @@ impl ScreenState {
         self.saved_cursor_col = self.saved_cursor_col.min(cols - 1);
         self.alt_cursor_row = self.alt_cursor_row.min(rows - 1);
         self.alt_cursor_col = self.alt_cursor_col.min(cols - 1);
-        if cols != self.tab_stops.len() {
-            let old_len = self.tab_stops.len();
-            self.tab_stops.resize(cols, false);
-            for (col, stop) in self.tab_stops.iter_mut().enumerate().skip(old_len) {
-                *stop = col % 8 == 0;
-            }
-        }
+        resize_tab_stops(&mut self.tab_stops, cols, TabStopOrigin::Set);
         if let Some(saved) = self.saved_state.as_mut() {
             saved.row = saved.row.min(rows - 1);
             saved.col = saved.col.min(cols - 1);
@@ -552,7 +886,7 @@ impl ScreenState {
             direction,
             top..=bottom,
             1,
-            true,
+            RegionWrapPolicy::MoveWithRows,
             capture_outgoing,
             allocate_id,
         )
@@ -575,7 +909,14 @@ impl ScreenState {
         count: usize,
         allocate_id: impl FnMut() -> RawRowId,
     ) -> Option<RegionMutation> {
-        self.shift_region(direction, top..=bottom, count, false, false, allocate_id)
+        self.shift_region(
+            direction,
+            top..=bottom,
+            count,
+            RegionWrapPolicy::KeepPhysicalIndices,
+            false,
+            allocate_id,
+        )
     }
 
     fn shift_region(
@@ -583,9 +924,9 @@ impl ScreenState {
         direction: RegionDirection,
         region: RangeInclusive<usize>,
         count: usize,
-        move_wraps: bool,
+        wrap_policy: RegionWrapPolicy,
         capture_outgoing: bool,
-        mut allocate_id: impl FnMut() -> RawRowId,
+        allocate_id: impl FnMut() -> RawRowId,
     ) -> Option<RegionMutation> {
         let (top, bottom) = (*region.start(), *region.end());
         if top > bottom || bottom >= self.grid.rows() || count == 0 {
@@ -598,8 +939,9 @@ impl ScreenState {
             RegionDirection::Up => top..top + count,
             RegionDirection::Down => end - count..end,
         };
-        let preserve_margin =
-            move_wraps && direction == RegionDirection::Up && top == 0 && end == self.grid.rows();
+        let preserve_margin = self
+            .grid
+            .preserves_shift_margin(direction, &region, wrap_policy);
         let removed = removed_rows
             .map(|row| {
                 let row_id = self.grid.row_id(row);
@@ -614,55 +956,16 @@ impl ScreenState {
             .collect();
 
         let blank = self.create_blank_cell();
-        let blank_rows = match direction {
-            RegionDirection::Up => {
-                if count < height {
-                    self.grid
-                        .copy_region_rows(top + count..end, top, preserve_margin);
-                    if move_wraps {
-                        self.grid.row_wrapped.copy_within(top + count..end, top);
-                    }
-                    self.grid.row_ids_mut().copy_within(top + count..end, top);
-                }
-                end - count..end
-            }
-            RegionDirection::Down => {
-                if count < height {
-                    self.grid
-                        .copy_region_rows(top..end - count, top + count, preserve_margin);
-                    if move_wraps {
-                        self.grid
-                            .row_wrapped
-                            .copy_within(top..end - count, top + count);
-                    }
-                    self.grid
-                        .row_ids_mut()
-                        .copy_within(top..end - count, top + count);
-                }
-                top..top + count
-            }
-        };
-        self.grid.fill_region_rows(blank_rows.clone(), blank);
-        if !preserve_margin {
-            // IL/DL and partial/moved boundaries can break logical adjacency.
-            self.grid.forget_region_margins(top.saturating_sub(1)..end);
-        }
-        if move_wraps {
-            self.grid.row_wrapped[blank_rows.clone()].fill(false);
-        }
-        // Allocate in ascending destination-row order, as Ember's separate
-        // shift_row_id_region_{up,down} helpers did. Never refill retained IDs,
-        // including UNTRACKED, and never allocate an identity for captured rows.
-        for row in blank_rows {
-            self.grid.row_ids_mut()[row] = allocate_id();
-        }
+        let dirty_rows =
+            self.grid
+                .shift_rows(direction, region, count, blank, wrap_policy, allocate_id)?;
         Some(RegionMutation {
             direction,
             top,
             bottom,
             count,
             removed,
-            dirty_rows: top..end,
+            dirty_rows,
         })
     }
 
@@ -716,86 +1019,42 @@ impl ScreenState {
     }
 
     pub fn default_tab_stops(cols: usize) -> Vec<bool> {
-        (0..cols).map(|c| c % 8 == 0).collect()
+        default_tab_stops(cols, TabStopOrigin::Set)
     }
 
     pub fn next_tab_stop(&self, col: usize) -> usize {
-        let cols = self.grid.row_len();
-        let mut c = col.saturating_add(1);
-        while c < cols {
-            if self.tab_stops.get(c).copied().unwrap_or(false) {
-                return c;
-            }
-            c += 1;
-        }
-        cols.saturating_sub(1)
+        next_tab_stop(&self.tab_stops, self.grid.cols(), col)
     }
 
     pub fn prev_tab_stop(&self, col: usize) -> usize {
-        let mut c = col.min(self.grid.cols());
-        while c > 0 {
-            c -= 1;
-            if self.tab_stops.get(c).copied().unwrap_or(false) {
-                return c;
-            }
-        }
-        0
+        previous_tab_stop(&self.tab_stops, self.grid.cols(), col)
     }
 
     pub fn save_cursor_state(&mut self, protocol: &ProtocolState) {
-        self.saved_state = Some(SavedCursorState {
-            row: self.cursor_row,
-            col: self.cursor_col,
-            fg: self.current_fg,
-            bg: self.current_bg,
-            flags: self.current_flags,
-            g0: self.g0_charset,
-            g1: self.g1_charset,
-            active: self.active_charset,
-            origin_mode: self.origin_mode,
-            autowrap: protocol.modes().contains(&7),
-            pending_wrap: self.pending_wrap,
-        });
+        self.saved_state = Some(
+            self.alternate_screen_controls()
+                .cursor
+                .snapshot(protocol.modes().contains(&7)),
+        );
     }
 
     pub fn restore_cursor_state(&mut self, protocol: &mut ProtocolState) {
-        if let Some(s) = self.saved_state.clone() {
-            self.cursor_row = s.row.min(self.grid.rows().saturating_sub(1));
-            self.cursor_col = s.col.min(self.grid.row_len().saturating_sub(1));
-            self.current_fg = s.fg;
-            self.current_bg = s.bg;
-            self.current_flags = s.flags;
-            self.g0_charset = s.g0;
-            self.g1_charset = s.g1;
-            self.active_charset = s.active;
-            self.origin_mode = s.origin_mode;
+        let saved = self.saved_state.clone();
+        let (rows, cols) = (self.grid.rows(), self.grid.cols());
+        self.alternate_screen_controls()
+            .cursor
+            .restore(saved.as_ref(), rows, cols);
+        if let Some(s) = saved {
             if s.autowrap {
                 protocol.modes_mut().insert(7);
             } else {
                 protocol.modes_mut().remove(&7);
             }
-            self.pending_wrap = s.pending_wrap;
-        } else {
-            self.cursor_row = 0;
-            self.cursor_col = 0;
-            self.pending_wrap = false;
         }
     }
 
     pub fn set_cursor_position(&mut self, row_param: usize, col_param: usize) {
-        self.pending_wrap = false;
-        let col = col_param
-            .saturating_sub(1)
-            .min(self.grid.row_len().saturating_sub(1));
-        let row0 = row_param.saturating_sub(1);
-        self.cursor_row = if self.origin_mode {
-            self.scroll_region_top
-                .saturating_add(row0)
-                .min(self.scroll_region_bottom)
-        } else {
-            row0.min(self.grid.rows().saturating_sub(1))
-        };
-        self.cursor_col = col;
+        self.cursor_controls().set_position(row_param, col_param);
     }
 
     pub fn create_blank_cell(&self) -> TerminalCell {
@@ -809,52 +1068,7 @@ impl ScreenState {
     }
 
     pub fn translate_char(&self, ch: char) -> char {
-        match self.active_charset {
-            Charset::Ascii => ch,
-            Charset::DecSpecialGraphics => match ch {
-                '`' => '◆',
-                'a' => '▒',
-                'f' => '°',
-                'g' => '±',
-                'j' => '┘',
-                'k' => '┐',
-                'l' => '┌',
-                'm' => '└',
-                'n' => '┼',
-                'o' => '⎺',
-                'p' => '⎻',
-                'q' => '─',
-                'r' => '⎼',
-                's' => '⎽',
-                't' => '├',
-                'u' => '┤',
-                'v' => '┴',
-                'w' => '┬',
-                'x' => '│',
-                'y' => '≤',
-                'z' => '≥',
-                '{' => 'π',
-                '|' => '≠',
-                '}' => '£',
-                '~' => '·',
-                _ => ch,
-            },
-        }
-    }
-
-    fn split_wide_pairs_around(&mut self, row: usize, start: usize, end: usize) {
-        let cols = self.grid.row_len();
-        if row >= self.grid.rows() || start >= end || start >= cols {
-            return;
-        }
-        let end = end.min(cols);
-        let blank_cell = self.create_blank_cell();
-        if start > 0 && self.grid.get(row, start - 1).flags.wide() {
-            *self.grid.get_mut(row, start - 1) = blank_cell;
-        }
-        if end < cols && self.grid.get(row, end).flags.wide_continuation() {
-            *self.grid.get_mut(row, end) = blank_cell;
-        }
+        self.active_charset.translate(ch)
     }
 
     pub fn expanded_cell_mutation_span(
@@ -863,40 +1077,8 @@ impl ScreenState {
         start: usize,
         end: usize,
     ) -> (usize, usize) {
-        let cols = self.grid.row_len();
-        let mut start = start.min(cols);
-        let mut end = end.min(cols);
-        if row >= self.grid.rows() || start >= end {
-            return (start, end);
-        }
-        if start > 0 && self.grid.get(row, start - 1).flags.wide() {
-            start -= 1;
-        }
-        if end < cols && self.grid.get(row, end).flags.wide_continuation() {
-            end += 1;
-        }
-        (start, end)
-    }
-
-    fn clear_cell_unchecked(&mut self, row: usize, col: usize) {
-        let cols = self.grid.row_len();
-        let bg_color = self.current_bg;
-        let blank_cell = TerminalCell {
-            character: ' ',
-            foreground: Color::Default,
-            background: bg_color,
-            flags: StyleFlags::default(),
-            hyperlink_id: HyperlinkId::NONE,
-        };
-        // If clearing a continuation cell, also clear the wide character body
-        if self.grid.get(row, col).flags.wide_continuation() && col > 0 {
-            *self.grid.get_mut(row, col - 1) = blank_cell;
-        }
-        // If clearing a wide character body, also clear the continuation cell
-        if self.grid.get(row, col).flags.wide() && col + 1 < cols {
-            *self.grid.get_mut(row, col + 1) = blank_cell;
-        }
-        *self.grid.get_mut(row, col) = blank_cell;
+        let affected = self.grid.expanded_wide_span(row, start..end);
+        (affected.start, affected.end)
     }
 
     /// Consume the deferred-wrap latch. Structural wrap/scroll is host-owned.
@@ -960,24 +1142,20 @@ impl ScreenState {
             }
             self.grid.clear_dangling_wide_at_row_end(row, blank);
         }
-        self.split_wide_pairs_around(row, col, end);
-        let cell = self.grid.get_mut(row, col);
-        *cell = TerminalCell {
-            character: ch,
-            foreground: self.current_fg,
-            background: self.current_bg,
-            flags: self.current_flags,
-            hyperlink_id: self.current_hyperlink,
-        };
-        cell.flags.set_wide(width == 2);
-        cell.flags.set_wide_continuation(false);
-        if width == 2 && col + 1 < cols {
-            let cell = self.grid.get_mut(row, col + 1);
-            *cell = blank;
-            cell.hyperlink_id = self.current_hyperlink;
-            cell.flags.set_wide_continuation(true);
-            cell.flags.set_protected(self.current_flags.protected());
-        }
+        self.grid.overwrite_graphic(
+            row,
+            col,
+            width,
+            TerminalCell {
+                character: ch,
+                foreground: self.current_fg,
+                background: self.current_bg,
+                flags: self.current_flags,
+                hyperlink_id: self.current_hyperlink,
+            },
+            blank,
+            WideContinuationProtection::FromLead,
+        );
         self.cursor_col += width;
         if self.cursor_col >= cols {
             self.cursor_col = cols.saturating_sub(width);
@@ -1025,26 +1203,22 @@ impl ScreenState {
         if count == 0 {
             return None;
         }
-        debug_assert!(bytes[..count].iter().all(|b| (0x20..=0x7e).contains(b)));
         let effect = self.row_mutation(row, col, col + count, Some(col..col + count));
-        self.split_wide_pairs_around(row, col, col + count);
-        let mut flags = self.current_flags;
-        flags.set_wide(false);
-        flags.set_wide_continuation(false);
-        for (cell, &byte) in self
-            .grid
-            .row_cells_mut(row, col..col + count)
-            .iter_mut()
-            .zip(&bytes[..count])
-        {
-            *cell = TerminalCell {
-                character: byte as char,
+        let blank = self.create_blank_cell();
+        self.grid.overwrite_ascii(
+            row,
+            col,
+            &bytes[..count],
+            TerminalCell {
+                character: ' ',
                 foreground: self.current_fg,
                 background: self.current_bg,
-                flags,
+                flags: self.current_flags,
                 hyperlink_id: self.current_hyperlink,
-            };
-        }
+            },
+            blank,
+            AsciiOverwritePolicy::SharedScreen,
+        );
         self.cursor_col += count;
         if self.cursor_col >= cols {
             self.cursor_col = cols - 1;
@@ -1083,7 +1257,11 @@ impl ScreenState {
             changed: col..col + 1,
             printed: Some(col..col + 1),
         };
+        let color = self.grid.underline_colors(row).get(col).copied();
         self.grid.get_mut(row, col).character = ch;
+        if let Some(color) = color {
+            self.grid.set_underline_color(row, col..col + 1, color);
+        }
         effect
     }
 
@@ -1098,13 +1276,8 @@ impl ScreenState {
         let effect = self.row_mutation(row, col, cols, None);
         self.pending_wrap = false;
         let blank = self.create_blank_cell();
-        if self.grid.get(row, col).flags.wide_continuation() {
-            self.clear_cell_unchecked(row, col);
-        }
-        for _ in 0..count {
-            self.grid.insert_cell_in_row(row, col, blank);
-        }
-        self.grid.clear_dangling_wide_at_row_end(row, blank);
+        self.grid
+            .insert_blank_cells(row, col, count, blank, WideCellEditPolicy::RepairSplitPairs);
         Some(effect)
     }
 
@@ -1119,11 +1292,8 @@ impl ScreenState {
         let effect = self.row_mutation(row, col, cols, None);
         self.pending_wrap = false;
         let blank = self.create_blank_cell();
-        self.split_wide_pairs_around(row, col, col + count);
-        for _ in 0..count {
-            self.grid.remove_cell_from_row(row, col);
-            *self.grid.get_mut(row, cols - 1) = blank;
-        }
+        self.grid
+            .delete_cells(row, col, count, blank, WideCellEditPolicy::RepairSplitPairs);
         Some(effect)
     }
 
@@ -1154,89 +1324,46 @@ impl ScreenState {
             }
             effects.push(self.row_mutation(row, start, col, None));
             self.pending_wrap = false;
-            for erased in start..col {
-                self.clear_cell_unchecked(row, erased);
-            }
+            let blank = self.create_blank_cell();
+            self.grid.erase_cells(row, start..col, blank);
         }
         effects
     }
 
     pub fn move_cursor_up(&mut self, count: usize) {
-        self.pending_wrap = false;
-        let floor = if self.cursor_row >= self.scroll_region_top {
-            self.scroll_region_top
-        } else {
-            0
-        };
-        self.cursor_row = self.cursor_row.saturating_sub(count).max(floor);
+        self.cursor_controls().move_up(count);
     }
     pub fn move_cursor_down(&mut self, count: usize) {
-        self.pending_wrap = false;
-        let ceil = if self.cursor_row <= self.scroll_region_bottom {
-            self.scroll_region_bottom
-        } else {
-            self.grid.rows() - 1
-        };
-        self.cursor_row = self.cursor_row.saturating_add(count).min(ceil);
+        self.cursor_controls().move_down(count);
     }
     pub fn move_cursor_forward(&mut self, count: usize) {
-        self.pending_wrap = false;
-        self.cursor_col = self
-            .cursor_col
-            .saturating_add(count)
-            .min(self.grid.cols() - 1);
+        self.cursor_controls().move_forward(count);
     }
     pub fn move_cursor_backward(&mut self, count: usize) {
-        self.pending_wrap = false;
-        self.cursor_col = self.cursor_col.saturating_sub(count);
+        self.cursor_controls().move_backward(count);
     }
     pub fn set_cursor_column(&mut self, column: usize) {
-        self.pending_wrap = false;
-        self.cursor_col = column.saturating_sub(1).min(self.grid.cols() - 1);
+        self.cursor_controls().set_column(column);
     }
     pub fn set_cursor_row(&mut self, row: usize) {
-        self.pending_wrap = false;
-        let row = row.saturating_sub(1);
-        self.cursor_row = if self.origin_mode {
-            self.scroll_region_top
-                .saturating_add(row)
-                .min(self.scroll_region_bottom)
-        } else {
-            row.min(self.grid.rows() - 1)
-        };
+        self.cursor_controls().set_row(row);
     }
     pub fn tab_forward(&mut self, count: usize) {
-        self.pending_wrap = false;
-        for _ in 0..count.min(self.grid.cols()) {
-            self.cursor_col = self.next_tab_stop(self.cursor_col);
-        }
+        self.cursor_controls().tab_forward(count);
     }
     pub fn tab_backward(&mut self, count: usize) {
-        self.pending_wrap = false;
-        for _ in 0..count.min(self.grid.cols()) {
-            self.cursor_col = self.prev_tab_stop(self.cursor_col);
-        }
+        self.cursor_controls().tab_backward(count);
     }
     pub fn set_tab_stop(&mut self) {
-        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
-            *stop = true;
-        }
+        self.cursor_controls().set_tab_stop(true);
     }
     pub fn clear_tab_stop(&mut self) {
-        if let Some(stop) = self.tab_stops.get_mut(self.cursor_col) {
-            *stop = false;
-        }
+        self.cursor_controls().set_tab_stop(false);
     }
     pub fn clear_all_tab_stops(&mut self) {
-        self.tab_stops.fill(false);
+        self.cursor_controls().clear_all_tab_stops();
     }
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
-        self.scroll_region_top = top.saturating_sub(1).min(self.grid.rows() - 1);
-        self.scroll_region_bottom = bottom.saturating_sub(1).min(self.grid.rows() - 1);
-        if self.scroll_region_top > self.scroll_region_bottom {
-            self.scroll_region_top = 0;
-            self.scroll_region_bottom = self.grid.rows() - 1;
-        }
-        self.set_cursor_position(1, 1);
+        self.cursor_controls().set_scroll_region(top, bottom);
     }
 }

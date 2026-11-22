@@ -22,6 +22,46 @@ pub enum Dispatch {
     Handled(Effects),
 }
 
+pub(crate) struct UnderlinePen {
+    pub current: Color,
+    pub primary: Option<Color>,
+    saved_cursor: Option<Color>,
+}
+
+impl Default for UnderlinePen {
+    fn default() -> Self {
+        Self {
+            current: Color::Default,
+            primary: None,
+            saved_cursor: None,
+        }
+    }
+}
+
+pub(crate) fn save_cursor_state(
+    screen: &mut ScreenState,
+    protocol: &ProtocolState,
+    underline: Option<&mut UnderlinePen>,
+) {
+    screen.save_cursor_state(protocol);
+    if let Some(underline) = underline {
+        underline.saved_cursor = Some(underline.current);
+    }
+}
+
+pub(crate) fn restore_cursor_state(
+    screen: &mut ScreenState,
+    protocol: &mut ProtocolState,
+    underline: Option<&mut UnderlinePen>,
+) {
+    screen.restore_cursor_state(protocol);
+    if let Some(underline) = underline {
+        if let Some(color) = underline.saved_cursor {
+            underline.current = color;
+        }
+    }
+}
+
 /// CSI DA1/DA2 wire replies shared by the existing Ember and Frost policies.
 ///
 /// These profiles ignore numeric parameters, require no intermediate bytes,
@@ -46,6 +86,15 @@ pub fn dispatch_local(
     screen: &mut ScreenState,
     protocol: &mut ProtocolState,
     event: &Event<'_>,
+) -> Dispatch {
+    dispatch_local_with_underline(screen, protocol, event, None)
+}
+
+pub(crate) fn dispatch_local_with_underline(
+    screen: &mut ScreenState,
+    protocol: &mut ProtocolState,
+    event: &Event<'_>,
+    mut underline: Option<&mut UnderlinePen>,
 ) -> Dispatch {
     let mut effects = Effects::new();
     match event {
@@ -86,6 +135,10 @@ pub fn dispatch_local(
             ..
         } if intermediates == b"!" => {
             soft_reset(screen, protocol);
+            if let Some(underline) = underline {
+                underline.current = Color::Default;
+                underline.saved_cursor = None;
+            }
             effects.push(Effect::GlobalBackground(Color::Default));
         }
         Event::String {
@@ -93,7 +146,11 @@ pub fn dispatch_local(
             payload,
             ..
         } if payload.starts_with(b"$q") => {
-            effects.push(Effect::Reply(decrqss_reply(screen, &payload[2..])));
+            effects.push(Effect::Reply(decrqss_reply(
+                screen,
+                &payload[2..],
+                underline.as_deref().map(|pen| pen.current),
+            )));
         }
         Event::Control(byte) if matches!(byte, 7 | 8 | 9 | 13 | 14 | 15) => match byte {
             7 => effects.push(Effect::Bell),
@@ -136,8 +193,8 @@ pub fn dispatch_local(
             && matches!(final_byte, b'7' | b'8' | b'H' | b'>' | b'=' | b'<') =>
         {
             match final_byte {
-                b'7' => screen.save_cursor_state(protocol),
-                b'8' => screen.restore_cursor_state(protocol),
+                b'7' => save_cursor_state(screen, protocol, underline),
+                b'8' => restore_cursor_state(screen, protocol, underline),
                 b'H' => {
                     if let Some(stop) = screen.tab_stops.get_mut(screen.cursor_col) {
                         *stop = true;
@@ -259,18 +316,24 @@ pub fn dispatch_local(
                                 .set_xterm_modify_other_keys(params.get(1).copied().unwrap_or(0));
                         }
                     } else {
-                        handle_sgr(screen, params, colon_flags, &mut effects);
+                        handle_sgr(
+                            screen,
+                            params,
+                            colon_flags,
+                            &mut effects,
+                            underline.as_deref_mut().map(|pen| &mut pen.current),
+                        );
                     }
                 }
                 b's' => {
                     if plain {
-                        screen.save_cursor_state(protocol);
+                        save_cursor_state(screen, protocol, underline);
                     }
                 }
                 b'u' => {
                     if intermediates.is_empty() {
                         match private_prefix {
-                            None => screen.restore_cursor_state(protocol),
+                            None => restore_cursor_state(screen, protocol, underline),
                             Some(b'?') => effects.push(Effect::Reply(
                                 format!("\x1b[?{}u", protocol.keyboard_enhancement_flags())
                                     .into_bytes(),
@@ -406,153 +469,277 @@ fn parse_sgr_extended_color(
         _ => None,
     }
 }
+const ANSI_COLORS: [Color; 8] = [
+    Color::Black,
+    Color::Red,
+    Color::Green,
+    Color::Yellow,
+    Color::Blue,
+    Color::Magenta,
+    Color::Cyan,
+    Color::White,
+];
+const ANSI_BRIGHT_COLORS: [Color; 8] = [
+    Color::BrightBlack,
+    Color::BrightRed,
+    Color::BrightGreen,
+    Color::BrightYellow,
+    Color::BrightBlue,
+    Color::BrightMagenta,
+    Color::BrightCyan,
+    Color::BrightWhite,
+];
+
+struct Rendition<'a> {
+    foreground: &'a mut Color,
+    background: &'a mut Color,
+    flags: &'a mut StyleFlags,
+    underline_color: Option<&'a mut Color>,
+    preserve_protection: bool,
+}
+
+impl Rendition<'_> {
+    fn reset(&mut self) {
+        *self.flags = StyleFlags::default();
+        self.flags.set_protected(self.preserve_protection);
+        *self.foreground = Color::Default;
+        *self.background = Color::Default;
+        self.set_underline_color(Color::Default);
+    }
+
+    fn set_underline_color(&mut self, color: Color) {
+        if let Some(current) = self.underline_color.as_deref_mut() {
+            *current = color;
+        }
+    }
+
+    fn underline(&mut self, style: u16) {
+        self.flags.set_underline(match style {
+            0 => UnderlineStyle::None,
+            2 => UnderlineStyle::Double,
+            3 => UnderlineStyle::Curly,
+            4 => UnderlineStyle::Dotted,
+            5 => UnderlineStyle::Dashed,
+            _ => UnderlineStyle::Single,
+        });
+    }
+
+    /// A new explicit background also updates the host's global background.
+    /// Resets affect the pen only. Legacy profiles consume underline colors
+    /// while the opted-in profile retains them for subsequent graphic cells.
+    fn color(&mut self, param: u16, color: Color) -> Option<Color> {
+        match param {
+            38 => *self.foreground = color,
+            48 => {
+                *self.background = color;
+                return Some(color);
+            }
+            58 => self.set_underline_color(color),
+            _ => {}
+        }
+        None
+    }
+
+    fn apply(&mut self, param: u16) -> Option<Color> {
+        match param {
+            0 => self.reset(),
+            1 => self.flags.set_bold(true),
+            2 => self.flags.set_dim(true),
+            3 => self.flags.set_italic(true),
+            5 => self.flags.set_blink(true),
+            7 => self.flags.set_inverse(true),
+            9 => self.flags.set_strikethrough(true),
+            21 => self.underline(2),
+            22 => {
+                self.flags.set_bold(false);
+                self.flags.set_dim(false);
+            }
+            23 => self.flags.set_italic(false),
+            24 => self.underline(0),
+            25 => self.flags.set_blink(false),
+            27 => self.flags.set_inverse(false),
+            29 => self.flags.set_strikethrough(false),
+            30..=37 => *self.foreground = ANSI_COLORS[usize::from(param - 30)],
+            39 => *self.foreground = Color::Default,
+            40..=47 => return self.color(48, ANSI_COLORS[usize::from(param - 40)]),
+            49 => *self.background = Color::Default,
+            59 => self.set_underline_color(Color::Default),
+            90..=97 => *self.foreground = ANSI_BRIGHT_COLORS[usize::from(param - 90)],
+            100..=107 => return self.color(48, ANSI_BRIGHT_COLORS[usize::from(param - 100)]),
+            _ => {}
+        }
+        None
+    }
+}
+
 fn handle_sgr(
     screen: &mut ScreenState,
     params: &[u16],
     colon_flags: &[bool],
     effects: &mut Effects,
+    underline_color: Option<&mut Color>,
 ) {
-    // DECSCA is independent of the visual rendition reset by SGR 0.
-    let protected = screen.current_flags.protected();
+    // DECSCA is independent of Ember's visual rendition reset by SGR 0.
+    let preserve_protection = screen.current_flags.protected();
+    let mut rendition = Rendition {
+        foreground: &mut screen.current_fg,
+        background: &mut screen.current_bg,
+        flags: &mut screen.current_flags,
+        underline_color,
+        preserve_protection,
+    };
     if params.is_empty() {
-        screen.current_flags = StyleFlags::default();
-        screen.current_flags.set_protected(protected);
-        screen.current_fg = Color::Default;
-        screen.current_bg = Color::Default;
+        rendition.reset();
         return;
     }
 
     let mut i = 0;
     while i < params.len() {
         let param = params[i];
-        match param {
-            0 => {
-                screen.current_flags = StyleFlags::default();
-                screen.current_flags.set_protected(protected);
-                screen.current_fg = Color::Default;
-                screen.current_bg = Color::Default;
-            }
-            1 => screen.current_flags.set_bold(true),
-            2 => screen.current_flags.set_dim(true),
-            3 => screen.current_flags.set_italic(true),
+        let background = match param {
             4 => {
-                // 仅当下一个参数是冒号子参数(`4:x`)时才作为扩展下划线样式;
-                // 分号分隔的 `4;x` 中 x 是独立 SGR(如 4;1 = 下划线+粗体),不能吞。
+                // Only a recognized colon subparameter selects a style. A
+                // semicolon or unknown value remains a separate parameter.
                 let next_is_substyle = i + 1 < params.len()
                     && colon_flags.get(i + 1).copied().unwrap_or(false)
                     && params[i + 1] <= 5;
-                if next_is_substyle {
-                    let style = params[i + 1];
-                    screen.current_flags.set_underline(match style {
-                        0 => UnderlineStyle::None,
-                        1 => UnderlineStyle::Single,
-                        2 => UnderlineStyle::Double,
-                        3 => UnderlineStyle::Curly,
-                        4 => UnderlineStyle::Dotted,
-                        5 => UnderlineStyle::Dashed,
-                        _ => UnderlineStyle::Single,
-                    });
+                let style = if next_is_substyle {
                     i += 1;
+                    params[i]
                 } else {
-                    screen.current_flags.set_underline(UnderlineStyle::Single);
-                }
-            }
-            5 => screen.current_flags.set_blink(true),
-            7 => screen.current_flags.set_inverse(true),
-            9 => screen.current_flags.set_strikethrough(true),
-            21 => screen.current_flags.set_underline(UnderlineStyle::Double),
-            22 => {
-                screen.current_flags.set_bold(false);
-                screen.current_flags.set_dim(false);
-            }
-            23 => screen.current_flags.set_italic(false),
-            24 => screen.current_flags.set_underline(UnderlineStyle::None),
-            25 => screen.current_flags.set_blink(false),
-            27 => screen.current_flags.set_inverse(false),
-            29 => screen.current_flags.set_strikethrough(false),
-            39 => screen.current_fg = Color::Default,
-            30..=37 => {
-                screen.current_fg = match param {
-                    30 => Color::Black,
-                    31 => Color::Red,
-                    32 => Color::Green,
-                    33 => Color::Yellow,
-                    34 => Color::Blue,
-                    35 => Color::Magenta,
-                    36 => Color::Cyan,
-                    37 => Color::White,
-                    _ => Color::Default,
+                    1
                 };
+                rendition.underline(style);
+                None
             }
-            49 => screen.current_bg = Color::Default,
-            40..=47 => {
-                screen.current_bg = match param {
-                    40 => Color::Black,
-                    41 => Color::Red,
-                    42 => Color::Green,
-                    43 => Color::Yellow,
-                    44 => Color::Blue,
-                    45 => Color::Magenta,
-                    46 => Color::Cyan,
-                    47 => Color::White,
-                    _ => Color::Default,
-                };
-                effects.push(Effect::GlobalBackground(screen.current_bg)); // Update global background
-            }
-            90..=97 => {
-                screen.current_fg = match param {
-                    90 => Color::BrightBlack,
-                    91 => Color::BrightRed,
-                    92 => Color::BrightGreen,
-                    93 => Color::BrightYellow,
-                    94 => Color::BrightBlue,
-                    95 => Color::BrightMagenta,
-                    96 => Color::BrightCyan,
-                    97 => Color::BrightWhite,
-                    _ => Color::Default,
-                };
-            }
-            100..=107 => {
-                screen.current_bg = match param {
-                    100 => Color::BrightBlack,
-                    101 => Color::BrightRed,
-                    102 => Color::BrightGreen,
-                    103 => Color::BrightYellow,
-                    104 => Color::BrightBlue,
-                    105 => Color::BrightMagenta,
-                    106 => Color::BrightCyan,
-                    107 => Color::BrightWhite,
-                    _ => Color::Default,
-                };
-                effects.push(Effect::GlobalBackground(screen.current_bg)); // Update global background
-            }
-            // 扩展前景色:38;5;n / 38;2;r;g;b 及对应冒号形式
-            38 => {
-                if let Some((color, last)) = parse_sgr_extended_color(params, colon_flags, i) {
-                    screen.current_fg = color;
+            38 | 48 | 58 => {
+                parse_sgr_extended_color(params, colon_flags, i).and_then(|(color, last)| {
                     i = last;
-                }
+                    rendition.color(param, color)
+                })
             }
-            // 扩展背景色
-            48 => {
-                if let Some((color, last)) = parse_sgr_extended_color(params, colon_flags, i) {
-                    screen.current_bg = color;
-                    effects.push(Effect::GlobalBackground(screen.current_bg));
-                    i = last;
-                }
-            }
-            // 58 设置下划线颜色 / 59 复位。当前渲染管线未存储独立下划线颜色,
-            // 故仅正确消费其子参数,避免颜色分量泄漏成后续 SGR 码被误解析。
-            58 => {
-                if let Some((_color, last)) = parse_sgr_extended_color(params, colon_flags, i) {
-                    i = last;
-                }
-            }
-            59 => {}
-            _ => {}
+            _ => rendition.apply(param),
+        };
+        if let Some(color) = background {
+            effects.push(Effect::GlobalBackground(color));
         }
         i += 1;
     }
+}
+
+/// Parse SGR parameters into groups. Top-level parameters are separated by ';';
+/// within a group, ':' introduces sub-parameters (ISO 8613-6 / curly underline,
+/// e.g. `4:3` or `38:2:r:g:b`). Empty fields parse as 0 so positions are preserved.
+fn frost_sgr_groups(param_bytes: &[u8]) -> SmallVec<[SmallVec<[u16; 6]>; 8]> {
+    let mut groups: SmallVec<[SmallVec<[u16; 6]>; 8]> = SmallVec::new();
+    let mut group: SmallVec<[u16; 6]> = SmallVec::new();
+    let mut current: u16 = 0;
+
+    for &byte in param_bytes {
+        match byte {
+            b'0'..=b'9' => {
+                current = current
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as u16);
+            }
+            b':' => {
+                group.push(current);
+                current = 0;
+            }
+            b';' => {
+                group.push(current);
+                groups.push(std::mem::take(&mut group));
+                current = 0;
+            }
+            _ => {}
+        }
+    }
+    group.push(current);
+    groups.push(group);
+    groups
+}
+
+/// Resolve an extended color (SGR 38/48/58) from either the colon sub-parameter
+/// form (within a single group, e.g. `38:2:r:g:b` or `38:2:cs:r:g:b`) or the
+/// legacy semicolon form (`38;2;r;g;b`), advancing `gi` past consumed groups.
+fn frost_sgr_color(groups: &[SmallVec<[u16; 6]>], gi: &mut usize) -> Option<Color> {
+    let g = &groups[*gi];
+    if g.len() >= 2 {
+        // Colon sub-parameter form: everything lives in this group.
+        match g[1] {
+            5 => g.get(2).map(|&n| Color::Indexed(n as u8)),
+            2 => {
+                // 38:2:r:g:b (len 5) or 38:2:colorspace:r:g:b (len >= 6)
+                if g.len() >= 6 {
+                    Some(Color::Rgb(g[3] as u8, g[4] as u8, g[5] as u8))
+                } else if g.len() >= 5 {
+                    Some(Color::Rgb(g[2] as u8, g[3] as u8, g[4] as u8))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    } else {
+        // Legacy semicolon form: the kind and components are separate groups.
+        let first = |idx: usize| groups.get(idx).and_then(|x| x.first().copied());
+        match first(*gi + 1) {
+            Some(5) => {
+                let n = first(*gi + 2);
+                *gi += 2;
+                n.map(|n| Color::Indexed(n as u8))
+            }
+            Some(2) => {
+                let (r, gg, b) = (first(*gi + 2), first(*gi + 3), first(*gi + 4));
+                *gi += 4;
+                match (r, gg, b) {
+                    (Some(r), Some(gg), Some(b)) => Some(Color::Rgb(r as u8, gg as u8, b as u8)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Apply the Frost legacy SGR argument and reset rules to the shared pen.
+/// The last explicit background is returned for the host's global background.
+/// Frost treats colon groups as one parameter and consumes the requested
+/// semicolon components of recognized extended colors, even if incomplete.
+pub fn frost_legacy_sgr(
+    raw_params: &[u8],
+    foreground: &mut Color,
+    background: &mut Color,
+    flags: &mut StyleFlags,
+) -> Option<Color> {
+    let groups = frost_sgr_groups(raw_params);
+    let mut rendition = Rendition {
+        foreground,
+        background,
+        flags,
+        underline_color: None,
+        preserve_protection: false,
+    };
+    let mut global_background = None;
+    let mut i = 0;
+    while let Some(group) = groups.get(i) {
+        let param = group.first().copied().unwrap_or(0);
+        let changed = match param {
+            4 => {
+                rendition.underline(group.get(1).copied().unwrap_or(1));
+                None
+            }
+            38 | 48 | 58 => {
+                frost_sgr_color(&groups, &mut i).and_then(|color| rendition.color(param, color))
+            }
+            _ => rendition.apply(param),
+        };
+        if changed.is_some() {
+            global_background = changed;
+        }
+        i += 1;
+    }
+    global_background
 }
 
 fn cursor_position_wire(row: usize, col: usize, private: bool) -> Vec<u8> {
@@ -624,7 +811,7 @@ fn soft_reset(screen: &mut ScreenState, protocol: &mut ProtocolState) {
     screen.pending_wrap = false;
 }
 
-fn decrqss_reply(screen: &ScreenState, pt: &[u8]) -> Vec<u8> {
+fn decrqss_reply(screen: &ScreenState, pt: &[u8], underline_color: Option<Color>) -> Vec<u8> {
     let reply = match pt {
         b" q" => {
             let n = match screen.cursor_shape {
@@ -647,14 +834,17 @@ fn decrqss_reply(screen: &ScreenState, pt: &[u8]) -> Vec<u8> {
             };
             format!("\x1bP1$r{n}\"q\x1b\\")
         }
-        b"m" => format!("\x1bP1$r{}\x1b\\", decrqss_sgr_payload(screen)),
+        b"m" => format!(
+            "\x1bP1$r{}\x1b\\",
+            decrqss_sgr_payload(screen, underline_color)
+        ),
         b"\"p" => "\x1bP1$r65;1\"p\x1b\\".to_string(),
         _ => "\x1bP0$r\x1b\\".to_string(),
     };
     reply.into_bytes()
 }
 
-fn decrqss_sgr_payload(screen: &ScreenState) -> String {
+fn decrqss_sgr_payload(screen: &ScreenState, underline_color: Option<Color>) -> String {
     let mut params: Vec<String> = Vec::new();
     if screen.current_flags.bold() {
         params.push("1".into());
@@ -684,6 +874,17 @@ fn decrqss_sgr_payload(screen: &ScreenState) -> String {
     }
     params.extend(sgr_color_params(screen.current_fg, true));
     params.extend(sgr_color_params(screen.current_bg, false));
+    match underline_color {
+        Some(Color::Indexed(index)) => params.extend(["58".into(), "5".into(), index.to_string()]),
+        Some(Color::Rgb(red, green, blue)) => params.extend([
+            "58".into(),
+            "2".into(),
+            red.to_string(),
+            green.to_string(),
+            blue.to_string(),
+        ]),
+        _ => {}
+    }
     if params.is_empty() {
         "0m".into()
     } else {

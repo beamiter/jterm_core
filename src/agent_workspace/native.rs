@@ -110,6 +110,22 @@ pub struct NativeLaunch {
     pub context: NativeLaunchContext,
     pub view: String,
 }
+
+/// Immutable worktree plan. Draft admission never carries provider credentials.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NativeDraft {
+    pub namespace: String,
+    pub task: AgentTask,
+    pub source_profile: PathBuf,
+}
+impl std::fmt::Debug for NativeDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeDraft")
+            .field("namespace", &self.namespace)
+            .field("task_id", &self.task.id)
+            .finish_non_exhaustive()
+    }
+}
 impl std::fmt::Debug for NativeLaunch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeLaunch")
@@ -157,6 +173,17 @@ pub enum NativeAction {
     Validate {
         expected_sequence: u64,
     },
+    /// Accept the exact reviewed worktree of an authored task with no recipe.
+    AcceptReviewedAt {
+        expected_sequence: u64,
+        fingerprint: String,
+    },
+    LaunchDraft {
+        expected_sequence: u64,
+        expected_queue_revision: u64,
+        context: NativeLaunchContext,
+        policy: NativePromptPolicy,
+    },
     MutateTask {
         expected_sequence: u64,
         mutation: NativeTaskMutation,
@@ -178,6 +205,8 @@ impl std::fmt::Debug for NativeAction {
             Self::Policy { .. } => "Policy",
             Self::UpdateTask { .. } => "UpdateTask",
             Self::Validate { .. } => "Validate",
+            Self::AcceptReviewedAt { .. } => "AcceptReviewedAt",
+            Self::LaunchDraft { .. } => "LaunchDraft",
             Self::MutateTask { .. } => "MutateTask",
         })
     }
@@ -189,6 +218,8 @@ pub struct NativeReportEvent {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeSnapshot {
+    #[serde(default)]
+    pub saved_draft: bool,
     #[serde(default = "default_redaction")]
     pub redact_secrets: bool,
     #[serde(default)]

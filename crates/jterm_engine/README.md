@@ -9,22 +9,29 @@ Both Ember and Frost use the shared incremental parser with explicit compatible
 profiles; neither frontend retains a second live byte scanner.
 Frost shares cell/style/color/cursor types and uses one engine grid backing store
 inside a thin wrapper retaining its identity revision and resize policy. Frost
-keeps its own scrollback compression and streamed search. Ember also uses the shared VT mode and
-keyboard protocol state, mouse reporting encoder, and GUI-neutral keyboard
-encoders. Host shortcut routing, IME pairing, and text spoof filtering remain
-in Ember; the engine does not acquire application policy.
+uses the shared scrollback codec and streamed search decoding. Ember also uses
+the shared VT mode and keyboard protocol state, mouse reporting encoder, and
+GUI-neutral keyboard encoders. Ember owns shortcut routing, IME pairing, and
+text spoof filtering.
 
-This is **not a complete terminal engine**. ANSI interpretation, Unicode width,
-reflow orchestration, selection, structural primary/alternate switching, command
-metadata, rendering, and host integration remain in the applications. No xterm.js
-or alternative terminal emulator was introduced.
+The standalone `terminal::Terminal` owns one parser, primary and alternate
+screens, modes, bounded physical history, normalized input encoding, and
+immutable frame publication. Aether's PTY forwards bytes and lifecycle events
+to it. The default profile retains scalar-width cells and bounded OSC and DCS
+handling. Hosts can call `enable_grapheme_clusters()` before the first feed to
+retain combining marks and extended graphemes. Emoji presentation and
+regional-indicator continuations can widen a provisional narrow glyph.
+Text presentation selectors can shrink a reversible wide glyph. A committed
+scroll retains the wide span. Frames and history expose full text at the head
+column.
+Ember and Frost continue to use their compatibility dispatch and host policies.
 
-Dependencies are `std` and `smallvec` only. This crate must not depend on GUI,
-PTY, Agent, companion, jterm_core, global application identity, filesystem or
-network services. Hyperlink IDs carry no URL-opening authority; validation and
-interning remain in the host. Row ID allocation remains host-owned; zero means
-untracked. Fixed-length mutable slices allow existing region moves without
-exposing storage vectors or permitting callers to resize those vectors.
+Dependencies are `std`, `smallvec`, `unicode-segmentation`, and `unicode-width`.
+The engine is independent of GUI, PTY, Agent, companion, jterm_core, global
+application identity, filesystem and network services. The engine interns
+hyperlink targets under a caller-supplied validation policy. The host owns
+opening links and allocating row IDs. Zero means an untracked row. Fixed-length
+mutable slices support existing region moves while retaining storage invariants.
 
 The storage algorithms and dimension assumptions are deliberately unchanged.
 Hosts must clamp dimensions before grid construction and preserve wide-cell and

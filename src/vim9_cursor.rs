@@ -1,10 +1,10 @@
 //! Vim-owned cursor appearance and a renderer-independent idle blink clock.
 
 use super::{Vim9PixelRect, Vim9RenderCursor, Vim9RenderFrame, Vim9RenderStyle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Vim9CursorShape {
     #[default]
@@ -13,7 +13,7 @@ pub enum Vim9CursorShape {
     Horizontal,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9CursorAppearance {
     pub shape: Vim9CursorShape,

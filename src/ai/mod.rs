@@ -3084,7 +3084,7 @@ mod tests {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             let child = spawn_supervised(&mut command);
-            let pid = child.id() as i32;
+            let pid = child.process_group_id();
             let result = wait_with_bounded_output_limits(
                 child,
                 &AiCancellationToken::new(),
@@ -3112,7 +3112,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut child = spawn_supervised(&mut command);
-        let pid = child.id() as i32;
+        let pid = child.process_group_id();
         let stdin = child.take_stdin().unwrap();
         let config = "x".repeat(2 * 1024 * 1024);
         let started = Instant::now();
@@ -3142,7 +3142,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = spawn_supervised(&mut command);
-        let pid = child.id() as i32;
+        let pid = child.process_group_id();
         let token = AiCancellationToken::new();
         let canceller_token = token.clone();
         let canceller = std::thread::spawn(move || {
@@ -3171,7 +3171,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = spawn_supervised(&mut command);
-        let pid = child.id() as i32;
+        let pid = child.process_group_id();
         let token = AiCancellationToken::new();
         let started = Instant::now();
 
@@ -3192,7 +3192,7 @@ mod tests {
             let holder = DetachedPipeHolder::new("captured");
             let mut command = holder.command();
             let mut child = spawn_supervised(&mut command);
-            let root_pid = child.id() as i32;
+            let root_pid = child.process_group_id();
             wait_until_supervised_root_exits(&mut child);
 
             let token = AiCancellationToken::new();
@@ -3244,7 +3244,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = spawn_supervised(&mut command);
-        let pid = child.id() as i32;
+        let pid = child.process_group_id();
         let token = AiCancellationToken::new();
         let mut deltas: Vec<String> = Vec::new();
         let (fold, prefix, status, _stderr) = stream_child_stdout(
@@ -3287,7 +3287,7 @@ mod tests {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             let mut child = spawn_supervised(&mut command);
-            let pid = child.id() as i32;
+            let pid = child.process_group_id();
             // The entire response is buffered and EOF is ready before cancellation.
             // This exercises the fast-completion path deterministically.
             wait_until_supervised_root_exits(&mut child);
@@ -3330,7 +3330,7 @@ mod tests {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             let mut child = spawn_supervised(&mut command);
-            let pid = child.id() as i32;
+            let pid = child.process_group_id();
             wait_until_supervised_root_exits(&mut child);
             let token = AiCancellationToken::new();
             let deadline = Instant::now() - Duration::from_millis(1);
@@ -3371,7 +3371,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = spawn_supervised(&mut command);
-        let pid = child.id() as i32;
+        let pid = child.process_group_id();
         let token = AiCancellationToken::new();
         let canceller_token = token.clone();
         let canceller = std::thread::spawn(move || {
@@ -3402,7 +3402,7 @@ mod tests {
             let holder = DetachedPipeHolder::new("streaming");
             let mut command = holder.command();
             let mut child = spawn_supervised(&mut command);
-            let root_pid = child.id() as i32;
+            let root_pid = child.process_group_id();
             wait_until_supervised_root_exits(&mut child);
 
             let token = AiCancellationToken::new();

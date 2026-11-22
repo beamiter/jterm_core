@@ -95,7 +95,9 @@ pub enum Event<'a> {
     },
     Csi {
         raw_params: Vec<u8>,
+        /// Numeric fields decoded according to the selected parser profile.
         params: Vec<u16>,
+        /// Whether the immediately preceding separator was a colon.
         colon_flags: Vec<bool>,
         private_prefix: Option<u8>,
         intermediates: Vec<u8>,
@@ -1027,7 +1029,8 @@ impl Parser {
                                 .filter(|b| matches!(b, b'<' | b'=' | b'>' | b'?'));
                             let raw_params =
                                 params[usize::from(private_prefix.is_some())..].to_vec();
-                            let (params, colon_flags) = parse_csi_params(&raw_params);
+                            let (params, colon_flags) =
+                                parse_profiled_csi_params(&raw_params, self.profile);
                             emit!(Event::Csi {
                                 raw_params,
                                 params,
@@ -1078,6 +1081,10 @@ impl Parser {
 }
 
 pub fn parse_csi_params(bytes: &[u8]) -> (Vec<u16>, Vec<bool>) {
+    parse_profiled_csi_params(bytes, ParserProfile::EmberV1)
+}
+
+fn parse_profiled_csi_params(bytes: &[u8], profile: ParserProfile) -> (Vec<u16>, Vec<bool>) {
     if bytes.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -1085,23 +1092,31 @@ pub fn parse_csi_params(bytes: &[u8]) -> (Vec<u16>, Vec<bool>) {
     let mut flags = Vec::new();
     let mut current: u16 = 0;
     let mut colon = false;
+    let mut has_digits = false;
+    let fill_empty = profile == ParserProfile::EmberV1;
     for &byte in bytes {
         match byte {
             b'0'..=b'9' => {
                 current = current
                     .saturating_mul(10)
-                    .saturating_add((byte - b'0') as u16)
+                    .saturating_add((byte - b'0') as u16);
+                has_digits = true;
             }
             b';' | b':' => {
-                params.push(current);
-                flags.push(colon);
+                if has_digits || fill_empty {
+                    params.push(current);
+                    flags.push(colon);
+                }
                 current = 0;
+                has_digits = false;
                 colon = byte == b':';
             }
             _ => {}
         }
     }
-    params.push(current);
-    flags.push(colon);
+    if has_digits || fill_empty {
+        params.push(current);
+        flags.push(colon);
+    }
     (params, flags)
 }

@@ -84,19 +84,19 @@ fn base() -> CellFrame {
 fn tightened_budgets_reject_without_allocating_or_advancing_receiver() {
     let base = base();
     for rows in [vec![], vec![(1, base.rows()[1].clone())]] {
-        let delta = Delta {
-            base: base.stamp(),
-            next: Stamp {
+        let delta = Delta::new(
+            base.stamp(),
+            Stamp {
                 revision: 2,
                 ..base.stamp()
             },
-            cursor: Cursor {
+            Cursor {
                 col: 3,
                 pending_wrap: true,
                 ..base.cursor()
             },
             rows,
-        };
+        );
         // Positive control: the allocation observer sees a successful copy.
         let (accepted, allocations) = measured(|| base.apply(&delta, LIMITS));
         assert!(allocations > 0);

@@ -15,8 +15,8 @@ class BoundaryTests(unittest.TestCase):
     def test_dependency_direction(self):
         manifest = tomllib.loads((ENGINE / 'Cargo.toml').read_text())
         self.assertFalse(manifest['package']['publish'])
-        self.assertEqual(set(manifest['dependencies']), {'smallvec'})
-        for path in (ENGINE / 'src').glob('*.rs'):
+        self.assertEqual(set(manifest['dependencies']), {'smallvec', 'unicode-segmentation', 'unicode-width'})
+        for path in (ENGINE / 'src').rglob('*.rs'):
             text = path.read_text()
             self.assertIsNone(re.search(r'\b(?:jterm_core|jagent|egui|iced|gtk|tokio|libc|companion_core)::', text), str(path))
             self.assertIsNone(re.search(r'\bstd::(?:fs|net|process)::', text), str(path))
@@ -59,6 +59,17 @@ class BoundaryTests(unittest.TestCase):
             source = (ENGINE / 'src' / name).read_text()
             self.assertNotRegex(source, r'\b(?:Instant|SystemTime|TerminalState|ProjectedViewport|KittyGraphics)\b')
 
+    def test_frost_retained_history_uses_shared_codec(self):
+        host = (FAMILY / 'frost/src/terminal.rs').read_text()
+        row = host.split('pub struct ScrollbackLine {', 1)[1].split('\n}', 1)[0]
+        self.assertEqual(row.strip(), 'storage: jterm_engine::ScrollbackLine,')
+        adapter = host.split('impl ScrollbackLine {', 1)[1].split('const _: () =', 1)[0]
+        self.assertIn('jterm_engine::ScrollbackLine::compress_preserving_blink(', adapter)
+        self.assertIn('self.storage.decompress()', adapter)
+        self.assertIn('self.storage.visit_search_cells(visit)', adapter)
+        self.assertNotIn('fn encode_cells(', adapter)
+        self.assertNotIn('fn decode_cells(', adapter)
+
     def test_vertical_motion_owns_real_physical_scroll(self):
         engine = (ENGINE / 'src/screen.rs').read_text()
         body = engine.split('pub fn vertical_motion(', 1)[1].split('    /// ED2:', 1)[0]
@@ -90,7 +101,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('decrqm_private_mode_state(screen, protocol, mode)', engine)
         self.assertIn('decrqm_ansi_mode_state(screen, mode)', engine)
         self.assertNotIn('[DECRQM]', host)
-        self.assertIn('Effect::Reply(decrqss_reply(screen, &payload[2..]))', engine)
+        self.assertRegex(engine, r'Effect::Reply\(decrqss_reply\(\s*screen,\s*&payload\[2\.\.\]')
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
         self.assertIn('fn soft_reset(', frost)
         self.assertNotIn('dispatch_local(', frost)
@@ -113,7 +124,9 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('self.parser.legacy_pending_control()',
                       (FAMILY / 'ember/src/terminal/watch.rs').read_text())
         state = (FAMILY / 'ember/src/terminal/state.rs').read_text()
-        self.assertIn('parser: jterm_engine::parser::Parser::new(', state)
+        constructor = state[state.index('parser: jterm_engine::parser::Parser::'):].split('.expect(', 1)[0]
+        self.assertIn('Parser::with_bounded_profile(', constructor)
+        self.assertIn('ParserProfile::EmberV1', constructor)
         self.assertNotIn('fn consume_utf8_lead(', state)
 
     def test_frost_parser_has_one_owner_and_explicit_profile(self):
@@ -125,14 +138,37 @@ class BoundaryTests(unittest.TestCase):
                       'discarding_oversized_apc', 'discarding_apc_prev_escape'):
             self.assertNotRegex(host, rf'(?m)^\s*(?:pub )?{field}:')
         for old in ('resume_pending_apc', 'resume_pending_osc', 'resume_pending_dcs',
-                    'abort_pending_control_string', 'consume_utf8_lead'):
+                    'abort_pending_control_string', 'consume_utf8_lead', 'parse_csi_params'):
             self.assertNotRegex(text, rf'fn {old}\b')
         self.assertIn('ParserProfile::FrostLegacyV1', text)
         self.assertIn('self.parser.begin_feed()', text)
         self.assertIn('self.parser.pending_kind()', text)
-        self.assertIn('self.parser.set_ascii_batching(', text)
+        self.assertRegex(text, r'self\.parser\s*\.set_ascii_batching\(')
         self.assertIn('CaptureEnd::Complete { token, escape }', text)
+        self.assertRegex(text, r'ParserEvent::Csi\s*\{\s*raw_params,\s*params,')
         self.assertNotIn('std::mem::take(&mut self.parser)', text)
+
+    def test_ascii_storage_is_shared_with_frost_host_order_preserved(self):
+        frost = (FAMILY / 'frost/src/terminal.rs').read_text()
+        lane = frost.split('    fn put_ascii_run(', 1)[1].split('    fn create_blank_cell(', 1)[0]
+        order = [
+            'self.last_printed_char =',
+            'while pos < bytes.len()',
+            'self.wrap_to_next_line()',
+            'self.note_idle_background_cells(',
+            '.overwrite_ascii(',
+            'self.cursor_col += chunk_len',
+            'self.mark_row_dirty(',
+            'self.mark_command_echo_extent(',
+            'self.pending_wrap = true',
+        ]
+        self.assertEqual(sorted(order, key=lane.index), order)
+        self.assertIn('AsciiOverwritePolicy::FrostLegacy', lane)
+        self.assertNotIn('self.grid.get_mut(', lane)
+        screen = (ENGINE / 'src/screen.rs').read_text()
+        shared = screen.split('    pub fn write_ascii_in_row(', 1)[1].split('    pub fn combining_target(', 1)[0]
+        self.assertIn('.overwrite_ascii(', shared)
+        self.assertIn('AsciiOverwritePolicy::SharedScreen', shared)
 
     def test_live_screen_has_one_explicit_owner(self):
         host = (FAMILY / 'ember/src/terminal/mod.rs').read_text().split('pub struct TerminalState {', 1)[1].split('\n}', 1)[0]
@@ -146,11 +182,32 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotRegex(live, r'(?m)^\s*(?:pub )?autowrap:')
         self.assertNotRegex(host + screen, r'impl(?:<[^>]*>)?\s+(?:std::ops::)?Deref')
         state = (FAMILY / 'ember/src/terminal/state.rs').read_text()
-        for operation in ('write_char_in_row', 'write_ascii_in_row', 'erase_span',
+        for operation in ('write_char_in_row', 'step_ascii_write', 'erase_span',
                           'save_cursor_state', 'restore_cursor_state'):
             self.assertIn(f'.{operation}(', state)
         self.assertIn('self.apply_screen_mutation(effect)', state)
         self.assertIn('if let Some(printed) = effect.printed', state)
+
+    def test_aether_uses_the_shared_pty_and_terminal_owners(self):
+        adapter = (FAMILY / 'aether/session/src/lib.rs').read_text()
+        self.assertIn('pub use jterm_engine::terminal::{HistoryPage, Terminal};', adapter)
+        self.assertIn('pub use jterm_runtime::pty_session::Session;', adapter)
+        self.assertNotRegex(adapter, r'\b(?:struct (?:Terminal|Session)|openpty|waitpid)\b')
+        runtime = (ENGINE.parent / 'jterm_runtime/src/pty_session.rs').read_text()
+        self.assertIn('terminal: Terminal,', runtime)
+        self.assertIn('self.terminal.feed(&bytes[..n])?', runtime)
+        self.assertIn('SessionActor::start_with_owner_writes(', runtime)
+        bridge = (FAMILY / 'aether/bridge/src/live.rs').read_text()
+        self.assertIn('Session::spawn_with_epoch(rows, cols, epoch)', bridge)
+        self.assertIn('let mut session = spawn(frame_epoch)?;', bridge)
+
+    def test_ember_shell_owns_one_shared_io_actor(self):
+        adapter = (FAMILY / 'ember/src/shell.rs').read_text().split('#[cfg(test)]', 1)[0]
+        self.assertIn('actor: SessionActor<Pty>,', adapter)
+        self.assertIn('SessionActor::start(pty, repaint_ctx)?', adapter)
+        self.assertNotRegex(adapter, r'\b(?:fn (?:io_loop|write_to_pty)|struct WriteQueue)\b')
+        source = (FAMILY / 'ember/src/output_batch.rs').read_text()
+        self.assertIn('pub use jterm_core::output_batch::*;', source)
 
     def test_region_mutations_execute_in_engine_without_host_policy(self):
         state = (FAMILY / 'ember/src/terminal/state.rs').read_text()
@@ -204,8 +261,22 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn('self.screen.pending_wrap =', transition)
         self.assertNotIn('fn clear_screen(', parser)
         screen = (ENGINE / 'src/screen.rs').read_text()
-        self.assertIn('std::mem::swap(&mut self.grid, &mut self.alt_grid)', screen)
+        swaps = screen.split("impl<Grid> AlternateScreenControls<'_, Grid> {", 1)[1].split('/// Tab stops', 1)[0]
+        self.assertEqual(swaps.count('std::mem::swap(self.grid, self.alt_grid)'), 2)
+        self.assertIn('.enter(save_cursor, protocol.modes().contains(&7))', screen)
+        self.assertIn('.leave(AlternateRestorePolicy::Standard', screen)
         self.assertIn('self.grid.cells_mut().fill(blank)', screen)
+
+        frost = (FAMILY / 'frost/src/terminal.rs').read_text()
+        frost_modes = frost.split('fn set_mode(', 1)[1].split('pub fn scrollback_len(', 1)[0]
+        entry, exit = frost_modes.split('fn reset_mode(', 1)
+        self.assertLess(entry.index('.enter(true, autowrap)'), entry.index('self.protocol.switch_screen()'))
+        self.assertLess(entry.index('self.protocol.switch_screen()'), entry.index('self.clear_screen()'))
+        self.assertLess(exit.index('.leave(AlternateRestorePolicy::Frost)'), exit.index('self.protocol.switch_screen()'))
+        self.assertIn('grid: &mut self.grid,', frost)
+        self.assertIn('alt_grid: &mut self.alt_grid,', frost)
+        self.assertNotIn('std::mem::swap(', frost_modes)
+        self.assertNotIn('SavedCursorState {', frost_modes)
 
     def test_local_semantics_are_live_and_not_duplicated(self):
         host = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
@@ -221,6 +292,10 @@ class BoundaryTests(unittest.TestCase):
         semantic = (ENGINE / 'src/semantics.rs').read_text()
         self.assertIn('if !local {', semantic)
         self.assertIn('return Dispatch::Unhandled;', semantic)
+        frost = (FAMILY / 'frost/src/terminal.rs').read_text()
+        self.assertIn('jterm_engine::semantics::frost_legacy_sgr(', frost)
+        self.assertNotIn('fn handle_sgr(', frost)
+        self.assertNotIn('fn parse_sgr_groups(', frost)
 
         # Pure Ember mode mutations have one production owner; admission,
         # parameter order and lifecycle hooks remain in the frontend.
@@ -233,7 +308,19 @@ class BoundaryTests(unittest.TestCase):
         pure = (ENGINE / 'src/mode_mutation.rs').read_text()
         self.assertIn('1004 | 47 | 1047 | 1048 | 1049 | 2026 | 5522 => return false', pure)
         self.assertNotIn('screen.pending_wrap =', pure)
-        self.assertNotIn('mode_mutation::', (FAMILY / 'frost/src/terminal.rs').read_text())
+        self.assertNotIn('mode_mutation::', frost)
+
+    def test_osc_color_commands_have_one_shared_owner(self):
+        frost = (FAMILY / 'frost/src/terminal.rs').read_text()
+        adapter = frost.split('    fn handle_osc_color(', 1)[1].split('    ///', 1)[0]
+        self.assertIn('.apply_frost_osc(command, value, self.osc_reply_terminator, defaults)', adapter)
+        for name in ('parse_color_spec', 'handle_osc_palette', 'append_osc_color_response'):
+            self.assertNotIn(f'fn {name}(', frost)
+        ember = (FAMILY / 'ember/src/terminal/state.rs').read_text()
+        self.assertIn('.apply_ember_osc(command, value, self.osc_reply_terminator)', ember)
+        colors = (ENGINE / 'src/colors.rs').read_text()
+        self.assertIn('OscColorProfile::Ember,', colors)
+        self.assertIn('OscColorProfile::Frost)', colors)
 
     def test_fullscreen_fill_authority_and_host_order(self):
         host = (FAMILY / 'ember/src/terminal/parser.rs').read_text()

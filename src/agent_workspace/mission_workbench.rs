@@ -125,18 +125,7 @@ impl MissionWorkbench {
     }
 
     pub fn create(&mut self, title: &str, goal: &str, roots: &[(String, PathBuf)]) {
-        self.candidate_inspection = None;
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|mission| mission.revision == 0)
-        {
-            self.notice = Some("An unsaved Mission is selected. Edit and save that stable identity before creating another.".into());
-            return;
-        }
-        if self.busy {
-            self.notice =
-                Some("Wait for the current Mission request before creating another".into());
+        if !self.admit_create() {
             return;
         }
         let mut mission = WorkspaceMission::new(title, goal);
@@ -160,6 +149,67 @@ impl MissionWorkbench {
         {
             mission.preset = WorkspaceMissionPreset::FourTerminals;
         }
+        self.save_new(mission);
+    }
+
+    /// Save a delivery plan for this exact existing task, worktree and run.
+    pub fn create_for_native_task(
+        &mut self,
+        title: &str,
+        goal: &str,
+        repository_name: &str,
+        target_ref: &str,
+        snapshot: &NativeSnapshot,
+    ) {
+        if !self.admit_create() {
+            return;
+        }
+        let mut repository = match WorkspaceMissionRepository::new(
+            repository_name,
+            snapshot.task.worktree_path.clone(),
+        ) {
+            Ok(repository) => repository,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        repository.baseline = snapshot.task.base_commit.clone();
+        repository.target_ref = target_ref.to_owned();
+        repository.tasks.push(WorkspaceMissionTaskRef {
+            conversation: snapshot.id.clone(),
+            task_id: snapshot.task.id,
+            run_id: snapshot.incarnation.clone(),
+            source_sequence: snapshot.sequence,
+        });
+        let mut mission = WorkspaceMission::new(title, goal);
+        mission.repositories.push(repository);
+        if let Err(error) = mission.validate() {
+            self.notice = Some(error);
+            return;
+        }
+        self.save_new(mission);
+    }
+
+    fn admit_create(&mut self) -> bool {
+        self.candidate_inspection = None;
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|mission| mission.revision == 0)
+        {
+            self.notice = Some("An unsaved Mission is selected. Edit and save that stable identity before creating another.".into());
+            return false;
+        }
+        if self.busy {
+            self.notice =
+                Some("Wait for the current Mission request before creating another".into());
+            return false;
+        }
+        true
+    }
+
+    fn save_new(&mut self, mission: WorkspaceMission) {
         self.generation = self.generation.wrapping_add(1);
         self.selected = Some(mission.clone());
         self.report = None;

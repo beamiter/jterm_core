@@ -252,7 +252,9 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                         super::api_host::Disposition::Handled(reply) => return *reply,
                         super::api_host::Disposition::Other(command) => command,
                     };
-                    let command = match native.handle(command, owner.clone(), &mut store) {
+                    let command = match native.handle(command, owner.clone(), &mut store, |row| {
+                        project_runtime_row(row, &runtimes, &paths)
+                    }) {
                         super::api_host::Disposition::Handled(reply) => return *reply,
                         super::api_host::Disposition::Other(command) => command,
                     };

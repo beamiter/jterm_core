@@ -55,7 +55,7 @@ impl Vim9PixelRect {
 
 /// Exact metrics of the visible buffer. Do not round each cell separately:
 /// fractional font advances and DPI must agree for paint, input and overlays.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct Vim9RenderMetrics {
     pub origin_x: f32,
     pub origin_y: f32,

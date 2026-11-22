@@ -13,8 +13,12 @@ categories = ["command-line-utilities", "development-tools"]
 [features]
 # Opt-in shared fixture data for adapter dev-dependencies; no runtime reducer.
 session-parity-tests = []
+terminal-session-actor = ["jterm_runtime/session-actor"]
+terminal-session-actor-test-hooks = ["terminal-session-actor", "jterm_runtime/session-actor-test-hooks"]
 
 [dependencies]
+jterm_engine = { version = "0.1.0", path = "crates/jterm_engine" }
+jterm_remote_client = { version = "0.1.0", path = "crates/jterm_remote_client" }
 jterm_runtime = { version = "0.1.0", path = "crates/jterm_runtime" }
 companion-protocol = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }
 companion-core = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }

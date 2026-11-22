@@ -537,6 +537,348 @@
           }
         }
       }
+    },
+    {
+      "id": "PRODUCT.SEARCH.001",
+      "journey": "Search completed blocks and older output, page results, then cancel",
+      "service": {
+        "path": "src/cross_block_search.rs",
+        "anchor": "pub struct CrossBlockSearchCursor {"
+      },
+      "work_package": 14,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.SEARCH.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Find a repeated literal across a wrapped row and two completed blocks. Page under live output, reveal the exact match, and cancel before a delayed result can change another session."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "The bounded physical history viewer has no established search, pagination, jump or cancellation path."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/app/commands.rs",
+            "anchor": "pub(crate) fn block_search_toggle(&mut self) {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/main.rs",
+            "anchor": "block_search: Option<BlockSearchState>,"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/find.rs",
+            "anchor": "pub fn cross_block_search_version(&self) -> CrossBlockSearchVersion {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/find.rs",
+            "anchor": "pub fn cross_block_search_version(&self) -> CrossBlockSearchVersion {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.CHAT.001",
+      "journey": "Use terminal Chat, enter a fullscreen TUI, then return to the same shell",
+      "service": {
+        "path": "src/chat_mode.rs",
+        "anchor": "pub const fn resolve_surface(state: ChatSessionState) -> ChatSurface {"
+      },
+      "work_package": 15,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.CHAT.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Set a unique shell variable, submit once from the composer, enter Vim and type text using the terminal view, then leave Vim and recover the same shell marker and reading position."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "The terminal canvas and standalone Vim PTY smoke do not establish the terminal Chat composer and surface lifecycle."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/terminal/chat.rs",
+            "anchor": "resolve_surface(ChatSessionState {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/terminal/chat_projection.rs",
+            "anchor": "pub(crate) fn chat_session_state(&self) -> ChatSessionState {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/chat.rs",
+            "anchor": "resolve_surface(ChatSessionState {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/chat.rs",
+            "anchor": "resolve_surface(ChatSessionState {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.WORKFLOW.001",
+      "journey": "Fill workflow arguments and review the command in the originating pane",
+      "service": {
+        "path": "src/workflows/render.rs",
+        "anchor": "pub fn render(workflow: &Workflow, values: &HashMap<String, String>) -> Result<String, String> {"
+      },
+      "work_package": 15,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.WORKFLOW.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Choose a local workflow with quoted and optional arguments, switch focus while the form is open, and confirm text imports to the original open pane exactly once and stays unsubmitted."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "A product workflow picker, argument form and pane-bound review action have not been established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/app/commands.rs",
+            "anchor": "pub(crate) fn submit_workflow_args(&mut self) {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/main.rs",
+            "anchor": "fn submit_workflow_args(&mut self) -> Task<Message> {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/ui/dialogs.rs",
+            "anchor": "pub(crate) fn show_workflow_args_dialog("
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/workflow_ops.rs",
+            "anchor": "pub(crate) fn insert_workflow_command(&self, pane_id: u64, command: &str) {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.COMPANION.001",
+      "journey": "Show companion feedback in the focused pane across split and close",
+      "service": {
+        "path": "src/companion_host.rs",
+        "anchor": "pub struct SharedHost {"
+      },
+      "work_package": 15,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.COMPANION.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Reveal the companion, complete a command, switch panes, close the original pane, and confirm exactly one visible body and no stale command feedback on the second pane."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "Attached terminal events have no established companion UI or focus and feedback lifecycle."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/organism_ui.rs",
+            "anchor": "pub(crate) fn prepare_organism(&mut self, ctx: &egui::Context) {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/eva_companion.rs",
+            "anchor": "pub fn task_result(&mut self, session: usize, exit: Option<i32>) {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/ui/organism_vte.rs",
+            "anchor": "pub(super) fn vte_companion_target(&self) -> Option<std::rc::Weak<VteOrganismSurface>> {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/action_ops.rs",
+            "anchor": "pub(crate) fn set_vte_companion_expanded(&self, pane_id: Option<u64>, expanded: bool) {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.CLI.001",
+      "journey": "Browse, resume and delete a saved CLI conversation by source identity",
+      "service": {
+        "path": "src/agent_workspace/store/deleted_cli.rs",
+        "anchor": "pub(in crate::agent_workspace) fn delete_cli_session("
+      },
+      "work_package": 16,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.CLI.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Use colliding conversation labels from two sources, resume the first one, explicitly delete only the second, refresh the catalog and verify the first can still reopen."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "A product CLI catalog, source-qualified resume and deletion confirmation have not been established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/app/agent_sessions.rs",
+            "anchor": "fn delete_cli_session(&mut self, target: &WorkspaceCliDeletion) -> Result<(), String> {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/agent_sessions.rs",
+            "anchor": "pub(crate) fn delete_cli_session("
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/ui/agent_sessions.rs",
+            "anchor": "pub fn delete_cli_session(&self, id: &RuntimeIdentity) -> Result<(), String> {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/agent_sessions.rs",
+            "anchor": "pub fn delete_cli_session(&self, id: &RuntimeIdentity) -> Result<(), String> {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.REVIEW.001",
+      "journey": "Compare frozen command output and export the result record",
+      "service": {
+        "path": "src/output_compare.rs",
+        "anchor": "pub fn compare(before: OutputSnapshot<'_>, after: OutputSnapshot<'_>) -> OutputComparison {"
+      },
+      "work_package": 18,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.REVIEW.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Compare two finalized outputs while a third command appends live output. Export Markdown and JSON, reload them, and verify status, source identity and compared text are unchanged."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "Visible terminal copy has no established frozen output comparison or durable command export."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/app/block_review.rs",
+            "anchor": "pub(crate) fn block_compare_selected(&mut self) {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_compare.rs",
+            "anchor": "pub(crate) fn block_compare_selected_task(&mut self, from_review: bool) -> Task<Message> {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/review.rs",
+            "anchor": "fn compare(&self) {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/output_compare.rs",
+            "anchor": "pub(crate) fn compare_command_output(&self) -> Result<(), &'static str> {"
+          }
+        }
+      }
     }
   ]
 }

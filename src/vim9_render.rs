@@ -2,9 +2,9 @@
 //! sequences or a terminal palette. Screen coordinates preserve Vim's input
 //! geometry while every glyph, RGB color and decoration is painted by the host.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderStyle {
     /// Packed `0xRRGGBB` GUI colors. `None` inherits the frame's normal style.
@@ -19,7 +19,7 @@ pub struct Vim9RenderStyle {
     pub reverse: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderRect {
     /// Zero-based position in the editor PTY's current screen geometry.
@@ -38,7 +38,7 @@ impl Vim9RenderRect {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderCursor {
     pub row: usize,
@@ -54,7 +54,7 @@ pub struct Vim9RenderCursor {
     pub appearance: Option<super::Vim9CursorAppearance>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderRun {
     /// Vim window identity. Zero is accepted only for legacy single-view frames.
@@ -91,7 +91,7 @@ impl Vim9RenderRun {
 /// to its viewport's top, never a terminal screen coordinate. Nested runs use
 /// row zero; their columns and source bytes retain the same meaning as visible
 /// runs. Empty lines are explicit, so missing paint is never guessed as text.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderMarginRow {
     pub row: i32,
@@ -109,7 +109,7 @@ pub struct Vim9RenderMarginRow {
 
 /// A visible Vim window, sampled in that window's own buffer/option context.
 /// Status lines and split separators are deliberately outside `view`.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderWindow {
     pub window: i64,
@@ -367,7 +367,7 @@ fn margin_display_row(edge: &Vim9RenderMarginRow) -> Vim9DisplayRow {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderCompletion {
     /// Vim's exact popup rectangle, independent of buffer/split ownership.
@@ -380,7 +380,7 @@ pub struct Vim9RenderCompletion {
 /// Protocol 6 display-only Vim popup. Vim owns its contents, geometry, input
 /// filters and lifetime; hosts only paint the sampled surface. Popup runs
 /// deliberately carry no editable buffer/window/source coordinates.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderPopup {
     /// Protocol 7 optional provider presentation hint; unknown values remain classic.
@@ -403,7 +403,7 @@ impl Vim9RenderPopup {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Vim9RenderFrame {
     pub revision: u64,

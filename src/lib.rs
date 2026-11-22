@@ -11,7 +11,7 @@ pub mod agent_task;
 pub mod agent_workspace;
 pub mod ai;
 pub mod atomic_file;
-pub mod block_contract;
+pub use jterm_engine::block_contract;
 pub mod bottom_bar;
 pub mod bounded_json;
 pub mod char_width;
@@ -36,6 +36,8 @@ pub mod keybindings;
 pub mod kitty_graphics;
 pub mod kitty_keyboard;
 pub mod link;
+#[cfg(unix)]
+pub mod notebook;
 pub mod notebook_text;
 pub mod notify;
 pub mod organism;
@@ -78,3 +80,9 @@ pub mod workflows;
 pub mod session_parity;
 
 pub mod companion_host;
+pub use jterm_remote_client;
+pub use jterm_runtime::output_batch;
+#[cfg(unix)]
+pub use jterm_runtime::pty_reader;
+#[cfg(all(unix, feature = "terminal-session-actor"))]
+pub use jterm_runtime::session_actor;

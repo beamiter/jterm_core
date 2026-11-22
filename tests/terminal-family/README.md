@@ -27,7 +27,7 @@ those lanes acceptance; a passing engine row must not promote them.
 
 ## Product journey inventory
 
-`product-cases.json` records the first nine user journeys and six exact
+`product-cases.json` records 15 user journeys and six exact
 comparison revisions. A source observation only points at a concrete code or
 document anchor; it is not proof the user journey works. A partial observation
 explains the missing relationship. An unestablished lane is an open work
@@ -52,3 +52,12 @@ The verifier never fetches and never executes a terminal or a provider:
 
 Both modes report all five native lanes as `not-run`. The evidence fixture
 and schema validation do not replace actual native tests.
+
+For a development build of Aether, run its
+`scripts/test-remote-project-webkit.py` with the built desktop and SSH helper
+on both X11 and Wayland. Each successful run emits
+`PRODUCT.REMOTE.001.NATIVE.001` with the display backend and both SHA-256
+digests. The driver compares actual local and remote bytes, replaces a file
+and a Workspace record while they are selected, and checks that stale
+versions cannot open as the current source. The frozen comparison revisions
+above keep their original results.

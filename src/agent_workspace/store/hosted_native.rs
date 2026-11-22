@@ -1,6 +1,16 @@
 use super::*;
 use crate::agent_workspace::native::{NativeCatalogEntry, NativeSnapshot};
 impl Store {
+    pub(in crate::agent_workspace) fn native_draft_count(&self) -> Result<usize, String> {
+        self.db
+            .query_row(
+                "SELECT count(*) FROM native_jobs WHERE json_extract(snapshot,'$.saved_draft') = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(err)
+    }
+
     pub(in crate::agent_workspace) fn save_native(
         &self,
         snapshot: &NativeSnapshot,

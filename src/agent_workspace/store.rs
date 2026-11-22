@@ -141,6 +141,17 @@ impl Store {
         Ok(rows)
     }
 
+    pub(super) fn complete_queue_catalog(&self) -> Result<Vec<WorkspaceRow>, String> {
+        let count: i64 = self
+            .db
+            .query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))
+            .map_err(err)?;
+        if count > MAX_ROWS as i64 {
+            return Err("The host cannot verify worktree readiness in the bounded catalog".into());
+        }
+        self.rows()
+    }
+
     pub fn upsert_runtime_row(&self, row: &WorkspaceRow) -> Result<(), String> {
         let mut row = row.clone();
         if let Some(existing) = self.row(&row.id)? {
@@ -424,7 +435,8 @@ impl Store {
                 receipt,
                 restore_draft,
             } => self.cancel(&receipt, restore_draft),
-            WorkspaceCommand::StartNative { .. }
+            WorkspaceCommand::SaveNativeDraft { .. }
+            | WorkspaceCommand::StartNative { .. }
             | WorkspaceCommand::DeleteCliSession { .. }
             | WorkspaceCommand::InspectResult { .. }
             | WorkspaceCommand::InspectMission { .. }

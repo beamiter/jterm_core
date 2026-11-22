@@ -8,6 +8,7 @@ on:
       - 'src/exit_status.rs'
       - 'src/process.rs'
       - 'src/runtime_wake.rs'
+      - 'src/supervised.rs'
       - 'tests/runtime_compatibility.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -19,6 +20,7 @@ on:
       - 'src/exit_status.rs'
       - 'src/process.rs'
       - 'src/runtime_wake.rs'
+      - 'src/supervised.rs'
       - 'tests/runtime_compatibility.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -45,13 +47,15 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
+      - name: Fetch locked runtime dependencies
+        run: cargo fetch --locked --manifest-path crates/jterm_runtime/Cargo.toml
       - name: Test independent helpers offline
-        run: cargo test --offline --locked --all-targets --manifest-path crates/jterm_runtime/Cargo.toml
+        run: cargo test --offline --locked --all-targets --all-features --manifest-path crates/jterm_runtime/Cargo.toml
       - name: Check runtime formatting, Clippy and docs
         if: matrix.rust == 'stable'
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: |
           cargo fmt --manifest-path crates/jterm_runtime/Cargo.toml -- --check
-          cargo clippy --offline --locked --all-targets --manifest-path crates/jterm_runtime/Cargo.toml -- -D warnings
-          cargo doc --offline --locked --no-deps --manifest-path crates/jterm_runtime/Cargo.toml
+          cargo clippy --offline --locked --all-targets --all-features --manifest-path crates/jterm_runtime/Cargo.toml -- -D warnings
+          cargo doc --offline --locked --all-features --no-deps --manifest-path crates/jterm_runtime/Cargo.toml

@@ -100,6 +100,8 @@
 //! did, and relative output only differs once scrolling begins, where the
 //! history keeps it anyway.
 
+mod archived_text;
+pub use archived_text::project_bounded_archive;
 mod emulator;
 mod grid;
 mod parser;

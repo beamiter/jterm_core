@@ -4,8 +4,8 @@ use jterm_engine::{
     parser::Event,
     protocol_state::ProtocolState,
     screen::ScreenState,
-    semantics::{dispatch_local, Dispatch, Effect},
-    Color, TerminalGrid,
+    semantics::{dispatch_local, frost_legacy_sgr, Dispatch, Effect},
+    Color, TerminalGrid, UnderlineStyle,
 };
 
 fn screen() -> ScreenState {
@@ -76,6 +76,47 @@ fn unhandled_events_never_mutate_even_mixed_host_hook_modes() {
         assert_eq!(dispatch_local(&mut s, &mut p, &event), Dispatch::Unhandled);
         assert_eq!(snapshot(&s, &p), before);
     }
+}
+
+#[test]
+fn sgr_profiles_keep_group_consumption_and_protection_distinct() {
+    let mut frost = screen();
+    frost.current_flags.set_protected(true);
+    let background = frost_legacy_sgr(
+        b"42;0;4:7;58;2;1",
+        &mut frost.current_fg,
+        &mut frost.current_bg,
+        &mut frost.current_flags,
+    );
+    assert_eq!(background, Some(Color::Green));
+    assert_eq!(frost.current_bg, Color::Default);
+    assert_eq!(frost.current_flags.underline(), UnderlineStyle::Single);
+    assert!(!frost.current_flags.protected());
+    assert!(!frost.current_flags.inverse());
+    assert!(!frost.current_flags.bold());
+    assert!(!frost.current_flags.dim());
+
+    let mut standard = screen();
+    standard.current_flags.set_protected(true);
+    let effects = handled(
+        &mut standard,
+        &mut ProtocolState::default(),
+        &Event::Csi {
+            raw_params: b"42;0;4:7;58;2;1".to_vec(),
+            params: vec![42, 0, 4, 7, 58, 2, 1],
+            colon_flags: vec![false, false, false, true, false, false, false],
+            private_prefix: None,
+            intermediates: vec![],
+            final_byte: b'm',
+        },
+    );
+    assert_eq!(effects, [Effect::GlobalBackground(Color::Green)]);
+    assert_eq!(standard.current_bg, Color::Default);
+    assert_eq!(standard.current_flags.underline(), UnderlineStyle::Single);
+    assert!(standard.current_flags.protected());
+    assert!(standard.current_flags.inverse());
+    assert!(standard.current_flags.bold());
+    assert!(standard.current_flags.dim());
 }
 
 #[test]

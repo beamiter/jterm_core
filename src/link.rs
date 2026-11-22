@@ -12,6 +12,16 @@
 /// this ceiling also bounds the allocation a frontend makes per candidate.
 pub const MAX_OPENABLE_URL_BYTES: usize = 2 * 1024;
 
+/// Validate the metadata of an OSC 8 link before storing its target for a user click.
+pub fn is_openable_osc8(params: &str, uri: &str) -> bool {
+    params.len() <= jterm_engine::hyperlink::MAX_OSC8_PARAMS_BYTES
+        && !params.contains('\u{fffd}')
+        && !params.chars().any(char::is_control)
+        && !crate::review_input::contains_visual_spoofing(params)
+        && !uri.contains('\u{fffd}')
+        && is_openable_url(uri)
+}
+
 /// Whether `url` may be handed to the system opener.
 pub fn is_openable_url(url: &str) -> bool {
     if url.is_empty()

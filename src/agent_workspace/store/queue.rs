@@ -23,7 +23,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 }
 
 impl Store {
-    fn queue_value(&self) -> Result<WorkspaceQueueSnapshot, String> {
+    pub(in crate::agent_workspace) fn queue_value(&self) -> Result<WorkspaceQueueSnapshot, String> {
         let revision: i64 = self
             .db
             .query_row(

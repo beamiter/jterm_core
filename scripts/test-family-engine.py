@@ -29,6 +29,10 @@ class EngineRoutingTests(unittest.TestCase):
         (self.family / 'aether/web').mkdir()
         self.nested = self.family / 'jterm_core/crates/jterm_engine'
         self.crate(self.nested, 'jterm_engine')
+        self.crate(self.nested.with_name('jterm_runtime'), 'jterm_runtime')
+        self.crate(self.nested.with_name('jterm_protocol'), 'jterm_protocol')
+        self.crate(self.nested.with_name('jterm_gtk_view'), 'jterm_gtk_view')
+        self.crate(self.nested.with_name('jterm_remote_client'), 'jterm_remote_client')
 
     def crate(self, path, name):
         path.mkdir(parents=True, exist_ok=True)
@@ -36,6 +40,112 @@ class EngineRoutingTests(unittest.TestCase):
         (path / 'Cargo.lock').write_text('# private lock fixture\n')
         (path / 'src').mkdir(exist_ok=True)
         (path / 'src/lib.rs').write_text('// source fixture\n')
+
+    def test_gtk_shared_terminal_is_private_and_opted_in(self):
+        for app in ('forge', 'anvil'):
+            with self.subTest(app=app):
+                source = self.family / app / 'Cargo.toml'
+                baseline = source.read_text() + '\n[dependencies]\n'
+                source.write_text(baseline)
+
+                def run(command, cwd, env):
+                    self.assertEqual(env[f"JTERM_{app.upper()}_SHARED_TERMINAL"], "1")
+                    self.assertIn('jterm_gtk_view = { path = "../jterm_core/crates/jterm_gtk_view" }',
+                                  (Path(cwd) / 'Cargo.toml').read_text())
+                    self.assertEqual((Path(cwd) / '../jterm_core/crates/jterm_gtk_view/src').resolve(),
+                                     self.nested.with_name('jterm_gtk_view') / 'src')
+                    core_crates = Path(cwd).parent / 'jterm_core' / 'crates'
+                    self.assertEqual((core_crates / 'jterm_engine/src').resolve(), self.nested / 'src')
+                    self.assertFalse((core_crates / 'jterm_engine/Cargo.toml').is_symlink())
+                    self.assertFalse((Path(cwd).parent / 'jterm_engine').exists())
+                    self.assertFalse((Path(cwd).parent / 'jterm_gtk_view').exists())
+                    return type('Result', (), {'returncode': 0})()
+
+                with patch.object(runner, '__file__', str(self.script)), \
+                     patch.object(sys, 'argv', [str(RUNNER), f'--{app}-shared-terminal', app, 'check']), \
+                     patch.object(runner.subprocess, 'run', side_effect=run):
+                    self.assertEqual(runner.main(), 0)
+                self.assertEqual(source.read_text(), baseline)
+
+    def test_aether_local_core_crates_resolve_inside_private_siblings(self):
+        source = self.family / 'aether'
+        for crate in ('session', 'bridge'):
+            manifest = source / crate / 'Cargo.toml'
+            manifest.write_text(manifest.read_text() + '\n[dependencies]\n'
+                                f'jterm_engine = {{ path = "{runner.AETHER_LOCAL_ENGINE}" }}\n')
+        bridge = source / 'bridge' / 'Cargo.toml'
+        bridge.write_text(bridge.read_text()
+                          + 'jterm_protocol = { path = "../../jterm_core/crates/jterm_protocol" }\n')
+        desktop = source / 'src-tauri' / 'Cargo.toml'
+        desktop.write_text(desktop.read_text() + '\n[dependencies]\n'
+                           'jterm_remote_client = { path = "../../jterm_core/crates/jterm_remote_client" }\n')
+
+        def run(command, cwd, env):
+            core_crates = Path(cwd) / '../../jterm_core/crates'
+            for crate in ('jterm_engine', 'jterm_runtime', 'jterm_protocol', 'jterm_remote_client'):
+                path = core_crates / crate
+                self.assertFalse((path / 'Cargo.toml').is_symlink())
+                self.assertEqual((path / 'src').resolve(), self.nested.parent / crate / 'src')
+            self.assertNotIn('--config', command)
+            return type('Result', (), {'returncode': 0})()
+
+        with patch.object(runner, '__file__', str(self.script)), \
+             patch.object(sys, 'argv', [str(RUNNER), 'aether', 'check']), \
+             patch.object(runner.subprocess, 'run', side_effect=run):
+            self.assertEqual(runner.main(), 0)
+
+    def test_aether_git_runtime_uses_the_same_private_engine(self):
+        manifest = self.family / 'aether/session/Cargo.toml'
+        manifest.write_text(
+            manifest.read_text() + "\n[target.'cfg(target_os = \"linux\")'.dependencies]\n"
+            'jterm_runtime = { git = "https://github.com/beamiter/jterm_core" }\n'
+        )
+
+        def run(command, cwd, env):
+            root = Path(cwd).parent.parent
+            for crate in ('jterm_engine', 'jterm_runtime'):
+                override = f'patch."https://github.com/beamiter/jterm_core.git".{crate}.path='
+                self.assertIn(override + json.dumps(str(root / crate)), command)
+                self.assertEqual((root / crate / 'src').resolve(), self.nested.parent / crate / 'src')
+            return type('Result', (), {'returncode': 0})()
+
+        with patch.object(runner, '__file__', str(self.script)), \
+             patch.object(sys, 'argv', [str(RUNNER), 'aether-session', 'check']), \
+             patch.object(runner.subprocess, 'run', side_effect=run):
+            self.assertEqual(runner.main(), 0)
+
+    def test_aether_desktop_workspace_dependency_mirrors_one_core_tree(self):
+        source = self.family / 'aether'
+        for name in ('session', 'bridge'):
+            manifest = source / name / 'Cargo.toml'
+            manifest.write_text(
+                manifest.read_text() + '\n[dependencies]\n'
+                f'jterm_engine = {{ path = "{runner.AETHER_LOCAL_ENGINE}" }}\n'
+            )
+        bridge = source / 'bridge' / 'Cargo.toml'
+        bridge.write_text(bridge.read_text()
+                          + 'jterm_protocol = { path = "../../jterm_core/crates/jterm_protocol" }\n')
+        desktop = source / 'src-tauri' / 'Cargo.toml'
+        desktop.write_text(desktop.read_text() + '\n[dependencies]\n'
+                           'jterm_core = { path = "../../jterm_core" }\n')
+
+        def run(command, cwd, env):
+            root = Path(cwd).parent.parent
+            core = root / 'jterm_core'
+            self.assertEqual((core / 'src').resolve(), self.family / 'jterm_core/src')
+            for crate in ('jterm_engine', 'jterm_runtime', 'jterm_protocol'):
+                path = core / 'crates' / crate
+                self.assertFalse((path / 'Cargo.toml').is_symlink())
+                self.assertEqual((path / 'src').resolve(), self.nested.parent / crate / 'src')
+                self.assertFalse((root / crate).exists())
+            self.assertIn('patch."https://github.com/beamiter/jterm_core.git".jterm_core.path='
+                          + json.dumps(str(core)), command)
+            return type('Result', (), {'returncode': 0})()
+
+        with patch.object(runner, '__file__', str(self.script)), \
+             patch.object(sys, 'argv', [str(RUNNER), 'aether', 'check']), \
+             patch.object(runner.subprocess, 'run', side_effect=run):
+            self.assertEqual(runner.main(), 0)
 
     def test_candidate_mirrors_and_standalone_boundary(self):
         for nested in (True, False):
@@ -52,9 +162,10 @@ class EngineRoutingTests(unittest.TestCase):
                             self.assertFalse((Path(cwd) / 'Cargo.toml').is_symlink())
                             self.assertFalse((Path(cwd) / 'Cargo.lock').is_symlink())
                             if project in ('ember', 'frost'):
-                                self.assertEqual((root / 'jterm_engine/src').resolve(), engine / 'src')
+                                engine_path = root / 'jterm_core/crates/jterm_engine' if nested else root / 'jterm_engine'
+                                self.assertEqual((engine_path / 'src').resolve(), engine / 'src')
                                 self.assertIn('patch."https://github.com/beamiter/jterm_core.git".jterm_engine.path='
-                                              + json.dumps(str(root / 'jterm_engine')), command)
+                                              + json.dumps(str(engine_path)), command)
                             if project == 'jterm_engine':
                                 self.assertFalse((root / 'jagent').exists())
                                 self.assertFalse((root / 'jterm_core').exists())
@@ -78,13 +189,13 @@ class EngineRoutingTests(unittest.TestCase):
 
 
     def test_aether_nested_crates_keep_all_locks_private(self):
-        for selected in ('aether', 'all'):
+        for selected in (*runner.AETHER_CRATES, 'all'):
             with self.subTest(selected=selected):
                 calls = []
                 def run(command, cwd, env):
                     cwd = Path(cwd)
                     calls.append(cwd.name)
-                    if cwd.name != 'src-tauri':
+                    if cwd.name not in runner.AETHER_CRATES.values():
                         return type('Result', (), {'returncode': 0})()
                     root = cwd.parent.parent
                     source = self.family / 'aether'
@@ -97,12 +208,13 @@ class EngineRoutingTests(unittest.TestCase):
                     self.assertEqual((cwd / '../bridge').resolve(), root / 'aether/bridge')
                     self.assertEqual((cwd / '../session').resolve(), root / 'aether/session')
                     self.assertEqual((cwd / '../web').resolve(), source / 'web')
+                    engine = root / 'jterm_core/crates/jterm_engine' if selected == 'all' else root / 'jterm_engine'
                     self.assertIn('patch."https://github.com/beamiter/jterm_core.git".jterm_engine.path='
-                                  + json.dumps(str(root / 'jterm_engine')), command)
+                                  + json.dumps(str(engine)), command)
                     self.assertIn('--offline', command)
-                    self.assertIn(str(source / 'src-tauri'),
+                    self.assertIn(str(source / cwd.name),
                                   env['CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER'])
-                    if selected == 'aether':
+                    if selected in runner.AETHER_CRATES:
                         self.assertFalse((root / 'jagent').exists())
                         self.assertFalse((root / 'jterm_core').exists())
                     return type('Result', (), {'returncode': 0})()
@@ -111,7 +223,9 @@ class EngineRoutingTests(unittest.TestCase):
                      patch.object(runner.subprocess, 'check_output', return_value='host: x86_64-unknown-linux-gnu\n'), \
                      patch.object(runner.subprocess, 'run', side_effect=run):
                     self.assertEqual(runner.main(), 0)
-                self.assertEqual(calls.count('src-tauri'), 1)
+                aether_calls = [name for name in calls if name in runner.AETHER_CRATES.values()]
+                self.assertEqual(aether_calls, list(runner.AETHER_CRATES.values()) if selected == 'all'
+                                 else [runner.AETHER_CRATES[selected]])
                 for crate in ('src-tauri', 'bridge', 'session'):
                     self.assertEqual((self.family / 'aether' / crate / 'Cargo.lock').read_text(),
                                      '# private lock fixture\n')

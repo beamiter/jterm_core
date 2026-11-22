@@ -1,7 +1,11 @@
 #![cfg(target_os = "linux")]
 //! Real cross-process tests: the standalone binary owns a real PTY and
 //! providers; terminal attachments are separately spawned client processes.
-use jterm_core::agent_sessions::{AgentSession, SessionProvider, SessionStatus};
+use jterm_core::agent_sessions::{
+    AgentSession, SessionBatchAction, SessionCatalog, SessionLibrarySnapshot, SessionProvider,
+    SessionStatus,
+};
+use jterm_core::agent_workspace::controllers::cli_sessions::WorkspaceSessions;
 use jterm_core::agent_workspace::*;
 use jterm_core::supervised::SupervisedChild;
 use std::fs::File;
@@ -332,6 +336,77 @@ fn process_live(pid: u32) -> bool {
                 .map(|(_, rest)| !rest.trim_start().starts_with('Z'))
         })
         .unwrap_or(false)
+}
+
+#[test]
+fn workspace_cli_controller_keeps_duplicate_provider_ids_source_qualified() {
+    let harness = Harness::new();
+    let first = &harness.session;
+    let second_source = harness
+        .root
+        .join("other-profile/.codex/sessions/2026/11/01")
+        .join(first.source.file_name().unwrap());
+    std::fs::create_dir_all(second_source.parent().unwrap()).unwrap();
+    std::fs::copy(&first.source, &second_source).unwrap();
+    let second = AgentSession {
+        source: second_source,
+        title: "Same provider ID in a second profile".into(),
+        ..first.clone()
+    };
+    let catalog = SessionCatalog {
+        sessions: vec![first.clone(), second.clone()],
+        ..SessionCatalog::default()
+    };
+    let legacy = SessionLibrarySnapshot::default();
+    let mut controller = WorkspaceSessions::with_client(harness.client());
+    let wait_for_sync = |controller: &mut WorkspaceSessions,
+                         ready: &dyn Fn(&WorkspaceSessions) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            controller.sync(&catalog, &legacy);
+            if ready(controller) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CLI controller did not converge: {:?}",
+                controller.notice
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    wait_for_sync(&mut controller, &|controller| {
+        controller.row(first).is_some() && controller.row(&second).is_some()
+    });
+    let first_id = controller.row(first).unwrap().id.clone();
+    let second_id = controller.row(&second).unwrap().id.clone();
+    assert_ne!(first_id, second_id);
+
+    controller
+        .set_details(first, "First profile alias", "reviewed, reviewed")
+        .unwrap();
+    assert_eq!(
+        controller
+            .apply_batch(std::slice::from_ref(first), &SessionBatchAction::Pin(true))
+            .unwrap(),
+        1
+    );
+    wait_for_sync(&mut controller, &|controller| {
+        controller.title(first) == "First profile alias" && controller.pinned(first)
+    });
+    assert_eq!(controller.row(first).unwrap().tags, ["reviewed"]);
+    assert_eq!(controller.title(&second), second.title);
+    assert!(!controller.pinned(&second));
+    assert!(
+        !controller
+            .projection(&catalog, &legacy)
+            .facts(first.provider, &first.id)
+            .pinned
+    );
+    assert!(controller.delete(second_id, first.clone()).is_err());
+    assert!(first.source.is_file() && second.source.is_file());
+    assert!(!harness.trace.exists(), "catalog edits started a provider");
 }
 
 #[test]
@@ -2041,8 +2116,15 @@ fn stopped_native_for_validation(
     command: &str,
 ) -> (NativeLaunch, ConversationId, NativeControlLease) {
     let mut launch = native_fixture(h);
-    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
     launch.task.source_context.as_mut().unwrap().command = Some(command.into());
+    start_and_finish_native_fixture(h, launch)
+}
+
+fn start_and_finish_native_fixture(
+    h: &Harness,
+    launch: NativeLaunch,
+) -> (NativeLaunch, ConversationId, NativeControlLease) {
+    let id = task_id(&launch.namespace, &launch.task.id.to_string()).unwrap();
     let client = h.client();
     let control = match request(
         &client,
@@ -2071,6 +2153,227 @@ fn stopped_native_for_validation(
     .unwrap();
     wait_native(&client, &id, |s| !s.ownership_locked);
     (launch, id, control)
+}
+
+#[test]
+fn a_manual_acceptance_requires_the_current_inspected_worktree() {
+    use jterm_core::agent_task::{TaskBrief, TaskStatus, TaskValidationStatus};
+
+    let h = Harness::new();
+    let mut launch = native_fixture(&h);
+    launch.task.source = None;
+    launch.task.source_context = None;
+    launch.task.brief = Some(TaskBrief::new("Review the authored worktree", None).unwrap());
+    let (launch, id, control) = start_and_finish_native_fixture(&h, launch);
+    let client = h.client();
+    let inspect = || {
+        let WorkspaceReply::Result { report } =
+            request(&client, WorkspaceCommand::InspectResult { id: id.clone() }).unwrap()
+        else {
+            panic!("expected worktree receipt")
+        };
+        report
+    };
+    let accept = |expected_sequence, fingerprint| {
+        request(
+            &client,
+            WorkspaceCommand::ControlNative {
+                control: control.clone(),
+                operation: uuid::Uuid::new_v4().to_string(),
+                action: Box::new(NativeAction::AcceptReviewedAt {
+                    expected_sequence,
+                    fingerprint,
+                }),
+            },
+        )
+    };
+    let original = inspect();
+    assert_eq!(original.run_id, control.incarnation);
+    let original_fingerprint = original.current.unwrap().fingerprint;
+    assert!(matches!(
+        accept(original.source_sequence - 1, original_fingerprint.clone()),
+        Err(error) if error.contains("Task changed")
+    ));
+    std::fs::write(launch.task.worktree_path.join("tracked"), "external edit").unwrap();
+    let after = inspect_native(&client, &id);
+    assert_eq!(after.task.status, TaskStatus::ReadyForReview);
+    assert!(matches!(
+        accept(after.sequence, original_fingerprint),
+        Err(error) if error.contains("Worktree changed after inspection")
+    ));
+    let fresh = inspect();
+    let reply = accept(fresh.source_sequence, fresh.current.unwrap().fingerprint).unwrap();
+    assert!(matches!(reply, WorkspaceReply::Native { snapshot, .. }
+        if snapshot.task.status == TaskStatus::Completed
+            && snapshot.task.validation.status == TaskValidationStatus::NotRun));
+}
+
+#[test]
+fn saved_native_draft_survives_restart_and_launches_once_after_queue_admission() {
+    use jterm_core::agent_task::{NativePromptPolicy, TaskBrief, TaskId, TaskStatus};
+
+    let mut h = Harness::new();
+    let launch = native_fixture(&h);
+    let mut task = launch.task.clone();
+    task.source = None;
+    task.source_context = None;
+    task.brief =
+        Some(TaskBrief::new("Queue fixture without provider until explicit launch", None).unwrap());
+    let draft = NativeDraft {
+        namespace: launch.namespace.clone(),
+        task,
+        source_profile: launch.context.claude_home.clone(),
+    };
+    let provider_trace = draft.source_profile.join("native-invocations");
+    let save = WorkspaceCommand::SaveNativeDraft {
+        draft: Box::new(draft.clone()),
+    };
+    let client = h.client();
+    let WorkspaceReply::Native {
+        snapshot,
+        control: None,
+    } = request(&client, save.clone()).unwrap()
+    else {
+        panic!("saved draft must not claim a provider or control")
+    };
+    let id = snapshot.id.clone();
+    let incarnation = snapshot.incarnation.clone();
+    assert!(
+        snapshot.saved_draft && !snapshot.preparing && !snapshot.live && !snapshot.ownership_locked
+    );
+    let WorkspaceReply::Native {
+        snapshot: replay,
+        control: None,
+    } = request(&client, save.clone()).unwrap()
+    else {
+        panic!("replay changed draft admission")
+    };
+    assert_eq!(
+        (replay.id, replay.incarnation, replay.sequence),
+        (id.clone(), incarnation.clone(), snapshot.sequence)
+    );
+    let mut dependency = draft.clone();
+    dependency.task.id = TaskId::new();
+    dependency.task.title = "Pending dependency".into();
+    let dependency_id = task_id(&dependency.namespace, &dependency.task.id.to_string()).unwrap();
+    request(
+        &client,
+        WorkspaceCommand::SaveNativeDraft {
+            draft: Box::new(dependency),
+        },
+    )
+    .unwrap();
+    let set_queue = |client: &WorkspaceClient, revision, dependencies| {
+        request(
+            client,
+            WorkspaceCommand::QueueUpdate {
+                update: WorkspaceQueueUpdate {
+                    expected_revision: revision,
+                    change: WorkspaceQueueChange::Upsert {
+                        intent: WorkspaceQueueIntent {
+                            id: id.clone(),
+                            dependencies,
+                            location: WorkspaceExecutionLocation::Local,
+                        },
+                    },
+                },
+            },
+        )
+    };
+    set_queue(&client, 0, vec![dependency_id.clone()]).unwrap();
+    assert!(!provider_trace.exists());
+    drop(client);
+
+    h.host.kill().unwrap();
+    h.host.wait().unwrap();
+    h.host = Command::new(host_executable())
+        .arg("--jterm-session-host")
+        .env("JTERM_WORKSPACE_STATE_DIR", &h.state)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = h.client();
+    let restored = wait_native(&client, &id, |native| native.saved_draft);
+    assert_ne!(restored.incarnation, incarnation);
+    assert_eq!(restored.task.status, TaskStatus::Created);
+    let WorkspaceReply::Queue { snapshot } =
+        request(&client, WorkspaceCommand::QueueSnapshot).unwrap()
+    else {
+        panic!("queue snapshot")
+    };
+    assert_eq!(snapshot.revision, 1);
+    assert_eq!(snapshot.entries[0].intent.dependencies, vec![dependency_id]);
+    let WorkspaceReply::Native {
+        control: Some(control),
+        ..
+    } = request(
+        &client,
+        WorkspaceCommand::AttachNative {
+            id: id.clone(),
+            incarnation: restored.incarnation,
+            view: "reopened-draft".into(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("draft control")
+    };
+    let issue = |action| WorkspaceCommand::ControlNative {
+        control: control.clone(),
+        operation: uuid::Uuid::new_v4().to_string(),
+        action: Box::new(action),
+    };
+    let start = |sequence, revision, consent| {
+        issue(NativeAction::LaunchDraft {
+            expected_sequence: sequence,
+            expected_queue_revision: revision,
+            context: launch.context.clone(),
+            policy: NativePromptPolicy {
+                share_command_context: consent,
+                redact_secrets: true,
+            },
+        })
+    };
+    assert!(matches!(
+        request(&client, issue(NativeAction::Resume { context: launch.context.clone(), policy: launch.policy })),
+        Err(error) if error.contains("through the task queue")
+    ));
+    let current = inspect_native(&client, &id);
+    assert!(matches!(
+        request(&client, start(current.sequence, 1, true)),
+        Err(error) if error.contains("explicitly accepted")
+    ));
+    set_queue(&client, 1, vec![]).unwrap();
+    let current = inspect_native(&client, &id);
+    assert!(matches!(request(&client, start(current.sequence, 1, true)),
+        Err(error) if error.contains("queue changed")));
+    let current = inspect_native(&client, &id);
+    assert!(
+        matches!(request(&client, start(current.sequence, 2, false)),
+        Err(error) if error.contains("Confirm sharing"))
+    );
+    assert!(!provider_trace.exists());
+    let current = inspect_native(&client, &id);
+    let admit = start(current.sequence, 2, true);
+    request(&client, admit.clone()).unwrap();
+    wait_native(&client, &id, |native| {
+        native.live && provider_trace.metadata().is_ok_and(|file| file.len() > 0)
+    });
+    request(&client, admit).unwrap();
+    assert!(!inspect_native(&client, &id).saved_draft);
+    assert_eq!(
+        std::fs::read_to_string(&provider_trace)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    std::fs::write(launch.context.claude_home.join("release-1"), "").unwrap();
+    wait_native(&client, &id, |native| native.can_prompt);
+    request(&client, issue(NativeAction::Finish)).unwrap();
+    wait_native(&client, &id, |native| !native.ownership_locked);
 }
 
 #[test]
@@ -2513,7 +2816,13 @@ fn attach_owned_fixture(h: &Harness, terminal: &OwnedTerminalDescriptor) -> Term
 #[test]
 fn hosted_validation_detaches_reattaches_once_and_commits_controlled_task_mutations() {
     use jterm_core::agent_task::{TaskStatus, TaskValidationStatus};
-    let(h,client,id,control,_) = stopped_native_validation_fixture("printf 'run\\n' >> FIXTURE_ROOT/validation-count; printf validation-started; while ! test -f FIXTURE_ROOT/validation-gate; do sleep .02; done; printf validation-final".into());
+    let (h, client, id, control, _) = stopped_native_validation_fixture(
+        concat!(
+            "printf 'run\\n' >> FIXTURE_ROOT/validation-count; printf 'validation-started\\n'; ",
+            "while ! test -f FIXTURE_ROOT/validation-gate; do sleep .02; done; printf validation-final"
+        )
+        .into(),
+    );
     let before = inspect_native(&client, &id);
     let operation = uuid::Uuid::new_v4().to_string();
     let start = WorkspaceCommand::ControlNative {

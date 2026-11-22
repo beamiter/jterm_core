@@ -36,7 +36,7 @@ pub const MAX_EXECUTION_ID_BYTES: usize = 192;
 /// Maximum retained UTF-8 bytes in one command.
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 /// Maximum retained UTF-8 bytes in one working directory.
-pub const MAX_CWD_BYTES: usize = 4 * 1024;
+pub use jterm_engine::shell_markers::MAX_OSC133_CWD_BYTES as MAX_CWD_BYTES;
 /// Maximum retained UTF-8 bytes in one terminal-output snapshot.
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_JOURNAL_PATH_BYTES: usize = 16 * 1024;
@@ -1962,19 +1962,7 @@ pub fn is_valid_jsh_execution_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-/// Maximum bytes in the jsh session identifier announced over OSC 7770 and
-/// stored on a journal start event.
-pub const MAX_JSH_SESSION_ID_BYTES: usize = 128;
-
-/// Shared definition of a well-formed jsh session id (apps re-use this for
-/// their own session-id handling).
-pub fn is_valid_jsh_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_JSH_SESSION_ID_BYTES
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
+pub use jterm_engine::shell_markers::{is_valid_jsh_session_id, MAX_JSH_SESSION_ID_BYTES};
 
 fn valid_jsh_session_id(id: &str) -> bool {
     is_valid_jsh_session_id(id)
@@ -1987,28 +1975,20 @@ fn valid_jsh_session_id(id: &str) -> bool {
 /// because they remain invisible there, so its OSC and journal consumers must
 /// apply that narrower protocol contract too.
 pub(crate) fn is_valid_jsh_command(command: &str) -> bool {
-    !command.is_empty()
-        && command.len() <= MAX_COMMAND_BYTES
-        // jsh commands are structurally multiline. Preserve newline and tab,
-        // which its JSONL serializer safely escapes, while still refusing
-        // terminal controls and non-control display ambiguity on replay.
-        && !command
-            .chars()
-            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
-        && !command.chars().any(|ch| {
-            !ch.is_control() && crate::review_input::is_terminal_visual_spoofing_character(ch)
-        })
+    jterm_engine::shell_markers::valid_command(
+        command,
+        MAX_COMMAND_BYTES,
+        crate::review_input::is_terminal_visual_spoofing_character,
+    )
 }
 
 /// Whether a cwd can identify the same directory across jsh's OSC and journal
 /// channels without truncation, terminal controls, or visual ambiguity.
 pub fn is_valid_jsh_cwd(cwd: &str) -> bool {
-    !cwd.is_empty()
-        && cwd.len() <= MAX_CWD_BYTES
-        && !cwd.chars().any(char::is_control)
-        && !cwd
-            .chars()
-            .any(crate::review_input::is_terminal_visual_spoofing_character)
+    jterm_engine::shell_markers::valid_cwd(
+        cwd,
+        crate::review_input::is_terminal_visual_spoofing_character,
+    )
 }
 
 fn bounded_text(value: &str, max_bytes: usize) -> String {

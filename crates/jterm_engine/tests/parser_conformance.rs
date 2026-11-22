@@ -180,23 +180,39 @@ fn csi_standard_syntax_and_xterm_extensions() {
 }
 #[test]
 fn empty_fields_and_colon_syntax_preserve_raw_bytes() {
-    check(
-        b"\x1b[;5H\x1b[38:2::1:2:3m",
-        vec![
-            csi(b";5", &[0, 5], None, b"", b'H'),
-            Token::Csi(
-                b"38:2::1:2:3".to_vec(),
-                vec![38, 2, 0, 1, 2, 3],
-                vec![false, true, true, true, true, true],
-                None,
-                vec![],
-                b'm',
-            ),
-        ],
-        128,
-        0,
-        0,
-    );
+    let input = b"\x1b[;5H\x1b[38:2::1:2:3m\x1b[;;g\x1b[1?2;999999P";
+    for (profile, cup, sgr, tbc) in [
+        (
+            ParserProfile::EmberV1,
+            vec![0, 5],
+            vec![38, 2, 0, 1, 2, 3],
+            vec![0, 0, 0],
+        ),
+        (
+            ParserProfile::FrostLegacyV1,
+            vec![5],
+            vec![38, 2, 1, 2, 3],
+            vec![],
+        ),
+    ] {
+        let mut flags = vec![true; sgr.len()];
+        flags[0] = false;
+        check_profile(
+            profile,
+            input,
+            &Trace {
+                tokens: vec![
+                    csi(b";5", &cup, None, b"", b'H'),
+                    Token::Csi(b"38:2::1:2:3".to_vec(), sgr, flags, None, vec![], b'm'),
+                    csi(b";;", &tbc, None, b"", b'g'),
+                    csi(b"1?2;999999", &[12, u16::MAX], None, b"", b'P'),
+                ],
+                rejected: 0,
+                abandoned_apc: 0,
+            },
+            128,
+        );
+    }
 }
 #[test]
 fn embedded_c0_executes_without_ending_csi() {
@@ -461,15 +477,14 @@ fn local_policy_csi_parameter_storage_caps_are_profile_specific() {
             input.extend(vec![b';'; length]);
             input.extend_from_slice(b"mZ\x1b[2J");
             let retained = length.min(cap);
+            let params = if profile == ParserProfile::EmberV1 {
+                vec![0; retained + 1]
+            } else {
+                Vec::new()
+            };
             let expected = Trace {
                 tokens: vec![
-                    csi(
-                        &vec![b';'; retained],
-                        &vec![0; retained + 1],
-                        None,
-                        b"",
-                        b'm',
-                    ),
+                    csi(&vec![b';'; retained], &params, None, b"", b'm'),
                     Token::Print('Z'),
                     csi(b"2", &[2], None, b"", b'J'),
                 ],
@@ -543,20 +558,30 @@ fn local_policy_csi_numeric_saturation_is_per_field() {
         0,
         0,
     );
-    check(
-        b"\x1b[38:2::65536:1:2m",
-        vec![Token::Csi(
-            b"38:2::65536:1:2".to_vec(),
-            vec![38, 2, 0, 65535, 1, 2],
-            vec![false, true, true, true, true, true],
-            None,
-            vec![],
-            b'm',
-        )],
-        1024,
-        0,
-        0,
-    );
+    for (profile, params) in [
+        (ParserProfile::EmberV1, vec![38, 2, 0, 65535, 1, 2]),
+        (ParserProfile::FrostLegacyV1, vec![38, 2, 65535, 1, 2]),
+    ] {
+        let mut flags = vec![true; params.len()];
+        flags[0] = false;
+        check_profile(
+            profile,
+            b"\x1b[38:2::65536:1:2m",
+            &Trace {
+                tokens: vec![Token::Csi(
+                    b"38:2::65536:1:2".to_vec(),
+                    params,
+                    flags,
+                    None,
+                    vec![],
+                    b'm',
+                )],
+                rejected: 0,
+                abandoned_apc: 0,
+            },
+            1024,
+        );
+    }
 }
 
 #[test]

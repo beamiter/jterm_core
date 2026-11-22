@@ -791,7 +791,7 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = crate::supervised::SupervisedChild::spawn(&mut command).unwrap();
-        let pid = child.id() as i32;
+        let pid = child.process_group_id();
         let stdout = child.take_stdout().unwrap();
         let started = Instant::now();
 

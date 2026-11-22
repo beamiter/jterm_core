@@ -256,6 +256,23 @@ impl HostedApiClient {
         observer: &ApiObservationToken,
         on_preview: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
+        let (snapshot, control) = self.start_confirmed(launch)?;
+        self.watch(
+            snapshot.id.clone(),
+            snapshot.epoch,
+            WorkspaceReply::Api { snapshot, control },
+            observer,
+            on_preview,
+        )
+    }
+
+    /// Admit a request once and return host-owned execution and view control.
+    /// An uncertain socket reply is resolved by receipt without sending another
+    /// provider request. The caller may then observe or detach the returned view.
+    pub fn start_confirmed(
+        &self,
+        launch: ApiLaunch,
+    ) -> Result<(ApiSnapshot, Option<ApiControlLease>), String> {
         let id = launch.receipt.id.clone();
         let epoch = launch.receipt.epoch;
         let receipt = launch.receipt.clone();
@@ -268,7 +285,13 @@ impl HostedApiClient {
                 Err(_) => Err(format!("API admission could not be confirmed: {error}. Reopen the conversation to inspect its state; it was not resubmitted.")),
             }
         })?;
-        self.watch(id, epoch, reply, observer, on_preview)
+        let WorkspaceReply::Api { snapshot, control } = reply else {
+            return Err("The running host does not support background API execution".into());
+        };
+        if snapshot.id != id || snapshot.epoch != epoch {
+            return Err("Background API incarnation changed; response was not adopted".into());
+        }
+        Ok((snapshot, control))
     }
     /// Reattach to an existing request without resolving credentials or sending
     /// another HTTP request. A live controller permits read-only observation.

@@ -68,6 +68,35 @@ fn plain_compression_padding_and_search_columns_are_unchanged() {
 }
 
 #[test]
+fn history_blink_is_opt_in_and_streaming_matches_bulk_cells() {
+    let mut blink = TerminalCell {
+        character: 'é',
+        foreground: Color::Red,
+        ..Default::default()
+    };
+    blink.flags.set_blink(true);
+    let mut cells = vec![blink; 257];
+    cells.push(TerminalCell::default());
+
+    let legacy = ScrollbackLine::compress(&cells, false);
+    assert!(!legacy.decompress()[0].flags.blink());
+
+    let retained = ScrollbackLine::compress_preserving_blink(&cells, true);
+    assert!(retained.is_wrapped);
+    assert_eq!(retained.decompress(), cells);
+    assert_eq!(
+        retained.decode_search_row(cells.len(), retained.search_encoded_bytes()),
+        Some(cells.clone())
+    );
+    let mut visited = Vec::new();
+    retained.visit_search_cells(|column, cell| {
+        assert_eq!(column, visited.len());
+        visited.push(cell);
+    });
+    assert_eq!(visited, &cells[..257]);
+}
+
+#[test]
 fn resize_and_scroll_preserve_retained_row_identity() {
     let mut grid = TerminalGrid::new(3, 2);
     grid.row_ids_mut()

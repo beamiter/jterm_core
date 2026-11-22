@@ -7,6 +7,9 @@ pub(super) const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceCommand {
+    SaveNativeDraft {
+        draft: Box<super::native::NativeDraft>,
+    },
     StartNative {
         launch: Box<super::native::NativeLaunch>,
     },

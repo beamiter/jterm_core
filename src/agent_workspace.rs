@@ -66,6 +66,7 @@ mod api_host;
 mod cli_catalog;
 mod client;
 mod context;
+pub mod controllers;
 mod host;
 mod mission;
 mod mission_attention;
@@ -87,6 +88,7 @@ mod result;
 mod search;
 mod ssh;
 mod store;
+mod terminal_attachment;
 
 pub use actions::{WorkspaceAction, WorkspaceActionDescriptor, WorkspaceInputScope};
 pub use api::{
@@ -104,8 +106,8 @@ pub use mission_attention::*;
 pub use mission_workbench::MissionWorkbench;
 pub use model::*;
 pub use native::{
-    HostedValidationSnapshot, NativeAction, NativeCatalogEntry, NativeControlLease, NativeLaunch,
-    NativeLaunchContext, NativeReportEvent, NativeSnapshot, NativeTaskMutation,
+    HostedValidationSnapshot, NativeAction, NativeCatalogEntry, NativeControlLease, NativeDraft,
+    NativeLaunch, NativeLaunchContext, NativeReportEvent, NativeSnapshot, NativeTaskMutation,
     OwnedTerminalDescriptor,
 };
 pub use overview::WorkspaceOverview;
@@ -125,6 +127,7 @@ pub use result::*;
 pub use search::*;
 pub use ssh::WorkspaceSshHost;
 pub(crate) use store::filter_deleted_cli_sessions;
+pub use terminal_attachment::{WorkspaceTerminalAttachment, WorkspaceTerminalEvent};
 
 /// Host wire version. Mission commands are additive: legacy commands remain
 /// usable with a live V2 host, which does not know the new command variants.
@@ -135,6 +138,13 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Worker-only location for durable, isolated native provider profiles.
 pub fn native_profiles_directory() -> Result<std::path::PathBuf, String> {
     let path = ownership::Paths::discover()?.state.join("native-profiles");
+    ownership::private_dir(&path)?;
+    Ok(path)
+}
+
+/// Shared private root for newly prepared native worktrees.
+pub fn native_worktrees_directory() -> Result<std::path::PathBuf, String> {
+    let path = ownership::Paths::discover()?.state.join("native-worktrees");
     ownership::private_dir(&path)?;
     Ok(path)
 }

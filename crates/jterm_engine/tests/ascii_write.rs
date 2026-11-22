@@ -1,4 +1,4 @@
-use jterm_engine::grid::{Color, RawRowId};
+use jterm_engine::grid::{AsciiOverwritePolicy, Color, RawRowId, TerminalCell, TerminalGrid};
 use jterm_engine::screen::{AsciiWriteStep, RowMutation, ScreenState, VerticalMotion};
 use jterm_engine::HyperlinkId;
 
@@ -162,4 +162,70 @@ fn wide_collateral_erasure_is_not_printed_output() {
     assert!(s.grid[0][1].flags.protected());
     assert_eq!(s.grid[0][1].hyperlink_id, HyperlinkId::from_raw(17));
     assert_eq!(s.last_printed_char, Some('A'));
+}
+
+#[test]
+fn frost_row_overwrite_repairs_both_touched_wide_pairs_and_applies_the_pen() {
+    let mut grid = TerminalGrid::new(1, 6);
+    grid[0][0].character = 'L';
+    grid[0][5].character = 'R';
+    for col in [1, 3] {
+        grid[0][col].character = '界';
+        grid[0][col].flags.set_wide(true);
+        grid[0][col + 1].flags.set_wide_continuation(true);
+    }
+    let blank = TerminalCell {
+        background: Color::Blue,
+        ..TerminalCell::default()
+    };
+    let mut pen = TerminalCell {
+        foreground: Color::Red,
+        background: Color::Blue,
+        hyperlink_id: HyperlinkId::from_raw(17),
+        ..TerminalCell::default()
+    };
+    pen.flags.set_bold(true);
+    pen.flags.set_wide(true);
+    pen.flags.set_wide_continuation(true);
+    grid.overwrite_ascii(0, 2, b"AB", pen, blank, AsciiOverwritePolicy::FrostLegacy);
+    assert_eq!(grid[0][0].character, 'L');
+    assert_eq!(grid[0][5].character, 'R');
+    assert_eq!(grid[0][1], blank);
+    assert_eq!(grid[0][4], blank);
+    pen.flags.set_wide(false);
+    pen.flags.set_wide_continuation(false);
+    assert_eq!(
+        grid[0][2],
+        TerminalCell {
+            character: 'A',
+            ..pen
+        }
+    );
+    assert_eq!(
+        grid[0][3],
+        TerminalCell {
+            character: 'B',
+            ..pen
+        }
+    );
+}
+
+#[test]
+fn legacy_and_shared_overwrites_read_different_edges_of_existing_split_pairs() {
+    let mut original = TerminalGrid::new(1, 6);
+    original[0][1].character = '界';
+    original[0][1].flags.set_wide(true);
+    original[0][4].flags.set_wide_continuation(true);
+    for (policy, repairs) in [
+        (AsciiOverwritePolicy::FrostLegacy, false),
+        (AsciiOverwritePolicy::SharedScreen, true),
+    ] {
+        let mut grid = original.clone();
+        let blank = TerminalCell::default();
+        grid.overwrite_ascii(0, 2, b"AB", blank, blank, policy);
+        assert_eq!(grid[0][1] == blank, repairs);
+        assert_eq!(grid[0][4] == blank, repairs);
+        assert_eq!(grid[0][2].character, 'A');
+        assert_eq!(grid[0][3].character, 'B');
+    }
 }

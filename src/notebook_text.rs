@@ -1,6 +1,4 @@
-//! Markdown text layer for notebook surfaces: fence splitting and rendering
-//! to Pango markup. Pure string processing — the notebook UI and cell
-//! execution stay in each app.
+//! Shared notebook fence parsing, shell admission and Pango text rendering.
 
 /// Shared upper bound before parsing duplicates any notebook source text.
 pub const MAX_NOTEBOOK_SOURCE_BYTES: usize = 4 * 1024 * 1024;
@@ -38,6 +36,28 @@ pub enum Segment {
     /// A fenced code block. `lang` is the optional info string after the
     /// opening fence (e.g. "bash", "rust", "" for an unlabeled fence).
     Code { lang: String, src: String },
+}
+
+/// Interpreter selection used by the family's executable Markdown dialect.
+/// The first token is the language; additional fence metadata is display-only.
+pub fn cell_argv(info: &str, configured_shell: &[String]) -> Option<Vec<String>> {
+    let language = info
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match language.as_str() {
+        "" | "shell" => (!configured_shell.is_empty()).then(|| configured_shell.to_vec()),
+        "bash" | "sh" | "zsh" | "fish" => Some(vec![language]),
+        "pwsh" | "powershell" => Some(vec![
+            language,
+            "-NoLogo".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "-".to_owned(),
+        ]),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
