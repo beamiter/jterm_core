@@ -1,0 +1,10 @@
+[package]
+name = "jterm_runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Low-level, UI-independent terminal runtime helpers"
+license = "MIT"
+publish = false
+
+[workspace]

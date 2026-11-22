@@ -322,6 +322,7 @@ dependencies = [
  "eva-character-atlas",
  "fuzzy-matcher",
  "jagent",
+ "jterm_runtime",
  "libc",
  "log",
  "lru",
@@ -338,6 +339,10 @@ dependencies = [
  "uuid",
  "zstd",
 ]
+
+[[package]]
+name = "jterm_runtime"
+version = "0.1.0"
 
 [[package]]
 name = "libc"

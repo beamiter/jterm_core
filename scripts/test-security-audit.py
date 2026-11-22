@@ -9,7 +9,12 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
-LOCKS = ["Cargo.lock", "tools/companion-host-harness/Cargo.lock", "crates/jterm_engine/Cargo.lock"]
+LOCKS = [
+    "Cargo.lock",
+    "tools/companion-host-harness/Cargo.lock",
+    "crates/jterm_engine/Cargo.lock",
+    "crates/jterm_runtime/Cargo.lock",
+]
 DIAGNOSTICS = [
     "error: couldn't check if the package is yanked: missing crate",
     "warning: couldn't update crates.io index: offline",
@@ -138,7 +143,7 @@ class Gate(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/security.yml").read_text()
         self.assertIn('CARGO_AUDIT_VERSION: "0.22.2"', workflow)
         for path in ("Cargo.toml", *LOCKS, "tools/companion-host-harness/Cargo.toml", "crates/jterm_engine/Cargo.toml",
-                     "scripts/security-audit.sh", "scripts/test-security-audit.py",
+                     "crates/jterm_runtime/Cargo.toml", "scripts/security-audit.sh", "scripts/test-security-audit.py",
                      ".github/workflows/security.yml", ".cargo/audit.toml"):
             self.assertEqual(workflow.count("      - " + path + "\n"), 2, path)
         self.assertIn("run: bash scripts/security-audit.sh", workflow)

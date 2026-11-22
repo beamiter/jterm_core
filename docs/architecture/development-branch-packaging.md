@@ -13,6 +13,11 @@ The earlier milestone reports retain their original local-only validation scope.
 - `crates/jterm_engine` is a separately locked, independent Cargo workspace,
   version 0.1.0 and Rust 1.86 minimum. Its only external dependency is smallvec.
   It has no core, GUI, PTY, Agent, filesystem, network or executor dependency.
+- `crates/jterm_runtime` initially contains the dependency-free scheduling
+  wake and shell exit-code helpers, with a separate lock and the same Rust 1.89
+  minimum as core. Core uses a relative path dependency, and the previous
+  `jterm_core::runtime_wake` and `jterm_core::exit_status` APIs re-export the same
+  items. It does not own PTYs, child processes, or a session actor yet.
 - Ember and Frost pin both package names to the same complete Git commit in the
   existing `beamiter/jterm_core` repository. Forge and Anvil pin only core.
   No new repository or crates.io publication is required.
@@ -38,13 +43,14 @@ python3 scripts/test-family-engine.py
 ```
 
 CI runs the engine separately on stable and Rust 1.86. The security audit covers
-all three independent locks: root core, engine and the companion-host harness.
+the locked graphs for root core, engine, runtime and the companion-host harness.
 The full engine boundary checker also requires Ember and Frost checkouts beside
 this repository; it verifies the actual frontend adapters and source identity.
 
 ## Source distribution
 
-Cargo fetches both package names from the same immutable Git source. The engine
+Cargo fetches both package names from the same immutable Git source. The runtime
+path dependency follows that checkout; frontends do not add a separate pin. The engine
 ships within that source tree, including its licenses, tests and separate lock.
 Frontend materialization helpers therefore need no independent engine checkout.
 Snapshot tooling includes `crates/` when present and excludes build products.

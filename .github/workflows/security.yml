@@ -10,6 +10,8 @@ on:
       - tools/companion-host-harness/Cargo.lock
       - crates/jterm_engine/Cargo.toml
       - crates/jterm_engine/Cargo.lock
+      - crates/jterm_runtime/Cargo.toml
+      - crates/jterm_runtime/Cargo.lock
       - scripts/security-audit.sh
       - scripts/test-security-audit.py
       - .cargo/audit.toml
@@ -23,6 +25,8 @@ on:
       - tools/companion-host-harness/Cargo.lock
       - crates/jterm_engine/Cargo.toml
       - crates/jterm_engine/Cargo.lock
+      - crates/jterm_runtime/Cargo.toml
+      - crates/jterm_runtime/Cargo.lock
       - scripts/security-audit.sh
       - scripts/test-security-audit.py
       - .cargo/audit.toml

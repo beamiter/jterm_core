@@ -1,0 +1,55 @@
+name: Independent terminal runtime
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'crates/jterm_runtime/**'
+      - 'src/exit_status.rs'
+      - 'src/runtime_wake.rs'
+      - 'tests/runtime_compatibility.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/runtime-boundary.yml'
+  push:
+    branches: [master, dev/shared-terminal-engine-20261108]
+    paths:
+      - 'crates/jterm_runtime/**'
+      - 'src/exit_status.rs'
+      - 'src/runtime_wake.rs'
+      - 'tests/runtime_compatibility.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/runtime-boundary.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    name: Standalone runtime (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.89.0", stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - name: Test independent helpers offline
+        run: cargo test --offline --locked --all-targets --manifest-path crates/jterm_runtime/Cargo.toml
+      - name: Check runtime formatting, Clippy and docs
+        if: matrix.rust == 'stable'
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          cargo fmt --manifest-path crates/jterm_runtime/Cargo.toml -- --check
+          cargo clippy --offline --locked --all-targets --manifest-path crates/jterm_runtime/Cargo.toml -- -D warnings
+          cargo doc --offline --locked --no-deps --manifest-path crates/jterm_runtime/Cargo.toml
