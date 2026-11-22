@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "core_baseline": "f0107afaf631d29d06358abec3997f1b5712b627",
+  "frontends": {
+    "anvil": "4315b10b3b2d4d1daf883333bd183edd7a1e7be5",
+    "aether": "909612db9896176140ca053a5251d6ee83289039",
+    "ember": "86d9fbe6f1678e56e9cec5feee6fb3aaecf24dc7",
+    "forge": "cc2253d07bd6a2f86c918f84355ff98b961b405e",
+    "frost": "5635699d86e7d12ba1009b70d8cab28ac17d6fb7"
+  },
+  "cases": [
+    {"id":"TERM.TUI.001","target":"tui_state_conformance","test":"tui_cursor_motion_and_status_reply_use_mutated_coordinates","oracle":"literal","profile":"ember-v1","service":"cursor and DSR"},
+    {"id":"TERM.PARSER.001","target":"parser_conformance","test":"tui_lifecycle_unicode_and_query_survive_every_two_cut_partition","oracle":"literal","profile":"ember-v1 and frost-legacy-v1","service":"stream framing"},
+    {"id":"TERM.PARSER.002","target":"parser_conformance","test":"local_policy_csi_parameter_storage_caps_are_profile_specific","oracle":"literal","profile":"ember-v1 and frost-legacy-v1 use distinct storage limits","service":"bounded CSI parsing"},
+    {"id":"TERM.INPUT.001","target":"input_conformance","test":"kitty_push_set_clear_pop_and_query_drive_literal_wire_bytes","oracle":"literal","profile":"local negotiated policy","service":"input encoding"},
+    {"id":"TERM.QUERY.001","target":"query_conformance","test":"local_capability_policy_does_not_advertise_stored_unsupported_modes","oracle":"literal","profile":"ember-v1","service":"mode reporting"},
+    {"id":"TERM.FRAME.001","target":"publication","test":"stalled_subscriber_is_bounded_and_latest_wins","oracle":"invariant","profile":"engine publication","service":"bounded frame publication"},
+    {"id":"TERM.RESIZE.001","target":"screen_resize","test":"physical_resize_matches_original_algorithm_matrix","oracle":"historical-differential","profile":"historical Ember physical resize","service":"screen resize"}
+  ]
+}

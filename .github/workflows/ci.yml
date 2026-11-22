@@ -100,3 +100,15 @@ jobs:
           workspaces: crates/jterm_engine
       - run: cargo test --manifest-path crates/jterm_engine/Cargo.toml --locked --all-targets
       - run: python3 crates/jterm_engine/scripts/check_boundary.py --engine-only
+      - name: Run exact shared terminal acceptance probes
+        shell: bash
+        run: |
+          python3 scripts/test-terminal-family-evidence.py
+          evidence="$RUNNER_TEMP/terminal-family-evidence"
+          python3 scripts/terminal-family-evidence.py --offline --expected-core "$GITHUB_SHA" --output "$evidence"
+          {
+            echo '### Shared terminal engine acceptance (not frontend parity)'
+            echo '```json'
+            cat "$evidence/summary.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
