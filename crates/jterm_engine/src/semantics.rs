@@ -22,6 +22,22 @@ pub enum Dispatch {
     Handled(Effects),
 }
 
+/// CSI DA1/DA2 wire replies shared by the existing Ember and Frost policies.
+///
+/// These profiles ignore numeric parameters, require no intermediate bytes,
+/// and do not implement other DA namespaces here. This selector neither
+/// advertises capabilities for a different product nor writes to the PTY.
+pub fn legacy_device_attributes_reply(
+    private_prefix: Option<u8>,
+    intermediates: &[u8],
+) -> Option<&'static [u8]> {
+    match (private_prefix, intermediates) {
+        (None, b"") => Some(b"\x1b[?65;1;9c"),
+        (Some(b'>'), b"") => Some(b"\x1b[>1;7802;0c"),
+        _ => None,
+    }
+}
+
 /// Ember-compatible semantics, including its DECSTR policy (not Frost soft reset).
 /// Frost parser profiles do not select or authorize this semantic policy.
 /// Dispatch exactly one event. Apply returned effects before the next event.
@@ -33,6 +49,17 @@ pub fn dispatch_local(
 ) -> Dispatch {
     let mut effects = Effects::new();
     match event {
+        Event::Csi {
+            private_prefix,
+            intermediates,
+            final_byte: b'c',
+            ..
+        } => {
+            let Some(reply) = legacy_device_attributes_reply(*private_prefix, intermediates) else {
+                return Dispatch::Unhandled;
+            };
+            effects.push(Effect::Reply(reply.to_vec()));
+        }
         Event::Csi {
             params,
             private_prefix,

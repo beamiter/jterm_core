@@ -4,7 +4,7 @@ use jterm_engine::{
     parser::{Event, Parser, ParserLimits, ParserProfile, PendingKind},
     protocol_state::ProtocolState,
     screen::ScreenState,
-    semantics::{dispatch_local, Dispatch, Effect},
+    semantics::{dispatch_local, legacy_device_attributes_reply, Dispatch, Effect},
     TerminalGrid,
 };
 
@@ -117,6 +117,62 @@ fn check(bytes: &[u8], enabled: bool, handled: bool, expected: &[&[u8]]) {
     }
     let cuts: Vec<_> = (0..=bytes.len()).flat_map(|n| [n, n]).collect();
     assert_eq!(run(bytes, &cuts, enabled, handled), expected);
+}
+
+#[test]
+fn da_queries_keep_wire_identity_and_interleave_with_other_replies() {
+    // Local profiles intentionally accept nonzero and multi-parameter DA.
+    // The literal identities come from both hosts' DA replies, not terminfo
+    // or a claim that every advertised VT capability is implemented.
+    check(
+        b"\x1b[c\x1b[5n\x1b[>0c\x1b[4$p\x1bP$q\"p\x1b\\\x1b[19;8c\x1b[>91;1c",
+        true,
+        true,
+        &[
+            b"\x1b[?65;1;9c",
+            b"\x1b[0n",
+            b"\x1b[>1;7802;0c",
+            b"\x1b[4;1$y",
+            b"\x1bP1$r65;1\"p\x1b\\",
+            b"\x1b[?65;1;9c",
+            b"\x1b[>1;7802;0c",
+        ],
+    );
+}
+
+#[test]
+fn da_unknown_prefixes_and_intermediates_leave_dispatch_unhandled() {
+    for bytes in [
+        b"\x1b[?0c".as_slice(),
+        b"\x1b[=0c",
+        b"\x1b[0$c",
+        b"\x1b[>0 c",
+        b"\x1bZ",
+    ] {
+        check(bytes, true, false, &[]);
+    }
+}
+
+#[test]
+fn da_shared_selector_matches_frozen_frost_decision() {
+    // Frost 5635699, src/terminal.rs handle_escape_sequence, 'c' arm.
+    for prefix in std::iter::once(None).chain((0..=u8::MAX).map(Some)) {
+        for intermediates in [b"".as_slice(), b" ", b"$", b"!!"] {
+            let original: Option<&[u8]> = if intermediates.is_empty() {
+                match prefix {
+                    None => Some(b"\x1b[?65;1;9c"),
+                    Some(b'>') => Some(b"\x1b[>1;7802;0c"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            assert_eq!(
+                legacy_device_attributes_reply(prefix, intermediates),
+                original
+            );
+        }
+    }
 }
 #[test]
 fn ansi_irm_and_dec_origin_report_live_state_with_exact_wire_form() {
