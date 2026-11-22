@@ -524,61 +524,10 @@ pub fn process_cwd(pid: i32) -> Option<String> {
         .and_then(|path| path.into_os_string().into_string().ok())
 }
 
-/// Fields of `/proc/<pid>/stat` the terminals inspect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessStat {
-    pub state: char,
-    pub process_group: i32,
-    pub session: i32,
-    /// Foreground process group of the controlling terminal (`tpgid`); `-1`
-    /// when the process has no controlling terminal.
-    pub foreground_group: i32,
-}
-
-impl ProcessStat {
-    pub fn is_live(self) -> bool {
-        !matches!(self.state, 'Z' | 'X' | 'x')
-    }
-}
-
-/// Parse `/proc/<pid>/stat` content. The `comm` field may contain spaces and
-/// parens, so fields index from the last `)`.
-pub fn parse_process_stat(contents: &str) -> Option<ProcessStat> {
-    let rparen_pos = contents.rfind(')')?;
-    let after_comm = &contents[rparen_pos + 1..];
-    let mut fields = after_comm.split_whitespace();
-    let state = fields.next()?.chars().next()?;
-    fields.next()?; // parent pid
-    let process_group = fields.next()?.parse().ok()?;
-    let session = fields.next()?.parse().ok()?;
-    fields.next()?; // tty_nr
-    let foreground_group = fields.next()?.parse().ok()?;
-    Some(ProcessStat {
-        state,
-        process_group,
-        session,
-        foreground_group,
-    })
-}
-
-/// Read and parse `/proc/<pid>/stat`, distinguishing a vanished process
-/// (`NotFound`) from an unreadable or malformed entry — the distinction a
-/// PID-reuse-safe shutdown drain needs.
-pub fn process_stat_result(pid: i32) -> io::Result<ProcessStat> {
-    if pid <= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "process id must be positive",
-        ));
-    }
-    let contents = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    parse_process_stat(&contents)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat"))
-}
-
-pub fn process_stat(pid: i32) -> Option<ProcessStat> {
-    process_stat_result(pid).ok()
-}
+// Compatibility exports: callers retain their old paths and the same type identity.
+pub use jterm_runtime::process_stat::{
+    parse_process_stat, process_stat, process_stat_result, ProcessStat,
+};
 
 // ---------------------------------------------------------------------------
 // Foreground discovery

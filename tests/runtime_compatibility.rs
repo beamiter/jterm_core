@@ -19,3 +19,16 @@ fn old_exit_paths_honor_existing_const_points_and_exit_names() {
     assert_eq!(INT, Some("SIGINT"));
     assert_eq!(signal_name_for_exit(148), Some("SIGTSTP"));
 }
+
+#[test]
+fn old_process_path_names_the_runtime_snapshot_type() {
+    use jterm_core::process::{parse_process_stat, process_stat, process_stat_result, ProcessStat};
+    let parsed: ProcessStat = parse_process_stat("9 (z) Z 1 9 9 0 -1 0 0").unwrap();
+    let runtime: jterm_runtime::process_stat::ProcessStat = parsed;
+    assert!(!runtime.is_live());
+    assert_eq!(
+        process_stat_result(0).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput,
+    );
+    assert_eq!(process_stat(0), None);
+}

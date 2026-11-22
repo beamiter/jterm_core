@@ -14,10 +14,12 @@ The earlier milestone reports retain their original local-only validation scope.
   version 0.1.0 and Rust 1.86 minimum. Its only external dependency is smallvec.
   It has no core, GUI, PTY, Agent, filesystem, network or executor dependency.
 - `crates/jterm_runtime` initially contains the dependency-free scheduling
-  wake and shell exit-code helpers, with a separate lock and the same Rust 1.89
+  wake, shell exit-code and read-only process-stat helpers, with a separate lock
+  and the same Rust 1.89
   minimum as core. Core uses a relative path dependency, and the previous
-  `jterm_core::runtime_wake` and `jterm_core::exit_status` APIs re-export the same
-  items. It does not own PTYs, child processes, or a session actor yet.
+  `jterm_core::runtime_wake`, `jterm_core::exit_status`, and the stat helpers in
+  `jterm_core::process` re-export the same items. Process signalling, wait/reap,
+  PTY ownership, and session drain policy are still in their original places.
 - Ember and Frost pin both package names to the same complete Git commit in the
   existing `beamiter/jterm_core` repository. Forge and Anvil pin only core.
   No new repository or crates.io publication is required.

@@ -6,6 +6,7 @@ on:
     paths:
       - 'crates/jterm_runtime/**'
       - 'src/exit_status.rs'
+      - 'src/process.rs'
       - 'src/runtime_wake.rs'
       - 'tests/runtime_compatibility.rs'
       - 'Cargo.toml'
@@ -16,6 +17,7 @@ on:
     paths:
       - 'crates/jterm_runtime/**'
       - 'src/exit_status.rs'
+      - 'src/process.rs'
       - 'src/runtime_wake.rs'
       - 'tests/runtime_compatibility.rs'
       - 'Cargo.toml'
