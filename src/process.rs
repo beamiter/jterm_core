@@ -31,8 +31,6 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-const MAX_PROC_CMDLINE_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_PROC_ARG_COUNT: usize = 4 * 1024;
 const MAX_PROCESS_LABEL_CHARS: usize = 128;
 
 // ---------------------------------------------------------------------------
@@ -440,45 +438,8 @@ pub fn read_ppid(pid: i32) -> Option<i32> {
     fields.next()?.parse::<i32>().ok()
 }
 
-/// Read `/proc/<pid>/cmdline` as a NUL-separated argv vector.
-pub fn read_proc_cmdline(pid: i32) -> Option<Vec<String>> {
-    if pid <= 0 {
-        return None;
-    }
-    use std::io::Read;
-
-    let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
-    let mut raw = Vec::new();
-    file.take(MAX_PROC_CMDLINE_BYTES + 1)
-        .read_to_end(&mut raw)
-        .ok()?;
-    if raw.len() as u64 > MAX_PROC_CMDLINE_BYTES {
-        return None;
-    }
-    parse_proc_cmdline_bytes(&raw)
-}
-
-fn parse_proc_cmdline_bytes(raw: &[u8]) -> Option<Vec<String>> {
-    if raw.is_empty() {
-        return None;
-    }
-    // Procfs terminates every argv element with NUL. Remove exactly the final
-    // delimiter, not every empty field: an empty argument is a real boundary
-    // that session restoration must preserve.
-    let body = raw.strip_suffix(&[0]).unwrap_or(raw);
-    let mut args = Vec::new();
-    for bytes in body.split(|byte| *byte == 0) {
-        if args.len() >= MAX_PROC_ARG_COUNT {
-            return None;
-        }
-        args.push(std::str::from_utf8(bytes).ok()?.to_string());
-    }
-    if args.first().is_none_or(String::is_empty) {
-        None
-    } else {
-        Some(args)
-    }
-}
+// Compatibility export: only the bounded read-only argv observation moved.
+pub use jterm_runtime::process_argv::read_proc_cmdline;
 
 fn process_label(raw: &str) -> Option<String> {
     let raw = raw.trim();
@@ -2393,19 +2354,6 @@ mod tests {
 
         assert!(parse_process_stat("garbage").is_none());
         assert!(parse_process_stat("1 (short) S 1").is_none());
-    }
-
-    #[test]
-    fn proc_cmdline_parser_preserves_boundaries_and_rejects_lossy_data() {
-        assert_eq!(
-            parse_proc_cmdline_bytes(b"ssh\0host\0\0remote arg\0"),
-            Some(argv(&["ssh", "host", "", "remote arg"]))
-        );
-        assert!(parse_proc_cmdline_bytes(b"ssh\0bad\xff\0").is_none());
-        assert!(parse_proc_cmdline_bytes(b"\0").is_none());
-
-        let too_many = vec![0_u8; MAX_PROC_ARG_COUNT + 1];
-        assert!(parse_proc_cmdline_bytes(&too_many).is_none());
     }
 
     #[test]

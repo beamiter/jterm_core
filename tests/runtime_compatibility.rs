@@ -32,3 +32,20 @@ fn old_process_path_names_the_runtime_snapshot_type() {
     );
     assert_eq!(process_stat(0), None);
 }
+
+#[test]
+fn old_argv_probe_keeps_the_independent_runtime_api() {
+    let old: fn(i32) -> Option<Vec<String>> = jterm_core::process::read_proc_cmdline;
+    assert_eq!(old(0), None);
+    assert_eq!(old(-1), jterm_runtime::process_argv::read_proc_cmdline(-1));
+    #[cfg(target_os = "linux")]
+    {
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let own = old(pid).unwrap();
+        assert!(!own[0].is_empty());
+        assert_eq!(
+            Some(own),
+            jterm_runtime::process_argv::read_proc_cmdline(pid)
+        );
+    }
+}
