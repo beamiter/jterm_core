@@ -63,6 +63,7 @@
 mod actions;
 mod api;
 mod api_host;
+mod cli_catalog;
 mod client;
 mod context;
 mod host;
@@ -92,6 +93,7 @@ pub use api::{
     ApiControlLease, ApiLaunch, ApiObservation, ApiObservationToken, ApiRequest, ApiSnapshot,
     ApiState, HostedApiClient,
 };
+pub use cli_catalog::WorkspaceCliCatalogIndex;
 pub use client::{
     managed_launch, managed_session_running, owned_terminal_launch, run_embedded_if_requested,
     WorkspaceClient,
