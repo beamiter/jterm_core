@@ -1,0 +1,542 @@
+{
+  "schema": 1,
+  "repos": {
+    "jterm_core": "c8d7933352930e5097ee210e22997d6ab7eb1051",
+    "ember": "86d9fbe6f1678e56e9cec5feee6fb3aaecf24dc7",
+    "frost": "5635699d86e7d12ba1009b70d8cab28ac17d6fb7",
+    "aether": "eec089158b4369c6152725f50fa2907b8ca215f0",
+    "forge": "cc2253d07bd6a2f86c918f84355ff98b961b405e",
+    "anvil": "4315b10b3b2d4d1daf883333bd183edd7a1e7be5"
+  },
+  "journeys": [
+    {
+      "id": "PRODUCT.SESSION.001",
+      "journey": "Open a terminal, detach its view, resume and inspect final output",
+      "service": {
+        "path": "src/agent_workspace/protocol.rs",
+        "anchor": "AttachNative {"
+      },
+      "work_package": 11,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.SESSION.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Detach while both sessions write deterministic markers; reattach the same epoch, observe tail before exit, and compare consumed markers without duplicate launch."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "partial-source",
+          "runtime": "not-run",
+          "source": {
+            "path": "web/app.js",
+            "anchor": "await invokeAttached('detach_shell',{epoch:previous.epoch},previous);"
+          },
+          "limit": "One visible attachment is wired; independent background progress and shared runtime parity are not established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/session.rs",
+            "anchor": "pub fn new_with_session_id("
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/main.rs",
+            "anchor": "fn spawn_argv("
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/ui/tabs.rs",
+            "anchor": "pub(crate) fn add_agent_session_tab(&self, request: super::agent_sessions::ResumeRequest) {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/session.rs",
+            "anchor": "pub(crate) fn load_session() -> Option<SavedSession> {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.LAYOUT.001",
+      "journey": "Use multiple tabs and split panes, then restore layout",
+      "service": {
+        "path": "src/pane_layout.rs",
+        "anchor": "pub enum PaneTree {"
+      },
+      "work_package": 13,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.LAYOUT.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Two independently sized sessions in a split and another tab; restart window, verify identities/layout, and ensure an observing view cannot resize."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "partial-source",
+          "runtime": "not-run",
+          "source": {
+            "path": "web/app.js",
+            "anchor": "const result=destination===null?await invoke('open_shell'):await invoke('ssh_terminal',{action:{operation:'open',destination}});"
+          },
+          "limit": "Current shell start is observed; tab/split and persisted layout journey not established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/app/tabs.rs",
+            "anchor": "pub fn new_tab(&mut self) -> Option<usize> {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/session_persistence.rs",
+            "anchor": "pub fn load(path: &Path) -> SnapshotLoad {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/ui/tabs.rs",
+            "anchor": "pub(crate) fn duplicate_current_tab(&self) {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/session.rs",
+            "anchor": "pub(crate) fn captured_leaf("
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.HISTORY.001",
+      "journey": "Read history while new output arrives and copy the same selection",
+      "service": {
+        "path": "src/transcript_canvas.rs",
+        "anchor": "pub struct CanvasMotion {"
+      },
+      "work_package": 14,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.HISTORY.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Select exact numbered rows, append synchronized text during resize and page movement; clipboard retains original selected bytes and view does not jump to live."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "partial-source",
+          "runtime": "not-run",
+          "source": {
+            "path": "web/app.js",
+            "anchor": "const history=installHistory({older:document.querySelector('#history-older'),newer:document.querySelector('#history-newer'),refresh:document.querySelector('#history-refresh'),output:document.querySelector('#history-output'),label:document.querySelector('#history-label'),invoke:invokeAttached,getEpoch:()=>epoch});"
+          },
+          "limit": "Paging controls are wired; shared stable anchors across resize and live append are not established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/transcript_canvas.rs",
+            "anchor": "pub struct TranscriptCanvas {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/transcript_canvas.rs",
+            "anchor": "pub struct TranscriptCanvas {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/cross_selection.rs",
+            "anchor": "fn cancel_drag_selection(self: &Rc<Self>) {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/cross_selection.rs",
+            "anchor": "fn cancel_drag_selection(self: &Rc<Self>) {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.BLOCK.001",
+      "journey": "Run a shell command in the live view and reopen its result card",
+      "service": {
+        "path": "src/chat_mode.rs",
+        "anchor": "pub struct ChatSessionState {"
+      },
+      "work_package": 15,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.BLOCK.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "One invocation yields one lifecycle and one immutable output card; live TUI changes view without a second PTY, and copied card bytes equal tagged command output."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "No executable Block/Chat output-card journey in the examined Aether UI baseline."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_mode.rs",
+            "anchor": "pub fn visible_live_block_span("
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_mode.rs",
+            "anchor": "pub fn block_copy_text(command: Option<&str>, output: Option<&str>) -> Option<String> {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/chat.rs",
+            "anchor": "fn chat_stop_captures_every_native_button_activation_key() {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/block_view/chat.rs",
+            "anchor": "fn current_lifecycle_owns_chat_surface() {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.WORKSPACE.001",
+      "journey": "Open an existing Workspace chat, save draft, close and reopen",
+      "service": {
+        "path": "src/agent_workspace/protocol.rs",
+        "anchor": "LoadChat {"
+      },
+      "work_package": 16,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.WORKSPACE.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "On reopen load the same conversation and exact draft; uncertain submit does not replay provider work, and unrelated conversation survives a stale UI receipt."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "Workspace chat controller/UI and stable draft lifecycle not established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/workspace_chat_bridge.rs",
+            "anchor": "Command::LoadChat { id },"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/workspace_chat_bridge.rs",
+            "anchor": "Command::LoadChat { id },"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/ui/workspace_chats.rs",
+            "anchor": "if let Err(error) = self.send(Command::LoadChat { id }, Pending::Bind(local)) {"
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/workspace_chats.rs",
+            "anchor": "if let Err(error) = self.send(Command::LoadChat { id }, Pending::Bind(local)) {"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.TASK.001",
+      "journey": "Review and recover a managed task without changing a separate task",
+      "service": {
+        "path": "src/agent_workspace/native_host.rs",
+        "anchor": "fn restore_historical("
+      },
+      "work_package": 17,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.TASK.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Recover the same task after a UI restart, compare persisted prompt/result and ownership, and verify opening a view cannot start a second task."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "Native task lifecycle, review and controller binding not established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/app/tasks.rs",
+            "anchor": "fn task_action_waits_for_recovery(action: &TaskSidebarAction, pending: &HashSet<TaskId>) -> bool {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/agent_task_workspace.rs",
+            "anchor": "pub(crate) fn task_composer_visible(&self) -> bool {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/agent_task_ui.rs",
+            "anchor": "pub(crate) fn task_terminal_binding("
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/agent_task_ui.rs",
+            "anchor": "pub(crate) fn task_terminal_binding("
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.VIM.001",
+      "journey": "Edit in Vim GUI, disconnect bridge, and continue in same PTY",
+      "service": {
+        "path": "src/vim9_gui.rs",
+        "anchor": "pub struct Vim9UiConfig {"
+      },
+      "work_package": 18,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.VIM.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "On real Vim, sever the GUI bridge, then compare visible PTY contents and continued input on the same session without a new process."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "partial-source",
+          "runtime": "not-run",
+          "source": {
+            "path": "README.md",
+            "anchor": "- The Vim smoke drives actual Vim through a PTY and checks screen transitions,"
+          },
+          "limit": "Terminal compatibility smoke exists; no native Vim9 buffer bridge/fallback journey established."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/vim9_ide.rs",
+            "anchor": "pub(crate) fn open_vim9_ide(&mut self, request: Vim9EntryRequest) {"
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/vim9_ide.rs",
+            "anchor": "pub(super) fn open_from_terminal(app: &mut super::Frost, request: Vim9EntryRequest) {"
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/vim9_ide.rs",
+            "anchor": "pub(crate) fn open("
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/vim9_ide.rs",
+            "anchor": "pub(crate) fn open("
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.NOTEBOOK.001",
+      "journey": "Run and stop a notebook cell, preserving output streams",
+      "service": {
+        "path": "src/notebook_text.rs",
+        "anchor": "pub enum NotebookParseError {"
+      },
+      "work_package": 18,
+      "target_adapters": [
+        "aether",
+        "ember",
+        "frost"
+      ],
+      "test": {
+        "id": "PRODUCT.NOTEBOOK.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Open a fixed .jtnb.md, run a cell that emits stdout and stderr, stop it, and compare stream labels and bytes while a sibling cell remains untouched."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "Executable notebook UI and cell lifecycle not established."
+        },
+        "ember": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "Notebook run/stop journey not established by reviewed Ember source."
+        },
+        "frost": {
+          "observation": "not-established",
+          "runtime": "not-run",
+          "limit": "Notebook run/stop journey not established by reviewed Frost source."
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/notebook.rs",
+            "anchor": "//! Executable `.jtnb.md` notebooks for the native GTK4 application."
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/notebook.rs",
+            "anchor": "//! Lightweight executable notebook: `.jtnb.md` files = markdown + runnable"
+          }
+        }
+      }
+    },
+    {
+      "id": "PRODUCT.REMOTE.001",
+      "journey": "Use SSH and open a remote source without a local-path fallback",
+      "service": {
+        "path": "src/agent_workspace/ssh.rs",
+        "anchor": "pub struct WorkspaceSshHost {"
+      },
+      "work_package": 18,
+      "target_adapters": [
+        "aether"
+      ],
+      "test": {
+        "id": "PRODUCT.REMOTE.001.NATIVE.001",
+        "platform": "linux-native-x11-and-wayland",
+        "status": "not-run",
+        "oracle": "Open same-named local and SSH files with different bytes; remote view shows only the selected host source and stale replies never open a local path."
+      },
+      "adapters": {
+        "aether": {
+          "observation": "partial-source",
+          "runtime": "not-run",
+          "source": {
+            "path": "README.md",
+            "anchor": "This slice does **not** support other image formats or remote file reads,"
+          },
+          "limit": "Aether has SSH PTY and JWM entry, but remote file reads are explicitly excluded by current preview scope."
+        },
+        "ember": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/remote_fs.rs",
+            "anchor": "pub fn list_dir("
+          }
+        },
+        "frost": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/remote_fs.rs",
+            "anchor": "pub fn download("
+          }
+        },
+        "forge": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/ui/remote_fs.rs",
+            "anchor": "pub(crate) fn download_file("
+          }
+        },
+        "anvil": {
+          "observation": "source-observed",
+          "runtime": "not-run",
+          "source": {
+            "path": "src/remote_fs.rs",
+            "anchor": "pub(crate) fn list_dir("
+          }
+        }
+      }
+    }
+  ]
+}

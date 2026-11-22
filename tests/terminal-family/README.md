@@ -24,3 +24,31 @@ Anvil, Ember, Forge and Frost are all `not-run` in this suite. This first lane
 does not execute frontend PTYs, product services, GUI/IME, host transport or
 performance. Add separate cases and platform-specific evidence before assigning
 those lanes acceptance; a passing engine row must not promote them.
+
+## Product journey inventory
+
+`product-cases.json` records the first nine user journeys and six exact
+comparison revisions. A source observation only points at a concrete code or
+document anchor; it is not proof the user journey works. A partial observation
+explains the missing relationship. An unestablished lane is an open work
+target, not an assertion that a feature cannot exist. For example, a Vim PTY
+smoke is not a native Vim9 GUI and fallback acceptance, and local preview
+does not demonstrate remote-file handling. Forge and Anvil notebook routes
+are observed; Ember, Frost and Aether are explicitly tracked as open on that
+journey. The future native test IDs describe behavior still to be executed.
+
+Run schema checks without any repository access:
+
+    python3 scripts/terminal-family-product-catalog.py
+    python3 scripts/test-terminal-family-product-catalog.py
+
+To also confirm the catalog anchors, supply all six local Git checkouts
+containing the listed immutable commits. Dirty working files are not read.
+The verifier never fetches and never executes a terminal or a provider:
+
+    python3 scripts/terminal-family-product-catalog.py \
+      --repo jterm_core=. --repo aether=../aether --repo anvil=../anvil \
+      --repo ember=../ember --repo forge=../forge --repo frost=../frost
+
+Both modes report all five native lanes as `not-run`. The evidence fixture
+and schema validation do not replace actual native tests.
