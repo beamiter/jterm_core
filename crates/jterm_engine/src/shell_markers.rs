@@ -90,8 +90,7 @@ pub fn valid_cwd(cwd: &str, invisible: fn(char) -> bool) -> bool {
 /// This parser used to split on `;`, read the mark, and throw every parameter
 /// away, so the two frontends that share it reconstructed the command by
 /// scraping it back off the screen and could never correlate their captured
-/// output with a journal record — while `jterm_core::execution_journal::submit`
-/// existed for exactly that.
+/// output with the execution journal entry created at submission.
 ///
 /// Every field is optional for terminal UI: the same mark is emitted by shells
 /// that send no metadata at all, and a field whose encoding is malformed,
