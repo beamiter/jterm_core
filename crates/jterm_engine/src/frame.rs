@@ -1,19 +1,71 @@
 //! Immutable raw-cell paint values. No projection, transport or resource ownership.
 use crate::grid::{CursorShape, TerminalCell};
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Primary,
     Alternate,
 }
-/// Epoch is supplied by the owning publisher, never a pointer or grid dirty version.
+/// Epoch is supplied by the owning publisher, never a pointer or grid dirty
+/// version. This is a frame stream stamp, not a runtime or attachment lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     pub epoch: u64,
     pub revision: u64,
     pub layout: u64,
     pub screen: Screen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublicationEpoch(NonZeroU64);
+impl PublicationEpoch {
+    pub(crate) fn from_raw(epoch: u64) -> Option<Self> {
+        NonZeroU64::new(epoch).map(Self)
+    }
+
+    pub(crate) fn into_raw(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FrameRevision(NonZeroU64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LayoutRevision(NonZeroU64);
+
+/// Stored in place of the raw public stamp. Only admitted values participate in
+/// publication ordering; epoch, frame revision and layout cannot be interchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdmittedStamp {
+    pub(crate) epoch: PublicationEpoch,
+    pub(crate) revision: FrameRevision,
+    pub(crate) layout: LayoutRevision,
+    screen: Screen,
+}
+
+impl TryFrom<Stamp> for AdmittedStamp {
+    type Error = Error;
+
+    fn try_from(stamp: Stamp) -> Result<Self, Self::Error> {
+        Ok(Self {
+            epoch: PublicationEpoch::from_raw(stamp.epoch).ok_or(Error::Revision)?,
+            revision: FrameRevision(NonZeroU64::new(stamp.revision).ok_or(Error::Revision)?),
+            layout: LayoutRevision(NonZeroU64::new(stamp.layout).ok_or(Error::Revision)?),
+            screen: stamp.screen,
+        })
+    }
+}
+
+impl From<AdmittedStamp> for Stamp {
+    fn from(stamp: AdmittedStamp) -> Self {
+        Self {
+            epoch: stamp.epoch.into_raw(),
+            revision: stamp.revision.0.get(),
+            layout: stamp.layout.0.get(),
+            screen: stamp.screen,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor {
@@ -36,7 +88,7 @@ pub struct Row {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellFrame {
-    stamp: Stamp,
+    stamp: AdmittedStamp,
     cols: usize,
     rows: Arc<[Row]>,
     cursor: Cursor,
@@ -71,9 +123,7 @@ impl CellFrame {
         cursor: Cursor,
         limits: Limits,
     ) -> Result<Self, Error> {
-        if stamp.epoch == 0 || stamp.revision == 0 || stamp.layout == 0 {
-            return Err(Error::Revision);
-        }
+        let stamp = stamp.try_into()?;
         if cols == 0
             || rows.is_empty()
             || cols > limits.max_cols
@@ -97,6 +147,9 @@ impl CellFrame {
         })
     }
     pub fn stamp(&self) -> Stamp {
+        self.stamp.into()
+    }
+    pub(crate) fn admitted_stamp(&self) -> AdmittedStamp {
         self.stamp
     }
     pub fn rows(&self) -> &[Row] {
@@ -113,13 +166,14 @@ impl CellFrame {
     }
     /// Fresh publication in the same stream. Screen/layout changes require a full frame.
     pub fn delta_to(&self, next: &Self) -> Result<Delta, Error> {
-        self.check_next(next.stamp)?;
+        let next_stamp = next.stamp();
+        self.admit_delta_stamp(next_stamp)?;
         if self.cols != next.cols || self.rows.len() != next.rows.len() {
             return Err(Error::Layout);
         }
         Ok(Delta {
-            base: self.stamp,
-            next: next.stamp,
+            base: self.stamp(),
+            next: next_stamp,
             cursor: next.cursor,
             rows: self
                 .rows
@@ -131,24 +185,28 @@ impl CellFrame {
                 .collect(),
         })
     }
-    fn check_next(&self, next: Stamp) -> Result<(), Error> {
-        if next.epoch != self.stamp.epoch
-            || next.layout != self.stamp.layout
-            || next.screen != self.stamp.screen
-        {
+    fn admit_delta_stamp(&self, next: Stamp) -> Result<AdmittedStamp, Error> {
+        // Keep malformed raw-delta error precedence: a mismatched stream or
+        // layout (including zero) outranks an invalid next revision.
+        let raw = self.stamp();
+        if next.epoch != raw.epoch || next.layout != raw.layout || next.screen != raw.screen {
             return Err(Error::Layout);
         }
-        if next.revision <= self.stamp.revision {
+        let revision = FrameRevision(NonZeroU64::new(next.revision).ok_or(Error::Revision)?);
+        if revision <= self.stamp.revision {
             return Err(Error::Revision);
         }
-        Ok(())
+        Ok(AdmittedStamp {
+            revision,
+            ..self.stamp
+        })
     }
     /// Budget checks precede scratch/copy allocation; rejection leaves the original intact.
     pub fn apply(&self, delta: &Delta, limits: Limits) -> Result<Self, Error> {
-        if delta.base != self.stamp {
+        if delta.base != self.stamp() {
             return Err(Error::Base);
         }
-        self.check_next(delta.next)?;
+        let next = self.admit_delta_stamp(delta.next)?;
         // The base may have been admitted under a larger budget. Check the
         // current budget before allocating either the seen table or copied rows.
         if self.cols > limits.max_cols
@@ -179,23 +237,33 @@ impl CellFrame {
         for (index, row) in &delta.rows {
             rows[*index] = row.clone();
         }
-        Self::new(delta.next, self.cols, rows.into(), delta.cursor, limits)
+        // The admitted base and validated edit set already establish all
+        // invariants, including row widths. Do not rescan cloned rows.
+        Ok(Self {
+            stamp: next,
+            cols: self.cols,
+            rows: rows.into(),
+            cursor: delta.cursor,
+        })
     }
 }
 /// Receiver does not invent epochs: reconnect must explicitly bind an expected epoch.
 pub struct Receiver {
-    epoch: u64,
+    epoch: Option<PublicationEpoch>,
     frame: Option<CellFrame>,
 }
 impl Receiver {
     pub fn new(epoch: u64) -> Self {
-        Self { epoch, frame: None }
+        Self {
+            epoch: PublicationEpoch::from_raw(epoch),
+            frame: None,
+        }
     }
     pub fn frame(&self) -> Option<&CellFrame> {
         self.frame.as_ref()
     }
     pub fn full(&mut self, frame: CellFrame) -> Result<(), Error> {
-        if frame.stamp.epoch != self.epoch
+        if Some(frame.stamp.epoch) != self.epoch
             || self
                 .frame
                 .as_ref()

@@ -115,6 +115,43 @@ fn sequence_exhaustion_never_wraps_and_new_epoch_is_explicit() {
     assert!(Sequence::new(0).is_err());
 }
 
+#[test]
+fn ack_and_reject_require_exact_layout_and_screen_even_at_same_revision() {
+    let mut subscriber = Subscriber::new(1).unwrap();
+    subscriber.offer(frame(1, 1)).unwrap();
+    let sent = subscriber.take().unwrap().stamp();
+    subscriber.offer(frame(1, 2)).unwrap();
+    for attempted in [
+        Stamp { layout: 2, ..sent },
+        Stamp {
+            screen: Screen::Alternate,
+            ..sent
+        },
+        Stamp { epoch: 0, ..sent },
+        Stamp {
+            revision: 0,
+            ..sent
+        },
+        Stamp { layout: 0, ..sent },
+    ] {
+        assert_eq!(
+            subscriber.acknowledge(attempted),
+            Err(publication::Error::Ack)
+        );
+        assert_eq!(subscriber.reject(attempted), Err(publication::Error::Ack));
+        assert_eq!(subscriber.retained_frames(), 2);
+        assert!(subscriber.take().is_none());
+    }
+    subscriber.acknowledge(sent).unwrap();
+    match subscriber.take().unwrap() {
+        Update::Delta(delta) => {
+            assert_eq!(delta.base, sent);
+            assert_eq!(delta.next.revision, 2);
+        }
+        _ => panic!("exact ACK should retain the originally applied baseline"),
+    }
+}
+
 fn sized_frame(revision: u64, layout: u64, cols: usize, rows: usize) -> CellFrame {
     let original = frame(1, revision);
     CellFrame::new(

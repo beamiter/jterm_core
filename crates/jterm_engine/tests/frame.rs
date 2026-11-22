@@ -111,6 +111,76 @@ fn malformed_patch_rejected_atomically() {
     assert_eq!(a.apply(&d, LIMITS), Err(Error::Cursor));
     assert_eq!(a, frame(1));
 }
+
+#[test]
+fn raw_stamp_zero_fields_preserve_validator_error_precedence() {
+    let base = frame(1);
+    let exact = base.stamp();
+    assert_eq!(
+        CellFrame::new(
+            Stamp { epoch: 0, ..exact },
+            0,
+            base.shared_rows(),
+            base.cursor(),
+            LIMITS,
+        ),
+        Err(Error::Revision),
+        "full-frame stamp validation precedes invalid geometry",
+    );
+    let clean = base.delta_to(&frame(2)).unwrap();
+    for (next, expected) in [
+        (
+            Stamp {
+                revision: 0,
+                ..clean.next
+            },
+            Error::Revision,
+        ),
+        (
+            Stamp {
+                layout: 0,
+                revision: 0,
+                ..clean.next
+            },
+            Error::Layout,
+        ),
+        (
+            Stamp {
+                epoch: 0,
+                revision: 0,
+                ..clean.next
+            },
+            Error::Layout,
+        ),
+        (
+            Stamp {
+                layout: 2,
+                revision: 0,
+                ..clean.next
+            },
+            Error::Layout,
+        ),
+        (
+            Stamp {
+                screen: Screen::Alternate,
+                revision: 0,
+                ..clean.next
+            },
+            Error::Layout,
+        ),
+    ] {
+        let mut invalid = clean.clone();
+        invalid.next = next;
+        invalid.rows = vec![(usize::MAX, base.rows()[0].clone())];
+        assert_eq!(base.apply(&invalid, LIMITS), Err(expected));
+        invalid.base.epoch = 0;
+        assert_eq!(base.apply(&invalid, LIMITS), Err(Error::Base));
+    }
+    assert_eq!(base.apply(&clean, LIMITS).unwrap().stamp(), clean.next);
+    let mut unbound = Receiver::new(0);
+    assert_eq!(unbound.full(base), Err(Error::Revision));
+    assert!(unbound.frame().is_none());
+}
 #[test]
 fn resize_and_screen_transition_require_full() {
     let a = frame(1);
