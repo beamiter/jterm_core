@@ -1,6 +1,126 @@
 use super::*;
 
 #[test]
+fn palette_queries_keep_order_and_only_changed_colors_publish() {
+    let mut terminal = Terminal::new(2, 8).unwrap();
+    let initial = TerminalDefaultColors {
+        background: (22, 33, 44),
+        ..TerminalDefaultColors::default()
+    };
+    terminal.set_color_defaults(initial);
+    let (initial_revision, _) = terminal.paint_colors().unwrap();
+    let reply = terminal
+        .feed(b"\x1b]4;202;#12e371;202;?\x07\x1b[5n\x1b]11;?\x1b\\\x1b]12;rgb:1/2/3\x07")
+        .unwrap();
+    assert_eq!(
+        reply,
+        b"\x1b]4;202;rgb:1212/e3e3/7171\x07\x1b[0n\x1b]11;rgb:1616/2121/2c2c\x1b\\"
+    );
+    let (changed_revision, colors) = terminal.paint_colors().unwrap();
+    assert_eq!(changed_revision, initial_revision + 2);
+    assert_eq!(colors.palette_color(202), (18, 227, 113));
+    assert_eq!(colors.cursor_override(), Some((17, 34, 51)));
+    assert_eq!(
+        terminal.feed(b"\x1b]12;?\x07").unwrap(),
+        b"\x1b]12;rgb:1111/2222/3333\x07"
+    );
+    let (still, unchanged) = terminal.paint_colors().unwrap();
+    assert_eq!(still, changed_revision);
+    assert!(Arc::ptr_eq(&colors, &unchanged));
+
+    let next = TerminalDefaultColors {
+        background: (1, 2, 3),
+        ..initial
+    };
+    terminal.set_color_defaults(next);
+    assert_eq!(
+        terminal.paint_colors().unwrap().1.palette_color(202),
+        (18, 227, 113)
+    );
+    terminal.feed(b"\x1b]104;202\x07\x1b]112\x07").unwrap();
+    let reset = terminal.paint_colors().unwrap().1;
+    assert_eq!(reset.palette_color(202), ColorState::default_256_color(202));
+    assert_eq!(reset.cursor_override(), None);
+    terminal.feed(b"\x1b]11;#aaaaff\x07\x1bc").unwrap();
+    assert_eq!(
+        terminal.paint_colors().unwrap().1.effective_background(),
+        (1, 2, 3)
+    );
+}
+
+#[test]
+fn window_updates_share_bounded_title_state_and_keep_bell_out_of_osc() {
+    let mut terminal = Terminal::new(4, 10).unwrap();
+    terminal.enable_window_updates();
+    terminal
+        .feed("\x1b]2;title\u{202e}\x07\x1b[22;2t".as_bytes())
+        .unwrap();
+    let update = terminal.take_window_updates();
+    assert_eq!(update.title.as_deref(), Some("title"));
+    assert!(!update.bell);
+    assert_eq!(terminal.window_title(), Some("title"));
+    assert_eq!(
+        terminal
+            .feed(b"\x1b]2;other\x1b\\\x1b[23;2t\x1b[21t\x07\x07")
+            .unwrap(),
+        b"\x1b]ltitle\x1b\\"
+    );
+    let update = terminal.take_window_updates();
+    assert_eq!(update.title.as_deref(), Some("title"));
+    assert!(update.bell);
+    let update = terminal.take_window_updates();
+    assert!(update.title.is_none());
+    assert!(!update.bell);
+}
+
+#[test]
+fn focus_and_pointer_encoding_follows_negotiated_modes() {
+    let mut terminal = Terminal::new(4, 10).unwrap();
+    assert_eq!(terminal.encode_focus(true), None);
+    assert_eq!(terminal.encode_mouse(MouseInput::Press(0), 2, 1, 0), None);
+    terminal.feed(b"\x1b[?1004;1002;1006h").unwrap();
+    assert_eq!(terminal.encode_focus(true), Some(b"\x1b[I".as_slice()));
+    assert_eq!(terminal.encode_focus(false), Some(b"\x1b[O".as_slice()));
+    assert_eq!(
+        terminal
+            .encode_mouse(MouseInput::Press(0), 2, 1, 16)
+            .unwrap(),
+        b"\x1b[<16;3;2M"
+    );
+    assert_eq!(
+        terminal.encode_mouse(MouseInput::Motion(None), 3, 1, 0),
+        None
+    );
+    assert_eq!(
+        terminal
+            .encode_mouse(MouseInput::Motion(Some(0)), 3, 1, 0)
+            .unwrap(),
+        b"\x1b[<32;4;2M"
+    );
+    assert_eq!(
+        terminal
+            .encode_mouse(MouseInput::Release(0), 3, 1, 0)
+            .unwrap(),
+        b"\x1b[<0;4;2m"
+    );
+    assert_eq!(
+        terminal.encode_mouse(MouseInput::WheelUp, 2, 1, 0).unwrap(),
+        b"\x1b[<64;3;2M"
+    );
+    assert_eq!(terminal.encode_mouse(MouseInput::Press(0), 10, 1, 0), None);
+    terminal
+        .feed(b"\x1b[?1004;1002;1006l\x1b[?1007;1049;1h")
+        .unwrap();
+    assert_eq!(terminal.encode_focus(false), None);
+    assert_eq!(
+        terminal.encode_mouse(MouseInput::WheelUp, 2, 1, 0).unwrap(),
+        b"\x1bOA"
+    );
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    assert_eq!(terminal.encode_mouse(MouseInput::WheelUp, 2, 1, 0), None);
+}
+
+#[test]
 fn row_effects_are_already_applied_exactly_once() {
     let mut t = Terminal::new(3, 12).unwrap();
     t.feed(b"abcdef\r\x1b[2C\x1b[2P").unwrap();
@@ -142,6 +262,54 @@ fn host_sequences_fragment_identically_and_unknown_modes_stay_visible() {
 }
 
 #[test]
+fn ascii_row_batches_match_scalar_prints_at_wraps_and_grapheme_boundaries() {
+    let make = || {
+        let mut terminal = Terminal::new(3, 9).unwrap();
+        terminal.enable_grapheme_clusters();
+        terminal.enable_underline_colors();
+        terminal.enable_hyperlinks(|_, target| target.starts_with("https://"));
+        terminal
+    };
+    let mut batched = make();
+    let mut scalar = make();
+    for text in [
+        "界界abcdefghi\r\n\x1b[4;58;2;1;2;3mstyled ascii1\u{fe0f}\u{20e3}\x1b[2b",
+        "\x1b]8;;https://example.com/ascii\x07ABCDE wide row\x1b]8;;\x07",
+        "\x1b[?7l\rreplace-at-the-right-margin\x1b[?7h",
+        "\x1b[1;1H\x1b[4hINSERT\x1b[4l\x1b(0jklmnopq\x1b(B",
+    ] {
+        batched.feed(text.as_bytes()).unwrap();
+        for byte in text.bytes() {
+            scalar.feed(&[byte]).unwrap();
+        }
+        let fast = batched.frame().unwrap();
+        let slow = scalar.frame().unwrap();
+        assert_eq!(fast.rows(), slow.rows());
+        assert_eq!(fast.cursor(), slow.cursor());
+        for (row, cells) in fast.rows().iter().enumerate() {
+            assert_eq!(
+                fast.underline_color_runs(row),
+                slow.underline_color_runs(row)
+            );
+            for (column, cell) in cells.cells.iter().enumerate() {
+                assert_eq!(
+                    fast.cluster_text(row, column),
+                    slow.cluster_text(row, column)
+                );
+                assert_eq!(
+                    fast.hyperlink_target(cell.hyperlink_id),
+                    slow.hyperlink_target(cell.hyperlink_id)
+                );
+            }
+        }
+        assert_eq!(
+            batched.history_page(0, 128).unwrap().text,
+            scalar.history_page(0, 128).unwrap().text
+        );
+    }
+}
+
+#[test]
 fn unsupported_diagnostics_are_bounded_and_omit_payload() {
     let mut t = Terminal::new(3, 10).unwrap();
     t.feed(b"\x1b]52;c;PRIVATE_CLIPBOARD\x07").unwrap();
@@ -199,10 +367,19 @@ fn paste_controls_markers_normalization_and_wire_bound() {
     }
     assert!(t.encode_paste(&"x".repeat(4096)).is_ok());
     assert!(t.encode_paste(&"x".repeat(4097)).is_err());
+    assert_eq!(t.encode_native_paste("first\r\nsecond").unwrap(), b"first");
+    assert!(t.encode_native_paste(&"x".repeat(4097)).is_err());
     t.feed(b"\x1b[?2004h").unwrap();
     assert_eq!(t.encode_paste("a\nb").unwrap(), b"\x1b[200~a\rb\x1b[201~");
     assert_eq!(t.encode_paste(&"x".repeat(4084)).unwrap().len(), 4096);
     assert!(t.encode_paste(&"x".repeat(4085)).is_err());
+    let maximum = "x".repeat(MAX_STREAMED_PASTE_BYTES - 12);
+    assert_eq!(
+        t.encode_native_paste(&maximum).unwrap().len(),
+        MAX_STREAMED_PASTE_BYTES
+    );
+    assert!(t.encode_native_paste(&(maximum + "x")).is_err());
+    assert!(t.encode_native_paste("paste\x1b[201~").is_err());
     t.feed(b"\x1b[?2004l").unwrap();
     assert_eq!(t.encode_paste("x").unwrap(), b"x");
     assert_eq!(t.unsupported_count(), 0);
@@ -240,6 +417,84 @@ fn vim_modify_other_keys_does_not_block_plain_escape_or_function_keys() {
     );
     t.feed(b"\x1b[>4;0m").unwrap();
     assert_eq!(t.encode_key("c", false, true, false).unwrap(), b"\x1bc");
+}
+
+#[test]
+fn native_keyboard_reports_only_disambiguation_and_keeps_ime_text_whole() {
+    let mut terminal = Terminal::new(4, 80).unwrap();
+    terminal.enable_keyboard_disambiguation();
+    assert_eq!(terminal.feed(b"\x1b[>31u\x1b[?u").unwrap(), b"\x1b[?1u");
+    assert_eq!(
+        terminal.encode_key("Enter", true, false, false).unwrap(),
+        b"\x1b[13;2u"
+    );
+    assert_eq!(
+        terminal.encode_key("Enter", false, false, false).unwrap(),
+        b"\r"
+    );
+    assert_eq!(
+        terminal.encode_key("Escape", false, false, false).unwrap(),
+        b"\x1b[27u"
+    );
+    assert_eq!(
+        terminal
+            .encode_key_with_base("!", Some('1'), true, true, false)
+            .unwrap(),
+        b"\x1b[49;4u"
+    );
+    assert_eq!(
+        terminal.encode_text("你e\u{301}").unwrap(),
+        "你e\u{301}".as_bytes()
+    );
+
+    assert_eq!(terminal.feed(b"\x1b[?1049h\x1b[?u").unwrap(), b"\x1b[?0u");
+    terminal.feed(b"\x1b[=15;2u").unwrap();
+    assert_eq!(terminal.feed(b"\x1b[?1049l\x1b[?u").unwrap(), b"\x1b[?1u");
+    assert_eq!(terminal.feed(b"\x1b[?1049h\x1b[?u").unwrap(), b"\x1b[?0u");
+    assert_eq!(
+        terminal.feed(b"\x1b[?1049l\x1b[<u\x1b[?u").unwrap(),
+        b"\x1b[?0u"
+    );
+}
+
+#[test]
+fn hard_reset_clears_both_screens_and_live_protocol_state() {
+    let mut terminal = Terminal::new(3, 20).unwrap();
+    terminal.enable_keyboard_disambiguation();
+    terminal.observe_command_blocks();
+    terminal
+        .feed(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C;id=one;command=first\x07one\r\ntwo\r\nthree\r\n\x1b]133;D;0;id=one\x07")
+        .unwrap();
+    let primary_end = terminal.history_extent().end;
+    assert_eq!(primary_end, 1);
+    assert_eq!(terminal.completed_command_blocks().unwrap().len(), 1);
+    terminal
+        .feed(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C;id=two;command=second\x07\x1b[>1u\x1b[?1049h\x1b[>1u\x1b[?25l\x1b[?2026h\x1b[31mALT")
+        .unwrap();
+    let alternate = terminal.frame().unwrap();
+    assert_eq!(alternate.stamp().screen, Screen::Alternate);
+    assert!(terminal.publication_held());
+
+    assert_eq!(
+        terminal
+            .feed(b"\x1bc\x1b[?u\x1b[6n\x1b]133;D;0;id=two\x07")
+            .unwrap(),
+        b"\x1b[?0u\x1b[1;1R"
+    );
+    let reset = terminal.frame().unwrap();
+    assert_eq!(reset.stamp().screen, Screen::Primary);
+    assert!(reset.cursor().visible && !terminal.publication_held());
+    assert!(reset.rows().iter().all(|row| row
+        .cells
+        .iter()
+        .all(|cell| *cell == crate::TerminalCell::default())));
+    assert_eq!(terminal.history_extent(), primary_end..primary_end);
+    assert_eq!(terminal.history_retained_bytes(), 0);
+    assert_eq!(terminal.completed_command_blocks().unwrap().len(), 1);
+    assert!(!terminal.command_prompt_ready());
+    assert_eq!(terminal.encode_key("i", false, false, true).unwrap(), b"\t");
+    assert_eq!(terminal.feed(b"\x1b[?1049h\x1b[?u").unwrap(), b"\x1b[?0u");
+    assert_eq!(terminal.feed(b"\x1b[>31u\x1b[?u").unwrap(), b"\x1b[?1u");
 }
 
 #[test]
@@ -355,6 +610,90 @@ fn primary_history_captures_scroll_and_snapshot_is_immutable() {
 }
 
 #[test]
+fn early_wide_wrap_keeps_copy_provenance_through_scrolling() {
+    let mut terminal = Terminal::new(3, 6).unwrap();
+    terminal.feed("abcde界Z".as_bytes()).unwrap();
+    assert_eq!(terminal.live_margin_gaps(), 1);
+    assert_eq!(terminal.frame().unwrap().rows()[0].cells[5].character, ' ');
+
+    terminal.feed(b"\r\nx\r\ny\r\n").unwrap();
+    assert_eq!(terminal.live_margin_gaps(), 0);
+    let page = terminal.history_page(0, 2).unwrap();
+    assert_eq!(page.synthetic_margin_gap(0), Some(5));
+    assert_eq!(page.text, "abcde界Z");
+
+    terminal.feed(b"\x1b[2J\x1b[H").unwrap();
+    terminal.feed("abcde 界Z".as_bytes()).unwrap();
+    assert_eq!(terminal.live_margin_gaps(), 0);
+}
+
+#[test]
+fn projected_history_keeps_clusters_styles_links_and_raw_anchors_across_widths() {
+    let mut terminal = Terminal::new(2, 6).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal.enable_underline_colors();
+    terminal.enable_hyperlinks(|_, target| target == "https://example.test/history");
+    terminal
+        .feed("\x1b]8;;https://example.test/history\x07a\x1b[4;58;2;9;8;7me\u{301}\x1b[0mcde界Z\x1b]8;;\x07\r\nnext\r\n".as_bytes())
+        .unwrap();
+    let original = terminal.history_layout().unwrap();
+    assert_eq!(original.len(), 2);
+    let wide = original.anchor_at(1).unwrap();
+    assert_eq!(wide.column, 0);
+    assert_eq!(terminal.history_page(0, 2).unwrap().text, "ae\u{301}cde界Z");
+
+    terminal.resize(2, 4).unwrap();
+    let narrow = terminal.history_layout().unwrap();
+    assert_eq!(narrow.row_at(wide), 1);
+    let page = terminal.projected_history_page(&narrow, 0, 2).unwrap();
+    assert_eq!(page.text, "ae\u{301}cde界Z");
+    assert_eq!(page.cluster_text(0, 1), Some("e\u{301}"));
+    assert_eq!(page.underline_color(0, 1), Some(Color::Rgb(9, 8, 7)));
+    let cells = &page.row(1).unwrap().cells;
+    assert!(cells[1].flags.wide());
+    assert!(cells[2].flags.wide_continuation());
+    assert_eq!(
+        page.hyperlink_target(cells[1].hyperlink_id),
+        Some("https://example.test/history")
+    );
+    assert!(terminal.projected_history_page(&original, 0, 2).is_err());
+
+    terminal.resize(2, 8).unwrap();
+    let wider = terminal.history_layout().unwrap();
+    assert_eq!(wider.len(), 1);
+    assert_eq!(wider.row_at(wide), 0);
+    let widened = terminal.projected_history_page(&wider, 0, 1).unwrap();
+    assert_eq!(widened.text, page.text);
+    assert_eq!(widened.row(0).unwrap().cells.len(), 8);
+    terminal.feed(b"\x1b[?1049h").unwrap();
+    assert!(terminal.history_layout().unwrap().is_empty());
+    assert!(terminal.projected_history_page(&wider, 0, 1).is_err());
+    assert_eq!(page.text, "ae\u{301}cde界Z");
+}
+
+#[test]
+fn exceptionally_narrow_history_projection_retains_access_to_raw_rows() {
+    let mut terminal = Terminal::new(1, 256).unwrap();
+    let mut line = "x".repeat(256);
+    line.push_str("\r\n");
+    for _ in 0..300 {
+        terminal.feed(line.as_bytes()).unwrap();
+    }
+    terminal.resize(1, 1).unwrap();
+    let history = terminal.history_layout().unwrap();
+    assert_eq!(history.len(), 300);
+    assert_eq!(history.anchor_at(299).unwrap().row, 299);
+    assert_eq!(
+        terminal
+            .projected_history_page(&history, 0, 1)
+            .unwrap()
+            .text
+            .len(),
+        256
+    );
+}
+
+#[test]
 fn alternate_and_partial_margins_never_archive_or_expose_primary_history() {
     let mut t = Terminal::new(3, 8).unwrap();
     t.feed(b"a\r\nb\r\nc\r\n").unwrap();
@@ -386,6 +725,43 @@ fn history_eviction_and_page_limits_are_bounded() {
 }
 
 #[test]
+fn history_byte_limit_charges_decorations_and_preserves_absolute_row_ids() {
+    let mut terminal = Terminal::new(1, MAX_COLS).unwrap();
+    terminal.enable_underline_colors();
+    terminal.enable_grapheme_clusters();
+    let text = "e\u{301}".repeat(MAX_COLS - 4);
+    for index in 0..MAX_HISTORY_ROWS {
+        terminal
+            .feed(format!("\x1b[4;58;2;7;8;9m{index:04}{text}\x1b[0m\r\n").as_bytes())
+            .unwrap();
+    }
+    let extent = terminal.history_extent();
+    assert_eq!(extent.end, MAX_HISTORY_ROWS as u64);
+    assert!(extent.start > 0 && extent.start < extent.end);
+    assert_eq!(
+        terminal.history_retained_bytes(),
+        terminal
+            .history
+            .iter()
+            .map(ScrollbackLine::retained_bytes)
+            .sum()
+    );
+    assert!(terminal.history_retained_bytes() <= crate::retained_history::RETAINED_HISTORY_BYTES);
+    let last = terminal.history_page(0, 1).unwrap();
+    assert_eq!(last.cluster_text(0, 4), Some("e\u{301}"));
+    assert!(last.text.starts_with("1023"));
+
+    let charged = terminal.history_retained_bytes();
+    terminal.feed(b"\x1b[?1049h\x1b[3J").unwrap();
+    assert_eq!(terminal.history_retained_bytes(), charged);
+    assert_eq!(terminal.history_extent(), extent.end..extent.end);
+    terminal.feed(b"\x1b[?1049l\x1b[3J").unwrap();
+    assert_eq!(terminal.history_retained_bytes(), 0);
+    assert_eq!(terminal.history_extent(), extent.end..extent.end);
+    assert!(last.text.starts_with("1023"));
+}
+
+#[test]
 fn history_extent_tracks_physical_rows_across_eviction_resize_and_clear() {
     let mut terminal = Terminal::new(1, 12).unwrap();
     terminal.feed(b"\x1b[31mpinned\x1b[0m\r\n").unwrap();
@@ -409,6 +785,14 @@ fn history_extent_tracks_physical_rows_across_eviction_resize_and_clear() {
     assert_eq!(terminal.history_extent(), 1..1025);
     terminal.feed(b"\x1b[3Jnext\r\n").unwrap();
     assert_eq!(terminal.history_extent(), 1025..1026);
+    terminal.set_history_row_limit(0);
+    terminal.feed(b"disabled\r\n").unwrap();
+    assert_eq!(terminal.history_extent(), 1026..1026);
+    assert_eq!(terminal.history_retained_bytes(), 0);
+    terminal.set_history_row_limit(2);
+    terminal.feed(b"a\r\nb\r\nc\r\n").unwrap();
+    assert_eq!(terminal.history_extent(), 1027..1029);
+    assert_eq!(terminal.history_page(0, 2).unwrap().text, "b\nc");
 }
 
 #[test]
@@ -613,6 +997,49 @@ fn immutable_capture_shares_idle_and_unchanged_rows() {
 }
 
 #[test]
+fn visible_hyperlink_resources_follow_cells_across_row_edits_and_screens() {
+    let mut terminal = Terminal::new(3, 20).unwrap();
+    terminal.enable_hyperlinks(|_, target| target.starts_with("https://"));
+    terminal.frame().unwrap();
+    terminal
+        .feed(b"\x1b]8;;https://example.com/one\x07A\x1b]8;;\x07\r\n\x1b]8;;https://example.com/two\x07B\x1b]8;;\x07")
+        .unwrap();
+    let initial = terminal.frame().unwrap();
+    let one = initial.rows()[0].cells[0].hyperlink_id;
+    let two = initial.rows()[1].cells[0].hyperlink_id;
+    assert_eq!(
+        initial.hyperlink_target(one),
+        Some("https://example.com/one")
+    );
+    assert_eq!(
+        initial.hyperlink_target(two),
+        Some("https://example.com/two")
+    );
+
+    terminal.feed(b"\x1b[H\x1b[2K").unwrap();
+    let erased = terminal.frame().unwrap();
+    assert_eq!(erased.hyperlink_target(one), None);
+    assert_eq!(
+        erased.hyperlink_target(two),
+        Some("https://example.com/two")
+    );
+    terminal.feed(b"\x1b[?1049h").unwrap();
+    assert_eq!(terminal.frame().unwrap().hyperlink_target(two), None);
+
+    terminal.feed(b"\x1b[?1049l\x1b[S").unwrap();
+    let scrolled = terminal.frame().unwrap();
+    assert_eq!(scrolled.rows()[0].cells[0].hyperlink_id, two);
+    assert_eq!(
+        scrolled.hyperlink_target(two),
+        Some("https://example.com/two")
+    );
+    assert_eq!(
+        initial.hyperlink_target(one),
+        Some("https://example.com/one")
+    );
+}
+
+#[test]
 fn resize_validation_and_kernel_failure_are_atomic() {
     let mut t = Terminal::new(3, 8).unwrap();
     t.feed(b"abcdefgh").unwrap();
@@ -639,6 +1066,38 @@ fn resize_validation_and_kernel_failure_are_atomic() {
     assert!(t
         .resize_with(1, 1, || panic!("overflow reached PTY"))
         .is_err());
+}
+
+#[test]
+fn native_height_shrink_retains_primary_rows_and_keeps_the_live_prompt() {
+    let mut terminal = Terminal::new(5, 12).unwrap();
+    terminal.enable_history_preserving_resize();
+    terminal.enable_underline_colors();
+    terminal.enable_grapheme_clusters();
+    terminal
+        .feed("\x1b[4;58;2;20;30;40me\u{301}\x1b[0m\r\ntwo\r\nthree\r\nfour\r\nprompt".as_bytes())
+        .unwrap();
+    terminal.resize(3, 9).unwrap();
+    assert_eq!(terminal.history_extent(), 0..2);
+    let page = terminal.history_page(0, 2).unwrap();
+    assert_eq!(page.text, "e\u{301}\ntwo");
+    assert_eq!(page.row(0).unwrap().cells.len(), 12);
+    assert_eq!(
+        page.underline_color(0, 0),
+        Some(crate::Color::Rgb(20, 30, 40))
+    );
+    let frame = terminal.frame().unwrap();
+    assert_eq!(frame.cursor().row, 2);
+    assert_eq!(frame.rows()[2].cells[0].character, 'p');
+
+    terminal.resize(5, 9).unwrap();
+    terminal.resize(3, 9).unwrap();
+    assert_eq!(terminal.history_extent(), 0..2);
+    terminal.feed(b"\x1b[?1049h\x1b[3;1HALT").unwrap();
+    terminal.resize(2, 9).unwrap();
+    assert_eq!(terminal.history_extent(), 2..2);
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    assert_eq!(terminal.history_extent(), 0..2);
 }
 
 #[test]

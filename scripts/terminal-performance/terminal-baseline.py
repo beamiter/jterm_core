@@ -20,8 +20,13 @@ WORKLOAD = (b'public-baseline 0123456789 abcdefghijklmnopqrstuvwxyz '
             b'\x1b[31mred\x1b[0m ' + '中文 é λ'.encode() + b'\r\n') * 512
 
 
+def percentile(values, fraction):
+    ordered = sorted(values)
+    return ordered[math.ceil(len(ordered) * fraction) - 1]
+
+
 def percentile95(values):
-    return sorted(values)[math.ceil(len(values) * .95) - 1]
+    return percentile(values, .95)
 
 
 def process_identity(pid):
@@ -46,6 +51,14 @@ def rss_kib(pid, identity):
     if not match:
         raise RuntimeError('host RSS unavailable; no fabricated zero')
     return int(match[1])
+
+
+def host_cpu_ticks(pid, identity):
+    stat = Path(f'/proc/{pid}/stat').read_text()
+    fields = stat[stat.rfind(')') + 2:].split()
+    if fields[19] != identity['start_ticks']:
+        raise RuntimeError('host PID was reused')
+    return int(fields[11]) + int(fields[12])  # utime and stime
 
 
 def proc_record(pid, proc=Path('/proc')):
@@ -145,10 +158,12 @@ def exchange(fd, payload, timeout):
         raise RuntimeError('extra input after DSR reply')
 
 
-def measure(fd, pid, samples, timeout, rss_scope='single-process'):
+def measure(fd, pid, samples, timeout, rss_scope='single-process', *, binary_sha256=None):
     if rss_scope not in ('single-process', 'process-tree'):
         raise ValueError('invalid RSS scope')
     identity = process_identity(pid)
+    if binary_sha256 is not None and identity['executable_sha256'] != binary_sha256:
+        raise RuntimeError('host executable does not match the expected SHA-256')
     size = os.get_terminal_size(fd)
     old = termios.tcgetattr(fd)
     blocking = os.get_blocking(fd)
@@ -159,6 +174,7 @@ def measure(fd, pid, samples, timeout, rss_scope='single-process'):
         if select.select([fd], [], [], 0)[0]:
             raise RuntimeError('pending input; rerun without typing')
         exchange(fd, WORKLOAD, timeout)  # explicit excluded warm-up
+        cpu_at_start = host_cpu_ticks(pid, identity)
         for i in range(samples):
             if os.get_terminal_size(fd) != size:
                 raise RuntimeError('terminal resized during measurement')
@@ -175,6 +191,9 @@ def measure(fd, pid, samples, timeout, rss_scope='single-process'):
                             rss_before_kib=before, rss_after_kib=after))
             if tree_before:
                 raw[-1].update(tree_before=tree_before, tree_after=tree_after)
+        cpu_delta = host_cpu_ticks(pid, identity) - cpu_at_start
+        if cpu_delta < 0:
+            raise RuntimeError('host CPU accounting moved backwards')
         if process_identity(pid) != identity:
             raise RuntimeError('host executable identity changed')
     finally:
@@ -184,7 +203,9 @@ def measure(fd, pid, samples, timeout, rss_scope='single-process'):
     return dict(host=identity, rss_scope=rss_scope, columns=size.columns, rows=size.lines,
                 workload_sha256=hashlib.sha256(WORKLOAD).hexdigest(), samples=raw,
                 barrier_p95_ms=percentile95(latencies),
+                barrier_p99_ms=percentile(latencies, .99),
                 barrier_median_ms=statistics.median(latencies),
+                host_cpu_ms=cpu_delta * 1000 / os.sysconf('SC_CLK_TCK'),
                 throughput_mib_s=sum(s['bytes'] for s in raw) / (1024**2) /
                     (sum(s['elapsed_ns'] for s in raw) / 1e9),
                 rss_sampled_max_kib=max(max(s['rss_before_kib'], s['rss_after_kib']) for s in raw))
@@ -192,8 +213,9 @@ def measure(fd, pid, samples, timeout, rss_scope='single-process'):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--host', required=True, choices=['ember', 'frost', 'forge', 'anvil'])
-    parser.add_argument('--revision', required=True)
+    parser.add_argument('--host', required=True, choices=['aether', 'ember', 'frost', 'forge', 'anvil'])
+    parser.add_argument('--revision', help='full Git commit identifying a committed build')
+    parser.add_argument('--binary-sha256', help='expected executable SHA-256, required if no revision is supplied')
     parser.add_argument('--host-pid', required=True, type=int)
     parser.add_argument('--rss-scope', choices=['single-process', 'process-tree'],
                         default='single-process')
@@ -201,8 +223,12 @@ def main():
     parser.add_argument('--samples', type=int, default=100)
     parser.add_argument('--timeout', type=float, default=10)
     args = parser.parse_args()
-    if not re.fullmatch('[0-9a-f]{40}', args.revision):
+    if args.revision is None and args.binary_sha256 is None:
+        parser.error('supply --revision or --binary-sha256')
+    if args.revision is not None and not re.fullmatch('[0-9a-f]{40}', args.revision):
         parser.error('revision must be full 40-character commit SHA')
+    if args.binary_sha256 is not None and not re.fullmatch('[0-9a-f]{64}', args.binary_sha256):
+        parser.error('binary SHA-256 must be 64 lowercase hex characters')
     if not 20 <= args.samples <= 10000 or not 0 < args.timeout <= 120:
         parser.error('samples must be 20..10000; timeout must be (0,120]')
     # Never clobber an earlier report, even on a failed attempt.
@@ -215,9 +241,12 @@ def main():
                       script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                       scope='PTY/parser DSR barrier; no pixel or keyboard latency; sampled RSS',
                       rss_scope=args.rss_scope)
+        if args.binary_sha256 is not None:
+            report['expected_executable_sha256'] = args.binary_sha256
         try:
             with open('/dev/tty', 'rb+', buffering=0) as terminal:
-                report.update(measure(terminal.fileno(), args.host_pid, args.samples, args.timeout, args.rss_scope))
+                report.update(measure(terminal.fileno(), args.host_pid, args.samples, args.timeout,
+                                      args.rss_scope, binary_sha256=args.binary_sha256))
             report['status'] = 'ok'
         except (Exception, KeyboardInterrupt) as error:
             report.update(status='failed', error=f'{type(error).__name__}: {error}')

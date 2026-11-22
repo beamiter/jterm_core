@@ -1,6 +1,16 @@
 //! Mouse reporting encoders extracted from Ember, including legacy limits.
 use crate::protocol_state::TerminalModes;
 
+/// Pointer input addressed to a terminal cell, before encoding for the PTY.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseInput {
+    Press(u8),
+    Release(u8),
+    Motion(Option<u8>),
+    WheelUp,
+    WheelDown,
+}
+
 impl TerminalModes {
     pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         // Check if any mouse reporting mode is enabled

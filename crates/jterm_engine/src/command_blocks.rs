@@ -141,6 +141,12 @@ impl CommandBlocks {
         }
     }
 
+    pub(crate) fn reset_live(&mut self) {
+        self.prompt = Prompt::None;
+        self.input_submitted = false;
+        self.active = None;
+    }
+
     /// Return true when the view consumed a lifecycle packet.
     pub(crate) fn observe(&mut self, event: &Event<'_>, alternate: bool) -> bool {
         if alternate {

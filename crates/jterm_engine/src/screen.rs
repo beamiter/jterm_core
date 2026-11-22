@@ -14,6 +14,23 @@ use crate::protocol_state::ProtocolState;
 use smallvec::SmallVec;
 use std::ops::{Range, RangeInclusive};
 
+/// Choose how many primary rows to move into history on a height reduction.
+/// Use blank space below the cursor first and keep the cursor on screen.
+pub fn rows_to_archive_on_height_shrink(
+    old_rows: usize,
+    new_rows: usize,
+    cursor_row: usize,
+    mut blank_row: impl FnMut(usize) -> bool,
+) -> usize {
+    let shrink = old_rows.saturating_sub(new_rows);
+    let blank_below = (cursor_row.saturating_add(1)..old_rows)
+        .rev()
+        .take(shrink)
+        .take_while(|&row| blank_row(row))
+        .count();
+    shrink.saturating_sub(blank_below).min(cursor_row)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Charset {
     #[default]

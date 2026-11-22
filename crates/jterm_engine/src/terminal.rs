@@ -1,29 +1,41 @@
 //! Bounded terminal owner for standalone sessions.
 
 use crate::{
+    colors::{ColorState, TerminalDefaultColors},
     command_blocks::{CommandBlock, CommandBlocks},
     frame::{underline_color_at, CellFrame, Cursor, Limits, Row, Screen, Stamp},
-    graphemes::{self, RowClusters, MAX_CLUSTER_BYTES, MAX_ROW_CLUSTER_BYTES},
+    graphemes::{self, RowClusters, MAX_CLUSTER_BYTES},
     grid::{PrintCheckpoint, WrapCheckpoint},
+    history_reflow::HistoryLayout,
     hyperlink::{resolve_resource, HyperlinkPolicy, HyperlinkResources, HyperlinkTable},
+    mouse::MouseInput,
     parser::{Event, Parser, ParserLimits, ParserProfile, StringKind},
     protocol_state::ProtocolState,
-    screen::{RegionDirection, RegionMutation, ScreenState, VerticalMotion},
-    semantics::{self, Dispatch, Effect, UnderlinePen},
+    retained_history::RetainedHistory,
+    screen::{
+        rows_to_archive_on_height_shrink, AsciiWriteStep, Charset, RegionDirection, RegionMutation,
+        ScreenState, VerticalMotion,
+    },
+    semantics::{self, Dispatch, Effect, Effects, UnderlinePen},
+    titles::TitleState,
     Color, HyperlinkId, RawRowId, ScrollbackLine, UnderlineColorRun,
 };
 use std::{
     collections::VecDeque,
     num::NonZeroU64,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 use unicode_width::UnicodeWidthChar;
+
+mod history_view;
 
 const MAX_ROWS: usize = 128;
 const MAX_COLS: usize = 256;
 /// Maximum UTF-8 bytes admitted by one encoded input operation.
 pub const MAX_INPUT_BYTES: usize = 4096;
+/// Largest native bracketed clipboard record, including both markers.
+pub const MAX_STREAMED_PASTE_BYTES: usize = u16::MAX as usize;
 /// Maximum bytes consumed or returned as replies by a single feed.
 pub const MAX_FEED_BYTES: usize = 65536;
 fn dimensions(rows: usize, cols: usize) -> Result<(), String> {
@@ -34,8 +46,15 @@ fn dimensions(rows: usize, cols: usize) -> Result<(), String> {
     }
 }
 
+fn initial_protocol() -> ProtocolState {
+    let mut protocol = ProtocolState::default();
+    protocol.modes_mut().insert(7);
+    protocol.modes_mut().insert(25);
+    protocol
+}
+
 const MAX_HISTORY_ROWS: usize = 1024;
-const MAX_COPY_BYTES: usize = MAX_ROWS * (MAX_COLS * 4 + MAX_ROW_CLUSTER_BYTES + 1);
+const MAX_COPY_BYTES: usize = MAX_ROWS * (MAX_COLS * MAX_CLUSTER_BYTES + 1);
 const MAX_HYPERLINK_URL_BYTES: usize = 1024 * 1024;
 /// Owned immutable primary-history snapshot. Coordinates address original
 /// physical columns, not UTF-8 byte indices. It remains valid after live output.
@@ -60,6 +79,11 @@ impl HistoryPage {
     /// between rows retained before and after a resize.
     pub fn row(&self, index: usize) -> Option<&Row> {
         self.rows.get(index).map(|row| &row.row)
+    }
+
+    /// Physical column skipped when extracting a logical line from this row.
+    pub fn synthetic_margin_gap(&self, index: usize) -> Option<usize> {
+        self.rows.get(index)?.synthetic_gap
     }
 
     /// Resolve a validated target referenced by this immutable history page.
@@ -150,18 +174,114 @@ pub struct Terminal {
     underline_pen: Option<UnderlinePen>,
     hyperlinks: Option<(HyperlinkPolicy, HyperlinkTable)>,
     graphemes: Option<GraphemeInput>,
+    window: Option<WindowState>,
+    colors: Option<Arc<ColorState>>,
+    color_revision: u64,
     revision: u64,
     layout: u64,
     unsupported: u64,
     unsupported_events: Vec<String>,
     negative_query_replies: u64,
-    history: VecDeque<ScrollbackLine>,
+    history: RetainedHistory<ScrollbackLine>,
+    history_row_limit: usize,
     history_end: u64,
+    retained_layout: Mutex<Weak<HistoryLayout>>,
+    preserve_primary_on_resize: bool,
     command_blocks: Option<CommandBlocks>,
     sync_started: Option<Instant>,
     capture_sync_end: bool,
     completed_sync_frame: Option<CellFrame>,
-    last_frame: Mutex<Option<CellFrame>>,
+    last_frame: Mutex<FrameCache>,
+}
+
+#[derive(Default)]
+struct FrameCache {
+    frame: Option<CellFrame>,
+    row_links: Vec<Vec<HyperlinkId>>,
+}
+
+fn visible_hyperlinks(
+    table: &HyperlinkTable,
+    row_links: &mut Vec<Vec<HyperlinkId>>,
+    previous: Option<&CellFrame>,
+    rows: &[Row],
+) -> Option<HyperlinkResources> {
+    let reuse = !row_links.is_empty();
+    if let Some(frame) = previous.filter(|frame| reuse && std::ptr::eq(frame.rows(), rows)) {
+        return frame.shared_hyperlinks();
+    }
+    row_links.resize_with(rows.len(), Vec::new);
+    for (index, (row, ids)) in rows.iter().zip(row_links.iter_mut()).enumerate() {
+        if reuse
+            && previous.is_some_and(|frame| Arc::ptr_eq(&frame.rows()[index].cells, &row.cells))
+        {
+            continue;
+        }
+        ids.clear();
+        for cell in row.cells.iter() {
+            let id = cell.hyperlink_id;
+            if !id.is_none() && ids.last() != Some(&id) {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    table.snapshot(row_links.iter().flatten().copied())
+}
+
+#[derive(Default)]
+pub struct WindowUpdates {
+    pub title: Option<String>,
+    pub bell: bool,
+}
+
+#[derive(Default)]
+struct WindowState {
+    titles: TitleState,
+    title_changed: bool,
+    bell: bool,
+}
+
+impl WindowState {
+    fn handle(&mut self, event: &Event<'_>) -> Option<Effects> {
+        match event {
+            Event::String {
+                kind: StringKind::Osc,
+                payload,
+                ..
+            } => {
+                let (command, title) = std::str::from_utf8(payload).ok()?.split_once(';')?;
+                if !matches!(command, "0" | "1" | "2") {
+                    return None;
+                }
+                let title = TitleState::reportable_title(title);
+                self.title_changed |= command != "1" && title != self.titles.window_title;
+                self.titles.set_osc(command, &title);
+                Some(Effects::new())
+            }
+            Event::Csi {
+                params,
+                private_prefix: None,
+                intermediates,
+                final_byte: b't',
+                ..
+            } if intermediates.is_empty() && matches!(params.first(), Some(20..=23)) => {
+                let previous = self.titles.window_title.clone();
+                let effects = self.titles.apply_window_op(params);
+                self.title_changed |= previous != self.titles.window_title;
+                Some(effects)
+            }
+            _ => None,
+        }
+    }
+
+    fn take_updates(&mut self) -> WindowUpdates {
+        let title =
+            std::mem::take(&mut self.title_changed).then(|| self.titles.window_title.clone());
+        let bell = std::mem::take(&mut self.bell);
+        WindowUpdates { title, bell }
+    }
 }
 
 #[derive(Default)]
@@ -199,9 +319,6 @@ impl Terminal {
 
     pub fn with_epoch(rows: usize, cols: usize, epoch: NonZeroU64) -> Result<Self, String> {
         dimensions(rows, cols)?;
-        let mut protocol = ProtocolState::default();
-        protocol.modes_mut().insert(7);
-        protocol.modes_mut().insert(25);
         Ok(Self {
             epoch,
             parser: Parser::with_bounded_profile(
@@ -212,22 +329,28 @@ impl Terminal {
                 ParserProfile::EmberV1,
             )?,
             screen: ScreenState::new(rows, cols),
-            protocol,
+            protocol: initial_protocol(),
             underline_pen: None,
             hyperlinks: None,
             graphemes: None,
+            window: None,
+            colors: None,
+            color_revision: 0,
             revision: 1,
             layout: 1,
             unsupported: 0,
             unsupported_events: Vec::new(),
             negative_query_replies: 0,
-            history: VecDeque::new(),
+            history: RetainedHistory::default(),
+            history_row_limit: MAX_HISTORY_ROWS,
             history_end: 0,
+            retained_layout: Mutex::new(Weak::new()),
+            preserve_primary_on_resize: false,
             command_blocks: None,
             sync_started: None,
             capture_sync_end: false,
             completed_sync_frame: None,
-            last_frame: Mutex::new(None),
+            last_frame: Mutex::new(FrameCache::default()),
         })
     }
 
@@ -253,6 +376,82 @@ impl Terminal {
     /// provisional glyph while keeping committed scrolling effects.
     pub fn enable_grapheme_clusters(&mut self) {
         self.graphemes.get_or_insert_with(GraphemeInput::default);
+    }
+
+    /// Opt in to bounded Bell and OSC title notifications for the owning view.
+    pub fn enable_window_updates(&mut self) {
+        self.window.get_or_insert_with(WindowState::default);
+    }
+
+    /// Native key controllers supply the base key in the active layout and
+    /// deliver committed IME text separately from physical key presses.
+    pub fn enable_keyboard_disambiguation(&mut self) {
+        self.protocol
+            .limit_keyboard_enhancements(u16::from(crate::input::KITTY_DISAMBIGUATE));
+    }
+
+    pub fn take_window_updates(&mut self) -> WindowUpdates {
+        self.window
+            .as_mut()
+            .map_or_else(WindowUpdates::default, WindowState::take_updates)
+    }
+
+    /// Supply the native theme and admit OSC palette and default-color operations.
+    pub fn set_color_defaults(&mut self, defaults: TerminalDefaultColors) {
+        let mut next = self
+            .colors
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| ColorState::new(defaults));
+        next.default_colors = defaults;
+        self.publish_colors(next);
+    }
+
+    pub fn paint_colors(&self) -> Option<(u64, Arc<ColorState>)> {
+        self.colors
+            .as_ref()
+            .map(|colors| (self.color_revision, Arc::clone(colors)))
+    }
+
+    fn publish_colors(&mut self, state: ColorState) {
+        if self.colors.as_deref() != Some(&state) {
+            self.colors = Some(Arc::new(state));
+            self.color_revision = self.color_revision.wrapping_add(1);
+        }
+    }
+
+    fn color_event(&mut self, event: &Event<'_>) -> Option<Effects> {
+        let Event::String {
+            kind: StringKind::Osc,
+            payload,
+            bel_terminated,
+        } = event
+        else {
+            return None;
+        };
+        let colors = self.colors.as_deref()?;
+        let text = std::str::from_utf8(payload).ok()?;
+        let (command, value) = text.split_once(';').unwrap_or((text, ""));
+        if !matches!(
+            command,
+            "4" | "10" | "11" | "12" | "104" | "110" | "111" | "112"
+        ) {
+            return None;
+        }
+        if payload.len() > 4096 {
+            return Some(Effects::new());
+        }
+        let mut next = colors.clone();
+        let end: &[u8] = if *bel_terminated { b"\x07" } else { b"\x1b\\" };
+        let effects = next.apply_ember_osc(command, value, end);
+        self.publish_colors(next);
+        Some(effects)
+    }
+
+    pub fn window_title(&self) -> Option<&str> {
+        self.window
+            .as_ref()
+            .map(|window| window.titles.window_title.as_str())
     }
 
     fn finish_grapheme(&mut self) {
@@ -292,8 +491,7 @@ impl Terminal {
     pub fn take_completed_sync_frame(&mut self) -> Option<CellFrame> {
         self.completed_sync_frame.take()
     }
-    /// Legacy and xterm modifyOtherKeys encoding; Kitty remains unsupported. `name` is a logical browser key or exactly
-    /// one already layout-resolved printable Unicode scalar (not a physical key).
+    /// Encode a logical key or one layout-resolved printable Unicode scalar.
     pub fn encode_key(
         &self,
         name: &str,
@@ -301,10 +499,24 @@ impl Terminal {
         alt: bool,
         ctrl: bool,
     ) -> Result<Vec<u8>, String> {
+        self.encode_key_with_base(name, None, shift, alt, ctrl)
+    }
+
+    /// Encode the pressed key and its unshifted value in the same layout.
+    pub fn encode_key_with_base(
+        &self,
+        name: &str,
+        base: Option<char>,
+        shift: bool,
+        alt: bool,
+        ctrl: bool,
+    ) -> Result<Vec<u8>, String> {
         use crate::input::{
-            legacy_function_key_sequence, xterm_encode_modify_other_keys, Key, Modifiers,
+            encode_kitty_disambiguated_key, legacy_function_key_sequence,
+            xterm_encode_modify_other_keys, Key, KittyKey, Modifiers,
         };
-        if self.protocol.keyboard_enhancement_flags() != 0 {
+        let flags = self.protocol.keyboard_enhancement_flags();
+        if flags != 0 && self.protocol.keyboard_enhancement_limit().is_none() {
             return Err("Kitty keyboard flags are unsupported".into());
         }
         let key = match name {
@@ -349,6 +561,23 @@ impl Terminal {
             ctrl,
             super_key: false,
         };
+        if flags != 0 {
+            let kitty_key = match key {
+                Key::Enter => KittyKey::Enter,
+                Key::Escape => KittyKey::Escape,
+                Key::Backspace => KittyKey::Backspace,
+                Key::Tab => KittyKey::Tab,
+                Key::Character(' ') => KittyKey::Space,
+                Key::Character(ch) => KittyKey::Unicode(
+                    base.filter(|ch| !ch.is_control())
+                        .unwrap_or_else(|| ch.to_lowercase().next().unwrap_or(ch)),
+                ),
+                _ => KittyKey::Functional,
+            };
+            if let Some(bytes) = encode_kitty_disambiguated_key(kitty_key, modifiers, flags as u8) {
+                return Ok(bytes);
+            }
+        }
         if let Some(sequence) =
             legacy_function_key_sequence(key, modifiers, self.protocol.modes().contains(&1))
         {
@@ -412,13 +641,58 @@ impl Terminal {
         }
         Ok(bytes)
     }
-    /// Already-committed IME/text input, not a key event or paste. Frost's
-    /// Message::Ime / Ime::Commit path writes committed UTF-8 bytes directly;
-    /// xterm modifyOtherKeys only applies to modified key events. Preserve the
-    /// complete commit, with no scalar splitting, normalization, modifiers or
-    /// bracket markers. The host must suppress duplicate key/input events.
-    /// Kitty flags remain unsupported by this spike, including report-all;
-    /// do not silently emit a legacy text fallback after that negotiation.
+    /// Encode the focus notification requested by DECSET 1004.
+    pub fn encode_focus(&self, focused: bool) -> Option<&'static [u8]> {
+        self.protocol
+            .modes()
+            .contains(&1004)
+            .then_some(if focused { b"\x1b[I" } else { b"\x1b[O" })
+    }
+
+    pub fn encode_mouse(
+        &self,
+        input: MouseInput,
+        column: usize,
+        row: usize,
+        modifiers: u8,
+    ) -> Option<Vec<u8>> {
+        if column >= self.screen.grid.cols() || row >= self.screen.grid.rows() {
+            return None;
+        }
+        let modes = self.protocol.modes();
+        let modifiers = modifiers & 0x1c;
+        match input {
+            MouseInput::Press(button) => modes.get_mouse_report(button | modifiers, column, row),
+            MouseInput::Release(button) => {
+                modes.get_mouse_release_report(button | modifiers, column, row)
+            }
+            MouseInput::Motion(button) => {
+                let code = button.unwrap_or(3) | modifiers | 32;
+                modes
+                    .should_report_mouse_motion(button.is_some())
+                    .then(|| modes.get_mouse_report(code, column, row))
+                    .flatten()
+            }
+            MouseInput::WheelUp | MouseInput::WheelDown => {
+                let up = input == MouseInput::WheelUp;
+                if !modes.is_mouse_enabled() && self.screen.use_alt_buffer && modes.contains(&1007)
+                {
+                    return self
+                        .encode_key(
+                            if up { "ArrowUp" } else { "ArrowDown" },
+                            false,
+                            false,
+                            false,
+                        )
+                        .ok();
+                }
+                modes.get_mouse_report((if up { 64 } else { 65 }) | modifiers, column, row)
+            }
+        }
+    }
+
+    /// Preserve a complete IME commit as UTF-8. The host pairs key and IME
+    /// delivery so each committed string reaches the PTY exactly once.
     pub fn encode_text(&self, text: &str) -> Result<Vec<u8>, String> {
         if text.len() > MAX_INPUT_BYTES {
             return Err("committed text byte limit".into());
@@ -429,7 +703,9 @@ impl Terminal {
         if text.is_empty() {
             return Ok(Vec::new());
         }
-        if self.protocol.keyboard_enhancement_flags() != 0 {
+        if self.protocol.keyboard_enhancement_flags() != 0
+            && self.protocol.keyboard_enhancement_limit().is_none()
+        {
             return Err("IME committed text with Kitty keyboard flags is unsupported".into());
         }
         Ok(text.as_bytes().to_vec())
@@ -438,7 +714,30 @@ impl Terminal {
     /// other controls except TAB are rejected, including ESC and C1 controls.
     /// In unbracketed mode CR may execute shell lines: host must obtain paste intent.
     pub fn encode_paste(&self, text: &str) -> Result<Vec<u8>, String> {
-        if text.len() > MAX_INPUT_BYTES {
+        self.encode_paste_bounded(text, self.protocol.modes().contains(&2004), MAX_INPUT_BYTES)
+    }
+
+    /// The native clipboard shortcut preserves an explicit Enter in a shell
+    /// that does not request bracketed paste.
+    pub fn encode_native_paste(&self, text: &str) -> Result<Vec<u8>, String> {
+        if self.protocol.modes().contains(&2004) {
+            self.encode_paste_bounded(text, true, MAX_STREAMED_PASTE_BYTES)
+        } else {
+            let mut bytes = self.encode_paste_bounded(text, false, MAX_INPUT_BYTES)?;
+            if let Some(first_line_end) = bytes.iter().position(|byte| *byte == b'\r') {
+                bytes.truncate(first_line_end);
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn encode_paste_bounded(
+        &self,
+        text: &str,
+        bracketed: bool,
+        byte_limit: usize,
+    ) -> Result<Vec<u8>, String> {
+        if text.len() > byte_limit {
             return Err("paste byte limit".into());
         }
         if text
@@ -451,12 +750,12 @@ impl Terminal {
             .replace("\r\n", "\n")
             .replace('\r', "\n")
             .replace('\n', "\r");
-        let bytes = if self.protocol.modes().contains(&2004) {
+        let bytes = if bracketed {
             format!("\x1b[200~{normalized}\x1b[201~").into_bytes()
         } else {
             normalized.into_bytes()
         };
-        if bytes.len() > MAX_INPUT_BYTES {
+        if bytes.len() > byte_limit {
             return Err("encoded paste byte limit".into());
         }
         Ok(bytes)
@@ -535,21 +834,27 @@ impl Terminal {
             {
                 for removed in effect.removed {
                     if let Some(line) = removed.captured {
-                        if self.history.len() == MAX_HISTORY_ROWS {
-                            self.history.pop_front();
-                        }
-                        self.history.push_back(line);
-                        self.history_end = self
-                            .history_end
-                            .checked_add(1)
-                            .expect("terminal history row identity exhausted");
+                        self.append_history(line);
                     }
                 }
             }
         }
     }
+
+    fn append_history(&mut self, line: ScrollbackLine) {
+        if self.history_row_limit == 0 {
+            return;
+        }
+        self.history.push_back(line);
+        self.history_end = self
+            .history_end
+            .checked_add(1)
+            .expect("terminal history row identity exhausted");
+        self.trim_history();
+    }
     fn history_admitted(&self) -> bool {
-        !self.screen.use_alt_buffer
+        self.history_row_limit != 0
+            && !self.screen.use_alt_buffer
             && self.screen.scroll_region_top == 0
             && self.screen.scroll_region_bottom + 1 == self.screen.grid.rows()
     }
@@ -567,6 +872,29 @@ impl Terminal {
             self.history.len()
         }
     }
+
+    /// Apply the frontend's existing scrollback preference. Physical history
+    /// remains constrained by the shared byte budget.
+    pub fn set_history_row_limit(&mut self, rows: usize) {
+        if self.history_row_limit == rows {
+            return;
+        }
+        self.history_row_limit = rows;
+        self.trim_history();
+        if self.history.capacity() > rows {
+            self.history.shrink_to_fit();
+        }
+    }
+
+    fn trim_history(&mut self) {
+        self.history.trim_oldest(self.history_row_limit);
+    }
+
+    /// Approximate bytes charged by retained primary history, including when
+    /// the alternate screen is active. Immutable pages have their own bounds.
+    pub fn history_retained_bytes(&self) -> usize {
+        self.history.retained_bytes()
+    }
     /// Absolute coordinates of retained physical history rows, oldest first.
     /// Appending advances the exclusive end. Eviction and explicit history
     /// erasure advance the start, so a saved primary-row anchor cannot name
@@ -575,12 +903,22 @@ impl Terminal {
         self.history_end - self.history_rows() as u64..self.history_end
     }
 
+    /// Bits identify live rows whose final physical cell was skipped when a
+    /// wide glyph wrapped early. Read alongside the matching paint frame.
+    pub fn live_margin_gaps(&self) -> u128 {
+        let grid = &self.screen.grid;
+        (0..grid.rows())
+            .filter(|&row| grid.synthetic_margin_gap(row).is_some())
+            .fold(0, |gaps, row| gaps | (1 << row))
+    }
+
     /// Newest-relative history pagination, oldest-to-newest within each page.
     /// Historical widths are retained across resize; there is no history reflow.
-    /// Resize truncations are not archived. Alternate screen cannot read history.
+    /// Transferred primary rows retain their original width. The alternate
+    /// screen exposes no history.
     pub fn history_page(&self, offset: usize, limit: usize) -> Result<HistoryPage, String> {
         let total_rows = self.history_rows();
-        if limit == 0 || limit > MAX_ROWS || offset > MAX_HISTORY_ROWS {
+        if limit == 0 || limit > MAX_ROWS || offset > self.history_row_limit {
             return Err("history page out of bounds".into());
         }
         let offset = offset.min(total_rows);
@@ -602,6 +940,15 @@ impl Terminal {
                 synthetic_gap: line.synthetic_margin_gap(),
             })
             .collect();
+        self.make_history_page(offset, total_rows, rows)
+    }
+
+    fn make_history_page(
+        &self,
+        offset: usize,
+        total_rows: usize,
+        rows: Vec<HistoryCopyRow>,
+    ) -> Result<HistoryPage, String> {
         let mut page = HistoryPage {
             revision: self.revision,
             offset,
@@ -771,6 +1118,55 @@ impl Terminal {
         }
     }
 
+    fn print_ascii(&mut self, bytes: &[u8]) {
+        if bytes.len() < 4
+            || self.screen.insert_mode
+            || self.screen.active_charset != Charset::Ascii
+        {
+            for &byte in bytes {
+                self.print(char::from(byte));
+            }
+            return;
+        }
+
+        let (&first, tail) = bytes.split_first().expect("nonempty ASCII run");
+        self.print(char::from(first));
+        if !self
+            .screen
+            .last_printed_char
+            .is_some_and(|ch| ch.is_ascii())
+        {
+            for &byte in tail {
+                self.print(char::from(byte));
+            }
+            return;
+        }
+
+        // Keep both boundaries in the scalar path. The leading byte can join
+        // a previous grapheme and the trailing byte owns any later extension.
+        let (&last, mut middle) = tail.split_last().expect("ASCII run has a tail");
+        let autowrap = self.protocol.modes().contains(&7);
+        while !middle.is_empty() {
+            match self.screen.step_ascii_write(middle, autowrap) {
+                AsciiWriteStep::NeedsWrap => self.motion(VerticalMotion::Wrap),
+                AsciiWriteStep::Written { consumed, mutation } => {
+                    if let (Some(pen), Some(columns)) = (&self.underline_pen, mutation.printed) {
+                        self.screen
+                            .grid
+                            .set_underline_color(mutation.row, columns, pen.current);
+                    }
+                    middle = &middle[consumed..];
+                }
+                AsciiWriteStep::Stopped => break,
+            }
+        }
+        self.finish_grapheme();
+        for &byte in middle {
+            self.print(char::from(byte));
+        }
+        self.print(char::from(last));
+    }
+
     fn print_cell(&mut self, ch: char, translated: char) {
         let width = ch.width().unwrap_or(0);
         if width == 0 || width > 2 {
@@ -877,6 +1273,30 @@ impl Terminal {
     }
 
     // Apply profile-specific screen operations after shared local dispatch.
+    fn reset_terminal(&mut self) {
+        self.screen = ScreenState::new(self.screen.grid.rows(), self.screen.grid.cols());
+        self.begin_revision(self.revision);
+        let keyboard_limit = self.protocol.keyboard_enhancement_limit();
+        self.protocol = initial_protocol();
+        if let Some(limit) = keyboard_limit {
+            self.protocol.limit_keyboard_enhancements(limit);
+        }
+        if let Some(pen) = &mut self.underline_pen {
+            *pen = UnderlinePen::default();
+        }
+        if let Some(graphemes) = &mut self.graphemes {
+            *graphemes = GraphemeInput::default();
+        }
+        if let Some(colors) = &self.colors {
+            self.publish_colors(ColorState::new(colors.defaults()));
+        }
+        self.history.clear();
+        self.sync_started = None;
+        if let Some(blocks) = &mut self.command_blocks {
+            blocks.reset_live();
+        }
+    }
+
     fn apply_profile_event(&mut self, event: &Event<'_>, now: Instant) -> bool {
         match event {
             Event::Escape {
@@ -889,6 +1309,7 @@ impl Terminal {
                     self.motion(VerticalMotion::LineFeed);
                 }
                 b'M' => self.motion(VerticalMotion::ReverseIndex),
+                b'c' => self.reset_terminal(),
                 _ => return false,
             },
             Event::Escape {
@@ -931,6 +1352,9 @@ impl Terminal {
                                     } else if let Some(effect) =
                                         self.screen.leave_alternate_screen(mode == 1049)
                                     {
+                                        if self.protocol.keyboard_enhancement_limit().is_some() {
+                                            self.protocol.reset_keyboard_enhancement();
+                                        }
                                         self.protocol.switch_screen();
                                         if let Some(underline) = &mut self.underline_pen {
                                             underline.current =
@@ -977,7 +1401,7 @@ impl Terminal {
                                     }
                                     continue;
                                 }
-                                1 | 25 | 2004 => (),
+                                1 | 25 | 1000 | 1002..=1007 | 1015 | 2004 => (),
                                 _ => {
                                     self.unsupported();
                                     continue;
@@ -1092,12 +1516,18 @@ impl Terminal {
         self.feed_at(input, Instant::now())
     }
 
+    fn begin_revision(&mut self, revision: u64) {
+        self.revision = revision;
+        self.screen.grid.begin_capture_revision(revision);
+        self.screen.alt_grid.begin_capture_revision(revision);
+    }
+
     /// Apply bytes sampled at a monotonic instant supplied by the session.
     pub fn feed_at(&mut self, input: &[u8], now: Instant) -> Result<Vec<u8>, String> {
         if input.len() > MAX_FEED_BYTES {
             return Err("feed byte limit".into());
         }
-        self.revision = self.revision.checked_add(1).ok_or("revision exhausted")?;
+        self.begin_revision(self.revision.checked_add(1).ok_or("revision exhausted")?);
         self.parser.begin_feed();
         let mut at = 0;
         let mut replies = Vec::new();
@@ -1189,12 +1619,22 @@ impl Terminal {
                 && self.sync_started.is_some()
                 && matches!(&event, Event::Csi { private_prefix: Some(b'?'), intermediates, final_byte: b'l', params, .. }
                     if intermediates.is_empty() && params.contains(&2026));
-            let dispatch = semantics::dispatch_local_with_underline(
-                &mut self.screen,
-                &mut self.protocol,
-                &event,
-                self.underline_pen.as_mut(),
-            );
+            let dispatch = self
+                .window
+                .as_mut()
+                .and_then(|window| window.handle(&event))
+                .or_else(|| self.color_event(&event))
+                .map_or_else(
+                    || {
+                        semantics::dispatch_local_with_underline(
+                            &mut self.screen,
+                            &mut self.protocol,
+                            &event,
+                            self.underline_pen.as_mut(),
+                        )
+                    },
+                    Dispatch::Handled,
+                );
             if sync_query {
                 self.protocol.modes_mut().remove(&2026);
             }
@@ -1203,21 +1643,25 @@ impl Terminal {
                     for effect in effects {
                         // ScreenState has already applied row edits. Aether
                         // captures paint rows from the resulting grid.
-                        if let Effect::Reply(bytes) = effect {
-                            if replies.len() + bytes.len() > MAX_FEED_BYTES {
-                                return Err("reply limit".into());
+                        match effect {
+                            Effect::Reply(bytes) => {
+                                if replies.len() + bytes.len() > MAX_FEED_BYTES {
+                                    return Err("reply limit".into());
+                                }
+                                replies.extend(bytes);
                             }
-                            replies.extend(bytes);
+                            Effect::Bell => {
+                                if let Some(window) = &mut self.window {
+                                    window.bell = true;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
                 Dispatch::Unhandled => match event {
                     Event::Print(ch) => self.print(ch),
-                    Event::Ascii(bytes) => {
-                        for &byte in bytes {
-                            self.print(byte as char);
-                        }
-                    }
+                    Event::Ascii(bytes) => self.print_ascii(bytes),
                     Event::Control(10..=12) => self.motion(VerticalMotion::LineFeed),
                     Event::Control(0) | Event::Boundary => (),
                     _ => {
@@ -1249,7 +1693,7 @@ impl Terminal {
                 // Reserve a distinct live revision even when no more bytes arrive.
                 let next = self.revision.checked_add(1).ok_or("revision exhausted")?;
                 self.completed_sync_frame = Some(self.frame()?);
-                self.revision = next;
+                self.begin_revision(next);
                 self.capture_sync_end = false;
             }
         }
@@ -1257,6 +1701,11 @@ impl Terminal {
     }
     pub fn resize(&mut self, rows: usize, cols: usize) -> Result<(), String> {
         self.resize_with(rows, cols, || Ok(()))
+    }
+
+    /// Retain primary rows moved above the viewport by a height reduction.
+    pub fn enable_history_preserving_resize(&mut self) {
+        self.preserve_primary_on_resize = true;
     }
     /// Validate geometry and frame counters before invoking the session's resize.
     /// Commit screen geometry only after that operation succeeds.
@@ -1274,14 +1723,36 @@ impl Terminal {
         if let Some(blocks) = &mut self.command_blocks {
             blocks.screen_changed();
         }
-        self.screen
-            .resize_geometry(rows, cols, 0, || RawRowId::UNTRACKED);
+        let transferred = if self.preserve_primary_on_resize && !self.screen.use_alt_buffer {
+            let grid = &self.screen.grid;
+            rows_to_archive_on_height_shrink(grid.rows(), rows, self.screen.cursor_row, |row| {
+                grid[row]
+                    .iter()
+                    .all(crate::TerminalCell::is_reflow_trimmable_blank)
+                    && grid.cluster_row(row).is_none()
+                    && grid.underline_color_runs(row).next().is_none()
+            })
+        } else {
+            0
+        };
+        self.begin_revision(revision);
+        if let Some(change) = self
+            .screen
+            .resize_geometry(rows, cols, transferred, || RawRowId::UNTRACKED)
+        {
+            for line in change.transferred {
+                self.append_history(line);
+            }
+        }
         self.layout = layout;
-        self.revision = revision;
         Ok(())
     }
     pub fn frame(&self) -> Result<CellFrame, String> {
-        let mut last = self.last_frame.lock().map_err(|_| "frame cache poisoned")?;
+        let mut cache = self.last_frame.lock().map_err(|_| "frame cache poisoned")?;
+        let FrameCache {
+            frame: last,
+            row_links,
+        } = &mut *cache;
         if let Some(frame) = last
             .as_ref()
             .filter(|frame| frame.stamp().revision == self.revision)
@@ -1298,19 +1769,33 @@ impl Terminal {
             cells: Arc::from(&grid[index][..]),
             wrapped: grid.row_wrapped[index],
         };
-        // Aether's current grid has no universal dirty-row signal. Compare
-        // contents against the last capture and allocate only changed rows.
+        // Raw cells and decorations carry the last mutation revision. Wrap
+        // bits may be edited by legacy callers, so compare those independently.
         let previous = last.as_ref().filter(|frame| {
             let stamp = frame.stamp();
             stamp.layout == self.layout && stamp.screen == screen
         });
+        let may_have_changed =
+            |row| previous.is_none_or(|frame| grid.row_changed_after(row, frame.stamp().revision));
         let rows = if let Some(previous) = previous {
             let mut changed = None;
             for (index, row) in previous.rows().iter().enumerate() {
-                if row.wrapped != grid.row_wrapped[index] || row.cells.as_ref() != &grid[index][..]
-                {
-                    changed.get_or_insert_with(|| previous.rows().to_vec())[index] =
-                        capture_row(index);
+                let cells_changed = if may_have_changed(index) {
+                    row.cells.as_ref() != &grid[index][..]
+                } else {
+                    debug_assert_eq!(row.cells.as_ref(), &grid[index][..]);
+                    false
+                };
+                let wrapped = grid.row_wrapped[index];
+                if row.wrapped != wrapped || cells_changed {
+                    changed.get_or_insert_with(|| previous.rows().to_vec())[index] = Row {
+                        cells: if cells_changed {
+                            Arc::from(&grid[index][..])
+                        } else {
+                            row.cells.clone()
+                        },
+                        wrapped,
+                    };
                 }
             }
             changed.map_or_else(|| previous.shared_rows(), Arc::from)
@@ -1321,6 +1806,10 @@ impl Terminal {
             let mut changed = None;
             for row in 0..grid.rows() {
                 let before = previous.map_or(&[][..], |frame| frame.underline_color_runs(row));
+                if !may_have_changed(row) {
+                    debug_assert!(grid.underline_color_runs(row).eq(before.iter().copied()));
+                    continue;
+                }
                 if grid.underline_color_runs(row).eq(before.iter().copied()) {
                     continue;
                 }
@@ -1339,15 +1828,16 @@ impl Terminal {
         } else {
             None
         };
-        let hyperlinks = match previous {
-            Some(frame) if std::ptr::eq(frame.rows(), rows.as_ref()) => frame.shared_hyperlinks(),
-            _ => self.hyperlink_snapshot(rows.iter()),
-        };
         let clusters = if self.graphemes.is_some() {
             let mut changed = None;
             for row in 0..grid.rows() {
                 let current = grid.cluster_row(row);
-                if current != previous.and_then(|frame| frame.cluster_row(row)) {
+                let before = previous.and_then(|frame| frame.cluster_row(row));
+                if !may_have_changed(row) {
+                    debug_assert_eq!(current, before);
+                    continue;
+                }
+                if current != before {
                     let rows = changed.get_or_insert_with(|| {
                         previous
                             .and_then(CellFrame::shared_clusters)
@@ -1387,8 +1877,13 @@ impl Terminal {
             underline_colors,
         )
         .map_err(|e| format!("{e:?}"))?
-        .with_hyperlinks(hyperlinks)
         .with_clusters(clusters);
+        let hyperlinks = self
+            .hyperlinks
+            .as_ref()
+            .filter(|(_, table)| !table.is_empty())
+            .and_then(|(_, table)| visible_hyperlinks(table, row_links, previous, frame.rows()));
+        let frame = frame.with_hyperlinks(hyperlinks);
         *last = Some(frame.clone());
         Ok(frame)
     }

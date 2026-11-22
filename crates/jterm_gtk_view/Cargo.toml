@@ -12,6 +12,8 @@ gtk4 = { version = "0.11.4", features = ["v4_12"] }
 jterm_engine = { version = "0.1.0", path = "../jterm_engine" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false }
 jterm_runtime = { version = "0.1.0", path = "../jterm_runtime", features = ["linux-pty"] }
 
 [workspace]

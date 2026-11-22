@@ -30,7 +30,16 @@ impl InputQueue {
     }
 
     pub(super) fn enqueue(&mut self, bytes: Vec<u8>) -> Result<(), String> {
-        if bytes.len() > INPUT_LIMIT - self.len() {
+        self.enqueue_with_limit(bytes, INPUT_LIMIT)
+    }
+
+    pub(super) fn enqueue_with_limit(
+        &mut self,
+        bytes: Vec<u8>,
+        limit: usize,
+    ) -> Result<(), String> {
+        let limit = limit.min(u16::MAX as usize);
+        if bytes.len() > limit.saturating_sub(self.len()) {
             return Err("input queue full; event not accepted".into());
         }
         if let Some(length) = NonZeroU16::new(bytes.len() as u16) {

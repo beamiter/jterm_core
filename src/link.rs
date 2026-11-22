@@ -8,6 +8,8 @@
 //! never typed. Whitespace, controls, backslashes, and visually ambiguous
 //! characters are refused so the target reads as the origin it resolves to.
 
+use std::ops::Range;
+
 /// Clickable-target text is terminal-controlled data, not a bulk payload;
 /// this ceiling also bounds the allocation a frontend makes per candidate.
 pub const MAX_OPENABLE_URL_BYTES: usize = 2 * 1024;
@@ -48,6 +50,68 @@ pub fn is_openable_url(url: &str) -> bool {
         return false;
     }
     authority_host(authority).is_some_and(is_valid_url_host)
+}
+
+/// Identify the clickable part of a token while preserving balanced URL
+/// punctuation such as the brackets of an IPv6 authority.
+pub fn plain_url_span(token: &str) -> Option<Range<usize>> {
+    if token.len() > MAX_OPENABLE_URL_BYTES + 64 {
+        return None;
+    }
+    let trimmed_start = token.trim_start_matches(['(', '[', '{', '<', '"', '\'']);
+    let start = token.len() - trimmed_start.len();
+    let mut end = trimmed_start.len();
+    let mut balance = [0i32; 3];
+    for character in trimmed_start.chars() {
+        match character {
+            '(' => balance[0] += 1,
+            ')' => balance[0] -= 1,
+            '[' => balance[1] += 1,
+            ']' => balance[1] -= 1,
+            '{' => balance[2] += 1,
+            '}' => balance[2] -= 1,
+            _ => {}
+        }
+    }
+    while let Some(character) = trimmed_start[..end].chars().next_back() {
+        let unbalanced = match character {
+            ')' => balance.get_mut(0),
+            ']' => balance.get_mut(1),
+            '}' => balance.get_mut(2),
+            _ => None,
+        };
+        if let Some(count) = unbalanced {
+            if *count >= 0 {
+                break;
+            }
+            *count += 1;
+        } else if !matches!(
+            character,
+            '.' | ',' | ';' | ':' | '!' | '?' | '>' | '\'' | '"'
+        ) {
+            break;
+        }
+        end -= character.len_utf8();
+    }
+    let target = &trimmed_start[..end];
+    (!target.contains(['<', '>', '"']) && is_openable_url(target)).then_some(start..start + end)
+}
+
+/// Locate the openable HTTP(S) URL at an exact byte within a logical line.
+pub fn plain_url_at(line: &str, byte: usize) -> Option<Range<usize>> {
+    if !line.is_char_boundary(byte) || byte >= line.len() {
+        return None;
+    }
+    let start = line[..byte]
+        .char_indices()
+        .rfind(|&(_, character)| character.is_whitespace())
+        .map_or(0, |(offset, character)| offset + character.len_utf8());
+    let end = line[byte..]
+        .find(char::is_whitespace)
+        .map_or(line.len(), |offset| byte + offset);
+    let range = plain_url_span(&line[start..end])?;
+    let absolute = start + range.start..start + range.end;
+    absolute.contains(&byte).then_some(absolute)
 }
 
 /// Return the host only when the complete authority has an unambiguous
@@ -149,6 +213,26 @@ fn is_url_ipv4_number(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_url_spans_keep_balanced_punctuation_and_require_an_exact_hit() {
+        let line = "你 (https://[2001:db8::1]).";
+        let target = "https://[2001:db8::1]";
+        let start = line.find(target).unwrap();
+        assert_eq!(
+            plain_url_at(line, start + 10),
+            Some(start..start + target.len())
+        );
+        assert_eq!(plain_url_at(line, start - 1), None);
+        assert_eq!(plain_url_at(line, start + target.len()), None);
+        assert_eq!(plain_url_at(line, 1), None);
+        let balanced = "https://example.com/Path_(topic)";
+        assert_eq!(plain_url_span(balanced), Some(0..balanced.len()));
+        assert_eq!(plain_url_at("<https://example.com>", 5), Some(1..20));
+        assert!(plain_url_span("https://example.com/<file/path>").is_none());
+        assert!(plain_url_span("(https://user:token@example.com).").is_none());
+        assert!(plain_url_span("file:///tmp/fixture").is_none());
+    }
 
     #[test]
     fn only_plain_http_targets_with_an_authority_are_openable() {

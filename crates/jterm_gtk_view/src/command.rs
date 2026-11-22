@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use gtk4::{gdk, pango, prelude::*};
 use jterm_engine::{
-    archived_text::{ArchiveStyle, ArchivedText},
+    archived_text::{is_literal_archive_unicode, ArchiveStyle, ArchivedText},
     grid::{Color, UnderlineStyle},
 };
 use std::{
@@ -10,19 +10,26 @@ use std::{
     rc::Rc,
 };
 
-use crate::view::terminal_color;
+use crate::{
+    text_link::connect_links,
+    view::{link_at, terminal_color, PresentedLink},
+    LinkActions,
+};
 
 const MAX_COMMAND_BYTES: usize = 96;
 
-/// First completed-card profile. Path-like text, terminal controls, multiline
-/// commands and wide clusters stay on the existing terminal presentation.
+/// A completed command with a literal text and highlighting projection.
+/// Path-like text, terminal controls and multiline commands require the
+/// existing renderer's recognition and geometry.
 pub fn supports_finished_command(command: &str) -> bool {
     !command.is_empty()
         && command == command.trim()
         && command.len() <= MAX_COMMAND_BYTES
-        && command
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b" _-+'\"$|&;><=,%!?()[]{}".contains(&byte))
+        && command.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || " _-+'\"$|&;><=,%!?()[]{}".contains(ch)
+                || is_literal_archive_unicode(ch)
+        })
 }
 
 /// Selectable text and style ranges for a retained command or output.
@@ -35,6 +42,7 @@ pub struct FinishedTextView {
     scale: Rc<Cell<f64>>,
     colors: [(gtk4::TextTag, Option<usize>); 6],
     output_tags: Rc<RefCell<Vec<(gtk4::TextTag, ArchiveStyle)>>>,
+    links: Rc<RefCell<Vec<PresentedLink>>>,
     palette: Rc<Cell<[gdk::RGBA; 16]>>,
 }
 
@@ -143,6 +151,7 @@ impl FinishedTextView {
             scale: Rc::new(Cell::new(scale)),
             colors,
             output_tags: Rc::new(RefCell::new(Vec::new())),
+            links: Rc::new(RefCell::new(Vec::new())),
             palette: Rc::new(Cell::new(*palette)),
         };
         view.apply_font();
@@ -152,6 +161,20 @@ impl FinishedTextView {
 
     pub fn widget(&self) -> &gtk4::TextView {
         &self.widget
+    }
+
+    pub fn install_links(&self, actions: LinkActions) {
+        let view = self.widget.downgrade();
+        let links = self.links.clone();
+        let open = (actions.attach_opener)(self.widget.upcast_ref());
+        connect_links(
+            &self.widget,
+            move |x, y| {
+                let target = link_at(&view.upgrade()?, &links.borrow(), actions.find_plain, x, y)?;
+                (actions.admit)("", &target.target).then_some(target)
+            },
+            open,
+        );
     }
 
     /// Line labels share the wrapped text's allocated row geometry.
@@ -198,6 +221,15 @@ impl FinishedTextView {
     /// Replace the view with a filtered projection of the retained capture.
     pub fn present_output(&self, document: &ArchivedText) {
         let buffer = self.widget.buffer();
+        let links = document
+            .links
+            .iter()
+            .filter_map(|link| {
+                let (start, end) = character_range(&document.text, link.bytes.clone())?;
+                Some(PresentedLink::text_span(start, end, &link.target))
+            })
+            .collect();
+        self.links.replace(links);
         buffer.set_text("");
         let mut tags = self.output_tags.borrow_mut();
         let table = buffer.tag_table();
@@ -379,6 +411,7 @@ mod tests {
     fn command_profile_leaves_paths_and_terminal_controls_to_the_legacy_view() {
         assert!(supports_finished_command("echo needle needle"));
         assert!(supports_finished_command("printf '%s' value"));
+        assert!(supports_finished_command("echo 好 e\u{301} 👩‍💻"));
         for command in [
             "",
             "echo path/to/file",
@@ -386,7 +419,7 @@ mod tests {
             "echo file.rs:9",
             "echo two\nlines",
             "echo \x1b[31mcolor",
-            "echo 好",
+            "echo \u{202e}unsafe",
             "echo trailing ",
         ] {
             assert!(!supports_finished_command(command), "{command:?}");

@@ -82,6 +82,10 @@ pub(crate) fn retain_resources(
 }
 
 impl HyperlinkTable {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
     pub(crate) fn with_url_byte_limit(url_byte_limit: usize) -> Self {
         Self {
             url_byte_limit: Some(url_byte_limit),
@@ -147,6 +151,9 @@ impl HyperlinkTable {
         &self,
         ids: impl Iterator<Item = HyperlinkId>,
     ) -> Option<HyperlinkResources> {
+        if self.is_empty() {
+            return None;
+        }
         let ids: BTreeSet<_> = ids.filter(|id| !id.is_none()).collect();
         let targets: Vec<_> = ids
             .into_iter()

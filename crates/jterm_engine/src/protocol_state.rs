@@ -75,15 +75,48 @@ impl TerminalModes {
 
 /// Active/inactive are relative to the displayed screen, not primary/alternate.
 /// Switching screens swaps only the Kitty flags and stacks.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ProtocolState {
     modes: TerminalModes,
     keyboard_enhancement_flags: u16,
     keyboard_enhancement_stack: Vec<u16>,
     alt_keyboard_enhancement_flags: u16,
     alt_keyboard_enhancement_stack: Vec<u16>,
+    keyboard_feature_mask: Option<u16>,
     xterm_modify_other_keys: u16,
     xterm_format_other_keys: u16,
+}
+
+impl std::fmt::Debug for ProtocolState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut output = formatter.debug_struct("ProtocolState");
+        output
+            .field("modes", &self.modes)
+            .field(
+                "keyboard_enhancement_flags",
+                &self.keyboard_enhancement_flags,
+            )
+            .field(
+                "keyboard_enhancement_stack",
+                &self.keyboard_enhancement_stack,
+            )
+            .field(
+                "alt_keyboard_enhancement_flags",
+                &self.alt_keyboard_enhancement_flags,
+            )
+            .field(
+                "alt_keyboard_enhancement_stack",
+                &self.alt_keyboard_enhancement_stack,
+            );
+        // Frozen production traces describe sessions without an explicit mask.
+        if self.keyboard_feature_mask.is_some() {
+            output.field("keyboard_feature_mask", &self.keyboard_feature_mask);
+        }
+        output
+            .field("xterm_modify_other_keys", &self.xterm_modify_other_keys)
+            .field("xterm_format_other_keys", &self.xterm_format_other_keys)
+            .finish()
+    }
 }
 
 impl ProtocolState {
@@ -102,6 +135,23 @@ impl ProtocolState {
     }
     pub fn keyboard_enhancement_flags(&self) -> u16 {
         self.keyboard_enhancement_flags
+    }
+
+    pub(crate) fn limit_keyboard_enhancements(&mut self, mask: u16) {
+        self.keyboard_feature_mask = Some(mask);
+        self.keyboard_enhancement_flags &= mask;
+        self.alt_keyboard_enhancement_flags &= mask;
+        for flags in self
+            .keyboard_enhancement_stack
+            .iter_mut()
+            .chain(&mut self.alt_keyboard_enhancement_stack)
+        {
+            *flags &= mask;
+        }
+    }
+
+    pub(crate) fn keyboard_enhancement_limit(&self) -> Option<u16> {
+        self.keyboard_feature_mask
     }
     pub fn keyboard_enhancement_stack(&self) -> &[u16] {
         &self.keyboard_enhancement_stack
@@ -137,6 +187,7 @@ impl ProtocolState {
     }
 
     pub fn set_keyboard_enhancement_flags(&mut self, flags: u16, mode: u16) {
+        let flags = flags & self.keyboard_feature_mask.unwrap_or(u16::MAX);
         match mode {
             1 => self.keyboard_enhancement_flags = flags,
             2 => self.keyboard_enhancement_flags |= flags,
@@ -151,7 +202,7 @@ impl ProtocolState {
         }
         self.keyboard_enhancement_stack
             .push(self.keyboard_enhancement_flags);
-        self.keyboard_enhancement_flags = flags;
+        self.keyboard_enhancement_flags = flags & self.keyboard_feature_mask.unwrap_or(u16::MAX);
     }
 
     pub fn pop_keyboard_enhancement_flags(&mut self, count: usize) {

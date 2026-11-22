@@ -27,6 +27,10 @@ impl RowClusters {
     }
 
     pub(crate) fn text(&self, column: usize) -> Option<&str> {
+        self.shared_text(column).map(Arc::as_ref)
+    }
+
+    pub(crate) fn shared_text(&self, column: usize) -> Option<&Arc<str>> {
         let cell = self.cells.get(self.position(column))?;
         (usize::from(cell.column) == column).then_some(&cell.text)
     }
@@ -39,6 +43,15 @@ impl RowClusters {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.cells.is_empty()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        // Include the Arc headers for the row and each retained string.
+        let arc_header = 2 * size_of::<usize>();
+        size_of::<Self>()
+            + self.cells.capacity() * size_of::<Cluster>()
+            + self.text_bytes
+            + (self.cells.len() + 1) * arc_header
     }
 
     pub(crate) fn can_store(&self, column: usize, bytes: usize) -> bool {

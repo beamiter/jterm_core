@@ -97,6 +97,8 @@ pub struct TerminalGrid {
     // for rows with explicit decoration. The base cell stays 16 bytes.
     underline_colors: Vec<Option<Vec<Color>>>,
     clusters: Vec<Option<Arc<RowClusters>>>,
+    capture_revision: u64,
+    row_changes: Vec<u64>,
 }
 
 impl TerminalGrid {
@@ -110,11 +112,34 @@ impl TerminalGrid {
             margin_origin: vec![MarginOrigin::VirginDefault; rows],
             underline_colors: Vec::new(),
             clusters: Vec::new(),
+            capture_revision: 0,
+            row_changes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn begin_capture_revision(&mut self, revision: u64) {
+        self.capture_revision = revision;
+        self.row_changes.resize(self.rows, revision);
+    }
+
+    /// Grid users that do not start capture revisions have no change certificate.
+    /// Legacy public wrap bits are compared independently of this certificate.
+    pub(crate) fn row_changed_after(&self, row: usize, revision: u64) -> bool {
+        self.row_changes
+            .get(row)
+            .is_none_or(|changed_at| *changed_at > revision)
+    }
+
+    #[inline]
+    fn mark_row_changed(&mut self, row: usize) {
+        if self.capture_revision != 0 {
+            self.row_changes[row] = self.capture_revision;
         }
     }
 
     /// Flat cells with a fixed length. Hosts must preserve wide-cell invariants.
     pub fn cells_mut(&mut self) -> &mut [TerminalCell] {
+        self.row_changes.fill(self.capture_revision);
         self.margin_origin.fill(MarginOrigin::Unknown);
         self.underline_colors = Vec::new();
         self.clusters = Vec::new();
@@ -139,6 +164,7 @@ impl TerminalGrid {
 
     #[inline]
     pub fn get_mut(&mut self, row: usize, col: usize) -> &mut TerminalCell {
+        self.mark_row_changed(row);
         if col == self.cols.saturating_sub(1) {
             self.margin_origin[row] = MarginOrigin::Unknown;
         }
@@ -168,6 +194,7 @@ impl TerminalGrid {
         {
             return None;
         }
+        self.mark_row_changed(row);
         self.clusters.resize_with(self.rows, || None);
         let line = self.clusters[row].get_or_insert_with(Arc::default);
         let text: Arc<str> = Arc::from(text);
@@ -176,6 +203,7 @@ impl TerminalGrid {
     }
 
     fn edit_clusters(&mut self, row: usize, edit: impl FnOnce(&mut RowClusters)) {
+        self.mark_row_changed(row);
         let Some(slot) = self.clusters.get_mut(row) else {
             return;
         };
@@ -225,6 +253,7 @@ impl TerminalGrid {
     }
 
     pub(crate) fn restore_print(&mut self, row: usize, checkpoint: PrintCheckpoint) {
+        self.mark_row_changed(row);
         let start = row * self.cols + checkpoint.cols.start;
         self.cells[start..start + checkpoint.cells.len()].copy_from_slice(&checkpoint.cells);
         if let Some(Some(colors)) = self.underline_colors.get_mut(row) {
@@ -282,6 +311,7 @@ impl TerminalGrid {
     }
 
     pub(crate) fn set_underline_color(&mut self, row: usize, cols: Range<usize>, color: Color) {
+        self.mark_row_changed(row);
         if color != Color::Default {
             debug_assert!(u16::try_from(self.cols).is_ok());
             self.underline_colors.resize_with(self.rows, || None);
@@ -346,11 +376,17 @@ impl TerminalGrid {
         };
     }
 
+    pub(crate) fn synthetic_margin_gap(&self, row: usize) -> Option<usize> {
+        (self.row_wrapped[row] && matches!(self.margin_origin[row], MarginOrigin::WideGap))
+            .then(|| self.cols - 1)
+    }
+
     pub(crate) fn row_cells_mut(
         &mut self,
         row: usize,
         cols: std::ops::Range<usize>,
     ) -> &mut [TerminalCell] {
+        self.mark_row_changed(row);
         if cols.end == self.cols && !cols.is_empty() {
             self.margin_origin[row] = MarginOrigin::Unknown;
         }
@@ -443,7 +479,7 @@ impl TerminalGrid {
             self.cluster_row(row).cloned(),
         );
         line.set_raw_row_id(self.row_id(row));
-        if allow_margin && wrapped && matches!(self.margin_origin[row], MarginOrigin::WideGap) {
+        if allow_margin && self.synthetic_margin_gap(row).is_some() {
             line.synthetic_margin_gap = true;
         }
         line
@@ -505,6 +541,9 @@ impl TerminalGrid {
             return None;
         }
         let end = bottom + 1;
+        if self.capture_revision != 0 {
+            self.row_changes[top..end].fill(self.capture_revision);
+        }
         let height = end - top;
         let count = count.min(height);
         let move_wraps = wrap_policy == RegionWrapPolicy::MoveWithRows;
@@ -568,6 +607,7 @@ impl TerminalGrid {
         if row >= self.rows || col >= self.cols {
             return;
         }
+        self.mark_row_changed(row);
         self.margin_origin[row] = MarginOrigin::Unknown;
         let start = row * self.cols;
         self.cells
@@ -583,6 +623,7 @@ impl TerminalGrid {
         if row >= self.rows || col >= self.cols {
             return;
         }
+        self.mark_row_changed(row);
         self.margin_origin[row] = MarginOrigin::Unknown;
         let start = row * self.cols;
         self.cells
@@ -605,6 +646,7 @@ impl TerminalGrid {
         }
         let last = row * self.cols + self.cols - 1;
         if self.cells[last].flags.wide() {
+            self.mark_row_changed(row);
             self.margin_origin[row] = MarginOrigin::Unknown;
             self.cells[last] = blank;
             self.set_underline_color(row, self.cols - 1..self.cols, Color::Default);
@@ -753,6 +795,10 @@ impl TerminalGrid {
 
     /// 调整网格大小
     pub fn resize(&mut self, new_rows: usize, new_cols: usize, default_cell: TerminalCell) {
+        if self.capture_revision != 0 {
+            self.row_changes.resize(new_rows, self.capture_revision);
+            self.row_changes.fill(self.capture_revision);
+        }
         let mut new_cells = vec![default_cell; new_rows * new_cols];
         let copy_rows = self.rows.min(new_rows);
         let copy_cols = self.cols.min(new_cols);
@@ -813,10 +859,8 @@ impl TerminalGrid {
 
     /// 获取mut访问所有行
     pub fn iter_mut(&mut self) -> std::slice::ChunksMut<'_, TerminalCell> {
-        self.margin_origin.fill(MarginOrigin::Unknown);
-        self.underline_colors = Vec::new();
-        self.clusters = Vec::new();
-        self.cells.chunks_mut(self.cols)
+        let columns = self.cols;
+        self.cells_mut().chunks_mut(columns)
     }
 
     /// 获取只读访问所有行
@@ -835,6 +879,7 @@ impl std::ops::Index<usize> for TerminalGrid {
 
 impl std::ops::IndexMut<usize> for TerminalGrid {
     fn index_mut(&mut self, row: usize) -> &mut [TerminalCell] {
+        self.mark_row_changed(row);
         self.margin_origin[row] = MarginOrigin::Unknown;
         if let Some(colors) = self.underline_colors.get_mut(row) {
             *colors = None;
@@ -1136,6 +1181,19 @@ impl CompressedLineData {
             Self::Decorated(data) => data.base.content(),
         }
     }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Plain(text, _) => text.capacity(),
+            Self::Encoded(bytes) => bytes.capacity(),
+            Self::Decorated(data) => {
+                size_of::<DecoratedLineData>()
+                    + data.base.heap_bytes()
+                    + size_of_val(data.underline_colors.as_ref())
+                    + data.clusters.as_ref().map_or(0, |row| row.retained_bytes())
+            }
+        }
+    }
 }
 
 /// Borrowed compressed content for history search, accounting and replay.
@@ -1353,6 +1411,16 @@ impl ScrollbackLine {
             ScrollbackContent::Plain(text, _) => text.len(),
             ScrollbackContent::Encoded(data) => data.len(),
         }
+    }
+
+    /// Size of a retained entry and its allocations, excluding allocator overhead.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let reflow_bytes = if self.reflow_wide_continuations.spilled() {
+            self.reflow_wide_continuations.capacity() * size_of::<u16>()
+        } else {
+            0
+        };
+        size_of::<Self>() + self.data.heap_bytes() + reflow_bytes
     }
 
     /// Whole-row decode with checked allocation/run limits. Existing render

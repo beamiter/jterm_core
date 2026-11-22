@@ -211,9 +211,14 @@ def main() -> int:
             for package, dependency in aether_dependencies.items():
                 if "path" in dependency:
                     mirror(sources[package], core_crates / package)
+        published_gtk = set()
         for app in sorted(gtk_apps):
             manifest = root / app / "Cargo.toml"
             text = manifest.read_text()
+            dependency = tomllib.loads(text).get("dependencies", {}).get("jterm_gtk_view")
+            if isinstance(dependency, dict) and "git" in dependency:
+                published_gtk.add(app)
+                continue
             if "[dependencies]\n" not in text:
                 parser.error(f"{app} manifest has no dependencies table")
             manifest.write_text(text.replace("[dependencies]\n",
@@ -243,7 +248,7 @@ def main() -> int:
             if project in {"forge", "anvil"}:
                 candidate = f"JTERM_{project.upper()}_SHARED_TERMINAL"
                 environment.pop(candidate, None)
-                if project in gtk_apps:
+                if project in gtk_apps - published_gtk:
                     environment[candidate] = "1"
             # Keep the existing cache unless the caller selected another one.
             environment.setdefault("CARGO_TARGET_DIR", str(original / "target"))
@@ -254,6 +259,14 @@ def main() -> int:
             # overrides themselves; global flags before the subcommand can
             # be lost when cargo-clippy launches its inner cargo check.
             project_patches = patches.copy()
+            if project in published_gtk:
+                project_patches += [
+                    "--config",
+                    'patch."https://github.com/beamiter/jterm_core.git".jterm_gtk_view.path='
+                    + json.dumps(str(mirror_paths["jterm_gtk_view"])),
+                    "--features",
+                    "shared-terminal",
+                ]
             if project in {"ember", "frost"} or (project in AETHER_CRATES and not local_aether_engine):
                 project_patches += [
                     "--config",

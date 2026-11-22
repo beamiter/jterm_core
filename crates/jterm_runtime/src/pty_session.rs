@@ -10,7 +10,7 @@ use crate::session_actor::{SessionActor, SessionEvent};
 use crossbeam_channel::TryRecvError;
 use jterm_engine::frame::CellFrame;
 use jterm_engine::terminal::{
-    Terminal, MAX_FEED_BYTES as READ_BUDGET, MAX_INPUT_BYTES as MAX_INPUT,
+    Terminal, MAX_FEED_BYTES as READ_BUDGET, MAX_INPUT_BYTES as MAX_INPUT, MAX_STREAMED_PASTE_BYTES,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::{
@@ -495,6 +495,7 @@ impl SessionIo {
 
 pub struct Session {
     io: Option<SessionIo>,
+    output_wake: Arc<std::sync::OnceLock<WakeSink>>,
     child: Arc<ChildLifecycle>,
     reap_ticket: Arc<reaper::Ticket>,
     terminal: Terminal,
@@ -670,7 +671,16 @@ impl Session {
         reap_ticket: Arc<reaper::Ticket>,
         terminal: Terminal,
     ) -> Result<Self, String> {
-        let actor = SessionActor::start_with_owner_writes(transport, WakeSink::new(|| {}))?;
+        let output_wake = Arc::new(std::sync::OnceLock::<WakeSink>::new());
+        let ready = output_wake.clone();
+        let actor = SessionActor::start_with_owner_writes(
+            transport,
+            WakeSink::new(move || {
+                if let Some(wake) = ready.get() {
+                    wake.wake();
+                }
+            }),
+        )?;
         Ok(Self {
             io: Some(SessionIo {
                 actor,
@@ -682,6 +692,7 @@ impl Session {
                 #[cfg(test)]
                 write_limit: None,
             }),
+            output_wake,
             child: lifecycle,
             reap_ticket,
             terminal,
@@ -700,6 +711,24 @@ impl Session {
     }
     pub fn terminal(&self) -> &Terminal {
         &self.terminal
+    }
+
+    /// Notify the parser owner when the reader publishes output or exit.
+    /// An immediate wake covers events published before registration.
+    pub fn set_output_wake(&self, wake: WakeSink) -> Result<(), String> {
+        self.output_wake
+            .set(wake.clone())
+            .map_err(|_| "PTY output wake already registered".to_owned())?;
+        wake.wake();
+        Ok(())
+    }
+
+    /// An owner-mode writer may need to retry after EAGAIN without new output.
+    pub fn needs_write_retry(&self) -> bool {
+        !self.closed
+            && !self.is_exited()
+            && self.write_error.is_none()
+            && (!self.input_idle() || !self.replies.is_empty())
     }
 
     pub fn child_pid(&self) -> Option<i32> {
@@ -725,6 +754,30 @@ impl Session {
         self.terminal.enable_hyperlinks(policy);
     }
 
+    pub fn enable_window_updates(&mut self) {
+        self.terminal.enable_window_updates();
+    }
+
+    pub fn set_color_defaults(&mut self, defaults: jterm_engine::colors::TerminalDefaultColors) {
+        self.terminal.set_color_defaults(defaults);
+    }
+
+    pub fn enable_keyboard_disambiguation(&mut self) {
+        self.terminal.enable_keyboard_disambiguation();
+    }
+
+    pub fn set_history_row_limit(&mut self, rows: usize) {
+        self.terminal.set_history_row_limit(rows);
+    }
+
+    pub fn enable_history_preserving_resize(&mut self) {
+        self.terminal.enable_history_preserving_resize();
+    }
+
+    pub fn take_window_updates(&mut self) -> jterm_engine::terminal::WindowUpdates {
+        self.terminal.take_window_updates()
+    }
+
     /// A partial logical event keeps its place ahead of later replies and input.
     pub fn enable_ordered_input(&mut self) {
         self.ordered_input = true;
@@ -732,13 +785,38 @@ impl Session {
 
     /// Admit a whole logical user event. The receipt does not claim a kernel write.
     pub fn submit_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.admit_input()?;
+        self.input.enqueue(bytes)
+    }
+
+    /// Keep a native bracketed paste as a single ordered record even though
+    /// the kernel accepts it in several writes. Ordinary input keeps its budget.
+    pub fn submit_native_paste(&mut self, text: &str) -> Result<bool, String> {
+        self.admit_input()?;
+        if !self.ordered_input {
+            return Err("native paste requires ordered input".into());
+        }
+        let bytes = self.terminal.encode_native_paste(text)?;
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        if bytes.len() > input_queue::INPUT_LIMIT {
+            self.input
+                .enqueue_with_limit(bytes, MAX_STREAMED_PASTE_BYTES)?;
+        } else {
+            self.input.enqueue(bytes)?;
+        }
+        Ok(true)
+    }
+
+    fn admit_input(&self) -> Result<(), String> {
         if self.closed || self.is_exited() || self.write_error.is_some() {
             return Err("input unavailable".into());
         }
         if matches!(self.input_boundary, Some(InputBoundary::Raw { .. })) {
             return Err("finish the pending raw input event before submitting a new one".into());
         }
-        self.input.enqueue(bytes)
+        Ok(())
     }
 
     pub fn input_idle(&self) -> bool {
@@ -972,7 +1050,7 @@ impl Session {
         }
         if !self.holding_replies
             || remaining == 0
-            || usize::from(accepted_prefix.get()) + remaining > input_queue::INPUT_LIMIT
+            || usize::from(accepted_prefix.get()) + remaining > MAX_STREAMED_PASTE_BYTES
             || suffix.len() != remaining.min(input_queue::WRITE_BATCH)
         {
             return Err("partial input continuation size".into());
@@ -1289,6 +1367,41 @@ mod tests {
             b"\x1b[200~OWNED\x1b[201~\x1b[1;1RFRESH"
         );
         assert!(session.input_idle());
+
+        wire.lock().unwrap().clear();
+        session.test_io().writer = Some(Box::new(Capture {
+            steps: [Ok(3), Err(ErrorKind::WouldBlock)].into(),
+            wire: wire.clone(),
+        }));
+        session.test_io().reader = Some(Box::new(Available(Cursor::new(b"\x1b[?2004h"))));
+        session.drive().unwrap();
+        let large_paste = "background input界\r\n".repeat(2100);
+        assert!(session.submit_native_paste(&large_paste).unwrap());
+        assert!(session
+            .submit_input(b"WOULD EXCEED NORMAL BUDGET".to_vec())
+            .is_err());
+        session.drive().unwrap();
+        assert_eq!(&*wire.lock().unwrap(), b"\x1b[2");
+        session.test_io().reader = Some(Box::new(Available(Cursor::new(b"\x1b[6n"))));
+        session.drive().unwrap();
+        assert_eq!(&*wire.lock().unwrap(), b"\x1b[2");
+        let mut expected = format!(
+            "\x1b[200~{}\x1b[201~\x1b[1;1R",
+            large_paste.replace("\r\n", "\r")
+        )
+        .into_bytes();
+        for _ in 0..MAX_STREAMED_PASTE_BYTES.div_ceil(input_queue::WRITE_BATCH) + 2 {
+            if session.input_idle() {
+                break;
+            }
+            session.drive().unwrap();
+        }
+        assert!(session.input_idle());
+        assert_eq!(*wire.lock().unwrap(), expected);
+        session.submit_input(b"AFTER".to_vec()).unwrap();
+        session.drive().unwrap();
+        expected.extend(b"AFTER");
+        assert_eq!(*wire.lock().unwrap(), expected);
         session.close().unwrap();
         await_cleanup(&session);
     }

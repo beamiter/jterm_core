@@ -27,9 +27,10 @@ class ProbeTests(unittest.TestCase):
         os.close(self.slave)
         os.close(self.master)
 
-    def test_p95_nearest_rank(self):
+    def test_p95_and_p99_nearest_rank(self):
         self.assertEqual(baseline.percentile95(list(range(1, 101))), 95)
         self.assertEqual(baseline.percentile95(list(range(1, 21))), 19)
+        self.assertEqual(baseline.percentile(list(range(100, 0, -1)), .99), 99)
 
     def test_large_write_and_fragmented_reply(self):
         data = bytearray()
@@ -90,6 +91,12 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             baseline.rss_kib(os.getpid(), dict(start_ticks='invalid'))
 
+    def test_mismatched_binary_is_rejected_before_terminal_changes(self):
+        with mock.patch.object(tty, 'setraw') as set_raw:
+            with self.assertRaisesRegex(RuntimeError, 'expected SHA-256'):
+                baseline.measure(self.slave, os.getpid(), 20, .1, binary_sha256='0' * 64)
+        set_raw.assert_not_called()
+
     def test_measure_plumbing_not_a_terminal_benchmark(self):
         # This fake DSR responder validates transport only. Never publish its timing.
         def responder():
@@ -108,6 +115,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(census.call_count, 40)
         self.assertEqual(result['rss_scope'], 'process-tree')
         self.assertEqual(result['rss_sampled_max_kib'], 123)
+        self.assertGreaterEqual(result['host_cpu_ms'], 0)
         self.assertTrue(all(s['tree_before'] == snapshot and s['tree_after'] == snapshot
                             for s in result['samples']))
         worker.join(2)

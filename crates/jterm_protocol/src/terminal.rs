@@ -6,6 +6,7 @@ pub const VERSION: u8 = 3;
 pub const MAX_ROWS: usize = 128;
 pub const MAX_COLUMNS: usize = 256;
 pub const MAX_CELLS: usize = 32_768;
+pub const MAX_HISTORY_SNAPSHOT_BYTES: usize = 131_200;
 
 /// The session ID names a PTY during its lifetime. The generation names
 /// the receiver's current attachment to that PTY.
@@ -112,6 +113,9 @@ pub struct HistorySnapshot {
     pub revision: String,
     pub offset: usize,
     pub total_rows: usize,
+    /// Number of physical rows in an ordinary page whose size may be limited by bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_count: Option<usize>,
     pub text: String,
 }
 

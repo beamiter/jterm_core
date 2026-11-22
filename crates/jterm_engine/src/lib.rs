@@ -4,6 +4,8 @@ pub mod archived_text;
 pub mod framing;
 mod graphemes;
 pub mod grid;
+pub mod history_reflow;
+pub mod history_search;
 pub mod hyperlink;
 pub use grid::*;
 pub use hyperlink::HyperlinkId;
@@ -12,6 +14,7 @@ pub const MAX_TERMINAL_COLS: usize = 1024;
 pub mod input;
 pub mod mouse;
 pub mod protocol_state;
+pub mod retained_history;
 
 pub mod screen;
 

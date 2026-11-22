@@ -9,7 +9,7 @@ pub(crate) fn admit_local_argv(argv: &[String], host_bridge: bool, opt_in: Optio
     !host_bridge
         && opt_in == Some(OsStr::new("1"))
         && matches!(argv, [program, arguments @ ..]
-            if matches!(program.as_str(), "/bin/sh" | "/usr/bin/sh")
+            if matches!(program.as_str(), "/bin/sh" | "/usr/bin/sh" | "/bin/bash" | "/usr/bin/bash")
                 && arguments.iter().all(|arg| matches!(arg.as_str(), "-i" | "-l")))
 }
 
@@ -43,10 +43,12 @@ mod tests {
         assert!(!admit_local_argv(&args, true, enabled));
         assert!(!admit_local_argv(&args, false, None));
         assert!(!admit_local_argv(&args, false, Some(OsStr::new("yes"))));
+        let bash = ["/usr/bin/bash".to_owned(), "-l".to_owned()];
+        assert!(admit_local_argv(&bash, false, enabled));
         for refused in [
             vec![],
             vec!["sh"],
-            vec!["/bin/bash"],
+            vec!["/bin/bash", "custom-script"],
             vec!["/bin/sh", "-c", "exit"],
         ] {
             let refused = refused.into_iter().map(str::to_owned).collect::<Vec<_>>();

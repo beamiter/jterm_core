@@ -44,11 +44,72 @@ pub struct Modifiers {
     pub super_key: bool,
 }
 
+/// The negotiated flag for disambiguating key presses.
+pub const KITTY_DISAMBIGUATE: u8 = 1;
+
+/// Toolkit-independent keys in the disambiguation profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyKey {
+    Unicode(char),
+    /// Keep the toolkit's text for matching the corresponding legacy commit.
+    UnicodeWithText {
+        base: char,
+        text: char,
+    },
+    Escape,
+    Enter,
+    Tab,
+    Backspace,
+    Space,
+    Functional,
+}
+
+/// Preserve the base key and the toolkit's text when the layout changes it.
+pub fn unicode_key(base: char, text: Option<char>) -> KittyKey {
+    if let Some(text) = text.filter(|ch| !ch.is_control()) {
+        let mut lower = text.to_lowercase();
+        if (lower.next(), lower.next()) != (Some(base), None) {
+            return KittyKey::UnicodeWithText { base, text };
+        }
+    }
+    KittyKey::Unicode(base)
+}
+
 pub fn kitty_modifier_value(modifiers: Modifiers) -> u8 {
     1 + u8::from(modifiers.shift)
         + 2 * u8::from(modifiers.alt)
         + 4 * u8::from(modifiers.ctrl)
         + 8 * u8::from(modifiers.super_key)
+}
+
+/// Encode keys that the disambiguation flag changes. A None result indicates
+/// that the terminal should use its regular key or committed-text encoding.
+pub fn encode_kitty_disambiguated_key(
+    key: KittyKey,
+    modifiers: Modifiers,
+    flags: u8,
+) -> Option<Vec<u8>> {
+    if flags & KITTY_DISAMBIGUATE == 0 {
+        return None;
+    }
+    let non_shift = modifiers.alt || modifiers.ctrl || modifiers.super_key;
+    let modified = modifiers.shift || non_shift;
+    let code = match key {
+        KittyKey::Escape => 27,
+        KittyKey::Enter if modified => 13,
+        KittyKey::Tab if modified => 9,
+        KittyKey::Backspace if modified => 127,
+        KittyKey::Space if non_shift => 32,
+        KittyKey::Unicode(ch) if non_shift => u32::from(ch),
+        KittyKey::UnicodeWithText { base, .. } if non_shift => u32::from(base),
+        _ => return None,
+    };
+    let parameter = kitty_modifier_value(modifiers);
+    Some(if parameter == 1 {
+        format!("\x1b[{code}u").into_bytes()
+    } else {
+        format!("\x1b[{code};{parameter}u").into_bytes()
+    })
 }
 
 // Preserve Ember's existing logical-key repertoire. Arbitrary OS-produced

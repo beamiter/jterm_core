@@ -14,6 +14,10 @@ The earlier milestone reports retain their original local-only validation scope.
   version 0.1.0 and Rust 1.86 minimum. It uses smallvec, unicode-width and
   unicode-segmentation.
   It has no core, GUI, PTY, Agent, filesystem, network or executor dependency.
+  The shared terminal, Ember and Frost use the same 8 MiB accounting for
+  stored compressed scrollback rows in addition to their configured row limits.
+  Aether and the GTK candidate search retained text with the engine's bounded
+  literal search, preserving the search range across live output and resize.
 - `crates/jterm_runtime` has a separate lock and a Rust 1.89 minimum. It owns
   scheduling, process observation, typed exit status, signalling and reaping.
   Aether and the private standalone GTK candidates enable the Linux PTY
@@ -50,11 +54,11 @@ The earlier milestone reports retain their original local-only validation scope.
   manifests/locks. It prefers the nested engine, supports older sibling layouts,
   and runs native tests from the original checkout. Overrides follow the Cargo
   subcommand so Clippy receives the same candidate as Cargo check/test.
-  Aether's three release manifests use a single published revision for the
-  shared crates. The same runner supports sibling engine and runtime checkouts.
-  Select the shared GTK terminal and document view in a private Forge build
-  with `python3 scripts/family-cargo.py --forge-shared-terminal forge build`
-  or in Anvil with
+  Aether's three release manifests use one published revision for the shared
+  crates. Forge and Anvil pin their optional `jterm_gtk_view` dependency to
+  the same revision as `jterm_core`. Build the candidate in either app with
+  `cargo build --locked --features shared-terminal`. For local core changes, use
+  `python3 scripts/family-cargo.py --forge-shared-terminal forge build` or
   `python3 scripts/family-cargo.py --anvil-shared-terminal anvil build`.
 
 ## Standalone checks
@@ -97,7 +101,10 @@ existing host policy. On the local candidate, Frost's native Wayland IME
 fixtures cover Block preedit and commit, multiline input, and an active Chat
 foreground process. Ember's X11 PTY fixture covers device attributes and
 status replies. Aether's native WebKitGTK/X11 fixture covers local Channel
-delivery, split focus and restart, and bounded search of retained history.
+delivery, split focus and restart, bounded search of retained history, and
+read-only recovery of the same live PTY after a WebView reload. Aether schedules
+local drain from the PTY reader wake and keeps a fallback poll for lifecycle
+checks.
 The native Wayland fixture covers preedit, a single commit to the focused
 local PTY, and cancellation when switching between two live sessions.
 Aether's local owner drains output and serves terminal replies before a
@@ -115,20 +122,29 @@ Uploads preserve existing files. The read-only Workspace rejects a changed
 host ID or evidence revision. The Vim9 X11 fixture covers the local project
 tree, byte-column jumps, palette, quickfix search and build output. The jsh
 fixture recalls an editable command and checks foreground-input isolation.
-Forge and Anvil keep their production libvte routes while the private GTK
-builds exercise the shared canvas and retained document view. In the private
-builds, `JTERM_SHARED_RUNTIME=1` routes eligible direct local `/bin/sh`
-sessions through the shared runtime. Both native X11 fixtures verify reply
-ordering, resizing and hidden output. The corresponding Wayland fixtures
-cover preedit, commit and copy. Set
-`JTERM_SHARED_FINISHED_COMMANDS=1` when running a private build to
-exercise shared GTK rendering for eligible completed Block command rows.
-Native acceptance covers the shell record, exact search selection and
-clipboard across both rendering surfaces.
-Eligible completed Block and Chat plain output uses the shared document view when
-`JTERM_SHARED_FINISHED_OUTPUT=1` is enabled alongside command rows.
-The native fixture covers complete plain output, fold-aware find,
-filtering and VTE fallback for links and ANSI-styled output.
+Forge and Anvil use `JTERM_SHARED_RUNTIME=1` and `terminal_mode = "vte"`
+to exercise the shared runtime in ordinary tabs and splits with an eligible
+direct local sh or Bash command. The GTK tests cover exact PTY replies,
+bracketed paste, scrollback reflow with a retained reading position, and
+output drain in a hidden tab. The existing Find action opens search for the
+focused shared pane. Native X11 tests cover copying matches across soft wraps,
+searching older rows while the PTY writes, and independent searches in two tabs.
+Native Wayland tests cover preedit cancellation
+when switching tabs, one commit in the focused pane, and clipboard transfer.
+The Vim9 tests run both the native buffer and compatibility display over the
+shared runtime and save a real file. The normal app configurations may use
+the existing VTE routes for shell integrations, remote sessions and other
+terminal modes.
+
+Set `JTERM_SHARED_FINISHED_COMMANDS=1` for eligible shell-reported Block and
+Chat commands. Set `JTERM_SHARED_FINISHED_OUTPUT=1` alongside it to render
+eligible completed output in the shared text view. A bounded document can
+retain grapheme clusters, supported ANSI styles, OSC 8 targets and recognized
+plain HTTPS or HTTP links. Native GTK tests cover fold-aware find, output
+filters, cross-card clipboard and rebuilding cards after Undo. Captures outside
+the document profile use VTE. The `JTERM_SHARED_LIVE_OUTPUT=1` candidate paints
+verified rows during a running command while the existing VTE terminal owns
+the session and continues to handle input and alternate screens.
 
 Release acceptance still requires the complete shared session lifecycle,
 Aether's remaining product journeys, the GTK production migration, and

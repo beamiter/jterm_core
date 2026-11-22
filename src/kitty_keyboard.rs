@@ -23,8 +23,10 @@
 
 use std::borrow::Cow;
 
-/// Disambiguate escape codes (`0b1`). Implemented.
-pub const DISAMBIGUATE: u8 = 0b1;
+pub use jterm_engine::input::{
+    encode_kitty_disambiguated_key as encode_key, unicode_key, KittyKey, Modifiers,
+    KITTY_DISAMBIGUATE as DISAMBIGUATE,
+};
 /// Report event types (`0b10`). Accepted, not implemented.
 pub const REPORT_EVENT_TYPES: u8 = 0b10;
 /// Report alternate keys (`0b100`). Accepted, not implemented.
@@ -160,109 +162,6 @@ impl KittyKeyboardStacks {
 /// The reply to `CSI ? u`: the honoured flags currently in effect.
 pub fn query_reply(flags: u8) -> Vec<u8> {
     format!("\x1b[?{}u", flags & SUPPORTED_FLAGS).into_bytes()
-}
-
-/// A key as the encoder needs to see it, already freed of toolkit detail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KittyKey {
-    /// A key with a Unicode value: the codepoint of the key's *base* form —
-    /// lowercase, unshifted — which is what the protocol reports regardless of
-    /// the modifiers held.
-    Unicode(char),
-    /// A layout maps the pressed key to a different character than its base
-    /// form (for example Shift+1 produces `!`). Preserve that exact toolkit
-    /// character solely to recognize the key's legacy commit; CSI-u still
-    /// reports `base`. Use [`unicode_key`] when recording toolkit events.
-    UnicodeWithText {
-        base: char,
-        text: char,
-    },
-    Escape,
-    Enter,
-    Tab,
-    Backspace,
-    Space,
-    /// Arrows, function keys, navigation and keypad keys, lone modifiers: the
-    /// legacy encoding the terminal already produces (with xterm-style
-    /// modifier parameters) is what the protocol specifies for them under the
-    /// disambiguate flag, so the encoder leaves them alone.
-    Functional,
-}
-
-/// Record a text key's base form together with the toolkit's actual keyval.
-/// Ordinary letter case changes retain the historical [`KittyKey::Unicode`]
-/// representation. Other layout-specific mappings need their exact character
-/// so commit rewriting never has to guess a keyboard layout or accept arbitrary
-/// composed/pasted text as the recorded key.
-pub fn unicode_key(base: char, text: Option<char>) -> KittyKey {
-    if let Some(text) = text.filter(|ch| !ch.is_control()) {
-        let mut lower = text.to_lowercase();
-        if (lower.next(), lower.next()) != (Some(base), None) {
-            return KittyKey::UnicodeWithText { base, text };
-        }
-    }
-    KittyKey::Unicode(base)
-}
-
-/// Modifier state of a key event. Lock modifiers are deliberately absent: the
-/// protocol reports them only with flags this implementation does not honour.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Modifiers {
-    pub shift: bool,
-    pub alt: bool,
-    pub ctrl: bool,
-    pub super_key: bool,
-}
-
-impl Modifiers {
-    /// Any modifier other than shift — the ones that turn a text key into an
-    /// escape code.
-    fn non_shift(&self) -> bool {
-        self.alt || self.ctrl || self.super_key
-    }
-
-    fn any(&self) -> bool {
-        self.shift || self.non_shift()
-    }
-
-    /// The protocol's modifier parameter: `1 + bitmask`, shift=1, alt=2,
-    /// ctrl=4, super=8.
-    fn parameter(&self) -> u8 {
-        1 + u8::from(self.shift)
-            + (u8::from(self.alt) << 1)
-            + (u8::from(self.ctrl) << 2)
-            + (u8::from(self.super_key) << 3)
-    }
-}
-
-/// What the terminal must send for this key while `flags` are in effect, or
-/// `None` when the legacy bytes the VTE produces on its own are already the
-/// right answer.
-///
-/// Under the disambiguate flag:
-/// - Esc is always `CSI 27 u` (with its modifier parameter when held).
-/// - Enter, Tab and Backspace stay legacy only with NO modifier at all;
-///   Shift+Enter is `CSI 13 ; 2 u`, which is the whole reason composers can
-///   tell "newline" from "submit".
-/// - Space and text keys stay text with shift alone; with Ctrl, Alt or Super
-///   they become `CSI codepoint ; mods u`, so Ctrl+I is no longer Tab and
-///   Alt+x is no longer Esc followed by x.
-/// - Functional keys keep their legacy form.
-pub fn encode_key(key: KittyKey, mods: Modifiers, flags: u8) -> Option<Vec<u8>> {
-    if flags & DISAMBIGUATE == 0 {
-        return None;
-    }
-    let code = match key {
-        KittyKey::Escape => 27,
-        KittyKey::Enter if mods.any() => 13,
-        KittyKey::Tab if mods.any() => 9,
-        KittyKey::Backspace if mods.any() => 127,
-        KittyKey::Space if mods.non_shift() => 32,
-        KittyKey::Unicode(ch) if mods.non_shift() => u32::from(ch),
-        KittyKey::UnicodeWithText { base, .. } if mods.non_shift() => u32::from(base),
-        _ => return None,
-    };
-    Some(csi_u(code, mods))
 }
 
 /// What the terminal should send *instead of* `legacy` — the bytes its VTE
@@ -420,15 +319,6 @@ impl AltEscapeJoiner {
 
     pub fn is_holding(&self) -> bool {
         self.holding
-    }
-}
-
-fn csi_u(code: u32, mods: Modifiers) -> Vec<u8> {
-    let parameter = mods.parameter();
-    if parameter == 1 {
-        format!("\x1b[{code}u").into_bytes()
-    } else {
-        format!("\x1b[{code};{parameter}u").into_bytes()
     }
 }
 

@@ -1,29 +1,56 @@
 use gtk4::{gdk, glib, graphene, pango, prelude::*, subclass::prelude::*};
+use jterm_engine::archived_text::{is_literal_archive_unicode, literal_text_columns};
 use std::cell::{Cell, RefCell};
 
-pub const MAX_LIVE_OUTPUT_BYTES: usize = 82;
+const MAX_LIVE_OUTPUT_ROWS: usize = 8;
+pub const MAX_LIVE_OUTPUT_BYTES: usize = MAX_LIVE_OUTPUT_ROWS * 258;
 
-/// A complete, short physical row from command capture. The host still has
-/// to prove that this exact row is visible in the terminal's current grid.
-pub fn captured_live_row(capture: &str, columns: usize) -> Option<&str> {
+/// Complete, unwrapped rows from the same command capture. The host checks
+/// that these rows are visible with default styling in its retained grid.
+pub fn captured_live_rows(capture: &str, columns: usize) -> Option<Vec<CapturedLiveRow<'_>>> {
     if capture.len() > MAX_LIVE_OUTPUT_BYTES {
         return None;
     }
-    let text = capture.strip_suffix("\r\n")?;
-    (!text.is_empty()
-        && text.len() < columns
-        && text.trim() == text
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b" _-=+,%!?()[]'\"".contains(&byte)))
-    .then_some(text)
+    let mut rows = Vec::new();
+    for text in capture.strip_suffix("\r\n")?.split("\r\n") {
+        let width = literal_text_columns(text);
+        if rows.len() == MAX_LIVE_OUTPUT_ROWS
+            || width == 0
+            || width >= columns
+            || text.trim() != text
+            || !text.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || " _-=+,%!?()[]'\"".contains(character)
+                    || is_literal_archive_unicode(character)
+            })
+        {
+            return None;
+        }
+        rows.push(CapturedLiveRow {
+            text,
+            columns: width,
+        });
+    }
+    Some(rows)
 }
 
-/// A passive row presentation for the actual running card. It holds neither
-/// terminal state nor a PTY and does not participate in input or selection.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CapturedLiveRow<'a> {
+    pub text: &'a str,
+    pub columns: usize,
+}
+
+pub struct LiveOutputRow<'a> {
+    pub text: &'a str,
+    pub area: gdk::Rectangle,
+}
+
+/// A passive presentation of visible command output. The native terminal
+/// remains the source of selection, input and accessibility.
 pub struct LiveOutputView {
     native: NativeOutputClip,
-    label: gtk4::Label,
+    overlay: gtk4::Fixed,
+    labels: RefCell<Vec<gtk4::Label>>,
     css: gtk4::CssProvider,
     colors: Cell<Option<(gdk::RGBA, gdk::RGBA)>>,
 }
@@ -36,33 +63,28 @@ impl LiveOutputView {
             .imp()
             .terminal
             .replace(Some(terminal.as_ref().clone()));
-        let label = gtk4::Label::builder()
+        let overlay = gtk4::Fixed::builder()
             .accessible_role(gtk4::AccessibleRole::Presentation)
             .can_target(false)
             .focusable(false)
-            .halign(gtk4::Align::Start)
-            .valign(gtk4::Align::Start)
-            .xalign(0.0)
+            .hexpand(true)
+            .vexpand(true)
             .visible(false)
             .build();
-        label.set_widget_name("shared-live-command-output");
-        let css = gtk4::CssProvider::new();
-        #[allow(deprecated)] // Local provider, without a display-global selector.
-        label
-            .style_context()
-            .add_provider(&css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        overlay.set_widget_name("shared-live-command-output");
         let clip = native.downgrade();
-        label.connect_visible_notify(move |label| {
-            if !label.get_visible() {
+        overlay.connect_visible_notify(move |overlay| {
+            if !overlay.get_visible() {
                 if let Some(clip) = clip.upgrade() {
-                    clip.set_excluded_area(None);
+                    clip.set_excluded_areas(&[]);
                 }
             }
         });
         Self {
             native,
-            label,
-            css,
+            overlay,
+            labels: RefCell::new(Vec::new()),
+            css: gtk4::CssProvider::new(),
             colors: Cell::new(None),
         }
     }
@@ -71,42 +93,70 @@ impl LiveOutputView {
         self.native.upcast_ref()
     }
 
-    pub fn widget(&self) -> &gtk4::Label {
-        &self.label
+    pub fn widget(&self) -> &gtk4::Fixed {
+        &self.overlay
     }
 
     pub fn clear(&self) {
-        self.label.set_visible(false);
+        self.overlay.set_visible(false);
     }
 
     pub fn present(
         &self,
-        text: &str,
-        area: gdk::Rectangle,
+        rows: &[LiveOutputRow<'_>],
         font: &pango::FontDescription,
         foreground: gdk::RGBA,
         background: gdk::RGBA,
     ) {
-        let attributes = pango::AttrList::new();
-        attributes.insert(pango::AttrFontDesc::new(font));
-        self.label.set_attributes(Some(&attributes));
-        self.label.set_text(text);
-        let layout = self.label.layout();
-        let (text_width, text_height) = layout.pixel_size();
-        if text_width > area.width() || text_height > area.height() {
+        if rows.is_empty() || rows.len() > MAX_LIVE_OUTPUT_ROWS {
             self.clear();
             return;
         }
+        let attributes = pango::AttrList::new();
+        attributes.insert(pango::AttrFontDesc::new(font));
         if self.colors.replace(Some((foreground, background))) != Some((foreground, background)) {
             self.css.load_from_string(&format!(
                 "label {{ color: {foreground}; background-color: {background}; }}"
             ));
         }
-        self.label.set_margin_start(area.x());
-        self.label.set_margin_top(area.y());
-        self.label.set_size_request(area.width(), area.height());
-        self.native.set_excluded_area(Some(area));
-        self.label.set_visible(true);
+        let mut labels = self.labels.borrow_mut();
+        while labels.len() < rows.len() {
+            let label = gtk4::Label::builder()
+                .accessible_role(gtk4::AccessibleRole::Presentation)
+                .can_target(false)
+                .focusable(false)
+                .xalign(0.0)
+                .build();
+            #[allow(deprecated)] // Scope the color provider to this label.
+            label
+                .style_context()
+                .add_provider(&self.css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
+            self.overlay.put(&label, 0.0, 0.0);
+            labels.push(label);
+        }
+        let mut areas = Vec::with_capacity(rows.len());
+        let mut previous_bottom = 0;
+        for (label, row) in labels.iter().zip(rows) {
+            let area = row.area;
+            label.set_attributes(Some(&attributes));
+            label.set_text(row.text);
+            let (width, height) = label.layout().pixel_size();
+            if width > area.width() || height > area.height() || area.y() < previous_bottom {
+                self.clear();
+                return;
+            }
+            label.set_size_request(area.width(), area.height());
+            self.overlay
+                .move_(label, f64::from(area.x()), f64::from(area.y()));
+            label.set_visible(true);
+            previous_bottom = area.y().saturating_add(area.height());
+            areas.push(area);
+        }
+        for label in &labels[rows.len()..] {
+            label.set_visible(false);
+        }
+        self.native.set_excluded_areas(&areas);
+        self.overlay.set_visible(true);
     }
 }
 
@@ -116,8 +166,12 @@ glib::wrapper! {
 }
 
 impl NativeOutputClip {
-    fn set_excluded_area(&self, area: Option<gdk::Rectangle>) {
-        if self.imp().excluded.replace(area) != area {
+    fn set_excluded_areas(&self, areas: &[gdk::Rectangle]) {
+        if self.imp().excluded.borrow().as_slice() != areas {
+            let mut excluded = self.imp().excluded.borrow_mut();
+            excluded.clear();
+            excluded.extend_from_slice(areas);
+            drop(excluded);
             self.queue_draw();
         }
     }
@@ -129,7 +183,7 @@ mod clip {
     #[derive(Default)]
     pub struct NativeOutputClip {
         pub(super) terminal: RefCell<Option<gtk4::Widget>>,
-        pub(super) excluded: Cell<Option<gdk::Rectangle>>,
+        pub(super) excluded: RefCell<Vec<gdk::Rectangle>>,
     }
 
     #[glib::object_subclass]
@@ -158,10 +212,11 @@ mod clip {
                 return;
             };
             let widget = self.obj();
-            let Some(area) = self.excluded.get() else {
+            let excluded = self.excluded.borrow();
+            if excluded.is_empty() {
                 widget.snapshot_child(terminal, snapshot);
                 return;
-            };
+            }
             // Reuse the native render node around the projected cells. This
             // leaves the real GTK backdrop visible even on a transparent tab.
             let original = gtk4::Snapshot::new();
@@ -171,16 +226,7 @@ mod clip {
             };
             let width = widget.width();
             let height = widget.height();
-            let left = area.x().clamp(0, width);
-            let top = area.y().clamp(0, height);
-            let right = (area.x() + area.width()).clamp(left, width);
-            let bottom = (area.y() + area.height()).clamp(top, height);
-            for (x, y, width, height) in [
-                (0, 0, width, top),
-                (0, bottom, width, height - bottom),
-                (0, top, left, bottom - top),
-                (right, top, width - right, bottom - top),
-            ] {
+            let draw = |x, y, width, height| {
                 if width > 0 && height > 0 {
                     snapshot.push_clip(&graphene::Rect::new(
                         x as f32,
@@ -191,34 +237,64 @@ mod clip {
                     snapshot.append_node(&original);
                     snapshot.pop();
                 }
+            };
+            let mut previous_bottom = 0;
+            for area in excluded.iter() {
+                let left = area.x().clamp(0, width);
+                let top = area.y().clamp(previous_bottom, height);
+                let right = area.x().saturating_add(area.width()).clamp(left, width);
+                let bottom = area.y().saturating_add(area.height()).clamp(top, height);
+                draw(0, previous_bottom, width, top - previous_bottom);
+                draw(0, top, left, bottom - top);
+                draw(right, top, width - right, bottom - top);
+                previous_bottom = bottom;
             }
+            draw(0, previous_bottom, width, height - previous_bottom);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::captured_live_row;
+    use super::{captured_live_rows, CapturedLiveRow};
 
     #[test]
-    fn only_projects_a_complete_unwrapped_plain_row() {
+    fn only_projects_complete_unwrapped_plain_rows() {
         assert_eq!(
-            captured_live_row("work complete\r\n", 40),
-            Some("work complete")
+            captured_live_rows("work in progress\r\n42 files\r\n", 40),
+            Some(vec![
+                CapturedLiveRow {
+                    text: "work in progress",
+                    columns: 16
+                },
+                CapturedLiveRow {
+                    text: "42 files",
+                    columns: 8
+                },
+            ])
+        );
+        assert_eq!(
+            captured_live_rows("测试 e\u{301} 👩‍💻\r\n", 20),
+            Some(vec![CapturedLiveRow {
+                text: "测试 e\u{301} 👩‍💻",
+                columns: 9
+            }]),
         );
         for capture in [
             "work in progress",
-            "one\r\ntwo\r\n",
+            "one\r\ntwo",
             "https://example.test\r\n",
             "\x1b[31mcolored\r\n",
             "progress\rrewritten\r\n",
             "misspaced \r\n",
             "\r\n",
-            "测试\r\n",
+            "spoof\u{202e}text\r\n",
             "tabs\tmove\r\n",
         ] {
-            assert_eq!(captured_live_row(capture, 40), None, "{capture:?}");
+            assert_eq!(captured_live_rows(capture, 40), None, "{capture:?}");
         }
-        assert_eq!(captured_live_row("full\r\n", 4), None);
+        assert_eq!(captured_live_rows("full\r\n", 4), None);
+        assert_eq!(captured_live_rows("测试\r\n", 4), None);
+        assert!(captured_live_rows(&"a\r\n".repeat(super::MAX_LIVE_OUTPUT_ROWS + 1), 40).is_none());
     }
 }

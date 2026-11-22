@@ -461,6 +461,8 @@ dependencies = [
 name = "jterm_gtk_view"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
+ "futures-util",
  "gtk4",
  "jterm_engine",
  "jterm_runtime",
