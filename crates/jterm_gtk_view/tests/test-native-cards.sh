@@ -38,11 +38,17 @@ cases=(
   shared_finished_output_preserves_search_filter_and_cross_card_copy
   shared_finished_chat_preserves_capsule_search_filter_and_copy
 )
-for case in "${cases[@]}"; do
-  test_name="block_view::cross_selection::tests::$case"
+run_case() {
+  local scenario=$1
+  shift
+  local test_name="block_view::cross_selection::tests::$scenario"
   "$test_binary" --list | grep -Fx "$test_name: test"
-  dbus-run-session -- xvfb-run -a env GSK_RENDERER=cairo \
-    JTERM_SHARED_LIVE_OUTPUT=1 JTERM_SHARED_FINISHED_OUTPUT=1 JTERM_SHARED_FINISHED_COMMANDS=1 \
+  dbus-run-session -- xvfb-run -a env -u JTERM_SHARED_FINISHED_COMMANDS \
+    -u JTERM_SHARED_FINISHED_OUTPUT GSK_RENDERER=cairo JTERM_SHARED_LIVE_OUTPUT=1 "$@" \
     "$test_binary" --exact "$test_name" --ignored --test-threads=1 \
-    | tee "$output/$case.log"
+    | tee "$output/$scenario.log"
+}
+for scenario in "${cases[@]}"; do
+  run_case "$scenario"
 done
+run_case shared_finished_command_preserves_search_and_cross_card_copy JTERM_SHARED_FINISHED_OUTPUT=0

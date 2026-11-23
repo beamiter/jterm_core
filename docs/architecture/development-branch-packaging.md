@@ -140,13 +140,14 @@ waiting shared shell. `JTERM_SHARED_RUNTIME=0`, Flatpak and featureless builds
 select the existing VTE editor backend. Shell integrations, remote sessions
 and other terminal modes can also use VTE.
 
-Set `JTERM_SHARED_FINISHED_COMMANDS=1` for eligible shell-reported Block and
-Chat commands. Set `JTERM_SHARED_FINISHED_OUTPUT=1` alongside it to render
-eligible completed output in the shared text view. A bounded document can
-retain grapheme clusters, supported ANSI styles, OSC 8 targets and recognized
-plain HTTPS or HTTP links. Native GTK tests cover fold-aware find, output
-filters, cross-card clipboard and rebuilding cards after Undo. Captures outside
-the document profile use VTE. The `JTERM_SHARED_LIVE_OUTPUT=1` candidate paints
+Forge and Anvil builds with `shared-terminal` use the GTK document view for
+eligible completed Block and Chat commands and output. A bounded document
+retains supported ANSI styles, grapheme clusters, OSC 8 targets and plain
+HTTPS and HTTP links. The native tests cover fold-aware find, output filters,
+cross-card clipboard and rebuilding cards after Undo. Captures outside the
+document profile use VTE. `JTERM_SHARED_FINISHED_OUTPUT=0` selects VTE for
+output. `JTERM_SHARED_FINISHED_COMMANDS=0` selects VTE for the entire card.
+The `JTERM_SHARED_LIVE_OUTPUT=1` candidate paints
 verified rows during a running command while the existing VTE terminal owns
 the session and continues to handle input and alternate screens.
 

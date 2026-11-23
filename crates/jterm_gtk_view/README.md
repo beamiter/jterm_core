@@ -111,52 +111,34 @@ dbus-run-session -- xvfb-run -a cargo test --offline --locked --release \
 
 ## Completed command rows
 
-For a candidate build, set `JTERM_SHARED_FINISHED_COMMANDS=1` when launching
-Forge or Anvil. Newly captured Block and Chat commands use the shared command
-view when the shell reports an exact, short, single-line command supported
-by the view. It retains syntax colors and participates in per-card and
-cross-card search, native selection, and bounded mixed-surface copying.
-The URL, path, multiline, and restored command rows continue to use their
-existing renderers.
-
-From `jterm_core`, validate the mapped Block journey with the candidate
-dependency and Xvfb:
-
-```sh
-JTERM_SHARED_FINISHED_COMMANDS=1 dbus-run-session -- xvfb-run -a \
-  python3 scripts/family-cargo.py --forge-shared-terminal forge test --release --lib \
-  block_view::cross_selection::tests::shared_finished_command_preserves_search_and_cross_card_copy -- --ignored --exact
-JTERM_SHARED_FINISHED_COMMANDS=1 dbus-run-session -- xvfb-run -a \
-  python3 scripts/family-cargo.py --anvil-shared-terminal anvil test --release --bin anvil \
-  block_view::cross_selection::tests::shared_finished_command_preserves_search_and_cross_card_copy -- --ignored --exact
-```
-
+Forge and Anvil builds with `shared-terminal` use a shared command view for
+eligible shell-reported Block and Chat commands. The view preserves syntax
+colors, native selection, per-card search and bounded cross-card copying.
+Set `JTERM_SHARED_FINISHED_COMMANDS=0` to use VTE for the entire card.
 
 ## Completed output rows
 
-Set both `JTERM_SHARED_FINISHED_COMMANDS=1` and
-`JTERM_SHARED_FINISHED_OUTPUT=1` on a candidate launch. Eligible foreground
-Block and Chat records present their output in the shared GTK document
-view. The finalized capture must fit within twelve logical lines, two KiB
-of visible text, eight KiB of decorated data, and the configured card
-viewport. The shared archive projection preserves supported ANSI palette,
-indexed and truecolor styles plus bold, italic, underline and strike as
-byte ranges on the exact visible text. Links, paths, non-ASCII clusters,
-images, partial captures, cursor controls and unsupported styles such as
-blink continue to use the existing archive renderer. The retained payload
+The shared GTK document view displays eligible finalized output. Its capture
+can contain up to twelve logical lines, two KiB of visible text, and eight KiB
+of styled data. It also fits within the configured card viewport. The view
+preserves supported ANSI styles, grapheme clusters, OSC 8 links, and plain
+HTTP and HTTPS links. Images, partial captures, cursor controls and
+unsupported styles use the compatibility renderer. The retained payload
 supplies copy, export and filtering.
 
-Run the same Xvfb commands above with both environment variables set and
-the test filter
-`block_view::cross_selection::tests::shared_finished_output_preserves_search_filter_and_cross_card_copy`.
-For Chat, use
-`block_view::cross_selection::tests::shared_finished_chat_preserves_capsule_search_filter_and_copy`
-to check that the content-sized command capsule and result keep their layout.
+Set `JTERM_SHARED_FINISHED_OUTPUT=0` to use VTE for completed output.
+Run the native GTK card fixture from either application checkout against
+its locked core. It tests the default with both overrides unset.
 
-The fixtures send real OSC 133 completion data through the application
-PTY readers and check six mapped styled lines, fold-aware find, native
-clipboard, style-preserving filtering, mixed copy, and URL and unsupported
-ANSI fallbacks.
+```sh
+core=$(python3 scripts/shared-core-path.py)
+bash "$core/crates/jterm_gtk_view/tests/test-native-cards.sh" forge /tmp/forge-card-evidence
+```
+
+Use `anvil` as the first argument in an Anvil checkout. The fixtures feed OSC
+133 completion data through the PTY readers and check mapped styled lines,
+fold-aware search, filtering, mixed clipboard selection and compatibility
+rendering for unsupported ANSI.
 
 ## Running command output
 
