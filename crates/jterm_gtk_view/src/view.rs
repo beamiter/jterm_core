@@ -170,7 +170,9 @@ impl PresentedLink {
 
 impl TerminalView {
     pub(crate) fn new(theme: Theme) -> Self {
+        let buffer = gtk4::TextBuffer::builder().enable_undo(false).build();
         let widget = gtk4::TextView::builder()
+            .buffer(&buffer)
             .editable(false)
             .cursor_visible(false)
             .monospace(true)
@@ -360,13 +362,19 @@ impl TerminalView {
             } else {
                 None
             };
-        let (current, install) = match (previous, updates) {
+        let current = match (previous, updates) {
             (Some(mut previous), Some(updates)) => {
                 previous.update_live(frame, margin_gaps, &theme, updates);
-                let install = previous.buffer != self.widget.buffer();
-                (previous, install)
+                previous
             }
-            _ => (Presentation::new(frame, margin_gaps, history, &theme), true),
+            (previous, _) => {
+                // GTK's input-method callback can retain line layout across a
+                // paint. Editing the mounted buffer lets GTK invalidate it.
+                if let Some(previous) = previous {
+                    previous.remove_tags();
+                }
+                Presentation::new(self.widget.buffer(), frame, margin_gaps, history, &theme)
+            }
         };
         let caret = current.rows.iter().enumerate().find_map(|(row, painted)| {
             current
@@ -380,11 +388,7 @@ impl TerminalView {
                 current.buffer.place_cursor(&caret);
             }
         }
-        let buffer = current.buffer.clone();
         self.presentation.replace(Some(current));
-        if install {
-            self.widget.set_buffer(Some(&buffer));
-        }
     }
 
     pub(crate) fn link_at(
@@ -699,6 +703,15 @@ fn live_update_preserves_unchanged_buffer_rows_and_moves_the_caret() {
         None,
     );
     let first = view.widget.buffer();
+    let window = gtk4::Window::builder()
+        .default_width(420)
+        .default_height(260)
+        .child(&view.widget)
+        .build();
+    window.present();
+    view.widget.grab_focus();
+    let context = gtk4::glib::MainContext::default();
+    while context.iteration(false) {}
     let unchanged_tags = first.start_iter().tags();
     let initial = first.text(&first.start_iter(), &first.end_iter(), true);
     assert_eq!(initial.lines().next().unwrap().trim_end(), "stable");
@@ -729,7 +742,25 @@ fn live_update_preserves_unchanged_buffer_rows_and_moves_the_caret() {
         None,
         None,
     );
-    assert_ne!(view.widget.buffer(), first);
+    while context.iteration(false) {}
+    assert_eq!(view.widget.buffer(), first);
+    let alternate = first.text(&first.start_iter(), &first.end_iter(), true);
+    assert!(alternate.lines().next().unwrap().starts_with("other"));
+
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    terminal.resize(6, 16).unwrap();
+    view.present(
+        &terminal.frame().unwrap(),
+        terminal.live_margin_gaps(),
+        None,
+        None,
+    );
+    while context.iteration(false) {}
+    assert_eq!(view.widget.buffer(), first);
+    assert_eq!(first.line_count(), 6);
+    let primary = first.text(&first.start_iter(), &first.end_iter(), true);
+    assert!(primary.lines().next().unwrap().starts_with("stable"));
+    window.close();
 }
 
 #[cfg(test)]
@@ -794,12 +825,13 @@ fn live_updates(before: &CellFrame, after: &CellFrame, changed_gaps: u128) -> Op
 
 impl Presentation {
     fn new(
+        buffer: gtk4::TextBuffer,
         frame: &CellFrame,
         margin_gaps: u128,
         history: Option<&HistoryPage>,
         theme: &PaintTheme<'_>,
     ) -> Self {
-        let buffer = gtk4::TextBuffer::new(None);
+        buffer.set_text("");
         let font = gtk4::TextTag::builder()
             .font_desc(&theme.configured.font)
             .build();
@@ -835,6 +867,14 @@ impl Presentation {
         }
     }
 
+    fn remove_tags(&self) {
+        let table = self.buffer.tag_table();
+        table.remove(&self.font);
+        for tag in self.rows.iter().flat_map(|row| &row.tags) {
+            table.remove(tag);
+        }
+    }
+
     fn update_live(
         &mut self,
         frame: &CellFrame,
@@ -847,7 +887,8 @@ impl Presentation {
         let mut targets = HashMap::new();
         for index in indices {
             let Some(mut start) = self.buffer.iter_at_line(index as i32) else {
-                *self = Self::new(frame, margin_gaps, None, theme);
+                self.remove_tags();
+                *self = Self::new(self.buffer.clone(), frame, margin_gaps, None, theme);
                 return;
             };
             let mut end = start;
