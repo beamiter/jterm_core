@@ -133,21 +133,24 @@ impl<P: Pty> TranscriptView<P> {
             .inspect(|terminal| terminal.primary_text_range(start, end).ok())
     }
 
-    /// The exact visual row for a still-reachable command. Live rows share
-    /// the tail scroll position. Alternate screens have no transcript rows.
+    /// The exact visual row where the retained command began. The heading
+    /// can still be shown when other ends of the range have been clipped or
+    /// discarded. The full source range independently verifies all endpoints.
     pub fn zone_scroll_row(&self, id: u64) -> Option<usize> {
-        let zone = self.zones.borrow().completed.get(&id)?.clone();
-        let [start, ..] = self.coordinates(&zone)?;
+        let start = self.heading(id)?;
         self.terminal
             .inspect(|terminal| Some(terminal.history_layout().ok()?.row_at(start)))
     }
 
     pub fn reveal_zone(&self, id: u64) -> bool {
-        let zone = self.zones.borrow().completed.get(&id).cloned();
-        let Some([start, ..]) = zone.as_ref().and_then(|zone| self.coordinates(zone)) else {
-            return false;
-        };
-        self.terminal.reveal_transcript_source(start)
+        self.heading(id)
+            .is_some_and(|start| self.terminal.reveal_transcript_source(start))
+    }
+
+    fn heading(&self, id: u64) -> Option<HistoryAnchor> {
+        let start = self.zones.borrow().completed.get(&id)?.prompt.start;
+        self.terminal
+            .inspect(|terminal| terminal.locate_transcript_source(start))
     }
 
     /// GTK widget-relative hit testing for the actual painted frame. A

@@ -1845,16 +1845,12 @@ impl Terminal {
             0
         };
         self.begin_revision(revision);
+        self.invalidate_clipped_sources(cols, transferred);
         if let Some(change) = self.screen.resize_geometry(rows, cols, transferred, || {
             RowSources::allocate(&mut self.row_sources)
         }) {
             for line in change.transferred {
                 self.append_history(line);
-            }
-            if change.old_cols > change.cols {
-                // Shortening an existing row can discard part of a source,
-                // including the partner cell of a wide glyph.
-                self.renew_live_source_rows();
             }
         }
         self.layout = layout;

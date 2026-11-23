@@ -1752,6 +1752,26 @@ mod transcript_tests {
         terminal.ingest(b"\x1b[3J").unwrap();
         assert!(view.source_zone(7).is_none());
         assert!(!view.reveal_zone(7));
+
+        terminal.resize(12, 4).unwrap();
+        terminal.ingest(b"\r\n").unwrap();
+        view.begin_restored_prompt(8);
+        terminal.ingest(b"prompt> ").unwrap();
+        view.end_prompt();
+        terminal.ingest(b"yes\r\n").unwrap();
+        view.begin_output(Some(8));
+        terminal
+            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nclipped row")
+            .unwrap();
+        view.end_output(Some(8), 64);
+        let restored = view.source_zone(8).unwrap();
+        assert_eq!(restored.origin, TranscriptZoneOrigin::Restored);
+        terminal.resize(6, 4).unwrap();
+        assert!(view.source_zone(8).is_none());
+        assert!(view.output_text(8).is_none());
+        assert!(view.reveal_zone(8));
+        next_frames();
+        assert_eq!(hit_first_cell(), Some(restored.prompt.start));
         window.close();
     }
 }

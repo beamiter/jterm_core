@@ -124,6 +124,35 @@ impl Terminal {
         }
     }
 
+    pub(super) fn invalidate_clipped_sources(&mut self, columns: usize, transfer: usize) {
+        let sources = &mut self.row_sources;
+        if sources.is_none() || columns >= self.screen.grid.cols() {
+            return;
+        }
+        for (grid, start) in [
+            (&mut self.screen.grid, transfer),
+            (&mut self.screen.alt_grid, 0),
+        ] {
+            for row in start..grid.rows() {
+                let clipped = grid[row][columns..]
+                    .iter()
+                    .any(|cell| !cell.is_reflow_trimmable_blank())
+                    || grid
+                        .cluster_row(row)
+                        .is_some_and(|clusters| clusters.end() > columns)
+                    || grid
+                        .underline_color_runs(row)
+                        .any(|run| usize::from(run.end) > columns);
+                // An unchanged source row keeps its address when shrinking
+                // only erases padding. Full outgoing rows archive at their
+                // original width and keep their identities too.
+                if clipped {
+                    grid.row_ids_mut()[row] = RowSources::allocate(sources);
+                }
+            }
+        }
+    }
+
     pub(super) fn renew_active_source_rows(&mut self) {
         if self.row_sources.is_some() {
             for id in self.screen.grid.row_ids_mut() {
@@ -211,11 +240,29 @@ mod tests {
     }
 
     #[test]
+    fn width_resize_keeps_unclipped_rows_and_retires_clipped_ones() {
+        let mut terminal = Terminal::new(3, 16).unwrap();
+        terminal.track_transcript_rows();
+        terminal.feed(b"short").unwrap();
+        let safe = terminal.transcript_cursor().unwrap();
+        terminal.feed(b"\r\nprinted trail").unwrap();
+        let lost = terminal.transcript_cursor().unwrap();
+        terminal.resize(3, 8).unwrap();
+        assert_eq!(terminal.locate_transcript_source(safe).unwrap().column, 5);
+        assert!(terminal.locate_transcript_source(lost).is_none());
+        terminal.resize(3, 16).unwrap();
+        assert!(terminal.locate_transcript_source(lost).is_none());
+        assert!(terminal.locate_transcript_source(safe).is_some());
+    }
+
+    #[test]
     fn archive_reflow_hits_original_cells_after_live_width_changes() {
         let mut terminal = Terminal::new(2, 4).unwrap();
         terminal.track_transcript_rows();
         let first = terminal.transcript_cursor().unwrap();
-        terminal.feed("a界bcdef\r\nmore\r\nend".as_bytes()).unwrap();
+        terminal
+            .feed("a界bcdef\r\nmore\r\nend!".as_bytes())
+            .unwrap();
         let live = terminal.transcript_cursor().unwrap();
         terminal.resize(2, 3).unwrap();
 
