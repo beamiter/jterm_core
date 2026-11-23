@@ -9,6 +9,7 @@ use jterm_engine::{
     mouse::MouseInput,
     terminal::{Terminal, WindowUpdates},
 };
+use jterm_runtime::exit_status::PtyExit;
 use std::{
     cell::{Cell, OnceCell, RefCell},
     rc::Rc,
@@ -44,7 +45,7 @@ pub trait Pty: 'static {
     fn start_reader(
         &self,
         output: impl FnMut(Vec<u8>) + 'static,
-        exited: impl FnOnce(i32) + 'static,
+        exited: impl FnOnce(PtyExit) + 'static,
     ) -> Result<(), String>;
 }
 
@@ -90,7 +91,7 @@ pub enum PaneEvent {
     Output,
     TitleChanged(String),
     Bell,
-    Exited(i32),
+    Exited(PtyExit),
 }
 
 type OnClose = Box<dyn Fn(&gtk4::Widget)>;
@@ -366,9 +367,9 @@ impl<P: Pty> TerminalPane<P> {
                             session.feed_legacy(&bytes);
                         }
                     },
-                    move |code| {
+                    move |status| {
                         if let Some(session) = for_exit.upgrade() {
-                            session.report_exit(code);
+                            session.report_exit(status);
                         }
                     },
                 )?;
@@ -431,21 +432,21 @@ impl<P: Pty> TerminalPane<P> {
                 return;
             }
         };
-        if update.output_changed || update.exit_code.is_some() || update.stopped {
+        if update.output_changed || update.exit_status.is_some() || update.stopped {
             self.dirty.set(true);
         }
         if update.output_changed {
             self.notify(PaneEvent::Output);
         }
         self.notify_window(update.window);
-        if let Some(code) = update.exit_code {
-            self.report_exit(code);
+        if let Some(error) = update.failure {
+            self.report(&format!("Terminal runtime failure: {error}"));
+        }
+        if let Some(status) = update.exit_status {
+            self.report_exit(status);
         }
         if update.stopped && !self.exited.replace(true) {
             self.set_input_focus(false);
-        }
-        if let Some(error) = update.failure {
-            self.report(&format!("Terminal runtime failure: {error}"));
         }
         if self.dirty.get()
             && self.view.widget.is_mapped()
@@ -455,11 +456,16 @@ impl<P: Pty> TerminalPane<P> {
         }
     }
 
-    fn report_exit(&self, code: i32) {
+    fn report_exit(&self, status: PtyExit) {
         if !self.exited.replace(true) {
             self.set_input_focus(false);
-            self.report(&format!("Shell exited ({code})"));
-            self.notify(PaneEvent::Exited(code));
+            let mut message = format!("Shell exited ({})", status.code);
+            if let Some(notice) = status.tail.notice() {
+                message.push_str(". ");
+                message.push_str(notice);
+            }
+            self.report(&message);
+            self.notify(PaneEvent::Exited(status));
         }
     }
 

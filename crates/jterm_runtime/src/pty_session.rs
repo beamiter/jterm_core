@@ -4,6 +4,7 @@
 use crate::child_lifecycle::{
     observe_child_exit, ChildExitOutcome, ChildLifecycle, EscalationPolicy, ProcessRef,
 };
+use crate::exit_status::{ExitTail, PtyExit};
 use crate::native_pty_launch::{launch_bundled_bash, BundledBash};
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{SessionActor, SessionEvent};
@@ -457,23 +458,34 @@ impl SessionIo {
         self.actor.try_write_owner_prefix(bytes)
     }
 
-    fn read(&mut self, buffer: &mut [u8], exit_code: &mut Option<i32>) -> io::Result<usize> {
+    fn read(
+        &mut self,
+        buffer: &mut [u8],
+        exit_code: &mut Option<i32>,
+        exit_tail: &mut ExitTail,
+    ) -> io::Result<usize> {
         #[cfg(test)]
         if let Some(reader) = &mut self.reader {
             return reader.read(buffer);
         }
         if self.output.position() as usize == self.output.get_ref().len() {
             self.output = Cursor::default();
-            match self.actor.events().try_recv() {
-                Ok(SessionEvent::Output(batch)) => self.output = Cursor::new(batch.into_bytes()),
-                Ok(SessionEvent::Exit(code)) => {
-                    *exit_code = Some(code);
-                    return Ok(0);
-                }
-                Ok(SessionEvent::Error(error)) => return Err(io::Error::other(error)),
-                Err(TryRecvError::Empty) => return Err(io::ErrorKind::WouldBlock.into()),
-                Err(TryRecvError::Disconnected) => {
-                    return Err(io::Error::other("PTY reader disconnected before exit"));
+            loop {
+                match self.actor.events().try_recv() {
+                    Ok(SessionEvent::Output(batch)) => {
+                        self.output = Cursor::new(batch.into_bytes());
+                        break;
+                    }
+                    Ok(SessionEvent::ExitTail(tail)) => *exit_tail = tail,
+                    Ok(SessionEvent::Exit(code)) => {
+                        *exit_code = Some(code);
+                        return Ok(0);
+                    }
+                    Ok(SessionEvent::Error(error)) => return Err(io::Error::other(error)),
+                    Err(TryRecvError::Empty) => return Err(io::ErrorKind::WouldBlock.into()),
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(io::Error::other("PTY reader disconnected before exit"));
+                    }
                 }
             }
         }
@@ -496,6 +508,7 @@ pub struct Session {
     holding_replies: bool,
     exited: bool,
     exit_code: Option<i32>,
+    exit_tail: ExitTail,
     closed: bool,
     read_eof: bool,
     write_error: Option<String>,
@@ -693,6 +706,7 @@ impl Session {
             holding_replies: false,
             exited: false,
             exit_code: None,
+            exit_tail: ExitTail::Complete,
             closed: false,
             read_eof: false,
             write_error: None,
@@ -730,6 +744,13 @@ impl Session {
 
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    pub fn exit_status(&self) -> Option<PtyExit> {
+        self.exit_code.map(|code| PtyExit {
+            code,
+            tail: self.exit_tail,
+        })
     }
 
     pub fn enable_underline_colors(&mut self) {
@@ -1150,12 +1171,11 @@ impl Session {
             }
             let mut bytes = [0; 4096];
             let remaining = (READ_BUDGET - total).min(bytes.len());
-            match self
-                .io
-                .as_mut()
-                .ok_or("reader closed")?
-                .read(&mut bytes[..remaining], &mut self.exit_code)
-            {
+            match self.io.as_mut().ok_or("reader closed")?.read(
+                &mut bytes[..remaining],
+                &mut self.exit_code,
+                &mut self.exit_tail,
+            ) {
                 Ok(0) => {
                     self.read_eof = true;
                     self.exited |= self.exit_code.is_some();

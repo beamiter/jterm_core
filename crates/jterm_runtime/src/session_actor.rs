@@ -5,8 +5,11 @@
 //! apply ordered output batches to their existing terminal owner.
 
 use crate::{
+    exit_status::ExitTail,
     output_batch::{OutputBuffer, OutputSource},
-    pty_reader::{poll_reader, run_observed, shutdown_pipe, PtyReadEvent, ReaderPoll},
+    pty_reader::{
+        drain_exit_tail, poll_reader, run_observed, shutdown_pipe, PtyReadEvent, ReaderPoll,
+    },
     runtime_wake::WakeSink,
 };
 use crossbeam_channel::{bounded, select_biased, Receiver, Sender};
@@ -95,57 +98,25 @@ impl WorkerEvents {
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
     Output(OutputBuffer),
+    ExitTail(ExitTail),
     Exit(i32),
     Error(String),
 }
 
-// An exited leader may leave bytes readable after the ordinary 128 KiB
-// batch cut-off. Bound the final drain by bytes and stop on EOF, WouldBlock
-// or Hangup. Existing blocking event sends and read EINTR retries mean this
-// is not a wall-clock bound on Exit delivery.
-const EXIT_DRAIN_BYTE_CAP: usize = 1024 * 1024;
-
 fn drain_exited_pty_output(
     source: &mut OutputSource,
     buffer: &mut [u8],
-    mut read: impl FnMut(&mut [u8]) -> Result<ReadOutcome, String>,
+    read: impl FnMut(&mut [u8]) -> Result<ReadOutcome, String>,
     mut emit: impl FnMut(SessionEvent) -> bool,
-    mut cancelled: impl FnMut() -> bool,
+    cancelled: impl FnMut() -> bool,
 ) -> bool {
-    let mut drained = 0usize;
-    loop {
-        if cancelled() {
-            return false;
-        }
-        if drained == EXIT_DRAIN_BYTE_CAP {
-            return emit(SessionEvent::Error(format!(
-                "PTY exit output drain reached the {EXIT_DRAIN_BYTE_CAP}-byte limit; remaining output may be omitted"
-            )));
-        }
-        let available = buffer.len().min(EXIT_DRAIN_BYTE_CAP - drained);
-        match read(&mut buffer[..available]) {
-            Ok(ReadOutcome::Data(0)) => {
-                return emit(SessionEvent::Error(
-                    "PTY exit output drain returned zero bytes without EOF".to_string(),
-                ));
-            }
-            Ok(ReadOutcome::Data(bytes)) => {
-                let read_at = std::time::Instant::now();
-                drained += bytes;
-                if !emit(SessionEvent::Output(
-                    source.batch(buffer[..bytes].to_vec(), read_at),
-                )) {
-                    return false;
-                }
-            }
-            Ok(ReadOutcome::WouldBlock | ReadOutcome::Eof | ReadOutcome::Hangup) => return true,
-            Err(error) => {
-                return emit(SessionEvent::Error(format!(
-                    "PTY exit output drain failed; remaining output may be omitted: {error}"
-                )));
-            }
-        }
-    }
+    let tail = drain_exit_tail(
+        buffer,
+        read,
+        |bytes, read_at| emit(SessionEvent::Output(source.batch(bytes.to_vec(), read_at))),
+        cancelled,
+    );
+    tail.is_some_and(|tail| tail == ExitTail::Complete || emit(SessionEvent::ExitTail(tail)))
 }
 
 /// 事件 channel 容量上限。每个事件最多 ~128KB(BATCH_SIZE_THRESHOLD),
@@ -734,10 +705,15 @@ impl<T: SessionTransport> SessionActor<T> {
                     retire_input(false);
                     events.send(SessionEvent::Error(format!("PTY reader stopped: {error}")))
                 }
-                PtyReadEvent::Exit(_) => {
+                PtyReadEvent::Exit { tail, .. } => {
                     while !shutdown.load(Ordering::Acquire) {
                         let reaped = transport.lock().try_reap();
                         if let Some(code) = reaped {
+                            if tail != ExitTail::Complete
+                                && !events.send(SessionEvent::ExitTail(tail))
+                            {
+                                return false;
+                            }
                             return events.send(SessionEvent::Exit(code));
                         }
                         if !matches!(

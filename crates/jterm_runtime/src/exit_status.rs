@@ -1,4 +1,42 @@
-//! Human-readable interpretation of shell exit codes.
+//! Shell exit status and the disposition of already-readable final output.
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExitTail {
+    #[default]
+    Complete,
+    LimitReached,
+    ReadFailed,
+}
+
+impl ExitTail {
+    /// A notice for the view that owns the session's exit presentation.
+    pub fn notice(self) -> Option<&'static str> {
+        match self {
+            Self::Complete => None,
+            Self::LimitReached => Some(
+                "The terminal reached its 1 MiB exit output limit. Some final output may have been omitted.",
+            ),
+            Self::ReadFailed => Some(
+                "The terminal could not finish reading exit output. Some final output may have been omitted.",
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtyExit {
+    pub code: i32,
+    pub tail: ExitTail,
+}
+
+impl From<i32> for PtyExit {
+    fn from(code: i32) -> Self {
+        Self {
+            code,
+            tail: ExitTail::Complete,
+        }
+    }
+}
 
 /// Shell convention: exit code 128+n means the process died from signal n.
 /// Name the signals a terminal user actually meets so "exit:130" reads as

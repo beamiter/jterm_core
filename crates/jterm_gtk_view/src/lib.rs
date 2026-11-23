@@ -21,6 +21,7 @@ pub use command::{
 };
 pub use document::DocumentView;
 pub use jterm_engine::authenticated_boundaries;
+pub use jterm_runtime::exit_status::PtyExit;
 #[cfg(target_os = "linux")]
 pub use jterm_runtime::shell_identity::ShellIdentityChannel;
 #[cfg(target_os = "linux")]

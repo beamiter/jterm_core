@@ -1,6 +1,7 @@
 //! Cancellable Unix master I/O and non-consuming child exit observation.
 
 use crate::child_lifecycle::{observe_child_exit, ChildExitOutcome};
+use crate::exit_status::ExitTail;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -124,13 +125,76 @@ fn poll_with(
 
 #[derive(Debug)]
 pub enum PtyReadEvent {
-    Output { bytes: Vec<u8>, read_at: Instant },
-    Exit(ChildExitOutcome),
+    Output {
+        bytes: Vec<u8>,
+        read_at: Instant,
+    },
+    Exit {
+        outcome: ChildExitOutcome,
+        tail: ExitTail,
+    },
     Error(io::Error),
 }
 
 const BATCH_CAP: usize = 1024 * 1024;
+pub(crate) const EXIT_TAIL_BYTES: usize = 1024 * 1024;
 const PROBE_MS: i32 = 200;
+
+/// Drain the PTY bytes already readable after the leader has exited. Read in
+/// 32 KiB chunks for existing application-owned PTYs, including blocking masters.
+/// None means cancellation or consumer loss. The caller still owns child reaping.
+pub fn drain_ready_exit_tail(
+    master: BorrowedFd<'_>,
+    mut emit: impl FnMut(Vec<u8>) -> bool,
+    cancelled: impl FnMut() -> bool,
+) -> Option<ExitTail> {
+    let mut buffer = [0; 32 * 1024];
+    drain_exit_tail(
+        &mut buffer,
+        |buffer| match poll_reader(master.as_raw_fd(), -1, 0)? {
+            ReaderPoll::Data => read_master(master, buffer),
+            ReaderPoll::Timeout => Ok(ReadOutcome::WouldBlock),
+            ReaderPoll::Shutdown => Err(io::Error::other("PTY master is unavailable")),
+        },
+        |bytes, _| emit(bytes.to_vec()),
+        cancelled,
+    )
+}
+
+pub(crate) fn drain_exit_tail<E: std::fmt::Display>(
+    buffer: &mut [u8],
+    mut read: impl FnMut(&mut [u8]) -> Result<ReadOutcome, E>,
+    mut emit: impl FnMut(&[u8], Instant) -> bool,
+    mut cancelled: impl FnMut() -> bool,
+) -> Option<ExitTail> {
+    let mut remaining = EXIT_TAIL_BYTES;
+    while !cancelled() {
+        if remaining == 0 {
+            return Some(ExitTail::LimitReached);
+        }
+        let available = buffer.len().min(remaining);
+        match read(&mut buffer[..available]) {
+            Ok(ReadOutcome::Data(count)) if (1..=available).contains(&count) => {
+                remaining -= count;
+                if !emit(&buffer[..count], Instant::now()) {
+                    return None;
+                }
+            }
+            Ok(ReadOutcome::WouldBlock | ReadOutcome::Eof | ReadOutcome::Hangup) => {
+                return Some(ExitTail::Complete);
+            }
+            Ok(ReadOutcome::Data(count)) => {
+                log::warn!("Invalid PTY exit read length: {count} for a {available}-byte buffer");
+                return Some(ExitTail::ReadFailed);
+            }
+            Err(error) => {
+                log::warn!("Could not finish reading PTY exit output: {error}");
+                return Some(ExitTail::ReadFailed);
+            }
+        }
+    }
+    None
+}
 
 fn observed_exit(child_pid: i32) -> Option<ChildExitOutcome> {
     match observe_child_exit(child_pid, true) {
@@ -180,8 +244,27 @@ pub(crate) fn run_observed(
             }
             if let Some(exit) = observed_exit(child_pid) {
                 retire_input();
-                if publish_ready(master, &mut buffer, true, &mut send).is_some() {
-                    send(PtyReadEvent::Exit(exit));
+                let tail = drain_exit_tail(
+                    &mut buffer,
+                    |buffer| read_master(master, buffer),
+                    |bytes, read_at| {
+                        send(PtyReadEvent::Output {
+                            bytes: bytes.to_vec(),
+                            read_at,
+                        })
+                    },
+                    || {
+                        matches!(
+                            poll_reader(-1, shutdown.as_raw_fd(), 0),
+                            Ok(ReaderPoll::Shutdown)
+                        )
+                    },
+                );
+                if let Some(tail) = tail {
+                    send(PtyReadEvent::Exit {
+                        outcome: exit,
+                        tail,
+                    });
                 }
                 return;
             }
@@ -211,7 +294,7 @@ pub(crate) fn run_observed(
             }
         }
 
-        match publish_ready(master, &mut buffer, false, &mut send) {
+        match publish_ready(master, &mut buffer, &mut send) {
             Some(true) => {
                 hangup_delay = Some(hangup_delay.map_or(50, |delay| (delay * 2).min(250)))
             }
@@ -226,7 +309,6 @@ pub(crate) fn run_observed(
 fn publish_ready(
     master: BorrowedFd<'_>,
     buffer: &mut [u8],
-    final_tail: bool,
     send: &mut impl FnMut(PtyReadEvent) -> bool,
 ) -> Option<bool> {
     let mut bytes = Vec::new();
@@ -251,21 +333,14 @@ fn publish_ready(
             }
         }
     }
-    if final_tail && bytes.len() == BATCH_CAP {
-        log::warn!("PTY natural-exit tail reached 1 MiB; remaining output may be omitted");
-    }
     if let Some(read_at) = read_at {
         if !send(PtyReadEvent::Output { bytes, read_at }) {
             return None;
         }
     }
     if let Some(error) = error {
-        if final_tail {
-            log::warn!("could not finish reading the PTY exit tail: {error}");
-        } else {
-            send(PtyReadEvent::Error(error));
-            return None;
-        }
+        send(PtyReadEvent::Error(error));
+        return None;
     }
     Some(hangup)
 }
@@ -274,6 +349,27 @@ fn publish_ready(
 mod reader_poll_tests {
     use super::*;
     use std::cell::Cell;
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn blocking_exit_tail_drains_only_bytes_already_ready() {
+        let (read, write) = shutdown_pipe().unwrap();
+        let mut write = std::fs::File::from(write);
+        write.write_all(b"exit tail").unwrap();
+        let mut captured = Vec::new();
+        let result = drain_ready_exit_tail(
+            read.as_fd(),
+            |chunk| {
+                captured.extend(chunk);
+                true
+            },
+            || false,
+        );
+        assert_eq!(result, Some(ExitTail::Complete));
+        assert_eq!(captured, b"exit tail");
+        drop(write);
+    }
 
     fn interrupted() -> std::io::Result<i32> {
         Err(std::io::Error::from_raw_os_error(libc::EINTR))

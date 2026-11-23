@@ -1,3 +1,4 @@
+use jterm_runtime::exit_status::PtyExit;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{Receiver, TryRecvError},
@@ -5,7 +6,7 @@ use std::sync::{
 
 pub enum PtyEvent {
     Data(Vec<u8>),
-    Exit(i32),
+    Exit(PtyExit),
 }
 
 /// Main-context receiver for ordered PTY output and the final exit event.
@@ -16,7 +17,7 @@ pub struct PtyDispatch<F, E> {
     exited: Option<E>,
 }
 
-impl<F: FnMut(Vec<u8>), E: FnOnce(i32)> PtyDispatch<F, E> {
+impl<F: FnMut(Vec<u8>), E: FnOnce(PtyExit)> PtyDispatch<F, E> {
     pub fn new(receiver: Receiver<PtyEvent>, output: F, exited: E) -> Self {
         Self {
             receiver,
@@ -69,9 +70,9 @@ impl<F: FnMut(Vec<u8>), E: FnOnce(i32)> PtyDispatch<F, E> {
                 after_output();
                 true
             }
-            Ok(PtyEvent::Exit(code)) => {
+            Ok(PtyEvent::Exit(status)) => {
                 if let Some(exited) = self.exited.take() {
-                    exited(code);
+                    exited(status);
                 }
                 false
             }
@@ -91,13 +92,18 @@ mod tests {
         let (tx, rx) = sync_channel(3);
         tx.send(PtyEvent::Data(b"first".to_vec())).unwrap();
         tx.send(PtyEvent::Data(b"last".to_vec())).unwrap();
-        tx.send(PtyEvent::Exit(7)).unwrap();
+        let exit = PtyExit {
+            code: 7,
+            tail: jterm_runtime::exit_status::ExitTail::LimitReached,
+        };
+        tx.send(PtyEvent::Exit(exit)).unwrap();
         let events = RefCell::new(Vec::new());
         let mut dispatch = PtyDispatch::new(
             rx,
             |data| events.borrow_mut().push(data),
-            |code| {
-                events.borrow_mut().push(vec![code as u8]);
+            |status| {
+                assert_eq!(status, exit);
+                events.borrow_mut().push(vec![status.code as u8]);
             },
         );
         assert!(dispatch.on_poll());

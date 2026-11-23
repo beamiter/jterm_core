@@ -207,19 +207,22 @@ fn exited_tail_error_follows_retained_output_before_exit_permission() {
     assert_eq!(reads, 2);
     assert_eq!(events.len(), 2);
     assert!(matches!(&events[0], SessionEvent::Output(bytes) if bytes.as_bytes() == b"tail"));
-    assert!(
-        matches!(&events[1], SessionEvent::Error(error) if error.contains("read fixture failure") && error.contains("may be omitted"))
-    );
+    assert!(matches!(
+        &events[1],
+        SessionEvent::ExitTail(ExitTail::ReadFailed)
+    ));
 }
 
 #[test]
 fn exited_tail_byte_cap_is_explicit_and_never_overread() {
+    use crate::pty_reader::EXIT_TAIL_BYTES;
+
     let (finish, events, reads) = exercise_exit_drain(
-        vec![ExitDrainStep::Bytes(vec![b'x'; EXIT_DRAIN_BYTE_CAP + 1])],
+        vec![ExitDrainStep::Bytes(vec![b'x'; EXIT_TAIL_BYTES + 1])],
         65_536,
     );
     assert!(finish);
-    assert_eq!(reads, EXIT_DRAIN_BYTE_CAP / 65_536);
+    assert_eq!(reads, EXIT_TAIL_BYTES / 65_536);
     let bytes = events
         .iter()
         .map(|event| match event {
@@ -227,10 +230,11 @@ fn exited_tail_byte_cap_is_explicit_and_never_overread() {
             _ => 0,
         })
         .sum::<usize>();
-    assert_eq!(bytes, EXIT_DRAIN_BYTE_CAP);
-    assert!(
-        matches!(events.last(), Some(SessionEvent::Error(error)) if error.contains("limit") && error.contains("may be omitted"))
-    );
+    assert_eq!(bytes, EXIT_TAIL_BYTES);
+    assert!(matches!(
+        events.last(),
+        Some(SessionEvent::ExitTail(ExitTail::LimitReached))
+    ));
 }
 
 #[test]
@@ -267,7 +271,10 @@ fn exited_tail_zero_data_reports_error_instead_of_spinning() {
     assert!(finish);
     assert_eq!(reads, 1);
     assert_eq!(events.len(), 1);
-    assert!(matches!(&events[0], SessionEvent::Error(error) if error.contains("zero bytes")));
+    assert!(matches!(
+        &events[0],
+        SessionEvent::ExitTail(ExitTail::ReadFailed)
+    ));
 }
 
 fn tiny_limits() -> WriteQueueLimits {

@@ -101,6 +101,8 @@ pub struct SessionStatus {
     pub exited: bool,
     pub drained: bool,
     pub write_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_output_notice: Option<String>,
     pub dropped_reply_bytes: String,
     pub unsupported: String,
     #[serde(default)]
@@ -188,6 +190,11 @@ mod tests {
             "frame": {"kind": "snapshot", "frame": view},
             "status": status
         });
+        let mut final_output = snapshot.clone();
+        final_output["status"]["exited"] = json!(true);
+        final_output["status"]["drained"] = json!(true);
+        final_output["status"]["exit_output_notice"] =
+            json!("Some final output may have been omitted.");
         let mut delta = snapshot.clone();
         delta["sequence"] = json!(6);
         delta["preview"] = json!({ "layout": 5, "frame": view });
@@ -199,7 +206,7 @@ mod tests {
         fields.insert("revision".into(), json!(13));
         fields.insert("rows".into(), json!([{"index": 0, "cells": rows}]));
         delta["frame"] = json!({"kind": "delta", "frame": changed});
-        for fixture in [snapshot, delta] {
+        for fixture in [snapshot, delta, final_output] {
             let parsed = serde_json::from_value::<StreamEvent>(fixture.clone()).unwrap();
             assert_eq!(serde_json::to_value(parsed).unwrap(), fixture);
         }

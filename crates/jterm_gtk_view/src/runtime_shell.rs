@@ -15,7 +15,7 @@ use jterm_engine::{
     hyperlink::HyperlinkPolicy,
     terminal::{Terminal, WindowUpdates},
 };
-use jterm_runtime::{pty_session::Session, runtime_wake::WakeSink};
+use jterm_runtime::{exit_status::PtyExit, pty_session::Session, runtime_wake::WakeSink};
 
 use crate::pane::{INITIAL_COLUMNS, INITIAL_ROWS};
 
@@ -51,7 +51,7 @@ struct CapturedViewport {
 #[derive(Default)]
 pub(crate) struct Update {
     pub output_changed: bool,
-    pub exit_code: Option<i32>,
+    pub exit_status: Option<PtyExit>,
     pub failure: Option<String>,
     pub stopped: bool,
     pub window: WindowUpdates,
@@ -60,7 +60,7 @@ pub(crate) struct Update {
 impl Update {
     fn has_activity(&self) -> bool {
         self.output_changed
-            || self.exit_code.is_some()
+            || self.exit_status.is_some()
             || self.failure.is_some()
             || self.stopped
             || self.window.title.is_some()
@@ -69,7 +69,7 @@ impl Update {
 
     fn merge(&mut self, update: Self) {
         self.output_changed |= update.output_changed;
-        self.exit_code = update.exit_code.or(self.exit_code);
+        self.exit_status = update.exit_status.or(self.exit_status);
         if let Some(failure) = update.failure {
             self.failure = Some(failure);
         }
@@ -449,7 +449,7 @@ impl State {
             }
         }
         if self.session.is_drained() {
-            update.exit_code = self.session.exit_code();
+            update.exit_status = self.session.exit_status();
             self.close();
         }
         (read, update)
@@ -547,11 +547,16 @@ mod tests {
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut update = Update::default();
-        while update.exit_code.is_none() && std::time::Instant::now() < deadline {
+        while update.exit_status.is_none() && std::time::Instant::now() < deadline {
             update.merge(owner.take_update().unwrap());
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(update.exit_code, Some(17), "{:?}", update.failure);
+        assert_eq!(
+            update.exit_status,
+            Some(PtyExit::from(17)),
+            "{:?}",
+            update.failure
+        );
         assert!(update.output_changed);
         let request = ViewportRequest {
             top: None,
