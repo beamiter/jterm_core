@@ -83,10 +83,11 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
     origins = re.findall(rf"set_window_geometry\((\d+), (\d+), {logical_width}, {logical_height}\)", trace)
     assert origins, "missing expected Wayland window geometry"
     if args.scale > 1:
-        assert re.search(rf"wl_output@\d+\.scale\({args.scale}\)", trace), "missing HiDPI output scale"
-    preedit = re.search(r'zwp_text_input_v3@(\d+)\.preedit_string\("ni", 2, 2\)', trace)
+        assert re.search(rf"wl_output[@#]\d+\.scale\({args.scale}\)", trace), "missing HiDPI output scale"
+    # Newer libwayland loggers use # in place of @ for the same object ID.
+    preedit = re.search(r'(zwp_text_input_v3[@#]\d+)\.preedit_string\("ni", 2, 2\)', trace)
     assert preedit, "missing text-input-v3 preedit"
-    context = f"zwp_text_input_v3@{preedit[1]}"
+    context = preedit[1]
     commit = trace.index(f'{context}.commit_string("你")', preedit.end())
     location = rf"{context}\.set_cursor_rectangle\((\d+), (\d+), (\d+), (\d+)\)"
     rectangles = [tuple(map(int, match)) for match in re.findall(location, trace[preedit.end():commit])]
@@ -169,9 +170,9 @@ def exercise_vim9(args, process, root, env, ime, control, document):
     assert ime.wait(timeout=5) == 0
 
     trace = (root / f"{args.app}.log").read_text(errors="replace")
-    preedit = re.search(r'zwp_text_input_v3@(\d+)\.preedit_string\("ni", 2, 2\)', trace)
+    preedit = re.search(r'(zwp_text_input_v3[@#]\d+)\.preedit_string\("ni", 2, 2\)', trace)
     assert preedit
-    context = f"zwp_text_input_v3@{preedit[1]}"
+    context = preedit[1]
     commit = trace.index(f'{context}.commit_string("你")', preedit.end())
     rectangles = re.findall(rf"{context}\.set_cursor_rectangle\((\d+), (\d+), (\d+), (\d+)\)", trace[:commit])
     assert rectangles and int(rectangles[-1][2]) > 0 and int(rectangles[-1][3]) > 0, rectangles
