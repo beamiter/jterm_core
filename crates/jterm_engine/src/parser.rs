@@ -852,10 +852,12 @@ impl Parser {
                         }
                         32..=126 => {
                             let start = at - 1;
-                            while self.ascii_batching
-                                && input.get(at).is_some_and(|b| (32..=126).contains(b))
-                            {
-                                at += 1;
+                            if self.ascii_batching {
+                                let remaining = &input[at..];
+                                let stop = remaining
+                                    .iter()
+                                    .position(|byte| !(32..=126).contains(byte));
+                                at += stop.unwrap_or(remaining.len());
                             }
                             emit!(Event::Ascii(&input[start..at]));
                         }
