@@ -156,9 +156,10 @@ def run(app, binary, mode, root):
             # accessible rectangle or client-side decorations offset it.
             green = [offset for offset, color in enumerate(colors) if color == INDEXED_42]
             left = min(offset % width for offset in green)
-            if left >= 3:
-                return next(((left - 3, offset // width) for offset in green
-                             if offset % width == left and colors[offset - 3] == PAPER), None)
+            # Unified can also paint zone chrome in the margin.
+            return next(((left - gap, offset // width)
+                         for offset in green if offset % width == left
+                         for gap in range(1, min(left, 5) + 1) if colors[offset - gap] == PAPER), None)
 
         x, y = wait_for("paper at the margin and both indexed backgrounds and cursor", painted_colors)
         check_replies("reset", reset)
