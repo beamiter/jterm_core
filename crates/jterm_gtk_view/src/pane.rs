@@ -17,6 +17,7 @@ use std::{
 };
 
 use crate::history_search::HistorySearchView;
+use crate::inline_images::{InlineImageRequest, InlineImages, PendingInlineImage};
 #[cfg(target_os = "linux")]
 use crate::runtime_shell::RuntimeShell;
 use crate::text_link::{connect_links, link_modifier};
@@ -244,6 +245,54 @@ impl<P: Pty> EmbeddedTerminal<P> {
         })
     }
 
+    /// Current physical grid coordinates for a graphics-protocol transfer.
+    pub fn inline_image_cursor(&self) -> Option<(i64, i64)> {
+        self.inspect(|terminal| {
+            let cursor = terminal.frame().ok()?.cursor();
+            Some((cursor.col.try_into().ok()?, cursor.row.try_into().ok()?))
+        })
+    }
+
+    /// Check a decoded inline image against the current cursor, grid and
+    /// render budget. The adapter can queue its reply before admitting it.
+    pub fn prepare_inline_image(
+        &self,
+        texture: gdk::Texture,
+        encoded_source_bytes: usize,
+        request: InlineImageRequest,
+    ) -> Option<PendingInlineImage> {
+        if self.pane.exited.get() {
+            return None;
+        }
+        let (_, _, width, height) = self.pane.view.cell_metrics();
+        self.inspect(|terminal| {
+            self.pane.inline_images.borrow().prepare(
+                terminal,
+                texture,
+                encoded_source_bytes,
+                request,
+                (width, height),
+            )
+        })
+    }
+
+    pub fn admit_inline_image(&self, pending: PendingInlineImage) -> bool {
+        let Backend::Legacy { terminal, .. } = &self.pane.backend else {
+            return false;
+        };
+        if self.pane.exited.get()
+            || !self
+                .pane
+                .inline_images
+                .borrow_mut()
+                .admit(&mut terminal.borrow_mut(), pending)
+        {
+            return false;
+        }
+        self.pane.dirty.set(true);
+        true
+    }
+
     pub fn inspect<T>(&self, read: impl FnOnce(&Terminal) -> T) -> T {
         let Backend::Legacy { terminal, .. } = &self.pane.backend else {
             unreachable!("an embedded terminal has its own shared engine")
@@ -286,6 +335,7 @@ pub struct TerminalPane<P: Pty> {
     backend: Backend<P>,
     status_text: fn(&str, usize) -> String,
     view: TerminalView,
+    inline_images: RefCell<InlineImages>,
     plain_links: Option<PlainLinkFinder>,
     status: gtk4::Label,
     event_handler: OnceCell<OnEvent>,
@@ -427,6 +477,7 @@ impl<P: Pty> TerminalPane<P> {
             .vexpand(true)
             .child(&scroll)
             .build();
+        let inline_images = InlineImages::attach(&viewport);
         view.attach_preedit(&viewport);
         let body = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         body.set_vexpand(true);
@@ -467,6 +518,7 @@ impl<P: Pty> TerminalPane<P> {
             backend,
             status_text,
             view,
+            inline_images: RefCell::new(inline_images),
             plain_links: links.find_plain,
             status,
             event_handler: OnceCell::new(),
@@ -992,11 +1044,11 @@ impl<P: Pty> TerminalPane<P> {
         let total = rail.len();
         self.history_rail.replace(rail);
         self.sync_scrollback(total, history_top, frame.rows().len());
-        match history {
+        match &history {
             Some(history) => {
-                if let Some(page) = history.page {
+                if let Some(page) = &history.page {
                     self.view
-                        .present(&frame, live_margin_gaps, Some(&page), colors.as_ref());
+                        .present(&frame, live_margin_gaps, Some(page), colors.as_ref());
                 }
                 self.painted_history.set(Some(history.window));
             }
@@ -1006,6 +1058,13 @@ impl<P: Pty> TerminalPane<P> {
                 self.painted_history.set(None);
             }
         }
+        self.inline_images.borrow_mut().present(
+            &frame,
+            history
+                .as_ref()
+                .map(|history| (history.window.history_rows, history.page.as_ref())),
+            || self.view.cell_metrics(),
+        );
         self.painted_source.set(Some((frame.stamp(), history_top)));
         self.dirty.set(newer_output);
     }
@@ -1673,6 +1732,64 @@ mod transcript_tests {
         ) -> Result<(), String> {
             panic!("the application owns the embedded reader")
         }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn inline_image_paint_obeys_sync_and_screen_transitions() {
+        gtk4::init().unwrap();
+        let theme = Theme {
+            font: pango::FontDescription::from_string("Monospace 12"),
+            foreground: gdk::RGBA::WHITE,
+            background: gdk::RGBA::BLACK,
+            palette: crate::default_ansi_palette(),
+        };
+        let links = LinkActions {
+            admit: |_, _| false,
+            find_plain: None,
+            attach_opener: |_| Box::new(|_| {}),
+        };
+        let (_, terminal) =
+            EmbeddedTerminal::new(TestPty, 8, 4, theme, |s, _| s.to_owned(), links).unwrap();
+        let texture = gdk::MemoryTexture::new(
+            2,
+            2,
+            gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_static(&[255; 16]),
+            8,
+        )
+        .upcast();
+        let images = || terminal.pane.inline_images.borrow().painted_slices();
+
+        terminal.ingest(b"\x1b[2;2H\x1b[?2026h").unwrap();
+        let image = terminal
+            .prepare_inline_image(
+                texture,
+                0,
+                InlineImageRequest {
+                    columns: Some(3),
+                    rows: 2,
+                    move_cursor: false,
+                    cursor: terminal.inline_image_cursor().unwrap(),
+                },
+            )
+            .unwrap();
+        assert!(terminal.admit_inline_image(image));
+        terminal.pane.paint();
+        assert_eq!(images(), 0);
+
+        terminal.ingest(b"\x1b[?2026l").unwrap();
+        terminal.pane.paint();
+        assert_eq!(images(), 2);
+        terminal.ingest(b"\x1b[?1049h").unwrap();
+        terminal.pane.paint();
+        assert_eq!(images(), 0);
+        terminal.ingest(b"\x1b[?1049l").unwrap();
+        terminal.pane.paint();
+        assert_eq!(images(), 2);
+        terminal.ingest(b"\x1b[2J").unwrap();
+        terminal.pane.paint();
+        assert_eq!(images(), 0);
     }
 
     #[test]

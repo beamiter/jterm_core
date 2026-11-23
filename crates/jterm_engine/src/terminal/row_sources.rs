@@ -138,7 +138,7 @@ impl Terminal {
                     .iter()
                     .any(|cell| !cell.is_reflow_trimmable_blank())
                     || grid
-                        .cluster_row(row)
+                        .row_annotations(row)
                         .is_some_and(|clusters| clusters.end() > columns)
                     || grid
                         .underline_color_runs(row)

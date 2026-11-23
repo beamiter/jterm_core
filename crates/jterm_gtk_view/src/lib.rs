@@ -4,6 +4,7 @@
 mod command;
 mod document;
 mod history_search;
+mod inline_images;
 mod live_output;
 mod pane;
 mod pty_dispatch;
@@ -21,6 +22,7 @@ pub use command::{
     supports_finished_command, FinishedTextView,
 };
 pub use document::DocumentView;
+pub use inline_images::{InlineImageRequest, PendingInlineImage};
 pub use jterm_engine::authenticated_boundaries;
 pub use jterm_engine::history_reflow::HistoryAnchor;
 pub use jterm_engine::terminal::TranscriptAnchor;

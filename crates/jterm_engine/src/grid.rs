@@ -1,5 +1,5 @@
 use super::hyperlink::HyperlinkId;
-use crate::graphemes::{RowClusters, MAX_CLUSTER_BYTES};
+use crate::{graphemes::MAX_CLUSTER_BYTES, row_annotations::RowAnnotations};
 use smallvec::SmallVec;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
@@ -63,7 +63,7 @@ pub(crate) struct PrintCheckpoint {
     cols: Range<usize>,
     cells: SmallVec<[TerminalCell; 4]>,
     colors: SmallVec<[Color; 4]>,
-    clusters: Option<Arc<RowClusters>>,
+    annotations: Option<Arc<RowAnnotations>>,
     margin_origin: MarginOrigin,
 }
 
@@ -74,8 +74,8 @@ pub(crate) struct WrapCheckpoint {
 }
 
 impl PrintCheckpoint {
-    pub(crate) fn cluster_row(&self) -> Option<&RowClusters> {
-        self.clusters.as_deref()
+    pub(crate) fn row_annotations(&self) -> Option<&RowAnnotations> {
+        self.annotations.as_deref()
     }
 }
 
@@ -96,7 +96,7 @@ pub struct TerminalGrid {
     // Allocate the row table on first colored output, and allocate cells only
     // for rows with explicit decoration. The base cell stays 16 bytes.
     underline_colors: Vec<Option<Vec<Color>>>,
-    clusters: Vec<Option<Arc<RowClusters>>>,
+    annotations: Vec<Option<Arc<RowAnnotations>>>,
     capture_revision: u64,
     row_changes: Vec<u64>,
     pub(crate) track_printed_spaces: bool,
@@ -112,7 +112,7 @@ impl TerminalGrid {
             row_ids: vec![RawRowId::UNTRACKED; rows],
             margin_origin: vec![MarginOrigin::VirginDefault; rows],
             underline_colors: Vec::new(),
-            clusters: Vec::new(),
+            annotations: Vec::new(),
             capture_revision: 0,
             row_changes: Vec::new(),
             track_printed_spaces: false,
@@ -144,7 +144,7 @@ impl TerminalGrid {
         self.row_changes.fill(self.capture_revision);
         self.margin_origin.fill(MarginOrigin::Unknown);
         self.underline_colors = Vec::new();
-        self.clusters = Vec::new();
+        self.annotations = Vec::new();
         &mut self.cells
     }
 
@@ -171,16 +171,16 @@ impl TerminalGrid {
             self.margin_origin[row] = MarginOrigin::Unknown;
         }
         self.set_underline_color(row, col..col + 1, Color::Default);
-        self.erase_clusters(row, col..col + 1);
+        self.erase_annotations(row, col..col + 1);
         &mut self.cells[row * self.cols + col]
     }
 
-    pub(crate) fn cluster_row(&self, row: usize) -> Option<&Arc<RowClusters>> {
-        self.clusters.get(row)?.as_ref()
+    pub(crate) fn row_annotations(&self, row: usize) -> Option<&Arc<RowAnnotations>> {
+        self.annotations.get(row)?.as_ref()
     }
 
     pub(crate) fn cluster_text(&self, row: usize, col: usize) -> Option<&str> {
-        self.cluster_row(row)?.text(col)
+        self.row_annotations(row)?.text(col)
     }
 
     pub(crate) fn set_cluster_text(
@@ -191,22 +191,34 @@ impl TerminalGrid {
     ) -> Option<Arc<str>> {
         if text.len() > MAX_CLUSTER_BYTES
             || self
-                .cluster_row(row)
+                .row_annotations(row)
                 .is_some_and(|line| !line.can_store(col, text.len()))
         {
             return None;
         }
         self.mark_row_changed(row);
-        self.clusters.resize_with(self.rows, || None);
-        let line = self.clusters[row].get_or_insert_with(Arc::default);
+        self.annotations.resize_with(self.rows, || None);
+        let line = self.annotations[row].get_or_insert_with(Arc::default);
         let text: Arc<str> = Arc::from(text);
         Arc::make_mut(line).set(col, text.clone());
         Some(text)
     }
 
-    fn edit_clusters(&mut self, row: usize, edit: impl FnOnce(&mut RowClusters)) {
+    pub(crate) fn set_image(
+        &mut self,
+        row: usize,
+        column: usize,
+        image: crate::terminal::ImageAnnotation,
+    ) {
         self.mark_row_changed(row);
-        let Some(slot) = self.clusters.get_mut(row) else {
+        self.annotations.resize_with(self.rows, || None);
+        let line = self.annotations[row].get_or_insert_with(Arc::default);
+        Arc::make_mut(line).set_image(column, image);
+    }
+
+    fn edit_annotations(&mut self, row: usize, edit: impl FnOnce(&mut RowAnnotations)) {
+        self.mark_row_changed(row);
+        let Some(slot) = self.annotations.get_mut(row) else {
             return;
         };
         let Some(line) = slot else { return };
@@ -217,12 +229,12 @@ impl TerminalGrid {
         }
     }
 
-    pub(crate) fn erase_clusters(&mut self, row: usize, cols: Range<usize>) {
+    pub(crate) fn erase_annotations(&mut self, row: usize, cols: Range<usize>) {
         if self
-            .cluster_row(row)
+            .row_annotations(row)
             .is_some_and(|line| line.end() > cols.start)
         {
-            self.edit_clusters(row, |line| line.erase(cols));
+            self.edit_annotations(row, |line| line.erase(cols));
         }
     }
 
@@ -249,7 +261,7 @@ impl TerminalGrid {
             cols,
             cells,
             colors,
-            clusters: self.cluster_row(row).cloned(),
+            annotations: self.row_annotations(row).cloned(),
             margin_origin: self.margin_origin[row],
         }
     }
@@ -266,8 +278,8 @@ impl TerminalGrid {
             }
         }
         // The live row table persists after an empty row's last cluster dies.
-        if let Some(slot) = self.clusters.get_mut(row) {
-            *slot = checkpoint.clusters;
+        if let Some(slot) = self.annotations.get_mut(row) {
+            *slot = checkpoint.annotations;
         }
         self.margin_origin[row] = checkpoint.margin_origin;
     }
@@ -420,7 +432,7 @@ impl TerminalGrid {
         let target = match policy {
             AsciiOverwritePolicy::SharedScreen => {
                 self.repair_wide_edges(row, col..end, blank);
-                self.erase_clusters(row, col..end);
+                self.erase_annotations(row, col..end);
                 self.row_cells_mut(row, col..end)
             }
             AsciiOverwritePolicy::FrostLegacy => {
@@ -487,7 +499,7 @@ impl TerminalGrid {
         let mut line = ScrollbackLine::compress(&self[row], wrapped);
         line.attach_decorations(
             self.underline_color_runs(row).collect(),
-            self.cluster_row(row).cloned(),
+            self.row_annotations(row).cloned(),
         );
         line.set_raw_row_id(self.row_id(row));
         if allow_margin && self.synthetic_margin_gap(row).is_some() {
@@ -523,8 +535,8 @@ impl TerminalGrid {
         if !self.underline_colors.is_empty() {
             self.underline_colors[rows.clone()].fill(None);
         }
-        if !self.clusters.is_empty() {
-            self.clusters[rows.clone()].fill(None);
+        if !self.annotations.is_empty() {
+            self.annotations[rows.clone()].fill(None);
         }
         self.margin_origin[rows].fill(Self::new_margin_origin(blank));
     }
@@ -582,8 +594,8 @@ impl TerminalGrid {
                 RegionDirection::Down => rows.rotate_right(count),
             }
         }
-        if count < height && !self.clusters.is_empty() {
-            let rows = &mut self.clusters[top..end];
+        if count < height && !self.annotations.is_empty() {
+            let rows = &mut self.annotations[top..end];
             match direction {
                 RegionDirection::Up => rows.rotate_left(count),
                 RegionDirection::Down => rows.rotate_right(count),
@@ -638,7 +650,7 @@ impl TerminalGrid {
         self.cells[start + col] = cell;
         self.shift_underline_colors(row, col, 1, true);
         let cols = self.cols;
-        self.edit_clusters(row, |line| line.insert_columns(col, 1, cols));
+        self.edit_annotations(row, |line| line.insert_columns(col, 1, cols));
     }
 
     /// 删除行内指定列的cell，右侧cell左移，末尾补blank
@@ -654,7 +666,7 @@ impl TerminalGrid {
         // Fill last cell with default
         self.cells[start + self.cols - 1] = TerminalCell::default();
         self.shift_underline_colors(row, col, 1, false);
-        self.edit_clusters(row, |line| line.delete_columns(col, 1));
+        self.edit_annotations(row, |line| line.delete_columns(col, 1));
     }
 
     /// Clear a double-width character left holding only its lead half at the
@@ -673,7 +685,7 @@ impl TerminalGrid {
             self.margin_origin[row] = MarginOrigin::Unknown;
             self.cells[last] = blank;
             self.set_underline_color(row, self.cols - 1..self.cols, Color::Default);
-            self.erase_clusters(row, self.cols - 1..self.cols);
+            self.erase_annotations(row, self.cols - 1..self.cols);
         }
     }
 
@@ -752,7 +764,7 @@ impl TerminalGrid {
         line[..count].fill(blank);
         self.shift_underline_colors(row, col, count, true);
         let cols = self.cols;
-        self.edit_clusters(row, |line| line.insert_columns(col, count, cols));
+        self.edit_annotations(row, |line| line.insert_columns(col, count, cols));
         self.clear_dangling_wide_at_row_end(row, blank);
         true
     }
@@ -784,7 +796,7 @@ impl TerminalGrid {
         let retained = line.len() - count;
         line[retained..].fill(blank);
         self.shift_underline_colors(row, col, count, false);
-        self.edit_clusters(row, |line| line.delete_columns(col, count));
+        self.edit_annotations(row, |line| line.delete_columns(col, count));
         true
     }
 
@@ -844,11 +856,11 @@ impl TerminalGrid {
                 colors.resize(new_cols, Color::Default);
             }
         }
-        if !self.clusters.is_empty() {
-            self.clusters.resize_with(new_rows, || None);
+        if !self.annotations.is_empty() {
+            self.annotations.resize_with(new_rows, || None);
             if new_cols < self.cols {
                 for row in 0..copy_rows {
-                    self.erase_clusters(row, new_cols..self.cols);
+                    self.erase_annotations(row, new_cols..self.cols);
                 }
             }
         }
@@ -907,7 +919,7 @@ impl std::ops::IndexMut<usize> for TerminalGrid {
         if let Some(colors) = self.underline_colors.get_mut(row) {
             *colors = None;
         }
-        if let Some(line) = self.clusters.get_mut(row) {
+        if let Some(line) = self.annotations.get_mut(row) {
             *line = None;
         }
         let start = row * self.cols;
@@ -1222,7 +1234,7 @@ enum CompressedLineData {
 struct DecoratedLineData {
     base: CompressedLineData,
     underline_colors: Box<[UnderlineColorRun]>,
-    clusters: Option<Arc<RowClusters>>,
+    annotations: Option<Arc<RowAnnotations>>,
 }
 
 impl CompressedLineData {
@@ -1242,7 +1254,10 @@ impl CompressedLineData {
                 size_of::<DecoratedLineData>()
                     + data.base.heap_bytes()
                     + size_of_val(data.underline_colors.as_ref())
-                    + data.clusters.as_ref().map_or(0, |row| row.retained_bytes())
+                    + data
+                        .annotations
+                        .as_ref()
+                        .map_or(0, |row| row.retained_bytes())
             }
         }
     }
@@ -1379,17 +1394,17 @@ impl ScrollbackLine {
     fn attach_decorations(
         &mut self,
         colors: Vec<UnderlineColorRun>,
-        clusters: Option<Arc<RowClusters>>,
+        annotations: Option<Arc<RowAnnotations>>,
     ) {
-        if !colors.is_empty() || clusters.is_some() {
-            if let Some(clusters) = &clusters {
-                self.reflow_content_len = self.reflow_content_len.max(clusters.end() as u16);
+        if !colors.is_empty() || annotations.is_some() {
+            if let Some(annotations) = &annotations {
+                self.reflow_content_len = self.reflow_content_len.max(annotations.end() as u16);
             }
             let base = std::mem::replace(&mut self.data, CompressedLineData::Encoded(Vec::new()));
             self.data = CompressedLineData::Decorated(Box::new(DecoratedLineData {
                 base,
                 underline_colors: colors.into_boxed_slice(),
-                clusters,
+                annotations,
             }));
         }
     }
@@ -1401,9 +1416,9 @@ impl ScrollbackLine {
         }
     }
 
-    pub(crate) fn cluster_row(&self) -> Option<&Arc<RowClusters>> {
+    pub(crate) fn row_annotations(&self) -> Option<&Arc<RowAnnotations>> {
         match &self.data {
-            CompressedLineData::Decorated(data) => data.clusters.as_ref(),
+            CompressedLineData::Decorated(data) => data.annotations.as_ref(),
             _ => None,
         }
     }
@@ -1990,7 +2005,7 @@ fn ascii_overwrite_preserves_each_profiles_margin_and_decoration_invalidation() 
         grid.record_wrap_margin(0, 5, true);
         let archived = grid.archive_row(0, true);
         assert_eq!(archived.synthetic_margin_gap(), retained.then_some(5));
-        assert_eq!(archived.cluster_row().is_some(), retained);
+        assert_eq!(archived.row_annotations().is_some(), retained);
         assert_eq!(!archived.underline_color_runs().is_empty(), retained);
     }
 }
@@ -2046,7 +2061,7 @@ fn graphic_overwrite_repairs_both_partners_with_bce_and_preserves_archive_proven
         let archived = grid.archive_row(0, true);
         assert_eq!(archived.raw_row_id(), row_id);
         assert_eq!(archived.synthetic_margin_gap(), Some(6));
-        let archived_clusters = archived.cluster_row().unwrap();
+        let archived_clusters = archived.row_annotations().unwrap();
         assert_eq!(archived_clusters.text(1), None);
         assert_eq!(archived_clusters.text(3), None);
         assert_eq!(archived_clusters.text(5), Some(" \u{301}"));
@@ -2114,10 +2129,16 @@ fn archived_cluster_preserves_the_codec_and_counts_decorated_space_as_content() 
     assert_eq!(original.decompress(), decorated.decompress());
     assert_eq!(original.reflow_content_len(), 2);
     assert_eq!(decorated.reflow_content_len(), 6);
-    assert_eq!(decorated.cluster_row().unwrap().text(5), Some(" \u{300}"));
+    assert_eq!(
+        decorated.row_annotations().unwrap().text(5),
+        Some(" \u{300}")
+    );
     grid.erase_cells(0, 0..6, TerminalCell::default());
-    assert!(grid.cluster_row(0).is_none());
-    assert_eq!(decorated.cluster_row().unwrap().text(1), Some("a\u{301}"));
+    assert!(grid.row_annotations(0).is_none());
+    assert_eq!(
+        decorated.row_annotations().unwrap().text(1),
+        Some("a\u{301}")
+    );
 }
 
 // Regression oracle pinned to fb477d1c; deliberately independent of the streaming visitor.

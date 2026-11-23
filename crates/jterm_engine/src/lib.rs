@@ -7,6 +7,7 @@ pub mod grid;
 pub mod history_reflow;
 pub mod history_search;
 pub mod hyperlink;
+mod row_annotations;
 pub use grid::*;
 pub use hyperlink::HyperlinkId;
 /// Existing Ember admission bound; unchanged by extraction.

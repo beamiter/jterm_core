@@ -12,7 +12,7 @@ pub(crate) struct HistoricalWindow {
     top: HistoryAnchor,
     rows: usize,
     layout: u64,
-    history_rows: usize,
+    pub(crate) history_rows: usize,
     history_tail: Option<u64>,
     live_revision: Option<u64>,
     palette_revision: u64,

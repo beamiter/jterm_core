@@ -1,6 +1,6 @@
 use super::{
     selection_text, underline_color_at, Arc, HistoryCopyRow, HistoryLayout, HistoryPage, Row,
-    RowClusters, ScrollbackLine, Terminal, UnderlineColorRun, MAX_ROWS,
+    RowAnnotations, ScrollbackLine, Terminal, UnderlineColorRun, MAX_ROWS,
 };
 use crate::{
     history_reflow::{source_columns, HistoryAnchor, ProjectedHistoryRow},
@@ -93,7 +93,7 @@ impl Terminal {
                             wrapped: line.is_wrapped,
                         },
                         underline_colors: None,
-                        clusters: line.cluster_row().cloned(),
+                        annotations: line.row_annotations().cloned(),
                         synthetic_gap: line.synthetic_margin_gap(),
                     }
                 } else {
@@ -104,7 +104,7 @@ impl Terminal {
                             wrapped: grid.row_wrapped[index],
                         },
                         underline_colors: None,
-                        clusters: grid.cluster_row(index).cloned(),
+                        annotations: grid.row_annotations(index).cloned(),
                         synthetic_gap: grid.synthetic_margin_gap(index),
                     }
                 }
@@ -248,7 +248,7 @@ impl HistoryReader<'_> {
         let width = usize::from(row.cells);
         let mut cells = Vec::with_capacity(width);
         let mut underline: Vec<UnderlineColorRun> = Vec::new();
-        let mut clusters = RowClusters::default();
+        let mut annotations = RowAnnotations::default();
         let mut index = (row.anchor.row - self.first) as usize;
         let mut column = usize::from(row.anchor.column);
         while cells.len() < width {
@@ -271,11 +271,13 @@ impl HistoryReader<'_> {
                     cell.flags.set_wide(false);
                 }
                 let column = cells.len();
-                if let Some(text) = line
-                    .cluster_row()
-                    .and_then(|row| row.shared_text(raw_column))
-                {
-                    clusters.set(column, Arc::clone(text));
+                if let Some(source) = line.row_annotations() {
+                    if let Some(text) = source.shared_text(raw_column) {
+                        annotations.set(column, Arc::clone(text));
+                    }
+                    if let Some(slice) = source.image_at(raw_column) {
+                        annotations.set_image(column, slice.clone());
+                    }
                 }
                 if let Some(color) = underline_color_at(line.underline_color_runs(), raw_column) {
                     let column = column as u16;
@@ -306,7 +308,7 @@ impl HistoryReader<'_> {
                 wrapped: row.wrapped,
             },
             underline_colors: (!underline.is_empty()).then(|| underline.into()),
-            clusters: (!clusters.is_empty()).then(|| Arc::new(clusters)),
+            annotations: (!annotations.is_empty()).then(|| Arc::new(annotations)),
             synthetic_gap: None,
         }
     }

@@ -4,7 +4,7 @@ use crate::{
     colors::{ColorState, TerminalDefaultColors},
     command_blocks::{CommandBlock, CommandBlocks},
     frame::{underline_color_at, CellFrame, Cursor, Limits, Row, Screen, Stamp},
-    graphemes::{self, RowClusters, MAX_CLUSTER_BYTES},
+    graphemes::{self, MAX_CLUSTER_BYTES},
     grid::{PrintCheckpoint, WrapCheckpoint},
     history_reflow::HistoryLayout,
     hyperlink::{resolve_resource, HyperlinkPolicy, HyperlinkResources, HyperlinkTable},
@@ -12,6 +12,7 @@ use crate::{
     parser::{Event, Parser, ParserLimits, ParserProfile, StringKind},
     protocol_state::ProtocolState,
     retained_history::RetainedHistory,
+    row_annotations::RowAnnotations,
     screen::{
         rows_to_archive_on_height_shrink, AsciiWriteStep, Charset, RegionDirection, RegionMutation,
         ScreenState, VerticalMotion,
@@ -29,6 +30,9 @@ use std::{
 use unicode_width::UnicodeWidthChar;
 
 mod history_view;
+mod inline_image;
+pub(crate) use inline_image::ImageAnnotation;
+pub use inline_image::{InlineImageId, InlineImageRow, PlacedInlineImage, PreparedInlineImage};
 mod row_sources;
 use row_sources::RowSources;
 pub use row_sources::TranscriptAnchor;
@@ -98,7 +102,7 @@ struct HistoryCopyRow {
     // Physical addressing is unchanged. Only extraction may omit this slot.
     row: Row,
     underline_colors: Option<Arc<[UnderlineColorRun]>>,
-    clusters: Option<Arc<RowClusters>>,
+    annotations: Option<Arc<RowAnnotations>>,
     synthetic_gap: Option<usize>,
 }
 impl HistoryPage {
@@ -120,7 +124,19 @@ impl HistoryPage {
 
     /// Complete text at a multi-scalar grapheme's original physical column.
     pub fn cluster_text(&self, row: usize, column: usize) -> Option<&str> {
-        self.rows.get(row)?.clusters.as_ref()?.text(column)
+        self.rows.get(row)?.annotations.as_ref()?.text(column)
+    }
+
+    /// Retained inline image rows in this projected history row.
+    pub fn inline_image_rows(
+        &self,
+        row: usize,
+    ) -> impl Iterator<Item = (usize, InlineImageRow)> + '_ {
+        self.rows
+            .get(row)
+            .and_then(|row| row.annotations.as_ref())
+            .into_iter()
+            .flat_map(|row| row.image_rows())
     }
 
     /// Explicit underline color at an original physical history coordinate.
@@ -184,7 +200,7 @@ fn selection_text(
             if require_literal && cell.flags.tab_padding() {
                 return Err("terminal range has tab expansion".into());
             }
-            if let Some(cluster) = source.clusters.as_ref().and_then(|row| row.text(col)) {
+            if let Some(cluster) = source.annotations.as_ref().and_then(|row| row.text(col)) {
                 text.push_str(cluster);
             } else {
                 text.push(cell.character);
@@ -234,6 +250,7 @@ pub struct Terminal {
     history_row_limit: usize,
     history_end: u64,
     row_sources: Option<RowSources>,
+    next_inline_image_id: u64,
     retained_layout: Mutex<Weak<HistoryLayout>>,
     preserve_primary_on_resize: bool,
     command_blocks: Option<CommandBlocks>,
@@ -395,6 +412,7 @@ impl Terminal {
             history_row_limit: MAX_HISTORY_ROWS,
             history_end: 0,
             row_sources: None,
+            next_inline_image_id: 0,
             retained_layout: Mutex::new(Weak::new()),
             preserve_primary_on_resize: false,
             command_blocks: None,
@@ -1003,7 +1021,7 @@ impl Terminal {
                 },
                 underline_colors: (!line.underline_color_runs().is_empty())
                     .then(|| Arc::from(line.underline_color_runs())),
-                clusters: line.cluster_row().cloned(),
+                annotations: line.row_annotations().cloned(),
                 synthetic_gap: line.synthetic_margin_gap(),
             })
             .collect();
@@ -1169,9 +1187,9 @@ impl Terminal {
         };
         if !cleared {
             let line = if row == anchor.row {
-                checkpoint.footprint.cluster_row()
+                checkpoint.footprint.row_annotations()
             } else {
-                self.screen.grid.cluster_row(row).map(Arc::as_ref)
+                self.screen.grid.row_annotations(row).map(Arc::as_ref)
             };
             let displaced = if self.screen.insert_mode {
                 cols - width..cols
@@ -1838,7 +1856,7 @@ impl Terminal {
                 grid[row]
                     .iter()
                     .all(crate::TerminalCell::is_reflow_trimmable_blank)
-                    && grid.cluster_row(row).is_none()
+                    && grid.row_annotations(row).is_none()
                     && grid.underline_color_runs(row).next().is_none()
             })
         } else {
@@ -1937,11 +1955,11 @@ impl Terminal {
         } else {
             None
         };
-        let clusters = if self.graphemes.is_some() {
+        let annotations = if self.graphemes.is_some() || self.next_inline_image_id != 0 {
             let mut changed = None;
             for row in 0..grid.rows() {
-                let current = grid.cluster_row(row);
-                let before = previous.and_then(|frame| frame.cluster_row(row));
+                let current = grid.row_annotations(row);
+                let before = previous.and_then(|frame| frame.row_annotations(row));
                 if !may_have_changed(row) {
                     debug_assert_eq!(current, before);
                     continue;
@@ -1949,7 +1967,7 @@ impl Terminal {
                 if current != before {
                     let rows = changed.get_or_insert_with(|| {
                         previous
-                            .and_then(CellFrame::shared_clusters)
+                            .and_then(CellFrame::shared_annotations)
                             .map_or_else(|| vec![None; grid.rows()], |rows| rows.to_vec())
                     });
                     rows[row] = current.cloned();
@@ -1957,7 +1975,7 @@ impl Terminal {
             }
             match changed {
                 Some(rows) => rows.iter().any(Option::is_some).then(|| rows.into()),
-                None => previous.and_then(CellFrame::shared_clusters),
+                None => previous.and_then(CellFrame::shared_annotations),
             }
         } else {
             None
@@ -1986,7 +2004,7 @@ impl Terminal {
             underline_colors,
         )
         .map_err(|e| format!("{e:?}"))?
-        .with_clusters(clusters);
+        .with_annotations(annotations);
         let hyperlinks = self
             .hyperlinks
             .as_ref()

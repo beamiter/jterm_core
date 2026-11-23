@@ -1,8 +1,8 @@
 //! Immutable raw-cell paint values and their referenced style metadata.
 use crate::{
-    graphemes::RowClusters,
     grid::{Color, CursorShape, TerminalCell, UnderlineColorRun},
     hyperlink::{resolve_resource, retain_resources, HyperlinkResources},
+    row_annotations::RowAnnotations,
     HyperlinkId,
 };
 use std::{fmt, num::NonZeroU64, sync::Arc};
@@ -99,7 +99,7 @@ pub struct CellFrame {
     cursor: Cursor,
     underline_colors: Option<UnderlineRows>,
     hyperlinks: Option<HyperlinkResources>,
-    clusters: Option<ClusterRows>,
+    annotations: Option<AnnotationRows>,
 }
 
 impl fmt::Debug for CellFrame {
@@ -116,15 +116,15 @@ impl fmt::Debug for CellFrame {
         if let Some(hyperlinks) = &self.hyperlinks {
             debug.field("hyperlink_count", &hyperlinks.len());
         }
-        if let Some(clusters) = &self.clusters {
-            debug.field("clusters", clusters);
+        if let Some(annotations) = &self.annotations {
+            debug.field("annotations", annotations);
         }
         debug.finish()
     }
 }
 
 pub(crate) type UnderlineRows = Arc<[Option<Arc<[UnderlineColorRun]>>]>;
-pub(crate) type ClusterRows = Arc<[Option<Arc<RowClusters>>]>;
+pub(crate) type AnnotationRows = Arc<[Option<Arc<RowAnnotations>>]>;
 
 pub(crate) fn underline_color_at(runs: &[UnderlineColorRun], col: usize) -> Option<Color> {
     let run = runs.get(runs.partition_point(|run| usize::from(run.end) <= col))?;
@@ -165,7 +165,7 @@ pub struct Delta {
     pub rows: Vec<(usize, Row)>,
     underline_colors: Vec<(usize, Arc<[UnderlineColorRun]>)>,
     hyperlinks: HyperlinkDelta,
-    clusters: Vec<(usize, Arc<RowClusters>)>,
+    annotations: Vec<(usize, Arc<RowAnnotations>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +184,7 @@ impl Delta {
             rows,
             underline_colors: Vec::new(),
             hyperlinks: HyperlinkDelta::Inherit,
-            clusters: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 }
@@ -239,7 +239,7 @@ impl CellFrame {
             cursor,
             underline_colors,
             hyperlinks: None,
-            clusters: None,
+            annotations: None,
         })
     }
     pub fn stamp(&self) -> Stamp {
@@ -278,26 +278,36 @@ impl CellFrame {
     /// Complete text at a multi-scalar grapheme head. Single-scalar and
     /// continuation cells remain represented by `rows()`.
     pub fn cluster_text(&self, row: usize, column: usize) -> Option<&str> {
-        self.cluster_row(row)?.text(column)
+        self.row_annotations(row)?.text(column)
     }
 
-    pub(crate) fn cluster_row(&self, row: usize) -> Option<&Arc<RowClusters>> {
-        self.clusters.as_ref()?.get(row)?.as_ref()
+    /// Inline image references published with exactly this cell row.
+    pub fn inline_image_rows(
+        &self,
+        row: usize,
+    ) -> impl Iterator<Item = (usize, crate::terminal::InlineImageRow)> + '_ {
+        self.row_annotations(row)
+            .into_iter()
+            .flat_map(|row| row.image_rows())
     }
 
-    pub(crate) fn shared_clusters(&self) -> Option<ClusterRows> {
-        self.clusters.clone()
+    pub(crate) fn row_annotations(&self, row: usize) -> Option<&Arc<RowAnnotations>> {
+        self.annotations.as_ref()?.get(row)?.as_ref()
     }
 
-    pub(crate) fn with_clusters(mut self, clusters: Option<ClusterRows>) -> Self {
-        debug_assert!(clusters.as_ref().is_none_or(|clusters| {
-            clusters.len() == self.rows.len()
-                && clusters
+    pub(crate) fn shared_annotations(&self) -> Option<AnnotationRows> {
+        self.annotations.clone()
+    }
+
+    pub(crate) fn with_annotations(mut self, annotations: Option<AnnotationRows>) -> Self {
+        debug_assert!(annotations.as_ref().is_none_or(|annotations| {
+            annotations.len() == self.rows.len()
+                && annotations
                     .iter()
                     .zip(self.rows.iter())
                     .all(|(line, row)| line.as_ref().is_none_or(|line| line.valid_for(&row.cells)))
         }));
-        self.clusters = clusters;
+        self.annotations = annotations;
         self
     }
 
@@ -329,14 +339,14 @@ impl CellFrame {
         for (index, (before, after)) in self.rows.iter().zip(next.rows.iter()).enumerate() {
             if before != after
                 || self.underline_color_runs(index) != next.underline_color_runs(index)
-                || self.cluster_row(index) != next.cluster_row(index)
+                || self.row_annotations(index) != next.row_annotations(index)
             {
                 delta.rows.push((index, after.clone()));
                 if let Some(runs) = next.underline_row(index) {
                     delta.underline_colors.push((index, runs.clone()));
                 }
-                if let Some(line) = next.cluster_row(index) {
-                    delta.clusters.push((index, line.clone()));
+                if let Some(line) = next.row_annotations(index) {
+                    delta.annotations.push((index, line.clone()));
                 }
             }
         }
@@ -395,7 +405,7 @@ impl CellFrame {
         }) {
             return Err(Error::Bounds);
         }
-        if delta.clusters.iter().any(|(index, line)| {
+        if delta.annotations.iter().any(|(index, line)| {
             !delta
                 .rows
                 .iter()
@@ -424,23 +434,23 @@ impl CellFrame {
         } else {
             None
         };
-        let clusters = if delta.rows.is_empty() {
-            self.shared_clusters()
-        } else if self.clusters.is_some() || !delta.clusters.is_empty() {
-            let mut clusters = self
-                .clusters
+        let annotations = if delta.rows.is_empty() {
+            self.shared_annotations()
+        } else if self.annotations.is_some() || !delta.annotations.is_empty() {
+            let mut annotations = self
+                .annotations
                 .as_ref()
                 .map_or_else(|| vec![None; rows.len()], |current| current.to_vec());
             for (index, _) in &delta.rows {
-                clusters[*index] = None;
+                annotations[*index] = None;
             }
-            for (index, line) in &delta.clusters {
-                clusters[*index] = Some(line.clone());
+            for (index, line) in &delta.annotations {
+                annotations[*index] = Some(line.clone());
             }
-            clusters
+            annotations
                 .iter()
                 .any(Option::is_some)
-                .then(|| clusters.into())
+                .then(|| annotations.into())
         } else {
             None
         };
@@ -464,7 +474,7 @@ impl CellFrame {
             cursor: delta.cursor,
             underline_colors,
             hyperlinks,
-            clusters,
+            annotations,
         })
     }
 }
