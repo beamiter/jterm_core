@@ -43,6 +43,23 @@ fn live_snapshot_resizes_without_restoring_cleared_tab_stops() {
     assert_eq!(restored.snapshot_ansi(), original.snapshot_ansi());
 }
 
+#[test]
+fn live_snapshot_restores_margins_when_the_viewport_grows_during_attach() {
+    for margins in [b"".as_slice(), b"\x1b[2;3r".as_slice()] {
+        let mut original = ScreenReplay::new(12, 4);
+        original.feed(margins);
+
+        let mut restored = ScreenReplay::new(12, 6);
+        restored.feed(&original.snapshot_ansi());
+        let mut expected = ScreenReplay::new(12, 6);
+        expected.feed(margins);
+        let scroll = b"\x1b[Hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven";
+        restored.feed(scroll);
+        expected.feed(scroll);
+        assert_eq!(restored.finish().to_plain(), expected.finish().to_plain());
+    }
+}
+
 const CODEX_16ROWS: &[u8] = include_bytes!("../../tests/fixtures/screen_replay/codex-16rows.bin");
 const CODEX_40_RESIZE: &[u8] =
     include_bytes!("../../tests/fixtures/screen_replay/codex-40-resize.bin");

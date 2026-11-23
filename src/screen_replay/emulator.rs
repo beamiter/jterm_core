@@ -228,11 +228,15 @@ impl Emulator {
                 let _ = write!(out, "\x1b[1;{}H\x1bH", col + 1);
             }
         }
+        if self.top == 0 && self.bottom + 1 == self.rows {
+            // An attachment can be resized between sending and applying the snapshot.
+            out.push_str("\x1b[r");
+        } else {
+            let _ = write!(out, "\x1b[{};{}r", self.top + 1, self.bottom + 1);
+        }
         let _ = write!(
             out,
-            "\x1b[{};{}r\x1b[?6{}\x1b[?7{}\x1b[4{}\x1b[?69{}",
-            self.top + 1,
-            self.bottom + 1,
+            "\x1b[?6{}\x1b[?7{}\x1b[4{}\x1b[?69{}",
             if self.origin { 'h' } else { 'l' },
             if self.autowrap { 'h' } else { 'l' },
             if self.insert { 'h' } else { 'l' },
