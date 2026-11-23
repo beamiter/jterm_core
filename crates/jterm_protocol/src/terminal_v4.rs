@@ -209,9 +209,11 @@ impl Update {
     }
 }
 
+/// A delivery carries one stage of the shared frame stream and the host's
+/// session status snapshot. The default retains the base terminal status.
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum StreamEvent {
+pub enum StreamEvent<Status = SessionStatus> {
     Update {
         owner: Attachment,
         sequence: Counter,
@@ -220,7 +222,7 @@ pub enum StreamEvent {
         frame: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview: Option<Box<PeerUpdate>>,
-        status: SessionStatus,
+        status: Status,
     },
     Stopped {
         owner: Attachment,
