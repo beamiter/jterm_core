@@ -13,6 +13,10 @@ from native_jsh import application, xdotool
 ARCHIVED = "archived-cross-copy witness"
 LIVE = "live-cross-copy witness"
 LATE = "released-after-copy"
+ARCHIVE_ROWS = ("record first", "record second", "record third", ARCHIVED,
+                "record fifth", "record sixth", "record seventh")
+LIVE_ROWS = ("running first", "running second", "running third", LIVE,
+             "running fifth", "running sixth", "running seventh")
 SENTINEL = b"selection test clipboard sentinel"
 SHELL = r"""#!/usr/bin/python3
 import os
@@ -24,8 +28,8 @@ import tty
 root = Path(__file__).parent
 (root / "leader").write_text(str(os.getpid()))
 tty.setraw(0)
-os.write(1, b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;C;cmdline_url=archived\x07archived-cross-copy witness\r\n")
-os.write(1, b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;C;cmdline_url=running\x07live-cross-copy witness\r\n")
+os.write(1, b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;C;cmdline_url=archived\x07" + ARCHIVE_PAYLOAD)
+os.write(1, b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07\r\n\x1b]133;C;cmdline_url=running\x07" + LIVE_PAYLOAD)
 sent = False
 deadline = time.monotonic() + 45
 while time.monotonic() < deadline:
@@ -45,13 +49,21 @@ def clipboard(*args, **kwargs):
     ).stdout
 
 
-def point(node, substring):
-    text = node.get_text_iface()
-    start = accessible_text(node).index(substring)
-    rect = Atspi.Text.get_character_extents(text, start, Atspi.CoordType.WINDOW)
+def bounds(node):
+    rect = Atspi.Component.get_extents(node.get_component_iface(), Atspi.CoordType.WINDOW)
     assert rect.x >= 0 and rect.y >= 0 and rect.width > 0 and rect.height > 0, rect
-    return rect.x + max(1, rect.width // 2), rect.y + rect.height // 2
+    return rect
 
+
+def points(archived, live):
+    card, terminal = bounds(archived), bounds(live)
+    # Use the middle of the visible output, including when the terminal's
+    # GTK child continues past the running card's clipped live region.
+    height = card.height / len(ARCHIVE_ROWS)
+    origin = (card.x + min(70, card.width // 2), card.y + card.height // 2)
+    target = (terminal.x + min(70, terminal.width // 2),
+              terminal.y + min(terminal.height // 2, round(4 * height)))
+    return origin, target
 
 def drag(window, start, end):
     xdotool("mousemove", "--window", window, str(start[0]), str(start[1]))
@@ -77,7 +89,9 @@ def copy():
 def exercise(binary, app, mode, root):
     root.mkdir(mode=0o700)
     shell = root / "shell"
-    shell.write_text(SHELL)
+    archive = "\r\n".join((*ARCHIVE_ROWS, "")).encode()
+    live_output = "\r\n".join((*LIVE_ROWS, "")).encode()
+    shell.write_text(SHELL.replace("ARCHIVE_PAYLOAD", repr(archive)).replace("LIVE_PAYLOAD", repr(live_output)))
     shell.chmod(0o700)
     config = root / f"{app}.toml"
     config.write_text(f'shell = {json.dumps(str(shell))}\nterminal_mode = "{mode}"\n')
@@ -112,9 +126,8 @@ def exercise(binary, app, mode, root):
         tty = Path(f"/proc/{child}/fd/0")
         source = tty.readlink()
         assert str(source).startswith("/dev/pts/"), source
-        origin = point(archived, "cross-copy witness")
-        target = point(live, "cross-copy witness")
-        expected = f"{ARCHIVED}\n$ \n{LIVE}\n"
+        origin, target = points(archived, live)
+        expected = "\n".join((*ARCHIVE_ROWS, "$ ", *LIVE_ROWS, ""))
         for start, end in ((origin, target), (target, origin)):
             clipboard("-i", input=SENTINEL)
             drag(window, start, end)
@@ -124,9 +137,16 @@ def exercise(binary, app, mode, root):
         clipboard("-i", input=SENTINEL)
         drag(window, origin, target)
         (root / "emit-after-selection").touch()
-        wait_for("paused output badge", lambda: any(
-            "output paused" in node.get_name().lower()
-            for node in shown() if node.get_name()))
+        def output_paused():
+            for node in shown():
+                if node.get_role() != Atspi.Role.STATUS_BAR:
+                    continue
+                label = node.get_name() or (accessible_text(node) if node.get_text_iface() else "")
+                if "output paused" in label.lower():
+                    return True
+            return False
+
+        wait_for("paused output badge", output_paused)
         assert LATE not in accessible_text(surface(LIVE, live=True))
         assert copy() == expected
         wait_for("parked PTY output replay after the copy", lambda: surface(LATE, live=True))
