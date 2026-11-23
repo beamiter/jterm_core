@@ -122,9 +122,10 @@ Uploads preserve existing files. The read-only Workspace rejects a changed
 host ID or evidence revision. The Vim9 X11 fixture covers the local project
 tree, byte-column jumps, palette, quickfix search and build output. The jsh
 fixture recalls an editable command and checks foreground-input isolation.
-Forge and Anvil use `JTERM_SHARED_RUNTIME=1` and `terminal_mode = "vte"`
-to exercise the shared runtime in ordinary tabs and splits with an eligible
-direct local sh or Bash command. The GTK tests cover exact PTY replies,
+Native Forge and Anvil packages built with `shared-terminal` use the shared
+runtime for eligible direct local sh and Bash tabs and splits configured
+with `terminal_mode = "vte"`. The native tests leave the runtime override
+unset for this route. The GTK tests cover exact PTY replies,
 bracketed paste, scrollback reflow with a retained reading position, and
 output drain in a hidden tab. The existing Find action opens search for the
 focused shared pane. Native X11 tests cover copying matches across soft wraps,

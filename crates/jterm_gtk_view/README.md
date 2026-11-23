@@ -44,19 +44,18 @@ both clicks with an isolated local GIO handler.
 
 ### Shared local session owner
 
-Set `JTERM_SHARED_RUNTIME=1` before launching a Linux candidate with a direct
-local `/bin/sh` or `/usr/bin/sh` login or interactive argv. **New shared
-terminal tab** opens the configured shell and working directory through
-`jterm_runtime`. The runtime owns the PTY, terminal state, bounded input
-queue, replies, resize, and exit. GTK renders its frames and history and
-keeps draining output when the tab is hidden. Other launch profiles use
-their existing transport, including Flatpak host shells.
+Linux Forge and Anvil builds with the `shared-terminal` feature use
+`jterm_runtime` by default for ordinary tabs and splits configured with
+`terminal_mode = "vte"` and a direct local sh or Bash argv. The runtime
+owns the PTY, terminal state, bounded input queue, replies, resize and exit.
+GTK renders its frames and history and keeps draining output when the tab is
+hidden. `JTERM_SHARED_RUNTIME=0` selects the existing compatibility route.
+Host-bridged shells and custom command launches use the compatibility transport.
 
-Add `--shared-runtime` to the X11 or Wayland fixture commands to verify this
-ownership route. X11 checks that exactly one PTY device-status reply arrives
-before the next typed byte, then exercises resize, clipboard, history, input
-effects, and a hidden tab. Wayland checks native IME and clipboard on the
-same runtime route.
+Use `--ordinary-panes` for the X11 fixture and `--ordinary-pane` for the
+Wayland fixture to check the default. For the standalone tab action, use
+`--shared-runtime` to verify ordered PTY replies and interactive input.
+The native checks also cover resizing, clipboard, history and hidden output.
 
 ### Wayland input method
 

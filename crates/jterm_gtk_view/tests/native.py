@@ -90,7 +90,8 @@ def run(args, root):
     environment[f"{app.upper()}_SHELL"] = shell
     if args.shell == "bash":
         (Path(environment["HOME"]) / ".bashrc").write_text("printf 'configured-bash-startup\\n'\n")
-    if args.shared_runtime or args.ordinary_panes:
+    environment.pop("JTERM_SHARED_RUNTIME", None)
+    if args.shared_runtime:
         environment["JTERM_SHARED_RUNTIME"] = "1"
     if args.osc8_links:
         install_link_handler(root, environment)

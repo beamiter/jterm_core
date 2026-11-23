@@ -3,11 +3,15 @@ use std::{
     os::unix::ffi::OsStrExt,
 };
 
-pub(crate) const OPT_IN: &str = "JTERM_SHARED_RUNTIME";
+pub(crate) const RUNTIME_OVERRIDE: &str = "JTERM_SHARED_RUNTIME";
 
-pub(crate) fn admit_local_argv(argv: &[String], host_bridge: bool, opt_in: Option<&OsStr>) -> bool {
+pub(crate) fn admit_local_argv(
+    argv: &[String],
+    host_bridge: bool,
+    runtime_override: Option<&OsStr>,
+) -> bool {
     !host_bridge
-        && opt_in == Some(OsStr::new("1"))
+        && runtime_override.is_none_or(|value| value == "1")
         && matches!(argv, [program, arguments @ ..]
             if matches!(program.as_str(), "/bin/sh" | "/usr/bin/sh" | "/bin/bash" | "/usr/bin/bash")
                 && arguments.iter().all(|arg| matches!(arg.as_str(), "-i" | "-l")))
@@ -21,7 +25,7 @@ pub(crate) fn runtime_environment(env: Vec<CString>) -> Result<Vec<(OsString, Os
             .iter()
             .position(|byte| *byte == b'=')
             .ok_or("invalid child environment entry")?;
-        if &bytes[..boundary] != OPT_IN.as_bytes() {
+        if &bytes[..boundary] != RUNTIME_OVERRIDE.as_bytes() {
             pairs.push((
                 OsStr::from_bytes(&bytes[..boundary]).to_owned(),
                 OsStr::from_bytes(&bytes[boundary + 1..]).to_owned(),
@@ -36,12 +40,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidate_profile_requires_explicit_local_shell_admission() {
+    fn local_shell_profile_defaults_to_shared_unless_overridden() {
         let enabled = Some(OsStr::new("1"));
         let args = ["/bin/sh".to_owned(), "-i".to_owned(), "-l".to_owned()];
         assert!(admit_local_argv(&args, false, enabled));
         assert!(!admit_local_argv(&args, true, enabled));
-        assert!(!admit_local_argv(&args, false, None));
+        assert!(admit_local_argv(&args, false, None));
+        assert!(!admit_local_argv(&args, true, None));
+        assert!(!admit_local_argv(&args, false, Some(OsStr::new("0"))));
         assert!(!admit_local_argv(&args, false, Some(OsStr::new("yes"))));
         let bash = ["/usr/bin/bash".to_owned(), "-l".to_owned()];
         assert!(admit_local_argv(&bash, false, enabled));
@@ -53,6 +59,7 @@ mod tests {
         ] {
             let refused = refused.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(!admit_local_argv(&refused, false, enabled));
+            assert!(!admit_local_argv(&refused, false, None));
         }
     }
 

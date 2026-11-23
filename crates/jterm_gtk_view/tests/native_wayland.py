@@ -215,7 +215,7 @@ def run(args):
     config.write_text(contents)
     config.chmod(0o600)
     env[f"{args.app.upper()}_SHELL"] = "/bin/sh"
-    if not args.vim9 and (args.shared_runtime or args.ordinary_pane):
+    if args.shared_runtime and not args.vim9:
         env["JTERM_SHARED_RUNTIME"] = "1"
     children = []
 

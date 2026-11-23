@@ -19,7 +19,7 @@ use jterm_runtime::{pty_session::Session, runtime_wake::WakeSink};
 
 use crate::pane::{INITIAL_COLUMNS, INITIAL_ROWS};
 
-use crate::runtime_launch::{admit_local_argv, runtime_environment, OPT_IN};
+use crate::runtime_launch::{admit_local_argv, runtime_environment, RUNTIME_OVERRIDE};
 use crate::viewport::{ViewportFrame, ViewportRequest};
 
 /// Main-context handle for the common runtime's sole PTY and terminal owner.
@@ -81,7 +81,11 @@ impl Update {
 
 impl RuntimeShell {
     pub fn admits_candidate(argv: &[String], host_bridge: bool) -> bool {
-        admit_local_argv(argv, host_bridge, std::env::var_os(OPT_IN).as_deref())
+        admit_local_argv(
+            argv,
+            host_bridge,
+            std::env::var_os(RUNTIME_OVERRIDE).as_deref(),
+        )
     }
 
     pub fn spawn_candidate(
@@ -124,7 +128,7 @@ impl RuntimeShell {
             return Ok(None);
         };
         if host_bridge
-            || std::env::var_os(OPT_IN).as_deref() != Some(std::ffi::OsStr::new("1"))
+            || std::env::var_os(RUNTIME_OVERRIDE).as_deref() != Some(std::ffi::OsStr::new("1"))
             || !matches!(program.as_str(), "/bin/bash" | "/usr/bin/bash")
         {
             return Ok(None);
