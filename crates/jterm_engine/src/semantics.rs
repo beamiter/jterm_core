@@ -229,10 +229,14 @@ pub(crate) fn dispatch_local_with_underline(
                 b'q' => {
                     private_prefix.is_none() && (intermediates == b" " || intermediates == b"\"")
                 }
-                b'n' => matches!(
-                    (private_prefix, params.first().copied().unwrap_or(0)),
-                    (None, 5 | 6) | (Some(b'?'), 6)
-                ),
+                b'n' => {
+                    // Standard and DEC-private DSR have no intermediate bytes.
+                    intermediates.is_empty()
+                        && matches!(
+                            (private_prefix, params.first().copied().unwrap_or(0)),
+                            (None, 5 | 6) | (Some(b'?'), 6)
+                        )
+                }
                 // Mode commands stay whole in the host, including mixed lists.
                 _ => false,
             };
