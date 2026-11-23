@@ -25,6 +25,7 @@ pub(crate) struct TerminalView {
     preedit: gtk4::Label,
     cursor_offset: Cell<Option<i32>>,
     presentation: RefCell<Option<Presentation>>,
+    find_tags: RefCell<Option<[gtk4::TextTag; 2]>>,
     theme: RefCell<Theme>,
     line_height_scale: Cell<f64>,
     appearance_changed: Cell<bool>,
@@ -54,13 +55,13 @@ struct CopyRow {
 }
 
 #[derive(Clone, Copy)]
-enum RowSource<'a> {
+pub(crate) enum RowSource<'a> {
     Live(&'a CellFrame, usize, u128),
     History(&'a HistoryPage, usize),
 }
 
 impl<'a> RowSource<'a> {
-    fn row(self) -> Option<&'a Row> {
+    pub(crate) fn row(self) -> Option<&'a Row> {
         match self {
             Self::Live(frame, index, _) => frame.rows().get(index),
             Self::History(page, index) => page.row(index),
@@ -74,7 +75,7 @@ impl<'a> RowSource<'a> {
         }
     }
 
-    fn margin_gap(self) -> Option<usize> {
+    pub(crate) fn margin_gap(self) -> Option<usize> {
         match self {
             Self::Live(frame, index, gaps) => (gaps & (1 << index) != 0).then(|| frame.cols() - 1),
             Self::History(page, index) => page.synthetic_margin_gap(index),
@@ -92,6 +93,21 @@ impl<'a> RowSource<'a> {
         match self {
             Self::Live(frame, index, _) => frame.cluster_text(index, column),
             Self::History(page, index) => page.cluster_text(index, column),
+        }
+    }
+
+    pub(crate) fn character_count(self, column: usize) -> i32 {
+        self.cluster(column)
+            .map_or(1, |cluster| cluster.chars().count() as i32)
+    }
+
+    pub(crate) fn push_text(self, text: &mut String, column: usize, character: char) -> i32 {
+        if let Some(cluster) = self.cluster(column) {
+            text.push_str(cluster);
+            cluster.chars().count() as i32
+        } else {
+            text.push(character);
+            1
         }
     }
 
@@ -200,6 +216,7 @@ impl TerminalView {
             preedit,
             cursor_offset: Cell::new(None),
             presentation: RefCell::default(),
+            find_tags: RefCell::default(),
             theme: RefCell::new(theme),
             line_height_scale: Cell::new(1.0),
             appearance_changed: Cell::new(false),
@@ -340,6 +357,7 @@ impl TerminalView {
         history: Option<&HistoryPage>,
         colors: Option<&(u64, Arc<ColorState>)>,
     ) {
+        self.clear_find();
         let revision = colors.map_or(0, |(revision, _)| *revision);
         let same_palette = self.palette_revision.replace(revision) == revision;
         let configured = self.theme.borrow().clone();
@@ -420,6 +438,56 @@ impl TerminalView {
             .rows
             .get(row)?
             .blank_tail
+    }
+
+    pub(crate) fn clear_find(&self) {
+        if let Some(tags) = self.find_tags.take() {
+            let table = self.widget.buffer().tag_table();
+            for tag in tags.iter().rev() {
+                table.remove(tag);
+            }
+        }
+    }
+
+    pub(crate) fn paint_find(&self, top: usize, hits: &[crate::FindMatch], current: Option<usize>) {
+        self.clear_find();
+        let buffer = self.widget.buffer();
+        let bottom = top + buffer.line_count() as usize;
+        let table = buffer.tag_table();
+        let tags = [
+            gtk4::TextTag::builder()
+                .name("jterm-screen-find-match")
+                .background("#e5ca75")
+                .foreground("#201a00")
+                .build(),
+            gtk4::TextTag::builder()
+                .name("jterm-screen-find-current")
+                .background("#ffa842")
+                .foreground("#201a00")
+                .build(),
+        ];
+        for tag in &tags {
+            table.add(tag);
+        }
+        for (index, hit) in hits.iter().enumerate() {
+            if hit.end.row < top || hit.start.row >= bottom {
+                continue;
+            }
+            let start = if hit.start.row < top {
+                Some(buffer.start_iter())
+            } else {
+                buffer.iter_at_line_offset((hit.start.row - top) as i32, hit.start.offset)
+            };
+            let end = if hit.end.row >= bottom {
+                Some(buffer.end_iter())
+            } else {
+                buffer.iter_at_line_offset((hit.end.row - top) as i32, hit.end.offset)
+            };
+            if let (Some(start), Some(end)) = (start, end) {
+                buffer.apply_tag(&tags[usize::from(Some(index) == current)], &start, &end);
+            }
+        }
+        self.find_tags.replace(Some(tags));
     }
 
     pub(crate) fn selected_text(&self) -> Option<String> {
@@ -1000,13 +1068,7 @@ fn paint_row(
                 .push(insert_run(buffer, end, &run, font, old_style));
             run.clear();
         }
-        let length = if let Some(cluster) = source.cluster(column) {
-            run.push_str(cluster);
-            cluster.chars().count() as i32
-        } else {
-            run.push(cell.character);
-            1
-        };
+        let length = source.push_text(&mut run, column, cell.character);
         let end_offset = offset + length;
         if length != 1 || cell.flags.wide() {
             result.column_spans.push(ColumnSpan {

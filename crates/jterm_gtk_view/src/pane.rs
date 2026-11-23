@@ -25,6 +25,7 @@ use crate::view::TerminalView;
 use crate::viewport::{
     HistoricalWindow, HistoryRail, ScrollTarget, ViewportFrame, ViewportRequest,
 };
+use crate::{find, FindFrame, FindMatch, FindRegion, FindSnapshot};
 
 pub(crate) const INITIAL_ROWS: usize = 24;
 pub(crate) const INITIAL_COLUMNS: usize = 80;
@@ -134,6 +135,7 @@ impl GridSize {
 /// application presents the same terminal at a prompt, running or fullscreen.
 pub struct EmbeddedTerminal<P: Pty> {
     pane: Rc<TerminalPane<P>>,
+    find_owner: Rc<()>,
 }
 
 impl<P: Pty> EmbeddedTerminal<P> {
@@ -157,7 +159,13 @@ impl<P: Pty> EmbeddedTerminal<P> {
             InputStyle::Terminal,
             grid_size,
         )?;
-        Ok((widget, Rc::new(Self { pane })))
+        Ok((
+            widget,
+            Rc::new(Self {
+                pane,
+                find_owner: Rc::new(()),
+            }),
+        ))
     }
 
     pub fn pane(&self) -> &Rc<TerminalPane<P>> {
@@ -190,10 +198,104 @@ impl<P: Pty> EmbeddedTerminal<P> {
         self.pane.report_exit(status);
     }
 
-    pub(crate) fn enable_transcript_sources(&self) {
+    pub fn enable_transcript_sources(&self) {
         if let Backend::Legacy { terminal, .. } = &self.pane.backend {
             terminal.borrow_mut().track_transcript_rows();
         }
+    }
+
+    pub fn find_snapshot(
+        &self,
+        region: FindRegion,
+        byte_limit: usize,
+        expired: &mut dyn FnMut() -> bool,
+    ) -> Option<FindSnapshot> {
+        let top = self.pane.scroll_top.get();
+        self.inspect(|terminal| {
+            find::capture(
+                terminal,
+                Rc::downgrade(&self.find_owner),
+                region,
+                top,
+                byte_limit,
+                expired,
+            )
+        })
+    }
+
+    pub fn find_is_current(&self, frame: &FindFrame) -> bool {
+        let source = &frame.0;
+        if !source.owner.ptr_eq(&Rc::downgrade(&self.find_owner)) {
+            return false;
+        }
+        self.inspect(|terminal| {
+            !terminal.publication_held()
+                && terminal.history_extent() == (source.history_start..source.history_end)
+                && terminal
+                    .frame()
+                    .is_ok_and(|actual| actual.stamp() == source.stamp)
+        })
+    }
+
+    /// Reveal the exact occurrence without changing GTK focus or starting a
+    /// text selection, so a search does not pause the PTY or own PRIMARY.
+    pub fn show_find(&self, frame: &FindFrame, hits: Rc<[FindMatch]>, current: usize) -> bool {
+        let Some(found) = hits.get(current) else {
+            return false;
+        };
+        if !self.find_is_current(frame) || !found.frame.same_snapshot(frame) {
+            return false;
+        }
+        self.pane.paint();
+        let is_visible = || {
+            self.pane.painted_find_top(frame).is_some_and(|top| {
+                (top..top + self.pane.dimensions.get().0).contains(&found.start.row)
+            })
+        };
+        if !is_visible() {
+            let top = if found.start.row < frame.0.history_rows {
+                let Some(anchor) = self
+                    .inspect(|terminal| terminal.history_layout().ok()?.anchor_at(found.start.row))
+                else {
+                    return false;
+                };
+                Some(ScrollTarget::Source(anchor))
+            } else {
+                None
+            };
+            self.pane.set_scroll_top(top);
+            self.pane.paint();
+        }
+        if !self.find_is_current(frame) || !is_visible() {
+            return false;
+        }
+        self.highlight_find(frame, hits, Some(current))
+    }
+
+    pub fn highlight_find(
+        &self,
+        frame: &FindFrame,
+        hits: Rc<[FindMatch]>,
+        current: Option<usize>,
+    ) -> bool {
+        if !self.find_is_current(frame) || hits.iter().any(|hit| !hit.frame.same_snapshot(frame)) {
+            self.clear_find();
+            return false;
+        }
+        self.pane
+            .find_highlights
+            .replace(Some(find::FindHighlights {
+                frame: frame.clone(),
+                hits,
+                current,
+            }));
+        self.pane.paint_find();
+        true
+    }
+
+    pub fn clear_find(&self) {
+        self.pane.find_highlights.take();
+        self.pane.view.clear_find();
     }
 
     pub(crate) fn reveal_transcript_source(&self, point: HistoryAnchor) -> bool {
@@ -406,6 +508,7 @@ pub struct TerminalPane<P: Pty> {
     scroll_top: Cell<Option<ScrollTarget>>,
     history_rail: RefCell<HistoryRail>,
     painted_source: Cell<Option<(Stamp, Option<usize>)>>,
+    find_highlights: RefCell<Option<find::FindHighlights>>,
     transcript_painted: OnceCell<Box<dyn Fn()>>,
     history_search: OnceCell<Rc<HistorySearchView>>,
     scroll_update: Cell<bool>,
@@ -590,6 +693,7 @@ impl<P: Pty> TerminalPane<P> {
             scroll_top: Cell::new(None),
             history_rail: RefCell::default(),
             painted_source: Cell::new(None),
+            find_highlights: RefCell::default(),
             transcript_painted: OnceCell::new(),
             history_search: OnceCell::new(),
             scroll_update: Cell::new(false),
@@ -1130,8 +1234,29 @@ impl<P: Pty> TerminalPane<P> {
         );
         self.painted_source.set(Some((frame.stamp(), history_top)));
         self.dirty.set(newer_output);
+        self.paint_find();
         if let Some(observer) = self.transcript_painted.get() {
             observer();
+        }
+    }
+
+    fn painted_find_top(&self, frame: &FindFrame) -> Option<usize> {
+        let (stamp, top) = self.painted_source.get()?;
+        let rail = self.history_rail.borrow();
+        let source = &frame.0;
+        (source.stamp == stamp && rail.extent == (source.history_start..source.history_end))
+            .then_some(top.unwrap_or(source.history_rows))
+    }
+
+    fn paint_find(&self) {
+        let Some(find) = self.find_highlights.borrow().clone() else {
+            return;
+        };
+        if let Some(top) = self.painted_find_top(&find.frame) {
+            self.view.paint_find(top, &find.hits, find.current);
+        } else {
+            self.find_highlights.take();
+            self.view.clear_find();
         }
     }
 
@@ -1798,6 +1923,112 @@ mod transcript_tests {
         ) -> Result<(), String> {
             panic!("the application owns the embedded reader")
         }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn find_paints_archived_unicode_without_stealing_focus_or_selection() {
+        gtk4::init().unwrap();
+        let theme = Theme {
+            font: pango::FontDescription::from_string("Monospace 12"),
+            foreground: gdk::RGBA::WHITE,
+            background: gdk::RGBA::BLACK,
+            palette: crate::default_ansi_palette(),
+        };
+        let links = || LinkActions {
+            admit: |_, _| false,
+            find_plain: None,
+            attach_opener: |_| Box::new(|_| {}),
+        };
+        let (widget, terminal) =
+            EmbeddedTerminal::new(TestPty, 9, 4, theme.clone(), |s, _| s.to_owned(), links())
+                .unwrap();
+        let (_, other_terminal) =
+            EmbeddedTerminal::new(TestPty, 9, 4, theme, |s, _| s.to_owned(), links()).unwrap();
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let entry = gtk4::Entry::new();
+        content.append(&entry);
+        content.append(&widget);
+        let window = gtk4::Window::builder().child(&content).build();
+        window.present();
+        entry.grab_focus();
+        let focus_before = gtk4::prelude::RootExt::focus(&window).expect("find entry focus");
+        terminal
+            .ingest("prefix界e\u{301}target\r\n1\r\n2\r\n3\r\n4\r\ncurrent".as_bytes())
+            .unwrap();
+        terminal.pane.paint();
+
+        let query = "界e\u{301}target";
+        let find = || {
+            let snapshot = terminal
+                .find_snapshot(FindRegion::Transcript, 8192, &mut || false)
+                .unwrap();
+            assert!(!snapshot.incomplete);
+            let hits: Rc<[FindMatch]> = snapshot
+                .windows
+                .iter()
+                .flat_map(|window| {
+                    window
+                        .text()
+                        .match_indices(query)
+                        .filter_map(|(offset, _)| window.match_at(offset..offset + query.len()))
+                })
+                .collect();
+            assert_eq!(hits.len(), 1);
+            (snapshot.frame, hits)
+        };
+        let (frame, hits) = find();
+        other_terminal
+            .ingest("prefix界e\u{301}target\r\n1\r\n2\r\n3\r\n4\r\ncurrent".as_bytes())
+            .unwrap();
+        assert_eq!(
+            terminal.inspect(|t| t.frame().unwrap().stamp()),
+            other_terminal.inspect(|t| t.frame().unwrap().stamp())
+        );
+        assert!(!other_terminal.find_is_current(&frame));
+        let other_frame = other_terminal
+            .find_snapshot(FindRegion::Transcript, 8192, &mut || false)
+            .unwrap()
+            .frame;
+        assert!(!other_terminal.highlight_find(&other_frame, hits.clone(), Some(0)));
+        let starts_with_highlight = |character| {
+            let screen = terminal.pane.screen();
+            let buffer = screen.buffer();
+            let tag = buffer
+                .tag_table()
+                .lookup("jterm-screen-find-current")
+                .unwrap();
+            let mut iter = buffer.start_iter();
+            while !iter.is_end() && !iter.has_tag(&tag) {
+                iter.forward_char();
+            }
+            assert_eq!(iter.char(), character);
+            assert!(!buffer.has_selection());
+            assert_eq!(
+                gtk4::prelude::RootExt::focus(&window),
+                Some(focus_before.clone())
+            );
+        };
+        assert!(terminal.show_find(&frame, hits.clone(), 0));
+        starts_with_highlight('界');
+        terminal.resize(7, 4).unwrap();
+        assert!(!terminal.show_find(&frame, hits, 0));
+        // Return to the live grid so the search owns the complete retained prefix.
+        terminal.pane.set_scroll_top(None);
+        let (frame, hits) = find();
+        assert!(terminal.show_find(&frame, hits, 0));
+        starts_with_highlight('界');
+        terminal.pane.set_history_row_limit(0);
+        terminal.pane.paint();
+        assert!(!terminal.find_is_current(&frame));
+        assert!(terminal
+            .pane
+            .screen()
+            .buffer()
+            .tag_table()
+            .lookup("jterm-screen-find-current")
+            .is_none());
+        window.close();
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 mod command;
 mod document;
+mod find;
 mod history_search;
 mod inline_images;
 mod live_output;
@@ -22,6 +23,7 @@ pub use command::{
     supports_finished_command, FinishedTextView,
 };
 pub use document::DocumentView;
+pub use find::{FindFrame, FindMatch, FindRegion, FindSnapshot, FindWindow};
 pub use inline_images::{InlineImageRequest, PendingInlineImage};
 pub use jterm_engine::authenticated_boundaries;
 pub use jterm_engine::history_reflow::HistoryAnchor;

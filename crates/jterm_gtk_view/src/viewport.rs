@@ -25,7 +25,7 @@ pub(crate) enum ScrollTarget {
 }
 
 impl ScrollTarget {
-    fn row(self, layout: &HistoryLayout) -> usize {
+    pub(crate) fn row(self, layout: &HistoryLayout) -> usize {
         match self {
             Self::Source(anchor) => layout.row_at(anchor),
             Self::FromTail(distance) => layout.len() - distance.min(layout.len() as u64) as usize,
