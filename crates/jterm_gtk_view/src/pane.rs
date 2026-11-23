@@ -7,7 +7,7 @@ use jterm_engine::{
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
     mouse::MouseInput,
-    terminal::{Terminal, WindowUpdates},
+    terminal::{Terminal, WindowUpdates, MAX_FEED_BYTES},
 };
 use jterm_runtime::exit_status::PtyExit;
 use std::{
@@ -39,7 +39,12 @@ enum Backend<P> {
 /// Existing application-owned PTY transport. Terminal semantics live in this
 /// view's single shared engine, while the transport owns the child and descriptors.
 pub trait Pty: 'static {
+    /// Finish any host-held output before encoding a user's next input.
+    fn before_input(&self) {}
     fn write(&self, bytes: &[u8]) -> Result<(), String>;
+    fn write_reply(&self, bytes: &[u8]) -> Result<(), String> {
+        self.write(bytes)
+    }
     fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
     fn stop(&self);
     fn start_reader(
@@ -103,6 +108,116 @@ enum InputStyle {
     HostedAttachment { inline_history: bool },
 }
 
+#[derive(Clone, Copy)]
+enum GridSize {
+    Allocation,
+    Application { cols: u16, rows: u16 },
+}
+
+impl GridSize {
+    fn dimensions(self) -> (usize, usize) {
+        match self {
+            Self::Allocation => (INITIAL_ROWS, INITIAL_COLUMNS),
+            Self::Application { cols, rows } => (usize::from(rows), usize::from(cols)),
+        }
+    }
+
+    fn automatic(self) -> bool {
+        matches!(self, Self::Allocation)
+    }
+}
+
+/// Live terminal for an application that already owns the PTY reader and
+/// decides when to resize the full grid. Its widget can be clipped as the
+/// application presents the same terminal at a prompt, running or fullscreen.
+pub struct EmbeddedTerminal<P: Pty> {
+    pane: Rc<TerminalPane<P>>,
+}
+
+impl<P: Pty> EmbeddedTerminal<P> {
+    /// `cols` and `rows` describe the PTY's existing grid at attachment time.
+    pub fn new(
+        pty: P,
+        cols: u16,
+        rows: u16,
+        theme: Theme,
+        status_text: fn(&str, usize) -> String,
+        links: LinkActions,
+    ) -> Result<(gtk4::Widget, Rc<Self>), String> {
+        let grid_size = GridSize::Application { cols, rows };
+        let backend = local_backend(pty, grid_size, links.admit)?;
+        let (widget, pane) = TerminalPane::attach(
+            backend,
+            theme,
+            status_text,
+            links,
+            None,
+            InputStyle::Terminal,
+            grid_size,
+        )?;
+        Ok((widget, Rc::new(Self { pane })))
+    }
+
+    pub fn pane(&self) -> &Rc<TerminalPane<P>> {
+        &self.pane
+    }
+
+    pub fn scrollback_adjustment(&self) -> &gtk4::Adjustment {
+        &self.pane.scrollback
+    }
+
+    pub fn fit_grid(&self, width: i32, height: i32) -> (u16, u16) {
+        let (rows, cols) = self.pane.view.dimensions(width, height);
+        (cols as u16, rows as u16)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        if self.pane.exited.get() {
+            return Err("terminal session is closed".into());
+        }
+        self.pane.resize_grid(usize::from(rows), usize::from(cols))
+    }
+
+    /// Apply the next bytes from the application's reader and queue the
+    /// engine's replies on the same transport before notifying observers.
+    pub fn ingest(&self, bytes: &[u8]) -> Result<(), String> {
+        self.pane.feed_local(bytes)
+    }
+
+    pub fn exited(&self, status: PtyExit) {
+        self.pane.report_exit(status);
+    }
+
+    pub fn inspect<T>(&self, read: impl FnOnce(&Terminal) -> T) -> T {
+        let Backend::Legacy { terminal, .. } = &self.pane.backend else {
+            unreachable!("an embedded terminal has its own shared engine")
+        };
+        read(&terminal.borrow())
+    }
+}
+
+fn local_backend<P: Pty>(
+    pty: P,
+    grid_size: GridSize,
+    link_policy: HyperlinkPolicy,
+) -> Result<Backend<P>, String> {
+    let (rows, cols) = grid_size.dimensions();
+    let mut terminal = Terminal::new(rows, cols)?;
+    terminal.enable_underline_colors();
+    terminal.enable_grapheme_clusters();
+    terminal.enable_hyperlinks(link_policy);
+    terminal.enable_window_updates();
+    if !grid_size.automatic() {
+        terminal.enable_history_preserving_resize();
+        terminal.enable_device_answers();
+        terminal.track_printed_spaces();
+    }
+    Ok(Backend::Legacy {
+        pty,
+        terminal: Box::new(RefCell::new(terminal)),
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PointerMotion {
     column: usize,
@@ -152,21 +267,16 @@ impl<P: Pty> TerminalPane<P> {
         links: LinkActions,
         close: impl Fn(&gtk4::Widget) + 'static,
     ) -> Result<(gtk4::Widget, Rc<Self>), String> {
-        let mut terminal = Terminal::new(INITIAL_ROWS, INITIAL_COLUMNS)?;
-        terminal.enable_underline_colors();
-        terminal.enable_grapheme_clusters();
-        terminal.enable_hyperlinks(links.admit);
-        terminal.enable_window_updates();
+        let grid_size = GridSize::Allocation;
+        let backend = local_backend(pty, grid_size, links.admit)?;
         Self::attach(
-            Backend::Legacy {
-                pty,
-                terminal: Box::new(RefCell::new(terminal)),
-            },
+            backend,
             theme,
             status_text,
             links,
             Some(Box::new(close)),
             InputStyle::Terminal,
+            grid_size,
         )
     }
 
@@ -185,6 +295,7 @@ impl<P: Pty> TerminalPane<P> {
             links,
             Some(Box::new(close)),
             InputStyle::Terminal,
+            GridSize::Allocation,
         )
     }
 
@@ -202,6 +313,7 @@ impl<P: Pty> TerminalPane<P> {
             links,
             None,
             InputStyle::Terminal,
+            GridSize::Allocation,
         )
     }
 
@@ -223,6 +335,7 @@ impl<P: Pty> TerminalPane<P> {
                 inline_history: std::env::var_os("JTERM_AGENT_SCROLLBACK")
                     .is_none_or(|value| value != "0"),
             },
+            GridSize::Allocation,
         )
     }
 
@@ -233,8 +346,10 @@ impl<P: Pty> TerminalPane<P> {
         links: LinkActions,
         close: Option<OnClose>,
         input_style: InputStyle,
+        grid_size: GridSize,
     ) -> Result<(gtk4::Widget, Rc<Self>), String> {
-        let (rows, columns) = (INITIAL_ROWS, INITIAL_COLUMNS);
+        let (rows, columns) = grid_size.dimensions();
+        let automatic_grid = grid_size.automatic();
         let colors = theme.terminal_colors();
         let view = TerminalView::new(theme);
         let scroll = gtk4::ScrolledWindow::builder()
@@ -259,7 +374,9 @@ impl<P: Pty> TerminalPane<P> {
         let body = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         body.set_vexpand(true);
         body.append(&viewport);
-        body.append(&scrollbar);
+        if automatic_grid {
+            body.append(&scrollbar);
+        }
         let status = gtk4::Label::new(None);
         status.set_xalign(0.0);
         status.set_hexpand(true);
@@ -321,7 +438,7 @@ impl<P: Pty> TerminalPane<P> {
             paste_reader: RefCell::new(None),
             input_revision: Cell::new(0),
         });
-        if session.pty().is_some() {
+        if automatic_grid && session.pty().is_some() {
             session.resize(rows, columns);
         }
         session.connect_input();
@@ -346,7 +463,8 @@ impl<P: Pty> TerminalPane<P> {
             let Some(scroll) = scroll.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if !session.exited.get() && scroll.width() > 0 && scroll.height() > 0 {
+            if automatic_grid && !session.exited.get() && scroll.width() > 0 && scroll.height() > 0
+            {
                 let (rows, columns) = session.view.dimensions(scroll.width(), scroll.height());
                 if session.dimensions.get() != (rows, columns) {
                     session.resize(rows, columns);
@@ -359,20 +477,25 @@ impl<P: Pty> TerminalPane<P> {
         match &session.backend {
             Backend::Legacy { pty, terminal } => {
                 terminal.borrow_mut().set_color_defaults(colors);
-                let for_output = Rc::downgrade(&session);
-                let for_exit = Rc::downgrade(&session);
-                pty.start_reader(
-                    move |bytes| {
-                        if let Some(session) = for_output.upgrade() {
-                            session.feed_legacy(&bytes);
-                        }
-                    },
-                    move |status| {
-                        if let Some(session) = for_exit.upgrade() {
-                            session.report_exit(status);
-                        }
-                    },
-                )?;
+                if automatic_grid {
+                    let for_output = Rc::downgrade(&session);
+                    let for_exit = Rc::downgrade(&session);
+                    pty.start_reader(
+                        move |bytes| {
+                            if let Some(session) = for_output.upgrade() {
+                                if let Err(error) = session.feed_local(&bytes) {
+                                    session.report(&error);
+                                    session.stop();
+                                }
+                            }
+                        },
+                        move |status| {
+                            if let Some(session) = for_exit.upgrade() {
+                                session.report_exit(status);
+                            }
+                        },
+                    )?;
+                }
             }
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => {
@@ -714,7 +837,13 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     fn resize(&self, rows: usize, columns: usize) {
-        let result = match &self.backend {
+        if let Err(error) = self.resize_grid(rows, columns) {
+            self.report(&format!("Cannot resize terminal: {error}"));
+        }
+    }
+
+    fn resize_grid(&self, rows: usize, columns: usize) -> Result<(), String> {
+        match &self.backend {
             Backend::Legacy { pty, terminal } => {
                 terminal
                     .borrow_mut()
@@ -722,41 +851,38 @@ impl<P: Pty> TerminalPane<P> {
             }
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => owner.resize(rows, columns),
-        };
-        match result {
-            Ok(()) => {
-                self.dimensions.set((rows, columns));
-                self.dirty.set(true);
-            }
-            Err(error) => self.report(&format!("Cannot resize terminal: {error}")),
-        }
+        }?;
+        self.dimensions.set((rows, columns));
+        self.dirty.set(true);
+        Ok(())
     }
 
-    fn feed_legacy(&self, input: &[u8]) {
+    fn feed_local(&self, input: &[u8]) -> Result<(), String> {
         let Backend::Legacy { pty, terminal } = &self.backend else {
-            return;
+            return Err("terminal session owns its reader".into());
         };
-        let (reply, window) = {
-            let mut terminal = terminal.borrow_mut();
-            let reply = terminal.feed(input);
-            (reply, terminal.take_window_updates())
-        };
+        if self.exited.get() {
+            return Err("terminal output is closed".into());
+        }
+        if input.is_empty() {
+            return Ok(());
+        }
+        let result = input.chunks(MAX_FEED_BYTES).try_for_each(|chunk| {
+            let reply = terminal
+                .borrow_mut()
+                .feed(chunk)
+                .map_err(|error| format!("Terminal output failed: {error}"))?;
+            if reply.is_empty() {
+                return Ok(());
+            }
+            pty.write_reply(&reply)
+                .map_err(|error| format!("Terminal reply delivery failed: {error}"))
+        });
+        let window = terminal.borrow_mut().take_window_updates();
         self.dirty.set(true);
         self.notify(PaneEvent::Output);
         self.notify_window(window);
-        match reply {
-            Ok(bytes) if bytes.is_empty() => {}
-            Ok(bytes) => {
-                if let Err(error) = pty.write(&bytes) {
-                    self.report(&format!("Terminal reply delivery failed: {error}"));
-                    self.stop();
-                }
-            }
-            Err(error) => {
-                self.report(&format!("Terminal output failed: {error}"));
-                self.stop();
-            }
-        }
+        result
     }
 
     fn paint(&self) {
@@ -976,6 +1102,11 @@ impl<P: Pty> TerminalPane<P> {
         &self,
         encode: impl FnOnce(&Terminal) -> Result<Vec<u8>, String>,
     ) -> Result<bool, String> {
+        if !self.exited.get() {
+            if let Some(pty) = self.pty() {
+                pty.before_input();
+            }
+        }
         let accepted = self.queue_input(encode)?;
         if accepted {
             self.input_admitted();

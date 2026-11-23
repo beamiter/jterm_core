@@ -53,6 +53,30 @@ fn initial_protocol() -> ProtocolState {
     protocol
 }
 
+fn device_answer(event: &Event<'_>) -> Option<&'static [u8]> {
+    let Event::Csi {
+        private_prefix,
+        params,
+        intermediates,
+        final_byte,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if !intermediates.is_empty() {
+        return None;
+    }
+    match (*private_prefix, *final_byte, params.as_slice()) {
+        (None, b'c', [] | [0]) => Some(b"\x1b[?1;2c"),
+        (Some(b'>'), b'c', [] | [0]) => Some(b"\x1b[>0;0;0c"),
+        (Some(b'='), b'c', [] | [0]) => Some(b"\x1bP!|00000000\x1b\\"),
+        (Some(b'>'), b'q', [] | [0]) => Some(b"\x1bP>|jterm\x1b\\"),
+        (Some(b'?'), b'm', [4]) => Some(b"\x1b[>4;0m"),
+        _ => None,
+    }
+}
+
 const MAX_HISTORY_ROWS: usize = 1024;
 const MAX_COPY_BYTES: usize = MAX_ROWS * (MAX_COLS * MAX_CLUSTER_BYTES + 1);
 const MAX_HYPERLINK_URL_BYTES: usize = 1024 * 1024;
@@ -117,47 +141,67 @@ impl HistoryPage {
         end_row: usize,
         end_col: usize,
     ) -> Result<String, String> {
-        let valid = |r: usize, c: usize| {
-            r < self.rows.len() && c <= self.rows[r].row.cells.len()
-                || r == self.rows.len() && c == 0
-        };
-        if !valid(start_row, start_col)
-            || !valid(end_row, end_col)
-            || (start_row, start_col) > (end_row, end_col)
-        {
-            return Err("selection out of bounds".into());
-        }
-        let mut text = String::new();
-        for row in start_row..self.rows.len().min(end_row.saturating_add(1)) {
-            let cells = &self.rows[row].row.cells;
-            let start = if row == start_row { start_col } else { 0 };
-            let end = if row == end_row { end_col } else { cells.len() };
-            for (offset, cell) in cells[start..end].iter().enumerate() {
-                if !cell.flags.wide_continuation()
-                    && self.rows[row].synthetic_gap != Some(start + offset)
-                {
-                    if let Some(cluster) = self.cluster_text(row, start + offset) {
-                        text.push_str(cluster);
-                    } else {
-                        text.push(cell.character);
-                    }
-                }
-            }
-            if row < end_row && !self.rows[row].row.wrapped {
-                // Physical trailing blank padding is not copied across a hard line.
-                while text.ends_with(' ') {
-                    text.pop();
-                }
-                if row + 1 < self.rows.len() {
-                    text.push('\n');
-                }
-            }
-            if text.len() > MAX_COPY_BYTES {
-                return Err("selection byte limit".into());
-            }
-        }
-        Ok(text)
+        selection_text(
+            &self.rows,
+            (start_row, start_col),
+            (end_row, end_col),
+            false,
+        )
     }
+}
+
+fn selection_text(
+    rows: &[HistoryCopyRow],
+    start: (usize, usize),
+    end: (usize, usize),
+    require_literal: bool,
+) -> Result<String, String> {
+    let valid = |(row, col): (usize, usize)| {
+        rows.get(row).is_some_and(|row| col <= row.row.cells.len()) || row == rows.len() && col == 0
+    };
+    if !valid(start) || !valid(end) || start > end {
+        return Err("selection out of bounds".into());
+    }
+    let mut text = String::new();
+    let mut printed_space_end = 0;
+    for (index, source) in rows
+        .iter()
+        .enumerate()
+        .skip(start.0)
+        .take(end.0 - start.0 + 1)
+    {
+        let cells = &source.row.cells;
+        let first_col = if index == start.0 { start.1 } else { 0 };
+        let last_col = if index == end.0 { end.1 } else { cells.len() };
+        for (offset, cell) in cells[first_col..last_col].iter().enumerate() {
+            let col = first_col + offset;
+            if cell.flags.wide_continuation() || source.synthetic_gap == Some(col) {
+                continue;
+            }
+            if require_literal && cell.flags.tab_padding() {
+                return Err("terminal range has tab expansion".into());
+            }
+            if let Some(cluster) = source.clusters.as_ref().and_then(|row| row.text(col)) {
+                text.push_str(cluster);
+            } else {
+                text.push(cell.character);
+            }
+            if cell.flags.printed_space() {
+                printed_space_end = text.len();
+            }
+        }
+        if index < end.0 && !source.row.wrapped {
+            // Physical trailing blank padding is not copied across a hard line.
+            text.truncate(text.trim_end_matches(' ').len().max(printed_space_end));
+            if index + 1 < rows.len() {
+                text.push('\n');
+            }
+        }
+        if text.len() > MAX_COPY_BYTES {
+            return Err("selection byte limit".into());
+        }
+    }
+    Ok(text)
 }
 
 /// Single owner of an incremental parser, screen, modes, history and frame revisions.
@@ -175,6 +219,7 @@ pub struct Terminal {
     hyperlinks: Option<(HyperlinkPolicy, HyperlinkTable)>,
     graphemes: Option<GraphemeInput>,
     window: Option<WindowState>,
+    device_answers: bool,
     colors: Option<Arc<ColorState>>,
     color_revision: u64,
     revision: u64,
@@ -334,6 +379,7 @@ impl Terminal {
             hyperlinks: None,
             graphemes: None,
             window: None,
+            device_answers: false,
             colors: None,
             color_revision: 0,
             revision: 1,
@@ -381,6 +427,12 @@ impl Terminal {
     /// Opt in to bounded Bell and OSC title notifications for the owning view.
     pub fn enable_window_updates(&mut self) {
         self.window.get_or_insert_with(WindowState::default);
+    }
+
+    /// Enable terminal identification for interactive frontends that advertise
+    /// the shared terminal to applications in their own PTY.
+    pub fn enable_device_answers(&mut self) {
+        self.device_answers = true;
     }
 
     /// Native key controllers supply the base key in the active layout and
@@ -1298,7 +1350,11 @@ impl Terminal {
 
     // Apply profile-specific screen operations after shared local dispatch.
     fn reset_terminal(&mut self) {
+        let track_printed_spaces = self.screen.grid.track_printed_spaces;
         self.screen = ScreenState::new(self.screen.grid.rows(), self.screen.grid.cols());
+        if track_printed_spaces {
+            self.track_printed_spaces();
+        }
         self.begin_revision(self.revision);
         let keyboard_limit = self.protocol.keyboard_enhancement_limit();
         self.protocol = initial_protocol();
@@ -1599,6 +1655,15 @@ impl Terminal {
                         .map_or(HyperlinkId::NONE, |fields| {
                             table.apply_osc8(fields, *policy)
                         });
+                    continue;
+                }
+            }
+            if self.device_answers {
+                if let Some(reply) = device_answer(&event) {
+                    if replies.len() + reply.len() > MAX_FEED_BYTES {
+                        return Err("reply byte limit".into());
+                    }
+                    replies.extend_from_slice(reply);
                     continue;
                 }
             }

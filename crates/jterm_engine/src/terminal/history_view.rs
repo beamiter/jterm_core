@@ -1,14 +1,123 @@
 use super::{
-    underline_color_at, Arc, HistoryCopyRow, HistoryLayout, HistoryPage, Row, RowClusters,
-    ScrollbackLine, Terminal, UnderlineColorRun, MAX_ROWS,
+    selection_text, underline_color_at, Arc, HistoryCopyRow, HistoryLayout, HistoryPage, Row,
+    RowClusters, ScrollbackLine, Terminal, UnderlineColorRun, MAX_ROWS,
 };
 use crate::{
-    history_reflow::{source_columns, ProjectedHistoryRow},
+    history_reflow::{source_columns, HistoryAnchor, ProjectedHistoryRow},
     TerminalCell,
 };
 use std::collections::VecDeque;
 
 impl Terminal {
+    /// Distinguish spaces written into the live grid from erase padding. Enable
+    /// before feeding text when later reads must prove an empty editor suffix.
+    pub fn track_printed_spaces(&mut self) {
+        self.screen.grid.track_printed_spaces = true;
+        self.screen.alt_grid.track_printed_spaces = true;
+    }
+
+    fn primary_cursor_column(&self) -> usize {
+        if self.screen.pending_wrap {
+            self.screen.grid.cols()
+        } else {
+            self.screen.cursor_col
+        }
+    }
+
+    /// Empty primary-grid cells after the cursor, including subsequent rows.
+    /// A literal space or tab written by the shell keeps the suffix nonempty.
+    pub fn primary_suffix_is_empty(&self) -> Option<bool> {
+        let grid = &self.screen.grid;
+        if self.alternate_screen_active() || !grid.track_printed_spaces {
+            return None;
+        }
+        let row = self.screen.cursor_row;
+        let col = self.primary_cursor_column();
+        Some((row..grid.rows()).all(|index| {
+            let start = if index == row { col } else { 0 };
+            grid[index][start..].iter().all(|cell| {
+                cell.character == ' '
+                    && !cell.flags.printed_space()
+                    && !cell.flags.wide_continuation()
+            })
+        }))
+    }
+
+    /// Absolute primary-screen cursor in the same physical coordinate space
+    /// as retained history. A pending wrap puts it after the last column.
+    /// Callers should discard live anchors on a reset or geometry change.
+    pub fn primary_cursor_anchor(&self) -> Option<HistoryAnchor> {
+        if self.alternate_screen_active() {
+            return None;
+        }
+        Some(HistoryAnchor {
+            row: self
+                .history_end
+                .checked_add(self.screen.cursor_row as u64)?,
+            column: self.primary_cursor_column() as u16,
+        })
+    }
+
+    /// Copy an exact half-open range over retained primary rows and the live
+    /// grid, using their original cells. Reject tab expansions, whose cells
+    /// cannot prove literal command text. At most one grid of rows is copied.
+    pub fn primary_text_range(
+        &self,
+        start: HistoryAnchor,
+        end: HistoryAnchor,
+    ) -> Result<String, String> {
+        let history = self.history_extent();
+        let grid = &self.screen.grid;
+        let last = history
+            .end
+            .checked_add(grid.rows() as u64)
+            .ok_or("row index exhausted")?;
+        if self.alternate_screen_active()
+            || start.row < history.start
+            || start.row > end.row
+            || end.row > last
+        {
+            return Err("primary text range out of bounds".into());
+        }
+        let stop = end.row.saturating_add(1).min(last);
+        if stop - start.row > MAX_ROWS as u64 {
+            return Err("primary text range row limit".into());
+        }
+        let rows: Vec<HistoryCopyRow> = (start.row..stop)
+            .map(|row| {
+                if row < history.end {
+                    let line = &self.history[(row - history.start) as usize];
+                    HistoryCopyRow {
+                        row: Row {
+                            cells: line.decompress().into(),
+                            wrapped: line.is_wrapped,
+                        },
+                        underline_colors: None,
+                        clusters: line.cluster_row().cloned(),
+                        synthetic_gap: line.synthetic_margin_gap(),
+                    }
+                } else {
+                    let index = (row - history.end) as usize;
+                    HistoryCopyRow {
+                        row: Row {
+                            cells: Arc::from(&grid[index][..]),
+                            wrapped: grid.row_wrapped[index],
+                        },
+                        underline_colors: None,
+                        clusters: grid.cluster_row(index).cloned(),
+                        synthetic_gap: grid.synthetic_margin_gap(index),
+                    }
+                }
+            })
+            .collect();
+        selection_text(
+            &rows,
+            (0, usize::from(start.column)),
+            ((end.row - start.row) as usize, usize::from(end.column)),
+            true,
+        )
+    }
+
     /// Index the retained archive at the current width. The caller owns the
     /// index while reading history, and repeated captures can reuse it.
     pub fn history_layout(&self) -> Result<Arc<HistoryLayout>, String> {

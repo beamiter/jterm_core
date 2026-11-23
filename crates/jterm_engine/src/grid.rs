@@ -99,6 +99,7 @@ pub struct TerminalGrid {
     clusters: Vec<Option<Arc<RowClusters>>>,
     capture_revision: u64,
     row_changes: Vec<u64>,
+    pub(crate) track_printed_spaces: bool,
 }
 
 impl TerminalGrid {
@@ -114,6 +115,7 @@ impl TerminalGrid {
             clusters: Vec::new(),
             capture_revision: 0,
             row_changes: Vec::new(),
+            track_printed_spaces: false,
         }
     }
 
@@ -413,6 +415,7 @@ impl TerminalGrid {
         }
         assert!(row < self.rows && bytes.len() <= self.cols.saturating_sub(col));
         let end = col + bytes.len();
+        let track_spaces = self.track_printed_spaces;
         debug_assert!(bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)));
         let target = match policy {
             AsciiOverwritePolicy::SharedScreen => {
@@ -434,6 +437,9 @@ impl TerminalGrid {
         rendition.flags.set_wide_continuation(false);
         for (cell, &byte) in target.iter_mut().zip(bytes) {
             rendition.character = char::from(byte);
+            if track_spaces {
+                rendition.flags.set_printed_space(byte == b' ');
+            }
             *cell = rendition;
         }
     }
@@ -455,6 +461,11 @@ impl TerminalGrid {
     ) {
         assert!(row < self.rows && col < self.cols && width > 0);
         self.repair_wide_edges(row, col..col.saturating_add(width), blank);
+        if self.track_printed_spaces {
+            rendition
+                .flags
+                .set_printed_space(rendition.character == ' ');
+        }
         rendition.flags.set_wide(width == 2);
         rendition.flags.set_wide_continuation(false);
         *self.get_mut(row, col) = rendition;
@@ -483,6 +494,18 @@ impl TerminalGrid {
             line.synthetic_margin_gap = true;
         }
         line
+    }
+
+    pub(crate) fn mark_tab_spaces(&mut self, row: usize, columns: std::ops::Range<usize>) {
+        if !self.track_printed_spaces || columns.is_empty() {
+            return;
+        }
+        for cell in self.row_cells_mut(row, columns) {
+            if cell.character == ' ' && !cell.flags.wide_continuation() {
+                cell.flags.set_printed_space(true);
+                cell.flags.set_tab_padding(true);
+            }
+        }
     }
 
     fn copy_region_rows(&mut self, source: Range<usize>, target: usize, preserve_margin: bool) {
@@ -946,6 +969,8 @@ pub enum UnderlineStyle {
 ///   bit 9: wide
 ///   bit 10: wide_continuation
 ///   bit 11: protected (DECSCA)
+///   bit 12: a printed space, distinct from erase padding
+///   bit 13: padding produced by a tab
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct StyleFlags(u16);
@@ -976,6 +1001,8 @@ const STRIKETHROUGH_BIT: u16 = 1 << 8;
 const WIDE_BIT: u16 = 1 << 9;
 const WIDE_CONT_BIT: u16 = 1 << 10;
 const PROTECTED_BIT: u16 = 1 << 11;
+const PRINTED_SPACE_BIT: u16 = 1 << 12;
+const TAB_PADDING_BIT: u16 = 1 << 13;
 
 impl StyleFlags {
     #[inline(always)]
@@ -1029,6 +1056,30 @@ impl StyleFlags {
     #[inline(always)]
     pub fn protected(&self) -> bool {
         self.0 & PROTECTED_BIT != 0
+    }
+
+    pub(crate) fn printed_space(&self) -> bool {
+        self.0 & PRINTED_SPACE_BIT != 0
+    }
+
+    pub(crate) fn tab_padding(&self) -> bool {
+        self.0 & TAB_PADDING_BIT != 0
+    }
+
+    fn set_printed_space(&mut self, printed: bool) {
+        if printed {
+            self.0 |= PRINTED_SPACE_BIT;
+        } else {
+            self.0 &= !PRINTED_SPACE_BIT;
+        }
+    }
+
+    fn set_tab_padding(&mut self, tab: bool) {
+        if tab {
+            self.0 |= TAB_PADDING_BIT;
+        } else {
+            self.0 &= !TAB_PADDING_BIT;
+        }
     }
 
     #[inline(always)]
@@ -1145,6 +1196,7 @@ pub struct ScrollbackLine {
     data: CompressedLineData,
     pub is_wrapped: bool,
     synthetic_margin_gap: bool,
+    printed_spaces: bool,
     cols: u16,
     /// Number of cells retained when historical soft-wrapped rows are joined
     /// before being split at the current terminal width.  Computing this when
@@ -1248,19 +1300,24 @@ impl ScrollbackLine {
                     && c.flags.is_default_style()
                     && !c.flags.wide()
                     && !c.flags.wide_continuation()
+                    && !c.flags.printed_space()
                     && c.hyperlink_id.is_none()
             })
             .count();
 
         let active_len = cells.len() - trailing_blanks;
-        let all_default_attrs = cells[..active_len].iter().all(|c| {
-            c.foreground == Color::Default
-                && c.background == Color::Default
-                && c.flags.is_default_style()
-                && !c.flags.wide()
-                && !c.flags.wide_continuation()
-                && c.hyperlink_id.is_none()
-        });
+        let printed_spaces = cells[..active_len]
+            .iter()
+            .any(|cell| cell.flags.printed_space());
+        let all_default_attrs = !printed_spaces
+            && cells[..active_len].iter().all(|c| {
+                c.foreground == Color::Default
+                    && c.background == Color::Default
+                    && c.flags.is_default_style()
+                    && !c.flags.wide()
+                    && !c.flags.wide_continuation()
+                    && c.hyperlink_id.is_none()
+            });
 
         if all_default_attrs {
             let text: String = cells[..active_len].iter().map(|c| c.character).collect();
@@ -1268,6 +1325,7 @@ impl ScrollbackLine {
                 data: CompressedLineData::Plain(text, trailing_blanks as u16),
                 is_wrapped,
                 synthetic_margin_gap: false,
+                printed_spaces: false,
                 cols,
                 reflow_content_len,
                 reflow_wide_continuations,
@@ -1279,6 +1337,7 @@ impl ScrollbackLine {
                 data: CompressedLineData::Encoded(encoded),
                 is_wrapped,
                 synthetic_margin_gap: false,
+                printed_spaces,
                 cols,
                 reflow_content_len,
                 reflow_wide_continuations,
@@ -1366,7 +1425,9 @@ impl ScrollbackLine {
                 cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
                 cells
             }
-            ScrollbackContent::Encoded(data) => Self::decode_cells(data, self.cols as usize),
+            ScrollbackContent::Encoded(data) => {
+                Self::decode_cells(data, self.cols as usize, self.printed_spaces)
+            }
         }
     }
 
@@ -1386,16 +1447,21 @@ impl ScrollbackLine {
                 }
             }
             ScrollbackContent::Encoded(data) => {
-                Self::visit_encoded_cells(data, self.columns(), visit);
+                Self::visit_encoded_cells(data, self.columns(), self.printed_spaces, visit);
             }
         }
     }
 
-    fn visit_encoded_cells(data: &[u8], cols: usize, mut visit: impl FnMut(usize, TerminalCell)) {
+    fn visit_encoded_cells(
+        data: &[u8],
+        cols: usize,
+        printed_spaces: bool,
+        mut visit: impl FnMut(usize, TerminalCell),
+    ) {
         let mut column = 0;
         let mut pos = 0;
         while column < cols {
-            let Some((cell, run)) = Self::decode_run(data, &mut pos) else {
+            let Some((cell, run)) = Self::decode_run(data, &mut pos, printed_spaces) else {
                 break;
             };
             for _ in 0..run.min(cols - column) {
@@ -1479,6 +1545,8 @@ impl ScrollbackLine {
                     flags.set_wide(wide & 1 != 0);
                     flags.set_wide_continuation(wide & 2 != 0);
                     flags.set_blink(wide & 4 != 0);
+                    flags.set_printed_space(self.printed_spaces && wide & 8 != 0);
+                    flags.set_tab_padding(self.printed_spaces && wide & 16 != 0);
                     let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
                         *data.get(pos)?,
                         *data.get(pos + 1)?,
@@ -1683,7 +1751,9 @@ impl ScrollbackLine {
                     4
                 } else {
                     0
-                };
+                }
+                | if cell.flags.printed_space() { 8 } else { 0 }
+                | if cell.flags.tab_padding() { 16 } else { 0 };
             buf.push(extra_flags);
             buf.extend_from_slice(&cell.hyperlink_id.as_raw().to_le_bytes());
             buf.push(run);
@@ -1693,10 +1763,10 @@ impl ScrollbackLine {
         buf
     }
 
-    fn decode_cells(data: &[u8], cols: usize) -> Vec<TerminalCell> {
+    fn decode_cells(data: &[u8], cols: usize, printed_spaces: bool) -> Vec<TerminalCell> {
         let mut cells = Vec::with_capacity(cols);
         let mut pos = 0;
-        while let Some((cell, run)) = Self::decode_run(data, &mut pos) {
+        while let Some((cell, run)) = Self::decode_run(data, &mut pos, printed_spaces) {
             for _ in 0..run {
                 cells.push(cell);
             }
@@ -1706,7 +1776,11 @@ impl ScrollbackLine {
         cells
     }
 
-    fn decode_run(data: &[u8], pos: &mut usize) -> Option<(TerminalCell, usize)> {
+    fn decode_run(
+        data: &[u8],
+        pos: &mut usize,
+        printed_spaces: bool,
+    ) -> Option<(TerminalCell, usize)> {
         let ch_len = usize::from(*data.get(*pos)?);
         *pos += 1;
         let ch = std::str::from_utf8(data.get(*pos..*pos + ch_len)?)
@@ -1724,6 +1798,8 @@ impl ScrollbackLine {
         flags.set_wide(extra_flags & 1 != 0);
         flags.set_wide_continuation(extra_flags & 2 != 0);
         flags.set_blink(extra_flags & 4 != 0);
+        flags.set_printed_space(printed_spaces && extra_flags & 8 != 0);
+        flags.set_tab_padding(printed_spaces && extra_flags & 16 != 0);
         let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
             data.get(*pos).copied().unwrap_or(0),
             data.get(*pos + 1).copied().unwrap_or(0),
@@ -1806,6 +1882,7 @@ impl TerminalCell {
             && self.background == Color::Default
             && !self.flags.wide()
             && !self.flags.wide_continuation()
+            && !self.flags.printed_space()
             && self.hyperlink_id.is_none()
     }
 }
@@ -2113,9 +2190,12 @@ mod decoder_parity {
             for cols in [0, 1, 17, 254, 255, 256, 511, 601] {
                 for length in 0..=bytes.len() {
                     let mut streamed = Vec::new();
-                    ScrollbackLine::visit_encoded_cells(&bytes[..length], cols, |_, cell| {
-                        streamed.push(cell)
-                    });
+                    ScrollbackLine::visit_encoded_cells(
+                        &bytes[..length],
+                        cols,
+                        false,
+                        |_, cell| streamed.push(cell),
+                    );
                     streamed.resize(cols, TerminalCell::default());
                     assert_eq!(
                         streamed,
@@ -2139,7 +2219,7 @@ mod decoder_parity {
                 }
                 for cols in [0, 1, 2, 17, 255, 512] {
                     let mut streamed = Vec::new();
-                    ScrollbackLine::visit_encoded_cells(&bytes, cols, |_, cell| {
+                    ScrollbackLine::visit_encoded_cells(&bytes, cols, false, |_, cell| {
                         streamed.push(cell)
                     });
                     streamed.resize(cols, TerminalCell::default());

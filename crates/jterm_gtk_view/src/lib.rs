@@ -21,6 +21,7 @@ pub use command::{
 };
 pub use document::DocumentView;
 pub use jterm_engine::authenticated_boundaries;
+pub use jterm_engine::history_reflow::HistoryAnchor;
 pub use jterm_runtime::exit_status::PtyExit;
 #[cfg(target_os = "linux")]
 pub use jterm_runtime::shell_identity::ShellIdentityChannel;
@@ -29,7 +30,9 @@ pub use jterm_runtime::startup_status;
 pub use live_output::{
     captured_live_rows, CapturedLiveRow, LiveOutputRow, LiveOutputView, MAX_LIVE_OUTPUT_BYTES,
 };
-pub use pane::{LinkActions, PaneEvent, PlainLinkFinder, Pty, TerminalPane, Theme};
+pub use pane::{
+    EmbeddedTerminal, LinkActions, PaneEvent, PlainLinkFinder, Pty, TerminalPane, Theme,
+};
 pub use pty_dispatch::{PtyDispatch, PtyEvent};
 #[cfg(target_os = "linux")]
 pub use runtime_shell::RuntimeShell;

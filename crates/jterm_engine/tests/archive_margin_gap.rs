@@ -1,8 +1,70 @@
 //! Independent physical/storage oracles for opt-in early-wide-wrap provenance.
 use jterm_engine::{
+    history_reflow::HistoryAnchor,
     screen::{RegionDirection, ScreenState, VerticalMotion, VerticalMutation},
+    terminal::Terminal,
     Color, HyperlinkId, RawRowId, ScrollbackLine, TerminalCell,
 };
+
+#[test]
+fn a_prompt_cursor_range_crosses_into_history_without_copying_the_wrap_gap() {
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal.feed(b"> ").unwrap();
+    let start = terminal.primary_cursor_anchor().unwrap();
+    assert_eq!(start, HistoryAnchor { row: 0, column: 2 });
+    terminal.feed("a界ZX".as_bytes()).unwrap();
+    let end = terminal.primary_cursor_anchor().unwrap();
+    assert_eq!(end, HistoryAnchor { row: 1, column: 4 });
+    terminal.feed(b" ").unwrap();
+    assert_eq!(terminal.history_extent(), 0..1);
+    assert_eq!(terminal.primary_text_range(start, end).unwrap(), "a界ZX");
+
+    terminal.feed(b"\x1b[?1049h").unwrap();
+    assert!(terminal.primary_cursor_anchor().is_none());
+    assert!(terminal.primary_text_range(start, end).is_err());
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    assert_eq!(terminal.primary_text_range(start, end).unwrap(), "a界ZX");
+    terminal.set_history_row_limit(0);
+    assert!(terminal.primary_text_range(start, end).is_err());
+}
+
+#[test]
+fn editor_suffix_proof_distinguishes_written_whitespace_from_erase_padding() {
+    let mut terminal = Terminal::new(2, 10).unwrap();
+    assert_eq!(terminal.primary_suffix_is_empty(), None);
+    terminal.track_printed_spaces();
+    terminal.feed(b"ok  \r\x1b[2C").unwrap();
+    assert_eq!(terminal.primary_suffix_is_empty(), Some(false));
+
+    terminal.feed(b"\x1b[K").unwrap();
+    assert_eq!(terminal.primary_suffix_is_empty(), Some(true));
+    let tab_start = terminal.primary_cursor_anchor().unwrap();
+    terminal.feed(b"\t").unwrap();
+    let tab_end = terminal.primary_cursor_anchor().unwrap();
+    assert!(terminal.primary_text_range(tab_start, tab_end).is_err());
+    terminal.feed(b"\r\x1b[2C").unwrap();
+    assert_eq!(terminal.primary_suffix_is_empty(), Some(false));
+    terminal.feed(b"\x1b[?1049h").unwrap();
+    assert_eq!(terminal.primary_suffix_is_empty(), None);
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    assert_eq!(terminal.primary_suffix_is_empty(), Some(false));
+
+    terminal.feed(b"\x1bcx \r\nZ\r\n").unwrap();
+    let start = HistoryAnchor {
+        row: terminal.history_extent().start,
+        column: 0,
+    };
+    let end = terminal.primary_cursor_anchor().unwrap();
+    assert_eq!(terminal.primary_text_range(start, end).unwrap(), "x \nZ\n");
+    assert_eq!(terminal.primary_suffix_is_empty(), Some(true));
+
+    terminal.resize(2, 4).unwrap();
+    terminal.feed(b"\x1bc").unwrap();
+    terminal.feed("ab界".as_bytes()).unwrap();
+    assert_eq!(terminal.primary_cursor_anchor().unwrap().column, 4);
+    assert_eq!(terminal.primary_suffix_is_empty(), Some(true));
+}
 
 fn untracked() -> RawRowId {
     RawRowId::UNTRACKED

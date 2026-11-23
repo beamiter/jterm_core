@@ -161,7 +161,11 @@ pub(crate) fn dispatch_local_with_underline(
             }
             9 => {
                 screen.pending_wrap = false;
+                let first = screen.cursor_col;
                 screen.cursor_col = screen.next_tab_stop(screen.cursor_col);
+                screen
+                    .grid
+                    .mark_tab_spaces(screen.cursor_row, first..screen.cursor_col);
                 effects.push(Effect::CursorReposition { non_linear: false });
             }
             13 => {
