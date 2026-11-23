@@ -1065,8 +1065,16 @@ impl<P: Pty> TerminalPane<P> {
         if sent {
             self.last_pointer_motion.set(motion);
             if let MouseInput::Press(button) = input {
-                self.reported_buttons
-                    .set(self.reported_buttons.get() | (1 << button));
+                let buttons = self.reported_buttons.get() | (1 << button);
+                self.reported_buttons.set(buttons);
+                // The press has already reported this cell. GTK can deliver
+                // motion from the same cell when the button grab starts.
+                self.last_pointer_motion.set(Some(PointerMotion {
+                    column,
+                    row,
+                    button: (0..3).find(|button| buttons & (1 << button) != 0),
+                    modifiers,
+                }));
                 self.view.widget.grab_focus();
             }
         } else if !reporting {

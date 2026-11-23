@@ -615,11 +615,17 @@ finally:
             raise RuntimeError(f"Expected {expected!r}, received {receipt.read_bytes()!r}") from error
 
     wait_input("SGR mouse press at the second cell", press)
+    # Move within the pressed cell and order a keyboard receipt after the
+    # motion. Cell-based tracking must stay quiet until the cell changes.
+    tool("mousemove_relative", "--sync", "--", "1", "0")
+    tool("key", "z")
+    cell_witness = b"z"
+    wait_input("same-cell drag suppression before the keyboard receipt", press + cell_witness)
     move((227, 18, 113))
     drag = b"\x1b[<32;5;2M"
     wait_input("SGR mouse drag at the fifth cell", drag)
     tool("mouseup", "1", "click", "4")
-    mouse = press + drag + b"\x1b[<0;5;2m\x1b[<64;5;2M"
+    mouse = press + cell_witness + drag + b"\x1b[<0;5;2m\x1b[<64;5;2M"
     wait_input("paired SGR release and wheel bytes", mouse)
     tool("keydown", "Shift_L", "click", "1", "keyup", "Shift_L")
     key("ctrl+shift+t")
