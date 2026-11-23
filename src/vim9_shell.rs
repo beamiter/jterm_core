@@ -11,9 +11,7 @@ const SHIM: crate::vendored_script::VendoredScript = crate::vendored_script::Ven
     source: include_str!("../runtime/vim9/vim-shell.sh"),
 };
 
-/// Used only by the hosts' owned Bash -ic launcher for jsh. Bash startup files
-/// can reset PATH; reapply the child-local integration after those files run.
-pub const VIM9_SHELL_EXEC: &str = "if [ -n \"${JTERM_VIM9_SHIM_DIR-}\" ]; then export PATH=\"$JTERM_VIM9_SHIM_DIR:$PATH\"; fi; exec \"$0\" \"$@\"";
+pub use jterm_runtime::local_shell::VIM9_SHELL_EXEC;
 
 /// Persistent, private cache entries survive this value being dropped. A
 /// terminal passes these overrides only to its interactive local shell child.
@@ -94,14 +92,8 @@ pub fn shell_argv_eligible(argv: &[String]) -> bool {
     }
     // The GTK hosts start jsh after the user's interactive Bash rc. Recognize
     // only this exact owned exec wrapper; arbitrary -c strings stay excluded.
-    if program.trim_start_matches('-') == "bash"
-        && argv.len() == 4
-        && argv[1] == "-ic"
-        && (argv[2] == "exec \"$0\" \"$@\"" || argv[2] == VIM9_SHELL_EXEC)
-    {
-        return Path::new(&argv[3])
-            .file_name()
-            .is_some_and(|name| name == "jsh");
+    if let Some((_, args)) = jterm_runtime::local_shell::wrapped_jsh(argv) {
+        return matches!(args, []);
     }
     if program.trim_start_matches('-') == "jsh" && argv.len() == 3 && argv[1] == "--session" {
         return !argv[2].is_empty() && !argv[2].contains('\0');

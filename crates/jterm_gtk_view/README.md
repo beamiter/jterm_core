@@ -52,10 +52,26 @@ GTK renders its frames and history and keeps draining output when the tab is
 hidden. `JTERM_SHARED_RUNTIME=0` selects the existing compatibility route.
 Host-bridged shells and custom command launches use the compatibility transport.
 
+With `JTERM_SHARED_RUNTIME=1` and `terminal_mode = "vte"`, ordinary local jsh
+panes also use the shared runtime. The application passes its pane's saved
+session ID to jsh as a separate argv value. The Bash startup wrapper keeps
+the same process and terminal while it changes its executable to jsh.
+
 Use `--ordinary-panes` for the X11 fixture and `--ordinary-pane` for the
 Wayland fixture to check the default. For the standalone tab action, use
 `--shared-runtime` to verify ordered PTY replies and interactive input.
 The native checks also cover resizing, clipboard, history and hidden output.
+
+Run the jsh fixture with an installed jsh executable. It opens a real split,
+closes the window, and verifies the saved jsh session ID, working directory
+and exported variable after restarting the application.
+
+```sh
+dbus-run-session -- xvfb-run -a /usr/bin/python3 -B crates/jterm_gtk_view/tests/native_jsh.py \
+  forge ../forge/target/release/forge --jsh "$(command -v jsh)"
+dbus-run-session -- xvfb-run -a /usr/bin/python3 -B crates/jterm_gtk_view/tests/native_jsh.py \
+  anvil ../anvil/target/release/anvil --jsh "$(command -v jsh)"
+```
 
 ### Wayland input method
 

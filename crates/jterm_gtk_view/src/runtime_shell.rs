@@ -19,7 +19,9 @@ use jterm_runtime::{pty_session::Session, runtime_wake::WakeSink};
 
 use crate::pane::{INITIAL_COLUMNS, INITIAL_ROWS};
 
-use crate::runtime_launch::{admit_local_argv, runtime_environment, RUNTIME_OVERRIDE};
+use crate::runtime_launch::{
+    admit_local_argv, candidate_program, runtime_environment, with_jsh_session, RUNTIME_OVERRIDE,
+};
 use crate::viewport::{ViewportFrame, ViewportRequest};
 
 /// Main-context handle for the common runtime's sole PTY and terminal owner.
@@ -100,6 +102,32 @@ impl RuntimeShell {
         }
         let cwd = local_directory(cwd, directory_available)?;
         Self::spawn_program(argv, &cwd, prepare_environment()?).map(Some)
+    }
+
+    /// Open a new ordinary pane with the host's saved or freshly minted jsh id.
+    pub fn spawn_session_candidate(
+        argv: &[String],
+        cwd: Option<&str>,
+        session_id: &str,
+        host_bridge: bool,
+        directory_available: fn(&str) -> bool,
+        prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
+    ) -> Result<Option<Rc<Self>>, String> {
+        let Some(argv) = with_jsh_session(argv, session_id) else {
+            return Ok(None);
+        };
+        Self::spawn_candidate(
+            &argv,
+            cwd,
+            host_bridge,
+            directory_available,
+            prepare_environment,
+        )
+    }
+
+    /// The image expected at the prompt after any admitted shell bootstrap.
+    pub fn candidate_program(argv: &[String]) -> Option<&Path> {
+        candidate_program(argv)
     }
 
     /// Start a host-selected program in a fresh PTY. File and project arguments

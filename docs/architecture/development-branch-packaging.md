@@ -132,6 +132,10 @@ focused shared pane. Native X11 tests cover copying matches across soft wraps,
 searching older rows while the PTY writes, and independent searches in two tabs.
 Native Wayland tests cover preedit cancellation
 when switching tabs, one commit in the focused pane, and clipboard transfer.
+The ordinary local jsh route uses the existing `JTERM_SHARED_RUNTIME=1`
+switch with `terminal_mode = "vte"`. Native X11 acceptance checks
+Bash startup, separate split identities, and a real app restart that
+restores jsh's session ID, working directory and exported state.
 Linux native Forge and Anvil packages built with `shared-terminal` use the
 shared runtime for both Vim9 displays by default. The native fixtures check
 this default and save a real file with no `JTERM_SHARED_RUNTIME` override.

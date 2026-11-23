@@ -4,6 +4,7 @@
 #[allow(unsafe_code)] // POSIX wait/signal and Linux process descriptors.
 pub mod child_lifecycle;
 pub mod exit_status;
+pub mod local_shell;
 #[cfg(all(target_os = "linux", feature = "linux-pty"))]
 #[allow(unsafe_code)] // Linux native fork/exec and private descriptor admission.
 mod native_pty_launch;
