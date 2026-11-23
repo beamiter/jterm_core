@@ -144,6 +144,33 @@ impl HistoryPage {
             .flat_map(|row| row.image_rows())
     }
 
+    /// Image resources and slices share the projected row's paint coordinates.
+    pub fn inline_images(
+        &self,
+        row: usize,
+    ) -> impl Iterator<Item = (usize, &InlineImage, u16)> + '_ {
+        self.rows
+            .get(row)
+            .and_then(|row| row.annotations.as_ref())
+            .into_iter()
+            .flat_map(|row| row.images())
+    }
+
+    /// One UTF-16 offset per physical cell boundary in the page's copy text.
+    /// Blank padding and wide continuation cells can share an offset.
+    pub fn copy_offsets_utf16(&self) -> Result<Vec<Vec<u32>>, String> {
+        let mut offsets = Vec::with_capacity(self.row_count);
+        let text = extract_selection(
+            &self.rows,
+            (0, 0),
+            (self.row_count, 0),
+            false,
+            Some(&mut offsets),
+        )?;
+        debug_assert_eq!(text, self.text);
+        Ok(offsets)
+    }
+
     /// Explicit underline color at an original physical history coordinate.
     pub fn underline_color(&self, row: usize, col: usize) -> Option<Color> {
         underline_color_at(self.underline_color_runs(row), col)
@@ -180,6 +207,16 @@ fn selection_text(
     end: (usize, usize),
     require_literal: bool,
 ) -> Result<String, String> {
+    extract_selection(rows, start, end, require_literal, None)
+}
+
+fn extract_selection(
+    rows: &[HistoryCopyRow],
+    start: (usize, usize),
+    end: (usize, usize),
+    require_literal: bool,
+    mut offsets: Option<&mut Vec<Vec<u32>>>,
+) -> Result<String, String> {
     let valid = |(row, col): (usize, usize)| {
         rows.get(row).is_some_and(|row| col <= row.row.cells.len()) || row == rows.len() && col == 0
     };
@@ -188,6 +225,7 @@ fn selection_text(
     }
     let mut text = String::new();
     let mut printed_space_end = 0;
+    let mut units = 0u32;
     for (index, source) in rows
         .iter()
         .enumerate()
@@ -197,7 +235,13 @@ fn selection_text(
         let cells = &source.row.cells;
         let first_col = if index == start.0 { start.1 } else { 0 };
         let last_col = if index == end.0 { end.1 } else { cells.len() };
+        let mut boundaries = offsets
+            .as_ref()
+            .map(|_| Vec::with_capacity(last_col - first_col + 1));
         for (offset, cell) in cells[first_col..last_col].iter().enumerate() {
+            if let Some(boundaries) = &mut boundaries {
+                boundaries.push(units);
+            }
             let col = first_col + offset;
             if cell.flags.wide_continuation() || source.synthetic_gap == Some(col) {
                 continue;
@@ -207,18 +251,43 @@ fn selection_text(
             }
             if let Some(cluster) = source.annotations.as_ref().and_then(|row| row.text(col)) {
                 text.push_str(cluster);
+                if boundaries.is_some() {
+                    units += cluster.encode_utf16().count() as u32;
+                }
             } else {
                 text.push(cell.character);
+                if boundaries.is_some() {
+                    units += cell.character.len_utf16() as u32;
+                }
             }
             if cell.flags.printed_space() {
                 printed_space_end = text.len();
             }
         }
+        if let (Some(offsets), Some(mut boundaries)) = (offsets.as_deref_mut(), boundaries) {
+            boundaries.push(units);
+            offsets.push(boundaries);
+        }
         if index < end.0 && !source.row.wrapped {
             // Physical trailing blank padding is not copied across a hard line.
-            text.truncate(text.trim_end_matches(' ').len().max(printed_space_end));
+            let end = text.trim_end_matches(' ').len().max(printed_space_end);
+            if let Some(offsets) = offsets.as_deref_mut() {
+                units -= (text.len() - end) as u32;
+                for boundary in offsets
+                    .iter_mut()
+                    .rev()
+                    .flat_map(|row| row.iter_mut().rev())
+                {
+                    if *boundary <= units {
+                        break;
+                    }
+                    *boundary = units;
+                }
+            }
+            text.truncate(end);
             if index + 1 < rows.len() {
                 text.push('\n');
+                units += 1;
             }
         }
         if text.len() > MAX_COPY_BYTES {

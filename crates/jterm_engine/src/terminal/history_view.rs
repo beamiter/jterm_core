@@ -138,6 +138,14 @@ impl Terminal {
         Ok(layout)
     }
 
+    /// Validate a stable physical cell before resolving it in any history layout.
+    pub fn retains_history_anchor(&self, anchor: HistoryAnchor) -> bool {
+        let extent = self.history_extent();
+        extent.contains(&anchor.row)
+            && usize::from(anchor.column)
+                < self.history[(anchor.row - extent.start) as usize].columns()
+    }
+
     /// Return the original cell behind one rendered history coordinate. The
     /// layout and source geometry are the same ones used to paint the page.
     pub fn projected_history_source(

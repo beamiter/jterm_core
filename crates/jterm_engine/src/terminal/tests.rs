@@ -1319,3 +1319,28 @@ fn repeated_osc_oversize_recovers_on_bel_and_accepts_fresh_query() {
         b"\x1bP0+r\x1b\\"
     );
 }
+
+#[test]
+fn immutable_history_copy_boundaries_use_utf16_and_never_select_padding() {
+    use crate::history_reflow::HistoryAnchor;
+    let mut terminal = Terminal::new(2, 6).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal
+        .feed("🐍e\u{301}\r\n中\r\n\r\n\r\n".as_bytes())
+        .unwrap();
+    let page = terminal.history_page(0, 8).unwrap();
+    assert_eq!(page.text, "🐍e\u{301}\n中\n");
+    let offsets = page.copy_offsets_utf16().unwrap();
+    assert_eq!(
+        offsets,
+        [
+            vec![0, 2, 2, 4, 4, 4, 4],
+            vec![5, 6, 6, 6, 6, 6, 6],
+            vec![7; 7]
+        ]
+    );
+    assert!(terminal.retains_history_anchor(HistoryAnchor { row: 0, column: 2 }));
+    terminal.feed(b"\x1b[3J").unwrap();
+    assert!(!terminal.retains_history_anchor(HistoryAnchor { row: 0, column: 2 }));
+    assert_eq!(page.copy_offsets_utf16().unwrap(), offsets);
+}

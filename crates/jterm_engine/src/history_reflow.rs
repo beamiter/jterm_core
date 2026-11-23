@@ -51,6 +51,10 @@ impl HistoryLayout {
             .map_or_else(|| (self.extent.end - self.extent.start) as usize, Vec::len)
     }
 
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

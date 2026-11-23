@@ -44,6 +44,50 @@ impl SnapshotFormat {
     }
 }
 
+pub const MAX_PROJECTED_HISTORY_ROWS: usize = 65_536;
+
+/// One-based physical archive row and its original cell boundary, stable across reflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistorySource {
+    pub row: Counter,
+    pub column: u16,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryRow {
+    pub source: HistorySource,
+    pub paint: Row,
+    /// Physical cell boundaries in the selectable snapshot, measured in UTF-16.
+    pub text_offsets: Vec<u32>,
+}
+
+/// An immutable primary-history window. It does not participate in live ACKs.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryView {
+    pub version: u8,
+    pub owner: Attachment,
+    pub revision: Counter,
+    pub offset: u32,
+    pub total_rows: u32,
+    pub cols: u16,
+    pub text: String,
+    pub rows: Vec<HistoryRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hyperlinks: Vec<Hyperlink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageResource>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum LocalHistorySnapshot {
+    Compatibility(terminal::HistorySnapshot),
+    Projection(String),
+}
+
 /// The selected local snapshot shape. The v3 decoder is also used by SSH.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
