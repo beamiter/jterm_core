@@ -4,6 +4,9 @@ use std::{collections::VecDeque, fmt, ops::Deref};
 use crate::ScrollbackLine;
 
 pub const RETAINED_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ROW_SCALED_HISTORY_BYTES: usize = 32 * 1024 * 1024;
+// Allow for a 120-column ASCII row plus its retained entry.
+const ROW_SCALED_HISTORY_BYTES_PER_ROW: usize = 192;
 
 pub trait RetainedRow {
     /// Charge the row and the backing storage it retains. Keep this cost
@@ -33,6 +36,14 @@ impl<Row> RetainedHistory<Row> {
             bytes: 0,
             byte_limit,
         }
+    }
+
+    /// Scale the byte allowance for an explicitly configured scrollback size.
+    /// The owner still enforces both limits and retires identities for rows it evicts.
+    pub fn scale_byte_limit_for_rows(&mut self, row_limit: usize) {
+        self.byte_limit = row_limit
+            .saturating_mul(ROW_SCALED_HISTORY_BYTES_PER_ROW)
+            .clamp(RETAINED_HISTORY_BYTES, MAX_ROW_SCALED_HISTORY_BYTES);
     }
 }
 
@@ -146,5 +157,39 @@ impl<Row: RetainedRow> RetainedHistory<Row> {
 
     pub fn into_rows(self) -> VecDeque<Row> {
         self.rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ChargedRow(usize);
+
+    impl RetainedRow for ChargedRow {
+        fn retained_bytes(&self) -> usize {
+            self.0
+        }
+    }
+
+    #[test]
+    fn configured_row_limit_scales_bytes_with_a_floor_and_hard_ceiling() {
+        let mut history = RetainedHistory::default();
+        let row = ChargedRow(RETAINED_HISTORY_BYTES + 1);
+        assert!(history.needs_room_for(&row, 100_000));
+
+        history.scale_byte_limit_for_rows(100_000);
+        assert!(!history.needs_room_for(&row, 100_000));
+        history.push_back(row);
+        assert!(!history.over_budget(100_000));
+
+        history.scale_byte_limit_for_rows(1);
+        assert!(history.over_budget(1));
+        assert_eq!(history.trim_oldest(1), 1);
+        assert!(!history.needs_room_for(&ChargedRow(RETAINED_HISTORY_BYTES), 1));
+
+        history.scale_byte_limit_for_rows(usize::MAX);
+        assert!(!history.needs_room_for(&ChargedRow(MAX_ROW_SCALED_HISTORY_BYTES), usize::MAX));
+        assert!(history.needs_room_for(&ChargedRow(MAX_ROW_SCALED_HISTORY_BYTES + 1), usize::MAX));
     }
 }
