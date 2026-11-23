@@ -1548,7 +1548,9 @@ impl Terminal {
                                         if matches!(erased.as_slice(), [change] if change.changed == (0..cols))
                                         {
                                             self.screen.grid.row_wrapped[row] = false;
-                                            self.renew_source_row(row);
+                                            // A shell's line editor redraws from its
+                                            // prompt with ED0. Clearing cells in place
+                                            // does not replace the physical source row.
                                         }
                                     }
                                 }

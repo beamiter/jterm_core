@@ -124,12 +124,6 @@ impl Terminal {
         }
     }
 
-    pub(super) fn renew_source_row(&mut self, row: usize) {
-        if self.row_sources.is_some() {
-            self.screen.grid.row_ids_mut()[row] = RowSources::allocate(&mut self.row_sources);
-        }
-    }
-
     pub(super) fn renew_active_source_rows(&mut self) {
         if self.row_sources.is_some() {
             for id in self.screen.grid.row_ids_mut() {
@@ -172,6 +166,26 @@ mod tests {
         assert_eq!(terminal.transcript_cursor(), Some(live));
         terminal.feed(b"\x1b[2J").unwrap();
         assert!(terminal.locate_transcript_source(live).is_none());
+    }
+
+    #[test]
+    fn shell_prompt_redraw_preserves_rows_that_were_erased_in_place() {
+        let mut terminal = Terminal::new(4, 24).unwrap();
+        terminal.track_transcript_rows();
+        let prompt = terminal.transcript_cursor().unwrap();
+        terminal.feed(b"context\r\nprompt> ").unwrap();
+        let input = terminal.transcript_cursor().unwrap();
+
+        terminal
+            .feed(b"\x1b[1G\x1b[1A\x1b[Jcontext\r\nprompt> command")
+            .unwrap();
+
+        let start = terminal.locate_transcript_source(input).unwrap();
+        let end = terminal.primary_cursor_anchor().unwrap();
+        assert_eq!(terminal.primary_text_range(start, end).unwrap(), "command");
+        assert_eq!(terminal.locate_transcript_source(prompt).unwrap().row, 0);
+        terminal.feed(b"\x1b[2J").unwrap();
+        assert!(terminal.locate_transcript_source(prompt).is_none());
     }
 
     #[test]

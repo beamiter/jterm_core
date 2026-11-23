@@ -1706,9 +1706,11 @@ mod transcript_tests {
 
         let view = TranscriptView::new(terminal.clone());
         view.begin_prompt(7);
-        terminal.ingest(b"prompt> ").unwrap();
+        terminal.ingest(b"context\r\nprompt> ").unwrap();
         view.end_prompt();
-        terminal.ingest(b"echo\r\n").unwrap();
+        terminal
+            .ingest(b"\x1b[1G\x1b[1A\x1b[Jcontext\r\nprompt> echo\r\n")
+            .unwrap();
         view.begin_output(Some(7));
         terminal.ingest(b"witness-old\r\n").unwrap();
         view.end_output(Some(7), 64);
