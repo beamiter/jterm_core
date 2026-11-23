@@ -854,9 +854,8 @@ impl Parser {
                             let start = at - 1;
                             if self.ascii_batching {
                                 let remaining = &input[at..];
-                                let stop = remaining
-                                    .iter()
-                                    .position(|byte| !(32..=126).contains(byte));
+                                let stop =
+                                    remaining.iter().position(|byte| !(32..=126).contains(byte));
                                 at += stop.unwrap_or(remaining.len());
                             }
                             emit!(Event::Ascii(&input[start..at]));
