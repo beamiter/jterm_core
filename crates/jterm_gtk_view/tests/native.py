@@ -836,10 +836,11 @@ def sample_pixels(window, bounds, width, height):
 def check_underline_colors(app, window, type_command, command, output, screen_extents):
     rgb = (18, 227, 113)
     indexed = (255, 95, 0)  # xterm color 202
+    background = (18, 22, 22)
     witness = "underlinecolorwitness"
     type_command(
-        rf"stty -echo; printf '\033[2J\033[3J\033[H\033[?25l\033[4;58;2;18;227;113m{witness}\033[0m'; "
-        rf"IFS= read -r phase; printf '\033[H\033[4;58;5;202m{witness}\033[0m'; "
+        rf"stty -echo; printf '\033[2J\033[3J\033[H\033[?25l\033[4;48;2;18;22;22;58;2;18;227;113m{witness}\033[0m'; "
+        rf"IFS= read -r phase; printf '\033[H\033[4;48;2;18;22;22;58;5;202m{witness}\033[0m'; "
         r"IFS= read -r phase; printf '\033[2;1H'; i=1; "
         r'''while [ "$i" -le 120 ]; do printf 'underline-scroll-%03d\n' "$i"; i=$((i+1)); done; '''
         r"stty echo; printf '\033[?25h'"
@@ -852,28 +853,43 @@ def check_underline_colors(app, window, type_command, command, output, screen_ex
     def sample():
         return sample_pixels(window, bounds, width, height)
 
-    def contains(color):
-        pixels = sample()
-        return pixels if pixels.count(color) >= 20 else None
+    def underline_pixels(pixels, color):
+        # Thin Pango strokes blend with the controlled background. Recover the
+        # coverage from the strongest channel and check the full RGB blend.
+        channel = max(range(3), key=lambda index: abs(color[index] - background[index]))
+        matches = {}
+        for index, pixel in enumerate(pixels):
+            coverage = (pixel[channel] - background[channel]) / (color[channel] - background[channel])
+            if 0.25 <= coverage <= 1 and all(
+                abs(after - (base + coverage * (ink - base))) <= 1
+                for after, base, ink in zip(pixel, background, color)
+            ):
+                matches[index] = coverage
+        return matches
 
-    first = wait_for("RGB-only underline pixels", lambda: contains(rgb))
+    def rendered(color):
+        pixels = sample()
+        matched = underline_pixels(pixels, color)
+        return (pixels, matched) if len(matched) >= 20 else None
+
+    first, rgb_pixels = wait_for("RGB underline pixels", lambda: rendered(rgb))
     command("key", "Return")
-    second = wait_for("indexed underline pixels", lambda: contains(indexed))
-    colors_changed = [(i, a, b) for i, (a, b) in enumerate(zip(first, second)) if a != b]
-    replaced = [i for i, a, b in colors_changed if a == rgb and b == indexed]
+    second, indexed_pixels = wait_for("indexed underline pixels", lambda: rendered(indexed))
+    changed = {i for i, (a, b) in enumerate(zip(first, second)) if a != b}
+    replaced = {i for i in changed & rgb_pixels.keys() & indexed_pixels.keys()
+                if abs(rgb_pixels[i] - indexed_pixels[i]) <= 0.01}
     assert len(replaced) >= 20, len(replaced)
     underline_lines = {i // width for i in replaced}
-    assert {i // width for i, _, _ in colors_changed}.issubset(underline_lines), underline_lines
+    assert {i // width for i in changed}.issubset(underline_lines), underline_lines
 
     command("key", "Return")
     output(r"(?m)^underline-scroll-120")
-    assert indexed not in sample(), "styled row was not scrolled out of the live buffer"
+    assert len(underline_pixels(sample(), indexed)) < 20, "the styled row stayed in the live buffer"
     command("key", "shift+Home")
     output(rf"(?m)^{witness}")
-    archived = wait_for("indexed underline in history", lambda: contains(indexed))
-    assert {i for i, pixel in enumerate(archived) if pixel == indexed} == {
-        i for i, pixel in enumerate(second) if pixel == indexed
-    }
+    archived, archived_pixels = wait_for("indexed underline in history", lambda: rendered(indexed))
+    assert archived_pixels == indexed_pixels
+    assert all(archived[i] == second[i] for i in indexed_pixels)
     print(f"{app} X11 underline colors passed: {len(replaced)} RGB to indexed pixels only on the underline, with exact history retention")
 
 
@@ -914,8 +930,8 @@ def check_osc8_links(app, pid, root, window, type_command, command, output, scre
     live = "https://example.test/shared-live"
     receipt = root / "links-opened"
     type_command(
-        rf"stty -echo; printf '\033[2J\033[3J\033[H\033]8;;{live}\033\\\033[4;58;2;18;227;113mclicklivewitness\033[0m\033]8;;\033\\'; "
-        r"printf '\033[2;1H\033]8;;file:///nonexistent\033\\\033[4;58;2;227;18;113mcliprejectedwitness\033[0m\033]8;;\033\\'; "
+        rf"stty -echo; printf '\033[2J\033[3J\033[H\033]8;;{live}\033\\\033[48;2;18;227;113mclicklivewitness\033[0m\033]8;;\033\\'; "
+        r"printf '\033[2;1H\033]8;;file:///nonexistent\033\\\033[48;2;227;18;113mcliprejectedwitness\033[0m\033]8;;\033\\'; "
         r"IFS= read -r phase; printf '\033[3;1H'; i=1; "
         r'''while [ "$i" -le 120 ]; do printf 'link-scroll-%03d\n' "$i"; i=$((i+1)); done; stty echo'''
     )
@@ -934,7 +950,7 @@ def check_osc8_links(app, pid, root, window, type_command, command, output, scre
         pixels = wait_for("mapped OSC 8 witness pixels", probe)
         center = pixels[len(pixels) // 2]
         command("mousemove", "--window", window, str(bounds.x + center % width),
-                str(bounds.y + center // width - 4))
+                str(bounds.y + center // width))
         if modified:
             command("keydown", "ctrl", "click", "1", "keyup", "ctrl")
         else:
@@ -965,7 +981,7 @@ def check_osc8_links(app, pid, root, window, type_command, command, output, scre
     command("key", "shift+End")
     prefix = "https://example.test/wrapped/" + "x" * 280
     plain = prefix + "tail"
-    type_command(r"printf '\033[2J\033[H(%s\033[4;58;2;18;227;113mtail\033[0m).\r\n' "
+    type_command(r"printf '\033[2J\033[H(%s\033[48;2;18;227;113mtail\033[0m).\r\n' "
                  + shlex.quote(prefix))
     output(r"(?m)^\(https://example\.test/wrapped/")
     click(approved)
