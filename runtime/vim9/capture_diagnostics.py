@@ -2,6 +2,34 @@
 import stat
 
 
+class CaptureInputEvidence:
+    """Fixed PTY write statuses, not receipts that Vim consumed the keys."""
+
+    def __init__(self):
+        self._yank = self._command = self._enter = "unobserved"
+
+    @staticmethod
+    def _acceptance(requested, accepted):
+        if (type(requested) is not int or type(accepted) is not int
+                or requested <= 0 or not 0 <= accepted <= requested):
+            return "invalid"
+        if accepted == requested:
+            return "complete"
+        return "partial" if accepted else "none"
+
+    def observe_yank(self, requested, accepted):
+        self._yank = self._acceptance(requested, accepted)
+
+    def observe_command(self, requested, accepted):
+        self._command = self._acceptance(requested, accepted)
+
+    def observe_enter(self, requested, accepted):
+        self._enter = self._acceptance(requested, accepted)
+
+    def metadata(self):
+        return {"yank": self._yank, "command": self._command, "enter": self._enter}
+
+
 def capture_failure_metadata(editor, output):
     state = editor.state if isinstance(editor.state, dict) else {}
     # Do not serialize arbitrary state, terminal bytes, exception text or paths.

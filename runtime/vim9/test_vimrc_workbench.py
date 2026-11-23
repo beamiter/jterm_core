@@ -135,13 +135,17 @@ for line in sys.stdin:
         self.editors.append(e)
         return e
 
-    def capture(self, e: Editor, expression: str):
+    def capture(self, e: Editor, expression: str, *, input_evidence=None):
         # A reused pathname can return the previous expression's JSON while
         # Vim is still draining queued PTY input (notably after yanking from a
         # documentation split). Give each request its own result identity.
         self.capture_serial = getattr(self, "capture_serial", 0) + 1
         output = self.root / f"capture-{self.capture_serial}.json"
-        e.ex("call writefile([json_encode(" + expression + ")], " + vim_string(output) + ")")
+        command = "call writefile([json_encode(" + expression + ")], " + vim_string(output) + ")"
+        if input_evidence is None:
+            e.ex(command)
+        else:
+            e.ex(command, input_evidence=input_evidence)
         deadline = time.monotonic() + 6
         while time.monotonic() < deadline:
             try:
@@ -150,8 +154,10 @@ for line in sys.stdin:
                 # writefile creates the file before filling it; a zero-byte
                 # result is not an acknowledgement of the requested value.
                 e.pump(0.02)
-        self.fail("Vim did not finish capture; metadata=" + json.dumps(
-            capture_failure_metadata(e, output), sort_keys=True))
+        metadata = capture_failure_metadata(e, output)
+        if input_evidence is not None:
+            metadata["pty_write_acceptance"] = input_evidence.metadata()
+        self.fail("Vim did not finish capture; metadata=" + json.dumps(metadata, sort_keys=True))
 
     def workbench(self, e: Editor, command: str, *, state=None, ok=True):
         source = state or e.snapshot()

@@ -191,19 +191,24 @@ class Editor:
         self.request("snapshot")
         return self.wait(lambda m: m.get("event") == "state")
 
-    def keys(self, data: str | bytes):
+    def keys(self, data: str | bytes, *, observe_write=None):
         self.messages = collections.deque(m for m in self.messages if m.get("event") != "state")
-        os.write(self.master, data.encode() if isinstance(data, str) else data)
+        payload = data.encode() if isinstance(data, str) else data
+        accepted = os.write(self.master, payload)
+        if observe_write is not None:
+            observe_write(len(payload), accepted)
 
     def state_where(self, predicate, timeout: float = 6.0):
         return self.wait(lambda m: m.get("event") == "state" and predicate(m), timeout)
 
-    def ex(self, command: str):
+    def ex(self, command: str, *, input_evidence=None):
         # Observe the command-line transition before Enter: a complete option
         # command can finish inside one coalesced tick without changing state.
-        self.keys(":" + command)
+        self.keys(":" + command, observe_write=(
+            None if input_evidence is None else input_evidence.observe_command))
         self.state_where(lambda s: s["mode"].startswith("c"))
-        self.keys("\r")
+        self.keys("\r", observe_write=(
+            None if input_evidence is None else input_evidence.observe_enter))
         self.state_where(lambda s: s["mode"] == "n")
 
     def gui_frame(self):

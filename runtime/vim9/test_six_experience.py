@@ -12,6 +12,7 @@ import time
 import unittest
 
 import test_vimrc_workbench as harness
+from capture_diagnostics import CaptureInputEvidence
 from test_render_popups import PopupEditor
 
 
@@ -131,8 +132,10 @@ for line in sys.stdin:
         self.assertEqual(pinned["origin"]["bufnr"], origin["buffer"])
         self.assertEqual(pinned["lines"][:2], ["函数(参数😀, 参数😀)", "Overload 3 / 4"])
         self.assertGreater(pinned["found"], 0)
-        e.keys("gg0y$")
-        self.assertEqual(self.capture(e, "getreg('\"')"), pinned["lines"][0])
+        input_evidence = CaptureInputEvidence()
+        e.keys("gg0y$", observe_write=input_evidence.observe_yank)
+        self.assertEqual(self.capture(e, "getreg('\"')", input_evidence=input_evidence),
+                         pinned["lines"][0])
         self.assertFalse(e.gui_frame().get("popups"))
         self.assertEqual(self.capture(e, "getbufline(" + str(origin["buffer"]) + ", 1, '$')"), ["original line", "second line"])
 
