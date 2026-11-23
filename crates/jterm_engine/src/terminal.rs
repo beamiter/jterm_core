@@ -211,6 +211,19 @@ fn selection_text(
     extract_selection(rows, start, end, require_literal, None)
 }
 
+fn append_copy_cell(
+    text: &mut String,
+    cell: &crate::TerminalCell,
+    annotations: Option<&RowAnnotations>,
+    col: usize,
+) {
+    if let Some(cluster) = annotations.and_then(|row| row.text(col)) {
+        text.push_str(cluster);
+    } else {
+        text.push(cell.character);
+    }
+}
+
 fn extract_selection(
     rows: &[HistoryCopyRow],
     start: (usize, usize),
@@ -250,16 +263,10 @@ fn extract_selection(
             if require_literal && cell.flags.tab_padding() {
                 return Err("terminal range has tab expansion".into());
             }
-            if let Some(cluster) = source.annotations.as_ref().and_then(|row| row.text(col)) {
-                text.push_str(cluster);
-                if boundaries.is_some() {
-                    units += cluster.encode_utf16().count() as u32;
-                }
-            } else {
-                text.push(cell.character);
-                if boundaries.is_some() {
-                    units += cell.character.len_utf16() as u32;
-                }
+            let start = text.len();
+            append_copy_cell(&mut text, cell, source.annotations.as_deref(), col);
+            if boundaries.is_some() {
+                units += text[start..].encode_utf16().count() as u32;
             }
             if cell.flags.printed_space() {
                 printed_space_end = text.len();

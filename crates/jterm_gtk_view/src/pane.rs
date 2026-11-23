@@ -13,7 +13,9 @@ use jterm_engine::{
 use jterm_runtime::exit_status::PtyExit;
 use std::{
     cell::{Cell, OnceCell, RefCell},
-    rc::Rc,
+    io,
+    ops::Range,
+    rc::{Rc, Weak},
 };
 
 use crate::history_search::HistorySearchView;
@@ -135,7 +137,15 @@ impl GridSize {
 /// application presents the same terminal at a prompt, running or fullscreen.
 pub struct EmbeddedTerminal<P: Pty> {
     pane: Rc<TerminalPane<P>>,
-    find_owner: Rc<()>,
+    source_owner: Rc<()>,
+}
+
+/// Identity of the retained terminal text when selected by a document view.
+#[derive(Clone)]
+pub struct RetainedTextSource {
+    owner: Weak<()>,
+    stamp: Stamp,
+    history: Range<u64>,
 }
 
 impl<P: Pty> EmbeddedTerminal<P> {
@@ -163,7 +173,7 @@ impl<P: Pty> EmbeddedTerminal<P> {
             widget,
             Rc::new(Self {
                 pane,
-                find_owner: Rc::new(()),
+                source_owner: Rc::new(()),
             }),
         ))
     }
@@ -204,6 +214,50 @@ impl<P: Pty> EmbeddedTerminal<P> {
         }
     }
 
+    /// Select the entire published terminal surface, including its history.
+    pub fn retained_text_source(&self) -> Option<RetainedTextSource> {
+        let (stamp, _) = self.pane.painted_source.get()?;
+        let source = RetainedTextSource {
+            owner: Rc::downgrade(&self.source_owner),
+            stamp,
+            history: self.pane.history_rail.borrow().extent.clone(),
+        };
+        self.inspect(|terminal| {
+            self.retains_text_source(terminal, &source)
+                .then_some(source)
+        })
+    }
+
+    /// Copy a whole-surface selection only while its screen and history agree
+    /// with the selected publication. The caller provides a bounded sink.
+    pub fn write_retained_text(
+        &self,
+        source: &RetainedTextSource,
+        output: &mut impl io::Write,
+    ) -> io::Result<()> {
+        self.inspect(|terminal| {
+            if !self.retains_text_source(terminal, source) {
+                return Err(io::Error::other("terminal text selection expired"));
+            }
+            terminal.write_retained_text(output)
+        })
+    }
+
+    fn retains_text_source(&self, terminal: &Terminal, source: &RetainedTextSource) -> bool {
+        source.owner.ptr_eq(&Rc::downgrade(&self.source_owner))
+            && self.pane.screen().is_mapped()
+            && self
+                .pane
+                .painted_source
+                .get()
+                .is_some_and(|(stamp, _)| stamp == source.stamp)
+            && !terminal.publication_held()
+            && terminal.history_extent() == source.history
+            && terminal
+                .frame()
+                .is_ok_and(|frame| frame.stamp() == source.stamp)
+    }
+
     pub fn find_snapshot(
         &self,
         region: FindRegion,
@@ -214,7 +268,7 @@ impl<P: Pty> EmbeddedTerminal<P> {
         self.inspect(|terminal| {
             find::capture(
                 terminal,
-                Rc::downgrade(&self.find_owner),
+                Rc::downgrade(&self.source_owner),
                 region,
                 top,
                 byte_limit,
@@ -225,7 +279,7 @@ impl<P: Pty> EmbeddedTerminal<P> {
 
     pub fn find_is_current(&self, frame: &FindFrame) -> bool {
         let source = &frame.0;
-        if !source.owner.ptr_eq(&Rc::downgrade(&self.find_owner)) {
+        if !source.owner.ptr_eq(&Rc::downgrade(&self.source_owner)) {
             return false;
         }
         self.inspect(|terminal| {
@@ -962,6 +1016,11 @@ impl<P: Pty> TerminalPane<P> {
         self.view.widget.buffer().has_selection()
     }
 
+    /// The text selected in the mounted frame, joining terminal soft wraps.
+    pub fn selected_text(&self) -> Option<String> {
+        self.view.selected_text()
+    }
+
     /// Let an overlay place and present composition while this screen keeps
     /// ownership of keys, committed input, and the PTY.
     pub fn delegate_composition(&self, delegated: bool) {
@@ -1040,7 +1099,7 @@ impl<P: Pty> TerminalPane<P> {
         if !self.view.widget.has_focus() || !self.view.widget.is_mapped() {
             return;
         }
-        if let Some(text) = self.view.selected_text() {
+        if let Some(text) = self.selected_text() {
             self.view.widget.clipboard().set_text(&text);
         }
     }

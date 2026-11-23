@@ -1,12 +1,12 @@
 use super::{
-    selection_text, underline_color_at, Arc, HistoryCopyRow, HistoryLayout, HistoryPage, Row,
-    RowAnnotations, ScrollbackLine, Terminal, UnderlineColorRun, MAX_ROWS,
+    append_copy_cell, selection_text, underline_color_at, Arc, HistoryCopyRow, HistoryLayout,
+    HistoryPage, Row, RowAnnotations, ScrollbackLine, Terminal, UnderlineColorRun, MAX_ROWS,
 };
 use crate::{
     history_reflow::{source_columns, HistoryAnchor, ProjectedHistoryRow},
     TerminalCell,
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, io};
 
 impl Terminal {
     /// Distinguish spaces written into the live grid from erase padding. Enable
@@ -116,6 +116,80 @@ impl Terminal {
             ((end.row - start.row) as usize, usize::from(end.column)),
             true,
         )
+    }
+
+    /// Export the current screen and its retained text in document order.
+    /// The sink can stop the scan on a byte or time limit without buffering
+    /// the scrollback. A soft wrap joins rows, including at the archive edge.
+    pub fn write_retained_text(&self, output: &mut impl io::Write) -> io::Result<()> {
+        const SPACES: &[u8] = &[b' '; 256];
+        let grid = &self.screen.grid;
+        let mut row_text = String::new();
+        let mut padding = 0;
+        let mut separate = false;
+        let mut write_row = |cells: &[TerminalCell],
+                             annotations: Option<&RowAnnotations>,
+                             margin_gap: Option<usize>,
+                             wrapped: bool| {
+            if separate {
+                output.write_all(b"\n")?;
+            }
+            row_text.clear();
+            let mut written_space_end = 0;
+            for (column, cell) in cells.iter().enumerate() {
+                if cell.flags.wide_continuation() || margin_gap == Some(column) {
+                    continue;
+                }
+                append_copy_cell(&mut row_text, cell, annotations, column);
+                if cell.flags.printed_space() {
+                    written_space_end = row_text.len();
+                }
+            }
+            let end = row_text.trim_end_matches(' ').len().max(written_space_end);
+            if end != 0 {
+                // Padding at an earlier wrap is internal when this row
+                // contains text. Only padding at a hard line end is dropped.
+                while padding > 0 {
+                    let count = padding.min(SPACES.len());
+                    output.write_all(&SPACES[..count])?;
+                    padding -= count;
+                }
+                output.write_all(&row_text.as_bytes()[..end])?;
+            }
+            padding = if wrapped {
+                padding + row_text.len() - end
+            } else {
+                0
+            };
+            separate = !wrapped;
+            Ok::<(), io::Error>(())
+        };
+        if !self.alternate_screen_active() {
+            for line in self.history.iter() {
+                write_row(
+                    &line.decompress(),
+                    line.row_annotations().map(Arc::as_ref),
+                    line.synthetic_margin_gap(),
+                    line.is_wrapped,
+                )?;
+            }
+        }
+        let last_drawn = (self.screen.cursor_row..grid.rows())
+            .rfind(|&row| {
+                grid[row]
+                    .iter()
+                    .any(|cell| !cell.is_reflow_trimmable_blank())
+            })
+            .unwrap_or(self.screen.cursor_row);
+        for row in 0..=last_drawn {
+            write_row(
+                &grid[row],
+                grid.row_annotations(row).map(Arc::as_ref),
+                grid.synthetic_margin_gap(row),
+                grid.row_wrapped[row],
+            )?;
+        }
+        Ok(())
     }
 
     /// Index the retained archive at the current width. The caller owns the

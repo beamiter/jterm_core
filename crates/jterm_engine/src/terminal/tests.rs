@@ -1248,6 +1248,43 @@ fn primary_reflow_preserves_virtual_cursor_space_and_deferred_wrap() {
 }
 
 #[test]
+fn retained_text_copies_archived_and_live_rows_with_exact_logical_boundaries() {
+    let mut terminal = Terminal::new(3, 12).unwrap();
+    terminal.track_printed_spaces();
+    terminal.enable_grapheme_clusters();
+    let archive = (0..140)
+        .map(|row| format!("archive-{row:03}\r\n"))
+        .collect::<String>();
+    terminal.feed(archive.as_bytes()).unwrap();
+    terminal
+        .feed("12345678901界e\u{301}  \r\nlive".as_bytes())
+        .unwrap();
+    assert!(terminal.history_rows() > 128);
+
+    let copied = |terminal: &Terminal| {
+        let mut output = Vec::new();
+        terminal.write_retained_text(&mut output).unwrap();
+        String::from_utf8(output).unwrap()
+    };
+    let primary = archive.replace("\r\n", "\n") + "12345678901界e\u{301}  \nlive";
+    assert_eq!(copied(&terminal), primary);
+    let mut bounded = [0; 13];
+    assert_eq!(
+        terminal
+            .write_retained_text(&mut &mut bounded[..])
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WriteZero
+    );
+    assert_eq!(&bounded, b"archive-000\na");
+
+    terminal.feed(b"\x1b[?1049hfullscreen").unwrap();
+    assert_eq!(copied(&terminal), "fullscreen");
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    assert_eq!(copied(&terminal), primary);
+}
+
+#[test]
 fn native_height_shrink_retains_primary_rows_and_keeps_the_live_prompt() {
     let mut terminal = Terminal::new(5, 12).unwrap();
     terminal.enable_history_preserving_resize();

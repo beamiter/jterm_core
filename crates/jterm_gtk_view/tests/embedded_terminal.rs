@@ -119,6 +119,23 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
     embedded.ingest(b"\x1b[?1049l").unwrap();
     assert!(embedded.inspect(|terminal| terminal.visible_text().contains("shell> run")));
     assert_eq!(&screen, pane.screen());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let source = loop {
+        if let Some(source) = embedded.retained_text_source() {
+            break source;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        main.iteration(false);
+    };
+    let mut copied = Vec::new();
+    embedded.write_retained_text(&source, &mut copied).unwrap();
+    assert_eq!(copied, b"shell> run\nworking");
+    embedded.resize(17, 8).unwrap();
+    copied.clear();
+    assert!(embedded.write_retained_text(&source, &mut copied).is_err());
+    assert!(copied.is_empty(), "an expired source produced partial text");
+
     embedded.exited(17.into());
     assert!(pane.write_text("ignored").is_err());
     assert!(embedded.ingest(b"ignored").is_err());
