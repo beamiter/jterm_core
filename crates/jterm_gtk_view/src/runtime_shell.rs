@@ -144,6 +144,20 @@ impl RuntimeShell {
         Ok(Self::new(session))
     }
 
+    /// Start the frontend's host-approved attachment relay in a local PTY.
+    /// The Session Host continues to own the provider or validation process.
+    pub fn spawn_hosted_attachment(
+        argv: &[String],
+        cwd: &Path,
+        host_bridge: bool,
+        prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
+    ) -> Result<Option<Rc<Self>>, String> {
+        if host_bridge || std::env::var_os(RUNTIME_OVERRIDE).is_some_and(|value| value != "1") {
+            return Ok(None);
+        }
+        Self::spawn_program(argv, cwd, prepare_environment()?).map(Some)
+    }
+
     pub fn spawn_anvil_bash_candidate(
         argv: &[String],
         cwd: Option<&str>,

@@ -96,6 +96,12 @@ pub enum PaneEvent {
 type OnClose = Box<dyn Fn(&gtk4::Widget)>;
 type OnEvent = Box<dyn Fn(PaneEvent)>;
 
+#[derive(Clone, Copy)]
+enum InputStyle {
+    Terminal,
+    HostedAttachment { inline_history: bool },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PointerMotion {
     column: usize,
@@ -130,6 +136,7 @@ pub struct TerminalPane<P: Pty> {
     input_method: gtk4::IMMulticontext,
     keys: gtk4::EventControllerKey,
     input_method_delegated: Cell<bool>,
+    input_style: InputStyle,
     input_cursor: Cell<Option<gdk::Rectangle>>,
     paste_revision: Cell<u64>,
     paste_reader: RefCell<Option<glib::JoinHandle<()>>>,
@@ -158,6 +165,7 @@ impl<P: Pty> TerminalPane<P> {
             status_text,
             links,
             Some(Box::new(close)),
+            InputStyle::Terminal,
         )
     }
 
@@ -175,6 +183,7 @@ impl<P: Pty> TerminalPane<P> {
             status_text,
             links,
             Some(Box::new(close)),
+            InputStyle::Terminal,
         )
     }
 
@@ -185,7 +194,35 @@ impl<P: Pty> TerminalPane<P> {
         status_text: fn(&str, usize) -> String,
         links: LinkActions,
     ) -> Result<(gtk4::Widget, Rc<Self>), String> {
-        Self::attach(Backend::Runtime(runtime), theme, status_text, links, None)
+        Self::attach(
+            Backend::Runtime(runtime),
+            theme,
+            status_text,
+            links,
+            None,
+            InputStyle::Terminal,
+        )
+    }
+
+    /// Display an attachment to a PTY owned by the Session Host.
+    #[cfg(target_os = "linux")]
+    pub fn with_hosted_attachment(
+        runtime: Rc<RuntimeShell>,
+        theme: Theme,
+        status_text: fn(&str, usize) -> String,
+        links: LinkActions,
+    ) -> Result<(gtk4::Widget, Rc<Self>), String> {
+        Self::attach(
+            Backend::Runtime(runtime),
+            theme,
+            status_text,
+            links,
+            None,
+            InputStyle::HostedAttachment {
+                inline_history: std::env::var_os("JTERM_AGENT_SCROLLBACK")
+                    .is_none_or(|value| value != "0"),
+            },
+        )
     }
 
     fn attach(
@@ -194,6 +231,7 @@ impl<P: Pty> TerminalPane<P> {
         status_text: fn(&str, usize) -> String,
         links: LinkActions,
         close: Option<OnClose>,
+        input_style: InputStyle,
     ) -> Result<(gtk4::Widget, Rc<Self>), String> {
         let (rows, columns) = (INITIAL_ROWS, INITIAL_COLUMNS);
         let colors = theme.terminal_colors();
@@ -276,6 +314,7 @@ impl<P: Pty> TerminalPane<P> {
             input_method: gtk4::IMMulticontext::new(),
             keys: gtk4::EventControllerKey::new(),
             input_method_delegated: Cell::new(false),
+            input_style,
             input_cursor: Cell::new(None),
             paste_revision: Cell::new(0),
             paste_reader: RefCell::new(None),
@@ -830,14 +869,30 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     fn scroll_key(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
-        if !modifiers.contains(gdk::ModifierType::SHIFT_MASK)
-            || modifiers.intersects(
-                gdk::ModifierType::CONTROL_MASK
-                    | gdk::ModifierType::ALT_MASK
-                    | gdk::ModifierType::META_MASK
-                    | gdk::ModifierType::SUPER_MASK
-                    | gdk::ModifierType::HYPER_MASK,
-            )
+        use gdk::ModifierType;
+        if modifiers.intersects(
+            ModifierType::CONTROL_MASK
+                | ModifierType::ALT_MASK
+                | ModifierType::META_MASK
+                | ModifierType::SUPER_MASK
+                | ModifierType::HYPER_MASK,
+        ) {
+            return false;
+        }
+        let shifted = modifiers.contains(ModifierType::SHIFT_MASK);
+        if !shifted
+            && !(matches!(
+                self.input_style,
+                InputStyle::HostedAttachment {
+                    inline_history: true
+                }
+            ) && matches!(
+                key,
+                gdk::Key::Page_Up
+                    | gdk::Key::Page_Down
+                    | gdk::Key::KP_Page_Up
+                    | gdk::Key::KP_Page_Down
+            ) && self.inspect(Terminal::alternate_screen_active) == Ok(false))
         {
             return false;
         }
@@ -845,6 +900,8 @@ impl<P: Pty> TerminalPane<P> {
         let delta = match key {
             gdk::Key::Page_Up => -page,
             gdk::Key::Page_Down => page,
+            gdk::Key::KP_Page_Up if !shifted => -page,
+            gdk::Key::KP_Page_Down if !shifted => page,
             gdk::Key::Home => i64::MIN,
             gdk::Key::End => i64::MAX,
             _ => return false,
@@ -1267,6 +1324,17 @@ impl<P: Pty> TerminalPane<P> {
                 key == gdk::Key::ISO_Left_Tab || modifiers.contains(gdk::ModifierType::SHIFT_MASK);
             let alt = modifiers.contains(gdk::ModifierType::ALT_MASK);
             let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+            if matches!(session.input_style, InputStyle::HostedAttachment { .. })
+                && key == gdk::Key::bracketright
+                && ctrl
+                && !shift
+                && !alt
+            {
+                // The relay consumes this byte before writing to the provider.
+                // Its meaning is independent of the provider's keyboard mode.
+                session.send_input(|_| Ok(vec![0x1d]));
+                return glib::Propagation::Stop;
+            }
             let base = if (alt || ctrl) && key.to_unicode().is_some() {
                 controller
                     .current_event()
@@ -1355,8 +1423,8 @@ fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {
             Key::End => "End",
             Key::Insert => "Insert",
             Key::Delete => "Delete",
-            Key::Page_Up => "PageUp",
-            Key::Page_Down => "PageDown",
+            Key::Page_Up | Key::KP_Page_Up => "PageUp",
+            Key::Page_Down | Key::KP_Page_Down => "PageDown",
             Key::F1 => "F1",
             Key::F2 => "F2",
             Key::F3 => "F3",
