@@ -370,10 +370,12 @@ impl TerminalView {
             (previous, _) => {
                 // GTK's input-method callback can retain line layout across a
                 // paint. Editing the mounted buffer lets GTK invalidate it.
+                let buffer = self.widget.buffer();
+                buffer.set_text("");
                 if let Some(previous) = previous {
                     previous.remove_tags();
                 }
-                Presentation::new(self.widget.buffer(), frame, margin_gaps, history, &theme)
+                Presentation::new(buffer, frame, margin_gaps, history, &theme)
             }
         };
         let caret = current.rows.iter().enumerate().find_map(|(row, painted)| {
@@ -831,7 +833,6 @@ impl Presentation {
         history: Option<&HistoryPage>,
         theme: &PaintTheme<'_>,
     ) -> Self {
-        buffer.set_text("");
         let font = gtk4::TextTag::builder()
             .font_desc(&theme.configured.font)
             .build();
@@ -869,8 +870,16 @@ impl Presentation {
 
     fn remove_tags(&self) {
         let table = self.buffer.tag_table();
-        table.remove(&self.font);
-        for tag in self.rows.iter().flat_map(|row| &row.tags) {
+        let mut tags: Vec<_> = self
+            .rows
+            .iter()
+            .flat_map(|row| &row.tags)
+            .chain(std::iter::once(&self.font))
+            .collect();
+        // Removing the highest priority first avoids reordering the tags
+        // that are still in the table.
+        tags.sort_unstable_by_key(|tag| std::cmp::Reverse(tag.priority()));
+        for tag in tags {
             table.remove(tag);
         }
     }
@@ -887,6 +896,7 @@ impl Presentation {
         let mut targets = HashMap::new();
         for index in indices {
             let Some(mut start) = self.buffer.iter_at_line(index as i32) else {
+                self.buffer.set_text("");
                 self.remove_tags();
                 *self = Self::new(self.buffer.clone(), frame, margin_gaps, None, theme);
                 return;
