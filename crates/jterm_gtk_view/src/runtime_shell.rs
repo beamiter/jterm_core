@@ -101,7 +101,9 @@ impl RuntimeShell {
             return Ok(None);
         }
         let cwd = local_directory(cwd, directory_available)?;
-        Self::spawn_program(argv, &cwd, prepare_environment()?).map(Some)
+        let runtime = Self::spawn_program(argv, &cwd, prepare_environment()?)?;
+        runtime.enable_primary_reflow()?;
+        Ok(Some(runtime))
     }
 
     /// Open a new ordinary pane with the host's saved or freshly minted jsh id.
@@ -179,7 +181,7 @@ impl RuntimeShell {
             .canonicalize()
             .map_err(|error| format!("invalid PTY working directory: {error}"))?;
         let env = runtime_environment(prepare_environment()?)?;
-        let session = Session::spawn_anvil_bash(
+        let mut session = Session::spawn_anvil_bash(
             INITIAL_ROWS,
             INITIAL_COLUMNS,
             Path::new(program),
@@ -187,6 +189,7 @@ impl RuntimeShell {
             &cwd,
             &env,
         )?;
+        session.enable_primary_reflow();
         Ok(Some(Self::new(session)))
     }
 
