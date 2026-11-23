@@ -10,6 +10,8 @@ mod live_output;
 mod pane;
 mod pty_dispatch;
 #[cfg(target_os = "linux")]
+mod prepared_pty;
+#[cfg(target_os = "linux")]
 mod runtime_launch;
 #[cfg(target_os = "linux")]
 mod runtime_shell;
@@ -41,6 +43,8 @@ pub use pane::{
     RetainedTextSource, TerminalPane, Theme,
 };
 pub use pty_dispatch::{PtyDispatch, PtyEvent};
+#[cfg(target_os = "linux")]
+pub use prepared_pty::{PreparedPtySession, WriteError};
 #[cfg(target_os = "linux")]
 pub use runtime_shell::RuntimeShell;
 pub use transcript::{TranscriptRowChrome, TranscriptView, TranscriptZone, TranscriptZoneOrigin};

@@ -49,6 +49,19 @@ pub trait SessionTransport: AsFd + Send + 'static {
     fn observe_before_reap_pid(&self) -> Option<i32> {
         None
     }
+    /// Hosts may limit a hangup when the launched child cannot reopen a slave.
+    fn hangup_timeout(&self) -> Option<Duration> {
+        None
+    }
+    /// Limit one reader dispatch for a view with a smaller paint budget.
+    fn read_batch_bytes(&self) -> Option<usize> {
+        None
+    }
+    /// Begin cleanup after fatal reader failure. A true return asks the
+    /// reader to wait for the final child status before publishing exit.
+    fn terminate_on_read_error(&mut self) -> bool {
+        false
+    }
     fn control_input_available(&mut self) -> bool {
         self.is_alive()
     }
@@ -221,6 +234,7 @@ struct WriteQueueState {
     accounted_messages: usize,
     reply_bytes: usize,
     retiring: bool,
+    admission_sequence: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -256,6 +270,7 @@ struct WriteQueue {
     ready: Condvar,
     limits: WriteQueueLimits,
     split: Option<SplitWriteLimits>,
+    reply_entries: usize,
     input_admitted: fn() -> bool,
     owner_writes: bool,
     closed: AtomicBool,
@@ -273,10 +288,12 @@ impl WriteQueue {
                 accounted_messages: 0,
                 reply_bytes: 0,
                 retiring: false,
+                admission_sequence: 0,
             }),
             ready: Condvar::new(),
             limits,
             split: None,
+            reply_entries: 0,
             input_admitted: || true,
             owner_writes: false,
             closed: AtomicBool::new(false),
@@ -298,7 +315,11 @@ impl WriteQueue {
                 WriteOrigin::User => (state.accounted_bytes - state.reply_bytes, split.user_bytes),
                 WriteOrigin::Reply => (state.reply_bytes, split.response_bytes),
             };
-            return (used, capacity, split.entries);
+            let entries = match origin {
+                WriteOrigin::User => split.entries - self.reply_entries,
+                WriteOrigin::Reply => split.entries,
+            };
+            return (used, capacity, entries);
         }
         if message_bytes <= self.limits.interactive_max_bytes {
             (
@@ -386,6 +407,7 @@ impl WriteQueue {
                 bytes: data.into_owned(),
             });
         }
+        state.admission_sequence = state.admission_sequence.saturating_add(1);
         self.ready.notify_one();
         Ok(())
     }
@@ -506,7 +528,7 @@ struct WorkerShutdown {
 
 impl<T: SessionTransport> SessionActor<T> {
     pub fn start(transport: T, wake: WakeSink) -> Result<Self, String> {
-        Self::start_with_limits(transport, wake, None, false)
+        Self::start_with_limits(transport, wake, None, 0, false)
     }
 
     pub fn start_with_split_writes(
@@ -514,7 +536,18 @@ impl<T: SessionTransport> SessionActor<T> {
         wake: WakeSink,
         limits: SplitWriteLimits,
     ) -> Result<Self, String> {
+        Self::start_with_reserved_replies(transport, wake, limits, 0)
+    }
+
+    /// Reserve both bytes and entries for protocol replies in the same FIFO.
+    pub fn start_with_reserved_replies(
+        transport: T,
+        wake: WakeSink,
+        limits: SplitWriteLimits,
+        reply_entries: usize,
+    ) -> Result<Self, String> {
         if limits.entries == 0
+            || reply_entries >= limits.entries
             || limits.user_bytes == 0
             || limits.response_bytes == 0
             || limits
@@ -524,7 +557,7 @@ impl<T: SessionTransport> SessionActor<T> {
         {
             return Err("invalid PTY write queue limits".into());
         }
-        Self::start_with_limits(transport, wake, Some(limits), false)
+        Self::start_with_limits(transport, wake, Some(limits), reply_entries, false)
     }
 
     /// The parser owner drives the bounded input FIFO when its callers need
@@ -532,13 +565,14 @@ impl<T: SessionTransport> SessionActor<T> {
     /// the actor, and the dedicated reader works independently of the owner.
     #[cfg(all(target_os = "linux", feature = "linux-pty"))]
     pub(crate) fn start_with_owner_writes(transport: T, wake: WakeSink) -> Result<Self, String> {
-        Self::start_with_limits(transport, wake, None, true)
+        Self::start_with_limits(transport, wake, None, 0, true)
     }
 
     fn start_with_limits(
         transport: T,
         wake: WakeSink,
         limits: Option<SplitWriteLimits>,
+        reply_entries: usize,
         owner_writes: bool,
     ) -> Result<Self, String> {
         let child_pid = transport.observe_before_reap_pid();
@@ -558,6 +592,7 @@ impl<T: SessionTransport> SessionActor<T> {
         let source = OutputSource::default();
         let mut queue = WriteQueue::new(WriteQueueLimits::PRODUCTION);
         queue.split = limits;
+        queue.reply_entries = reply_entries;
         queue.input_admitted = T::input_admitted;
         queue.owner_writes = owner_writes;
         let mut actor = Self {
@@ -692,10 +727,36 @@ impl<T: SessionTransport> SessionActor<T> {
             }
             queue.close();
         };
+        let publish_exit = |tail| {
+            while !shutdown.load(Ordering::Acquire) {
+                let reaped = transport.lock().try_reap();
+                if let Some(code) = reaped {
+                    if tail != ExitTail::Complete && !events.send(SessionEvent::ExitTail(tail)) {
+                        return false;
+                    }
+                    return events.send(SessionEvent::Exit(code));
+                }
+                if !matches!(
+                    poll_reader(-1, shutdown_read.as_raw_fd(), 25),
+                    Ok(ReaderPoll::Timeout)
+                ) {
+                    break;
+                }
+            }
+            false
+        };
+        let limits = {
+            let transport = transport.lock();
+            crate::pty_reader::ReadLimits {
+                hangup_timeout: transport.hangup_timeout(),
+                batch_bytes: transport.read_batch_bytes(),
+            }
+        };
         run_observed(
             descriptor.as_fd(),
             shutdown_read.as_fd(),
             child_pid,
+            limits,
             || retire_input(true),
             |event| match event {
                 PtyReadEvent::Output { bytes, read_at } => {
@@ -703,28 +764,13 @@ impl<T: SessionTransport> SessionActor<T> {
                 }
                 PtyReadEvent::Error(error) => {
                     retire_input(false);
-                    events.send(SessionEvent::Error(format!("PTY reader stopped: {error}")))
-                }
-                PtyReadEvent::Exit { tail, .. } => {
-                    while !shutdown.load(Ordering::Acquire) {
-                        let reaped = transport.lock().try_reap();
-                        if let Some(code) = reaped {
-                            if tail != ExitTail::Complete
-                                && !events.send(SessionEvent::ExitTail(tail))
-                            {
-                                return false;
-                            }
-                            return events.send(SessionEvent::Exit(code));
-                        }
-                        if !matches!(
-                            poll_reader(-1, shutdown_read.as_raw_fd(), 25),
-                            Ok(ReaderPoll::Timeout)
-                        ) {
-                            break;
-                        }
+                    let cleanup_started = transport.lock().terminate_on_read_error();
+                    if !events.send(SessionEvent::Error(format!("PTY reader stopped: {error}"))) {
+                        return false;
                     }
-                    false
+                    !cleanup_started || publish_exit(ExitTail::ReadFailed)
                 }
+                PtyReadEvent::Exit { tail, .. } => publish_exit(tail),
             },
         );
     }
@@ -1192,6 +1238,18 @@ impl<T: SessionTransport> SessionActor<T> {
             .try_enqueue_input(WriteOrigin::Reply, data.into())
     }
 
+    /// Observe input admission only at an idle writer boundary. This stamp
+    /// does not attest that the child has read or acted on any input.
+    pub fn display_idle_input_stamp(&self) -> Option<u64> {
+        let queue = &self.write_tx.queue;
+        let state = queue.state.try_lock()?;
+        (!queue.is_closed()
+            && !state.retiring
+            && state.accounted_messages == 0
+            && state.admission_sequence != u64::MAX)
+            .then_some(state.admission_sequence)
+    }
+
     pub fn can_queue_user_input(&self, len: usize) -> Result<(), WriteError> {
         let queue = &self.write_tx.queue;
         queue
@@ -1237,7 +1295,7 @@ impl<T: SessionTransport> SessionActor<T> {
     /// and proves there is no queued/in-flight writer. Never enqueue a Chat
     /// control for later delivery, and never partially send an escape sequence.
     pub fn try_write_control_byte(&self, byte: u8, validate: impl FnOnce(i32) -> bool) -> bool {
-        let Some(state) = self.write_tx.queue.state.try_lock() else {
+        let Some(mut state) = self.write_tx.queue.state.try_lock() else {
             return false;
         };
         if self.write_tx.queue.owner_writes
@@ -1268,7 +1326,11 @@ impl<T: SessionTransport> SessionActor<T> {
         if foreground <= 0 || !validate(foreground) {
             return false;
         }
-        pty.write_control_byte(byte)
+        if !pty.write_control_byte(byte) {
+            return false;
+        }
+        state.admission_sequence = state.admission_sequence.saturating_add(1);
+        true
     }
 
     /// 返回写入队列的发送端,供需要先做阻塞 I/O(如读剪贴板)再写 PTY 的后台线程使用。
@@ -1285,6 +1347,11 @@ impl<T: SessionTransport> SessionActor<T> {
     pub fn freeze_after_exit(&self) {
         self.stop_workers();
         while self.event_rx.try_recv().is_ok() {}
+    }
+
+    #[cfg(all(target_os = "linux", feature = "linux-pty"))]
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {

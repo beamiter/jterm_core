@@ -1215,22 +1215,27 @@ impl<P: Pty> TerminalPane<P> {
         if input.is_empty() {
             return Ok(());
         }
+        let mut reply_error = None;
         let result = input.chunks(MAX_FEED_BYTES).try_for_each(|chunk| {
             let reply = terminal
                 .borrow_mut()
                 .feed(chunk)
                 .map_err(|error| format!("Terminal output failed: {error}"))?;
-            if reply.is_empty() {
-                return Ok(());
+            if !reply.is_empty() {
+                if let Err(error) = pty.write_reply(&reply) {
+                    reply_error.get_or_insert(error);
+                }
             }
-            pty.write_reply(&reply)
-                .map_err(|error| format!("Terminal reply delivery failed: {error}"))
+            Ok(())
         });
         let window = terminal.borrow_mut().take_window_updates();
         self.dirty.set(true);
         self.notify(PaneEvent::Output);
         self.notify_window(window);
-        result
+        result.and_then(|()| match reply_error {
+            Some(error) => Err(format!("Terminal reply delivery failed: {error}")),
+            None => Ok(()),
+        })
     }
 
     fn paint(&self) {

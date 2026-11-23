@@ -219,19 +219,35 @@ pub fn run(
     child_pid: i32,
     send: impl FnMut(PtyReadEvent) -> bool,
 ) {
-    run_observed(master, shutdown, child_pid, || {}, send);
+    run_observed(
+        master,
+        shutdown,
+        child_pid,
+        ReadLimits::default(),
+        || {},
+        send,
+    );
+}
+
+#[derive(Default)]
+pub(crate) struct ReadLimits {
+    pub hangup_timeout: Option<Duration>,
+    pub batch_bytes: Option<usize>,
 }
 
 pub(crate) fn run_observed(
     master: BorrowedFd<'_>,
     shutdown: BorrowedFd<'_>,
     child_pid: i32,
+    limits: ReadLimits,
     mut retire_input: impl FnMut(),
     mut send: impl FnMut(PtyReadEvent) -> bool,
 ) {
-    let mut buffer = vec![0; 65536];
+    let batch_bytes = limits.batch_bytes.unwrap_or(BATCH_CAP).clamp(1, BATCH_CAP);
+    let mut buffer = vec![0; batch_bytes.min(65536)];
     let mut probe_at = Instant::now();
     let mut hangup_delay = None;
+    let mut hangup_started = None;
     loop {
         if Instant::now() >= probe_at || hangup_delay.is_some() {
             match poll_reader(-1, shutdown.as_raw_fd(), 0) {
@@ -272,6 +288,16 @@ pub(crate) fn run_observed(
         }
 
         if let Some(delay) = hangup_delay {
+            if hangup_started
+                .zip(limits.hangup_timeout)
+                .is_some_and(|(started, limit): (Instant, Duration)| started.elapsed() >= limit)
+            {
+                send(PtyReadEvent::Error(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PTY hung up while its child was still running",
+                )));
+                return;
+            }
             // A hung-up master remains readable. Wait only on cancellation
             // before trying the slave again, so the worker cannot busy-spin.
             match poll_reader(-1, shutdown.as_raw_fd(), delay) {
@@ -294,11 +320,15 @@ pub(crate) fn run_observed(
             }
         }
 
-        match publish_ready(master, &mut buffer, &mut send) {
+        match publish_ready(master, &mut buffer, batch_bytes, &mut send) {
             Some(true) => {
-                hangup_delay = Some(hangup_delay.map_or(50, |delay| (delay * 2).min(250)))
+                hangup_started.get_or_insert_with(Instant::now);
+                hangup_delay = Some(hangup_delay.map_or(50, |delay| (delay * 2).min(250)));
             }
-            Some(false) => hangup_delay = None,
+            Some(false) => {
+                hangup_started = None;
+                hangup_delay = None;
+            }
             None => return,
         }
     }
@@ -309,14 +339,15 @@ pub(crate) fn run_observed(
 fn publish_ready(
     master: BorrowedFd<'_>,
     buffer: &mut [u8],
+    batch_bytes: usize,
     send: &mut impl FnMut(PtyReadEvent) -> bool,
 ) -> Option<bool> {
     let mut bytes = Vec::new();
     let mut read_at = None;
     let mut hangup = false;
     let mut error = None;
-    while bytes.len() < BATCH_CAP {
-        let available = buffer.len().min(BATCH_CAP - bytes.len());
+    while bytes.len() < batch_bytes {
+        let available = buffer.len().min(batch_bytes - bytes.len());
         match read_master(master, &mut buffer[..available]) {
             Ok(ReadOutcome::Data(count)) => {
                 read_at.get_or_insert_with(Instant::now);

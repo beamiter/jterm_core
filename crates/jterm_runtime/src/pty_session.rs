@@ -26,8 +26,10 @@ use std::{
 };
 
 mod input_queue;
+mod prepared;
 mod transport;
 use input_queue::InputQueue;
+pub use prepared::PreparedPty;
 use transport::Transport;
 
 const INPUT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(2);

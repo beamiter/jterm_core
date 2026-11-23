@@ -97,23 +97,7 @@ impl SessionTransport for Transport {
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<WriteOutcome, String> {
-        let descriptor = self.as_fd();
-        let written = bounded_write(bytes, |bytes| {
-            // The borrowed master stays live during the nonblocking write.
-            let result =
-                unsafe { libc::write(descriptor.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-            if result < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(result as usize)
-            }
-        })
-        .map_err(|error| error.to_string())?;
-        if written == 0 {
-            Ok(WriteOutcome::WouldBlock)
-        } else {
-            Ok(WriteOutcome::Written(written))
-        }
+        write_master(self.as_fd(), bytes).map_err(|error| error.to_string())
     }
 
     fn resize(&mut self, cols: usize, rows: usize) -> Result<(), String> {
@@ -126,19 +110,8 @@ impl SessionTransport for Transport {
                     pixel_height: 0,
                 })
                 .map_err(|error| error.to_string()),
-            Master::Native(master) => {
-                let size = libc::winsize {
-                    ws_row: rows as u16,
-                    ws_col: cols as u16,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
-                };
-                // SAFETY: `master` owns the live PTY and size is initialized.
-                if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
-                    return Err(io::Error::last_os_error().to_string());
-                }
-                Ok(())
-            }
+            Master::Native(master) => resize_master(master.as_fd(), cols as u16, rows as u16)
+                .map_err(|error| error.to_string()),
         }
     }
 
@@ -185,4 +158,35 @@ impl SessionTransport for Transport {
     fn force_kill_and_reap(&mut self) {
         self.handoff_cleanup();
     }
+}
+
+pub(super) fn write_master(fd: BorrowedFd<'_>, bytes: &[u8]) -> io::Result<WriteOutcome> {
+    let written = bounded_write(bytes, |bytes| {
+        // SAFETY: the borrow pins the master and bytes is valid for its length.
+        let result = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    })?;
+    if written == 0 {
+        Ok(WriteOutcome::WouldBlock)
+    } else {
+        Ok(WriteOutcome::Written(written))
+    }
+}
+
+pub(super) fn resize_master(fd: BorrowedFd<'_>, cols: u16, rows: u16) -> io::Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: the borrow pins the master and size is initialized.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

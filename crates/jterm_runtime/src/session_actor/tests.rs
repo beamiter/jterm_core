@@ -454,6 +454,49 @@ fn split_write_queue_keeps_a_shared_fifo_with_independent_byte_caps() {
 }
 
 #[test]
+fn reserved_reply_entries_survive_user_saturation_and_keep_fifo_order() {
+    let mut queue = WriteQueue::new(WriteQueueLimits::PRODUCTION);
+    queue.split = Some(SplitWriteLimits {
+        user_bytes: 6,
+        response_bytes: 3,
+        entries: 3,
+        coalesce_bytes: 0,
+    });
+    queue.reply_entries = 1;
+    queue.try_enqueue(b"paste-".to_vec()).unwrap();
+    let in_flight = queue.take().unwrap();
+    assert!(matches!(
+        queue.try_enqueue(vec![b'x']),
+        Err(WriteError::Full { .. })
+    ));
+    queue.finish(&in_flight);
+
+    queue.try_enqueue(b"A".to_vec()).unwrap();
+    let in_flight = queue.take().unwrap();
+    queue.try_enqueue(b"B".to_vec()).unwrap();
+    assert!(matches!(
+        queue.try_enqueue(vec![b'C']),
+        Err(WriteError::Full { .. })
+    ));
+    queue
+        .try_enqueue_input(WriteOrigin::Reply, b"rep".as_slice().into())
+        .unwrap();
+    assert!(matches!(
+        queue.try_enqueue_input(WriteOrigin::Reply, b"x".as_slice().into()),
+        Err(WriteError::Full { .. })
+    ));
+    assert_eq!(in_flight.bytes, b"A");
+    queue.finish(&in_flight);
+    let user = queue.take().unwrap();
+    assert_eq!(user.bytes, b"B");
+    queue.finish(&user);
+    let reply = queue.take().unwrap();
+    assert_eq!(reply.bytes, b"rep");
+    queue.finish(&reply);
+    assert_eq!(queue.drained(), Ok(true));
+}
+
+#[test]
 fn retiring_admission_allows_an_inflight_message_to_finish() {
     let queue = WriteQueue::new(tiny_limits());
     queue.try_enqueue(b"release".to_vec()).unwrap();
