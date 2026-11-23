@@ -183,9 +183,13 @@ def exercise_ordinary(args, pid, root):
 
     key("ctrl+shift+e")
     wait_for("two ordinary split screens", lambda: len(screens()) == 2)
-    send(r"""printf 'new-split-dir=[%s]\n' "$PWD" """)
-    wait_text(f"new-split-dir=[{project}]")
-    assert [bool(re.search(r"(?m)^new-split-dir=", accessible_text(view))) for view in screens()].count(True) == 1
+    wait_for("new split owns terminal focus", lambda: (view := screen()) is not None
+             and "new-tab-dir=" not in accessible_text(view))
+    # Compare the full working directory inside the shell. A split may be too
+    # narrow to expose that path on one physical accessibility row.
+    send(f"test \"$PWD\" = {shlex.quote(str(project))} && printf 'new-split-dir-ok\\n'")
+    wait_text("new-split-dir-ok")
+    assert [bool(re.search(r"(?m)^new-split-dir-ok *$", accessible_text(view))) for view in screens()].count(True) == 1
     assert all(view.get_description() == "Shared runtime session" for view in screens())
     send("exit 7")
     wait_for("real process exit collapsed only its split", lambda: len(screens()) == 1)
@@ -275,6 +279,8 @@ print("history-search-appended", flush=True)
                     str(extent.y + extent.height // 2), "click", "1"], check=True, timeout=5)
     try:
         wait_for("older match in another archive page", lambda: match("older"))
+        wait_for("older match is available in the X11 primary selection", lambda: subprocess.check_output(
+            ["xclip", "-selection", "primary", "-o"], stderr=subprocess.DEVNULL, timeout=5) == query.encode())
     except RuntimeError:
         labels = [node.get_name() for node in application_nodes(pid) if node.get_role() == Atspi.Role.LABEL]
         result = first_named(pid, "Terminal history match")

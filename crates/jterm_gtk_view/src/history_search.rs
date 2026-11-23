@@ -46,6 +46,7 @@ impl HistorySearchView {
             .editable(false)
             .monospace(true)
             .wrap_mode(gtk4::WrapMode::Char)
+            .buffer(&gtk4::TextBuffer::builder().enable_undo(false).build())
             .build();
         output.update_property(&[gtk4::accessible::Property::Label("Terminal history match")]);
         let scroller = gtk4::ScrolledWindow::builder()
@@ -221,9 +222,19 @@ impl HistorySearchView {
         let start = found.text[..found.range.start].chars().count() as i32;
         let end = start + found.text[found.range].chars().count() as i32;
         let buffer = self.output.buffer();
-        buffer.set_text(&found.text);
+        let previous_len = buffer.char_count();
+        // Keep PRIMARY owned while swapping results. Clearing the buffer first
+        // can enqueue an X11 ownership loss that clears the new selection.
+        buffer.insert(&mut buffer.end_iter(), &found.text);
         self.output.grab_focus();
-        buffer.select_range(&buffer.iter_at_offset(start), &buffer.iter_at_offset(end));
+        buffer.select_range(
+            &buffer.iter_at_offset(previous_len + start),
+            &buffer.iter_at_offset(previous_len + end),
+        );
+        buffer.delete(
+            &mut buffer.start_iter(),
+            &mut buffer.iter_at_offset(previous_len),
+        );
         self.output
             .scroll_to_mark(&buffer.get_insert(), 0.1, true, 0.0, 0.3);
         self.status.set_text("Match selected in retained history.");
