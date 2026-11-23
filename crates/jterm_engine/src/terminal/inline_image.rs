@@ -7,6 +7,83 @@ use std::sync::{Arc, Weak};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InlineImageId(u64);
 
+impl InlineImageId {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Tightly packed, unassociated RGBA8 pixels owned by an immutable image.
+#[derive(PartialEq, Eq)]
+pub struct InlineRaster {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for InlineRaster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineRaster")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("byte_len", &self.rgba.len())
+            .finish()
+    }
+}
+
+impl InlineRaster {
+    pub(crate) fn new(width: u32, height: u32, rgba: Vec<u8>) -> Option<Self> {
+        let expected = usize::try_from(width)
+            .ok()?
+            .checked_mul(usize::try_from(height).ok()?)?
+            .checked_mul(4)?;
+        (expected != 0 && rgba.len() == expected).then_some(Self {
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
+}
+
+/// Resource retained by live, archived and published image rows.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InlineImage {
+    id: InlineImageId,
+    columns: u16,
+    rows: u16,
+    raster: Option<InlineRaster>,
+}
+
+impl InlineImage {
+    pub fn id(&self) -> InlineImageId {
+        self.id
+    }
+
+    pub fn columns(&self) -> u16 {
+        self.columns
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.rows
+    }
+
+    pub fn raster(&self) -> Option<&InlineRaster> {
+        self.raster.as_ref()
+    }
+}
+
 /// One row of an inline image, attached to its first physical column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InlineImageRow {
@@ -18,14 +95,18 @@ pub struct InlineImageRow {
 /// lifetime. The raster store holds only a weak reference to this lease.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImageAnnotation {
-    image: Arc<InlineImageId>,
+    image: Arc<InlineImage>,
     slice: u16,
 }
 
 impl ImageAnnotation {
+    pub(crate) fn resource(&self) -> (&InlineImage, u16) {
+        (&self.image, self.slice)
+    }
+
     pub(crate) fn row(&self) -> InlineImageRow {
         InlineImageRow {
-            image: *self.image,
+            image: self.image.id,
             slice: self.slice,
         }
     }
@@ -45,7 +126,7 @@ pub struct PreparedInlineImage {
 /// Stable engine references that let a renderer retire its raster backing.
 pub struct PlacedInlineImage {
     image: InlineImageId,
-    lease: Weak<InlineImageId>,
+    lease: Weak<InlineImage>,
 }
 
 impl PlacedInlineImage {
@@ -102,6 +183,22 @@ impl Terminal {
         &mut self,
         prepared: PreparedInlineImage,
     ) -> Option<PlacedInlineImage> {
+        self.commit_inline_image(prepared, None)
+    }
+
+    pub(crate) fn place_inline_raster(
+        &mut self,
+        prepared: PreparedInlineImage,
+        raster: InlineRaster,
+    ) -> Option<PlacedInlineImage> {
+        self.commit_inline_image(prepared, Some(raster))
+    }
+
+    fn commit_inline_image(
+        &mut self,
+        prepared: PreparedInlineImage,
+        raster: Option<InlineRaster>,
+    ) -> Option<PlacedInlineImage> {
         if prepared.epoch != self.epoch.get() || prepared.revision != self.revision {
             return None;
         }
@@ -113,11 +210,20 @@ impl Terminal {
             prepared.moves_cursor,
         )?;
         self.finish_grapheme();
-        self.begin_revision(self.revision.checked_add(1)?);
+        // Parser-driven placements run inside a feed, whose one revision
+        // already covers every row write in byte order.
+        if raster.is_none() {
+            self.begin_revision(self.revision.checked_add(1)?);
+        }
         self.next_inline_image_id = self.next_inline_image_id.checked_add(1)?;
         let image = InlineImageId(self.next_inline_image_id);
         let blank = self.screen.create_blank_cell();
-        let lease = Arc::new(image);
+        let lease = Arc::new(InlineImage {
+            id: image,
+            columns: prepared.columns,
+            rows: prepared.rows,
+            raster,
+        });
         for slice in 0..prepared.rows {
             let row = self.screen.cursor_row;
             let column = prepared.column;

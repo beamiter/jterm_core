@@ -13,6 +13,7 @@ pub use hyperlink::HyperlinkId;
 /// Existing Ember admission bound; unchanged by extraction.
 pub const MAX_TERMINAL_COLS: usize = 1024;
 pub mod input;
+pub mod kitty_graphics;
 pub mod mouse;
 pub mod protocol_state;
 pub mod retained_history;

@@ -340,7 +340,7 @@ pub fn parse_command<'a>(payload: &'a [u8], caps: &Caps) -> Result<Command<'a>, 
     let rest = payload
         .strip_prefix(b"G")
         .ok_or(Error::Invalid("payload is not a graphics command"))?;
-    let (control, body) = match memchr::memchr(b';', rest) {
+    let (control, body) = match rest.iter().position(|&byte| byte == b';') {
         Some(index) => (&rest[..index], &rest[index + 1..]),
         None => (rest, &rest[rest.len()..]),
     };
@@ -616,7 +616,7 @@ impl Assembled {
         let mut rgba = Vec::new();
         rgba.try_reserve_exact(layout.rgba_bytes)
             .map_err(|_| Error::TooLarge)?;
-        for pixel in self.bytes.as_chunks::<3>().0 {
+        for pixel in self.bytes.chunks_exact(3) {
             rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xFF]);
         }
         debug_assert_eq!(rgba.len(), layout.rgba_bytes);
@@ -943,6 +943,8 @@ fn base64_index(byte: u8) -> Option<u32> {
         _ => None,
     }
 }
+
+pub(crate) mod inline;
 
 #[cfg(test)]
 mod tests {

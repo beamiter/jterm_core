@@ -33,7 +33,7 @@ pub mod identity;
 pub mod jsh_install;
 pub mod jsh_remote;
 pub mod keybindings;
-pub mod kitty_graphics;
+pub use jterm_engine::kitty_graphics;
 pub mod kitty_keyboard;
 pub mod link;
 #[cfg(unix)]

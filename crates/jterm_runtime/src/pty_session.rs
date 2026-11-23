@@ -727,6 +727,16 @@ impl Session {
         Ok(())
     }
 
+    /// Apply direct graphics and their replies in the same PTY byte stream.
+    pub fn enable_inline_graphics(
+        &mut self,
+        cell_pixels: (u16, u16),
+        decode_png: jterm_engine::terminal::PngDecoder,
+    ) {
+        self.terminal
+            .enable_inline_graphics(cell_pixels, decode_png);
+    }
+
     /// An owner-mode writer may need to retry after EAGAIN without new output.
     pub fn needs_write_retry(&self) -> bool {
         !self.closed

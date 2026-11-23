@@ -1,5 +1,5 @@
 use crate::{
-    terminal::{ImageAnnotation, InlineImageRow},
+    terminal::{ImageAnnotation, InlineImage, InlineImageRow},
     TerminalCell,
 };
 use std::{ops::Range, sync::Arc};
@@ -67,6 +67,16 @@ impl RowAnnotations {
     pub(crate) fn image_rows(&self) -> impl Iterator<Item = (usize, InlineImageRow)> + '_ {
         self.cells.iter().filter_map(|cell| match &cell.value {
             Value::Image(image) => Some((usize::from(cell.column), image.row())),
+            Value::Text(_) => None,
+        })
+    }
+
+    pub(crate) fn images(&self) -> impl Iterator<Item = (usize, &InlineImage, u16)> + '_ {
+        self.cells.iter().filter_map(|cell| match &cell.value {
+            Value::Image(annotation) => {
+                let (image, slice) = annotation.resource();
+                Some((usize::from(cell.column), image, slice))
+            }
             Value::Text(_) => None,
         })
     }

@@ -1,4 +1,4 @@
-//! Terminal Channel version 4. The control plane continues to use `Attachment`.
+//! Terminal Channel frames. Version 5 adds inline raster resources to version 4.
 
 use crate::terminal::{self, Attachment, CursorShape, SessionStatus, WireFrame};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -6,6 +6,11 @@ use std::{fmt, num::NonZeroU64};
 
 pub use crate::terminal::{MAX_CELLS, MAX_COLUMNS, MAX_ROWS};
 pub const VERSION: u8 = 4;
+pub const IMAGE_VERSION: u8 = 5;
+pub const MAX_IMAGES: usize = 32;
+pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_IMAGE_DIMENSION: u32 = 4096;
+pub const MAX_ENCODED_IMAGE_BYTES: usize = 4 * (MAX_IMAGE_BYTES + 2 * MAX_IMAGES).div_ceil(3);
 pub const MAX_ENCODED_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 512 * 1024;
 pub const MAX_CLUSTER_BYTES: usize = 64;
@@ -13,10 +18,11 @@ pub const MAX_HYPERLINKS: usize = 4096;
 pub const MAX_HYPERLINK_BYTES: usize = 1024 * 1024;
 pub const MAX_HYPERLINK_TARGET_BYTES: usize = 2048;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotFormat {
     Compatibility,
     Channel,
+    ChannelImages,
 }
 
 impl SnapshotFormat {
@@ -24,7 +30,16 @@ impl SnapshotFormat {
         match version {
             None | Some(terminal::VERSION) => Ok(Self::Compatibility),
             Some(VERSION) => Ok(Self::Channel),
+            Some(IMAGE_VERSION) => Ok(Self::ChannelImages),
             Some(_) => Err("unsupported terminal snapshot version"),
+        }
+    }
+
+    pub fn channel_version(self) -> Option<u8> {
+        match self {
+            Self::Compatibility => None,
+            Self::Channel => Some(VERSION),
+            Self::ChannelImages => Some(IMAGE_VERSION),
         }
     }
 }
@@ -148,6 +163,29 @@ pub struct Row {
     /// The row continues on the next physical row.
     pub wrapped: bool,
     pub cells: Vec<Cell>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_slices: Vec<ImageSlice>,
+}
+
+/// Row-relative location of one vertical slice of a retained image.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageSlice {
+    pub column: u16,
+    pub id: Counter,
+    pub slice: u16,
+}
+
+/// Immutable unassociated RGBA8 pixels in canonical base64 and cell geometry.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageResource {
+    pub id: Counter,
+    pub width: u32,
+    pub height: u32,
+    pub columns: u16,
+    pub rows: u16,
+    pub rgba: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -166,7 +204,7 @@ pub struct Stamp {
     pub revision: Counter,
     pub layout: Counter,
     pub screen: Screen,
-    /// Hyperlink IDs are immutable for one owner incarnation.
+    /// Hyperlink and image IDs are immutable for one owner incarnation.
     pub resource_generation: Counter,
     pub cursor_row: u16,
     pub cursor_col: u16,
@@ -191,6 +229,8 @@ pub enum Update {
         rows: Vec<Row>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hyperlinks: Vec<Hyperlink>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageResource>,
     },
     Delta {
         stamp: Stamp,
@@ -198,6 +238,8 @@ pub enum Update {
         rows: Vec<ChangedRow>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hyperlinks: Vec<Hyperlink>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageResource>,
     },
 }
 

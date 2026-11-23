@@ -8,6 +8,7 @@ use crate::{
     grid::{PrintCheckpoint, WrapCheckpoint},
     history_reflow::HistoryLayout,
     hyperlink::{resolve_resource, HyperlinkPolicy, HyperlinkResources, HyperlinkTable},
+    kitty_graphics::{self, inline::InlineGraphics},
     mouse::MouseInput,
     parser::{Event, Parser, ParserLimits, ParserProfile, StringKind},
     protocol_state::ProtocolState,
@@ -32,7 +33,11 @@ use unicode_width::UnicodeWidthChar;
 mod history_view;
 mod inline_image;
 pub(crate) use inline_image::ImageAnnotation;
-pub use inline_image::{InlineImageId, InlineImageRow, PlacedInlineImage, PreparedInlineImage};
+pub use inline_image::{
+    InlineImage, InlineImageId, InlineImageRow, InlineRaster, PlacedInlineImage,
+    PreparedInlineImage,
+};
+pub use kitty_graphics::inline::PngDecoder;
 mod row_sources;
 use row_sources::RowSources;
 pub use row_sources::TranscriptAnchor;
@@ -251,6 +256,7 @@ pub struct Terminal {
     history_end: u64,
     row_sources: Option<RowSources>,
     next_inline_image_id: u64,
+    inline_graphics: Option<InlineGraphics>,
     retained_layout: Mutex<Weak<HistoryLayout>>,
     preserve_primary_on_resize: bool,
     command_blocks: Option<CommandBlocks>,
@@ -413,6 +419,7 @@ impl Terminal {
             history_end: 0,
             row_sources: None,
             next_inline_image_id: 0,
+            inline_graphics: None,
             retained_layout: Mutex::new(Weak::new()),
             preserve_primary_on_resize: false,
             command_blocks: None,
@@ -438,6 +445,19 @@ impl Terminal {
                 HyperlinkTable::with_url_byte_limit(MAX_HYPERLINK_URL_BYTES),
             )
         });
+    }
+
+    /// Enable bounded direct Kitty graphics on this terminal's own parser.
+    pub fn enable_inline_graphics(&mut self, cell_pixels: (u16, u16), decode_png: PngDecoder) {
+        self.parser.enable_inline_graphics_packets();
+        self.inline_graphics
+            .get_or_insert_with(|| InlineGraphics::new(cell_pixels, decode_png));
+    }
+
+    fn cancel_inline_upload(&mut self) {
+        if let Some(graphics) = &mut self.inline_graphics {
+            graphics.cancel();
+        }
     }
 
     /// Preserve streaming grapheme continuations in paint and history.
@@ -1379,6 +1399,7 @@ impl Terminal {
 
     // Apply profile-specific screen operations after shared local dispatch.
     fn reset_terminal(&mut self) {
+        self.cancel_inline_upload();
         let track_printed_spaces = self.screen.grid.track_printed_spaces;
         self.screen = ScreenState::new(self.screen.grid.rows(), self.screen.grid.cols());
         if track_printed_spaces {
@@ -1445,6 +1466,9 @@ impl Terminal {
                         for &mode in params.iter() {
                             match mode {
                                 47 | 1047 | 1049 => {
+                                    if set != self.screen.use_alt_buffer {
+                                        self.cancel_inline_upload();
+                                    }
                                     if set {
                                         if let Some(entry) = self.screen.enter_alternate_screen(
                                             mode == 1049,
@@ -1657,6 +1681,9 @@ impl Terminal {
             }
             let rejected_before = self.parser.rejected_count();
             let step = self.parser.next(&input[at..]);
+            if step.abandoned_apc {
+                self.cancel_inline_upload();
+            }
             if self.parser.rejected_count() != rejected_before {
                 if self.hyperlinks.is_some() {
                     self.screen.current_hyperlink = HyperlinkId::NONE;
@@ -1667,6 +1694,27 @@ impl Terminal {
             let Some(event) = step.event else { continue };
             if !matches!(&event, Event::Print(_) | Event::Ascii(_)) {
                 self.finish_grapheme();
+            }
+            if let Event::String {
+                kind: StringKind::Apc,
+                payload,
+                ..
+            } = &event
+            {
+                if kitty_graphics::is_graphics_payload(payload) {
+                    if let Some(mut graphics) = self.inline_graphics.take() {
+                        let cursor = (self.screen.cursor_col, self.screen.cursor_row);
+                        let reply = graphics.apply(self, cursor, payload);
+                        self.inline_graphics = Some(graphics);
+                        if let Some(reply) = reply {
+                            if replies.len() + reply.len() > MAX_FEED_BYTES {
+                                return Err("reply byte limit".into());
+                            }
+                            replies.extend_from_slice(reply.as_bytes());
+                        }
+                        continue;
+                    }
+                }
             }
             if self
                 .command_blocks

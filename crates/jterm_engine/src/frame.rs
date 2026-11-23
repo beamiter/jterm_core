@@ -291,6 +291,16 @@ impl CellFrame {
             .flat_map(|row| row.image_rows())
     }
 
+    /// Image resource and vertical slice at each annotated physical column.
+    pub fn inline_images(
+        &self,
+        row: usize,
+    ) -> impl Iterator<Item = (usize, &crate::terminal::InlineImage, u16)> + '_ {
+        self.row_annotations(row)
+            .into_iter()
+            .flat_map(|row| row.images())
+    }
+
     pub(crate) fn row_annotations(&self, row: usize) -> Option<&Arc<RowAnnotations>> {
         self.annotations.as_ref()?.get(row)?.as_ref()
     }

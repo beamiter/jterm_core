@@ -216,6 +216,7 @@ pub struct Parser {
     capture: Option<OpenCapture>,
     ascii_batching: bool,
     bounded: bool,
+    apc_bytes: Option<usize>,
     rejected: u64,
 }
 
@@ -254,6 +255,7 @@ impl Parser {
             capture: None,
             ascii_batching: true,
             bounded: false,
+            apc_bytes: None,
             rejected: 0,
         }
     }
@@ -279,6 +281,17 @@ impl Parser {
         parser.bounded = true;
         Ok(parser)
     }
+    pub(crate) fn enable_inline_graphics_packets(&mut self) {
+        self.apc_bytes = Some(64 * 1024);
+    }
+
+    fn string_limit(&self, kind: StringKind) -> usize {
+        if kind == StringKind::Apc {
+            return self.apc_bytes.unwrap_or(self.limits.pending_bytes);
+        }
+        self.limits.pending_bytes
+    }
+
     /// Lifetime count of resource rejections. Reset clears parser state, not this counter.
     pub fn rejected_count(&self) -> u64 {
         self.rejected
@@ -568,7 +581,7 @@ impl Parser {
                     // short OSC titles without accepting any unchecked tail.
                     if data.is_empty() {
                         let remaining = &input[at..];
-                        let scan_len = remaining.len().min(self.limits.pending_bytes + 1);
+                        let scan_len = remaining.len().min(self.string_limit(kind) + 1);
                         if let Some(end) = remaining[..scan_len].iter().position(|&byte| {
                             matches!(byte, 0x1b | 0x18 | 0x1a)
                                 || (kind == StringKind::Osc && byte == 7)
@@ -625,7 +638,7 @@ impl Parser {
                             bel_terminated: true
                         });
                     }
-                    if byte != 0x1b && data.len() >= self.limits.pending_bytes {
+                    if byte != 0x1b && data.len() >= self.string_limit(kind) {
                         abandoned_apc = kind == StringKind::Apc;
                         at += 1;
                         self.rejected = self.rejected.saturating_add(1);
