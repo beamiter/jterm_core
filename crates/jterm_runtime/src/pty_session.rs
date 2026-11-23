@@ -7,6 +7,7 @@ use crate::child_lifecycle::{
 use crate::native_pty_launch::{launch_bundled_bash, BundledBash};
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{SessionActor, SessionEvent};
+use crate::supervised::require_waitable_sigchld;
 use crossbeam_channel::TryRecvError;
 use jterm_engine::frame::CellFrame;
 use jterm_engine::terminal::{
@@ -76,19 +77,6 @@ mod reaper {
     pub(super) struct Ticket {
         pub reaped: AtomicBool,
         pub pending: AtomicBool,
-    }
-    pub(super) fn check_child_wait_ownership() -> Result<(), String> {
-        let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
-        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let action = unsafe { action.assume_init() };
-        if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
-            return Err(
-                "exclusive child wait ownership requires default SIGCHLD disposition".into(),
-            );
-        }
-        Ok(())
     }
     pub(super) enum Job {
         Bound(Arc<ChildLifecycle>),
@@ -493,6 +481,8 @@ impl SessionIo {
     }
 }
 
+/// Owns the direct PTY child and its wait status. Other child watchers in
+/// the embedding process must only wait for PIDs they own.
 pub struct Session {
     io: Option<SessionIo>,
     output_wake: Arc<std::sync::OnceLock<WakeSink>>,
@@ -620,8 +610,8 @@ impl Session {
         terminal: Terminal,
         command: CommandBuilder,
     ) -> Result<Self, String> {
+        require_waitable_sigchld().map_err(|error| error.to_string())?;
         let lease = reaper::global()?.reserve()?;
-        reaper::check_child_wait_ownership()?;
         let reap_ticket = lease.ticket.clone();
         let pair = native_pty_system()
             .openpty(PtySize {
