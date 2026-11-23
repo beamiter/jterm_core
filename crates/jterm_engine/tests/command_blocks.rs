@@ -13,19 +13,30 @@ fn submitting_a_line_revokes_recall_until_the_next_complete_prompt() {
     let mut terminal = Terminal::new(3, 16).unwrap();
     terminal.observe_command_blocks();
     terminal.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07").unwrap();
+    assert_eq!(terminal.command_prompt_generation(), Some(1));
     terminal.observe_prompt_input(b"printf hello");
     assert!(terminal.command_prompt_ready());
+    assert_eq!(terminal.command_prompt_generation(), Some(1));
     terminal.observe_prompt_input(b"\r");
     assert!(!terminal.command_prompt_ready());
+    assert_eq!(terminal.command_prompt_generation(), None);
     terminal
         .feed(b"\x1b]133;C;id=one;cmdline_url=printf%20hello\x07hello\r\n")
         .unwrap();
+    assert!(terminal.command_running());
+    terminal.feed(b"\x1b[?1049h").unwrap();
+    assert!(terminal.alternate_screen_active());
+    assert_eq!(terminal.command_prompt_generation(), None);
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    assert!(!terminal.alternate_screen_active());
     terminal.feed(END).unwrap();
+    assert!(!terminal.command_running());
     assert_eq!(terminal.completed_command_blocks().unwrap().len(), 1);
     terminal.feed(b"\x1b]133;A\x07$ ").unwrap();
     assert!(!terminal.command_prompt_ready());
     terminal.feed(b"\x1b]133;B\x07").unwrap();
     assert!(terminal.command_prompt_ready());
+    assert_eq!(terminal.command_prompt_generation(), Some(2));
 }
 
 #[test]

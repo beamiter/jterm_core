@@ -714,13 +714,17 @@ impl Terminal {
     /// other controls except TAB are rejected, including ESC and C1 controls.
     /// In unbracketed mode CR may execute shell lines: host must obtain paste intent.
     pub fn encode_paste(&self, text: &str) -> Result<Vec<u8>, String> {
-        self.encode_paste_bounded(text, self.protocol.modes().contains(&2004), MAX_INPUT_BYTES)
+        self.encode_paste_bounded(text, self.bracketed_paste_active(), MAX_INPUT_BYTES)
+    }
+
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.protocol.modes().contains(&2004)
     }
 
     /// The native clipboard shortcut preserves an explicit Enter in a shell
     /// that does not request bracketed paste.
     pub fn encode_native_paste(&self, text: &str) -> Result<Vec<u8>, String> {
-        if self.protocol.modes().contains(&2004) {
+        if self.bracketed_paste_active() {
             self.encode_paste_bounded(text, true, MAX_STREAMED_PASTE_BYTES)
         } else {
             let mut bytes = self.encode_paste_bounded(text, false, MAX_INPUT_BYTES)?;
@@ -981,6 +985,26 @@ impl Terminal {
                 .command_blocks
                 .as_ref()
                 .is_some_and(CommandBlocks::prompt_ready)
+    }
+
+    /// Identifies a single ready prompt in this PTY incarnation. A submitted
+    /// line, reset, or alternate screen invalidates the current generation.
+    pub fn command_prompt_generation(&self) -> Option<u64> {
+        if self.alternate_screen_active() {
+            return None;
+        }
+        self.command_blocks.as_ref()?.prompt_generation()
+    }
+
+    /// A command with a usable start marker is still in progress.
+    pub fn command_running(&self) -> bool {
+        self.command_blocks
+            .as_ref()
+            .is_some_and(CommandBlocks::command_running)
+    }
+
+    pub fn alternate_screen_active(&self) -> bool {
+        self.screen.use_alt_buffer
     }
 
     /// A submitted line can start a foreground command before its PTY markers arrive.
