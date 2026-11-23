@@ -12,7 +12,7 @@ import time
 import unittest
 
 import test_vimrc_workbench as harness
-from capture_diagnostics import CaptureInputEvidence
+from capture_diagnostics import CaptureInputEvidence, capture_failure_metadata
 from test_render_popups import PopupEditor
 
 
@@ -132,10 +132,25 @@ for line in sys.stdin:
         self.assertEqual(pinned["origin"]["bufnr"], origin["buffer"])
         self.assertEqual(pinned["lines"][:2], ["函数(参数😀, 参数😀)", "Overload 3 / 4"])
         self.assertGreater(pinned["found"], 0)
+        # Capture the unnamed register inside the actual PTY yank event.
+        # A PTY write completing does not establish that Vim has consumed it.
+        yank = self.root / "signature-yank.json"
         input_evidence = CaptureInputEvidence()
+        e.ex(
+            "autocmd TextYankPost * ++once call writefile([json_encode(getreg('\"'))], "
+            + harness.vim_string(yank) + ")",
+            input_evidence=input_evidence,
+        )
         e.keys("gg0y$", observe_write=input_evidence.observe_yank)
-        self.assertEqual(self.capture(e, "getreg('\"')", input_evidence=input_evidence),
-                         pinned["lines"][0])
+        try:
+            self.until(e, lambda: yank.is_file() and yank.read_bytes().endswith(b"\n"))
+        except AssertionError:
+            metadata = capture_failure_metadata(e, yank)
+            metadata["pty_write_acceptance"] = input_evidence.metadata()
+            raise AssertionError(
+                "Vim did not report the yank; metadata=" + json.dumps(metadata, sort_keys=True)
+            ) from None
+        self.assertEqual(json.loads(yank.read_text(encoding="utf-8")), pinned["lines"][0])
         self.assertFalse(e.gui_frame().get("popups"))
         self.assertEqual(self.capture(e, "getbufline(" + str(origin["buffer"]) + ", 1, '$')"), ["original line", "second line"])
 
