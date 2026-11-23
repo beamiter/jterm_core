@@ -109,6 +109,11 @@ mod tests {
 
     #[test]
     fn deleted_cli_history_stays_out_after_reopen_and_source_rescan() {
+        if crate::agent_workspace::isolated_lease_test(
+            "agent_workspace::store::deleted_cli::tests::deleted_cli_history_stays_out_after_reopen_and_source_rescan",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("jterm-cli-delete-{}", uuid::Uuid::new_v4()));
         let paths = super::super::Paths::at(dir.clone()).unwrap();
         let fixture = |profile: &str, title: &str| {
