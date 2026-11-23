@@ -52,7 +52,11 @@ def run(app, binary, root, native_buffer, embedded=False):
         directory = root / name
         directory.mkdir(mode=0o700)
         environment[name] = str(directory)
-    environment.update(GDK_BACKEND="x11", GSK_RENDERER="cairo", GTK_A11Y="atspi", JTERM_SHARED_RUNTIME="1")
+    environment.update(GDK_BACKEND="x11", GSK_RENDERER="cairo", GTK_A11Y="atspi")
+    if embedded:
+        environment["JTERM_SHARED_RUNTIME"] = "1"
+    else:
+        environment.pop("JTERM_SHARED_RUNTIME", None)
     with (root / "app.log").open("w+") as log:
         target = ["--no-restore", str(project)] if embedded else ["--ide", str(document)]
         process = subprocess.Popen([binary, "--config", str(config), *target],

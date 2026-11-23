@@ -131,10 +131,13 @@ focused shared pane. Native X11 tests cover copying matches across soft wraps,
 searching older rows while the PTY writes, and independent searches in two tabs.
 Native Wayland tests cover preedit cancellation
 when switching tabs, one commit in the focused pane, and clipboard transfer.
-The Vim9 tests run both the native buffer and compatibility display over the
-shared runtime and save a real file. The normal app configurations may use
-the existing VTE routes for shell integrations, remote sessions and other
-terminal modes.
+Linux native Forge and Anvil packages built with `shared-terminal` use the
+shared runtime for both Vim9 displays by default. The native fixtures check
+this default and save a real file with no `JTERM_SHARED_RUNTIME` override.
+The embedded X11 fixture also checks the exit status delivered to the
+waiting shared shell. `JTERM_SHARED_RUNTIME=0`, Flatpak and featureless builds
+select the existing VTE editor backend. Shell integrations, remote sessions
+and other terminal modes can also use VTE.
 
 Set `JTERM_SHARED_FINISHED_COMMANDS=1` for eligible shell-reported Block and
 Chat commands. Set `JTERM_SHARED_FINISHED_OUTPUT=1` alongside it to render
