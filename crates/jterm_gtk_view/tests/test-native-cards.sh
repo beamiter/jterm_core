@@ -34,7 +34,6 @@ PY
 )
 
 cases=(
-  shared_live_output_keeps_the_owned_shell_through_alternate_screen
   shared_finished_output_preserves_search_filter_and_cross_card_copy
   shared_finished_chat_preserves_capsule_search_filter_and_copy
 )
@@ -44,10 +43,17 @@ run_case() {
   local test_name="block_view::cross_selection::tests::$scenario"
   "$test_binary" --list | grep -Fx "$test_name: test"
   dbus-run-session -- xvfb-run -a env -u JTERM_SHARED_FINISHED_COMMANDS \
-    -u JTERM_SHARED_FINISHED_OUTPUT GSK_RENDERER=cairo JTERM_SHARED_LIVE_OUTPUT=1 "$@" \
+    -u JTERM_SHARED_FINISHED_OUTPUT -u JTERM_SHARED_LIVE_OUTPUT \
+    -u JTERM_SHARED_ACTIVE_TERMINAL -u JTERM_SHARED_TRANSCRIPT GSK_RENDERER=cairo "$@" \
     "$test_binary" --exact "$test_name" --ignored --test-threads=1 \
     | tee "$output/$scenario.log"
 }
+if [[ $app == anvil ]]; then
+  run_case shared_live_output_keeps_the_owned_shell_through_alternate_screen \
+    JTERM_SHARED_ACTIVE_TERMINAL=1 JTERM_SHARED_TRANSCRIPT=1
+else
+  run_case shared_live_output_keeps_the_owned_shell_through_alternate_screen JTERM_SHARED_LIVE_OUTPUT=1
+fi
 for scenario in "${cases[@]}"; do
   run_case "$scenario"
 done

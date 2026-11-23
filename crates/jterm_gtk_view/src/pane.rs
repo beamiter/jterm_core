@@ -245,6 +245,35 @@ impl<P: Pty> EmbeddedTerminal<P> {
         })
     }
 
+    pub(crate) fn when_transcript_painted(&self, observer: impl Fn() + 'static) -> bool {
+        self.pane.transcript_painted.set(Box::new(observer)).is_ok()
+    }
+
+    pub(crate) fn with_painted_transcript<R>(
+        &self,
+        inspect: impl FnOnce(&Terminal, PaintedTranscript<'_>) -> R,
+    ) -> Option<R> {
+        let (stamp, top) = self.pane.painted_source.get()?;
+        if stamp.screen != Screen::Primary {
+            return None;
+        }
+        self.inspect(|terminal| {
+            if terminal.frame().ok()?.stamp() != stamp {
+                return None;
+            }
+            let rail = self.pane.history_rail.borrow();
+            Some(inspect(
+                terminal,
+                PaintedTranscript {
+                    top: top.unwrap_or_else(|| rail.len()),
+                    rows: self.pane.dimensions.get().0,
+                    rail: &rail,
+                    view: &self.pane.view,
+                },
+            ))
+        })
+    }
+
     /// Current physical grid coordinates for a graphics-protocol transfer.
     pub fn inline_image_cursor(&self) -> Option<(i64, i64)> {
         self.inspect(|terminal| {
@@ -331,6 +360,38 @@ struct PointerMotion {
     modifiers: u8,
 }
 
+/// Coordinates for the same primary rows installed in the GTK text buffer.
+pub(crate) struct PaintedTranscript<'a> {
+    pub(crate) top: usize,
+    pub(crate) rows: usize,
+    rail: &'a HistoryRail,
+    view: &'a TerminalView,
+}
+
+impl PaintedTranscript<'_> {
+    pub(crate) fn locate(&self, source: HistoryAnchor) -> Option<(usize, bool)> {
+        if source.row < self.rail.extent.start {
+            return None;
+        }
+        if self.rail.extent.contains(&source.row) {
+            if let Some(layout) = &self.rail.layout {
+                let row = layout.row_at(source);
+                return Some((row, layout.anchor_at(row) == Some(source)));
+            }
+            return Some((
+                (source.row - self.rail.extent.start) as usize,
+                source.column == 0,
+            ));
+        }
+        let live_row = usize::try_from(source.row - self.rail.extent.end).ok()?;
+        (live_row < self.rows).then_some((self.rail.len() + live_row, source.column == 0))
+    }
+
+    pub(crate) fn blank_tail(&self, row: usize) -> Option<usize> {
+        self.view.blank_tail(row)
+    }
+}
+
 pub struct TerminalPane<P: Pty> {
     backend: Backend<P>,
     status_text: fn(&str, usize) -> String,
@@ -345,6 +406,7 @@ pub struct TerminalPane<P: Pty> {
     scroll_top: Cell<Option<ScrollTarget>>,
     history_rail: RefCell<HistoryRail>,
     painted_source: Cell<Option<(Stamp, Option<usize>)>>,
+    transcript_painted: OnceCell<Box<dyn Fn()>>,
     history_search: OnceCell<Rc<HistorySearchView>>,
     scroll_update: Cell<bool>,
     wheel_rows: Cell<f64>,
@@ -528,6 +590,7 @@ impl<P: Pty> TerminalPane<P> {
             scroll_top: Cell::new(None),
             history_rail: RefCell::default(),
             painted_source: Cell::new(None),
+            transcript_painted: OnceCell::new(),
             history_search: OnceCell::new(),
             scroll_update: Cell::new(false),
             wheel_rows: Cell::new(0.0),
@@ -1067,6 +1130,9 @@ impl<P: Pty> TerminalPane<P> {
         );
         self.painted_source.set(Some((frame.stamp(), history_top)));
         self.dirty.set(newer_output);
+        if let Some(observer) = self.transcript_painted.get() {
+            observer();
+        }
     }
 
     fn viewport_request(&self) -> ViewportRequest {
@@ -1860,15 +1926,28 @@ mod transcript_tests {
         };
         next_frames();
         assert_eq!(hit_first_cell(), Some(zone.prompt.start));
+        let painted_heading = |id| {
+            view.painted_zone_rows()
+                .into_iter()
+                .find(|row| row.id == id && row.heading && row.completed)
+        };
+        let heading = painted_heading(7).unwrap();
+        assert_eq!(heading.row, 0);
+        assert_eq!(heading.blank_tail, Some(7));
 
         terminal.resize(6, 4).unwrap();
         assert!(hit_first_cell().is_none());
+        assert!(painted_heading(7).is_none());
         assert!(view.reveal_zone(7));
         next_frames();
         assert_eq!(hit_first_cell(), Some(zone.prompt.start));
+        let heading = painted_heading(7).unwrap();
+        assert_eq!(heading.row, 0);
+        assert_eq!(heading.blank_tail, Some(6));
         terminal.ingest(b"\x1b[3J").unwrap();
         assert!(view.source_zone(7).is_none());
         assert!(!view.reveal_zone(7));
+        assert!(painted_heading(7).is_none());
 
         terminal.resize(12, 4).unwrap();
         terminal.ingest(b"\r\n").unwrap();
@@ -1889,6 +1968,7 @@ mod transcript_tests {
         assert!(view.reveal_zone(8));
         next_frames();
         assert_eq!(hit_first_cell(), Some(restored.prompt.start));
+        assert_eq!(painted_heading(8).unwrap().row, 0);
         window.close();
     }
 }

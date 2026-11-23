@@ -20,6 +20,18 @@ pub struct TranscriptZone {
     pub output: Range<TranscriptAnchor>,
 }
 
+/// One visible row belonging to a verified transcript source span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscriptRowChrome {
+    pub id: u64,
+    pub row: usize,
+    pub heading: bool,
+    pub completed: bool,
+    /// First clear column at the right edge. Images and an unknown paint
+    /// geometry make a badge inadmissible on the row.
+    pub blank_tail: Option<usize>,
+}
+
 struct PendingZone {
     origin: TranscriptZoneOrigin,
     id: u64,
@@ -145,6 +157,61 @@ impl<P: Pty> TranscriptView<P> {
     pub fn reveal_zone(&self, id: u64) -> bool {
         self.heading(id)
             .is_some_and(|start| self.terminal.reveal_transcript_source(start))
+    }
+
+    /// Redraw decorations after the same frame has reached the text and image layers.
+    pub fn on_painted(&self, observer: impl Fn() + 'static) -> bool {
+        self.terminal.when_transcript_painted(observer)
+    }
+
+    pub fn painted_zone_rows(&self) -> Vec<TranscriptRowChrome> {
+        self.terminal
+            .with_painted_transcript(|terminal, viewport| {
+                let zones = self.zones.borrow();
+                let mut rows = vec![None; viewport.rows];
+                let mut mark =
+                    |id, completed, start: TranscriptAnchor, end: Option<TranscriptAnchor>| {
+                        let Some(start) = terminal.locate_transcript_source(start) else {
+                            return;
+                        };
+                        let Some((first, _)) = viewport.locate(start) else {
+                            return;
+                        };
+                        let last = end
+                            .and_then(|end| terminal.locate_transcript_source(end))
+                            .filter(|end| *end >= start)
+                            .and_then(|end| viewport.locate(end))
+                            .map_or(first, |(row, boundary)| {
+                                row.saturating_sub(usize::from(boundary)).max(first)
+                            });
+                        let top = viewport.top;
+                        let bottom = top + viewport.rows;
+                        for row in first.max(top)..last.saturating_add(1).min(bottom) {
+                            let row_index = row - top;
+                            rows[row_index].get_or_insert_with(|| TranscriptRowChrome {
+                                id,
+                                row: row_index,
+                                heading: row == first,
+                                completed,
+                                blank_tail: viewport.blank_tail(row_index),
+                            });
+                        }
+                    };
+                // Later command boundaries own a row shared by two zones.
+                if let Some(pending) = &zones.pending {
+                    mark(
+                        pending.id,
+                        false,
+                        pending.prompt,
+                        terminal.transcript_cursor(),
+                    );
+                }
+                for (&id, zone) in zones.completed.iter().rev() {
+                    mark(id, true, zone.prompt.start, Some(zone.output.end));
+                }
+                rows.into_iter().flatten().collect()
+            })
+            .unwrap_or_default()
     }
 
     fn heading(&self, id: u64) -> Option<HistoryAnchor> {

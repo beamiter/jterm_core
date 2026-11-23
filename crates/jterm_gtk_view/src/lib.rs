@@ -40,7 +40,7 @@ pub use pane::{
 pub use pty_dispatch::{PtyDispatch, PtyEvent};
 #[cfg(target_os = "linux")]
 pub use runtime_shell::RuntimeShell;
-pub use transcript::{TranscriptView, TranscriptZone, TranscriptZoneOrigin};
+pub use transcript::{TranscriptRowChrome, TranscriptView, TranscriptZone, TranscriptZoneOrigin};
 pub use view::default_ansi_palette;
 
 /// Capabilities advertised by the shared standalone shell profile.

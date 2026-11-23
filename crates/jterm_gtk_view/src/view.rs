@@ -44,6 +44,7 @@ struct PresentedRow {
     column_spans: Vec<ColumnSpan>,
     copy: CopyRow,
     cursor: Option<i32>,
+    blank_tail: Option<usize>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -63,6 +64,13 @@ impl<'a> RowSource<'a> {
         match self {
             Self::Live(frame, index, _) => frame.rows().get(index),
             Self::History(page, index) => page.row(index),
+        }
+    }
+
+    fn has_image(self) -> bool {
+        match self {
+            Self::Live(frame, index, _) => frame.inline_image_rows(index).next().is_some(),
+            Self::History(page, index) => page.inline_image_rows(index).next().is_some(),
         }
     }
 
@@ -397,6 +405,15 @@ impl TerminalView {
                     .map_or_else(CopyRow::default, |row| row.copy)
             })
         })
+    }
+
+    pub(crate) fn blank_tail(&self, row: usize) -> Option<usize> {
+        self.presentation
+            .borrow()
+            .as_ref()?
+            .rows
+            .get(row)?
+            .blank_tail
     }
 
     pub(crate) fn selected_text(&self) -> Option<String> {
@@ -875,6 +892,19 @@ fn paint_row(
             margin_gap: None,
         },
         cursor: None,
+        blank_tail: (!source.has_image()).then(|| {
+            let trailing = row
+                .cells
+                .iter()
+                .rposition(|cell| {
+                    !cell.is_reflow_trimmable_blank() || !cell.flags.is_default_style()
+                })
+                .map_or(0, |column| column + 1);
+            let caret = cursor
+                .filter(|cursor| cursor.visible)
+                .map_or(0, |cursor| cursor.paint_position().1 + 1);
+            trailing.max(caret)
+        }),
     };
     let mut offset = 0;
     let mut run = String::new();
