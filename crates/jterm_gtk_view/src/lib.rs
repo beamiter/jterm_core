@@ -12,6 +12,7 @@ mod runtime_launch;
 #[cfg(target_os = "linux")]
 mod runtime_shell;
 mod text_link;
+mod transcript;
 mod view;
 mod viewport;
 
@@ -22,6 +23,7 @@ pub use command::{
 pub use document::DocumentView;
 pub use jterm_engine::authenticated_boundaries;
 pub use jterm_engine::history_reflow::HistoryAnchor;
+pub use jterm_engine::terminal::TranscriptAnchor;
 pub use jterm_runtime::exit_status::PtyExit;
 #[cfg(target_os = "linux")]
 pub use jterm_runtime::shell_identity::ShellIdentityChannel;
@@ -36,6 +38,7 @@ pub use pane::{
 pub use pty_dispatch::{PtyDispatch, PtyEvent};
 #[cfg(target_os = "linux")]
 pub use runtime_shell::RuntimeShell;
+pub use transcript::{TranscriptView, TranscriptZone, TranscriptZoneOrigin};
 pub use view::default_ansi_palette;
 
 /// Capabilities advertised by the shared standalone shell profile.

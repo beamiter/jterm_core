@@ -29,6 +29,9 @@ use std::{
 use unicode_width::UnicodeWidthChar;
 
 mod history_view;
+mod row_sources;
+use row_sources::RowSources;
+pub use row_sources::TranscriptAnchor;
 
 const MAX_ROWS: usize = 128;
 const MAX_COLS: usize = 256;
@@ -230,6 +233,7 @@ pub struct Terminal {
     history: RetainedHistory<ScrollbackLine>,
     history_row_limit: usize,
     history_end: u64,
+    row_sources: Option<RowSources>,
     retained_layout: Mutex<Weak<HistoryLayout>>,
     preserve_primary_on_resize: bool,
     command_blocks: Option<CommandBlocks>,
@@ -390,6 +394,7 @@ impl Terminal {
             history: RetainedHistory::default(),
             history_row_limit: MAX_HISTORY_ROWS,
             history_end: 0,
+            row_sources: None,
             retained_layout: Mutex::new(Weak::new()),
             preserve_primary_on_resize: false,
             command_blocks: None,
@@ -901,6 +906,9 @@ impl Terminal {
         if self.history_row_limit == 0 {
             return;
         }
+        if let Some(sources) = &mut self.row_sources {
+            sources.appended(line.raw_row_id(), self.history_end);
+        }
         self.history.push_back(line);
         self.history_end = self
             .history_end
@@ -918,7 +926,7 @@ impl Terminal {
         let capture = self.history_admitted();
         let effect = self
             .screen
-            .vertical_motion(m, capture, || RawRowId::UNTRACKED);
+            .vertical_motion(m, capture, || RowSources::allocate(&mut self.row_sources));
         self.capture_history(effect.region);
     }
     pub fn history_rows(&self) -> usize {
@@ -944,6 +952,9 @@ impl Terminal {
 
     fn trim_history(&mut self) {
         self.history.trim_oldest(self.history_row_limit);
+        if let Some(sources) = &mut self.row_sources {
+            sources.trim_to(self.history.len());
+        }
     }
 
     /// Approximate bytes charged by retained primary history, including when
@@ -1273,9 +1284,9 @@ impl Terminal {
             .then(|| self.screen.grid.checkpoint_wrap(origin_row));
         if early_wrap {
             let capture = self.history_admitted();
-            let effect = self
-                .screen
-                .vertical_early_wide_wrap(width, capture, || RawRowId::UNTRACKED);
+            let effect = self.screen.vertical_early_wide_wrap(width, capture, || {
+                RowSources::allocate(&mut self.row_sources)
+            });
             self.capture_history(effect.region);
         }
         // A committed region scroll can displace retained content and advance
@@ -1371,6 +1382,8 @@ impl Terminal {
             self.publish_colors(ColorState::new(colors.defaults()));
         }
         self.history.clear();
+        self.clear_transcript_archive();
+        self.renew_live_source_rows();
         self.sync_started = None;
         if let Some(blocks) = &mut self.command_blocks {
             blocks.reset_live();
@@ -1397,6 +1410,7 @@ impl Terminal {
                 final_byte: b'8',
             } if intermediates == b"#" => {
                 self.screen.screen_alignment_test();
+                self.renew_active_source_rows();
             }
             Event::Csi {
                 params,
@@ -1505,6 +1519,7 @@ impl Terminal {
                     }
                     (None, b'J') if first == 2 => {
                         self.screen.erase_screen();
+                        self.renew_active_source_rows();
                         // Erased physical rows no longer continue the previous
                         // text in the standalone terminal's logical projection.
                         self.screen.grid.row_wrapped.fill(false);
@@ -1533,6 +1548,7 @@ impl Terminal {
                                         if matches!(erased.as_slice(), [change] if change.changed == (0..cols))
                                         {
                                             self.screen.grid.row_wrapped[row] = false;
+                                            self.renew_source_row(row);
                                         }
                                     }
                                 }
@@ -1542,6 +1558,7 @@ impl Terminal {
                             3 if !selective => {
                                 if !self.screen.use_alt_buffer {
                                     self.history.clear();
+                                    self.clear_transcript_archive();
                                 }
                             }
                             _ => self.unsupported(),
@@ -1556,8 +1573,9 @@ impl Terminal {
                             } else {
                                 RegionDirection::Up
                             };
-                            self.screen
-                                .edit_lines(direction, top, bottom, count, || RawRowId::UNTRACKED);
+                            self.screen.edit_lines(direction, top, bottom, count, || {
+                                RowSources::allocate(&mut self.row_sources)
+                            });
                         }
                     }
                     (None, b'S' | b'T') => {
@@ -1576,7 +1594,7 @@ impl Terminal {
                                 top,
                                 bottom,
                                 capture,
-                                || RawRowId::UNTRACKED,
+                                || RowSources::allocate(&mut self.row_sources),
                             );
                             self.capture_history(effect);
                         }
@@ -1825,12 +1843,16 @@ impl Terminal {
             0
         };
         self.begin_revision(revision);
-        if let Some(change) = self
-            .screen
-            .resize_geometry(rows, cols, transferred, || RawRowId::UNTRACKED)
-        {
+        if let Some(change) = self.screen.resize_geometry(rows, cols, transferred, || {
+            RowSources::allocate(&mut self.row_sources)
+        }) {
             for line in change.transferred {
                 self.append_history(line);
+            }
+            if change.old_cols > change.cols {
+                // Shortening an existing row can discard part of a source,
+                // including the partner cell of a wide glyph.
+                self.renew_live_source_rows();
             }
         }
         self.layout = layout;

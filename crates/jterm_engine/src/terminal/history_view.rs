@@ -138,6 +138,68 @@ impl Terminal {
         Ok(layout)
     }
 
+    /// Return the original cell behind one rendered history coordinate. The
+    /// layout and source geometry are the same ones used to paint the page.
+    pub fn projected_history_source(
+        &self,
+        layout: &HistoryLayout,
+        row: usize,
+        column: usize,
+    ) -> Option<HistoryAnchor> {
+        if !std::ptr::eq(self.history_layout().ok()?.as_ref(), layout) {
+            return None;
+        }
+        let start = layout.anchor_at(row)?;
+        let Some(rows) = &layout.projected else {
+            let line = &self.history[(start.row - layout.extent.start) as usize];
+            return (column < line.columns()).then_some(HistoryAnchor {
+                row: start.row,
+                column: column as u16,
+            });
+        };
+        if column >= usize::from(rows[row].cells) {
+            return None;
+        }
+        let mut remaining = column;
+        let mut raw_column = usize::from(start.column);
+        for raw_row in start.row..layout.extent.end {
+            let line = &self.history[(raw_row - layout.extent.start) as usize];
+            let end = source_columns(line);
+            if layout.columns != 1 {
+                let span = end.saturating_sub(raw_column);
+                if remaining < span {
+                    return Some(HistoryAnchor {
+                        row: raw_row,
+                        column: (raw_column + remaining) as u16,
+                    });
+                }
+                remaining -= span;
+            } else {
+                for cell in raw_column..end {
+                    if line
+                        .reflow_wide_continuations()
+                        .binary_search(&(cell as u16))
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    if remaining == 0 {
+                        return Some(HistoryAnchor {
+                            row: raw_row,
+                            column: cell as u16,
+                        });
+                    }
+                    remaining -= 1;
+                }
+            }
+            raw_column = 0;
+            if !line.is_wrapped {
+                break;
+            }
+        }
+        None
+    }
+
     /// Materialize only the requested rows. The raw archive and its row
     /// identities are retained for subsequent widths and existing readers.
     pub fn projected_history_page(

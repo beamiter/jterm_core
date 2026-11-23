@@ -3,11 +3,12 @@ use futures_util::StreamExt;
 use gtk4::{gdk, glib, pango, prelude::*};
 use jterm_engine::{
     colors::{Rgb, TerminalDefaultColors},
-    frame::Screen,
+    frame::{Screen, Stamp},
+    history_reflow::HistoryAnchor,
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
     mouse::MouseInput,
-    terminal::{Terminal, WindowUpdates, MAX_FEED_BYTES},
+    terminal::{Terminal, TranscriptAnchor, WindowUpdates, MAX_FEED_BYTES},
 };
 use jterm_runtime::exit_status::PtyExit;
 use std::{
@@ -188,6 +189,61 @@ impl<P: Pty> EmbeddedTerminal<P> {
         self.pane.report_exit(status);
     }
 
+    pub(crate) fn enable_transcript_sources(&self) {
+        if let Backend::Legacy { terminal, .. } = &self.pane.backend {
+            terminal.borrow_mut().track_transcript_rows();
+        }
+    }
+
+    pub(crate) fn reveal_transcript_source(&self, point: HistoryAnchor) -> bool {
+        if self.pane.view.widget.buffer().has_selection() {
+            return false;
+        }
+        let history = self.inspect(Terminal::history_extent);
+        if point.row < history.start {
+            return false;
+        }
+        self.pane
+            .set_scroll_top((point.row < history.end).then_some(ScrollTarget::Source(point)));
+        self.pane.paint();
+        self.pane.view.widget.grab_focus();
+        true
+    }
+
+    pub(crate) fn painted_transcript_source(&self, x: f64, y: f64) -> Option<TranscriptAnchor> {
+        let (stamp, top) = self.pane.painted_source.get()?;
+        if stamp.screen != Screen::Primary {
+            return None;
+        }
+        let (column, row) = self
+            .pane
+            .view
+            .cell_at((x, y), self.pane.dimensions.get(), false)?;
+        self.inspect(|terminal| {
+            if terminal.frame().ok()?.stamp() != stamp {
+                return None;
+            }
+            let rail = self.pane.history_rail.borrow();
+            let point = if let (Some(top), Some(layout)) = (top, rail.layout.as_ref()) {
+                let index = top.checked_add(row)?;
+                if index < layout.len() {
+                    terminal.projected_history_source(layout, index, column)?
+                } else {
+                    HistoryAnchor {
+                        row: rail.extent.end + (index - layout.len()) as u64,
+                        column: column as u16,
+                    }
+                }
+            } else {
+                HistoryAnchor {
+                    row: rail.extent.end + row as u64,
+                    column: column as u16,
+                }
+            };
+            terminal.transcript_source_at(point)
+        })
+    }
+
     pub fn inspect<T>(&self, read: impl FnOnce(&Terminal) -> T) -> T {
         let Backend::Legacy { terminal, .. } = &self.pane.backend else {
             unreachable!("an embedded terminal has its own shared engine")
@@ -238,6 +294,7 @@ pub struct TerminalPane<P: Pty> {
     scrollback: gtk4::Adjustment,
     scroll_top: Cell<Option<ScrollTarget>>,
     history_rail: RefCell<HistoryRail>,
+    painted_source: Cell<Option<(Stamp, Option<usize>)>>,
     history_search: OnceCell<Rc<HistorySearchView>>,
     scroll_update: Cell<bool>,
     wheel_rows: Cell<f64>,
@@ -418,6 +475,7 @@ impl<P: Pty> TerminalPane<P> {
             scrollback,
             scroll_top: Cell::new(None),
             history_rail: RefCell::default(),
+            painted_source: Cell::new(None),
             history_search: OnceCell::new(),
             scroll_update: Cell::new(false),
             wheel_rows: Cell::new(0.0),
@@ -948,6 +1006,7 @@ impl<P: Pty> TerminalPane<P> {
                 self.painted_history.set(None);
             }
         }
+        self.painted_source.set(Some((frame.stamp(), history_top)));
         self.dirty.set(newer_output);
     }
 
@@ -1587,4 +1646,110 @@ fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {
         }
         .into(),
     )
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+    use crate::{TranscriptView, TranscriptZoneOrigin};
+
+    struct TestPty;
+
+    impl Pty for TestPty {
+        fn write(&self, _bytes: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn stop(&self) {}
+
+        fn start_reader(
+            &self,
+            _output: impl FnMut(Vec<u8>) + 'static,
+            _exited: impl FnOnce(PtyExit) + 'static,
+        ) -> Result<(), String> {
+            panic!("the application owns the embedded reader")
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn transcript_jump_and_hit_share_the_reflowed_row_source() {
+        gtk4::init().unwrap();
+        let theme = Theme {
+            font: pango::FontDescription::from_string("Monospace 12"),
+            foreground: gdk::RGBA::WHITE,
+            background: gdk::RGBA::BLACK,
+            palette: crate::default_ansi_palette(),
+        };
+        let links = LinkActions {
+            admit: |_, _| false,
+            find_plain: None,
+            attach_opener: |_| Box::new(|_| {}),
+        };
+        let (widget, terminal) = EmbeddedTerminal::new(
+            TestPty,
+            12,
+            4,
+            theme,
+            |message, _| message.to_owned(),
+            links,
+        )
+        .unwrap();
+        let window = gtk4::Window::new();
+        window.set_default_size(400, 240);
+        window.set_child(Some(&widget));
+        window.present();
+
+        let view = TranscriptView::new(terminal.clone());
+        view.begin_prompt(7);
+        terminal.ingest(b"prompt> ").unwrap();
+        view.end_prompt();
+        terminal.ingest(b"echo\r\n").unwrap();
+        view.begin_output(Some(7));
+        terminal.ingest(b"witness-old\r\n").unwrap();
+        view.end_output(Some(7), 64);
+        terminal
+            .ingest(b"filler\r\nnext\r\nmore\r\nagain\r\n")
+            .unwrap();
+        let zone = view.source_zone(7).unwrap();
+        assert_eq!(zone.origin, TranscriptZoneOrigin::Live);
+        assert_eq!(view.output_text(7).unwrap(), "witness-old\n");
+        assert!(view.reveal_zone(7));
+
+        let next_frames = || {
+            let context = glib::MainContext::default();
+            for _ in 0..8 {
+                while context.iteration(false) {}
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        };
+        let hit_first_cell = || {
+            let screen = terminal.pane.screen();
+            let buffer = screen.buffer();
+            let iter = buffer.start_iter();
+            let area = screen.iter_location(&iter);
+            let (x, y) = screen.buffer_to_window_coords(
+                gtk4::TextWindowType::Widget,
+                area.x() + area.width() / 4,
+                area.y() + area.height() / 2,
+            );
+            view.source_at(f64::from(x), f64::from(y))
+        };
+        next_frames();
+        assert_eq!(hit_first_cell(), Some(zone.prompt.start));
+
+        terminal.resize(6, 4).unwrap();
+        assert!(hit_first_cell().is_none());
+        assert!(view.reveal_zone(7));
+        next_frames();
+        assert_eq!(hit_first_cell(), Some(zone.prompt.start));
+        terminal.ingest(b"\x1b[3J").unwrap();
+        assert!(view.source_zone(7).is_none());
+        assert!(!view.reveal_zone(7));
+        window.close();
+    }
 }
