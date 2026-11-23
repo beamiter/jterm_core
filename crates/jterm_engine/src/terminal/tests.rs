@@ -1,4 +1,5 @@
 use super::*;
+use crate::history_reflow::HistoryAnchor;
 
 #[test]
 fn palette_queries_keep_order_and_only_changed_colors_publish() {
@@ -1066,6 +1067,184 @@ fn resize_validation_and_kernel_failure_are_atomic() {
     assert!(t
         .resize_with(1, 1, || panic!("overflow reached PTY"))
         .is_err());
+}
+
+#[test]
+fn primary_reflow_keeps_a_live_shell_line_and_insertion_point_on_split() {
+    let mut terminal = Terminal::new(6, 46).unwrap();
+    terminal.enable_primary_reflow();
+    let line = "new-tab-dir=[/some/path/with a space]";
+    terminal.feed(format!("{line}\r\n$ ").as_bytes()).unwrap();
+    let start = HistoryAnchor { row: 0, column: 0 };
+    let before = terminal
+        .primary_text_range(start, terminal.primary_cursor_anchor().unwrap())
+        .unwrap();
+
+    terminal.resize(6, 25).unwrap();
+    assert!(terminal.frame().unwrap().rows()[0].wrapped);
+    assert_eq!(terminal.primary_cursor_anchor().unwrap().row, 2);
+    assert_eq!(
+        terminal
+            .primary_text_range(start, terminal.primary_cursor_anchor().unwrap())
+            .unwrap(),
+        before
+    );
+    terminal.resize(6, 46).unwrap();
+    assert!(!terminal.frame().unwrap().rows()[0].wrapped);
+    assert_eq!(terminal.primary_cursor_anchor().unwrap().row, 1);
+    terminal.feed(b"next").unwrap();
+    assert_eq!(
+        terminal
+            .primary_text_range(start, terminal.primary_cursor_anchor().unwrap())
+            .unwrap(),
+        format!("{line}\n$ next")
+    );
+}
+
+#[test]
+fn primary_reflow_preserves_wide_pairs_clusters_and_decorations_through_one_column() {
+    let mut terminal = Terminal::new(20, 16).unwrap();
+    terminal.enable_primary_reflow();
+    terminal.enable_grapheme_clusters();
+    terminal.enable_underline_colors();
+    terminal
+        .feed("abc\x1b[4;5;58;2;20;30;40m界e\u{301}\x1b[0m ❤\u{fe0f} end".as_bytes())
+        .unwrap();
+    let start = HistoryAnchor { row: 0, column: 0 };
+    let expected = "abc界e\u{301} ❤\u{fe0f} end";
+
+    terminal.resize(20, 4).unwrap();
+    let frame = terminal.frame().unwrap();
+    assert_eq!(terminal.live_margin_gaps() & 1, 1);
+    assert!(frame.rows()[0].wrapped);
+    assert!(frame.rows()[1].cells[0].flags.wide());
+    assert!(frame.rows()[1].cells[1].flags.wide_continuation());
+    assert!(frame.rows()[1].cells[0].flags.blink());
+    assert_eq!(frame.underline_color(1, 0), Some(Color::Rgb(20, 30, 40)));
+    assert_eq!(frame.cluster_text(1, 2), Some("e\u{301}"));
+
+    for width in [1, 16, 5, 16] {
+        terminal.resize(20, width).unwrap();
+        assert_eq!(
+            terminal
+                .primary_text_range(start, terminal.primary_cursor_anchor().unwrap())
+                .unwrap(),
+            expected
+        );
+        for row in terminal.frame().unwrap().rows() {
+            for (column, _) in row
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| cell.flags.wide())
+            {
+                assert!(row
+                    .cells
+                    .get(column + 1)
+                    .is_some_and(|next| next.flags.wide_continuation()));
+            }
+        }
+    }
+    let frame = terminal.frame().unwrap();
+    assert!(frame.rows()[0].cells[3].flags.wide());
+    assert_eq!(frame.underline_color(0, 3), Some(Color::Rgb(20, 30, 40)));
+    assert_eq!(frame.cluster_text(0, 5), Some("e\u{301}"));
+}
+
+#[test]
+fn primary_reflow_archives_overflow_in_order_without_moving_existing_history() {
+    let mut terminal = Terminal::new(3, 12).unwrap();
+    terminal.enable_primary_reflow();
+    terminal.track_transcript_rows();
+    let archived_origin = terminal.transcript_cursor().unwrap();
+    terminal
+        .feed(b"retained\r\nabcdefghi\r\nsecond\r\n$ ")
+        .unwrap();
+    let prior = terminal.locate_transcript_source(archived_origin).unwrap();
+    let before = terminal.history_extent();
+    assert!(before.contains(&prior.row));
+    let expected = "retained\nabcdefghi\nsecond\n$ ";
+
+    for width in [4, 12, 3, 12] {
+        terminal.resize(3, width).unwrap();
+        assert_eq!(
+            terminal.locate_transcript_source(archived_origin),
+            Some(prior)
+        );
+        assert_eq!(
+            terminal
+                .primary_text_range(prior, terminal.primary_cursor_anchor().unwrap())
+                .unwrap(),
+            expected
+        );
+    }
+    assert!(terminal.history_extent().end > before.end);
+}
+
+#[test]
+fn primary_reflow_remaps_saved_cursor_and_preserves_the_hidden_primary_screen() {
+    let mut terminal = Terminal::new(8, 20).unwrap();
+    terminal.enable_primary_reflow();
+    terminal.feed(b"abcdefghij\x1b[1;7H\x1b7\r\n$ ").unwrap();
+    terminal.resize(8, 4).unwrap();
+    terminal.feed(b"\x1b8!\r\n\x1b[6;1H$ ").unwrap();
+    let start = HistoryAnchor { row: 0, column: 0 };
+    let expected = terminal
+        .primary_text_range(start, terminal.primary_cursor_anchor().unwrap())
+        .unwrap();
+    assert!(expected.starts_with("abcdef!hij\n"));
+
+    terminal.resize(8, 20).unwrap();
+    terminal.feed(b"\x1b[?1049hNORMALGRID").unwrap();
+    terminal.resize(8, 5).unwrap();
+    let alt = terminal.frame().unwrap();
+    assert_eq!(
+        alt.rows()[0]
+            .cells
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>(),
+        "NORMA"
+    );
+    assert!(!alt.rows()[0].wrapped);
+    terminal.feed(b"\x1b[?1049l").unwrap();
+    assert_eq!(
+        terminal
+            .primary_text_range(start, terminal.primary_cursor_anchor().unwrap())
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn primary_reflow_preserves_virtual_cursor_space_and_deferred_wrap() {
+    let mut terminal = Terminal::new(4, 10).unwrap();
+    terminal.enable_primary_reflow();
+    terminal.feed(b"1234\x1b[7G").unwrap();
+    terminal.resize(4, 3).unwrap();
+    assert_eq!(
+        terminal.primary_cursor_anchor().unwrap(),
+        HistoryAnchor { row: 1, column: 3 }
+    );
+    terminal.feed(b"!").unwrap();
+    assert_eq!(
+        terminal.primary_cursor_anchor().unwrap(),
+        HistoryAnchor { row: 2, column: 1 }
+    );
+    terminal.resize(4, 10).unwrap();
+    assert_eq!(
+        terminal.primary_cursor_anchor().unwrap(),
+        HistoryAnchor { row: 0, column: 7 }
+    );
+    assert_eq!(
+        terminal
+            .primary_text_range(
+                HistoryAnchor { row: 0, column: 0 },
+                terminal.primary_cursor_anchor().unwrap()
+            )
+            .unwrap(),
+        "1234  !"
+    );
 }
 
 #[test]

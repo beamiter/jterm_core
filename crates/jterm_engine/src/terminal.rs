@@ -38,6 +38,7 @@ pub use inline_image::{
     PreparedInlineImage,
 };
 pub use kitty_graphics::inline::PngDecoder;
+mod primary_reflow;
 mod row_sources;
 use row_sources::RowSources;
 pub use row_sources::TranscriptAnchor;
@@ -328,6 +329,7 @@ pub struct Terminal {
     inline_graphics: Option<InlineGraphics>,
     retained_layout: Mutex<Weak<HistoryLayout>>,
     preserve_primary_on_resize: bool,
+    reflow_primary_on_resize: bool,
     command_blocks: Option<CommandBlocks>,
     sync_started: Option<Instant>,
     capture_sync_end: bool,
@@ -491,6 +493,7 @@ impl Terminal {
             inline_graphics: None,
             retained_layout: Mutex::new(Weak::new()),
             preserve_primary_on_resize: false,
+            reflow_primary_on_resize: false,
             command_blocks: None,
             sync_started: None,
             capture_sync_end: false,
@@ -1373,6 +1376,11 @@ impl Terminal {
     }
 
     fn write_graphic(&mut self, translated: char, width: usize) {
+        let width = if self.reflow_primary_on_resize && !self.screen.use_alt_buffer {
+            width.min(self.screen.grid.cols())
+        } else {
+            width
+        };
         let wrap = self.protocol.modes().contains(&7);
         if self.screen.take_pending_wrap(wrap) {
             self.motion(VerticalMotion::Wrap);
@@ -1951,6 +1959,15 @@ impl Terminal {
     pub fn enable_history_preserving_resize(&mut self) {
         self.preserve_primary_on_resize = true;
     }
+
+    /// Preserve logical primary lines when an ordinary terminal changes width.
+    /// Enable this before feeding output to distinguish written spaces from padding.
+    pub fn enable_primary_reflow(&mut self) {
+        self.reflow_primary_on_resize = true;
+        self.enable_history_preserving_resize();
+        self.track_printed_spaces();
+    }
+
     /// Validate geometry and frame counters before invoking the session's resize.
     /// Commit screen geometry only after that operation succeeds.
     pub fn resize_with(
@@ -1967,6 +1984,11 @@ impl Terminal {
         if let Some(blocks) = &mut self.command_blocks {
             blocks.screen_changed();
         }
+        self.begin_revision(revision);
+        if self.reflow_primary_on_resize && self.reflow_primary(rows, cols) {
+            self.layout = layout;
+            return Ok(());
+        }
         let transferred = if self.preserve_primary_on_resize && !self.screen.use_alt_buffer {
             let grid = &self.screen.grid;
             rows_to_archive_on_height_shrink(grid.rows(), rows, self.screen.cursor_row, |row| {
@@ -1979,7 +2001,6 @@ impl Terminal {
         } else {
             0
         };
-        self.begin_revision(revision);
         self.invalidate_clipped_sources(cols, transferred);
         if let Some(change) = self.screen.resize_geometry(rows, cols, transferred, || {
             RowSources::allocate(&mut self.row_sources)

@@ -795,6 +795,10 @@ impl Session {
         self.terminal.enable_history_preserving_resize();
     }
 
+    pub fn enable_primary_reflow(&mut self) {
+        self.terminal.enable_primary_reflow();
+    }
+
     pub fn take_window_updates(&mut self) -> jterm_engine::terminal::WindowUpdates {
         self.terminal.take_window_updates()
     }

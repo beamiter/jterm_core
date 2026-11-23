@@ -240,6 +240,11 @@ impl RuntimeShell {
         })
     }
 
+    pub(crate) fn enable_primary_reflow(&self) -> Result<(), String> {
+        self.lock()?.session.enable_primary_reflow();
+        Ok(())
+    }
+
     pub(crate) fn configure_view(
         &self,
         hyperlinks: HyperlinkPolicy,

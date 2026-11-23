@@ -508,6 +508,33 @@ impl TerminalGrid {
         line
     }
 
+    pub(crate) fn install_projected_row(
+        &mut self,
+        row: usize,
+        cells: &[TerminalCell],
+        wrapped: bool,
+        wide_gap: bool,
+        underline: &[UnderlineColorRun],
+        annotations: Option<Arc<RowAnnotations>>,
+    ) {
+        self.row_cells_mut(row, 0..cells.len())
+            .copy_from_slice(cells);
+        self.row_wrapped[row] = wrapped;
+        if wide_gap {
+            debug_assert!(wrapped && cells.len() + 1 == self.cols);
+            let margin = self.cols - 1;
+            *self.get_mut(row, margin) = TerminalCell::default();
+            self.margin_origin[row] = MarginOrigin::WideGap;
+        }
+        for run in underline {
+            self.set_underline_color(row, usize::from(run.start)..usize::from(run.end), run.color);
+        }
+        if let Some(annotations) = annotations {
+            self.annotations.resize_with(self.rows, || None);
+            self.annotations[row] = Some(annotations);
+        }
+    }
+
     pub(crate) fn mark_tab_spaces(&mut self, row: usize, columns: std::ops::Range<usize>) {
         if !self.track_printed_spaces || columns.is_empty() {
             return;
@@ -1391,7 +1418,7 @@ impl ScrollbackLine {
         self.raw_row_id = id;
     }
 
-    fn attach_decorations(
+    pub(crate) fn attach_decorations(
         &mut self,
         colors: Vec<UnderlineColorRun>,
         annotations: Option<Arc<RowAnnotations>>,
@@ -1407,6 +1434,17 @@ impl ScrollbackLine {
                 annotations,
             }));
         }
+    }
+
+    /// Used by live reflow to preserve an insertion point in unwritten space.
+    pub(crate) fn include_reflow_columns(&mut self, columns: usize) {
+        self.reflow_content_len = self
+            .reflow_content_len
+            .max(columns.min(self.columns()) as u16);
+    }
+
+    pub(crate) fn set_synthetic_margin_gap(&mut self, present: bool) {
+        self.synthetic_margin_gap = present;
     }
 
     pub(crate) fn underline_color_runs(&self) -> &[UnderlineColorRun] {

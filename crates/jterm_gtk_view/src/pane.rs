@@ -443,7 +443,9 @@ fn local_backend<P: Pty>(
     terminal.enable_grapheme_clusters();
     terminal.enable_hyperlinks(link_policy);
     terminal.enable_window_updates();
-    if !grid_size.automatic() {
+    if grid_size.automatic() {
+        terminal.enable_primary_reflow();
+    } else {
         terminal.enable_history_preserving_resize();
         terminal.enable_device_answers();
         terminal.track_printed_spaces();
@@ -560,6 +562,7 @@ impl<P: Pty> TerminalPane<P> {
         links: LinkActions,
         close: impl Fn(&gtk4::Widget) + 'static,
     ) -> Result<(gtk4::Widget, Rc<Self>), String> {
+        runtime.enable_primary_reflow()?;
         Self::attach(
             Backend::Runtime(runtime),
             theme,

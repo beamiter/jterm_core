@@ -230,12 +230,7 @@ impl Terminal {
         let Some(projected) = &layout.projected else {
             return self.history_page(offset, limit);
         };
-        let mut reader = HistoryReader {
-            raw: &self.history,
-            cached: None,
-            first: layout.extent.start,
-            single_column: layout.columns == 1,
-        };
+        let mut reader = HistoryReader::new(&self.history, layout);
         let rows = projected[first..end]
             .iter()
             .map(|row| reader.read(*row))
@@ -244,15 +239,24 @@ impl Terminal {
     }
 }
 
-struct HistoryReader<'a> {
+pub(super) struct HistoryReader<'a> {
     raw: &'a VecDeque<ScrollbackLine>,
     cached: Option<(usize, Vec<TerminalCell>)>,
     first: u64,
     single_column: bool,
 }
 
-impl HistoryReader<'_> {
-    fn read(&mut self, row: ProjectedHistoryRow) -> HistoryCopyRow {
+impl<'a> HistoryReader<'a> {
+    pub(super) fn new(raw: &'a VecDeque<ScrollbackLine>, layout: &HistoryLayout) -> Self {
+        Self {
+            raw,
+            cached: None,
+            first: layout.extent.start,
+            single_column: layout.columns == 1,
+        }
+    }
+
+    pub(super) fn read(&mut self, row: ProjectedHistoryRow) -> HistoryCopyRow {
         let width = usize::from(row.cells);
         let mut cells = Vec::with_capacity(width);
         let mut underline: Vec<UnderlineColorRun> = Vec::new();

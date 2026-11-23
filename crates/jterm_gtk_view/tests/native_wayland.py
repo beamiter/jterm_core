@@ -9,7 +9,10 @@ import subprocess
 import tempfile
 import time
 
-from native import Atspi, accessible_text, first_named, start_accessibility, wait_for
+from native import (
+    Atspi, accessible_text, first_named, live_line_visible, prepare_split_line,
+    split_line_visible, start_accessibility, wait_for,
+)
 
 OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 900
@@ -39,6 +42,14 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
     focused = wait_for("Wayland shared screen focus", screen)
     if args.shared_runtime or args.ordinary_pane:
         assert focused.get_description() == "Shared runtime session", focused.get_description()
+    if args.ordinary_pane:
+        line = prepare_split_line(process.pid, command)
+        key("-M", "ctrl", "-M", "shift", "-k", "e", "-m", "shift", "-m", "ctrl")
+        wait_for("the original Wayland pane reflows the line", lambda: split_line_visible(process.pid, line))
+        command("exit 7")
+        wait_for("the widened Wayland pane shows the complete line",
+                 lambda: live_line_visible(process.pid, line))
+        print(f"{app} Wayland split reflow passed at scale {args.scale}", flush=True)
     witness = "waylandcopywitness"
     receipt = root / "pty-receipt"
     negotiate = r"printf '\033[>31u\033[?u'; " if args.keyboard_disambiguation else ""

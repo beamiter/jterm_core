@@ -71,6 +71,39 @@ def accessible_text(node):
     return Atspi.Text.get_text(text, 0, Atspi.Text.get_character_count(text))
 
 
+def painted_columns(text):
+    return max(map(len, text.splitlines()), default=0)
+
+
+def live_line_visible(pid, line):
+    view = first_named(pid, "Shared terminal screen", Atspi.StateType.FOCUSED)
+    return re.search(r"(?m)^" + re.escape(line) + r" *$", accessible_text(view))
+
+
+def prepare_split_line(pid, send):
+    view = first_named(pid, "Shared terminal screen", Atspi.StateType.FOCUSED)
+    columns = painted_columns(accessible_text(view))
+    # The line fits in the unsplit grid and exceeds half its width.
+    length = columns - len("split-reflow[]") - 5
+    payload = ("0123456789" * (1 + length // 10))[:length]
+    witness = f"split-reflow[{payload}]"
+    send(r"printf 'split-reflow[%s]\n' " + shlex.quote(payload))
+    wait_for("the complete line in the unsplit pane", lambda: live_line_visible(pid, witness))
+    return witness
+
+
+def split_line_visible(pid, witness):
+    for view in application_nodes(pid):
+        state = view.get_state_set()
+        if (view.get_name() == "Shared terminal screen"
+                and state.contains(Atspi.StateType.SHOWING) and not state.contains(Atspi.StateType.FOCUSED)):
+            text = accessible_text(view)
+            if 0 < painted_columns(text) < len(witness) and witness in "".join(
+                    line.rstrip(" ") for line in text.splitlines()):
+                return True
+    return False
+
+
 def run(args, root):
     app = args.app
     binary = args.binary.resolve(strict=True)
@@ -179,13 +212,16 @@ def exercise_ordinary(args, pid, root):
     wait_for("the shell returned its tab title", lambda: first_named(pid, title) is None)
     key("ctrl+shift+t")
     wait_for("new ordinary tab", lambda: screen() and "original-owned" not in accessible_text(screen()))
-    send(r"""printf 'new-tab-dir=[%s]\n' "$PWD" """)
-    wait_text(f"new-tab-dir=[{project}]")
+    send(f"test \"$PWD\" = {shlex.quote(str(project))} && printf 'new-tab-dir-ok\\n'")
+    wait_text("new-tab-dir-ok")
+    witness = prepare_split_line(pid, send)
 
     key("ctrl+shift+e")
     wait_for("two ordinary split screens", lambda: len(screens()) == 2)
     wait_for("new split owns terminal focus", lambda: (view := screen()) is not None
-             and "new-tab-dir=" not in accessible_text(view))
+             and "new-tab-dir-ok" not in accessible_text(view))
+    wait_for("the original pane reflows its retained line at the split width",
+             lambda: split_line_visible(pid, witness))
     # Compare the full working directory inside the shell. A split may be too
     # narrow to expose that path on one physical accessibility row.
     send(f"test \"$PWD\" = {shlex.quote(str(project))} && printf 'new-split-dir-ok\\n'")
@@ -194,7 +230,8 @@ def exercise_ordinary(args, pid, root):
     assert all(view.get_description() == "Shared runtime session" for view in screens())
     send("exit 7")
     wait_for("real process exit collapsed only its split", lambda: len(screens()) == 1)
-    wait_text(f"new-tab-dir=[{project}]")
+    wait_text(witness)
+    wait_text("new-tab-dir-ok")
     send("exit")
     wait_text("original-owned")
     print(f"{app} X11 ordinary shared shell passed: startup, new tab, directory inheritance, split and child exit")
