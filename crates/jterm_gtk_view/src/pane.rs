@@ -65,6 +65,13 @@ pub struct Theme {
     pub foreground: gdk::RGBA,
     pub background: gdk::RGBA,
     pub palette: [gdk::RGBA; 16],
+    pub cursor: Option<CursorColors>,
+}
+
+#[derive(Clone, Copy)]
+pub struct CursorColors {
+    pub foreground: gdk::RGBA,
+    pub background: gdk::RGBA,
 }
 
 impl Theme {
@@ -80,7 +87,9 @@ impl Theme {
         TerminalDefaultColors {
             foreground: rgb(self.foreground),
             background: rgb(self.background),
-            cursor: rgb(self.foreground),
+            cursor: rgb(self
+                .cursor
+                .map_or(self.foreground, |cursor| cursor.background)),
             ansi: self.palette.map(rgb),
         }
     }
@@ -1996,6 +2005,7 @@ mod transcript_tests {
             foreground: gdk::RGBA::WHITE,
             background: gdk::RGBA::BLACK,
             palette: crate::default_ansi_palette(),
+            cursor: None,
         };
         let links = || LinkActions {
             admit: |_, _| false,
@@ -2102,6 +2112,7 @@ mod transcript_tests {
             foreground: gdk::RGBA::WHITE,
             background: gdk::RGBA::BLACK,
             palette: crate::default_ansi_palette(),
+            cursor: None,
         };
         let links = LinkActions {
             admit: |_, _| false,
@@ -2160,6 +2171,7 @@ mod transcript_tests {
             foreground: gdk::RGBA::WHITE,
             background: gdk::RGBA::BLACK,
             palette: crate::default_ansi_palette(),
+            cursor: None,
         };
         let links = LinkActions {
             admit: |_, _| false,

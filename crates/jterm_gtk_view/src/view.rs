@@ -27,6 +27,8 @@ pub(crate) struct TerminalView {
     presentation: RefCell<Option<Presentation>>,
     find_tags: RefCell<Option<[gtk4::TextTag; 2]>>,
     theme: RefCell<Theme>,
+    background_style: gtk4::CssProvider,
+    background: Cell<Option<gdk::RGBA>>,
     line_height_scale: Cell<f64>,
     appearance_changed: Cell<bool>,
     palette_revision: Cell<u64>,
@@ -164,8 +166,10 @@ impl PaintTheme<'_> {
     }
 
     fn cursor(&self) -> Option<gdk::RGBA> {
-        let (r, g, b) = self.dynamic.and_then(ColorState::cursor_override)?;
-        Some(rgba(r, g, b))
+        self.dynamic
+            .and_then(ColorState::cursor_override)
+            .map(|(r, g, b)| rgba(r, g, b))
+            .or_else(|| self.configured.cursor.map(|cursor| cursor.background))
     }
 
     fn color(&self, color: Color, default: gdk::RGBA) -> gdk::RGBA {
@@ -201,6 +205,11 @@ impl TerminalView {
             .vexpand(true)
             .build();
         widget.set_widget_name("shared-terminal-screen");
+        let background_style = gtk4::CssProvider::new();
+        #[allow(deprecated)]
+        widget
+            .style_context()
+            .add_provider(&background_style, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
         widget.update_property(&[gtk4::accessible::Property::Label("Shared terminal screen")]);
         let preedit = gtk4::Label::builder()
             .can_target(false)
@@ -211,16 +220,31 @@ impl TerminalView {
         preedit.update_property(&[gtk4::accessible::Property::Description(
             "Terminal composition",
         )]);
-        Self {
+        let background = theme.background;
+        let view = Self {
             widget,
             preedit,
             cursor_offset: Cell::new(None),
             presentation: RefCell::default(),
             find_tags: RefCell::default(),
             theme: RefCell::new(theme),
+            background_style,
+            background: Cell::new(None),
             line_height_scale: Cell::new(1.0),
             appearance_changed: Cell::new(false),
             palette_revision: Cell::new(0),
+        };
+        view.paint_background(background);
+        view
+    }
+
+    fn paint_background(&self, background: gdk::RGBA) {
+        if self.background.replace(Some(background)) != Some(background) {
+            // Text tags color cells. The view also owns the paper around
+            // them, including the margins and the area below the last row.
+            self.background_style.load_from_string(&format!(
+                "textview {{ background-color: {background}; }} text {{ background-color: transparent; }}"
+            ));
         }
     }
 
@@ -365,6 +389,7 @@ impl TerminalView {
             configured: &configured,
             dynamic: colors.map(|(_, palette)| palette.as_ref()),
         };
+        self.paint_background(theme.background());
         let previous = self.presentation.take();
         let updates =
             if !self.appearance_changed.replace(false) && same_palette && history.is_none() {
@@ -565,9 +590,15 @@ impl TerminalView {
         let mut background = theme.color(cell.background, theme.background());
         if cell.flags.inverse() {
             std::mem::swap(&mut foreground, &mut background);
+            foreground.set_alpha(1.0);
         }
         if matches!(cursor, Some(CursorShape::Block | CursorShape::Beam)) {
             std::mem::swap(&mut foreground, &mut background);
+            if let Some(cursor) = theme.configured.cursor {
+                foreground = cursor.foreground;
+            } else {
+                foreground.set_alpha(1.0);
+            }
             if let Some(cursor_color) = theme.cursor() {
                 background = cursor_color;
             }
@@ -762,6 +793,7 @@ fn live_update_preserves_unchanged_buffer_rows_and_moves_the_caret() {
         foreground: gdk::RGBA::WHITE,
         background: gdk::RGBA::BLACK,
         palette: default_ansi_palette(),
+        cursor: None,
     });
     terminal
         .feed(b"stable\x1b[2;1Hbefore\x1b[3;1Hcaret")
@@ -845,6 +877,7 @@ fn selection_joins_wide_wraps_in_live_and_archived_rows() {
         foreground: gdk::RGBA::WHITE,
         background: gdk::RGBA::BLACK,
         palette: default_ansi_palette(),
+        cursor: None,
     });
     let select = || {
         let buffer = view.widget.buffer();

@@ -62,6 +62,7 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
             foreground: gdk::RGBA::WHITE,
             background: gdk::RGBA::BLACK,
             palette: default_ansi_palette(),
+            cursor: None,
         },
         |message, _| message.to_owned(),
         LinkActions {

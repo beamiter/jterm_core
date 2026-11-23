@@ -37,8 +37,8 @@ pub use live_output::{
     captured_live_rows, CapturedLiveRow, LiveOutputRow, LiveOutputView, MAX_LIVE_OUTPUT_BYTES,
 };
 pub use pane::{
-    EmbeddedTerminal, LinkActions, PaneEvent, PlainLinkFinder, Pty, RetainedTextSource,
-    TerminalPane, Theme,
+    CursorColors, EmbeddedTerminal, LinkActions, PaneEvent, PlainLinkFinder, Pty,
+    RetainedTextSource, TerminalPane, Theme,
 };
 pub use pty_dispatch::{PtyDispatch, PtyEvent};
 #[cfg(target_os = "linux")]

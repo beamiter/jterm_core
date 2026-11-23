@@ -137,6 +137,9 @@ pub enum ParserEvent {
     /// its only answer and must write a `\e]<n>;rgb:RRRR/GGGG/BBBB\e\\` reply
     /// to the PTY.
     ColorQuery(ColorKind),
+    /// A query-only color OSC for the live terminal's protocol owner.
+    /// Includes the original OSC terminator and has no transcript text.
+    LiveColorQuery(Vec<u8>),
     /// App queried a keyboard/capability protocol. The bytes still pass
     /// through, and the live VTE answers some of these itself; the caller
     /// replies on the PTY only for the ones it does not (see
@@ -393,6 +396,7 @@ pub struct Parser {
     passthrough: Vec<u8>,
     ground_utf8_tail: GroundUtf8Tail,
     config: ParserConfig,
+    live_terminal_colors: bool,
     /// `?2004` — shell asked for paste content to be bracketed with `\e[200~`
     /// / `\e[201~`. The caller wraps its own `Paste` write when this is on.
     bracketed_paste: bool,
@@ -544,11 +548,50 @@ impl Parser {
             passthrough: Vec::with_capacity(4096),
             ground_utf8_tail: GroundUtf8Tail::default(),
             config,
+            live_terminal_colors: false,
             bracketed_paste: false,
             mouse_tracking: 0,
             mouse_encoding: 0,
             focus_events: false,
         }
+    }
+
+    /// Let the live terminal interpret color OSCs and write their replies.
+    pub fn with_live_terminal_colors(mut self, enabled: bool) -> Self {
+        self.live_terminal_colors = enabled;
+        self
+    }
+
+    /// Reset stream and reporting state while retaining the live color owner.
+    pub fn reset_with_config(&mut self, config: ParserConfig) {
+        *self = Self::with_config(config).with_live_terminal_colors(self.live_terminal_colors);
+    }
+
+    fn finish_osc(&self, payload: &[u8], terminator: &[u8], events: &mut Vec<ParserEvent>) {
+        if self.live_terminal_colors {
+            let mut fields = payload.split(|&byte| byte == b';');
+            let query_only = match fields.next().unwrap_or_default() {
+                b"4" => Some(fields.skip(1).step_by(2).all(|spec| spec == b"?")),
+                b"10" | b"11" | b"12" => {
+                    Some(fields.next() == Some(b"?") && fields.next().is_none())
+                }
+                b"104" | b"110" | b"111" | b"112" => Some(false),
+                _ => None,
+            };
+            if let Some(query_only) = query_only {
+                let mut bytes = Vec::with_capacity(2 + payload.len() + terminator.len());
+                bytes.extend_from_slice(b"\x1b]");
+                bytes.extend_from_slice(payload);
+                bytes.extend_from_slice(terminator);
+                events.push(if query_only {
+                    ParserEvent::LiveColorQuery(bytes)
+                } else {
+                    ParserEvent::Bytes(bytes)
+                });
+                return;
+            }
+        }
+        handle_osc(payload, events);
     }
 
     /// True while the shell has `?2004` enabled — callers should wrap pasted
@@ -1045,7 +1088,7 @@ impl Parser {
                         let payload = std::mem::take(buf);
                         self.state = State::Ground;
                         flush!();
-                        handle_osc(&payload, events);
+                        self.finish_osc(&payload, b"\x07", events);
                     }
                     0x1b => {
                         let payload = std::mem::take(buf);
@@ -1068,7 +1111,7 @@ impl Parser {
                         let payload = std::mem::take(payload);
                         self.state = State::Ground;
                         flush!();
-                        handle_osc(&payload, events);
+                        self.finish_osc(&payload, b"\x1b\\", events);
                     } else {
                         // ESC followed by a non-ST byte aborts the incomplete
                         // OSC. Do not accept its payload (especially OSC 133),
@@ -2305,6 +2348,34 @@ mod tests {
             .iter()
             .all(|event| !matches!(event, ParserEvent::ColorSet { .. })));
         assert!(matches!(&events[..], [ParserEvent::Bytes(_)]));
+    }
+
+    #[test]
+    fn live_color_queries_keep_wire_order_and_stay_out_of_display_bytes() {
+        let set = b"\x1b]4;42;#12e371;43;#ab12d1\x1b\\";
+        let bel_query = b"\x1b]4;42;?;43;?\x07";
+        let dsr = b"\x1b[5n";
+        let mixed = b"\x1b]4;42;#fedcba;42;?\x1b\\";
+        let reset = b"\x1b]104;42\x07";
+        let st_query = b"\x1b]12;?\x1b\\";
+        let input = [set.as_slice(), bel_query, dsr, mixed, reset, st_query].concat();
+        let expected = [
+            ParserEvent::Bytes(set.to_vec()),
+            ParserEvent::LiveColorQuery(bel_query.to_vec()),
+            ParserEvent::KeyboardProtocolQuery(KeyboardProtocolQuery::DeviceStatus),
+            ParserEvent::Bytes(dsr.to_vec()),
+            ParserEvent::Bytes(mixed.to_vec()),
+            ParserEvent::Bytes(reset.to_vec()),
+            ParserEvent::LiveColorQuery(st_query.to_vec()),
+        ];
+        for split in 0..=input.len() {
+            let mut parser = Parser::new().with_live_terminal_colors(true);
+            parser.reset_with_config(ParserConfig::default());
+            let mut events = Vec::new();
+            parser.feed(&input[..split], &mut events);
+            parser.feed(&input[split..], &mut events);
+            assert_eq!(events, expected, "split at byte {split}");
+        }
     }
 
     #[test]
