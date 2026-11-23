@@ -53,7 +53,7 @@ def thread_names(pid):
     for task in Path(f"/proc/{pid}/task").glob("*/comm"):
         try:
             names.append(task.read_text().strip())
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
     return names
 
@@ -61,7 +61,7 @@ def thread_names(pid):
 def stopped(pid):
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
 
 
