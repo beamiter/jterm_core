@@ -140,7 +140,14 @@ impl LiveOutputView {
             let area = row.area;
             label.set_attributes(Some(&attributes));
             label.set_text(row.text);
-            let (width, height) = label.layout().pixel_size();
+            let layout = label.layout();
+            let context = layout.context();
+            // Match the terminal's pixel grid before checking the row bounds.
+            if !context.is_round_glyph_positions() {
+                context.set_round_glyph_positions(true);
+                layout.context_changed();
+            }
+            let (width, height) = layout.pixel_size();
             if width > area.width() || height > area.height() || area.y() < previous_bottom {
                 self.clear();
                 return;
