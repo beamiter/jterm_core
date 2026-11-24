@@ -241,13 +241,12 @@ fn launch_with_inherited_fds(
                     child_failed(&status_writer, StartupStage::ShellIdentity);
                 }
             }
-            status_writer.entering_exec();
             if let (Some(candidates), Some(shell_argv)) = (search, shell_argv.as_mut()) {
+                status_writer.entering_exec();
                 let error = exec_search(candidates, &argv, &envp, shell_argv);
                 status_writer.report_and_exit(StartupStage::Exec, error, 127);
             }
-            libc::execve(spec.executable.as_ptr(), argv.as_ptr(), envp.as_ptr());
-            child_failed(&status_writer, StartupStage::Exec);
+            status_writer.execve(spec.executable, &argv, &envp);
         }
     }
 

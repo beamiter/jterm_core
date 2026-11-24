@@ -1,6 +1,7 @@
 //! A private Unix fork-to-exec status pipe. Child lifetime belongs to the spawner.
 
 use crate::pty_reader::cloexec_pipe_above_stdio;
+use std::ffi::CStr;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -235,6 +236,24 @@ impl StartupReader {
 }
 
 impl StartupWriter {
+    /// Mark the exec transition, then run the prepared program or report its
+    /// execve failure. This keeps the status record adjacent to the syscall.
+    ///
+    /// # Safety
+    /// Call only in the forked PTY child. Both pointer slices must be
+    /// null-terminated and point to live C strings up to their terminators.
+    pub unsafe fn execve(
+        &self,
+        program: &CStr,
+        argv: &[*const libc::c_char],
+        envp: &[*const libc::c_char],
+    ) -> ! {
+        self.entering_exec();
+        // SAFETY: the caller supplies execve's prepared string lists.
+        unsafe { libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        self.report_and_exit(StartupStage::Exec, errno(), 127);
+    }
+
     /// Mark the transition immediately before execve. EOF before this record
     /// can come from a child killed during setup, with no failure errno.
     pub(crate) fn entering_exec(&self) {
