@@ -24,7 +24,9 @@ The earlier milestone reports retain their original local-only validation scope.
   profile. It owns the terminal grid, queued logical input and its reply
   boundaries, and uses the shared pidfd-bound child lifecycle. Ember enables
   the session actor for its existing native PTY backend and legacy terminal owner.
-  Frost also uses the actor for its ordinary terminal and Vim9 workbench.
+  Frost launches its ordinary terminal and Vim9 workbench through the shared
+  native PTY startup and runs both with the session actor. Restore retries
+  the launch in the default directory only after a working-directory error.
   The actor owns the bounded input FIFO, resize, cancellation, output
   batching and native teardown. Frost keeps separate input and response
   byte allowances and holds the unreaped leader identity until its reader

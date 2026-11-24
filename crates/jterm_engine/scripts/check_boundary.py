@@ -171,7 +171,7 @@ class BoundaryTests(unittest.TestCase):
         order = [
             'self.screen.last_printed_char =',
             'while pos < bytes.len()',
-            'self.wrap_to_next_line()',
+            'self.move_vertical(VerticalMotion::Wrap)',
             'self.note_idle_background_cells(',
             '.overwrite_ascii(',
             'self.screen.cursor_col += chunk_len',
