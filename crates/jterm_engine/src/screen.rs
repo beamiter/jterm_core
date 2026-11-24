@@ -1,7 +1,7 @@
 //! Live VT screen ownership, row edits, region shifts and physical resizing.
 //!
-//! The host owns identity allocation, history, resize/scroll policy and
-//! graphics. Public fields are an explicit transitional orchestration boundary,
+//! The host selects a compatibility profile and consumes history and graphics
+//! effects. Public fields are an explicit transitional orchestration boundary,
 //! not a mirrored screen or a Deref facade. Every row operation returns bounded
 //! effects which the host must consume before the next protocol command.
 pub use crate::grid::RegionDirection;
@@ -905,6 +905,82 @@ impl ScreenState {
             self.alt_grid
                 .clear_dangling_wide_at_row_end(row, hidden_blank);
         }
+        if let Some(saved) = self.saved_state.as_mut() {
+            saved.row = saved.row.saturating_sub(transfer_top).min(rows - 1);
+            saved.col = saved.col.min(cols - 1);
+        }
+        self.finish_physical_resize(rows, cols, had_full_screen_region, TabStopOrigin::Set);
+        Some(ResizeMutation {
+            old_rows,
+            old_cols,
+            rows,
+            cols,
+            transferred,
+            dirty_rows: 0..rows,
+        })
+    }
+
+    /// Resize both actual FrostLegacyV1 grids and transfer any displaced
+    /// primary rows. A resize to the current dimensions still repairs wide
+    /// pairs, clears pending wrap, and advances the physical grid revision.
+    ///
+    /// # Panics
+    /// Both dimensions must be nonzero. The host applies its admission limits
+    /// before calling and settles history and view effects before the next feed.
+    pub fn resize_frost_legacy(&mut self, rows: usize, cols: usize) -> ResizeMutation {
+        assert!(rows > 0 && cols > 0);
+        let old_rows = self.grid.rows();
+        let old_cols = self.grid.cols();
+        let had_full_screen_region =
+            self.scroll_region_top == 0 && self.scroll_region_bottom >= old_rows - 1;
+        let blank = self.create_blank_cell();
+        let mut transferred = SmallVec::new();
+        if !self.use_alt_buffer && rows < old_rows {
+            let transfer_top =
+                rows_to_archive_on_height_shrink(old_rows, rows, self.cursor_row, |row| {
+                    self.grid[row]
+                        .iter()
+                        .all(TerminalCell::is_reflow_trimmable_blank)
+                });
+            if transfer_top > 0 {
+                transferred
+                    .extend((0..transfer_top).map(|row| self.grid.archive_frost_legacy_row(row)));
+                self.grid.scroll_up_by(transfer_top, blank);
+                self.cursor_row -= transfer_top;
+                self.saved_cursor_row = self.saved_cursor_row.saturating_sub(transfer_top);
+                if let Some(saved) = self.saved_state.as_mut() {
+                    saved.row = saved.row.saturating_sub(transfer_top);
+                }
+            }
+        }
+
+        let mut hidden_blank = blank;
+        if self.use_alt_buffer {
+            hidden_blank.background = self
+                .saved_primary_screen_state
+                .as_ref()
+                .map_or(Color::Default, |state| state.bg);
+        }
+        self.grid.resize_frost_legacy(rows, cols, blank);
+        self.alt_grid.resize_frost_legacy(rows, cols, hidden_blank);
+        self.finish_physical_resize(rows, cols, had_full_screen_region, TabStopOrigin::Clear);
+        ResizeMutation {
+            old_rows,
+            old_cols,
+            rows,
+            cols,
+            transferred,
+            dirty_rows: 0..rows,
+        }
+    }
+
+    fn finish_physical_resize(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        had_full_screen_region: bool,
+        tab_stop_origin: TabStopOrigin,
+    ) {
         self.pending_wrap = false;
         self.cursor_row = self.cursor_row.min(rows - 1);
         self.cursor_col = self.cursor_col.min(cols - 1);
@@ -912,11 +988,7 @@ impl ScreenState {
         self.saved_cursor_col = self.saved_cursor_col.min(cols - 1);
         self.alt_cursor_row = self.alt_cursor_row.min(rows - 1);
         self.alt_cursor_col = self.alt_cursor_col.min(cols - 1);
-        resize_tab_stops(&mut self.tab_stops, cols, TabStopOrigin::Set);
-        if let Some(saved) = self.saved_state.as_mut() {
-            saved.row = saved.row.saturating_sub(transfer_top).min(rows - 1);
-            saved.col = saved.col.min(cols - 1);
-        }
+        resize_tab_stops(&mut self.tab_stops, cols, tab_stop_origin);
         if had_full_screen_region {
             self.scroll_region_top = 0;
             self.scroll_region_bottom = rows - 1;
@@ -928,14 +1000,6 @@ impl ScreenState {
                 self.scroll_region_bottom = rows - 1;
             }
         }
-        Some(ResizeMutation {
-            old_rows,
-            old_cols,
-            rows,
-            cols,
-            transferred,
-            dirty_rows: 0..rows,
-        })
     }
 
     /// Move one physical row through an inclusive region. Repeated SU/SD calls
@@ -1050,6 +1114,16 @@ impl ScreenState {
     /// Panics for zero dimensions, as does `with_grids`.
     pub fn new(rows: usize, cols: usize) -> Self {
         Self::with_grids(TerminalGrid::new(rows, cols), TerminalGrid::new(rows, cols))
+    }
+
+    /// Adopt FrostLegacyV1's process-wide row identities and tab stops.
+    /// Panics for zero dimensions, as does `new`.
+    pub fn new_frost_legacy(rows: usize, cols: usize) -> Self {
+        Self::with_grid_pair(
+            TerminalGrid::with_row_ids(rows, cols, RawRowId::allocate_process_unique),
+            TerminalGrid::with_row_ids(rows, cols, RawRowId::allocate_process_unique),
+            TabStopOrigin::Clear,
+        )
     }
 
     /// Adopt real grids, including any identities already allocated by the host.

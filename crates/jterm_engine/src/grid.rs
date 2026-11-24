@@ -2,6 +2,7 @@ use super::hyperlink::HyperlinkId;
 use crate::{graphemes::MAX_CLUSTER_BYTES, row_annotations::RowAnnotations};
 use smallvec::SmallVec;
 use std::ops::{Range, RangeInclusive};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +93,7 @@ pub struct TerminalGrid {
     /// Stable identity travels with retained physical rows across structural
     /// moves. `UNTRACKED` is fail-closed after allocator exhaustion.
     row_ids: Vec<RawRowId>,
+    identity_revision: u64,
     margin_origin: Vec<MarginOrigin>,
     // Allocate the row table on first colored output, and allocate cells only
     // for rows with explicit decoration. The base cell stays 16 bytes.
@@ -110,6 +112,7 @@ impl TerminalGrid {
             cols,
             row_wrapped: vec![false; rows],
             row_ids: vec![RawRowId::UNTRACKED; rows],
+            identity_revision: 1,
             margin_origin: vec![MarginOrigin::VirginDefault; rows],
             underline_colors: Vec::new(),
             annotations: Vec::new(),
@@ -117,6 +120,19 @@ impl TerminalGrid {
             row_changes: Vec::new(),
             track_printed_spaces: false,
         }
+    }
+
+    /// Initialize the physical rows in ascending order with the caller's IDs.
+    pub fn with_row_ids(
+        rows: usize,
+        cols: usize,
+        mut allocate_id: impl FnMut() -> RawRowId,
+    ) -> Self {
+        let mut grid = Self::new(rows, cols);
+        for id in &mut grid.row_ids {
+            *id = allocate_id();
+        }
+        grid
     }
 
     pub(crate) fn begin_capture_revision(&mut self, revision: u64) {
@@ -157,6 +173,24 @@ impl TerminalGrid {
     /// The host must keep identities synchronized with physical cell moves.
     pub fn row_ids_mut(&mut self) -> &mut [RawRowId] {
         &mut self.row_ids
+    }
+
+    /// Revision of physical row shifts and resizes. Direct repairs to the
+    /// tracking IDs and changes to cells have their own invalidation paths.
+    pub fn identity_revision(&self) -> u64 {
+        self.identity_revision
+    }
+
+    fn bump_identity_revision(&mut self) {
+        self.identity_revision = self.identity_revision.wrapping_add(1).max(1);
+    }
+
+    pub fn row_slice(&self, row: usize) -> Option<&[TerminalCell]> {
+        (row < self.rows).then(|| &self[row])
+    }
+
+    pub fn raw_row_id(&self, row: usize) -> Option<RawRowId> {
+        self.row_ids.get(row).copied()
     }
 
     #[inline]
@@ -368,10 +402,7 @@ impl TerminalGrid {
 
     #[inline]
     pub fn row_id(&self, row: usize) -> RawRowId {
-        self.row_ids
-            .get(row)
-            .copied()
-            .unwrap_or(RawRowId::UNTRACKED)
+        self.raw_row_id(row).unwrap_or(RawRowId::UNTRACKED)
     }
 
     /// Record exactly one wrap departure. An ordinary or ambiguous wrap must
@@ -505,6 +536,13 @@ impl TerminalGrid {
         if allow_margin && self.synthetic_margin_gap(row).is_some() {
             line.synthetic_margin_gap = true;
         }
+        line
+    }
+
+    /// Transfer a FrostLegacyV1 row with its original identity and blink bit.
+    pub fn archive_frost_legacy_row(&self, row: usize) -> ScrollbackLine {
+        let mut line = ScrollbackLine::compress_preserving_blink(&self[row], self.row_wrapped[row]);
+        line.set_raw_row_id(self.row_id(row));
         line
     }
 
@@ -645,6 +683,7 @@ impl TerminalGrid {
         for row in blank_rows {
             self.row_ids[row] = allocate_id();
         }
+        self.bump_identity_revision();
         Some(top..end)
     }
 
@@ -904,6 +943,37 @@ impl TerminalGrid {
         }
         self.rows = new_rows;
         self.cols = new_cols;
+        self.bump_identity_revision();
+    }
+
+    /// Resize using FrostLegacyV1's wide-pair repair and identity cadence.
+    /// The original grid reserves an ID for every destination row, including
+    /// the retained rows whose existing identities are copied forward.
+    pub fn resize_frost_legacy(&mut self, rows: usize, cols: usize, blank: TerminalCell) {
+        let retained = self.rows.min(rows);
+        self.resize(rows, cols, blank);
+        for row in 0..retained {
+            let line = &mut self[row];
+            for col in 0..cols {
+                if line[col].flags.wide()
+                    && (col + 1 >= cols || !line[col + 1].flags.wide_continuation())
+                {
+                    line[col] = blank;
+                }
+            }
+            for col in 0..cols {
+                if line[col].flags.wide_continuation() && (col == 0 || !line[col - 1].flags.wide())
+                {
+                    line[col] = blank;
+                }
+            }
+        }
+        for (row, id) in self.row_ids.iter_mut().enumerate() {
+            let fresh = RawRowId::allocate_process_unique();
+            if row >= retained {
+                *id = fresh;
+            }
+        }
     }
 
     /// 向上滚动 n 行:丢弃顶部 n 行,其余行上移,底部补 blank。缩小高度前调用,
@@ -1218,6 +1288,18 @@ pub struct RawRowId(u64);
 impl RawRowId {
     pub const UNTRACKED: Self = Self(0);
 
+    /// Allocate within the process-wide row identity domain used by Frost.
+    /// Session-local domains can use their own allocator and `RawRowId::new`.
+    #[allow(deprecated)] // fetch_update supports the engine's Rust 1.86 MSRV.
+    pub fn allocate_process_unique() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map(Self::new)
+        .unwrap_or(Self::UNTRACKED)
+    }
+
     #[allow(dead_code)] // Public library accessor; binary keeps the id opaque.
     pub const fn get(self) -> Option<u64> {
         if self.0 == 0 {
@@ -1234,6 +1316,17 @@ impl RawRowId {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn structural_grid_revision_stays_nonzero_after_wrap() {
+    let mut grid = TerminalGrid::new(2, 2);
+    grid.identity_revision = u64::MAX;
+    grid.scroll_up_by(1, TerminalCell::default());
+    assert_eq!(grid.identity_revision(), 1);
+    grid.resize(2, 3, TerminalCell::default());
+    assert_eq!(grid.identity_revision(), 2);
 }
 
 #[derive(Clone, Debug)]
