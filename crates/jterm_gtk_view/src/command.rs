@@ -189,18 +189,19 @@ impl FinishedTextView {
         gutter.add_css_class("shared-finished-output-gutter");
         let view = self.widget.downgrade();
         let font = self.font.clone();
-        gutter.set_draw_func(move |area, context, width, _| {
+        gutter.set_draw_func(move |area, context, width, height| {
             let Some(view) = view.upgrade() else {
                 return;
             };
-            let buffer = view.buffer();
-            for line in 0..buffer.line_count() {
-                let Some(iter) = buffer.iter_at_line(line) else {
-                    continue;
-                };
+            let visible = view.visible_rect();
+            let (mut iter, _) = view.line_at_y(visible.y());
+            loop {
                 let (y, _) = view.line_yrange(&iter);
                 let (_, y) = view.buffer_to_window_coords(gtk4::TextWindowType::Widget, 0, y);
-                let layout = area.create_pango_layout(Some(&(line + 1).to_string()));
+                if y >= height {
+                    break;
+                }
+                let layout = area.create_pango_layout(Some(&(iter.line() + 1).to_string()));
                 layout.set_font_description(font.font_desc().as_ref());
                 let (label_width, _) = layout.pixel_size();
                 gtk4::render_layout(
@@ -210,6 +211,9 @@ impl FinishedTextView {
                     f64::from(y),
                     &layout,
                 );
+                if !iter.forward_line() {
+                    break;
+                }
             }
         });
         let weak = gutter.downgrade();
@@ -218,17 +222,27 @@ impl FinishedTextView {
                 gutter.queue_draw();
             }
         });
+        if let Some(adjustment) = self.widget.vadjustment() {
+            let weak = gutter.downgrade();
+            adjustment.connect_value_changed(move |_| {
+                if let Some(gutter) = weak.upgrade() {
+                    gutter.queue_draw();
+                }
+            });
+        }
         gutter
     }
 
     /// Replace the view with a filtered projection of the retained capture.
     pub fn present_output(&self, document: &ArchivedText) {
         let buffer = self.widget.buffer();
+        let mut offsets = (0, 0);
         let links = document
             .links
             .iter()
             .filter_map(|link| {
-                let (start, end) = character_range(&document.text, link.bytes.clone())?;
+                let (start, end) =
+                    ordered_character_range(&document.text, link.bytes.clone(), &mut offsets)?;
                 Some(PresentedLink::text_span(start, end, &link.target))
             })
             .collect();
@@ -245,8 +259,11 @@ impl FinishedTextView {
             &[&self.font, &self.colors[0].0],
         );
         let palette = self.palette.get();
+        let mut offsets = (0, 0);
         for span in &document.spans {
-            let Some((start, end)) = character_range(&document.text, span.bytes.clone()) else {
+            let Some((start, end)) =
+                ordered_character_range(&document.text, span.bytes.clone(), &mut offsets)
+            else {
                 continue;
             };
             let tag = gtk4::TextTag::builder()
@@ -295,6 +312,14 @@ impl FinishedTextView {
         let layout = self.widget.create_pango_layout(Some(&text));
         layout.set_font_description(self.font.font_desc().as_ref());
         layout.pixel_size().0
+    }
+
+    pub(crate) fn line_height(&self) -> i32 {
+        let metrics = self
+            .widget
+            .pango_context()
+            .metrics(self.font.font_desc().as_ref(), None);
+        ((metrics.ascent() + metrics.descent() + pango::SCALE - 1) / pango::SCALE).max(1)
     }
 
     pub fn set_colors(&self, foreground: gdk::RGBA, palette: &[gdk::RGBA; 16]) {
@@ -394,6 +419,23 @@ fn character_range(text: &str, range: Range<usize>) -> Option<(i32, i32)> {
     Some((start, end))
 }
 
+fn ordered_character_range(
+    text: &str,
+    range: Range<usize>,
+    cursor: &mut (usize, i32),
+) -> Option<(i32, i32)> {
+    let (byte, character) = if range.start >= cursor.0 {
+        *cursor
+    } else {
+        (0, 0)
+    };
+    let start = character + text.get(byte..range.start)?.chars().count() as i32;
+    let last_byte = range.end;
+    let end = start + text.get(range)?.chars().count() as i32;
+    *cursor = (last_byte, end);
+    Some((start, end))
+}
+
 /// Translate byte ranges of the source snapshot into GTK character offsets.
 /// The source is immutable while presented, so ordinals survive wrapping.
 pub fn select_finished_text_bytes(view: &gtk4::TextView, range: Range<usize>) -> bool {
@@ -402,7 +444,14 @@ pub fn select_finished_text_bytes(view: &gtk4::TextView, range: Range<usize>) ->
     let Some((start, end)) = character_range(&text, range) else {
         return false;
     };
-    buffer.select_range(&buffer.iter_at_offset(end), &buffer.iter_at_offset(start));
+    let mut start = buffer.iter_at_offset(start);
+    buffer.select_range(&buffer.iter_at_offset(end), &start);
+    if view
+        .vadjustment()
+        .is_some_and(|adjustment| adjustment.upper() - adjustment.lower() > adjustment.page_size())
+    {
+        view.scroll_to_iter(&mut start, 0.05, false, 0.0, 0.0);
+    }
     true
 }
 

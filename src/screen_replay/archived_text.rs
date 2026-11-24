@@ -1,15 +1,18 @@
-use super::parser::Params;
 use super::pen::{apply_sgr, supported_archive_sgr, Color, Pen, BOLD, ITALIC, STRIKE};
+use super::{parser::Params, MAX_COMPLETED_CAPTURE_BYTES};
 use jterm_engine::archived_text::{
     is_literal_archive_unicode, ArchiveLink, ArchiveSpan, ArchiveStyle, ArchivedText,
 };
 use jterm_engine::grid::{Color as GridColor, StyleFlags, UnderlineStyle};
+use std::borrow::Cow;
 
-const MAX_RETAINED_BYTES: usize = 8 * 1024;
-const MAX_TEXT_BYTES: usize = 2 * 1024;
-const MAX_LINES: usize = 12;
-const MAX_SPANS: usize = 128;
-const MAX_LINKS: usize = 32;
+// The view retains a text buffer plus indexing and layout for each paragraph.
+// Charge empty paragraphs too, so a small newline flood cannot build an
+// unbounded GTK document. The host retains the original capture separately.
+const MAX_LAYOUT_UNITS: usize = 256 * 1024;
+const UNITS_PER_PARAGRAPH: usize = 64;
+const MAX_SPANS: usize = 512;
+const MAX_LINKS: usize = 128;
 
 /// Project a bounded finalized capture of plain text and supported SGR into
 /// immutable text and style ranges. The caller still owns the retained bytes
@@ -20,7 +23,7 @@ const MAX_LINKS: usize = 32;
 /// Other OSC commands, cursor movement, tabs, path hints and unsupported SGR
 /// require the original renderer.
 pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
-    if capture.len() > MAX_RETAINED_BYTES {
+    if capture.len() > MAX_COMPLETED_CAPTURE_BYTES {
         return None;
     }
     let capture = capture
@@ -30,6 +33,7 @@ pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
     let mut output = ArchivedText::default();
     let mut pen = Pen::default();
     let mut style_changes = 0;
+    let mut layout_units = UNITS_PER_PARAGRAPH;
     let mut link = None;
     let mut rest = capture;
     while !rest.is_empty() {
@@ -67,7 +71,21 @@ pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
         if end == 0 {
             return None;
         }
-        let run = rest[..end].replace("\r\n", "\n");
+        let raw = &rest[..end];
+        // Normalizing CRLF can at most halve the length of the run.
+        if raw.len() > 2 * (MAX_LAYOUT_UNITS - layout_units) {
+            return None;
+        }
+        let run = if raw.contains('\r') {
+            Cow::Owned(raw.replace("\r\n", "\n"))
+        } else {
+            Cow::Borrowed(raw)
+        };
+        layout_units += run.len()
+            + run.as_bytes().iter().filter(|&&byte| byte == b'\n').count() * UNITS_PER_PARAGRAPH;
+        if layout_units > MAX_LAYOUT_UNITS {
+            return None;
+        }
         // The card filter can drop entire raw lines. Keep each link's open
         // and close in one logical line so filtering cannot extend its target.
         if link.is_some() && run.contains('\n') {
@@ -80,9 +98,6 @@ pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
         }
         let start = output.text.len();
         output.text.push_str(&run);
-        if output.text.len() > MAX_TEXT_BYTES {
-            return None;
-        }
         if let Some(target) = link {
             if let Some(previous) = output
                 .links
@@ -121,7 +136,6 @@ pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
         rest = &rest[end..];
     }
     (link.is_none()
-        && output.text.split('\n').count() <= MAX_LINES
         && output.text.split_whitespace().all(|token| {
             token.chars().all(|ch| {
                 ch.is_ascii_alphanumeric() || "_-=+,%!?()[]'\"".contains(ch) || !ch.is_ascii()
@@ -245,11 +259,28 @@ mod tests {
         ] {
             assert!(project_bounded_archive(input).is_none(), "{input:?}");
         }
-        assert!(project_bounded_archive(&"line\r\n".repeat(13)).is_none());
-        assert!(project_bounded_archive(&"a".repeat(2049)).is_none());
         assert_eq!(
             project_bounded_archive("").unwrap(),
             ArchivedText::default()
         );
+    }
+
+    #[test]
+    fn long_outputs_keep_their_tail_and_charge_blank_paragraphs() {
+        let capture = format!(
+            "{}\x1b[31mtail witness\x1b[0m\r\n",
+            "visible line\r\n".repeat(1200)
+        );
+        let document = project_bounded_archive(&capture).expect("full archived text");
+        assert_eq!(document.text.lines().count(), 1201);
+        assert!(document.text.ends_with("\ntail witness"));
+        assert_eq!(
+            &document.text[document.spans[0].bytes.clone()],
+            "tail witness"
+        );
+
+        let empty_paragraphs = "\n".repeat(MAX_LAYOUT_UNITS / UNITS_PER_PARAGRAPH + 1);
+        assert!(project_bounded_archive(&empty_paragraphs).is_none());
+        assert!(project_bounded_archive(&"a".repeat(MAX_LAYOUT_UNITS + 1)).is_none());
     }
 }

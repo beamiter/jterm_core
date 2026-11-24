@@ -4,6 +4,7 @@
 mod command;
 mod document;
 mod find;
+mod finished_output;
 mod history_search;
 mod inline_images;
 mod pane;
@@ -25,6 +26,7 @@ pub use command::{
 };
 pub use document::DocumentView;
 pub use find::{FindFrame, FindMatch, FindRegion, FindSnapshot, FindWindow};
+pub use finished_output::{scroll_finished_output, FinishedOutputView};
 pub use inline_images::{InlineImageRequest, PendingInlineImage};
 pub use jterm_engine::authenticated_boundaries;
 pub use jterm_engine::history_reflow::HistoryAnchor;

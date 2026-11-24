@@ -124,6 +124,9 @@ use tables::Tables;
 /// quarter of a million).
 pub const DEFAULT_CELL_BUDGET: usize = 2 * 1024 * 1024;
 
+/// Maximum raw capture retained for one completed command by the GTK hosts.
+pub const MAX_COMPLETED_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Geometry bounds. Anything outside is clamped; a zero-sized winsize (a PTY
 /// that was never sized) becomes 1 so the emulator stays well-defined.
 const MAX_COLS: usize = 4096;
