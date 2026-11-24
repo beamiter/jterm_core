@@ -2,16 +2,19 @@ use super::model::*;
 use super::ownership::*;
 use super::protocol::*;
 use super::store::Store;
+use super::terminal_viewport::{retained_viewport, viewport_connection, ViewportDelivery};
 use super::PROTOCOL_VERSION;
+use super::{WorkspaceViewportOperation, WorkspaceViewportReply};
 use crate::agent_sessions::{AgentSession, SessionProvider, SessionStatus};
 use crate::native_pty_launch::{launch_hosted_pty, PtyLaunchError};
 use crate::screen_replay::ScreenReplay;
 use crate::supervised::SupervisedChild;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use jterm_engine::{frame::CellFrame, terminal::Terminal};
 use jterm_runtime::{
     exit_status::ExitTail,
     runtime_wake::WakeSink,
-    session_actor::{HostedPty, SessionActor, SessionEvent, SplitWriteLimits},
+    session_actor::{HostedPty, SessionActor, SessionEvent, SplitWriteLimits, WriteError},
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -54,6 +57,7 @@ enum HostRequest {
         String,
         Sender<Response>,
         Arc<AtomicBool>,
+        Option<u32>,
         Sender<Result<RuntimeHandle, String>>,
     ),
 }
@@ -68,6 +72,7 @@ pub(super) struct RuntimeHandle {
 pub(super) struct RuntimeOutput {
     pub raw: VecDeque<u8>,
     pub screen: Vec<u8>,
+    pub(super) viewport: Option<CellFrame>,
     pub truncated: bool,
 }
 impl RuntimeHandle {
@@ -85,6 +90,7 @@ pub(super) enum Control {
         closed: Arc<AtomicBool>,
         cols: u16,
         rows: u16,
+        generation: Option<u32>,
         ack: Sender<Result<(), String>>,
     },
     Input {
@@ -99,6 +105,12 @@ pub(super) enum Control {
         epoch: String,
         cols: u16,
         rows: u16,
+    },
+    Viewport {
+        client: String,
+        epoch: String,
+        operation: WorkspaceViewportOperation,
+        reply: Sender<Result<WorkspaceViewportReply, String>>,
     },
     Detach {
         client: String,
@@ -363,7 +375,7 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                 })();
                 let _ = reply.try_send(response);
             }
-            Ok(HostRequest::Attach(target, client, output, closed, reply)) => {
+            Ok(HostRequest::Attach(target, client, output, closed, generation, reply)) => {
                 let result = (|| {
                     if closed.load(Ordering::Relaxed) {
                         return Err("Attachment closed before Session Host admitted it".into());
@@ -380,7 +392,7 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                             if runtime.snapshot.lock().epoch != terminal.epoch {
                                 return Err("Stale owned runtime epoch".into());
                             }
-                            return attach(runtime, cols, rows, client, output, closed);
+                            return attach(runtime, cols, rows, client, output, closed, generation);
                         }
                     };
                     validate_launch(&launch)?;
@@ -397,6 +409,7 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                                 client,
                                 output,
                                 closed,
+                                generation,
                             );
                         }
                     }
@@ -424,7 +437,15 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
                     store.upsert_runtime_row(&launch.row)?;
                     let runtime = spawn_runtime(&paths, &launch)?;
                     runtimes.insert(id, runtime.clone());
-                    attach(runtime, launch.cols, launch.rows, client, output, closed)
+                    attach(
+                        runtime,
+                        launch.cols,
+                        launch.rows,
+                        client,
+                        output,
+                        closed,
+                        generation,
+                    )
                 })();
                 let _ = reply.try_send(result);
             }
@@ -441,10 +462,11 @@ fn attach(
     client: String,
     output: Sender<Response>,
     closed: Arc<AtomicBool>,
+    generation: Option<u32>,
 ) -> Result<RuntimeHandle, String> {
     let snapshot = runtime.snapshot.lock().clone();
     if !snapshot.state.is_live() {
-        attach_exited(&runtime, snapshot, &output)?;
+        attach_exited(&runtime, snapshot, &output, generation)?;
         return Ok(runtime);
     }
     let (ack, rx) = bounded(1);
@@ -456,6 +478,7 @@ fn attach(
             closed,
             cols,
             rows,
+            generation,
             ack,
         })
         .is_err()
@@ -464,7 +487,7 @@ fn attach(
         if snapshot.state.is_live() {
             return Err("The PTY is registered but its attachment queue is busy".into());
         }
-        attach_exited(&runtime, snapshot, &output)?;
+        attach_exited(&runtime, snapshot, &output, generation)?;
     } else {
         match rx.recv_timeout(Duration::from_secs(3)) {
             Ok(result) => result?,
@@ -473,7 +496,7 @@ fn attach(
                 if snapshot.state.is_live() {
                     return Err("The PTY is registered but its attachment closed".into());
                 }
-                attach_exited(&runtime, snapshot, &output)?;
+                attach_exited(&runtime, snapshot, &output, generation)?;
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 return Err("The PTY is registered but its attachment timed out".into());
@@ -487,7 +510,17 @@ fn attach_exited(
     runtime: &RuntimeHandle,
     snapshot: RuntimeSnapshot,
     output: &Sender<Response>,
+    generation: Option<u32>,
 ) -> Result<(), String> {
+    if let Some(generation) = generation {
+        let frame = retained_viewport(&runtime.output.lock(), &snapshot, generation)?;
+        return output
+            .try_send(Response::ViewportAttached {
+                snapshot,
+                frame: Box::new(frame),
+            })
+            .map_err(|_| "Attachment closed".into());
+    }
     let (sequence, code) = (snapshot.event_sequence, snapshot.exit_code);
     output
         .try_send(Response::Attached {
@@ -557,20 +590,49 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
                 .map_err(|_| "Workspace request timed out")?;
             write_frame(&mut stream, &Response::Reply(Box::new(result)))
         }
-        request @ (Request::Attach { .. } | Request::AttachOwned { .. }) => {
-            let (version, target, client) = match request {
+        request @ (Request::Attach { .. }
+        | Request::AttachOwned { .. }
+        | Request::AttachViewport { .. }) => {
+            let (version, target, client, generation) = match request {
                 Request::Attach {
                     version,
                     launch,
                     client,
-                } => (version, AttachTarget::Provider(launch), client),
+                } => (version, AttachTarget::Provider(launch), client, None),
+                Request::AttachViewport {
+                    version,
+                    launch,
+                    client,
+                    generation,
+                } => {
+                    if generation == 0
+                        || !(1..=120).contains(&launch.rows)
+                        || !(1..=256).contains(&launch.cols)
+                    {
+                        return write_frame(
+                            &mut stream,
+                            &Response::Error("Invalid viewport dimensions or generation".into()),
+                        );
+                    }
+                    (
+                        version,
+                        AttachTarget::Provider(launch),
+                        client,
+                        Some(generation),
+                    )
+                }
                 Request::AttachOwned {
                     version,
                     terminal,
                     client,
                     cols,
                     rows,
-                } => (version, AttachTarget::Owned(terminal, cols, rows), client),
+                } => (
+                    version,
+                    AttachTarget::Owned(terminal, cols, rows),
+                    client,
+                    None,
+                ),
                 _ => unreachable!(),
             };
             if version != PROTOCOL_VERSION || client.len() > 128 {
@@ -589,6 +651,7 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
                     client.clone(),
                     output,
                     writer_closed.clone(),
+                    generation,
                     reply,
                 ))
                 .is_err()
@@ -607,6 +670,16 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
                     return write_frame(&mut stream, &Response::Error(message.into()));
                 }
             };
+            if let Some(generation) = generation {
+                return viewport_connection(
+                    reader,
+                    runtime,
+                    client,
+                    generation,
+                    events,
+                    writer_closed,
+                );
+            }
             let epoch = runtime.snapshot.lock().epoch.clone();
             let output_stream = stream.try_clone().map_err(|e| e.to_string())?;
             let closed = writer_closed.clone();
@@ -901,6 +974,8 @@ pub(super) fn register_pty<G: Send + 'static>(
         host_start,
         runtime: snapshot.clone(),
     };
+    let screen = RuntimeScreen::new(cols, rows)
+        .map_err(|error| PtyLaunchError::ExecConfirmed(io::Error::other(error)))?;
     let mut pty = RegisteredPty {
         actor: SessionActor::start_hosted(
             pty.master,
@@ -937,7 +1012,7 @@ pub(super) fn register_pty<G: Send + 'static>(
                 record,
             )) = registration.recv()
             {
-                runtime_loop(actor, lease, record, rx, thread_view, thread_output);
+                runtime_loop(actor, lease, record, rx, thread_view, thread_output, screen);
             }
         })
         .map_err(|error| {
@@ -964,7 +1039,27 @@ fn dimensions(cols: u16, rows: u16) -> (u16, u16) {
     (cols.clamp(1, 400), rows.clamp(1, 120))
 }
 
-type Attachment = (String, Sender<Response>, Arc<AtomicBool>);
+struct Attachment {
+    client: String,
+    output: Sender<Response>,
+    closed: Arc<AtomicBool>,
+    viewport: Option<ViewportDelivery>,
+}
+
+struct RuntimeScreen {
+    terminal: Terminal,
+    legacy: ScreenReplay,
+}
+
+impl RuntimeScreen {
+    fn new(cols: u16, rows: u16) -> Result<Self, String> {
+        let (cols, rows) = (usize::from(cols), usize::from(rows));
+        Ok(Self {
+            terminal: Terminal::new_host_viewport(rows, cols)?,
+            legacy: ScreenReplay::with_budget(cols, rows, RUNTIME_OUTPUT_BYTES),
+        })
+    }
+}
 
 fn publish_output(
     bytes: &[u8],
@@ -972,7 +1067,7 @@ fn publish_output(
     output: &Mutex<RuntimeOutput>,
     owner: &mut Option<Attachment>,
     sequence: &mut u64,
-) {
+) -> bool {
     screen.feed(bytes);
     {
         let mut capture = output.lock();
@@ -984,8 +1079,12 @@ fn publish_output(
         }
     }
     *sequence = sequence.saturating_add(1);
-    if let Some((_, attached, _)) = owner {
+    if let Some(attached) = owner
+        .as_ref()
+        .filter(|view| view.viewport.is_none() && !view.closed.load(Ordering::Relaxed))
+    {
         if attached
+            .output
             .try_send(Response::Output {
                 sequence: *sequence,
                 bytes: bytes.to_vec(),
@@ -996,8 +1095,11 @@ fn publish_output(
                 owner,
                 "Output consumer fell behind. Reattach to restore the current screen.",
             );
+        } else {
+            return true;
         }
     }
+    false
 }
 
 fn runtime_loop(
@@ -1007,12 +1109,8 @@ fn runtime_loop(
     controls: Receiver<Control>,
     view: Arc<Mutex<RuntimeSnapshot>>,
     output: Arc<Mutex<RuntimeOutput>>,
+    mut screen: RuntimeScreen,
 ) {
-    let mut screen = ScreenReplay::with_budget(
-        record.runtime.cols as usize,
-        record.runtime.rows as usize,
-        RUNTIME_OUTPUT_BYTES,
-    );
     let mut owner: Option<Attachment> = None;
     let mut kill_at: Option<Instant> = None;
     let mut next_control = None;
@@ -1022,10 +1120,63 @@ fn runtime_loop(
     let exit = 'running: loop {
         if owner
             .as_ref()
-            .is_some_and(|(_, _, closed)| closed.load(Ordering::Relaxed))
+            .is_some_and(|owner| owner.closed.load(Ordering::Relaxed))
         {
             owner = None;
         }
+        for event in next_event
+            .take()
+            .into_iter()
+            .chain(actor.events().try_iter())
+            .take(32)
+        {
+            match event {
+                SessionEvent::Output(batch) => {
+                    let batch_read_at = batch
+                        .fragments()
+                        .next()
+                        .and_then(|fragment| fragment.origin)
+                        .map_or_else(Instant::now, |origin| origin.read_at);
+                    for bytes in batch.as_bytes().chunks(OUTPUT_CHUNK_BYTES) {
+                        let legacy_replies = publish_output(
+                            bytes,
+                            &mut screen.legacy,
+                            &output,
+                            &mut owner,
+                            &mut record.runtime.event_sequence,
+                        );
+                        for chunk in bytes.chunks(4096) {
+                            match screen.terminal.feed_at(chunk, batch_read_at) {
+                                Ok(reply) if !legacy_replies && !reply.is_empty() => {
+                                    if let Err(error) = actor.write_response(reply) {
+                                        if error != WriteError::Closed {
+                                            record.runtime.detail = format!(
+                                                "Workspace terminal reply rejected. {error}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    record.runtime.detail =
+                                        format!("Workspace terminal parser failed. {error}");
+                                }
+                            }
+                        }
+                    }
+                }
+                SessionEvent::ExitTail(status) => tail = status,
+                SessionEvent::Exit(code) => break 'running Ok(code),
+                SessionEvent::Error(error) => {
+                    if let Some(exit_error) = actor.hosted_exit_error() {
+                        break 'running Err(exit_error);
+                    }
+                    record.runtime.detail = error.clone();
+                    detach_with_error(&mut owner, &error);
+                }
+            }
+        }
+
         for control in next_control
             .take()
             .into_iter()
@@ -1039,6 +1190,7 @@ fn runtime_loop(
                     closed,
                     cols,
                     rows,
+                    generation,
                     ack,
                 } => {
                     if closed.load(Ordering::Relaxed) {
@@ -1056,20 +1208,42 @@ fn runtime_loop(
                         let _ = ack.try_send(Err("The session is stopping or its input queue is unavailable. Retry after it settles.".into()));
                         continue;
                     }
-                    resize(&actor, &mut screen, &mut record.runtime, cols, rows);
-                    let replay = match screen.snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES) {
-                        Ok(replay) => replay,
-                        Err(error) => {
-                            let _ = ack.try_send(Err(error));
-                            continue;
-                        }
-                    };
+                    if let Err(error) = resize(&actor, &mut screen, &mut record.runtime, cols, rows)
+                    {
+                        let _ = ack.try_send(Err(error));
+                        continue;
+                    }
                     let mut snapshot = record.runtime.clone();
                     snapshot.state = RuntimeState::Attached;
-                    let response = Response::Attached {
-                        snapshot,
-                        screen: replay,
-                        truncated: true,
+                    let (viewport, response) = if let Some(generation) = generation {
+                        match ViewportDelivery::attach(generation, &screen.terminal, &snapshot) {
+                            Ok((delivery, frame)) => (
+                                Some(delivery),
+                                Response::ViewportAttached {
+                                    snapshot,
+                                    frame: Box::new(frame),
+                                },
+                            ),
+                            Err(error) => {
+                                let _ = ack.try_send(Err(error));
+                                continue;
+                            }
+                        }
+                    } else {
+                        match screen.legacy.snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES) {
+                            Ok(replay) => (
+                                None,
+                                Response::Attached {
+                                    snapshot,
+                                    screen: replay,
+                                    truncated: true,
+                                },
+                            ),
+                            Err(error) => {
+                                let _ = ack.try_send(Err(error));
+                                continue;
+                            }
+                        }
                     };
                     if output.try_send(response).is_err() {
                         let _ = ack.try_send(Err(
@@ -1078,7 +1252,12 @@ fn runtime_loop(
                         continue;
                     }
                     if ack.try_send(Ok(())).is_ok() {
-                        owner = Some((client, output, closed));
+                        owner = Some(Attachment {
+                            client,
+                            output,
+                            closed,
+                            viewport,
+                        });
                         record.runtime.state = RuntimeState::Attached;
                     }
                 }
@@ -1115,7 +1294,31 @@ fn runtime_loop(
                     cols,
                     rows,
                 } if valid_owner(&owner, &client, &epoch, &record.runtime) => {
-                    resize(&actor, &mut screen, &mut record.runtime, cols, rows);
+                    let _ = resize(&actor, &mut screen, &mut record.runtime, cols, rows);
+                }
+                Control::Viewport {
+                    client,
+                    epoch,
+                    operation,
+                    reply,
+                } => {
+                    let result = if valid_owner(&owner, &client, &epoch, &record.runtime) {
+                        owner
+                            .as_mut()
+                            .and_then(|owner| owner.viewport.as_mut())
+                            .ok_or_else(|| "Workspace viewport lease is unavailable".to_string())
+                            .and_then(|viewport| {
+                                viewport.execute(
+                                    &screen.terminal,
+                                    &record.runtime,
+                                    &actor,
+                                    operation,
+                                )
+                            })
+                    } else {
+                        Err("Stale Workspace viewport attachment".into())
+                    };
+                    let _ = reply.try_send(result);
                 }
                 Control::Detach { client, epoch }
                     if valid_owner(&owner, &client, &epoch, &record.runtime) =>
@@ -1130,36 +1333,6 @@ fn runtime_loop(
                     record.runtime.state = RuntimeState::Stopping;
                 }
                 _ => {}
-            }
-        }
-
-        for event in next_event
-            .take()
-            .into_iter()
-            .chain(actor.events().try_iter())
-            .take(32)
-        {
-            match event {
-                SessionEvent::Output(batch) => {
-                    for bytes in batch.into_bytes().chunks(OUTPUT_CHUNK_BYTES) {
-                        publish_output(
-                            bytes,
-                            &mut screen,
-                            &output,
-                            &mut owner,
-                            &mut record.runtime.event_sequence,
-                        );
-                    }
-                }
-                SessionEvent::ExitTail(status) => tail = status,
-                SessionEvent::Exit(code) => break 'running Ok(code),
-                SessionEvent::Error(error) => {
-                    if let Some(exit_error) = actor.hosted_exit_error() {
-                        break 'running Err(exit_error);
-                    }
-                    record.runtime.detail = error.clone();
-                    detach_with_error(&mut owner, &error);
-                }
             }
         }
 
@@ -1224,12 +1397,19 @@ fn runtime_loop(
         Response::Error(record.runtime.detail.clone())
     };
     let _ = lease.write(&record);
-    output.lock().screen = screen
-        .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
-        .unwrap_or_default();
+    {
+        let mut output = output.lock();
+        output.screen = screen
+            .legacy
+            .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
+            .unwrap_or_default();
+        output.viewport = screen.terminal.frame().ok();
+    }
     *view.lock() = record.runtime;
-    if let Some((_, output, _)) = owner.take() {
-        let _ = output.try_send(event);
+    if let Some(owner) = owner.take() {
+        if owner.viewport.is_none() || matches!(event, Response::Error(_)) {
+            let _ = owner.output.try_send(event);
+        }
     }
 }
 
@@ -1241,31 +1421,35 @@ fn valid_owner(
 ) -> bool {
     owner
         .as_ref()
-        .is_some_and(|(id, _, closed)| id == client && !closed.load(Ordering::Relaxed))
+        .is_some_and(|owner| owner.client == client && !owner.closed.load(Ordering::Relaxed))
         && epoch == snapshot.epoch
 }
 fn detach_with_error(owner: &mut Option<Attachment>, error: &str) {
-    if let Some((_, output, _)) = owner.take() {
-        let _ = output.try_send(Response::Error(error.into()));
+    if let Some(owner) = owner.take() {
+        let _ = owner.output.try_send(Response::Error(error.into()));
     }
 }
 
 fn resize(
     actor: &SessionActor<HostedPty>,
-    screen: &mut ScreenReplay,
+    screen: &mut RuntimeScreen,
     snapshot: &mut RuntimeSnapshot,
     cols: u16,
     rows: u16,
-) {
+) -> Result<(), String> {
     let (cols, rows) = dimensions(cols, rows);
     if snapshot.cols == cols && snapshot.rows == rows {
-        return;
+        return Ok(());
     }
-    if actor.resize(cols as usize, rows as usize).is_ok() {
-        screen.resize(cols as usize, rows as usize);
-        snapshot.cols = cols;
-        snapshot.rows = rows;
-    }
+    screen
+        .terminal
+        .resize_with(usize::from(rows), usize::from(cols), || {
+            actor.resize(usize::from(cols), usize::from(rows))
+        })?;
+    screen.legacy.resize(usize::from(cols), usize::from(rows));
+    snapshot.cols = cols;
+    snapshot.rows = rows;
+    Ok(())
 }
 
 /// Provider CLI processes outside the host cannot be attached safely. Match

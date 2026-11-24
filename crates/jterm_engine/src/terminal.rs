@@ -45,14 +45,15 @@ pub use row_sources::TranscriptAnchor;
 
 const MAX_ROWS: usize = 128;
 const MAX_COLS: usize = 256;
+const HOST_MAX_COLS: usize = 400;
 /// Maximum UTF-8 bytes admitted by one encoded input operation.
 pub const MAX_INPUT_BYTES: usize = 4096;
 /// Largest native bracketed clipboard record, including both markers.
 pub const MAX_STREAMED_PASTE_BYTES: usize = u16::MAX as usize;
 /// Maximum bytes consumed or returned as replies by a single feed.
 pub const MAX_FEED_BYTES: usize = 65536;
-fn dimensions(rows: usize, cols: usize) -> Result<(), String> {
-    if rows == 0 || cols == 0 || rows > MAX_ROWS || cols > MAX_COLS {
+fn dimensions(rows: usize, cols: usize, max_cols: usize) -> Result<(), String> {
+    if rows == 0 || cols == 0 || rows > MAX_ROWS || cols > max_cols {
         Err("viewport out of bounds".into())
     } else {
         Ok(())
@@ -313,6 +314,7 @@ fn extract_selection(
 /// belong to the owning session.
 pub struct Terminal {
     epoch: NonZeroU64,
+    max_cols: usize,
     parser: Parser,
     screen: ScreenState,
     protocol: ProtocolState,
@@ -468,9 +470,24 @@ impl Terminal {
     }
 
     pub fn with_epoch(rows: usize, cols: usize, epoch: NonZeroU64) -> Result<Self, String> {
-        dimensions(rows, cols)?;
+        Self::with_grid_bound(rows, cols, epoch, MAX_COLS)
+    }
+
+    /// Keep the native host's existing width limit separate from wire limits.
+    pub fn new_host_viewport(rows: usize, cols: usize) -> Result<Self, String> {
+        Self::with_grid_bound(rows, cols, NonZeroU64::MIN, HOST_MAX_COLS)
+    }
+
+    fn with_grid_bound(
+        rows: usize,
+        cols: usize,
+        epoch: NonZeroU64,
+        max_cols: usize,
+    ) -> Result<Self, String> {
+        dimensions(rows, cols, max_cols)?;
         Ok(Self {
             epoch,
+            max_cols,
             parser: Parser::with_bounded_profile(
                 ParserLimits {
                     pending_bytes: 4096,
@@ -1983,7 +2000,7 @@ impl Terminal {
         cols: usize,
         resize_pty: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        dimensions(rows, cols)?;
+        dimensions(rows, cols, self.max_cols)?;
         let layout = self.layout.checked_add(1).ok_or("layout exhausted")?;
         let revision = self.revision.checked_add(1).ok_or("revision exhausted")?;
         resize_pty()?;
@@ -2143,8 +2160,8 @@ impl Terminal {
             },
             Limits {
                 max_rows: MAX_ROWS,
-                max_cols: MAX_COLS,
-                max_cells: MAX_ROWS * MAX_COLS,
+                max_cols: self.max_cols,
+                max_cells: MAX_ROWS * self.max_cols,
             },
             underline_colors,
         )

@@ -323,6 +323,7 @@ dependencies = [
  "fuzzy-matcher",
  "jagent",
  "jterm_engine",
+ "jterm_protocol",
  "jterm_remote_client",
  "jterm_runtime",
  "libc",
@@ -349,6 +350,14 @@ dependencies = [
  "smallvec",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "jterm_protocol"
+version = "0.1.0"
+dependencies = [
+ "jterm_engine",
+ "serde",
 ]
 
 [[package]]

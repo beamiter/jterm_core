@@ -73,6 +73,15 @@ pub enum Update {
     Delta { frame: WireDelta },
 }
 
+impl Update {
+    pub fn revision(&self) -> u32 {
+        match self {
+            Self::Snapshot { frame } => frame.revision,
+            Self::Delta { frame } => frame.revision,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WireDelta {
     pub version: u8,

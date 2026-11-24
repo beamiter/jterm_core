@@ -313,3 +313,17 @@ reaping after an exec-confirmed registration failure.
   confirmed multiline paste byte for byte, reopened the same provider PTY,
   and displayed its final output before handling exit. The native task
   fixture reopened the same running verification in a real user systemd scope.
+
+## Host-owned Workspace viewport (2026-11-24)
+
+- The Engine passed 401 cases and the terminal protocol passed its three
+  tests with the shared paint projection enabled. The Workspace suite
+  passed 118 tests and the Host integration suite passed 33. The viewport
+  socket test accepts a pending revision
+  acknowledgement after exit and releases the final frame only after that
+  acknowledgement.
+- The native Workspace fixture verifies one cursor-position reply while the
+  raw terminal owns the attachment, then a Host reply at column 300 while
+  detached from a 384-column PTY. Aether redraws the retained Host viewport
+  and sends reviewed paste as logical input. The provider sees the bracket
+  markers and payload byte for byte.

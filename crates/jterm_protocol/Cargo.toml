@@ -9,6 +9,10 @@ publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+jterm_engine = { version = "0.1.0", path = "../jterm_engine", optional = true }
+
+[features]
+engine-projection = ["dep:jterm_engine"]
 
 [dev-dependencies]
 serde_json = "1"

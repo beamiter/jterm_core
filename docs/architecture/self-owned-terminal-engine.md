@@ -96,9 +96,17 @@ If it has started when Stop retires it, the writer gets a bounded attempt
 to send the remainder of the closing marker. The Host reports an incomplete
 paste when that attempt fails.
 
-The attached Aether parser labels its replies for the reserved FIFO. Output
-continues draining into the Host's recovery screen and raw capture while
-detached.
+The Session Host applies output to the shared engine and owns replies while
+detached or serving an Aether viewport. It encodes key, text and paste requests
+using the same live terminal modes. Aether receives an immutable paint
+snapshot or exact-base delta, with one frame in flight until acknowledgement.
+An outstanding frame can be acknowledged after the provider exits, before
+the Host offers the final viewport.
+
+Raw terminal attachments receive a bounded ANSI compatibility snapshot and
+the live PTY stream. The attached legacy terminal answers its queries through
+that stream. The Host retains the compatibility replay and the raw output
+budget for these consumers and for task verification output.
 
 ## Initial host-context seam (Ember)
 

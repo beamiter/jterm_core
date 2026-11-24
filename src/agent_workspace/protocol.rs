@@ -1,4 +1,6 @@
 use super::model::*;
+use super::terminal_viewport::{WorkspaceViewportOperation, WorkspaceViewportReply};
+use jterm_protocol::terminal::WireFrame;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
@@ -302,6 +304,12 @@ pub(super) enum Request {
         launch: Box<ManagedLaunch>,
         client: String,
     },
+    AttachViewport {
+        version: u32,
+        launch: Box<ManagedLaunch>,
+        client: String,
+        generation: u32,
+    },
     AttachOwned {
         version: u32,
         terminal: super::native::OwnedTerminalDescriptor,
@@ -322,6 +330,11 @@ pub(super) enum Request {
         cols: u16,
         rows: u16,
     },
+    Viewport {
+        client: String,
+        epoch: String,
+        operation: WorkspaceViewportOperation,
+    },
     Detach {
         client: String,
         epoch: String,
@@ -332,7 +345,7 @@ fn is_user_input(kind: &InputKind) -> bool {
     matches!(kind, InputKind::User)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) enum Response {
     Reply(Box<Result<WorkspaceReply, String>>),
     Attached {
@@ -340,6 +353,11 @@ pub(super) enum Response {
         screen: Vec<u8>,
         truncated: bool,
     },
+    ViewportAttached {
+        snapshot: RuntimeSnapshot,
+        frame: Box<WireFrame>,
+    },
+    Viewport(Result<Box<WorkspaceViewportReply>, String>),
     Output {
         sequence: u64,
         bytes: Vec<u8>,

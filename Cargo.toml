@@ -18,6 +18,7 @@ terminal-session-actor-test-hooks = ["terminal-session-actor", "jterm_runtime/se
 
 [dependencies]
 jterm_engine = { version = "0.1.0", path = "crates/jterm_engine" }
+jterm_protocol = { version = "0.1.0", path = "crates/jterm_protocol", features = ["engine-projection"] }
 jterm_remote_client = { version = "0.1.0", path = "crates/jterm_remote_client" }
 jterm_runtime = { version = "0.1.0", path = "crates/jterm_runtime", features = ["session-actor"] }
 companion-protocol = { version = "0.1.0", git = "https://github.com/beamiter/jcompanion.git", rev = "9aa569540091524d637a7115b64c587b9177a55b" }

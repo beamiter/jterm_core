@@ -54,11 +54,12 @@
 //! provider runtimes. GUI queues, input queues and attachment output queues
 //! are bounded. An output consumer that falls behind must reconnect to a
 //! fresh viewport snapshot; it cannot backpressure the provider indefinitely.
-//! Reattachment restores the primary/alternate text viewports, cursor, common
-//! input modes and pending parser bytes. It does not replay historical OSC
-//! side effects, terminal images, or the entire terminal scrollback. Viewport
-//! snapshots have a 2 MiB wire budget. API history is separately paged in
-//! complete user/assistant pairs and never inferred from a terminal screen.
+//! The raw attachment restores the primary/alternate text viewports, cursor,
+//! input modes and pending parser bytes from a 2 MiB ANSI snapshot. Semantic
+//! attachments receive bounded paint frames and send logical input to the
+//! Host. The Host answers supported terminal queries while detached and when
+//! serving a semantic attachment. API history is separately paged in
+//! complete user/assistant pairs and stays independent of terminal capture.
 
 mod actions;
 mod api;
@@ -89,6 +90,7 @@ mod search;
 mod ssh;
 mod store;
 mod terminal_attachment;
+mod terminal_viewport;
 
 pub use actions::{WorkspaceAction, WorkspaceActionDescriptor, WorkspaceInputScope};
 pub use api::{
@@ -128,6 +130,10 @@ pub use search::*;
 pub use ssh::WorkspaceSshHost;
 pub(crate) use store::filter_deleted_cli_sessions;
 pub use terminal_attachment::{WorkspaceTerminalAttachment, WorkspaceTerminalEvent};
+pub use terminal_viewport::{
+    WorkspaceViewportAttachment, WorkspaceViewportOperation, WorkspaceViewportPoll,
+    WorkspaceViewportReply,
+};
 
 /// Host wire version. Mission commands are additive: legacy commands remain
 /// usable with a live V2 host, which does not know the new command variants.
