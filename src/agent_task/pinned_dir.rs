@@ -15,6 +15,13 @@ type Result<T> = std::result::Result<T, String>;
 pub struct PinnedDirectory(std::fs::File);
 
 #[cfg(unix)]
+impl std::os::fd::AsFd for PinnedDirectory {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(unix)]
 impl std::fmt::Debug for PinnedDirectory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use std::os::fd::AsRawFd;

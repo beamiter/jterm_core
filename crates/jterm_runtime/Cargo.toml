@@ -12,7 +12,7 @@ log = "0.4"
 jterm_engine = { version = "0.1.0", path = "../jterm_engine", optional = true }
 
 [features]
-linux-pty = ["terminal", "dep:portable-pty", "session-actor"]
+linux-pty = ["terminal", "session-actor"]
 session-actor = ["dep:crossbeam-channel", "dep:parking_lot"]
 session-actor-test-hooks = ["session-actor"]
 terminal = ["dep:jterm_engine"]
@@ -21,8 +21,5 @@ terminal = ["dep:jterm_engine"]
 libc = "0.2.189"
 crossbeam-channel = { version = "0.5", optional = true }
 parking_lot = { version = "0.12", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-portable-pty = { version = "0.9", optional = true }
 
 [workspace]

@@ -1,4 +1,4 @@
-//! Reuse-safe ownership for short-lived, application-controlled helpers.
+//! Reuse-safe child ownership for application-controlled helpers and PTYs.
 //!
 //! On Unix, a child in this module is the leader of a fresh process group. The
 //! root is observed with `waitid(..., WNOWAIT)`, which deliberately leaves it
@@ -20,18 +20,57 @@
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
 
-/// An owned helper child whose process group is cleared before reap on Unix.
+/// An owned child whose process group is cleared before reap on Unix.
 ///
-/// The underlying [`Child`] is deliberately opaque: callers may take its
-/// standard streams, observe the root without reaping it, and finish the
+/// The wait handle is deliberately opaque. Callers may take standard streams
+/// of a command, observe the root without reaping it, and finish the
 /// owned cleanup, but cannot accidentally poll its status destructively and
 /// release the PID early.
 pub struct SupervisedChild {
-    child: Option<Child>,
+    child: Option<ChildHandle>,
     #[cfg(unix)]
     process_group: i32,
     #[cfg(any(not(unix), test))]
     cached_status: Option<ExitStatus>,
+}
+
+enum ChildHandle {
+    Command(Child),
+    #[cfg(unix)]
+    Pty(libc::pid_t),
+}
+
+impl ChildHandle {
+    fn command(&mut self) -> Option<&mut Child> {
+        match self {
+            Self::Command(child) => Some(child),
+            #[cfg(unix)]
+            Self::Pty(_) => None,
+        }
+    }
+
+    fn kill_and_wait(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Command(child) => {
+                let _ = child.kill();
+                child.wait()
+            }
+            #[cfg(unix)]
+            Self::Pty(pid) => {
+                use std::os::unix::process::ExitStatusExt;
+                let mut status = 0;
+                // SAFETY: the caller proved exclusive wait ownership of
+                // this exact child before signalling its group.
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                    if libc::waitpid(*pid, &mut status, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(ExitStatus::from_raw(status))
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -79,6 +118,24 @@ pub(crate) fn require_waitable_sigchld() -> io::Result<()> {
 }
 
 impl SupervisedChild {
+    /// Take the exclusive wait from a confirmed native PTY startup.
+    #[cfg(unix)]
+    pub(crate) fn adopt_pty(pid: libc::pid_t) -> io::Result<Self> {
+        // SAFETY: getpgrp only reads the caller's process group.
+        if pid <= 1 || pid == unsafe { libc::getpgrp() } {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PTY child did not have a safe process-group id",
+            ));
+        }
+        Ok(Self {
+            child: Some(ChildHandle::Pty(pid)),
+            process_group: pid,
+            #[cfg(test)]
+            cached_status: None,
+        })
+    }
+
     /// Spawn a process in a fresh Unix session with fd 0 as its controlling
     /// PTY. Unlike process_group(0), setsid makes it a session leader before
     /// TIOCSCTTY. The same WNOWAIT/group-before-reap ownership applies.
@@ -98,7 +155,7 @@ impl SupervisedChild {
         }
         let (child, process_group) = validate_unix_child(command.spawn()?)?;
         Ok(Self {
-            child: Some(child),
+            child: Some(ChildHandle::Command(child)),
             process_group,
             #[cfg(test)]
             cached_status: None,
@@ -124,7 +181,7 @@ impl SupervisedChild {
         let child = command.spawn()?;
 
         Ok(Self {
-            child: Some(child),
+            child: Some(ChildHandle::Command(child)),
             #[cfg(unix)]
             process_group,
             #[cfg(any(not(unix), test))]
@@ -133,15 +190,15 @@ impl SupervisedChild {
     }
 
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.child.as_mut()?.stdin.take()
+        self.child.as_mut()?.command()?.stdin.take()
     }
 
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.child.as_mut()?.stdout.take()
+        self.child.as_mut()?.command()?.stdout.take()
     }
 
     pub fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.child.as_mut()?.stderr.take()
+        self.child.as_mut()?.command()?.stderr.take()
     }
 
     /// Observe a terminal root status without consuming it.
@@ -197,12 +254,16 @@ impl SupervisedChild {
         if self.cached_status.is_some() {
             return Ok(true);
         }
-        let child = self.child.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "supervised child was already reaped",
-            )
-        })?;
+        let child = self
+            .child
+            .as_mut()
+            .and_then(ChildHandle::command)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "supervised child was already reaped",
+                )
+            })?;
         match child.try_wait()? {
             Some(status) => {
                 self.cached_status = Some(status);
@@ -271,9 +332,8 @@ impl SupervisedChild {
         // A normal-exit zombie rejects or ignores this direct fallback without
         // changing its recorded status. A still-running timeout/cancel target
         // receives the same SIGKILL even if group signalling raced ESRCH.
-        let _ = child.kill();
         loop {
-            match child.wait() {
+            match child.kill_and_wait() {
                 Ok(status) => return Ok(status),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
@@ -453,7 +513,15 @@ mod tests {
         let pid = child.process_group_id();
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
-            match child.child.as_mut().unwrap().try_wait().unwrap() {
+            match child
+                .child
+                .as_mut()
+                .unwrap()
+                .command()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+            {
                 Some(status) => break status,
                 None => {
                     assert!(Instant::now() < deadline, "child did not exit");

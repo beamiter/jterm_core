@@ -1,14 +1,12 @@
 //! Explicit, host-owned validation execution. Commands never enter descriptors.
-use super::host::{self, RuntimeHandle, RuntimeOutput};
-use super::model::{ConversationId, RuntimeSnapshot, RuntimeState};
-use super::ownership::{process_start, Lease, LeaseRecord, NativeSessionLease, Paths};
+use super::host::{self, RuntimeHandle, RuntimePty};
+use super::model::ConversationId;
+use super::ownership::{Lease, NativeSessionLease, Paths};
 use crate::agent_task::{prepare_task_validation, AgentTask, PreparedTaskValidation};
+use crate::native_pty_launch::launch_hosted_pty;
 use crate::screen_replay::{resync_ring_head, ScreenReplay};
-use crate::supervised::SupervisedChild;
-use crossbeam_channel::bounded;
-use parking_lot::Mutex;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::os::fd::AsFd;
+use std::process::Command;
 use std::sync::Arc;
 
 pub(super) struct PreparedValidation {
@@ -66,19 +64,14 @@ pub(super) fn spawn(
     task_lease: Arc<NativeSessionLease>,
     search_path: Option<&str>,
 ) -> Result<RuntimeHandle, String> {
-    let mut lease = Lease::acquire(&paths.lease(&id))?;
-    let (master, slave) = host::open_pty(100, 30)?;
+    let lease = Lease::acquire(&paths.lease(&id))?;
     let mut command = Command::new(&prepared.argv[0]);
     command
         .args(&prepared.argv[1..])
-        .current_dir(prepared.prepared.pinned_cwd.proc_path())
         .env("TERM", "xterm-256color")
         .env("BASH_ENV", "/dev/null")
         .env("ENV", "/dev/null")
-        .env("ZDOTDIR", "/dev/null")
-        .stdin(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
-        .stdout(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
-        .stderr(Stdio::from(slave));
+        .env("ZDOTDIR", "/dev/null");
     if let Some(path) = search_path {
         command.env("PATH", path);
     }
@@ -93,70 +86,27 @@ pub(super) fn spawn(
     ] {
         command.env_remove(key);
     }
-    lease.configure_child(&mut command)?;
-    task_lease.configure_child(&mut command)?;
-    let directory = prepared.prepared.pinned_cwd.as_raw_fd();
-    // fchdir runs in the child while the pinned FD is still open. The user-
-    // visible canonical path is never re-resolved after preflight.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fchdir(directory) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = SupervisedChild::spawn_pty_session(&mut command)
-        .map_err(|e| format!("Could not start validation: {e}"))?;
-    let pid = child.process_group_id() as u32;
-    let start = super::ownership::supervised_process_start(&child)
-        .ok_or("Cannot record the owned validation process identity")?;
-    let snapshot = RuntimeSnapshot {
-        cleanup_verified: false,
-        id: id.clone(),
-        state: RuntimeState::Running,
-        pid,
-        process_start: start,
-        epoch: uuid::Uuid::new_v4().to_string(),
-        event_sequence: 0,
-        cols: 100,
-        rows: 30,
-        exit_code: None,
-        detail: "Host-owned validation PTY".into(),
-    };
-    let record = LeaseRecord {
+    let (master, child) = launch_hosted_pty(
+        &command,
+        Some(prepared.prepared.pinned_cwd.as_fd()),
+        30,
+        100,
+        &[lease.as_fd(), task_lease.as_ref().as_fd()],
+    )
+    .map_err(|e| format!("Could not start validation: {e}"))?;
+    host::register_pty(
         id,
-        host_pid: std::process::id(),
-        host_start: process_start(std::process::id()).ok_or("Cannot identify session host")?,
-        runtime: snapshot.clone(),
-    };
-    lease.write(&record)?;
-    let snapshot = Arc::new(Mutex::new(snapshot));
-    let output = Arc::new(Mutex::new(RuntimeOutput::default()));
-    let (control, rx) = bounded(128);
-    let thread_snapshot = snapshot.clone();
-    let thread_output = output.clone();
-    std::thread::Builder::new()
-        .name("jterm-validation-pty".into())
-        .spawn(move || {
-            let _task_lease = task_lease;
-            let _prepared = prepared;
-            host::runtime_loop(
-                master,
-                child,
-                lease,
-                record,
-                rx,
-                thread_snapshot,
-                thread_output,
-            );
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(RuntimeHandle {
-        control,
-        snapshot,
-        output,
-    })
+        (100, 30),
+        "jterm-validation-pty",
+        "Host-owned validation PTY",
+        RuntimePty {
+            master,
+            child,
+            lease,
+            guard: (prepared, task_lease),
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub(super) fn output(runtime: &RuntimeHandle, redact: bool) -> (String, bool) {

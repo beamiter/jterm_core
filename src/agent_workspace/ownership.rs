@@ -2,7 +2,7 @@ use super::model::{ConversationId, RuntimeSnapshot};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -131,6 +131,12 @@ pub(super) struct Lease {
     file: File,
 }
 
+impl AsFd for Lease {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 impl Lease {
     pub fn acquire(path: &Path) -> Result<Self, String> {
         let file = private_file(path)?;
@@ -174,6 +180,12 @@ impl Lease {
 pub struct NativeSessionLease {
     _lease: Lease,
     pub id: ConversationId,
+}
+
+impl AsFd for NativeSessionLease {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self._lease.as_fd()
+    }
 }
 
 impl std::fmt::Debug for NativeSessionLease {
@@ -399,6 +411,121 @@ mod tests {
         assert!(process_matches(pid, &start));
         assert!(!process_matches(pid, "different-start"));
     }
+
+    #[test]
+    fn hosted_pty_inherits_only_admitted_leases_and_uses_pinned_directory() {
+        if super::super::isolated_lease_test(
+            "agent_workspace::ownership::tests::hosted_pty_inherits_only_admitted_leases_and_uses_pinned_directory",
+        ) {
+            return;
+        }
+        use std::time::{Duration, Instant};
+
+        let root = std::env::temp_dir().join(format!("jterm-hosted-pty-{}", uuid::Uuid::new_v4()));
+        private_dir(&root).unwrap();
+        let source = root.join("source");
+        let moved = root.join("moved");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        let script = source.join("bin/pty-fixture");
+        // An executable without a shebang exercises execvp's shell fallback.
+        std::fs::write(
+            &script,
+            b"IFS= read -r line; test \"$line\" = ready || exit 42; exit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = File::open(&source).unwrap();
+        std::fs::rename(&source, &moved).unwrap();
+        std::fs::create_dir(&source).unwrap();
+
+        let admitted_path = root.join("admitted");
+        let unrelated_path = root.join("unrelated");
+        let admitted = Lease::acquire(&admitted_path).unwrap();
+        let unrelated = Lease::acquire(&unrelated_path).unwrap();
+        // An unlisted descriptor must also close if it wasn't already CLOEXEC.
+        assert_eq!(unsafe { libc::fcntl(unrelated.fd(), libc::F_SETFD, 0) }, 0);
+        let mut command = std::process::Command::new("pty-fixture");
+        command.current_dir(&source).env("PATH", "bin");
+        let (master, mut child) = crate::native_pty_launch::launch_hosted_pty(
+            &command,
+            Some(directory.as_fd()),
+            30,
+            100,
+            &[admitted.as_fd()],
+        )
+        .unwrap();
+        let child_directory = format!("/proc/{}/cwd", child.process_group_id());
+        assert_eq!(std::fs::read_link(child_directory).unwrap(), moved);
+        let flags = unsafe { libc::fcntl(admitted.fd(), libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        drop(admitted);
+        drop(unrelated);
+        assert!(lease_is_held(&admitted_path));
+        assert!(!lease_is_held(&unrelated_path));
+
+        File::from(master.try_clone().unwrap())
+            .write_all(b"ready\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child.root_has_exited().unwrap() {
+            assert!(Instant::now() < deadline, "hosted PTY did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(child.reap_after_group_kill().unwrap().code(), Some(23));
+        assert!(!lease_is_held(&admitted_path));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hosted_pty_registration_failure_reaps_exec_and_releases_the_lease() {
+        if super::super::isolated_lease_test(
+            "agent_workspace::ownership::tests::hosted_pty_registration_failure_reaps_exec_and_releases_the_lease",
+        ) {
+            return;
+        }
+        use super::super::host::{register_pty, RuntimePty};
+        use crate::native_pty_launch::{launch_hosted_pty, PtyLaunchError};
+
+        let root =
+            std::env::temp_dir().join(format!("jterm-hosted-register-{}", uuid::Uuid::new_v4()));
+        private_dir(&root).unwrap();
+        let path = root.join("owner");
+        File::create(&path).unwrap();
+        // An exclusive lock works on this descriptor. Writing its record fails.
+        let lease = Lease {
+            file: File::open(&path).unwrap(),
+        };
+        assert_eq!(
+            unsafe { libc::flock(lease.fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        let (master, child) = launch_hosted_pty(&command, None, 30, 100, &[lease.as_fd()]).unwrap();
+        let pid = child.process_group_id();
+        assert!(std::fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .ends_with("sleep"));
+        let result = register_pty(
+            ConversationId("test:hosted:registration-fault".into()),
+            (100, 30),
+            "jterm-test-pty",
+            "Test PTY",
+            RuntimePty {
+                master,
+                child,
+                lease,
+                guard: (),
+            },
+        );
+        assert!(matches!(result, Err(PtyLaunchError::ExecConfirmed(error))
+            if error.to_string().contains("cannot register PTY lease")));
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!lease_is_held(&path));
+        assert!(read_lease(&path).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn inherited_native_lease_survives_guard_drop_until_child_exits() {

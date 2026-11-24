@@ -219,10 +219,23 @@ class BoundaryTests(unittest.TestCase):
     def test_ember_shell_owns_one_shared_io_actor(self):
         adapter = (FAMILY / 'ember/src/shell.rs').read_text().split('#[cfg(test)]', 1)[0]
         self.assertIn('actor: SessionActor<Pty>,', adapter)
-        self.assertIn('SessionActor::start(pty, repaint_ctx)?', adapter)
+        self.assertIn('SessionActor::start(pty, repaint_ctx)', adapter)
         self.assertNotRegex(adapter, r'\b(?:fn (?:io_loop|write_to_pty)|struct WriteQueue)\b')
         source = (FAMILY / 'ember/src/output_batch.rs').read_text()
         self.assertIn('pub use jterm_core::output_batch::*;', source)
+
+    def test_local_pty_launches_share_the_runtime_owner(self):
+        for frontend in ('ember', 'frost'):
+            with self.subTest(frontend=frontend):
+                pty = (FAMILY / frontend / 'src/pty.rs').read_text().split('#[cfg(test)]', 1)[0]
+                self.assertIn('launch_pty(PtyLaunch {', pty)
+                self.assertIn('master: OwnedFd,', pty)
+                self.assertNotRegex(pty, r'libc::(?:fork|openpty|execve)\(')
+        session = (ENGINE.parent / 'jterm_runtime/src/pty_session.rs').read_text()
+        self.assertIn('launch_standalone_pty(command.spec', session)
+        self.assertIn('launch_bundled_bash(BundledBash {', session)
+        self.assertEqual(session.count('Self::register_program(pending, lease, terminal)'), 2)
+        self.assertNotIn('portable_pty', session)
 
     def test_region_mutations_execute_in_engine_without_host_policy(self):
         state = (FAMILY / 'ember/src/terminal/state.rs').read_text()

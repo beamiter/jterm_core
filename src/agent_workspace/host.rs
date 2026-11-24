@@ -4,18 +4,20 @@ use super::protocol::*;
 use super::store::Store;
 use super::PROTOCOL_VERSION;
 use crate::agent_sessions::{AgentSession, SessionProvider, SessionStatus};
+use crate::native_pty_launch::{launch_hosted_pty, PtyLaunchError};
+use crate::pty_reader::{drain_ready_exit_tail, read_master, ReadOutcome};
 use crate::screen_replay::ScreenReplay;
 use crate::supervised::SupervisedChild;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io::{self, BufReader, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +25,8 @@ use std::time::{Duration, Instant};
 const MAX_RUNTIMES: usize = 16;
 const MAX_CLIENTS: usize = 64;
 const MAX_INPUT: usize = 64 * 1024;
+const RUNTIME_OUTPUT_BYTES: usize = 128 * 1024;
+const RUNTIME_SCREEN_BYTES: usize = 2 * 1024 * 1024;
 
 enum AttachTarget {
     Provider(Box<ManagedLaunch>),
@@ -353,6 +357,9 @@ pub(super) fn run(paths: Paths) -> Result<(), String> {
             }
             Ok(HostRequest::Attach(target, client, output, closed, reply)) => {
                 let result = (|| {
+                    if closed.load(Ordering::Relaxed) {
+                        return Err("Attachment closed before Session Host admitted it".into());
+                    }
                     let launch = match target {
                         AttachTarget::Provider(launch) => launch,
                         AttachTarget::Owned(terminal, cols, rows) => {
@@ -429,36 +436,61 @@ fn attach(
 ) -> Result<RuntimeHandle, String> {
     let snapshot = runtime.snapshot.lock().clone();
     if !snapshot.state.is_live() {
-        output
-            .try_send(Response::Attached {
-                snapshot: snapshot.clone(),
-                screen: runtime.output.lock().screen.clone(),
-                truncated: true,
-            })
-            .map_err(|_| "Attachment closed")?;
-        output
-            .try_send(Response::Exited {
-                sequence: snapshot.event_sequence,
-                code: snapshot.exit_code,
-            })
-            .map_err(|_| "Attachment closed")?;
+        attach_exited(&runtime, snapshot, &output)?;
         return Ok(runtime);
     }
     let (ack, rx) = bounded(1);
-    runtime
+    if runtime
         .control
         .try_send(Control::Attach {
             client,
-            output,
+            output: output.clone(),
             closed,
             cols,
             rows,
             ack,
         })
-        .map_err(|_| "Runtime is busy or has exited")?;
-    rx.recv_timeout(Duration::from_secs(3))
-        .map_err(|_| "Runtime attach timed out")??;
+        .is_err()
+    {
+        let snapshot = runtime.snapshot.lock().clone();
+        if snapshot.state.is_live() {
+            return Err("The PTY is registered but its attachment queue is busy".into());
+        }
+        attach_exited(&runtime, snapshot, &output)?;
+    } else {
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(result) => result?,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                let snapshot = runtime.snapshot.lock().clone();
+                if snapshot.state.is_live() {
+                    return Err("The PTY is registered but its attachment closed".into());
+                }
+                attach_exited(&runtime, snapshot, &output)?;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                return Err("The PTY is registered but its attachment timed out".into());
+            }
+        }
+    }
     Ok(runtime)
+}
+
+fn attach_exited(
+    runtime: &RuntimeHandle,
+    snapshot: RuntimeSnapshot,
+    output: &Sender<Response>,
+) -> Result<(), String> {
+    let (sequence, code) = (snapshot.event_sequence, snapshot.exit_code);
+    output
+        .try_send(Response::Attached {
+            snapshot,
+            screen: runtime.output.lock().screen.clone(),
+            truncated: true,
+        })
+        .map_err(|_| "Attachment closed")?;
+    output
+        .try_send(Response::Exited { sequence, code })
+        .map_err(|_| "Attachment closed".into())
 }
 
 fn project_runtime_row(
@@ -543,20 +575,29 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
             let (reply, rx) = bounded(1);
             let writer_closed = Arc::new(AtomicBool::new(false));
             let _close_attachment = CloseAttachment(writer_closed.clone());
-            host.try_send(HostRequest::Attach(
-                target,
-                client.clone(),
-                output,
-                writer_closed.clone(),
-                reply,
-            ))
-            .map_err(|_| "Host attach queue is busy")?;
-            let runtime = match rx
-                .recv_timeout(Duration::from_secs(8))
-                .map_err(|_| "Host attach timed out")?
+            if host
+                .try_send(HostRequest::Attach(
+                    target,
+                    client.clone(),
+                    output,
+                    writer_closed.clone(),
+                    reply,
+                ))
+                .is_err()
             {
-                Ok(runtime) => runtime,
-                Err(error) => return write_frame(&mut stream, &Response::Error(error)),
+                return write_frame(
+                    &mut stream,
+                    &Response::Error("Session Host attachment queue is busy".into()),
+                );
+            }
+            let runtime = match rx.recv_timeout(Duration::from_secs(8)) {
+                Ok(Ok(runtime)) => runtime,
+                Ok(Err(error)) => return write_frame(&mut stream, &Response::Error(error)),
+                Err(_) => {
+                    writer_closed.store(true, Ordering::Relaxed);
+                    let message = "Session Host did not confirm the attachment. The PTY may already be running.";
+                    return write_frame(&mut stream, &Response::Error(message.into()));
+                }
             };
             let epoch = runtime.snapshot.lock().epoch.clone();
             let output_stream = stream.try_clone().map_err(|e| e.to_string())?;
@@ -694,26 +735,22 @@ pub(super) fn spawn_runtime_with_native(
     // Native app-server profiles are isolated and may have an owner before
     // their first thread ID is known. The profile lease bridges that phase
     // and is released only by an acknowledged native-to-CLI handoff.
-    let profile_lease = if native.is_none()
+    if native.is_none()
         && launch.provider == "codex"
         && launch
             .provider_home
             .join("jterm-native-profile.json")
             .is_file()
     {
-        Some(NativeSessionLease::acquire_at(
+        let _profile_lease = NativeSessionLease::acquire_at(
             &paths.state,
             SessionProvider::Codex,
             &launch.provider_home,
             "native-profile",
-        )?)
-    } else {
-        None
-    };
-    if profile_lease.is_some() {
+        )?;
         return Err("Open the native task and choose Continue in Terminal to acquire a fresh access grant for this exact thread".into());
     }
-    let mut lease = match native
+    let lease = match native
         .as_mut()
         .and_then(|options| options.session_lease.take())
     {
@@ -721,7 +758,6 @@ pub(super) fn spawn_runtime_with_native(
         None => Lease::acquire(&paths.lease(&launch.row.id))?,
     };
     let (cols, rows) = dimensions(launch.cols, launch.rows);
-    let (master, slave) = open_pty(cols, rows)?;
     let mut command = if let Some(options) = &native {
         let first = options
             .argv
@@ -742,10 +778,9 @@ pub(super) fn spawn_runtime_with_native(
                 .arg("resume")
                 .arg(&launch.native_id)
                 .env("CODEX_HOME", &launch.provider_home);
-            if profile_lease.is_some()
-                || native
-                    .as_ref()
-                    .is_some_and(|options| options.profile.is_some())
+            if native
+                .as_ref()
+                .is_some_and(|options| options.profile.is_some())
             {
                 command.arg("--cd").arg(&launch.cwd);
             }
@@ -758,14 +793,7 @@ pub(super) fn spawn_runtime_with_native(
         }
         _ => return Err("Unsupported managed provider".into()),
     }
-    command
-        .stdin(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
-        .stdout(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
-        .stderr(Stdio::from(slave));
-    lease.configure_child(&mut command)?;
-    if let Some(profile) = &profile_lease {
-        profile.configure_child(&mut command)?;
-    }
+    let mut inherited = vec![lease.as_fd()];
     if let Some(options) = &native {
         let provider = if launch.provider == "codex" {
             crate::agent_task::AgentProvider::Codex
@@ -775,28 +803,61 @@ pub(super) fn spawn_runtime_with_native(
         options
             .context
             .configure_authentication(&mut command, provider);
-        options.execution_lease.configure_child(&mut command)?;
+        inherited.push(options.execution_lease.as_ref().as_fd());
         if let Some(profile) = &options.profile {
-            profile
-                .configure_child_command(&mut command)
-                .map_err(|e| e.to_string())?;
-        }
-        if let Some(lease) = &options.session_lease {
-            lease.configure_child(&mut command)?;
+            inherited.extend(profile.inherited_descriptors());
         }
         if let Some(grant) = &options.grant {
-            grant.configure_child(&mut command);
+            grant.configure_environment(&mut command);
+            inherited.extend(grant.inherited_descriptors());
         }
     }
-    let child = SupervisedChild::spawn_pty_session(&mut command)
+    let (master, child) = launch_hosted_pty(&command, None, rows, cols, &inherited)
         .map_err(|e| format!("Could not start {}: {e}", launch.provider))?;
-    let pid = child.process_group_id() as u32;
-    let Some(start) = super::ownership::supervised_process_start(&child) else {
-        return Err("Could not record the owned provider process identity".into());
+    register_pty(
+        launch.row.id.clone(),
+        (cols, rows),
+        "jterm-managed-pty",
+        "Persistent PTY owned by jterm Session Host",
+        RuntimePty {
+            master,
+            child,
+            lease,
+            guard: native,
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub(super) struct RuntimePty<G> {
+    pub master: OwnedFd,
+    pub child: SupervisedChild,
+    pub lease: Lease,
+    // Keep supplementary leases and grants alive through child cleanup,
+    // including failed registration before the worker has taken ownership.
+    pub guard: G,
+}
+
+pub(super) fn register_pty<G: Send + 'static>(
+    id: ConversationId,
+    (cols, rows): (u16, u16),
+    thread_name: &str,
+    detail: &str,
+    mut pty: RuntimePty<G>,
+) -> Result<RuntimeHandle, PtyLaunchError> {
+    let pid = pty.child.process_group_id() as u32;
+    let Some(start) = supervised_process_start(&pty.child) else {
+        return Err(PtyLaunchError::ExecConfirmed(io::Error::other(
+            "cannot record the owned PTY process identity",
+        )));
     };
+    let host_pid = std::process::id();
+    let host_start = process_start(host_pid).ok_or_else(|| {
+        PtyLaunchError::ExecConfirmed(io::Error::other("cannot identify Session Host process"))
+    })?;
     let snapshot = RuntimeSnapshot {
         cleanup_verified: false,
-        id: launch.row.id.clone(),
+        id: id.clone(),
         state: RuntimeState::Running,
         pid,
         process_start: start,
@@ -805,29 +866,57 @@ pub(super) fn spawn_runtime_with_native(
         cols,
         rows,
         exit_code: None,
-        detail: "Persistent PTY owned by jterm Session Host".into(),
+        detail: detail.into(),
     };
     let record = LeaseRecord {
-        id: launch.row.id.clone(),
-        host_pid: std::process::id(),
-        host_start: process_start(std::process::id())
-            .ok_or("Cannot identify session host process")?,
+        id,
+        host_pid,
+        host_start,
         runtime: snapshot.clone(),
     };
-    lease.write(&record)?;
     let view = Arc::new(Mutex::new(snapshot));
     let (control, rx) = bounded(128);
+    let (registered, registration) = bounded::<(RuntimePty<G>, LeaseRecord)>(1);
     let output = Arc::new(Mutex::new(RuntimeOutput::default()));
     let thread_output = output.clone();
     let thread_view = view.clone();
     std::thread::Builder::new()
-        .name("jterm-managed-pty".into())
+        .name(thread_name.into())
         .spawn(move || {
-            let _profile_lease = profile_lease;
-            let _native_options = native;
-            runtime_loop(master, child, lease, record, rx, thread_view, thread_output)
+            if let Ok((
+                RuntimePty {
+                    master,
+                    child,
+                    lease,
+                    guard: _guard,
+                },
+                record,
+            )) = registration.recv()
+            {
+                runtime_loop(
+                    File::from(master),
+                    child,
+                    lease,
+                    record,
+                    rx,
+                    thread_view,
+                    thread_output,
+                );
+            }
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| {
+            PtyLaunchError::ExecConfirmed(io::Error::other(format!(
+                "cannot start PTY worker: {error}"
+            )))
+        })?;
+    pty.lease.write(&record).map_err(|error| {
+        PtyLaunchError::ExecConfirmed(io::Error::other(format!(
+            "cannot register PTY lease: {error}"
+        )))
+    })?;
+    registered.send((pty, record)).map_err(|_| {
+        PtyLaunchError::ExecConfirmed(io::Error::other("PTY worker stopped during registration"))
+    })?;
     Ok(RuntimeHandle {
         control,
         snapshot: view,
@@ -839,44 +928,45 @@ fn dimensions(cols: u16, rows: u16) -> (u16, u16) {
     (cols.clamp(1, 400), rows.clamp(1, 120))
 }
 
-pub(super) fn open_pty(cols: u16, rows: u16) -> Result<(File, File), String> {
-    let mut master = -1;
-    let mut slave = -1;
-    let winsize = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &winsize,
-        )
-    } != 0
+type Attachment = (String, Sender<Response>, Arc<AtomicBool>);
+
+fn publish_output(
+    bytes: &[u8],
+    screen: &mut ScreenReplay,
+    output: &Mutex<RuntimeOutput>,
+    owner: &mut Option<Attachment>,
+    sequence: &mut u64,
+) -> bool {
+    screen.feed(bytes);
     {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let master = unsafe { File::from_raw_fd(master) };
-    let slave = unsafe { File::from_raw_fd(slave) };
-    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+        let mut capture = output.lock();
+        capture.raw.extend(bytes);
+        if capture.raw.len() > RUNTIME_OUTPUT_BYTES {
+            let excess = capture.raw.len() - RUNTIME_OUTPUT_BYTES;
+            capture.raw.drain(..excess);
+            capture.truncated = true;
         }
     }
-    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
-        return Err(std::io::Error::last_os_error().to_string());
+    *sequence = sequence.saturating_add(1);
+    if let Some((_, attached, _)) = owner {
+        if attached
+            .try_send(Response::Output {
+                sequence: *sequence,
+                bytes: bytes.to_vec(),
+            })
+            .is_err()
+        {
+            detach_with_error(
+                owner,
+                "Output consumer fell behind. Reattach to restore the current screen.",
+            );
+            return false;
+        }
     }
-    Ok((master, slave))
+    true
 }
 
-pub(super) fn runtime_loop(
+fn runtime_loop(
     mut master: File,
     mut child: SupervisedChild,
     mut lease: Lease,
@@ -888,9 +978,9 @@ pub(super) fn runtime_loop(
     let mut screen = ScreenReplay::with_budget(
         record.runtime.cols as usize,
         record.runtime.rows as usize,
-        128 * 1024,
+        RUNTIME_OUTPUT_BYTES,
     );
-    let mut owner: Option<(String, Sender<Response>, Arc<AtomicBool>)> = None;
+    let mut owner: Option<Attachment> = None;
     let mut pending: VecDeque<u8> = VecDeque::new();
     let mut stopping: Option<Instant> = None;
     let mut bytes = [0u8; OUTPUT_CHUNK_BYTES];
@@ -911,6 +1001,11 @@ pub(super) fn runtime_loop(
                     rows,
                     ack,
                 } => {
+                    if closed.load(Ordering::Relaxed) {
+                        let _ = ack
+                            .try_send(Err("Attachment closed before the PTY could attach".into()));
+                        continue;
+                    }
                     if owner.is_some() {
                         let _=ack.try_send(Err("This session is attached to another terminal. Detach that terminal with Ctrl+] before attaching here.".into()));
                         continue;
@@ -920,21 +1015,18 @@ pub(super) fn runtime_loop(
                         continue;
                     }
                     resize(&master, &mut screen, &mut record.runtime, cols, rows);
-                    record.runtime.state = if stopping.is_some() {
-                        RuntimeState::Stopping
-                    } else {
-                        RuntimeState::Attached
-                    };
-                    let snapshot = match screen.snapshot_ansi_bounded(2 * 1024 * 1024) {
-                        Ok(snapshot) => snapshot,
+                    let replay = match screen.snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES) {
+                        Ok(replay) => replay,
                         Err(error) => {
                             let _ = ack.try_send(Err(error));
                             continue;
                         }
                     };
+                    let mut snapshot = record.runtime.clone();
+                    snapshot.state = RuntimeState::Attached;
                     let response = Response::Attached {
-                        snapshot: record.runtime.clone(),
-                        screen: snapshot,
+                        snapshot,
+                        screen: replay,
                         truncated: true,
                     };
                     if output.try_send(response).is_err() {
@@ -943,8 +1035,10 @@ pub(super) fn runtime_loop(
                         ));
                         continue;
                     }
-                    owner = Some((client, output, closed));
-                    let _ = ack.try_send(Ok(()));
+                    if ack.try_send(Ok(())).is_ok() {
+                        owner = Some((client, output, closed));
+                        record.runtime.state = RuntimeState::Attached;
+                    }
                 }
                 Control::Input {
                     client,
@@ -1001,40 +1095,21 @@ pub(super) fn runtime_loop(
             }
         }
         for _ in 0..32 {
-            match master.read(&mut bytes) {
-                Ok(0) => break,
-                Ok(n) => {
-                    screen.feed(&bytes[..n]);
-                    {
-                        let mut capture = output.lock();
-                        capture.raw.extend(&bytes[..n]);
-                        if capture.raw.len() > 128 * 1024 {
-                            let excess = capture.raw.len() - 128 * 1024;
-                            capture.raw.drain(..excess);
-                            capture.truncated = true;
-                        }
-                    }
-                    record.runtime.event_sequence = record.runtime.event_sequence.saturating_add(1);
-                    if let Some((_, output, _)) = &owner {
-                        if output
-                            .try_send(Response::Output {
-                                sequence: record.runtime.event_sequence,
-                                bytes: bytes[..n].to_vec(),
-                            })
-                            .is_err()
-                        {
-                            detach_with_error(&mut owner,"Output consumer fell behind. Reattach to restore the current screen.");
-                            pending.clear();
-                        }
+            match read_master(master.as_fd(), &mut bytes) {
+                Ok(ReadOutcome::Data(n)) => {
+                    if !publish_output(
+                        &bytes[..n],
+                        &mut screen,
+                        &output,
+                        &mut owner,
+                        &mut record.runtime.event_sequence,
+                    ) {
+                        pending.clear();
                     }
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::Interrupted =>
-                {
+                Ok(ReadOutcome::WouldBlock | ReadOutcome::Eof | ReadOutcome::Hangup) | Err(_) => {
                     break
                 }
-                Err(_) => break,
             }
         }
         match child.root_has_exited() {
@@ -1051,14 +1126,31 @@ pub(super) fn runtime_loop(
                         record.runtime.state = RuntimeState::Failed;
                         record.runtime.detail = format!("Could not stop provider group: {error}");
                         detach_with_error(&mut owner, &record.runtime.detail);
+                        let _ = lease.write(&record);
                         output.lock().screen = screen
-                            .snapshot_ansi_bounded(2 * 1024 * 1024)
+                            .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
                             .unwrap_or_default();
                         *view.lock() = record.runtime;
                         return;
                     }
                 };
                 let empty = wait_group_empty(group, Duration::from_secs(2));
+                let tail = drain_ready_exit_tail(
+                    master.as_fd(),
+                    |bytes| {
+                        publish_output(
+                            &bytes,
+                            &mut screen,
+                            &output,
+                            &mut owner,
+                            &mut record.runtime.event_sequence,
+                        );
+                        // The retained capture still needs the tail if the live
+                        // attachment fell behind.
+                        true
+                    },
+                    || false,
+                );
                 record.runtime.cleanup_verified = empty;
                 record.runtime.state = RuntimeState::Exited;
                 record.runtime.exit_code = Some(
@@ -1069,18 +1161,21 @@ pub(super) fn runtime_loop(
                 if !empty {
                     record.runtime.detail="Provider exited; descendant cleanup is still pending. Its inherited lease prevents a second writer.".into();
                 }
-                record.runtime.event_sequence = record.runtime.event_sequence.saturating_add(1);
-                if let Some((_, output, _)) = owner.take() {
-                    let _ = output.try_send(Response::Exited {
-                        sequence: record.runtime.event_sequence,
-                        code: record.runtime.exit_code,
-                    });
+                if let Some(notice) = tail.and_then(|tail| tail.notice()) {
+                    output.lock().truncated = true;
+                    record.runtime.detail.push(' ');
+                    record.runtime.detail.push_str(notice);
                 }
+                record.runtime.event_sequence = record.runtime.event_sequence.saturating_add(1);
+                let (sequence, code) = (record.runtime.event_sequence, record.runtime.exit_code);
                 let _ = lease.write(&record);
                 output.lock().screen = screen
-                    .snapshot_ansi_bounded(2 * 1024 * 1024)
+                    .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
                     .unwrap_or_default();
                 *view.lock() = record.runtime;
+                if let Some((_, output, _)) = owner.take() {
+                    let _ = output.try_send(Response::Exited { sequence, code });
+                }
                 return;
             }
             Err(error) => {
@@ -1090,7 +1185,7 @@ pub(super) fn runtime_loop(
                 detach_with_error(&mut owner, &record.runtime.detail);
                 let _ = lease.write(&record);
                 output.lock().screen = screen
-                    .snapshot_ansi_bounded(2 * 1024 * 1024)
+                    .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
                     .unwrap_or_default();
                 *view.lock() = record.runtime;
                 return;
@@ -1118,7 +1213,7 @@ pub(super) fn runtime_loop(
 }
 
 fn valid_owner(
-    owner: &Option<(String, Sender<Response>, Arc<AtomicBool>)>,
+    owner: &Option<Attachment>,
     client: &str,
     epoch: &str,
     snapshot: &RuntimeSnapshot,
@@ -1128,7 +1223,7 @@ fn valid_owner(
         .is_some_and(|(id, _, closed)| id == client && !closed.load(Ordering::Relaxed))
         && epoch == snapshot.epoch
 }
-fn detach_with_error(owner: &mut Option<(String, Sender<Response>, Arc<AtomicBool>)>, error: &str) {
+fn detach_with_error(owner: &mut Option<Attachment>, error: &str) {
     if let Some((_, output, _)) = owner.take() {
         let _ = output.try_send(Response::Error(error.into()));
     }

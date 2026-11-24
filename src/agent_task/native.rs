@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -247,6 +247,13 @@ impl PreparedNativeCodexHome {
                 .map_err(NativeCodexHomeError::Create)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn inherited_descriptors(&self) -> impl Iterator<Item = BorrowedFd<'_>> {
+        self.execution_lease
+            .iter()
+            .map(|lease| lease.as_ref().as_fd())
+            .chain(self.profile_lease.iter().map(AsFd::as_fd))
     }
 
     pub(crate) fn record_thread(path: &Path, thread_id: &str) -> Result<(), NativeCodexHomeError> {

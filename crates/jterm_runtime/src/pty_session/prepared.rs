@@ -214,7 +214,7 @@ mod tests {
         })
         .unwrap();
         let (master, child) = pending
-            .adopt(|master, pid, _| {
+            .adopt(|master, pid| {
                 ChildLifecycle::new(pid, ReapOwner::Ours).map(|child| (master, child))
             })
             .unwrap();

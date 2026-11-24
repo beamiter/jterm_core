@@ -276,3 +276,25 @@ SHA-256; no expected value was recaptured or changed. The checked-in utility
 `scripts/intern-oracle-fixture.py` supports independent reconstruction. All three
 original oracle comparisons, four decoder tests, both frontend test compilations
 and all-target Clippy pass after the format-only change.
+
+## Hosted PTY candidate and family pin check (2026-11-24)
+
+Provider CLI sessions and native task verification now use the shared native
+PTY launch handshake. Real child tests cover descriptor-scoped leases, pinned
+directory entry after a path rename, access to the sealed handoff grant, and
+reaping after an exec-confirmed registration failure.
+
+- Runtime tests passed across 122 unit cases and one wait-ownership integration
+  case. Clippy with warnings denied passed for both the full and minimal feature
+  sets. All 20 source boundary checks passed.
+- The Workspace library suite passed 116 tests. The Session Host integration
+  suite passed 33 tests serially, with three internal fixtures ignored. Aether's
+  native X11 WebKitGTK
+  tests recovered the same CLI PTY across window close and reopen, preserved
+  running validation across reopen, and rejected stale verification evidence.
+  The native task journey used a local provider fixture in a real user systemd
+  scope.
+- The six committed release baselines resolve all seven production lock graphs
+  to core `7982ef5` with Frost's local pin commit `df100c0`. Frost checked all
+  targets against that Git dependency with `--locked`. The hosted PTY candidate
+  was tested with a local core override.

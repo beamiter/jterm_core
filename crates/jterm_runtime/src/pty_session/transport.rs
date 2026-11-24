@@ -2,92 +2,50 @@
 use super::{bounded_write, reaper, ChildLifecycle};
 use crate::pty_reader::read_master;
 use crate::session_actor::{ReadOutcome, SessionTransport, WriteOutcome};
-use portable_pty::{MasterPty, PtySize};
 use std::{
     io,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 pub(super) struct Transport {
-    master: Master,
+    master: OwnedFd,
     child: Option<Arc<ChildLifecycle>>,
     lease: Option<reaper::Lease>,
 }
 
-enum Master {
-    Portable {
-        owner: Box<dyn MasterPty + Send>,
-        fd: RawFd,
-    },
-    Native(OwnedFd),
-}
-
 impl Transport {
-    pub(super) fn new(
-        master: Box<dyn MasterPty + Send>,
-        fd: RawFd,
-        child: Arc<ChildLifecycle>,
-        lease: reaper::Lease,
-    ) -> Self {
+    pub(super) fn new(master: OwnedFd, child: Arc<ChildLifecycle>, lease: reaper::Lease) -> Self {
         Self {
-            master: Master::Portable { owner: master, fd },
-            child: Some(child),
-            lease: Some(lease),
-        }
-    }
-
-    pub(super) fn from_native(
-        master: OwnedFd,
-        child: Arc<ChildLifecycle>,
-        lease: reaper::Lease,
-    ) -> Self {
-        Self {
-            master: Master::Native(master),
+            master,
             child: Some(child),
             lease: Some(lease),
         }
     }
 
     #[cfg(test)]
-    pub(super) fn size(&self) -> PtySize {
-        match &self.master {
-            Master::Portable { owner, .. } => owner.get_size().unwrap(),
-            Master::Native(master) => {
-                let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
-                assert_eq!(
-                    unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) },
-                    0
-                );
-                let size = unsafe { size.assume_init() };
-                PtySize {
-                    rows: size.ws_row,
-                    cols: size.ws_col,
-                    pixel_width: size.ws_xpixel,
-                    pixel_height: size.ws_ypixel,
-                }
-            }
-        }
+    pub(super) fn size(&self) -> libc::winsize {
+        let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+        // SAFETY: the master is live and ioctl writes one winsize on success.
+        assert_eq!(
+            unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) },
+            0
+        );
+        unsafe { size.assume_init() }
     }
 }
 
 impl Drop for Transport {
     fn drop(&mut self) {
-        if matches!(&self.master, Master::Native(_)) {
-            // Actor setup can fail after the startup wait owner handed off.
-            self.handoff_cleanup();
-        }
+        // Actor setup can fail after the startup wait owner handed off.
+        self.handoff_cleanup();
     }
 }
 
 impl AsFd for Transport {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        match &self.master {
-            // The owner stays alive for this borrow of the transport.
-            Master::Portable { fd, .. } => unsafe { BorrowedFd::borrow_raw(*fd) },
-            Master::Native(master) => master.as_fd(),
-        }
+        self.master.as_fd()
     }
 }
 
@@ -101,18 +59,7 @@ impl SessionTransport for Transport {
     }
 
     fn resize(&mut self, cols: usize, rows: usize) -> Result<(), String> {
-        match &self.master {
-            Master::Portable { owner, .. } => owner
-                .resize(PtySize {
-                    rows: rows as u16,
-                    cols: cols as u16,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|error| error.to_string()),
-            Master::Native(master) => resize_master(master.as_fd(), cols as u16, rows as u16)
-                .map_err(|error| error.to_string()),
-        }
+        resize_master(self.as_fd(), cols as u16, rows as u16).map_err(|error| error.to_string())
     }
 
     fn is_alive(&mut self) -> bool {

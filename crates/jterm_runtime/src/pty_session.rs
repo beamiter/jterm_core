@@ -5,7 +5,9 @@ use crate::child_lifecycle::{
     observe_child_exit, ChildExitOutcome, ChildLifecycle, EscalationPolicy, ProcessRef,
 };
 use crate::exit_status::{ExitTail, PtyExit};
-use crate::native_pty_launch::{launch_bundled_bash, BundledBash};
+use crate::native_pty_launch::{
+    launch_bundled_bash, launch_standalone_pty, BundledBash, PendingPty, PtyLaunchError,
+};
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{SessionActor, SessionEvent};
 use crate::supervised::require_waitable_sigchld;
@@ -15,7 +17,6 @@ use jterm_engine::frame::CellFrame;
 use jterm_engine::terminal::{
     Terminal, MAX_FEED_BYTES as READ_BUDGET, MAX_INPUT_BYTES as MAX_INPUT, MAX_STREAMED_PASTE_BYTES,
 };
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::{
     collections::VecDeque,
     ffi::OsString,
@@ -28,9 +29,11 @@ use std::{
 
 mod input_queue;
 mod prepared;
+mod program;
 mod transport;
 use input_queue::InputQueue;
 pub use prepared::PreparedPty;
+use program::Program;
 use transport::Transport;
 
 const INPUT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -84,7 +87,8 @@ mod reaper {
     }
     pub(super) enum Job {
         Bound(Arc<ChildLifecycle>),
-        ObserveOnly(Box<dyn Child + Send + Sync>),
+        #[cfg(test)]
+        Probe(Box<dyn FnMut() -> io::Result<bool> + Send>),
     }
 
     impl Job {
@@ -109,8 +113,8 @@ mod reaper {
                         Some(ChildExitOutcome::Exited(_) | ChildExitOutcome::Signaled(_))
                     )
                 }
-                // A failure to bind can retain only the original wait owner.
-                Self::ObserveOnly(child) => matches!(child.try_wait(), Ok(Some(_))),
+                #[cfg(test)]
+                Self::Probe(probe) => probe().unwrap_or(false),
             }
         }
     }
@@ -272,41 +276,16 @@ mod reaper {
     mod tests {
         use super::*;
         use std::sync::atomic::AtomicUsize;
-        #[derive(Debug)]
-        struct FakeChild {
-            state: Arc<AtomicUsize>,
+        fn probe(state: &Arc<AtomicUsize>) -> Job {
+            let state = Arc::clone(state);
+            Job::Probe(Box::new(move || match state.load(Ordering::Acquire) {
+                0 => Ok(false),
+                1 => Err(io::Error::from_raw_os_error(libc::ECHILD)),
+                2 => Ok(true),
+                _ => panic!("injected child polling panic"),
+            }))
         }
-        impl portable_pty::ChildKiller for FakeChild {
-            fn kill(&mut self) -> std::io::Result<()> {
-                panic!("portable kill forbidden");
-            }
-            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-                Box::new(Self {
-                    state: self.state.clone(),
-                })
-            }
-        }
-        impl Child for FakeChild {
-            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-                match self.state.load(Ordering::Acquire) {
-                    0 => Ok(None),
-                    1 => Err(std::io::Error::from_raw_os_error(libc::ECHILD)),
-                    2 => Ok(Some(portable_pty::ExitStatus::with_exit_code(0))),
-                    _ => panic!("injected child polling panic"),
-                }
-            }
-            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-                panic!("blocking wait forbidden");
-            }
-            fn process_id(&self) -> Option<u32> {
-                None
-            }
-        }
-        fn child(state: &Arc<AtomicUsize>) -> Box<dyn Child + Send + Sync> {
-            Box::new(FakeChild {
-                state: state.clone(),
-            })
-        }
+
         #[test]
         fn startup_failure_publishes_no_reaper_or_child() {
             assert!(initialize(|_| Err("injected worker startup failure".into())).is_err());
@@ -325,7 +304,7 @@ mod reaper {
             .join()
             .is_err());
             let state = Arc::new(AtomicUsize::new(2));
-            lease.handoff(Job::ObserveOnly(child(&state)));
+            lease.handoff(probe(&state));
             owner.tick();
             assert!(owner.reserve().is_err());
             assert!(ticket.pending.load(Ordering::Acquire));
@@ -341,10 +320,7 @@ mod reaper {
             let owner = Reaper::table();
             let state = Arc::new(AtomicUsize::new(0));
             for _ in 0..CAPACITY {
-                owner
-                    .reserve()
-                    .unwrap()
-                    .handoff(Job::ObserveOnly(child(&state)));
+                owner.reserve().unwrap().handoff(probe(&state));
             }
             for _ in 0..3 {
                 owner.tick();
@@ -371,21 +347,21 @@ mod reaper {
             assert!(owner.reserve().is_ok());
         }
         #[test]
-        fn wait_error_retains_observe_only_slot_until_confirmed_reap() {
+        fn wait_error_holds_the_slot_until_confirmed_reap() {
             for initial in [0, 1] {
                 let owner = Reaper::table();
                 let state = Arc::new(AtomicUsize::new(initial));
                 let lease = owner.reserve().unwrap();
                 let index = lease.index;
                 let ticket = lease.ticket.clone();
-                lease.handoff(Job::ObserveOnly(child(&state)));
+                lease.handoff(probe(&state));
                 owner.tick();
                 {
                     let slots = owner.slots.lock().unwrap();
                     assert!(matches!(
                         &slots[index],
                         Slot::Pending(OwnedChild {
-                            job: Job::ObserveOnly(_),
+                            job: Job::Probe(_),
                             ..
                         })
                     ));
@@ -409,7 +385,7 @@ mod reaper {
             let state = Arc::new(AtomicUsize::new(3));
             let lease = owner.reserve().unwrap();
             let ticket = lease.ticket.clone();
-            lease.handoff(Job::ObserveOnly(child(&state)));
+            lease.handoff(probe(&state));
             owner.tick();
             assert!(owner.reserve().is_err());
             assert!(ticket.pending.load(Ordering::Acquire));
@@ -496,6 +472,13 @@ impl SessionIo {
     }
 }
 
+fn launch_error(error: PtyLaunchError) -> String {
+    match error {
+        PtyLaunchError::Prepare(error) => error.to_string(),
+        error => error.to_string(),
+    }
+}
+
 /// Owns the direct PTY child and its wait status. Other child watchers in
 /// the embedding process must only wait for PIDs they own.
 pub struct Session {
@@ -524,11 +507,10 @@ impl Session {
 
     pub fn spawn_with_epoch(rows: usize, cols: usize, epoch: NonZeroU64) -> Result<Self, String> {
         let terminal = Terminal::with_epoch(rows, cols, epoch)?;
-        let mut command = CommandBuilder::new("/bin/sh");
-        command.arg("-i");
-        command.env("TERM", "dumb");
-        command.env("PS1", "$ ");
-        command.env("ENV", "/dev/null");
+        let command = Program::interactive(
+            "/bin/sh".into(),
+            &[("TERM", "dumb"), ("PS1", "$ "), ("ENV", "/dev/null")],
+        )?;
         Self::spawn_program(rows, cols, terminal, command)
     }
 
@@ -543,9 +525,7 @@ impl Session {
         let path = std::env::var_os("PATH")
             .and_then(|path| find_installed_jsh(&path))
             .ok_or("jsh executable not found on the application PATH")?;
-        let mut command = CommandBuilder::new(path);
-        command.arg("-i");
-        command.env("TERM", "xterm");
+        let command = Program::interactive(path, &[("TERM", "xterm")])?;
         terminal.observe_command_blocks();
         Self::spawn_program(rows, cols, terminal, command)
     }
@@ -560,8 +540,7 @@ impl Session {
         env: &[(OsString, OsString)],
     ) -> Result<Self, String> {
         let terminal = Terminal::new(rows, cols)?;
-        let (program, args) = argv.split_first().ok_or("missing PTY command")?;
-        if program.is_empty() {
+        if argv.first().is_none_or(|program| program.is_empty()) {
             return Err("missing PTY command".into());
         }
         let cwd = match cwd {
@@ -574,13 +553,7 @@ impl Session {
         if !cwd.is_dir() {
             return Err("PTY working directory is not a directory".into());
         }
-        let mut command = CommandBuilder::new(program);
-        command.args(args);
-        command.cwd(&cwd);
-        command.env_clear();
-        for (key, value) in env {
-            command.env(key, value);
-        }
+        let command = Program::command(argv, &cwd, env)?;
         let mut session = Self::spawn_program(rows, cols, terminal, command)?;
         session.enable_ordered_input();
         Ok(session)
@@ -597,7 +570,6 @@ impl Session {
     ) -> Result<Self, String> {
         let terminal = Terminal::new(rows, cols)?;
         let lease = reaper::global()?.reserve()?;
-        let reap_ticket = lease.ticket.clone();
         let pending = launch_bundled_bash(BundledBash {
             executable,
             startup_script,
@@ -608,14 +580,8 @@ impl Session {
             rows: rows as u16,
             columns: cols as u16,
         })
-        .map_err(|error| error.to_string())?;
-        let (transport, lifecycle) = pending
-            .adopt(|master, pid, _token| {
-                let child = ChildLifecycle::new_kernel_bound(pid)?;
-                Ok::<_, io::Error>((Transport::from_native(master, child.clone(), lease), child))
-            })
-            .map_err(|error| error.to_string())?;
-        let mut session = Self::with_transport(transport, lifecycle, reap_ticket, terminal)?;
+        .map_err(launch_error)?;
+        let mut session = Self::register_program(pending, lease, terminal)?;
         session.enable_ordered_input();
         Ok(session)
     }
@@ -624,51 +590,29 @@ impl Session {
         rows: usize,
         cols: usize,
         terminal: Terminal,
-        command: CommandBuilder,
+        command: Program,
     ) -> Result<Self, String> {
         require_waitable_sigchld().map_err(|error| error.to_string())?;
         let lease = reaper::global()?.reserve()?;
+        let pending =
+            launch_standalone_pty(command.spec(rows as u16, cols as u16)).map_err(launch_error)?;
+        Self::register_program(pending, lease, terminal)
+    }
+
+    fn register_program(
+        pending: PendingPty,
+        lease: reaper::Lease,
+        terminal: Terminal,
+    ) -> Result<Self, String> {
         let reap_ticket = lease.ticket.clone();
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: rows as u16,
-                cols: cols as u16,
-                pixel_width: 0,
-                pixel_height: 0,
+        let (transport, lifecycle) = pending
+            .adopt(|master, pid| {
+                let child = ChildLifecycle::new_kernel_bound(pid)?;
+                Ok::<_, io::Error>((Transport::new(master, child.clone(), lease), child))
             })
-            .map_err(|e| e.to_string())?;
-        let fd = pair
-            .master
-            .as_raw_fd()
-            .ok_or("nonblocking PTY unsupported")?;
-        // The cloned descriptors share the same open-file status flags.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|e| e.to_string())?;
-        drop(pair.slave);
-        let lifecycle = match child
-            .process_id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .ok_or("child has no process id".to_string())
-            .and_then(|pid| ChildLifecycle::new_kernel_bound(pid).map_err(|e| e.to_string()))
-        {
-            Ok(lifecycle) => lifecycle,
-            Err(error) => {
-                drop(pair.master);
-                lease.handoff(reaper::Job::ObserveOnly(child));
-                return Err(format!("child pidfd unavailable: {error}"));
-            }
-        };
-        // portable-pty's Unix child is std::process::Child, whose Drop leaves
-        // the wait status with the explicit lifecycle owner.
-        drop(child);
-        let transport = Transport::new(pair.master, fd, lifecycle.clone(), lease);
+            .map_err(|error| PtyLaunchError::ExecConfirmed(error).to_string())?;
         Self::with_transport(transport, lifecycle, reap_ticket, terminal)
+            .map_err(|error| format!("shell exec confirmed but session setup failed: {error}"))
     }
 
     fn with_transport(
@@ -1269,7 +1213,7 @@ mod tests {
             self.io.as_mut().unwrap()
         }
 
-        fn kernel_size(&self) -> PtySize {
+        fn kernel_size(&self) -> libc::winsize {
             self.io
                 .as_ref()
                 .unwrap()
@@ -1284,6 +1228,53 @@ mod tests {
         }
         assert!(!s.cleanup_pending(), "owned child did not finish cleanup");
     }
+
+    #[test]
+    fn explicit_command_uses_child_path_and_closes_unregistered_descriptors() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let input = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: input is live. F_DUPFD returns an owned descriptor whose
+        // close-on-exec flag is clear so the launcher must isolate it.
+        let fd = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_DUPFD, 128) };
+        assert!(fd >= 128);
+        let ambient = unsafe { OwnedFd::from_raw_fd(fd) };
+        let args = [
+            "sh".into(),
+            "-c".into(),
+            concat!(
+                "test ! -e \"/proc/self/fd/$AMBIENT_FD\" || exit 78; ",
+                "printf 'LAUNCHED %s %s %s\\n' \"$0\" \"$VALUE\" \"$PWD\"; exit 127"
+            )
+            .into(),
+        ];
+        let environment = [
+            ("PATH".into(), "bin".into()),
+            ("VALUE".into(), "first".into()),
+            ("VALUE".into(), "last".into()),
+            ("AMBIENT_FD".into(), ambient.as_raw_fd().to_string().into()),
+        ];
+        let mut session =
+            Session::spawn_command(6, 72, &args, Some(Path::new("/")), &environment).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.is_drained() {
+            assert!(
+                Instant::now() < deadline,
+                "standalone command did not drain"
+            );
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.exit_code(), Some(127));
+        assert!(session
+            .terminal()
+            .visible_text()
+            .contains("LAUNCHED sh last /"));
+        assert!(unsafe { libc::fcntl(ambient.as_raw_fd(), libc::F_GETFD) } >= 0);
+        session.close().unwrap();
+        await_cleanup(&session);
+    }
+
     struct ScriptedWriter {
         steps: VecDeque<Result<usize, std::io::ErrorKind>>,
         bytes: Vec<u8>,
@@ -1512,7 +1503,7 @@ mod tests {
         }
         session.resize(14, 94).unwrap();
         let size = session.kernel_size();
-        assert_eq!((size.rows, size.cols), (14, 94));
+        assert_eq!((size.ws_row, size.ws_col), (14, 94));
         session
             .submit_input(b"printf '\\nNATIVE_GRID_RESULT\\n'; exit 7\r".to_vec())
             .unwrap();
@@ -1894,7 +1885,10 @@ mod tests {
         for (rows, cols) in [(1, 1), (128, 256), (3, 9)] {
             s.resize(rows, cols).unwrap();
             let kernel = s.kernel_size();
-            assert_eq!((kernel.rows as usize, kernel.cols as usize), (rows, cols));
+            assert_eq!(
+                (kernel.ws_row as usize, kernel.ws_col as usize),
+                (rows, cols)
+            );
             let frame = s.terminal().frame().unwrap();
             assert_eq!((frame.rows().len(), frame.cols()), (rows, cols));
         }
@@ -1918,7 +1912,7 @@ mod tests {
             assert!(s.resize(rows, cols).is_err());
         }
         let kernel = s.kernel_size();
-        assert_eq!((kernel.rows, kernel.cols), (3, 9));
+        assert_eq!((kernel.ws_row, kernel.ws_col), (3, 9));
         assert_eq!(s.terminal().frame().unwrap().stamp(), before.stamp());
         s.close().unwrap();
         assert!(s.resize(4, 8).is_err());

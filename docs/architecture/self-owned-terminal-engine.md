@@ -48,6 +48,36 @@ Wake callbacks must be nonblocking, thread-safe and non-panicking. Publish data
 before waking and do not hold queue locks while calling the sink. Wakes may
 coalesce; payloads may not. The sink does not own cancellation or a process.
 
+## Native PTY startup ownership
+
+The Unix runtime owns the master and child wait from PTY allocation through
+the exec handshake. Ember and Frost prepare their own command and restore
+policy before starting this launcher. Aether and GTK standalone sessions use
+the same handshake and adopt the owned master into the existing kernel-bound
+session reaper before starting I/O workers.
+
+The child reports the failing setup stage and errno on a private pipe. A
+program that execs and exits immediately retains its actual exit status.
+Registration failures retain the exec-confirmed phase because the command
+may have had effects. Ember and Frost retry a saved session in the default
+directory after a confirmed directory failure.
+An external fatal signal can close the pipe between the exec marker and the
+syscall. The recovery policy treats an unclassified launch failure as
+ineligible for a directory retry.
+
+The ordinary standalone profile preserves argv, the supplied environment and
+relative PATH resolution against the child directory. It closes ambient
+descriptors and resets the inherited signal mask. Anvil's bundled Bash
+explicitly inherits its sealed startup script and private identity channel.
+Both profiles use the same standalone transport with an owned native master.
+GTK hosted attachments use that transport for the local relay. The Session
+Host launches provider and validation PTYs through the same allocator and exec
+handshake. It admits the runtime leases and any native handoff grant descriptors
+explicitly, then gives its existing supervisor the exclusive child wait.
+Validation enters the pinned directory by descriptor. The Host registers the
+lease after the I/O worker starts and drains the bounded exit tail before
+publishing the terminal result.
+
 ## Initial host-context seam (Ember)
 
 `TerminalState::new_with_host_context` accepts an owned hostname and trusted

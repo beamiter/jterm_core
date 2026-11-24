@@ -1,8 +1,9 @@
 //! One-shot Linux shell-integration identity transport.
 
+use crate::pty_reader::cloexec_pipe_above_stdio;
 use std::fmt::Write as _;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 /// A private token and its pipe, prepared before forking a shell. Both ends
 /// begin close-on-exec. Only the child may admit the read end across exec.
@@ -46,41 +47,12 @@ impl ShellIdentityChannel {
     }
 }
 
-pub(super) fn cloexec_pipe_above_stdio() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut descriptors = [-1; 2];
-    // SAFETY: the array provides space for both new descriptor numbers.
-    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `pipe2` returned two fresh, owned descriptors. Own both
-    // before attempting the fallible remap above stdin/stdout/stderr.
-    let (read_end, write_end) = unsafe {
-        (
-            OwnedFd::from_raw_fd(descriptors[0]),
-            OwnedFd::from_raw_fd(descriptors[1]),
-        )
-    };
-    Ok((move_above_stdio(read_end)?, move_above_stdio(write_end)?))
-}
-
-pub(super) fn move_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
-    if fd.as_raw_fd() > libc::STDERR_FILENO {
-        return Ok(fd);
-    }
-    // SAFETY: `fd` pins the source, and fcntl returns a fresh CLOEXEC duplicate.
-    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the duplicate is now owned by this process.
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn token_and_both_cloexec_descriptors_form_one_bounded_channel() {

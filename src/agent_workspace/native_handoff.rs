@@ -5,9 +5,8 @@ use crate::agent_task::pinned_dir::PinnedDirectory;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 pub(super) struct CodexCliGrant {
@@ -203,20 +202,11 @@ impl CodexCliGrant {
             marker_identity,
         })
     }
-    pub fn configure_child(&self, command: &mut std::process::Command) {
+    pub fn configure_environment(&self, command: &mut std::process::Command) {
         command.env("CODEX_HOME", self.profile.proc_path());
-        let fds = [self.profile.as_raw_fd(), self.token.as_raw_fd()];
-        unsafe {
-            command.pre_exec(move || {
-                for fd in fds {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
-        }
+    }
+    pub fn inherited_descriptors(&self) -> [BorrowedFd<'_>; 2] {
+        [self.profile.as_fd(), self.token.as_fd()]
     }
 }
 impl Drop for CodexCliGrant {
@@ -388,6 +378,29 @@ mod tests {
             .unwrap()
             .write_all(b"replacement")
             .is_err());
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "/usr/bin/grep -Fq chatgptAuthTokens \"$CODEX_HOME/auth.json\"",
+        ]);
+        grant.configure_environment(&mut command);
+        let (_master, mut child) = crate::native_pty_launch::launch_hosted_pty(
+            &command,
+            None,
+            24,
+            80,
+            &grant.inherited_descriptors(),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !child.root_has_exited().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grant probe did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(child.reap_after_group_kill().unwrap().success());
         drop(grant);
         assert!(!path.join("auth.json").exists());
         assert!(!path.join(GRANT_MARKER).exists());

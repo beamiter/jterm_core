@@ -178,12 +178,13 @@ release runtime ownership. If the host dies while a descendant survives, another
 host fails closed rather than starting a duplicate. A recorded PID or elapsed
 timeout alone is never enough to steal a lease.
 
-`SupervisedChild::spawn_pty_session` establishes the controlling terminal.
-Explicit Stop and abnormal cleanup terminate the group, handle TERM-ignoring
-descendants, and delay leader reaping until supervision finishes. Failed
-startup removes incomplete runtime rows and stops any child already created.
-Exited providers are recorded as exited; historical messages are not evidence
-of current execution.
+The shared native PTY launcher establishes the controlling terminal. The host
+registers the runtime after it confirms exec and starts the I/O worker.
+Registration errors retain the exec-confirmed phase and reap the child before
+releasing its leases. Attachment uses the registered runtime and its epoch.
+Explicit Stop and abnormal cleanup terminate the group and delay leader reaping
+until supervision finishes. The host reads the bounded final output before
+recording exit and publishing the terminal result.
 
 ## Native providers
 
