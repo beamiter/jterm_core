@@ -11,8 +11,29 @@ use std::{borrow::Cow, ops::Range};
 // unbounded GTK document. The host retains the original capture separately.
 const MAX_LAYOUT_UNITS: usize = 256 * 1024;
 const UNITS_PER_PARAGRAPH: usize = 64;
-const MAX_SPANS: usize = 512;
-const MAX_LINKS: usize = 128;
+pub(super) const MAX_SPANS: usize = 512;
+pub(super) const MAX_LINKS: usize = 128;
+
+fn literal_run_layout_units(text: &str) -> usize {
+    text.bytes().fold(text.len(), |cost, byte| {
+        cost + match byte {
+            b'\n' => UNITS_PER_PARAGRAPH,
+            b'\t' => 7, // one visible tab can occupy eight cells
+            _ => 0,
+        }
+    })
+}
+
+fn is_literal_run(text: &str) -> bool {
+    text.chars()
+        .all(|ch| matches!(ch, '\n' | '\t' | ' '..='~') || is_literal_archive_unicode(ch))
+}
+
+pub(super) fn is_bounded_document_text(text: &str) -> bool {
+    text.len() <= MAX_LAYOUT_UNITS
+        && literal_run_layout_units(text) + UNITS_PER_PARAGRAPH <= MAX_LAYOUT_UNITS
+        && is_literal_run(text)
+}
 
 /// Project a bounded finalized capture of plain text and supported SGR into
 /// immutable text and style ranges. The caller still owns the retained bytes
@@ -174,21 +195,8 @@ fn project_literal_archive(capture: &str) -> Option<ArchivedText> {
         } else {
             Cow::Borrowed(raw)
         };
-        layout_units += run.len();
-        for byte in run.bytes() {
-            layout_units += match byte {
-                b'\n' => UNITS_PER_PARAGRAPH,
-                b'\t' => 7, // one visible tab can occupy eight cells
-                _ => 0,
-            };
-        }
-        if layout_units > MAX_LAYOUT_UNITS {
-            return None;
-        }
-        if !run
-            .chars()
-            .all(|ch| matches!(ch, '\n' | '\t' | ' '..='~') || is_literal_archive_unicode(ch))
-        {
+        layout_units += literal_run_layout_units(&run);
+        if layout_units > MAX_LAYOUT_UNITS || !is_literal_run(&run) {
             return None;
         }
         let start = output.text.len();

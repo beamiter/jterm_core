@@ -101,10 +101,12 @@
 //! history keeps it anyway.
 
 mod archived_text;
+mod finished_document;
 pub use archived_text::{
     filter_archived_output, project_bounded_archive, project_bounded_command_archive,
     project_finished_output,
 };
+pub use finished_document::{FinishedDocument, FinishedHistoryFrame};
 mod emulator;
 mod grid;
 mod parser;
