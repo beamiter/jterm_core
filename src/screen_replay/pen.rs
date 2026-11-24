@@ -170,8 +170,10 @@ pub(super) fn supported_archive_sgr(params: &Params) -> bool {
             | 1
             | 3
             | 4
+            | 7
             | 9
             | 21..=24
+            | 27
             | 29..=37
             | 39..=47
             | 49

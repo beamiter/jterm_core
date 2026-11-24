@@ -20,14 +20,16 @@ use crate::{
 const FINISHED_HYPERLINK: &str = "jterm-finished-explicit-hyperlink";
 const MAX_REFERENCE_DOCUMENT_CHARS: i32 = 256 * 1024;
 
-/// A literal command within the shell integration budget, with LF as the only
-/// permitted line break.
+/// A literal command within the shell integration budget. Tabs retain their
+/// terminal stop width, and LF is the only line break.
 pub fn supports_finished_command(command: &str) -> bool {
     !command.is_empty()
         && command == command.trim()
         && command.len() <= MAX_OSC133_COMMAND_BYTES
         && command.chars().all(|ch| {
-            ch.is_ascii_graphic() || matches!(ch, ' ' | '\n') || is_literal_archive_unicode(ch)
+            ch.is_ascii_graphic()
+                || matches!(ch, ' ' | '\n' | '\t')
+                || is_literal_archive_unicode(ch)
         })
 }
 
@@ -44,6 +46,7 @@ pub struct FinishedTextView {
     hyperlink_tag: gtk4::TextTag,
     links: Rc<RefCell<Vec<PresentedLink>>>,
     palette: Rc<Cell<[gdk::RGBA; 16]>>,
+    default_colors: Rc<Cell<(gdk::RGBA, gdk::RGBA)>>,
     background_style: Rc<RefCell<Option<gtk4::CssProvider>>>,
 }
 
@@ -182,6 +185,7 @@ impl FinishedTextView {
             hyperlink_tag,
             links: Rc::new(RefCell::new(Vec::new())),
             palette: Rc::new(Cell::new(*palette)),
+            default_colors: Rc::new(Cell::new((foreground, gdk::RGBA::BLACK))),
             background_style: Rc::new(RefCell::new(None)),
         };
         view.apply_font();
@@ -316,7 +320,7 @@ impl FinishedTextView {
                 })
                 .strikethrough(span.style.flags.strikethrough())
                 .build();
-            set_span_colors(&tag, span.style, &palette);
+            set_span_colors(&tag, span.style, &palette, self.default_colors.get());
             table.add(&tag);
             buffer.apply_tag(
                 &tag,
@@ -339,6 +343,17 @@ impl FinishedTextView {
 
     pub fn set_foreground(&self, foreground: gdk::RGBA) {
         self.colors[0].0.set_foreground_rgba(Some(&foreground));
+        self.default_colors
+            .set((foreground, self.default_colors.get().1));
+        self.update_archive_colors();
+    }
+
+    /// The terminal backdrop used for inverse video. The document can still
+    /// have a transparent widget background inside its card.
+    pub fn set_terminal_background(&self, background: gdk::RGBA) {
+        self.default_colors
+            .set((self.default_colors.get().0, background));
+        self.update_archive_colors();
     }
 
     #[allow(deprecated)]
@@ -363,6 +378,7 @@ impl FinishedTextView {
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
         let layout = self.widget.create_pango_layout(Some(&text));
         layout.set_font_description(self.font.font_desc().as_ref());
+        layout.set_tabs(self.widget.tabs().as_ref());
         layout.pixel_size().0
     }
 
@@ -377,12 +393,20 @@ impl FinishedTextView {
 
     pub fn set_colors(&self, foreground: gdk::RGBA, palette: &[gdk::RGBA; 16]) {
         self.palette.set(*palette);
+        self.default_colors
+            .set((foreground, self.default_colors.get().1));
         for (tag, color) in &self.colors {
             let color = color.map_or(foreground, |index| palette[index]);
             tag.set_foreground_rgba(Some(&color));
         }
+        self.update_archive_colors();
+    }
+
+    fn update_archive_colors(&self) {
+        let palette = self.palette.get();
+        let defaults = self.default_colors.get();
         for (tag, style) in self.output_tags.borrow().iter() {
-            set_span_colors(tag, *style, palette);
+            set_span_colors(tag, *style, &palette, defaults);
         }
     }
 
@@ -394,6 +418,12 @@ impl FinishedTextView {
         } else {
             font.set_size(scaled as i32);
         }
+        let metrics = self.widget.pango_context().metrics(Some(&font), None);
+        let tab_width = metrics.approximate_digit_width().max(1).saturating_mul(8);
+        let mut tabs = pango::TabArray::new(2, false);
+        tabs.set_tab(0, pango::TabAlign::Left, tab_width);
+        tabs.set_tab(1, pango::TabAlign::Left, tab_width.saturating_mul(2));
+        self.widget.set_tabs(&tabs);
         self.font.set_font_desc(Some(&font));
         self.widget.queue_resize();
     }
@@ -442,11 +472,24 @@ fn finished_link_at(
     Some(PresentedLink::text_span(start, end, target))
 }
 
-fn set_span_colors(tag: &gtk4::TextTag, style: ArchiveStyle, palette: &[gdk::RGBA; 16]) {
+fn set_span_colors(
+    tag: &gtk4::TextTag,
+    style: ArchiveStyle,
+    palette: &[gdk::RGBA; 16],
+    defaults: (gdk::RGBA, gdk::RGBA),
+) {
     let color =
         |value| (value != Color::Default).then(|| terminal_color(value, gdk::RGBA::BLACK, palette));
-    tag.set_foreground_rgba(color(style.foreground).as_ref());
-    tag.set_background_rgba(color(style.background).as_ref());
+    let mut foreground = color(style.foreground);
+    let mut background = color(style.background);
+    if style.flags.inverse() {
+        let mut ink = background.unwrap_or(defaults.1);
+        ink.set_alpha(1.0);
+        background = Some(foreground.unwrap_or(defaults.0));
+        foreground = Some(ink);
+    }
+    tag.set_foreground_rgba(foreground.as_ref());
+    tag.set_background_rgba(background.as_ref());
     tag.set_underline_rgba(color(style.underline_color).as_ref());
 }
 
@@ -568,6 +611,7 @@ mod tests {
     fn command_profile_accepts_literal_paths_and_multiline_commands() {
         assert!(supports_finished_command("echo needle needle"));
         assert!(supports_finished_command("printf '%s' value"));
+        assert!(supports_finished_command("echo one\ttwo"));
         assert!(supports_finished_command("echo 好 e\u{301} 👩‍💻"));
         assert!(supports_finished_command(
             "cd ./src && \\\nrg file.rs:9 https://example.test"
@@ -575,13 +619,65 @@ mod tests {
         for command in [
             "",
             "echo one\rtwo",
-            "echo one\ttwo",
             "echo \x1b[31mcolor",
             "echo \u{202e}unsafe",
             "echo trailing ",
         ] {
             assert!(!supports_finished_command(command), "{command:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn finished_documents_keep_tab_stops_and_recolor_inverse_video() {
+        use jterm_engine::archived_text::ArchiveSpan;
+
+        gtk4::init().expect("GTK display");
+        let palette = crate::default_ansi_palette();
+        let font = pango::FontDescription::from_string("Monospace 13");
+        let foreground = gdk::RGBA::new(0.82, 0.81, 0.80, 1.0);
+        let background = gdk::RGBA::new(0.15, 0.25, 0.35, 1.0);
+        let tabbed =
+            FinishedTextView::command("A\tB", b"A\tB", font.clone(), 1.0, foreground, &palette)
+                .expect("tab is part of the literal command");
+        let spaces = FinishedTextView::command(
+            "A       B",
+            b"A       B",
+            font.clone(),
+            1.0,
+            foreground,
+            &palette,
+        )
+        .unwrap();
+        assert!((tabbed.natural_width() - spaces.natural_width()).abs() <= 1);
+        tabbed.set_font_scale(1.6);
+        spaces.set_font_scale(1.6);
+        assert!((tabbed.natural_width() - spaces.natural_width()).abs() <= 1);
+        let buffer = tabbed.widget().buffer();
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            "A\tB"
+        );
+
+        let mut inverse = ArchiveStyle::default();
+        inverse.flags.set_inverse(true);
+        let archive = ArchivedText {
+            text: "selection".to_owned(),
+            spans: vec![ArchiveSpan {
+                bytes: 0..9,
+                style: inverse,
+            }],
+            ..ArchivedText::default()
+        };
+        let view = FinishedTextView::output(&archive, font, 1.0, foreground, &palette);
+        view.set_terminal_background(background);
+        let tag = view.output_tags.borrow()[0].0.clone();
+        assert_eq!(tag.foreground_rgba(), Some(background));
+        assert_eq!(tag.background_rgba(), Some(foreground));
+        let new_foreground = gdk::RGBA::WHITE;
+        view.set_colors(new_foreground, &palette);
+        assert_eq!(tag.foreground_rgba(), Some(background));
+        assert_eq!(tag.background_rgba(), Some(new_foreground));
     }
 
     #[test]

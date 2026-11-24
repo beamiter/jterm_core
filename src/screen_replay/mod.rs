@@ -101,7 +101,10 @@
 //! history keeps it anyway.
 
 mod archived_text;
-pub use archived_text::{project_bounded_archive, project_bounded_command_archive};
+pub use archived_text::{
+    filter_archived_output, project_bounded_archive, project_bounded_command_archive,
+    project_finished_output,
+};
 mod emulator;
 mod grid;
 mod parser;
@@ -293,6 +296,11 @@ impl Replay {
     /// 8 columns) is written as `\t`, so copying from the target yields the
     /// tab the program wrote; other tabs stay spaces.
     pub fn to_ansi(&self) -> String {
+        self.to_ansi_with_budget(usize::MAX)
+            .expect("an allocated string cannot exceed usize::MAX bytes")
+    }
+
+    fn to_ansi_with_budget(&self, max_bytes: usize) -> Option<String> {
         let mut out = String::new();
         let mut scratch = SgrScratch::default();
         let mut pen = Pen::default();
@@ -361,6 +369,9 @@ impl Replay {
                 } else {
                     push_cell_text(&mut out, &self.tables, cell);
                 }
+                if out.len() > max_bytes {
+                    return None;
+                }
             }
             if link != 0 {
                 out.push_str("\x1b]8;;\x1b\\");
@@ -374,11 +385,14 @@ impl Replay {
                 write_sgr_transition(&mut out, &mut scratch, &pen, &plain);
                 pen = plain;
             }
+            if out.len() > max_bytes {
+                return None;
+            }
         }
         if !pen.is_plain() {
             out.push_str("\x1b[0m");
         }
-        out
+        (out.len() <= max_bytes).then_some(out)
     }
 }
 
