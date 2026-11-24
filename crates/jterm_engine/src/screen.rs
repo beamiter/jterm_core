@@ -705,6 +705,36 @@ impl ScreenState {
             && self.scroll_region_bottom < self.grid.rows()
     }
 
+    /// Apply Frost's physical cursor move and identify the region shift, if
+    /// needed. Frost preserves the row's legacy wrap metadata. The caller
+    /// decides whether to archive the outgoing row before shifting the region.
+    pub fn frost_legacy_vertical_cursor_motion(
+        &mut self,
+        motion: VerticalMotion,
+    ) -> Option<RegionDirection> {
+        if motion == VerticalMotion::Wrap {
+            self.grid.row_wrapped[self.cursor_row] = true;
+            self.cursor_col = 0;
+        } else {
+            self.pending_wrap = false;
+        }
+        self.advance_vertical_cursor(motion)
+    }
+
+    fn advance_vertical_cursor(&mut self, motion: VerticalMotion) -> Option<RegionDirection> {
+        if motion == VerticalMotion::ReverseIndex {
+            if self.cursor_row == self.scroll_region_top {
+                return Some(RegionDirection::Down);
+            }
+            self.cursor_row = self.cursor_row.saturating_sub(1);
+        } else if self.cursor_row == self.scroll_region_bottom {
+            return Some(RegionDirection::Up);
+        } else if self.cursor_row + 1 < self.grid.rows() {
+            self.cursor_row += 1;
+        }
+        None
+    }
+
     fn vertical_motion_impl(
         &mut self,
         motion: VerticalMotion,
@@ -733,33 +763,15 @@ impl ScreenState {
             self.grid.row_wrapped[self.cursor_row] = true;
             self.cursor_col = 0;
         }
-        let region = if motion == VerticalMotion::ReverseIndex {
-            if self.cursor_row == self.scroll_region_top {
-                self.scroll_region_one(
-                    RegionDirection::Down,
-                    self.scroll_region_top,
-                    self.scroll_region_bottom,
-                    false,
-                    allocate_id,
-                )
-            } else {
-                self.cursor_row = self.cursor_row.saturating_sub(1);
-                None
-            }
-        } else if self.cursor_row == self.scroll_region_bottom {
+        let region = self.advance_vertical_cursor(motion).and_then(|direction| {
             self.scroll_region_one(
-                RegionDirection::Up,
+                direction,
                 self.scroll_region_top,
                 self.scroll_region_bottom,
-                capture_outgoing,
+                capture_outgoing && direction == RegionDirection::Up,
                 allocate_id,
             )
-        } else {
-            if self.cursor_row + 1 < self.grid.rows() {
-                self.cursor_row += 1;
-            }
-            None
-        };
+        });
         VerticalMutation { departure, region }
     }
 
@@ -1401,6 +1413,19 @@ impl ScreenState {
         self.grid
             .delete_cells(row, col, count, blank, WideCellEditPolicy::RepairSplitPairs);
         Some(effect)
+    }
+
+    /// Frost uses the same wide-cell boundary edit for ICH and printable IRM.
+    /// It preserves the deferred-wrap latch.
+    pub fn insert_frost_legacy_blanks(&mut self, count: usize) -> bool {
+        let blank = self.create_blank_cell();
+        self.grid.insert_blank_cells(
+            self.cursor_row,
+            self.cursor_col,
+            count,
+            blank,
+            WideCellEditPolicy::ClearBoundaryPairs,
+        )
     }
 
     /// At most one effect per eligible run, bounded by the width of this row.

@@ -97,7 +97,14 @@ agree; a local path override is not exact-publication validation.
 ## Compatibility and acceptance limits
 
 The extraction preserves the Ember and Frost compatibility profiles and
-existing host policy. On the local candidate, Frost's native Wayland IME
+existing host policy. Frost applies local ANSI and DEC mode parameters through
+the engine. Its adapter applies the mouse scroll lease, alternate-screen and
+synchronized-output effects in parameter order. The engine also owns the
+physical cursor motions and region shifts behind LF, IND, NEL, RI, soft wrap
+and SU/SD. The adapter still admits history using its existing primary,
+synchronized alternate-screen and inline CLI policy, then updates the visible
+row and history revisions. Printable insert mode and CSI ICH use the same
+Frost wide-cell edit. On the local candidate, Frost's native Wayland IME
 fixtures cover Block preedit and commit, multiline input, and an active Chat
 foreground process. Ember's X11 PTY fixture covers device attributes and
 status replies. Aether's native WebKitGTK/X11 fixture covers local Channel

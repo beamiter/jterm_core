@@ -596,13 +596,7 @@ fn edit_frost_legacy_line(
             screen.grid.erase_cells(row, span, blank);
         }
         b'@' => {
-            if !screen.grid.insert_blank_cells(
-                row,
-                col,
-                count,
-                blank,
-                WideCellEditPolicy::ClearBoundaryPairs,
-            ) {
+            if !screen.insert_frost_legacy_blanks(count) {
                 return None;
             }
         }
