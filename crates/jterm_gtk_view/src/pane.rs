@@ -1,9 +1,10 @@
 #[cfg(target_os = "linux")]
 use futures_util::StreamExt;
-use gtk4::{gdk, glib, pango, prelude::*};
+use gtk4::{gdk, glib, graphene, pango, prelude::*};
 use jterm_engine::{
     colors::{Rgb, TerminalDefaultColors},
-    frame::{Screen, Stamp},
+    frame::{CellFrame, Screen, Stamp},
+    grid::{Color, UnderlineStyle},
     history_reflow::HistoryAnchor,
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
@@ -179,6 +180,115 @@ impl<P: Pty> EmbeddedTerminal<P> {
 
     pub fn scrollback_adjustment(&self) -> &gtk4::Adjustment {
         &self.pane.scrollback
+    }
+
+    /// The viewport-relative cursor row of the primary grid currently painted.
+    pub fn painted_primary_cursor_row(&self) -> Option<usize> {
+        Some(self.painted_primary_frame()?.cursor().row)
+    }
+
+    /// Test an overlay footprint in the given widget's coordinates, with a
+    /// one-cell guard. A pending paint, scrollback or the alternate screen
+    /// cannot authorize placing anything over the live grid.
+    pub fn painted_primary_rect_is_blank(
+        &self,
+        source: &impl IsA<gtk4::Widget>,
+        rect: graphene::Rect,
+    ) -> bool {
+        let view = &self.pane.view;
+        let screen = &view.widget;
+        let Some(origin) = source.compute_point(screen, &graphene::Point::new(rect.x(), rect.y()))
+        else {
+            return false;
+        };
+        let (x, y, width, height) = (origin.x(), origin.y(), rect.width(), rect.height());
+        let right = x + width;
+        let bottom = y + height;
+        if !x.is_finite()
+            || !y.is_finite()
+            || !width.is_finite()
+            || !height.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || width <= 0.0
+            || height <= 0.0
+            || right > screen.width() as f32
+            || bottom > screen.height() as f32
+        {
+            return false;
+        }
+        let Some(frame) = self.painted_primary_frame() else {
+            return false;
+        };
+        let (_, _, cell_width, cell_height) = view.cell_metrics();
+        let guarded = graphene::Rect::new(
+            x - cell_width as f32,
+            y - cell_height as f32,
+            width + 2.0 * cell_width as f32,
+            height + 2.0 * cell_height as f32,
+        );
+        if self.pane.inline_images.borrow().overlaps(screen, guarded) {
+            return false;
+        }
+        let coords = gtk4::TextWindowType::Widget;
+        let (left, top) = screen.window_to_buffer_coords(coords, x.floor() as i32, y.floor() as i32);
+        let (right, bottom) =
+            screen.window_to_buffer_coords(coords, right.ceil() as i32, bottom.ceil() as i32);
+        let first_row = (screen.line_at_y(top).0.line() as usize).saturating_sub(1);
+        let last_row = (screen.line_at_y(bottom).0.line() as usize + 1).min(frame.rows().len() - 1);
+        if first_row > last_row {
+            return false;
+        }
+        let cursor = frame.cursor();
+        let buffer = screen.buffer();
+        (first_row..=last_row).all(|row| {
+            let Some(line) = buffer.iter_at_line(row as i32) else {
+                return false;
+            };
+            // Use each painted row's own layout. A fallback font or a wide
+            // glyph can move its pixel columns relative to the next row.
+            let (line_top, line_height) = screen.line_yrange(&line);
+            let last_col = frame.cols() - 1;
+            let column_at = |x| {
+                view.text_cell_at(x, line_top + line_height / 2)
+                    .filter(|&(_, found_row)| found_row == row)
+                    .map(|(col, _)| col.min(last_col))
+                    .unwrap_or_else(|| if x <= screen.left_margin() { 0 } else { last_col })
+            };
+            let (left, right) = (column_at(left), column_at(right));
+            if left > right {
+                return false;
+            }
+            let columns = left.saturating_sub(1)..=(right + 1).min(last_col);
+            if cursor.visible && cursor.row == row && columns.contains(&cursor.col) {
+                return false;
+            }
+            columns.into_iter().all(|col| {
+                let cell = &frame.rows()[row].cells[col];
+                cell.character.is_whitespace()
+                    && !cell.flags.wide_continuation()
+                    && cell.background == Color::Default
+                    && !cell.flags.inverse()
+                    && cell.flags.underline() == UnderlineStyle::None
+                    && !cell.flags.strikethrough()
+                    && frame
+                        .cluster_text(row, col)
+                        .is_none_or(|cluster| cluster.chars().all(char::is_whitespace))
+            })
+        })
+    }
+
+    fn painted_primary_frame(&self) -> Option<CellFrame> {
+        let (stamp, history_top) = self.pane.painted_source.get()?;
+        if stamp.screen != Screen::Primary
+            || history_top.is_some()
+            || self.pane.dirty.get()
+            || !self.pane.view.widget.is_mapped()
+        {
+            return None;
+        }
+        let frame = self.pane.view.painted_frame()?;
+        (frame.stamp() == stamp).then_some(frame)
     }
 
     pub fn fit_grid(&self, width: i32, height: i32) -> (u16, u16) {
@@ -2004,6 +2114,124 @@ mod transcript_tests {
         )
         .unwrap();
         (widget, terminal, output)
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn painted_primary_footprint_tracks_the_visible_grid() {
+        gtk4::init().unwrap();
+        let theme = Theme {
+            font: pango::FontDescription::from_string("Monospace 12"),
+            foreground: gdk::RGBA::WHITE,
+            background: gdk::RGBA::BLACK,
+            palette: crate::default_ansi_palette(),
+            cursor: None,
+        };
+        let links = LinkActions {
+            admit: |_, _| false,
+            find_plain: None,
+            attach_opener: |_| Box::new(|_| {}),
+        };
+        let (widget, terminal, output) = attach_test(40, 12, theme, links);
+        let window = gtk4::Window::builder()
+            .default_width(700)
+            .default_height(400)
+            .child(&widget)
+            .build();
+        window.present();
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while terminal.pane.screen().height() < 300 && std::time::Instant::now() < deadline {
+            while context.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let screen = terminal.pane.screen();
+        let (left, top, cell_width, cell_height) = terminal.pane.cell_metrics();
+        let blank = |col, row| {
+            terminal.painted_primary_rect_is_blank(
+                screen,
+                graphene::Rect::new(
+                    (left + col * cell_width + 1) as f32,
+                    (top + row * cell_height + 1) as f32,
+                    (cell_width - 2) as f32,
+                    (cell_height - 2) as f32,
+                ),
+            )
+        };
+        let painted_blank = |line, offset, far_half| {
+            let iter = screen.buffer().iter_at_line_offset(line, offset).unwrap();
+            let area = screen.iter_location(&iter);
+            let (x, y) = screen.buffer_to_window_coords(
+                gtk4::TextWindowType::Widget,
+                area.x() + if far_half { area.width() / 2 } else { 0 },
+                area.y(),
+            );
+            terminal.painted_primary_rect_is_blank(
+                screen,
+                graphene::Rect::new(x as f32 + 1.0, y as f32 + 1.0, 3.0, 3.0),
+            )
+        };
+        terminal.pane.paint();
+        assert!(blank(12, 5));
+        output
+            .apply("\x1b[6;12H界\x1b[6;22H\x1b[41m \x1b[0m\x1b[9;1H".as_bytes())
+            .unwrap();
+        assert!(!blank(29, 5), "pending output cannot authorize a seat");
+        terminal.pane.paint();
+        assert_eq!(terminal.painted_primary_cursor_row(), Some(8));
+        assert!(
+            !painted_blank(5, 11, true),
+            "a wide glyph occupies both cells"
+        );
+        assert!(
+            !painted_blank(5, 20, false),
+            "a colored space occupies a cell"
+        );
+        assert!(blank(29, 5));
+
+        output.apply(b"\x1b[7;11H").unwrap();
+        let texture = gdk::MemoryTexture::new(
+            2,
+            2,
+            gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_static(&[255; 16]),
+            8,
+        )
+        .upcast();
+        let image = terminal
+            .prepare_inline_image(
+                texture,
+                0,
+                InlineImageRequest {
+                    columns: Some(8),
+                    rows: 1,
+                    move_cursor: false,
+                    cursor: terminal.inline_image_cursor().unwrap(),
+                },
+            )
+            .unwrap();
+        assert!(terminal.admit_inline_image(image));
+        terminal.pane.paint();
+        assert!(
+            !blank(17, 6),
+            "the far edge of an inline image occupies pixels"
+        );
+
+        output.apply(b"\x1b[?1049h").unwrap();
+        terminal.pane.paint();
+        assert_eq!(terminal.painted_primary_cursor_row(), None);
+        assert!(!blank(29, 5));
+        output.apply(b"\x1b[?1049l").unwrap();
+        terminal.pane.paint();
+        assert!(blank(29, 5));
+
+        output.apply(b"\x1b[12;1H\r\n\r\n").unwrap();
+        terminal.pane.paint();
+        terminal.pane.scroll(-2);
+        terminal.pane.paint();
+        assert_eq!(terminal.painted_primary_cursor_row(), None);
+        assert!(!blank(29, 5));
+        window.close();
     }
 
     #[test]

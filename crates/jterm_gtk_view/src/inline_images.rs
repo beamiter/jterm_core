@@ -113,6 +113,23 @@ impl InlineImages {
         self.canvas.imp().slices.borrow().len()
     }
 
+    pub(crate) fn overlaps(&self, screen: &gtk4::TextView, rect: graphene::Rect) -> bool {
+        let slices = self.canvas.imp().slices.borrow();
+        if slices.is_empty() {
+            return false;
+        }
+        let Some(origin) = self.canvas.parent().and_then(|viewport| {
+            screen.compute_point(&viewport, &graphene::Point::new(rect.x(), rect.y()))
+        })
+        else {
+            return true;
+        };
+        let footprint = graphene::Rect::new(origin.x(), origin.y(), rect.width(), rect.height());
+        slices
+            .iter()
+            .any(|slice| slice.strip.intersection(&footprint).is_some())
+    }
+
     pub(crate) fn prepare(
         &self,
         terminal: &Terminal,

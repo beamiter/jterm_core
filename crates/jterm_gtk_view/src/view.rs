@@ -348,7 +348,7 @@ impl TerminalView {
         }
     }
 
-    fn text_cell_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
+    pub(crate) fn text_cell_at(&self, x: i32, y: i32) -> Option<(usize, usize)> {
         let (iter, _) = self.widget.iter_at_position(x, y)?;
         let row = iter.line() as usize;
         let offset = iter.line_offset();
@@ -434,6 +434,12 @@ impl TerminalView {
             }
         }
         self.presentation.replace(Some(current));
+    }
+
+    pub(crate) fn painted_frame(&self) -> Option<CellFrame> {
+        let presentation = self.presentation.borrow();
+        let (frame, _) = presentation.as_ref()?.live.as_ref()?;
+        Some(frame.clone())
     }
 
     pub(crate) fn link_at(
