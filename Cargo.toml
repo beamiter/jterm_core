@@ -44,6 +44,7 @@ dirs = "7.0"
 # Typo ranking for the shared command-correction engine (all four apps
 # already depend on the same version).
 fuzzy-matcher = "0.3"
+regex = "1"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 # SQLite >=3.54 fixes RUSTSEC-2026-0459; fallible_uint preserves u64 row decoding.

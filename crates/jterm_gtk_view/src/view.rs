@@ -634,7 +634,7 @@ impl TerminalView {
     }
 }
 
-fn text_at_point(view: &gtk4::TextView, x: f64, y: f64) -> Option<gtk4::TextIter> {
+pub(crate) fn text_at_point(view: &gtk4::TextView, x: f64, y: f64) -> Option<gtk4::TextIter> {
     let (x, y) = view.window_to_buffer_coords(
         gtk4::TextWindowType::Widget,
         x.floor() as i32,
@@ -646,24 +646,12 @@ fn text_at_point(view: &gtk4::TextView, x: f64, y: f64) -> Option<gtk4::TextIter
         .then_some(iter)
 }
 
-fn link_for_offset(links: &[PresentedLink], offset: i32) -> Option<PresentedLink> {
+pub(crate) fn link_for_offset(links: &[PresentedLink], offset: i32) -> Option<PresentedLink> {
     let index = links.partition_point(|link| link.end <= offset);
     links
         .get(index)
         .filter(|link| link.start <= offset)
         .cloned()
-}
-
-pub(crate) fn link_at(
-    view: &gtk4::TextView,
-    links: &[PresentedLink],
-    find_plain: Option<PlainLinkFinder>,
-    x: f64,
-    y: f64,
-) -> Option<PresentedLink> {
-    let iter = text_at_point(view, x, y)?;
-    link_for_offset(links, iter.offset())
-        .or_else(|| plain_link_at(view, &iter, find_plain?, |_| CopyRow::default()))
 }
 
 fn plain_link_at(

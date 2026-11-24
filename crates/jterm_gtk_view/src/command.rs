@@ -13,9 +13,12 @@ use std::{
 
 use crate::{
     text_link::connect_links,
-    view::{link_at, terminal_color, PresentedLink},
-    LinkActions,
+    view::{link_for_offset, terminal_color, text_at_point, PresentedLink},
+    LinkActions, PlainLinkFinder,
 };
+
+const FINISHED_HYPERLINK: &str = "jterm-finished-explicit-hyperlink";
+const MAX_REFERENCE_DOCUMENT_CHARS: i32 = 256 * 1024;
 
 /// A literal command within the shell integration budget, with LF as the only
 /// permitted line break.
@@ -38,6 +41,7 @@ pub struct FinishedTextView {
     scale: Rc<Cell<f64>>,
     colors: [(gtk4::TextTag, Option<usize>); 6],
     output_tags: Rc<RefCell<Vec<(gtk4::TextTag, ArchiveStyle)>>>,
+    hyperlink_tag: gtk4::TextTag,
     links: Rc<RefCell<Vec<PresentedLink>>>,
     palette: Rc<Cell<[gdk::RGBA; 16]>>,
     background_style: Rc<RefCell<Option<gtk4::CssProvider>>>,
@@ -141,6 +145,8 @@ impl FinishedTextView {
         let buffer = gtk4::TextBuffer::new(None);
         let font_tag = gtk4::TextTag::builder().build();
         buffer.tag_table().add(&font_tag);
+        let hyperlink_tag = gtk4::TextTag::builder().name(FINISHED_HYPERLINK).build();
+        buffer.tag_table().add(&hyperlink_tag);
         let colors = [None, Some(2), Some(5), Some(8), Some(6), Some(6)]
             .map(|color| (gtk4::TextTag::builder().build(), color));
         for (tag, _) in &colors {
@@ -173,6 +179,7 @@ impl FinishedTextView {
             scale: Rc::new(Cell::new(scale)),
             colors,
             output_tags: Rc::new(RefCell::new(Vec::new())),
+            hyperlink_tag,
             links: Rc::new(RefCell::new(Vec::new())),
             palette: Rc::new(Cell::new(*palette)),
             background_style: Rc::new(RefCell::new(None)),
@@ -186,6 +193,8 @@ impl FinishedTextView {
         &self.widget
     }
 
+    /// For a finished document, the plain link finder receives the logical
+    /// document and a byte offset. Soft wrapping in GTK does not change either.
     pub fn install_links(&self, actions: LinkActions) {
         let view = self.widget.downgrade();
         let links = self.links.clone();
@@ -193,7 +202,8 @@ impl FinishedTextView {
         connect_links(
             &self.widget,
             move |x, y| {
-                let target = link_at(&view.upgrade()?, &links.borrow(), actions.find_plain, x, y)?;
+                let target =
+                    finished_link_at(&view.upgrade()?, &links.borrow(), actions.find_plain, x, y)?;
                 (actions.admit)("", &target.target).then_some(target)
             },
             open,
@@ -256,17 +266,6 @@ impl FinishedTextView {
     /// Replace the view with a filtered projection of the retained capture.
     pub fn present_output(&self, document: &ArchivedText) {
         let buffer = self.widget.buffer();
-        let mut offsets = (0, 0);
-        let links = document
-            .links
-            .iter()
-            .filter_map(|link| {
-                let (start, end) =
-                    ordered_character_range(&document.text, link.bytes.clone(), &mut offsets)?;
-                Some(PresentedLink::text_span(start, end, &link.target))
-            })
-            .collect();
-        self.links.replace(links);
         buffer.set_text("");
         let mut tags = self.output_tags.borrow_mut();
         let table = buffer.tag_table();
@@ -278,6 +277,22 @@ impl FinishedTextView {
             &document.text,
             &[&self.font, &self.colors[0].0],
         );
+        let mut offsets = (0, 0);
+        let links = document
+            .links
+            .iter()
+            .filter_map(|link| {
+                let (start, end) =
+                    ordered_character_range(&document.text, link.bytes.clone(), &mut offsets)?;
+                buffer.apply_tag(
+                    &self.hyperlink_tag,
+                    &buffer.iter_at_offset(start),
+                    &buffer.iter_at_offset(end),
+                );
+                Some(PresentedLink::text_span(start, end, &link.target))
+            })
+            .collect();
+        self.links.replace(links);
         let palette = self.palette.get();
         let mut offsets = (0, 0);
         for span in &document.spans {
@@ -382,6 +397,49 @@ impl FinishedTextView {
         self.font.set_font_desc(Some(&font));
         self.widget.queue_resize();
     }
+}
+
+/// Locate ordinary text in a finished command or output. Explicit hyperlinks
+/// belong to the link handler even when their displayed label looks like a file.
+pub fn finished_text_at(view: &gtk4::TextView, x: f64, y: f64) -> Option<(String, usize)> {
+    let tag = view.buffer().tag_table().lookup(FINISHED_HYPERLINK)?;
+    let iter = text_at_point(view, x, y)?;
+    if iter.has_tag(&tag) {
+        return None;
+    }
+    document_offset(view, &iter)
+}
+
+fn document_offset(view: &gtk4::TextView, iter: &gtk4::TextIter) -> Option<(String, usize)> {
+    let buffer = view.buffer();
+    if buffer.char_count() > MAX_REFERENCE_DOCUMENT_CHARS {
+        return None;
+    }
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+    let (byte, _) = text.char_indices().nth(iter.offset() as usize)?;
+    Some((text.to_string(), byte))
+}
+
+fn finished_link_at(
+    view: &gtk4::TextView,
+    links: &[PresentedLink],
+    find_plain: Option<PlainLinkFinder>,
+    x: f64,
+    y: f64,
+) -> Option<PresentedLink> {
+    let iter = text_at_point(view, x, y)?;
+    if let Some(link) = link_for_offset(links, iter.offset()) {
+        return Some(link);
+    }
+    let (text, byte) = document_offset(view, &iter)?;
+    let range = find_plain?(&text, byte)?;
+    if !range.contains(&byte) {
+        return None;
+    }
+    let start = text.get(..range.start)?.chars().count() as i32;
+    let target = text.get(range)?;
+    let end = start + target.chars().count() as i32;
+    Some(PresentedLink::text_span(start, end, target))
 }
 
 fn set_span_colors(tag: &gtk4::TextTag, style: ArchiveStyle, palette: &[gdk::RGBA; 16]) {
@@ -583,7 +641,7 @@ mod tests {
             rect.x() + rect.width() / 2,
             rect.y() + rect.height() / 2,
         );
-        let link = link_at(
+        let link = finished_link_at(
             view.widget(),
             &[],
             Some(|line, offset| {
@@ -596,6 +654,10 @@ mod tests {
         )
         .expect("resolve a link in the second logical line");
         assert_eq!(link.target.as_ref(), URL);
+        assert_eq!(
+            finished_text_at(view.widget(), f64::from(x), f64::from(y)),
+            Some((command.to_owned(), offset as usize))
+        );
         assert!(buffer
             .start_iter()
             .tags()
@@ -612,6 +674,34 @@ mod tests {
         assert!(!buffer.iter_at_offset(5).has_tag(&painted));
         view.set_font_scale(1.5);
         assert_eq!(view.font.font_desc().unwrap().size(), 18 * pango::SCALE);
+        let source = "文档 ./notes.md";
+        view.present_output(&ArchivedText {
+            text: source.into(),
+            links: vec![jterm_engine::archived_text::ArchiveLink {
+                bytes: source.find("./").unwrap()..source.len(),
+                target: URL.into(),
+            }],
+            ..ArchivedText::default()
+        });
+        while main.pending() {
+            main.iteration(false);
+        }
+        let rect = view.widget().iter_location(&buffer.iter_at_offset(4));
+        let (x, y) = view.widget().buffer_to_window_coords(
+            gtk4::TextWindowType::Widget,
+            rect.x() + rect.width() / 2,
+            rect.y() + rect.height() / 2,
+        );
+        assert!(finished_text_at(view.widget(), f64::from(x), f64::from(y)).is_none());
+        let link = finished_link_at(
+            view.widget(),
+            &view.links.borrow(),
+            None,
+            x.into(),
+            y.into(),
+        )
+        .expect("explicit hyperlink covering a path-like label");
+        assert_eq!(link.target.as_ref(), URL);
         window.close();
     }
 }

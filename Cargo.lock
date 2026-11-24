@@ -332,6 +332,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "parking_lot",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

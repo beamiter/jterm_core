@@ -20,19 +20,10 @@ const MAX_LINKS: usize = 128;
 ///
 /// Accept explicit OSC 8 targets through the same opener policy as the live
 /// terminal. Plain HTTP(S) targets remain in the text for exact hit-testing.
-/// Other OSC commands, cursor movement, tabs, path hints and unsupported SGR
-/// require the original renderer.
+/// Other OSC commands, cursor movement, tabs and unsupported SGR require
+/// terminal replay. File references stay as literal document text.
 pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
-    let output = project_literal_archive(capture)?;
-    output
-        .text
-        .split_whitespace()
-        .all(|token| {
-            token.chars().all(|ch| {
-                ch.is_ascii_alphanumeric() || "_-=+,%!?()[]'\"".contains(ch) || !ch.is_ascii()
-            }) || crate::link::plain_url_span(token).is_some()
-        })
-        .then_some(output)
+    project_literal_archive(capture)
 }
 
 /// Project a historical command heading whose logical text must match the
@@ -206,7 +197,7 @@ mod tests {
         assert_eq!(archive.text, command);
         assert_eq!(archive.spans[0].bytes, 0..command.len());
         assert_eq!(archive.spans[0].style.foreground, GridColor::Indexed(10));
-        assert!(project_bounded_archive(&marked).is_none());
+        assert_eq!(project_bounded_archive(&marked).unwrap(), archive);
         assert!(project_bounded_command_archive(&marked, "printf changed").is_none());
         assert!(project_bounded_command_archive(&format!("{marked}\x1b[2J"), command).is_none());
     }
@@ -255,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_url_can_cross_sgr_runs_without_admitting_path_hints() {
+    fn plain_urls_and_paths_can_cross_sgr_runs() {
         let document =
             project_bounded_archive("see (https://example.test/\x1b[32ma?b=c\x1b[m).\r\n").unwrap();
         let url = "https://example.test/a?b=c";
@@ -263,8 +254,11 @@ mod tests {
         let hit = crate::link::plain_url_at(&document.text, offset + 22).unwrap();
         assert_eq!(&document.text[hit], url);
         assert_eq!(&document.text[document.spans[0].bytes.clone()], "a?b=c");
-        assert!(project_bounded_archive("https://example.test/ and folder/path").is_none());
-        assert!(project_bounded_archive("https://user:token@example.test").is_none());
+        let text = "https://example.test/ and folder/path";
+        assert_eq!(project_bounded_archive(text).unwrap().text, text);
+        let text = "https://user:token@example.test";
+        assert_eq!(project_bounded_archive(text).unwrap().text, text);
+        assert!(crate::link::document_url_at(text, 1).is_none());
     }
 
     #[test]
@@ -279,8 +273,6 @@ mod tests {
             "capture \x1b]8;;https://example.test\x1b[0mlinked",
             "capture \x1b]8;;https://example.test\x07unclosed",
             "capture \x1b]8;;https://example.test\x07link\r\nnext\x1b]8;;\x07",
-            "file.txt",
-            "folder/path",
             "unsafe\rreplacement",
             "tab\tcolumn",
             "spoof \u{202e}name",

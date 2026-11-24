@@ -10,6 +10,12 @@
 
 use std::ops::Range;
 
+mod delimited_reference;
+mod document_reference;
+
+pub use delimited_reference::{detect_delimited_references, DelimitedReference};
+pub use document_reference::{document_local_reference_at, document_url_at};
+
 /// Clickable-target text is terminal-controlled data, not a bulk payload;
 /// this ceiling also bounds the allocation a frontend makes per candidate.
 pub const MAX_OPENABLE_URL_BYTES: usize = 2 * 1024;

@@ -21,8 +21,8 @@ mod view;
 mod viewport;
 
 pub use command::{
-    clear_finished_text_matches, paint_finished_text_matches, select_finished_text_bytes,
-    supports_finished_command, FinishedTextView,
+    clear_finished_text_matches, finished_text_at, paint_finished_text_matches,
+    select_finished_text_bytes, supports_finished_command, FinishedTextView,
 };
 pub use document::DocumentView;
 pub use find::{FindFrame, FindMatch, FindRegion, FindSnapshot, FindWindow};
