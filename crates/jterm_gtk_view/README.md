@@ -158,24 +158,12 @@ rendering for unsupported ANSI.
 
 ## Running command output
 
-Set `JTERM_SHARED_LIVE_OUTPUT=1` on a candidate launch. The active Block and
-Chat card can allocate its shared GTK row to one complete, unwrapped ASCII
-output line. The current visible row must match the bounded capture and have
-plain attributes in the legacy terminal export. The GTK snapshot clips the
-legacy paint for those cells, preserving transparent card backgrounds. The
-presentation has no input, parser, replies, or PTY handle. The existing
-session owns shell input, find and selection, and presents links, styled
-output, scrollback and alternate-screen applications.
+Set `JTERM_SHARED_ACTIVE_TERMINAL=1` for Block and Chat and
+`JTERM_SHARED_TRANSCRIPT=1` for Unified in a `shared-terminal` build. These
+panes render the Rust terminal runtime's screen and history. Find navigates
+the mapped GTK screen, including the active alternate screen.
 
-Run the native Block and Chat journey with a real long-lived shell in both
-candidate configurations. It checks a live projected line, active find,
-alternate-screen fallback, completion, and the next command in the same PTY.
-
-```sh
-JTERM_SHARED_LIVE_OUTPUT=1 dbus-run-session -- xvfb-run -a \
-  python3 scripts/family-cargo.py --forge-shared-terminal forge test --release --lib \
-  block_view::cross_selection::tests::shared_live_block_and_chat_keep_the_owned_shell -- --ignored --exact
-JTERM_SHARED_LIVE_OUTPUT=1 dbus-run-session -- xvfb-run -a \
-  python3 scripts/family-cargo.py --anvil-shared-terminal anvil test --release --bin anvil \
-  block_view::cross_selection::tests::shared_live_block_and_chat_keep_the_owned_shell -- --ignored --exact
-```
+The native card fixture above launches a shell through each product's pane
+constructor in all three modes. It checks distinct Unicode output rows, Find
+navigation, alternate-screen entry and exit, and completed records for
+consecutive commands with the same terminal view and PTY.

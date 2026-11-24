@@ -151,9 +151,11 @@ HTTPS and HTTP links. The native tests cover fold-aware find, output filters,
 cross-card clipboard and rebuilding cards after Undo. Captures outside the
 document profile use VTE. `JTERM_SHARED_FINISHED_OUTPUT=0` selects VTE for
 output. `JTERM_SHARED_FINISHED_COMMANDS=0` selects VTE for the entire card.
-The `JTERM_SHARED_LIVE_OUTPUT=1` candidate paints
-verified rows during a running command while the existing VTE terminal owns
-the session and continues to handle input and alternate screens.
+`JTERM_SHARED_ACTIVE_TERMINAL=1` selects the shared runtime and live GTK
+terminal for Block and Chat. `JTERM_SHARED_TRANSCRIPT=1` selects it for
+Unified. The native card fixture verifies that each mode keeps its session
+and terminal view through Find, an alternate-screen application and the
+completion of consecutive commands.
 
 Release acceptance still requires the complete shared session lifecycle,
 Aether's remaining product journeys, the GTK production migration, and
