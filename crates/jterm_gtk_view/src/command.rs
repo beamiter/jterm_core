@@ -2,6 +2,7 @@ use gtk4::{gdk, pango, prelude::*};
 use jterm_engine::{
     archived_text::{is_literal_archive_unicode, ArchiveStyle, ArchivedText},
     grid::{Color, UnderlineStyle},
+    shell_markers::MAX_OSC133_COMMAND_BYTES,
 };
 use std::{
     borrow::Cow,
@@ -16,13 +17,12 @@ use crate::{
     LinkActions,
 };
 
-const MAX_COMMAND_BYTES: usize = 96;
-
-/// A bounded literal command, with LF as the only permitted line break.
+/// A literal command within the shell integration budget, with LF as the only
+/// permitted line break.
 pub fn supports_finished_command(command: &str) -> bool {
     !command.is_empty()
         && command == command.trim()
-        && command.len() <= MAX_COMMAND_BYTES
+        && command.len() <= MAX_OSC133_COMMAND_BYTES
         && command.chars().all(|ch| {
             ch.is_ascii_graphic() || matches!(ch, ' ' | '\n') || is_literal_archive_unicode(ch)
         })
@@ -428,6 +428,13 @@ mod tests {
         ] {
             assert!(!supports_finished_command(command), "{command:?}");
         }
+    }
+
+    #[test]
+    fn command_profile_matches_the_shell_integration_budget() {
+        let command = "x".repeat(MAX_OSC133_COMMAND_BYTES);
+        assert!(supports_finished_command(&command));
+        assert!(!supports_finished_command(&(command + "x")));
     }
 
     #[test]
