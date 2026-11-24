@@ -418,8 +418,9 @@ impl FinishedTextView {
         } else {
             font.set_size(scaled as i32);
         }
-        let metrics = self.widget.pango_context().metrics(Some(&font), None);
-        let tab_width = metrics.approximate_digit_width().max(1).saturating_mul(8);
+        let tab_layout = self.widget.create_pango_layout(Some("        "));
+        tab_layout.set_font_description(Some(&font));
+        let tab_width = tab_layout.size().0.max(1);
         let mut tabs = pango::TabArray::new(2, false);
         tabs.set_tab(0, pango::TabAlign::Left, tab_width);
         tabs.set_tab(1, pango::TabAlign::Left, tab_width.saturating_mul(2));
@@ -649,10 +650,10 @@ mod tests {
             &palette,
         )
         .unwrap();
-        assert!((tabbed.natural_width() - spaces.natural_width()).abs() <= 1);
+        assert_eq!(tabbed.natural_width(), spaces.natural_width());
         tabbed.set_font_scale(1.6);
         spaces.set_font_scale(1.6);
-        assert!((tabbed.natural_width() - spaces.natural_width()).abs() <= 1);
+        assert_eq!(tabbed.natural_width(), spaces.natural_width());
         let buffer = tabbed.widget().buffer();
         assert_eq!(
             buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
