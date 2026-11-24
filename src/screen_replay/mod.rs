@@ -101,7 +101,7 @@
 //! history keeps it anyway.
 
 mod archived_text;
-pub use archived_text::project_bounded_archive;
+pub use archived_text::{project_bounded_archive, project_bounded_command_archive};
 mod emulator;
 mod grid;
 mod parser;

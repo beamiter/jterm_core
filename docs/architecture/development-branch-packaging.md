@@ -159,8 +159,9 @@ cross-card clipboard and rebuilding cards after Undo. Screen captures and
 shell reports can both supply document command headings. Review and retry use
 the record's provenance. Anvil applies supported historical markup when the
 projected text matches the retained command. Cross-card copy joins the logical
-text of each document surface with one newline between surfaces. Captures
-outside the document profile use VTE. `JTERM_SHARED_FINISHED_OUTPUT=0` selects
+text of each document surface with one newline between surfaces. Finished
+cards snapshot the live OSC 10 and 11 colors for the surfaces that use them.
+Captures outside the document profile use VTE. `JTERM_SHARED_FINISHED_OUTPUT=0` selects
 VTE for output. `JTERM_SHARED_FINISHED_COMMANDS=0` selects VTE for the entire card.
 Native Linux packages built with `shared-terminal` default to the shared
 runtime and live GTK terminal for new Block, Chat, and Unified panes.

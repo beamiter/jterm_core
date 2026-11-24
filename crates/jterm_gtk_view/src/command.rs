@@ -40,6 +40,7 @@ pub struct FinishedTextView {
     output_tags: Rc<RefCell<Vec<(gtk4::TextTag, ArchiveStyle)>>>,
     links: Rc<RefCell<Vec<PresentedLink>>>,
     palette: Rc<Cell<[gdk::RGBA; 16]>>,
+    background_style: Rc<RefCell<Option<gtk4::CssProvider>>>,
 }
 
 impl FinishedTextView {
@@ -174,6 +175,7 @@ impl FinishedTextView {
             output_tags: Rc::new(RefCell::new(Vec::new())),
             links: Rc::new(RefCell::new(Vec::new())),
             palette: Rc::new(Cell::new(*palette)),
+            background_style: Rc::new(RefCell::new(None)),
         };
         view.apply_font();
         view.set_colors(foreground, palette);
@@ -324,6 +326,23 @@ impl FinishedTextView {
         self.colors[0].0.set_foreground_rgba(Some(&foreground));
     }
 
+    #[allow(deprecated)]
+    pub fn set_background(&self, background: Option<gdk::RGBA>) {
+        let mut style = self.background_style.borrow_mut();
+        if let Some(background) = background {
+            let provider = style.get_or_insert_with(|| {
+                let provider = gtk4::CssProvider::new();
+                self.widget
+                    .style_context()
+                    .add_provider(&provider, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+                provider
+            });
+            provider.load_from_string(&format!("textview {{ background-color: {background}; }}"));
+        } else if let Some(provider) = style.take() {
+            self.widget.style_context().remove_provider(&provider);
+        }
+    }
+
     pub fn natural_width(&self) -> i32 {
         let buffer = self.widget.buffer();
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
@@ -332,7 +351,8 @@ impl FinishedTextView {
         layout.pixel_size().0
     }
 
-    pub(crate) fn line_height(&self) -> i32 {
+    /// Pixel height of one row in the view's scaled terminal font.
+    pub fn line_height(&self) -> i32 {
         let metrics = self
             .widget
             .pango_context()

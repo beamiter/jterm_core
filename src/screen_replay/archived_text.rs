@@ -23,6 +23,29 @@ const MAX_LINKS: usize = 128;
 /// Other OSC commands, cursor movement, tabs, path hints and unsupported SGR
 /// require the original renderer.
 pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
+    let output = project_literal_archive(capture)?;
+    output
+        .text
+        .split_whitespace()
+        .all(|token| {
+            token.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || "_-=+,%!?()[]'\"".contains(ch) || !ch.is_ascii()
+            }) || crate::link::plain_url_span(token).is_some()
+        })
+        .then_some(output)
+}
+
+/// Project a historical command heading whose logical text must match the
+/// retained command, including shell punctuation and paths.
+pub fn project_bounded_command_archive(capture: &str, command: &str) -> Option<ArchivedText> {
+    if command.is_empty() || command.len() > jterm_engine::shell_markers::MAX_OSC133_COMMAND_BYTES {
+        return None;
+    }
+    let archive = project_literal_archive(capture)?;
+    (archive.text == command).then_some(archive)
+}
+
+fn project_literal_archive(capture: &str) -> Option<ArchivedText> {
     if capture.len() > MAX_COMPLETED_CAPTURE_BYTES {
         return None;
     }
@@ -135,13 +158,7 @@ pub fn project_bounded_archive(capture: &str) -> Option<ArchivedText> {
         }
         rest = &rest[end..];
     }
-    (link.is_none()
-        && output.text.split_whitespace().all(|token| {
-            token.chars().all(|ch| {
-                ch.is_ascii_alphanumeric() || "_-=+,%!?()[]'\"".contains(ch) || !ch.is_ascii()
-            }) || crate::link::plain_url_span(token).is_some()
-        }))
-    .then_some(output)
+    link.is_none().then_some(output)
 }
 
 fn project_style(pen: &Pen) -> ArchiveStyle {
@@ -180,6 +197,19 @@ fn project_color(color: Color) -> GridColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_archive_keeps_shell_punctuation_and_requires_exact_text() {
+        let command = "$ printf '%s' ./notes.txt";
+        let marked = format!("\x1b[1;32m{command}\x1b[0m");
+        let archive = project_bounded_command_archive(&marked, command).unwrap();
+        assert_eq!(archive.text, command);
+        assert_eq!(archive.spans[0].bytes, 0..command.len());
+        assert_eq!(archive.spans[0].style.foreground, GridColor::Indexed(10));
+        assert!(project_bounded_archive(&marked).is_none());
+        assert!(project_bounded_command_archive(&marked, "printf changed").is_none());
+        assert!(project_bounded_command_archive(&format!("{marked}\x1b[2J"), command).is_none());
+    }
 
     #[test]
     fn canonical_sgr_projects_exact_text_and_style_ranges() {
