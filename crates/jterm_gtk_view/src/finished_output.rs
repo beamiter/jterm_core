@@ -351,16 +351,34 @@ mod tests {
         adjustment.set_value(0.0);
         let start = capture.text.find("尾部 witness").unwrap();
         let text = view.text().widget();
+        let primary = text.primary_clipboard();
+        primary.set_text("existing primary selection");
         assert!(crate::select_finished_text_bytes(
             text,
             start..capture.text.len()
         ));
+        let main = glib::MainContext::default();
+        assert_eq!(
+            main.block_on(primary.read_text_future())
+                .unwrap()
+                .as_deref(),
+            Some("existing primary selection")
+        );
+        primary.set_text("new primary selection");
         wait_for("find near end", &|| {
             adjustment.value() >= adjustment.upper() - collapsed * 2.0
         });
         let buffer = text.buffer();
         let (start, end) = buffer.selection_bounds().unwrap();
         assert_eq!(buffer.text(&start, &end, true), "尾部 witness");
+        let clipboard = text.clipboard();
+        buffer.copy_clipboard(&clipboard);
+        assert_eq!(
+            main.block_on(clipboard.read_text_future())
+                .unwrap()
+                .as_deref(),
+            Some("尾部 witness")
+        );
 
         expand.emit_clicked();
         wait_for("expanded layout", &|| adjustment.page_size() > collapsed);

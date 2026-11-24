@@ -445,7 +445,16 @@ pub fn select_finished_text_bytes(view: &gtk4::TextView, range: Range<usize>) ->
         return false;
     };
     let mut start = buffer.iter_at_offset(start);
+    // Keep Find selections independent of X11 PRIMARY ownership changes.
+    // Restore GTK's normal publication before the next user selection.
+    let primary = view.is_realized().then(|| view.primary_clipboard());
+    if let Some(clipboard) = &primary {
+        buffer.remove_selection_clipboard(clipboard);
+    }
     buffer.select_range(&buffer.iter_at_offset(end), &start);
+    if let Some(clipboard) = &primary {
+        buffer.add_selection_clipboard(clipboard);
+    }
     if view
         .vadjustment()
         .is_some_and(|adjustment| adjustment.upper() - adjustment.lower() > adjustment.page_size())
