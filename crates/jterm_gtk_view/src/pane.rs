@@ -1048,6 +1048,31 @@ impl<P: Pty> TerminalPane<P> {
         self.submit_input(|_| Ok(input)).map(|_| ())
     }
 
+    /// Give the configured shell its usual startup interval before submitting
+    /// commands through the same input queue as interactive input.
+    #[cfg(target_os = "linux")]
+    pub fn schedule_initial_commands(self: &Rc<Self>, commands: &[String]) {
+        if commands.is_empty() {
+            return;
+        }
+        let pane = Rc::downgrade(self);
+        let commands = commands.to_vec();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            let Some(pane) = pane.upgrade() else { return };
+            for command in commands {
+                if pane.exited.get() || pane.runtime().and_then(|runtime| runtime.child_pid()).is_none() {
+                    break;
+                }
+                let mut input = command.into_bytes();
+                input.push(b'\r');
+                if let Err(error) = pane.write_input(input) {
+                    pane.report(&format!("Could not send a startup command ({error})"));
+                    break;
+                }
+            }
+        });
+    }
+
     pub fn scroll(&self, lines: i64) {
         self.scroll_rows(lines);
     }

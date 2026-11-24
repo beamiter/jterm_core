@@ -10,6 +10,18 @@ use jterm_runtime::local_shell::wrapped_jsh;
 
 pub(crate) const RUNTIME_OVERRIDE: &str = "JTERM_SHARED_RUNTIME";
 
+pub(crate) fn admit_configured_shell(
+    argv: &[String],
+    host_bridge: bool,
+    runtime_override: Option<&OsStr>,
+) -> bool {
+    !host_bridge
+        && runtime_override.is_none_or(|value| value == "1")
+        && argv
+            .first()
+            .is_some_and(|program| Path::new(program).is_absolute() || program == "sh")
+}
+
 pub(crate) fn admit_local_argv(
     argv: &[String],
     host_bridge: bool,
@@ -79,6 +91,18 @@ pub(crate) fn runtime_environment(env: Vec<CString>) -> Result<Vec<(OsString, Os
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_panes_accept_resolved_shells_and_keep_the_rollout_override() {
+        let shell = ["/opt/configured shell/bin/fish", "--login"].map(str::to_owned);
+        assert!(admit_configured_shell(&shell, false, None));
+        assert!(!admit_local_argv(&shell, false, None));
+        assert!(!admit_configured_shell(&shell, true, None));
+        assert!(!admit_configured_shell(&shell, false, Some(OsStr::new("0"))));
+        assert!(admit_configured_shell(&["sh".into()], false, None));
+        assert!(!admit_configured_shell(&["./fish".into()], false, None));
+        assert!(!admit_configured_shell(&[], false, None));
+    }
 
     #[test]
     fn local_jsh_defaults_to_shared_and_preserves_session_and_exec_image() {

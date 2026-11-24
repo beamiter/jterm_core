@@ -20,7 +20,8 @@ use jterm_runtime::{exit_status::PtyExit, pty_session::Session, runtime_wake::Wa
 use crate::pane::{INITIAL_COLUMNS, INITIAL_ROWS};
 
 use crate::runtime_launch::{
-    admit_local_argv, candidate_program, runtime_environment, with_jsh_session, RUNTIME_OVERRIDE,
+    admit_configured_shell, admit_local_argv, candidate_program, runtime_environment,
+    with_jsh_session, RUNTIME_OVERRIDE,
 };
 use crate::viewport::{ViewportFrame, ViewportRequest};
 
@@ -82,10 +83,10 @@ impl Update {
 }
 
 impl RuntimeShell {
-    /// Whether an ordinary local shell can use the shared runtime. Hosts use
-    /// this to keep the ordinary pane layout when a launch selects VTE.
+    /// Whether the frontend's resolved, configured shell can use the ordinary
+    /// shared pane. Standalone previews use the narrower candidate profile.
     pub fn supports_local_shell(argv: &[String], host_bridge: bool) -> bool {
-        admit_local_argv(argv, host_bridge, None)
+        admit_configured_shell(argv, host_bridge, None)
     }
 
     pub fn admits_candidate(argv: &[String], host_bridge: bool) -> bool {
@@ -106,10 +107,19 @@ impl RuntimeShell {
         if !Self::admits_candidate(argv, host_bridge) {
             return Ok(None);
         }
+        Self::spawn_interactive(argv, cwd, directory_available, prepare_environment).map(Some)
+    }
+
+    fn spawn_interactive(
+        argv: &[String],
+        cwd: Option<&str>,
+        directory_available: fn(&str) -> bool,
+        prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
+    ) -> Result<Rc<Self>, String> {
         let cwd = local_directory(cwd, directory_available)?;
         let runtime = Self::spawn_program(argv, &cwd, prepare_environment()?)?;
         runtime.enable_primary_reflow()?;
-        Ok(Some(runtime))
+        Ok(runtime)
     }
 
     /// Open a new ordinary pane with the host's saved or freshly minted jsh id.
@@ -121,16 +131,17 @@ impl RuntimeShell {
         directory_available: fn(&str) -> bool,
         prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
     ) -> Result<Option<Rc<Self>>, String> {
+        if !admit_configured_shell(
+            argv,
+            host_bridge,
+            std::env::var_os(RUNTIME_OVERRIDE).as_deref(),
+        ) {
+            return Ok(None);
+        }
         let Some(argv) = with_jsh_session(argv, session_id) else {
             return Ok(None);
         };
-        Self::spawn_candidate(
-            &argv,
-            cwd,
-            host_bridge,
-            directory_available,
-            prepare_environment,
-        )
+        Self::spawn_interactive(&argv, cwd, directory_available, prepare_environment).map(Some)
     }
 
     /// The image expected at the prompt after any admitted shell bootstrap.
@@ -157,10 +168,9 @@ impl RuntimeShell {
     pub fn spawn_hosted_attachment(
         argv: &[String],
         cwd: &Path,
-        host_bridge: bool,
         prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
     ) -> Result<Option<Rc<Self>>, String> {
-        if host_bridge || std::env::var_os(RUNTIME_OVERRIDE).is_some_and(|value| value != "1") {
+        if std::env::var_os(RUNTIME_OVERRIDE).is_some_and(|value| value != "1") {
             return Ok(None);
         }
         Self::spawn_program(argv, cwd, prepare_environment()?).map(Some)
@@ -538,6 +548,45 @@ fn local_directory(cwd: Option<&str>, available: fn(&str) -> bool) -> Result<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_attachment_uses_the_prepared_argv_and_local_directory() {
+        let program = [
+            "/bin/sh",
+            "-c",
+            "test \"$PWD\" = / && test \"$1\" = '--directory=/host project' && test -t 0 || exit 18; \
+             stty raw -echo; printf '\\033[5n'; reply=$(head -c 4); stty sane; \
+             test \"$reply\" = \"$(printf '\\033[0n')\" || exit 19; exit 17",
+            "bridge-fixture",
+            "--directory=/host project",
+        ]
+        .map(str::to_owned);
+        let owner = RuntimeShell::spawn_hosted_attachment(&program, Path::new("/"), || {
+            Ok(vec![CString::new("PATH=/usr/bin:/bin").unwrap()])
+        })
+        .expect("start prepared attachment PTY");
+        if std::env::var_os(RUNTIME_OVERRIDE).is_some_and(|value| value != "1") {
+            assert!(owner.is_none());
+            return;
+        }
+        let owner = owner.expect("shared hosted attachment");
+        owner
+            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut update = Update::default();
+        while update.exit_status.is_none() && std::time::Instant::now() < deadline {
+            update.merge(owner.take_update().unwrap());
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            update.exit_status,
+            Some(PtyExit::from(17)),
+            "{:?}",
+            update.failure
+        );
+        assert!(owner.child_pid().is_none());
+    }
 
     #[test]
     fn background_runtime_processes_query_then_drains_exit_without_gtk() {

@@ -1591,11 +1591,10 @@ fn native_frontend_fixture() {
         },
     )
     .unwrap();
-    std::fs::write(
-        std::env::var("JTERM_NATIVE_FIXTURE_REPLY").unwrap(),
-        serde_json::to_vec(&reply).unwrap(),
-    )
-    .unwrap();
+    let path = std::path::PathBuf::from(std::env::var_os("JTERM_NATIVE_FIXTURE_REPLY").unwrap());
+    let pending = path.with_extension("pending");
+    std::fs::write(&pending, serde_json::to_vec(&reply).unwrap()).unwrap();
+    std::fs::rename(pending, path).unwrap();
     loop {
         std::thread::sleep(Duration::from_millis(100));
     }

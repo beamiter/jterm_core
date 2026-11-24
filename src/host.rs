@@ -394,6 +394,35 @@ pub fn wrap_argv(argv: &[String], cwd: Option<&str>, env_extra: &[(&str, &str)])
     wrap_argv_for(is_flatpak(), argv, cwd, env_extra)
 }
 
+/// Prepare the approved attachment relay and the cwd of its local PTY child.
+/// A Flatpak host directory belongs to the bridged process. The local bridge
+/// starts in the sandbox root even when the project is invisible there.
+pub fn hosted_attachment_pty<'a>(
+    argv: &'a [String],
+    cwd: &'a str,
+    environment: &[(&str, &str)],
+) -> (std::borrow::Cow<'a, [String]>, &'a Path) {
+    hosted_attachment_pty_for(is_flatpak(), argv, cwd, environment)
+}
+
+fn hosted_attachment_pty_for<'a>(
+    flatpak: bool,
+    argv: &'a [String],
+    cwd: &'a str,
+    environment: &[(&str, &str)],
+) -> (std::borrow::Cow<'a, [String]>, &'a Path) {
+    use std::borrow::Cow;
+
+    if flatpak {
+        (
+            Cow::Owned(wrap_argv_for(true, argv, Some(cwd), environment)),
+            Path::new("/"),
+        )
+    } else {
+        (Cow::Borrowed(argv), Path::new(cwd))
+    }
+}
+
 /// Whether an argv is a `flatpak-spawn --host` wrapper produced by
 /// [`wrap_argv`] (or equivalent).
 pub fn is_host_wrapper_argv(args: &[String]) -> bool {
@@ -914,6 +943,27 @@ mod tests {
             wrap_argv_for(false, &argv, Some("/tmp"), &[("LESS", "R")]),
             argv
         );
+    }
+
+    #[test]
+    fn hosted_attachment_preserves_host_project_and_separate_local_cwd() {
+        let argv = ["/opt/jterm/session-host", "attach", "session id"].map(str::to_owned);
+        let project = "/mnt/host-only/project with spaces";
+        let environment = [("TERM", "xterm-256color")];
+        let (native, dir) = hosted_attachment_pty_for(false, &argv, project, &environment);
+        assert_eq!(native.as_ref(), &argv);
+        assert_eq!(dir, Path::new(project));
+
+        let (bridged, dir) = hosted_attachment_pty_for(true, &argv, project, &environment);
+        assert_eq!(dir, Path::new("/"));
+        assert_eq!(
+            &bridged[1..4],
+            ["--host", "--watch-bus", &format!("--directory={project}")]
+        );
+        assert!(bridged
+            .iter()
+            .any(|argument| argument == "--env=TERM=xterm-256color"));
+        assert!(bridged.ends_with(&argv));
     }
 
     #[cfg(unix)]
