@@ -99,6 +99,24 @@ impl FinishedTextView {
         ))
     }
 
+    /// Display a historical ANSI projection only when its complete text
+    /// agrees with the retained command. The caller owns the record's provenance.
+    pub fn archived_command(
+        command: &str,
+        document: &ArchivedText,
+        font: pango::FontDescription,
+        scale: f64,
+        foreground: gdk::RGBA,
+        palette: &[gdk::RGBA; 16],
+    ) -> Option<Self> {
+        if document.text != command || !supports_finished_command(command) {
+            return None;
+        }
+        let view = Self::from_runs(Vec::new(), font, scale, foreground, palette, false);
+        view.present_output(document);
+        Some(view)
+    }
+
     pub fn output(
         document: &ArchivedText,
         font: pango::FontDescription,

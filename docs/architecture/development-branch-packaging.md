@@ -155,9 +155,13 @@ Forge and Anvil builds with `shared-terminal` use the GTK document view for
 eligible completed Block and Chat commands and output. A bounded document
 retains supported ANSI styles, grapheme clusters, OSC 8 targets and plain
 HTTPS and HTTP links. The native tests cover fold-aware find, output filters,
-cross-card clipboard and rebuilding cards after Undo. Captures outside the
-document profile use VTE. `JTERM_SHARED_FINISHED_OUTPUT=0` selects VTE for
-output. `JTERM_SHARED_FINISHED_COMMANDS=0` selects VTE for the entire card.
+cross-card clipboard and rebuilding cards after Undo. Screen captures and
+shell reports can both supply document command headings. Review and retry use
+the record's provenance. Anvil applies supported historical markup when the
+projected text matches the retained command. Cross-card copy joins the logical
+text of each document surface with one newline between surfaces. Captures
+outside the document profile use VTE. `JTERM_SHARED_FINISHED_OUTPUT=0` selects
+VTE for output. `JTERM_SHARED_FINISHED_COMMANDS=0` selects VTE for the entire card.
 Native Linux packages built with `shared-terminal` default to the shared
 runtime and live GTK terminal for new Block, Chat, and Unified panes.
 `JTERM_SHARED_ACTIVE_TERMINAL=0` rolls back Block and Chat at launch.
