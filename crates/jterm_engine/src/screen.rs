@@ -855,7 +855,7 @@ impl ScreenState {
         self.alt_cursor_col = self.alt_cursor_col.min(cols - 1);
         resize_tab_stops(&mut self.tab_stops, cols, TabStopOrigin::Set);
         if let Some(saved) = self.saved_state.as_mut() {
-            saved.row = saved.row.min(rows - 1);
+            saved.row = saved.row.saturating_sub(transfer_top).min(rows - 1);
             saved.col = saved.col.min(cols - 1);
         }
         if had_full_screen_region {

@@ -1317,6 +1317,23 @@ fn native_height_shrink_retains_primary_rows_and_keeps_the_live_prompt() {
 }
 
 #[test]
+fn height_shrink_keeps_the_saved_prompt_origin_on_its_live_row() {
+    let mut terminal = Terminal::new(6, 12).unwrap();
+    terminal.enable_history_preserving_resize();
+    terminal
+        .feed(b"one\r\ntwo\r\noutput\r\n\x1b7prompt\r\ndraft\r\nstatus")
+        .unwrap();
+    terminal.resize(4, 9).unwrap();
+    assert_eq!(terminal.history_extent(), 0..2);
+
+    terminal.feed(b"\x1b8\x1b[Jrepaint").unwrap();
+    let frame = terminal.frame().unwrap();
+    assert_eq!(frame.rows()[0].cells[0].character, 'o');
+    assert_eq!(frame.rows()[1].cells[0].character, 'r');
+    assert_eq!(frame.rows()[2].cells[0].character, ' ');
+}
+
+#[test]
 fn cursor_shape_visibility_and_pending_wrap_across_resize_and_alternate() {
     use crate::CursorShape;
     let mut t = Terminal::new(3, 4).unwrap();
