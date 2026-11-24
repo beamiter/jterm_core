@@ -31,6 +31,7 @@ pub use jterm_engine::authenticated_boundaries;
 pub use jterm_engine::history_reflow::HistoryAnchor;
 pub use jterm_engine::terminal::TranscriptAnchor;
 pub use jterm_runtime::exit_status::PtyExit;
+pub use jterm_runtime::terminal::{Pty, TerminalHandle, TerminalOutput, TerminalProfile};
 #[cfg(target_os = "linux")]
 pub use jterm_runtime::shell_identity::ShellIdentityChannel;
 #[cfg(target_os = "linux")]
@@ -39,7 +40,7 @@ pub use live_output::{
     captured_live_rows, CapturedLiveRow, LiveOutputRow, LiveOutputView, MAX_LIVE_OUTPUT_BYTES,
 };
 pub use pane::{
-    CursorColors, EmbeddedTerminal, LinkActions, PaneEvent, PlainLinkFinder, Pty,
+    CursorColors, EmbeddedTerminal, LinkActions, PaneEvent, PlainLinkFinder,
     RetainedTextSource, TerminalPane, Theme,
 };
 pub use pty_dispatch::{PtyDispatch, PtyEvent};

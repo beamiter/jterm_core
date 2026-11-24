@@ -8,9 +8,12 @@ use jterm_engine::{
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
     mouse::MouseInput,
-    terminal::{Terminal, TranscriptAnchor, WindowUpdates, MAX_FEED_BYTES},
+    terminal::{Terminal, TranscriptAnchor, WindowUpdates},
 };
 use jterm_runtime::exit_status::PtyExit;
+use jterm_runtime::terminal::{
+    Pty, TerminalHandle, TerminalOutput, TerminalProfile, TerminalUpdate,
+};
 use std::{
     cell::{Cell, OnceCell, RefCell},
     io,
@@ -33,30 +36,12 @@ pub(crate) const INITIAL_ROWS: usize = 24;
 pub(crate) const INITIAL_COLUMNS: usize = 80;
 
 enum Backend<P> {
-    Legacy {
-        pty: P,
-        terminal: Box<RefCell<Terminal>>,
+    Host {
+        terminal: TerminalHandle<P>,
+        local_reader: Option<TerminalOutput<P>>,
     },
     #[cfg(target_os = "linux")]
     Runtime(Rc<RuntimeShell>),
-}
-
-/// Existing application-owned PTY transport. Terminal semantics live in this
-/// view's single shared engine, while the transport owns the child and descriptors.
-pub trait Pty: 'static {
-    /// Finish any host-held output before encoding a user's next input.
-    fn before_input(&self) {}
-    fn write(&self, bytes: &[u8]) -> Result<(), String>;
-    fn write_reply(&self, bytes: &[u8]) -> Result<(), String> {
-        self.write(bytes)
-    }
-    fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
-    fn stop(&self);
-    fn start_reader(
-        &self,
-        output: impl FnMut(Vec<u8>) + 'static,
-        exited: impl FnOnce(PtyExit) + 'static,
-    ) -> Result<(), String>;
 }
 
 #[derive(Clone)]
@@ -158,19 +143,20 @@ pub struct RetainedTextSource {
 }
 
 impl<P: Pty> EmbeddedTerminal<P> {
-    /// `cols` and `rows` describe the PTY's existing grid at attachment time.
-    pub fn new(
-        pty: P,
-        cols: u16,
-        rows: u16,
+    /// Attach the presentation to the runtime's existing terminal grid.
+    pub fn attach(
+        terminal: TerminalHandle<P>,
         theme: Theme,
         status_text: fn(&str, usize) -> String,
         links: LinkActions,
     ) -> Result<(gtk4::Widget, Rc<Self>), String> {
+        let (cols, rows) = terminal.grid_size()?;
         let grid_size = GridSize::Application { cols, rows };
-        let backend = local_backend(pty, grid_size, links.admit)?;
         let (widget, pane) = TerminalPane::attach(
-            backend,
+            Backend::Host {
+                terminal,
+                local_reader: None,
+            },
             theme,
             status_text,
             links,
@@ -207,19 +193,9 @@ impl<P: Pty> EmbeddedTerminal<P> {
         self.pane.resize_grid(usize::from(rows), usize::from(cols))
     }
 
-    /// Apply the next bytes from the application's reader and queue the
-    /// engine's replies on the same transport before notifying observers.
-    pub fn ingest(&self, bytes: &[u8]) -> Result<(), String> {
-        self.pane.feed_local(bytes)
-    }
-
-    pub fn exited(&self, status: PtyExit) {
-        self.pane.report_exit(status);
-    }
-
     pub fn enable_transcript_sources(&self) {
-        if let Backend::Legacy { terminal, .. } = &self.pane.backend {
-            terminal.borrow_mut().track_transcript_rows();
+        if let Backend::Host { terminal, .. } = &self.pane.backend {
+            terminal.track_transcript_rows();
         }
     }
 
@@ -471,7 +447,7 @@ impl<P: Pty> EmbeddedTerminal<P> {
     }
 
     pub fn admit_inline_image(&self, pending: PendingInlineImage) -> bool {
-        let Backend::Legacy { terminal, .. } = &self.pane.backend else {
+        let Backend::Host { terminal, .. } = &self.pane.backend else {
             return false;
         };
         if self.pane.exited.get()
@@ -479,7 +455,9 @@ impl<P: Pty> EmbeddedTerminal<P> {
                 .pane
                 .inline_images
                 .borrow_mut()
-                .admit(&mut terminal.borrow_mut(), pending)
+                .admit(pending, |reservation| {
+                    terminal.place_inline_image(reservation)
+                })
         {
             return false;
         }
@@ -488,35 +466,11 @@ impl<P: Pty> EmbeddedTerminal<P> {
     }
 
     pub fn inspect<T>(&self, read: impl FnOnce(&Terminal) -> T) -> T {
-        let Backend::Legacy { terminal, .. } = &self.pane.backend else {
+        let Backend::Host { terminal, .. } = &self.pane.backend else {
             unreachable!("an embedded terminal has its own shared engine")
         };
-        read(&terminal.borrow())
+        terminal.inspect(read)
     }
-}
-
-fn local_backend<P: Pty>(
-    pty: P,
-    grid_size: GridSize,
-    link_policy: HyperlinkPolicy,
-) -> Result<Backend<P>, String> {
-    let (rows, cols) = grid_size.dimensions();
-    let mut terminal = Terminal::new(rows, cols)?;
-    terminal.enable_underline_colors();
-    terminal.enable_grapheme_clusters();
-    terminal.enable_hyperlinks(link_policy);
-    terminal.enable_window_updates();
-    if grid_size.automatic() {
-        terminal.enable_primary_reflow();
-    } else {
-        terminal.enable_history_preserving_resize();
-        terminal.enable_device_answers();
-        terminal.track_printed_spaces();
-    }
-    Ok(Backend::Legacy {
-        pty,
-        terminal: Box::new(RefCell::new(terminal)),
-    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -605,9 +559,18 @@ impl<P: Pty> TerminalPane<P> {
         close: impl Fn(&gtk4::Widget) + 'static,
     ) -> Result<(gtk4::Widget, Rc<Self>), String> {
         let grid_size = GridSize::Allocation;
-        let backend = local_backend(pty, grid_size, links.admit)?;
+        let output = TerminalOutput::new(
+            pty,
+            INITIAL_COLUMNS as u16,
+            INITIAL_ROWS as u16,
+            TerminalProfile::Standalone,
+            links.admit,
+        )?;
         Self::attach(
-            backend,
+            Backend::Host {
+                terminal: output.handle(),
+                local_reader: Some(output),
+            },
             theme,
             status_text,
             links,
@@ -818,15 +781,25 @@ impl<P: Pty> TerminalPane<P> {
             glib::ControlFlow::Continue
         });
         match &session.backend {
-            Backend::Legacy { pty, terminal } => {
-                terminal.borrow_mut().set_color_defaults(colors);
-                if automatic_grid {
+            Backend::Host {
+                terminal,
+                local_reader,
+            } => {
+                terminal.set_color_defaults(colors);
+                let pane = Rc::downgrade(&session);
+                terminal.on_update(move |update| {
+                    if let Some(pane) = pane.upgrade() {
+                        pane.observe_host(update);
+                    }
+                })?;
+                if local_reader.is_some() {
                     let for_output = Rc::downgrade(&session);
                     let for_exit = Rc::downgrade(&session);
-                    pty.start_reader(
+                    terminal.pty().start_reader(
                         move |bytes| {
                             if let Some(session) = for_output.upgrade() {
-                                if let Err(error) = session.feed_local(&bytes) {
+                                let output = session.local_reader();
+                                if let Err(error) = output.apply(&bytes) {
                                     session.report(&error);
                                     session.stop();
                                 }
@@ -834,7 +807,7 @@ impl<P: Pty> TerminalPane<P> {
                         },
                         move |status| {
                             if let Some(session) = for_exit.upgrade() {
-                                session.report_exit(status);
+                                session.local_reader().finish(status);
                             }
                         },
                     )?;
@@ -863,7 +836,7 @@ impl<P: Pty> TerminalPane<P> {
 
     pub fn pty(&self) -> Option<&P> {
         match &self.backend {
-            Backend::Legacy { pty, .. } => Some(pty),
+            Backend::Host { terminal, .. } => Some(terminal.pty()),
             #[cfg(target_os = "linux")]
             Backend::Runtime(_) => None,
         }
@@ -872,16 +845,37 @@ impl<P: Pty> TerminalPane<P> {
     #[cfg(target_os = "linux")]
     pub fn runtime(&self) -> Option<&Rc<RuntimeShell>> {
         match &self.backend {
-            Backend::Legacy { .. } => None,
+            Backend::Host { .. } => None,
             Backend::Runtime(owner) => Some(owner),
         }
     }
 
     fn inspect<T>(&self, read: impl FnOnce(&Terminal) -> T) -> Result<T, String> {
         match &self.backend {
-            Backend::Legacy { terminal, .. } => Ok(read(&terminal.borrow())),
+            Backend::Host { terminal, .. } => Ok(terminal.inspect(read)),
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => owner.inspect(read),
+        }
+    }
+
+    fn local_reader(&self) -> &TerminalOutput<P> {
+        match &self.backend {
+            Backend::Host {
+                local_reader: Some(output),
+                ..
+            } => output,
+            _ => unreachable!("only a standalone host pane installs a local reader"),
+        }
+    }
+
+    fn observe_host(&self, update: TerminalUpdate) {
+        self.dirty.set(true);
+        match update {
+            TerminalUpdate::Output(window) => {
+                self.notify(PaneEvent::Output);
+                self.notify_window(window);
+            }
+            TerminalUpdate::Exited(status) => self.report_exit(status),
         }
     }
 
@@ -967,7 +961,7 @@ impl<P: Pty> TerminalPane<P> {
     pub fn set_theme(&self, theme: Theme) {
         let colors = theme.terminal_colors();
         match &self.backend {
-            Backend::Legacy { terminal, .. } => terminal.borrow_mut().set_color_defaults(colors),
+            Backend::Host { terminal, .. } => terminal.set_color_defaults(colors),
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => {
                 if let Err(error) = owner.set_color_defaults(colors) {
@@ -994,7 +988,7 @@ impl<P: Pty> TerminalPane<P> {
 
     pub fn set_history_row_limit(&self, rows: usize) {
         match &self.backend {
-            Backend::Legacy { terminal, .. } => terminal.borrow_mut().set_history_row_limit(rows),
+            Backend::Host { terminal, .. } => terminal.set_history_row_limit(rows),
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => {
                 if let Err(error) = owner.set_history_row_limit(rows) {
@@ -1072,8 +1066,8 @@ impl<P: Pty> TerminalPane<P> {
         mut search: HistorySearch,
     ) -> Result<(HistorySearch, HistorySearchProgress), String> {
         match &self.backend {
-            Backend::Legacy { terminal, .. } => {
-                let progress = search.step(&terminal.borrow())?;
+            Backend::Host { terminal, .. } => {
+                let progress = terminal.inspect(|terminal| search.step(terminal))?;
                 Ok((search, progress))
             }
             #[cfg(target_os = "linux")]
@@ -1098,7 +1092,7 @@ impl<P: Pty> TerminalPane<P> {
         self.exited.set(true);
         self.set_input_focus(false);
         match &self.backend {
-            Backend::Legacy { pty, .. } => pty.stop(),
+            Backend::Host { terminal, .. } => terminal.stop(),
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => owner.close(),
         }
@@ -1192,50 +1186,13 @@ impl<P: Pty> TerminalPane<P> {
 
     fn resize_grid(&self, rows: usize, columns: usize) -> Result<(), String> {
         match &self.backend {
-            Backend::Legacy { pty, terminal } => {
-                terminal
-                    .borrow_mut()
-                    .resize_with(rows, columns, || pty.resize(columns as u16, rows as u16))
-            }
+            Backend::Host { terminal, .. } => terminal.resize(rows, columns),
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => owner.resize(rows, columns),
         }?;
         self.dimensions.set((rows, columns));
         self.dirty.set(true);
         Ok(())
-    }
-
-    fn feed_local(&self, input: &[u8]) -> Result<(), String> {
-        let Backend::Legacy { pty, terminal } = &self.backend else {
-            return Err("terminal session owns its reader".into());
-        };
-        if self.exited.get() {
-            return Err("terminal output is closed".into());
-        }
-        if input.is_empty() {
-            return Ok(());
-        }
-        let mut reply_error = None;
-        let result = input.chunks(MAX_FEED_BYTES).try_for_each(|chunk| {
-            let reply = terminal
-                .borrow_mut()
-                .feed(chunk)
-                .map_err(|error| format!("Terminal output failed: {error}"))?;
-            if !reply.is_empty() {
-                if let Err(error) = pty.write_reply(&reply) {
-                    reply_error.get_or_insert(error);
-                }
-            }
-            Ok(())
-        });
-        let window = terminal.borrow_mut().take_window_updates();
-        self.dirty.set(true);
-        self.notify(PaneEvent::Output);
-        self.notify_window(window);
-        result.and_then(|()| match reply_error {
-            Some(error) => Err(format!("Terminal reply delivery failed: {error}")),
-            None => Ok(()),
-        })
     }
 
     fn paint(&self) {
@@ -1245,8 +1202,8 @@ impl<P: Pty> TerminalPane<P> {
         let exited = self.exited.get();
         let request = self.viewport_request();
         let snapshot = match &self.backend {
-            Backend::Legacy { terminal, .. } => request
-                .capture(&terminal.borrow(), exited)
+            Backend::Host { terminal, .. } => terminal
+                .viewport(request)
                 .map(|frame| frame.map(|frame| (frame, false))),
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => owner.poll_viewport(request),
@@ -1514,11 +1471,11 @@ impl<P: Pty> TerminalPane<P> {
             return Err("terminal input is closed".into());
         }
         match &self.backend {
-            Backend::Legacy { pty, terminal } => encode(&terminal.borrow()).and_then(|bytes| {
+            Backend::Host { terminal, .. } => terminal.inspect(encode).and_then(|bytes| {
                 if bytes.is_empty() {
                     return Ok(false);
                 }
-                pty.write(&bytes).map(|()| true)
+                terminal.pty().write(&bytes).map(|()| true)
             }),
             #[cfg(target_os = "linux")]
             Backend::Runtime(owner) => owner.input(encode),
@@ -2001,6 +1958,29 @@ mod transcript_tests {
         }
     }
 
+    fn attach_test(
+        cols: u16,
+        rows: u16,
+        theme: Theme,
+        links: LinkActions,
+    ) -> (
+        gtk4::Widget,
+        Rc<EmbeddedTerminal<TestPty>>,
+        TerminalOutput<TestPty>,
+    ) {
+        let output =
+            TerminalOutput::new(TestPty, cols, rows, TerminalProfile::Embedded, links.admit)
+                .unwrap();
+        let (widget, terminal) = EmbeddedTerminal::attach(
+            output.handle(),
+            theme,
+            |s, _| s.to_owned(),
+            links,
+        )
+        .unwrap();
+        (widget, terminal, output)
+    }
+
     #[test]
     #[ignore = "requires a GTK display"]
     fn find_paints_archived_unicode_without_stealing_focus_or_selection() {
@@ -2017,11 +1997,8 @@ mod transcript_tests {
             find_plain: None,
             attach_opener: |_| Box::new(|_| {}),
         };
-        let (widget, terminal) =
-            EmbeddedTerminal::new(TestPty, 9, 4, theme.clone(), |s, _| s.to_owned(), links())
-                .unwrap();
-        let (_, other_terminal) =
-            EmbeddedTerminal::new(TestPty, 9, 4, theme, |s, _| s.to_owned(), links()).unwrap();
+        let (widget, terminal, output) = attach_test(9, 4, theme.clone(), links());
+        let (_, other_terminal, other_output) = attach_test(9, 4, theme, links());
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         let entry = gtk4::Entry::new();
         content.append(&entry);
@@ -2030,8 +2007,8 @@ mod transcript_tests {
         window.present();
         entry.grab_focus();
         let focus_before = gtk4::prelude::RootExt::focus(&window).expect("find entry focus");
-        terminal
-            .ingest("prefix界e\u{301}target\r\n1\r\n2\r\n3\r\n4\r\ncurrent".as_bytes())
+        output
+            .apply("prefix界e\u{301}target\r\n1\r\n2\r\n3\r\n4\r\ncurrent".as_bytes())
             .unwrap();
         terminal.pane.paint();
 
@@ -2055,8 +2032,8 @@ mod transcript_tests {
             (snapshot.frame, hits)
         };
         let (frame, hits) = find();
-        other_terminal
-            .ingest("prefix界e\u{301}target\r\n1\r\n2\r\n3\r\n4\r\ncurrent".as_bytes())
+        other_output
+            .apply("prefix界e\u{301}target\r\n1\r\n2\r\n3\r\n4\r\ncurrent".as_bytes())
             .unwrap();
         assert_eq!(
             terminal.inspect(|t| t.frame().unwrap().stamp()),
@@ -2124,8 +2101,7 @@ mod transcript_tests {
             find_plain: None,
             attach_opener: |_| Box::new(|_| {}),
         };
-        let (_, terminal) =
-            EmbeddedTerminal::new(TestPty, 8, 4, theme, |s, _| s.to_owned(), links).unwrap();
+        let (_, terminal, output) = attach_test(8, 4, theme, links);
         let texture = gdk::MemoryTexture::new(
             2,
             2,
@@ -2136,7 +2112,7 @@ mod transcript_tests {
         .upcast();
         let images = || terminal.pane.inline_images.borrow().painted_slices();
 
-        terminal.ingest(b"\x1b[2;2H\x1b[?2026h").unwrap();
+        output.apply(b"\x1b[2;2H\x1b[?2026h").unwrap();
         let image = terminal
             .prepare_inline_image(
                 texture,
@@ -2153,16 +2129,16 @@ mod transcript_tests {
         terminal.pane.paint();
         assert_eq!(images(), 0);
 
-        terminal.ingest(b"\x1b[?2026l").unwrap();
+        output.apply(b"\x1b[?2026l").unwrap();
         terminal.pane.paint();
         assert_eq!(images(), 2);
-        terminal.ingest(b"\x1b[?1049h").unwrap();
+        output.apply(b"\x1b[?1049h").unwrap();
         terminal.pane.paint();
         assert_eq!(images(), 0);
-        terminal.ingest(b"\x1b[?1049l").unwrap();
+        output.apply(b"\x1b[?1049l").unwrap();
         terminal.pane.paint();
         assert_eq!(images(), 2);
-        terminal.ingest(b"\x1b[2J").unwrap();
+        output.apply(b"\x1b[2J").unwrap();
         terminal.pane.paint();
         assert_eq!(images(), 0);
     }
@@ -2183,15 +2159,7 @@ mod transcript_tests {
             find_plain: None,
             attach_opener: |_| Box::new(|_| {}),
         };
-        let (widget, terminal) = EmbeddedTerminal::new(
-            TestPty,
-            12,
-            4,
-            theme,
-            |message, _| message.to_owned(),
-            links,
-        )
-        .unwrap();
+        let (widget, terminal, output) = attach_test(12, 4, theme, links);
         let window = gtk4::Window::new();
         window.set_default_size(400, 240);
         window.set_child(Some(&widget));
@@ -2199,16 +2167,16 @@ mod transcript_tests {
 
         let view = TranscriptView::new(terminal.clone());
         view.begin_prompt(7);
-        terminal.ingest(b"context\r\nprompt> ").unwrap();
+        output.apply(b"context\r\nprompt> ").unwrap();
         view.end_prompt();
-        terminal
-            .ingest(b"\x1b[1G\x1b[1A\x1b[Jcontext\r\nprompt> echo\r\n")
+        output
+            .apply(b"\x1b[1G\x1b[1A\x1b[Jcontext\r\nprompt> echo\r\n")
             .unwrap();
         view.begin_output(Some(7));
-        terminal.ingest(b"witness-old\r\n").unwrap();
+        output.apply(b"witness-old\r\n").unwrap();
         view.end_output(Some(7), 64);
-        terminal
-            .ingest(b"filler\r\nnext\r\nmore\r\nagain\r\n")
+        output
+            .apply(b"filler\r\nnext\r\nmore\r\nagain\r\n")
             .unwrap();
         let zone = view.source_zone(7).unwrap();
         assert_eq!(zone.origin, TranscriptZoneOrigin::Live);
@@ -2254,20 +2222,20 @@ mod transcript_tests {
         let heading = painted_heading(7).unwrap();
         assert_eq!(heading.row, 0);
         assert_eq!(heading.blank_tail, Some(6));
-        terminal.ingest(b"\x1b[3J").unwrap();
+        output.apply(b"\x1b[3J").unwrap();
         assert!(view.source_zone(7).is_none());
         assert!(!view.reveal_zone(7));
         assert!(painted_heading(7).is_none());
 
         terminal.resize(12, 4).unwrap();
-        terminal.ingest(b"\r\n").unwrap();
+        output.apply(b"\r\n").unwrap();
         view.begin_restored_prompt(8);
-        terminal.ingest(b"prompt> ").unwrap();
+        output.apply(b"prompt> ").unwrap();
         view.end_prompt();
-        terminal.ingest(b"yes\r\n").unwrap();
+        output.apply(b"yes\r\n").unwrap();
         view.begin_output(Some(8));
-        terminal
-            .ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nclipped row")
+        output
+            .apply(b"one\r\ntwo\r\nthree\r\nfour\r\nclipped row")
             .unwrap();
         view.end_output(Some(8), 64);
         let restored = view.source_zone(8).unwrap();

@@ -155,11 +155,15 @@ impl InlineImages {
         })
     }
 
-    pub(crate) fn admit(&mut self, terminal: &mut Terminal, prepared: PendingInlineImage) -> bool {
+    pub(crate) fn admit(
+        &mut self,
+        prepared: PendingInlineImage,
+        place: impl FnOnce(PreparedInlineImage) -> Option<PlacedInlineImage>,
+    ) -> bool {
         if prepared.owner.upgrade().as_ref() != Some(&self.canvas) {
             return false;
         }
-        let Some(source) = terminal.place_inline_image(prepared.reservation) else {
+        let Some(source) = place(prepared.reservation) else {
             return false;
         };
         self.retained_bytes += prepared.charge;

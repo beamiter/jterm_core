@@ -7,7 +7,7 @@ use std::{
 use gtk4::{gdk, glib, prelude::*};
 use jterm_engine::history_search::{HistoryMatch, HistorySearch, HistorySearchProgress};
 
-use crate::pane::{Pty, TerminalPane};
+use crate::{Pty, TerminalPane};
 
 const SEARCH_WINDOW_BYTES: usize = 128 * 1024;
 

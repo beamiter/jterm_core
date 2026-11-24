@@ -32,3 +32,7 @@ pub mod shell_identity;
 pub mod startup_status;
 #[allow(unsafe_code)] // Process-group creation and non-consuming Unix wait.
 pub mod supervised;
+#[cfg(feature = "terminal")]
+pub mod terminal;
+#[cfg(feature = "terminal")]
+pub mod viewport;

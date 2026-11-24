@@ -53,10 +53,16 @@ impl Pty for Transport {
 fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
     gtk4::init().unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
-    let (widget, embedded) = EmbeddedTerminal::new(
+    let output = jterm_gtk_view::TerminalOutput::new(
         Transport(events.clone()),
         12,
         6,
+        jterm_gtk_view::TerminalProfile::Embedded,
+        |_, _| false,
+    )
+    .unwrap();
+    let (widget, embedded) = EmbeddedTerminal::attach(
+        output.handle(),
         Theme {
             font: pango::FontDescription::from_string("Monospace 10"),
             foreground: gdk::RGBA::WHITE,
@@ -89,9 +95,9 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
     assert_eq!(pane.grid_size(), (12, 6));
     assert!(events.borrow().is_empty());
 
-    embedded.ingest(b"shell> ").unwrap();
+    output.apply(b"shell> ").unwrap();
     pane.write_text("run").unwrap();
-    embedded.ingest(b"run\r\nworking").unwrap();
+    output.apply(b"run\r\nworking").unwrap();
     let observing = events.clone();
     assert!(pane.set_event_handler(move |event| {
         if matches!(event, PaneEvent::Output) {
@@ -102,7 +108,7 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
     embedded.resize(18, 8).unwrap();
     let mut fullscreen = vec![b'\r'; MAX_FEED_BYTES - 1];
     fullscreen.extend_from_slice(b"\x1b[?1049h\x1b[5;7H\x1b[6n\x1b[c\x1b[?u\x1b[?4m\x1b[>q");
-    embedded.ingest(&fullscreen).unwrap();
+    output.apply(&fullscreen).unwrap();
     assert_eq!(pane.grid_size(), (18, 8));
     assert!(embedded.inspect(|terminal| terminal.alternate_screen_active()));
     assert_eq!(
@@ -117,7 +123,7 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
             TransportEvent::Output,
         ]
     );
-    embedded.ingest(b"\x1b[?1049l").unwrap();
+    output.apply(b"\x1b[?1049l").unwrap();
     assert!(embedded.inspect(|terminal| terminal.visible_text().contains("shell> run")));
     assert_eq!(&screen, pane.screen());
 
@@ -137,8 +143,8 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
     assert!(embedded.write_retained_text(&source, &mut copied).is_err());
     assert!(copied.is_empty(), "an expired source produced partial text");
 
-    embedded.exited(17.into());
+    output.finish(17.into());
     assert!(pane.write_text("ignored").is_err());
-    assert!(embedded.ingest(b"ignored").is_err());
+    assert!(output.apply(b"ignored").is_err());
     window.close();
 }

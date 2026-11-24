@@ -9,6 +9,7 @@ use crate::native_pty_launch::{launch_bundled_bash, BundledBash};
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{SessionActor, SessionEvent};
 use crate::supervised::require_waitable_sigchld;
+use crate::terminal::Emulator;
 use crossbeam_channel::TryRecvError;
 use jterm_engine::frame::CellFrame;
 use jterm_engine::terminal::{
@@ -502,7 +503,7 @@ pub struct Session {
     output_wake: Arc<std::sync::OnceLock<WakeSink>>,
     child: Arc<ChildLifecycle>,
     reap_ticket: Arc<reaper::Ticket>,
-    terminal: Terminal,
+    terminal: Emulator,
     input: InputQueue,
     ordered_input: bool,
     input_boundary: Option<InputBoundary>,
@@ -700,7 +701,7 @@ impl Session {
             output_wake,
             child: lifecycle,
             reap_ticket,
-            terminal,
+            terminal: Emulator { engine: terminal },
             input: InputQueue::default(),
             ordered_input: false,
             input_boundary: None,
@@ -716,7 +717,7 @@ impl Session {
         })
     }
     pub fn terminal(&self) -> &Terminal {
-        &self.terminal
+        &self.terminal.engine
     }
 
     /// Notify the parser owner when the reader publishes output or exit.
@@ -736,6 +737,7 @@ impl Session {
         decode_png: jterm_engine::terminal::PngDecoder,
     ) {
         self.terminal
+            .engine
             .enable_inline_graphics(cell_pixels, decode_png);
     }
 
@@ -766,43 +768,43 @@ impl Session {
     }
 
     pub fn enable_underline_colors(&mut self) {
-        self.terminal.enable_underline_colors();
+        self.terminal.engine.enable_underline_colors();
     }
 
     pub fn enable_grapheme_clusters(&mut self) {
-        self.terminal.enable_grapheme_clusters();
+        self.terminal.engine.enable_grapheme_clusters();
     }
 
     pub fn enable_hyperlinks(&mut self, policy: jterm_engine::hyperlink::HyperlinkPolicy) {
-        self.terminal.enable_hyperlinks(policy);
+        self.terminal.engine.enable_hyperlinks(policy);
     }
 
     pub fn enable_window_updates(&mut self) {
-        self.terminal.enable_window_updates();
+        self.terminal.engine.enable_window_updates();
     }
 
     pub fn set_color_defaults(&mut self, defaults: jterm_engine::colors::TerminalDefaultColors) {
-        self.terminal.set_color_defaults(defaults);
+        self.terminal.engine.set_color_defaults(defaults);
     }
 
     pub fn enable_keyboard_disambiguation(&mut self) {
-        self.terminal.enable_keyboard_disambiguation();
+        self.terminal.engine.enable_keyboard_disambiguation();
     }
 
     pub fn set_history_row_limit(&mut self, rows: usize) {
-        self.terminal.set_history_row_limit(rows);
+        self.terminal.engine.set_history_row_limit(rows);
     }
 
     pub fn enable_history_preserving_resize(&mut self) {
-        self.terminal.enable_history_preserving_resize();
+        self.terminal.engine.enable_history_preserving_resize();
     }
 
     pub fn enable_primary_reflow(&mut self) {
-        self.terminal.enable_primary_reflow();
+        self.terminal.engine.enable_primary_reflow();
     }
 
     pub fn take_window_updates(&mut self) -> jterm_engine::terminal::WindowUpdates {
-        self.terminal.take_window_updates()
+        self.terminal.engine.take_window_updates()
     }
 
     /// A partial logical event keeps its place ahead of later replies and input.
@@ -823,7 +825,7 @@ impl Session {
         if !self.ordered_input {
             return Err("native paste requires ordered input".into());
         }
-        let bytes = self.terminal.encode_native_paste(text)?;
+        let bytes = self.terminal.engine.encode_native_paste(text)?;
         if bytes.is_empty() {
             return Ok(false);
         }
@@ -854,7 +856,7 @@ impl Session {
     /// belong to the directly launched shell before inserting recalled text.
     pub fn at_shell_prompt(&self) -> bool {
         self.input_idle()
-            && self.terminal.command_prompt_ready()
+            && self.terminal.engine.command_prompt_ready()
             && self.child_pid().is_some_and(|pid| {
                 self.io.as_ref().and_then(|io| io.actor.foreground_pgid()) == Some(pid)
             })
@@ -1092,7 +1094,7 @@ impl Session {
         // Caller owns unaccepted suffix. Interrupted/WouldBlock consume no input.
         match self.io.as_mut().ok_or("writer closed")?.write(input) {
             Ok(n) => {
-                self.terminal.observe_prompt_input(&input[..n]);
+                self.terminal.engine.observe_prompt_input(&input[..n]);
                 Ok(n)
             }
             Err(message) => {
@@ -1134,7 +1136,7 @@ impl Session {
         }
     }
     pub fn take_completed_sync_frame(&mut self) -> Option<CellFrame> {
-        self.terminal.take_completed_sync_frame()
+        self.terminal.engine.take_completed_sync_frame()
     }
     pub fn poll(&mut self) -> Result<usize, String> {
         self.poll_with_sync_capture(false)
@@ -1172,7 +1174,7 @@ impl Session {
     }
 
     fn poll_output(&mut self, capture: bool, flush_replies: bool) -> Result<usize, String> {
-        self.terminal.begin_update(capture);
+        self.terminal.engine.begin_update(capture);
         if self.closed {
             return Err("session is closed".into());
         }
@@ -1204,7 +1206,7 @@ impl Session {
                 }
                 Ok(n) => {
                     total += n;
-                    let replies = self.terminal.feed(&bytes[..n])?;
+                    let replies = self.terminal.apply(&bytes[..n])?;
                     self.queue_replies(replies);
                     if flush_replies {
                         self.flush_replies();
@@ -1231,6 +1233,7 @@ impl Session {
         }
         let actor = &self.io.as_ref().ok_or("master closed")?.actor;
         self.terminal
+            .engine
             .resize_with(rows, cols, || actor.resize(cols, rows))
     }
     /// Drop PTY handles and transfer owned child to the fixed-capacity reaper.
@@ -1458,7 +1461,7 @@ mod tests {
         assert!(session.write_transaction_chunk(b"wrong size").is_err());
         assert!(session.submit_input(b"ordinary input".to_vec()).is_err());
         assert_eq!(session.write(b"legacy input").unwrap(), 0);
-        let replies = session.terminal.feed(b"\x1b[6n").unwrap();
+        let replies = session.terminal.apply(b"\x1b[6n").unwrap();
         session.queue_replies(replies);
         assert_eq!(session.replies.len(), 6);
         assert_eq!(session.write_transaction_chunk(b"aw-line\n").unwrap(), 8);
@@ -1541,7 +1544,7 @@ mod tests {
         ];
         let mut session = Session::spawn_command(4, 80, &argv, None, &[]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !session.terminal.visible_text().contains("PTY_READY") {
+        while !session.terminal().visible_text().contains("PTY_READY") {
             assert!(Instant::now() < deadline);
             session.drive().unwrap();
             std::thread::sleep(Duration::from_millis(1));
@@ -1554,7 +1557,7 @@ mod tests {
             assert!(session.poll_detached_idle().unwrap());
             std::thread::sleep(Duration::from_millis(1));
         }
-        let output = session.terminal.visible_text();
+        let output = session.terminal().visible_text();
         assert!(output.contains("DETACHED_OUTPUT"));
         assert!(!output.contains("INPUT_WOKE"));
         assert!(session.write_transaction_chunk(b"rtial\n").is_err());
