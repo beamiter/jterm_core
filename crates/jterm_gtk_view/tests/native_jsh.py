@@ -2,20 +2,29 @@
 """Verify ordinary GTK jsh panes and saved shell state on an isolated X11 display."""
 import argparse
 from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import struct
 import subprocess
 import tempfile
 import termios
 
-from native import Atspi, accessible_text, application_nodes, first_named, start_accessibility, wait_for
+from native import (
+    Atspi, accessible_text, application_nodes, first_named, start_accessibility, wait_for,
+    window_has_solid_color,
+)
 
 
 def xdotool(*args):
     return subprocess.check_output(["xdotool", *args], text=True, timeout=5).strip()
+
+
+def window_for(pid):
+    return xdotool("search", "--onlyvisible", "--pid", str(pid)).split()[0]
 
 
 def send(command):
@@ -55,6 +64,15 @@ def shells(pid, program):
     return found
 
 
+def pty_columns(child):
+    fd = os.open(f"/proc/{child}/fd/0", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        size = fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8))
+        return struct.unpack("HHHH", size)[1]
+    finally:
+        os.close(fd)
+
+
 @contextmanager
 def application(binary, config, environment, log_path, restore):
     command = [binary, "--config", str(config)]
@@ -63,8 +81,7 @@ def application(binary, config, environment, log_path, restore):
     with log_path.open("w+") as log:
         process = subprocess.Popen(command, cwd=config.parent, env=environment, stdout=log, stderr=log)
         try:
-            window = wait_for("terminal window", lambda: xdotool(
-                "search", "--onlyvisible", "--pid", str(process.pid)).split()[0])
+            window = wait_for("terminal window", lambda: window_for(process.pid))
             xdotool("windowfocus", "--sync", window)
             yield process
         except Exception:
@@ -117,8 +134,8 @@ def exercise(args, root):
     environment.pop("BASH_ENV", None)
     home = Path(environment["HOME"])
     (home / ".bashrc").write_text("printf 'shared-jsh-bootstrap\\n'\n")
-    working = home / "saved working directory"
-    working.mkdir()
+    working = root / "parent directory outside the shell home" / "saved working directory"
+    working.mkdir(parents=True)
     with application(args.binary, config, environment, root / "initial.log", restore=False) as process:
         pid = process.pid
         assert wait_for("shared jsh pane", lambda: shared_screen(pid)).get_description() == "Shared runtime session"
@@ -130,6 +147,10 @@ def exercise(args, root):
         send("export FAMILY_RESUME_WITNESS=retained; cd "
              + shlex.quote(str(working)) + r"; printf 'jsh-state-prepared\n'")
         wait_text(pid, "jsh-state-prepared")
+        columns = pty_columns(child)
+        draft = root / "split-draft"
+        xdotool("type", "--clearmodifiers", "--delay", "5",
+                "printf 'draft retained' > " + shlex.quote(str(draft)))
         xdotool("key", "--clearmodifiers", "ctrl+shift+e")
 
         def split():
@@ -138,12 +159,19 @@ def exercise(args, root):
 
         panes = wait_for("two jsh children with different session ids", split)
         assert panes[session] == child, panes
+        wait_for("the original jsh PTY narrowed", lambda: 0 < pty_columns(child) < columns)
         wait_for("focus in the new shared split", lambda: shared_screen(pid)
                  and "jsh-state-prepared" not in accessible_text(shared_screen(pid)))
         wait_text(pid, "❯")
         send("exit")
         wait_for("the split exited and returned focus", lambda: shells(pid, args.jsh) == original)
+        wait_for("the original jsh PTY recovered its width", lambda: pty_columns(child) == columns)
         wait_text(pid, "jsh-state-prepared")
+        assert not draft.exists(), "resize submitted the draft"
+        xdotool("key", "--clearmodifiers", "Return")
+        wait_for("the user submitted the retained draft", lambda: (
+            draft.is_file() and draft.read_bytes() == b"draft retained"))
+        wait_text(pid, "❯")
         close_window(process)
     assert not Path(f"/proc/{child}").exists(), "the initial jsh child survived app exit"
     state = json.loads((home / ".jsh" / "sessions" / f"{session}.json").read_text())
@@ -164,9 +192,6 @@ def exercise(args, root):
     environment["JTERM_SHARED_RUNTIME"] = "0"
     with application(args.binary, config, environment, root / "legacy.log", restore=False) as process:
         pid = process.pid
-        wait_for("the compatibility terminal", lambda: next(
-            (node for node in application_nodes(pid) if node.get_role() == Atspi.Role.TERMINAL
-             and node.get_state_set().contains(Atspi.StateType.SHOWING)), None))
         legacy = wait_for("jsh in the compatibility terminal", lambda: shells(pid, args.jsh))
         assert len(legacy) == 1, legacy
         legacy_child = next(iter(legacy.values()))
@@ -178,13 +203,17 @@ def exercise(args, root):
         finally:
             os.close(fd)
         receipt = root / "legacy-input"
-        send("printf 'legacy-jsh' > " + shlex.quote(str(receipt)))
+        window = window_for(pid)
+        send("printf 'legacy-jsh' > " + shlex.quote(str(receipt))
+             + r"; printf '\033[48;2;18;227;113mlegacy-jsh\033[0m\n'")
         wait_for("input reached the compatibility PTY", lambda: (
             receipt.is_file() and receipt.read_bytes() == b"legacy-jsh"))
+        wait_for("compatibility jsh output painted",
+                 lambda: window_has_solid_color(window, (18, 227, 113)))
         assert shared_screen(pid, Atspi.StateType.SHOWING) is None
         close_window(process, confirmation="Close Window" if args.app == "forge" else "Close")
     wait_for("compatibility jsh child stopped", lambda: not Path(f"/proc/{legacy_child}").exists())
-    print(f"{args.app} X11 jsh passed: bootstrap, independent split, same saved shell id, cwd, environment and rollback")
+    print(f"{args.app} X11 jsh passed: bootstrap, split reflow and draft, session restore and rollback")
 
 
 def main():

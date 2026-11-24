@@ -861,6 +861,12 @@ def exercise(app, pid, root, underline_colors, osc8_links, shared_runtime):
     output(r"(?m)^" + re.escape(cluster_line) + r" *$")
 
 
+def window_has_solid_color(window, rgb):
+    pixels = subprocess.check_output(
+        ["import", "-window", window, "-depth", "8", "rgb:-"], timeout=5)
+    return bytes(rgb) * 4 in pixels
+
+
 def sample_pixels(window, bounds, width, height):
     pixels = subprocess.check_output([
         "import", "-window", window, "-crop", f"{width}x{height}+{bounds.x}+{bounds.y}",

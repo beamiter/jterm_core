@@ -6,8 +6,10 @@ import os
 from pathlib import Path
 import tempfile
 
-from native import Atspi, accessible_text, application_nodes, start_accessibility, wait_for
-from native_jsh import application
+from native import (
+    Atspi, accessible_text, application_nodes, start_accessibility, wait_for, window_has_solid_color,
+)
+from native_jsh import application, window_for
 
 
 SHELL = r"""#!/usr/bin/python3
@@ -22,7 +24,8 @@ root = Path(__file__).parent
 tty.setraw(0)
 (root / "leader").write_text(str(os.getpid()))
 os.write(1, b"\x1b]133;A\x07$ \x1b]133;B\x07\r\n"
-            b"\x1b]133;C;cmdline_url=prepared-probe\x07prepared-pty-ready\r\n\x1b[5n")
+            b"\x1b]133;C;cmdline_url=prepared-probe\x07"
+            b"\x1b[48;2;18;227;113mprepared-pty-ready\x1b[0m\r\n\x1b[5n")
 if not select.select([0], [], [], 8)[0]:
     raise RuntimeError("no device status reply")
 reply = bytearray()
@@ -85,17 +88,21 @@ def run(app, binary, mode, root, rollback):
     if rollback:
         env["JTERM_SHARED_TRANSCRIPT" if mode == "unified" else "JTERM_SHARED_ACTIVE_TERMINAL"] = "0"
     with application(binary, config, env, root / "app.log", restore=False) as process:
-        def terminal_ready():
-            for node in application_nodes(process.pid):
-                if not node.get_state_set().contains(Atspi.StateType.SHOWING):
-                    continue
-                if rollback and node.get_role() == Atspi.Role.TERMINAL:
-                    return True
-                if not rollback and node.get_description() == "Shared active terminal":
-                    return "prepared-pty-ready" in accessible_text(node)
-            return False
+        def shared_screen():
+            return next((node for node in application_nodes(process.pid)
+                         if node.get_state_set().contains(Atspi.StateType.SHOWING)
+                         and node.get_description() == "Shared active terminal"), None)
 
-        wait_for("VTE rollback surface" if rollback else "early PTY output painted", terminal_ready)
+        if rollback:
+            # Older libvte builds can draw the terminal without an AT-SPI
+            # terminal node. Require pixels produced by this exact PTY.
+            window = window_for(process.pid)
+            wait_for("compatibility PTY output painted",
+                     lambda: window_has_solid_color(window, (18, 227, 113)))
+            assert shared_screen() is None
+        else:
+            wait_for("early shared PTY output painted", lambda: (
+                "prepared-pty-ready" in accessible_text(shared_screen())))
         reply = root / "reply"
         wait_for("device status reply", lambda: reply.is_file() and len(reply.read_bytes()) >= 4)
         assert reply.read_bytes() == b"\x1b[0n", reply.read_bytes()
