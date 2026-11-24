@@ -94,7 +94,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertLess(nel.index('note_output_cursor_reposition'), nel.index('line_feed'))
         self.assertIn('apply_vertical_motion(VerticalMotion::ReverseIndex)', parser)
 
-    def test_ember_reset_query_has_one_production_owner(self):
+    def test_reset_query_has_one_production_owner(self):
         host = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
         for name in ('soft_reset', 'handle_decrqss', 'decrqss_sgr_payload',
                      'sgr_color_params', 'handle_dcs_payload',
@@ -102,12 +102,15 @@ class BoundaryTests(unittest.TestCase):
             self.assertNotRegex(host, rf'fn {name}\b')
         engine = (ENGINE / 'src/semantics.rs').read_text()
         self.assertIn('soft_reset(screen, protocol)', engine)
-        self.assertIn('decrqm_private_mode_state(screen, protocol, mode)', engine)
+        self.assertIn('decrqm_private_mode_state(screen, protocol, mode, true)', engine)
         self.assertIn('decrqm_ansi_mode_state(screen, mode)', engine)
         self.assertNotIn('[DECRQM]', host)
         self.assertRegex(engine, r'Effect::Reply\(decrqss_reply\(\s*screen,\s*&payload\[2\.\.\]')
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
-        self.assertIn('fn soft_reset(', frost)
+        for name in ('soft_reset', 'report_private_mode_status',
+                     'decrqm_private_mode_state', 'decrqm_ansi_mode_state'):
+            self.assertNotRegex(frost, rf'fn {name}\b')
+        self.assertIn('decrqm_private_mode_state(screen, protocol, mode, false)', engine)
         self.assertNotIn('dispatch_local(', frost)
 
     def test_live_parser_has_one_owner_and_ordered_dispatch(self):
@@ -311,7 +314,15 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('if !local {', semantic)
         self.assertIn('return Dispatch::Unhandled;', semantic)
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
-        self.assertIn('jterm_engine::semantics::frost_legacy_sgr(', frost)
+        csi = frost.split('fn handle_escape_sequence(', 1)[1].split('fn decaln(', 1)[0]
+        self.assertIn('dispatch_frost_legacy_csi(', csi)
+        self.assertIn('Effect::Reply(bytes)', csi)
+        self.assertIn('Effect::GlobalBackground(color)', csi)
+        fallback = csi.split('let count = first.unwrap_or(1)', 1)[1]
+        for final_byte in ('A', 'B', 'H', 'f', 'g', 'm', 'c', 'p', 'r'):
+            self.assertNotRegex(fallback, rf"(?m)^\s*'{final_byte}'\s*(?:=>|if)")
+        frost_semantics = semantic.split('pub fn dispatch_frost_legacy_csi(', 1)[1]
+        self.assertIn('frost_legacy_sgr(', frost_semantics.split('fn set_xterm_modify_other_keys(', 1)[0])
         self.assertNotIn('fn handle_sgr(', frost)
         self.assertNotIn('fn parse_sgr_groups(', frost)
 

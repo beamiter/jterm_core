@@ -6,6 +6,7 @@ use crate::{
     Color, CursorShape, StyleFlags, UnderlineStyle,
 };
 use smallvec::SmallVec;
+use std::fmt::Write;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -78,6 +79,161 @@ pub fn legacy_device_attributes_reply(
     }
 }
 
+fn dispatch_cursor_csi(
+    screen: &mut ScreenState,
+    protocol: &mut ProtocolState,
+    params: &[u16],
+    cmd: u8,
+    private_prefix: Option<u8>,
+    intermediates: &[u8],
+) -> bool {
+    let first = params.first().copied();
+    let count = first.unwrap_or(1).max(1) as usize;
+    match cmd {
+        b'A' | b'k' => screen.move_cursor_up(count),
+        b'B' | b'e' => screen.move_cursor_down(count),
+        b'C' | b'a' => screen.move_cursor_forward(count),
+        b'D' | b'j' => screen.move_cursor_backward(count),
+        b'E' => {
+            screen.move_cursor_down(count);
+            screen.set_cursor_column(1);
+        }
+        b'F' => {
+            screen.move_cursor_up(count);
+            screen.set_cursor_column(1);
+        }
+        b'G' | b'`' => screen.set_cursor_column(first.unwrap_or(1) as usize),
+        b'd' => screen.set_cursor_row(first.unwrap_or(1) as usize),
+        b'H' | b'f' => {
+            if cmd == b'f' && private_prefix == Some(b'>') && intermediates.is_empty() {
+                screen.pending_wrap = false;
+                if first == Some(4) {
+                    protocol.set_xterm_format_other_keys(params.get(1).copied().unwrap_or(0));
+                }
+            } else {
+                screen.set_cursor_position(
+                    first.unwrap_or(1) as usize,
+                    params.get(1).copied().unwrap_or(1) as usize,
+                );
+            }
+        }
+        b'I' => screen.tab_forward(count),
+        b'Z' => screen.tab_backward(count),
+        b'g' => match first.unwrap_or(0) {
+            0 => screen.clear_tab_stop(),
+            3 => screen.clear_all_tab_stops(),
+            _ => {}
+        },
+        // XTRESTORE and DECCARA also end in r. They must never set margins.
+        b'r' if private_prefix.is_none() && intermediates.is_empty() => {
+            let top = first.unwrap_or(1).max(1) as usize;
+            let bottom = match params.get(1).copied().unwrap_or(screen.grid.rows() as u16) {
+                0 => screen.grid.rows(),
+                value => value as usize,
+            };
+            screen.set_scroll_region(top, bottom);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Apply Frost's local cursor, rendition and query controls. Apply the returned
+/// effects before the next event. Paint-dependent queries and host lifecycle
+/// commands stay unhandled.
+pub fn dispatch_frost_legacy_csi(
+    screen: &mut ScreenState,
+    protocol: &mut ProtocolState,
+    raw_params: &[u8],
+    params: &[u16],
+    cmd: u8,
+    private_prefix: Option<u8>,
+    intermediates: &[u8],
+) -> Dispatch {
+    // The older profile omits the four cursor-movement aliases.
+    if !matches!(cmd, b'a' | b'e' | b'j' | b'k')
+        && dispatch_cursor_csi(screen, protocol, params, cmd, private_prefix, intermediates)
+    {
+        return Dispatch::Handled(Effects::new());
+    }
+
+    let first = params.first().copied();
+    let mut effects = Effects::new();
+    let reply = match (cmd, private_prefix, intermediates, first) {
+        (b'c', _, _, _) => {
+            let Some(reply) = legacy_device_attributes_reply(private_prefix, intermediates) else {
+                return Dispatch::Unhandled;
+            };
+            Some(reply.to_vec())
+        }
+        (b'n', None, b"", Some(5)) => Some(b"\x1b[0n".to_vec()),
+        (b'n', prefix @ (None | Some(b'?')), b"", Some(6)) => {
+            Some(frost_legacy_cursor_position_reply(
+                screen.cursor_row,
+                screen.cursor_col,
+                prefix.is_some(),
+            ))
+        }
+        (b'p', None, b"!", _) => {
+            reset_local_attributes(screen, protocol);
+            effects.push(Effect::GlobalBackground(Color::Default));
+            None
+        }
+        (b'p', prefix @ (None | Some(b'?')), b"$", _) => {
+            let prefix = if prefix.is_some() { "?" } else { "" };
+            let mut response = String::new();
+            for &mode in params {
+                let state = if prefix.is_empty() {
+                    decrqm_ansi_mode_state(screen, mode)
+                } else {
+                    decrqm_private_mode_state(screen, protocol, mode, false)
+                };
+                write!(response, "\x1b[{prefix}{mode};{state}$y").expect("write to String");
+            }
+            (!response.is_empty()).then(|| response.into_bytes())
+        }
+        (b'm', Some(b'>'), b"", _) => {
+            set_xterm_modify_other_keys(protocol, params);
+            None
+        }
+        (b'm', _, _, _) => {
+            if let Some(color) = frost_legacy_sgr(
+                raw_params,
+                &mut screen.current_fg,
+                &mut screen.current_bg,
+                &mut screen.current_flags,
+            ) {
+                effects.push(Effect::GlobalBackground(color));
+            }
+            None
+        }
+        (b'q', None, b" ", _) => {
+            // Frost historically truncates the argument to one byte.
+            screen.cursor_shape = cursor_shape(u16::from(first.unwrap_or(0) as u8));
+            None
+        }
+        _ => return Dispatch::Unhandled,
+    };
+    if let Some(reply) = reply {
+        effects.push(Effect::Reply(reply));
+    }
+    Dispatch::Handled(effects)
+}
+
+fn set_xterm_modify_other_keys(protocol: &mut ProtocolState, params: &[u16]) {
+    if params.first() == Some(&4) {
+        protocol.set_xterm_modify_other_keys(params.get(1).copied().unwrap_or(0));
+    }
+}
+
+fn cursor_shape(param: u16) -> CursorShape {
+    match param {
+        3 | 4 => CursorShape::Underline,
+        5 | 6 => CursorShape::Beam,
+        _ => CursorShape::Block,
+    }
+}
+
 /// Ember-compatible semantics, including its DECSTR policy (not Frost soft reset).
 /// Frost parser profiles do not select or authorize this semantic policy.
 /// Dispatch exactly one event. Apply returned effects before the next event.
@@ -121,7 +277,7 @@ pub(crate) fn dispatch_local_with_underline(
                 Some(b'?') => format!(
                     "\x1b[?{};{}$y",
                     mode,
-                    decrqm_private_mode_state(screen, protocol, mode)
+                    decrqm_private_mode_state(screen, protocol, mode, true)
                 ),
                 None => format!("\x1b[{};{}$y", mode, decrqm_ansi_mode_state(screen, mode)),
                 _ => unreachable!(),
@@ -249,80 +405,28 @@ pub(crate) fn dispatch_local_with_underline(
             }
             if matches!(
                 cmd,
-                b'A' | b'B'
-                    | b'C'
-                    | b'D'
-                    | b'E'
-                    | b'F'
-                    | b'G'
-                    | b'H'
-                    | b'f'
-                    | b'd'
-                    | b'`'
-                    | b'I'
-                    | b'Z'
-                    | b'a'
-                    | b'e'
-                    | b'j'
-                    | b'k'
-            ) {
-                screen.pending_wrap = false;
-            }
-            if matches!(
-                cmd,
                 b'A' | b'B' | b'E' | b'F' | b'H' | b'f' | b'd' | b'e' | b'k'
             ) {
                 effects.push(Effect::CursorReposition { non_linear: true });
             } else if matches!(cmd, b'C' | b'D' | b'G' | b'`' | b'I' | b'Z' | b'a' | b'j') {
                 effects.push(Effect::CursorReposition { non_linear: false });
             }
+            if dispatch_cursor_csi(
+                screen,
+                protocol,
+                params,
+                cmd,
+                *private_prefix,
+                intermediates,
+            ) {
+                return Dispatch::Handled(effects);
+            }
             let first = params.first().copied();
             let count = first.unwrap_or(1).max(1) as usize;
             match cmd {
-                b'A' | b'k' => screen.move_cursor_up(count),
-                b'B' | b'e' => screen.move_cursor_down(count),
-                b'C' | b'a' => screen.move_cursor_forward(count),
-                b'D' | b'j' => screen.move_cursor_backward(count),
-                b'E' => {
-                    screen.move_cursor_down(count);
-                    screen.set_cursor_column(1);
-                }
-                b'F' => {
-                    screen.move_cursor_up(count);
-                    screen.set_cursor_column(1);
-                }
-                b'G' | b'`' => screen.set_cursor_column(first.unwrap_or(1) as usize),
-                b'd' => screen.set_cursor_row(first.unwrap_or(1) as usize),
-                b'H' => screen.set_cursor_position(
-                    first.unwrap_or(1) as usize,
-                    params.get(1).copied().unwrap_or(1) as usize,
-                ),
-                b'f' => {
-                    if *private_prefix == Some(b'>') && intermediates.is_empty() {
-                        if first.unwrap_or(0) == 4 {
-                            protocol
-                                .set_xterm_format_other_keys(params.get(1).copied().unwrap_or(0));
-                        }
-                    } else {
-                        screen.set_cursor_position(
-                            first.unwrap_or(1) as usize,
-                            params.get(1).copied().unwrap_or(1) as usize,
-                        );
-                    }
-                }
-                b'I' => screen.tab_forward(count),
-                b'Z' => screen.tab_backward(count),
-                b'g' => match first.unwrap_or(0) {
-                    0 => screen.clear_tab_stop(),
-                    3 => screen.clear_all_tab_stops(),
-                    _ => {}
-                },
                 b'm' => {
                     if *private_prefix == Some(b'>') && intermediates.is_empty() {
-                        if first.unwrap_or(0) == 4 {
-                            protocol
-                                .set_xterm_modify_other_keys(params.get(1).copied().unwrap_or(0));
-                        }
+                        set_xterm_modify_other_keys(protocol, params);
                     } else {
                         handle_sgr(
                             screen,
@@ -406,21 +510,9 @@ pub(crate) fn dispatch_local_with_underline(
                             .map(Effect::Row),
                     );
                 }
-                b'r' => {
-                    let top = first.unwrap_or(1).max(1) as usize;
-                    let bottom = match params.get(1).copied().unwrap_or(screen.grid.rows() as u16) {
-                        0 => screen.grid.rows(),
-                        v => v as usize,
-                    };
-                    screen.set_scroll_region(top, bottom);
-                }
                 b'q' => {
                     if intermediates == b" " {
-                        screen.cursor_shape = match first.unwrap_or(0) {
-                            3 | 4 => CursorShape::Underline,
-                            5 | 6 => CursorShape::Beam,
-                            _ => CursorShape::Block,
-                        };
+                        screen.cursor_shape = cursor_shape(first.unwrap_or(0));
                     } else {
                         match first.unwrap_or(0) {
                             0 | 2 => screen.current_flags.set_protected(false),
@@ -797,6 +889,15 @@ pub fn reported_cursor_position(screen: &ScreenState) -> (usize, usize) {
 /// DECSTR (`CSI ! p`): soft reset of the modes and drawing state DECSTR
 /// is defined to touch, leaving the screen and cursor position alone.
 fn soft_reset(screen: &mut ScreenState, protocol: &mut ProtocolState) {
+    reset_local_attributes(screen, protocol);
+    // Ember resets application cursor keys and keypad and restores Alternate
+    // Scroll to its resource default.
+    protocol.modes_mut().insert(1007);
+    protocol.modes_mut().remove(&1);
+    protocol.modes_mut().remove(&66);
+}
+
+fn reset_local_attributes(screen: &mut ScreenState, protocol: &mut ProtocolState) {
     screen.current_fg = Color::Default;
     screen.current_bg = Color::Default;
     screen.current_flags = StyleFlags::default();
@@ -808,14 +909,8 @@ fn soft_reset(screen: &mut ScreenState, protocol: &mut ProtocolState) {
     screen.saved_state = None;
     screen.origin_mode = false;
     screen.insert_mode = false;
-    // DECTCEM and DECAWM on, DECCKM (application cursor keys) off,
-    // DECKPAM (application keypad) off. Alternate Scroll returns to the
-    // xterm-resource default (enabled).
     protocol.modes_mut().insert(25);
     protocol.modes_mut().insert(7);
-    protocol.modes_mut().insert(1007);
-    protocol.modes_mut().remove(&1);
-    protocol.modes_mut().remove(&66);
     screen.pending_wrap = false;
 }
 
@@ -941,25 +1036,18 @@ fn sgr_color_params(color: Color, foreground: bool) -> Vec<String> {
     }
 }
 
-// Ember mode-query compatibility policy. Unsupported modes stay unrecognized.
-fn decrqm_private_mode_state(screen: &ScreenState, protocol: &ProtocolState, mode: u16) -> u8 {
+fn decrqm_private_mode_state(
+    screen: &ScreenState,
+    protocol: &ProtocolState,
+    mode: u16,
+    ember_extensions: bool,
+) -> u8 {
     let set = match mode {
         6 => screen.origin_mode,
-        1
-        | 7
-        | 12
-        | 25
-        | 47
-        | 66
-        | 1000..=1007
-        | 1015
-        | 1034
-        | 1036
-        | 1047..=1049
-        | 2004
-        | 2026
-        | 2031
-        | 5522 => protocol.modes().contains(&mode),
+        1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
+            protocol.modes().contains(&mode)
+        }
+        12 | 1007 | 1034 | 1036 if ember_extensions => protocol.modes().contains(&mode),
         _ => return 0,
     };
     if set {

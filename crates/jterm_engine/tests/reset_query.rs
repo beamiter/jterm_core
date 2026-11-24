@@ -4,7 +4,7 @@ use jterm_engine::{
     parser::{Event, StringKind},
     protocol_state::ProtocolState,
     screen::{Charset, SavedCursorState, ScreenState},
-    semantics::{dispatch_local, Dispatch, Effect},
+    semantics::{dispatch_frost_legacy_csi, dispatch_local, Dispatch, Effect},
     Color, CursorShape, HyperlinkId, TerminalGrid, UnderlineStyle,
 };
 use reference::Original;
@@ -170,6 +170,67 @@ fn run(t: &mut Original, event: &Event<'_>) -> Vec<Effect> {
     }
     effects
 }
+
+#[test]
+fn frost_csi_retains_absolute_cursor_and_ordered_mode_replies() {
+    let mut terminal = seeded(0);
+    let dispatch = |terminal: &mut Original, cmd, prefix, intermediates: &[u8], params: &[u16]| {
+        dispatch_frost_legacy_csi(
+            &mut terminal.screen,
+            &mut terminal.protocol,
+            b"",
+            params,
+            cmd,
+            prefix,
+            intermediates,
+        )
+    };
+    let unchanged = snapshot(&terminal);
+    let Dispatch::Handled(reply) = dispatch(&mut terminal, b'n', Some(b'?'), b"", &[6]) else {
+        panic!("Frost DECXCPR request was unhandled");
+    };
+    assert_eq!(reply.as_slice(), [Effect::Reply(b"\x1b[?4;8R".to_vec())]);
+    let Dispatch::Handled(reply) = dispatch(&mut terminal, b'p', Some(b'?'), b"$", &[6, 1007, 7])
+    else {
+        panic!("Frost DECRQM list was unhandled");
+    };
+    assert_eq!(
+        reply.as_slice(),
+        [Effect::Reply(
+            b"\x1b[?6;1$y\x1b[?1007;0$y\x1b[?7;1$y".to_vec()
+        )]
+    );
+
+    for cmd in *b"aejk" {
+        assert_eq!(
+            dispatch(&mut terminal, cmd, None, b"", &[2]),
+            Dispatch::Unhandled
+        );
+    }
+    assert_eq!(
+        dispatch(&mut terminal, b'r', Some(b'?'), b"", &[1049]),
+        Dispatch::Unhandled
+    );
+    assert_eq!(
+        dispatch(&mut terminal, b'n', Some(b'?'), b"", &[996]),
+        Dispatch::Unhandled
+    );
+    assert_eq!(snapshot(&terminal), unchanged);
+
+    terminal.protocol.modes_mut().remove(&1007);
+    let Dispatch::Handled(effects) = dispatch(&mut terminal, b'p', None, b"!", &[]) else {
+        panic!("Frost DECSTR was unhandled");
+    };
+    assert_eq!(
+        effects.as_slice(),
+        [Effect::GlobalBackground(Color::Default)]
+    );
+    assert!(terminal.protocol.modes().contains(&1));
+    assert!(terminal.protocol.modes().contains(&66));
+    assert!(!terminal.protocol.modes().contains(&1007));
+    assert!(!terminal.screen.pending_wrap);
+}
+
 #[test]
 fn decstr_matches_frozen_host_and_retains_all_unrelated_state() {
     for seed in 0..8 {
