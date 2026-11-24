@@ -74,15 +74,17 @@ def pty_columns(child):
 
 
 @contextmanager
-def application(binary, config, environment, log_path, restore):
+def application(binary, config, environment, log_path, restore, launch_args=()):
     command = [binary, "--config", str(config)]
     if not restore:
         command.append("--no-restore")
+    command.extend(launch_args)
     with log_path.open("w+") as log:
         process = subprocess.Popen(command, cwd=config.parent, env=environment, stdout=log, stderr=log)
         try:
-            window = wait_for("terminal window", lambda: window_for(process.pid))
-            xdotool("windowfocus", "--sync", window)
+            if environment.get("GDK_BACKEND") != "wayland":
+                window = wait_for("terminal window", lambda: window_for(process.pid))
+                xdotool("windowfocus", "--sync", window)
             yield process
         except Exception:
             log.seek(0)

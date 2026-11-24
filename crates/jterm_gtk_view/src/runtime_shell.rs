@@ -163,6 +163,30 @@ impl RuntimeShell {
         Ok(Self::new(session))
     }
 
+    pub fn admits_explicit_command(host_bridge: bool) -> bool {
+        !host_bridge && std::env::var_os(RUNTIME_OVERRIDE).is_none_or(|value| value == "1")
+    }
+
+    /// Open the prepared command with a local GTK viewport. The argument list
+    /// is already complete and the directory is the command's lookup base.
+    pub fn spawn_explicit_command(
+        argv: &[String],
+        cwd: Option<&str>,
+        host_bridge: bool,
+        prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
+    ) -> Result<Option<Rc<Self>>, String> {
+        if !Self::admits_explicit_command(host_bridge) {
+            return Ok(None);
+        }
+        let cwd = match cwd {
+            Some(cwd) => PathBuf::from(cwd),
+            None => std::env::current_dir().map_err(|error| error.to_string())?,
+        };
+        let runtime = Self::spawn_program(argv, &cwd, prepare_environment()?)?;
+        runtime.enable_primary_reflow()?;
+        Ok(Some(runtime))
+    }
+
     /// Start the frontend's host-approved attachment relay in a local PTY.
     /// The Session Host continues to own the provider or validation process.
     pub fn spawn_hosted_attachment(

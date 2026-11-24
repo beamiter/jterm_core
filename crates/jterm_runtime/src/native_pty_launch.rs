@@ -159,7 +159,15 @@ pub fn launch_pty(spec: PtyLaunch<'_>) -> Result<PendingPty, PtyLaunchError> {
 /// Preserve the standalone runtime's isolated descriptor and signal policy.
 #[cfg(all(target_os = "linux", feature = "linux-pty"))]
 pub(crate) fn launch_standalone_pty(spec: PtyLaunch<'_>) -> Result<PendingPty, PtyLaunchError> {
-    launch_with_inherited_fds(spec, &[], None, Some(descriptor_ceiling()?), None)
+    // Preserve execvp's executable-text fallback in the same child.
+    let executable = spec.executable.to_owned();
+    launch_with_inherited_fds(
+        spec,
+        &[],
+        None,
+        Some(descriptor_ceiling()?),
+        Some(std::slice::from_ref(&executable)),
+    )
 }
 
 fn launch_with_inherited_fds(

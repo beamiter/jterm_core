@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     ffi::{CStr, CString, OsStr, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     ptr,
 };
 
@@ -103,17 +103,13 @@ impl Program {
 
 /// Keep command resolution anchored to the child directory and its explicit PATH.
 fn resolve(program: &OsStr, directory: &Path, path: Option<&OsString>) -> Result<CString, String> {
-    let program_path = Path::new(program);
-    let candidate = if program_path.is_absolute() {
-        executable(program_path)
-    } else if matches!(
-        program_path.components().next(),
-        Some(Component::CurDir | Component::ParentDir)
-    ) {
+    let candidate = if program.as_bytes().contains(&b'/') {
         executable(&directory.join(program))
     } else {
-        path.into_iter()
-            .flat_map(std::env::split_paths)
+        let path = path
+            .map(OsString::as_os_str)
+            .unwrap_or(OsStr::new("/bin:/usr/bin"));
+        std::env::split_paths(path)
             .find_map(|entry| executable(&directory.join(entry).join(program)))
     };
     candidate
@@ -121,7 +117,7 @@ fn resolve(program: &OsStr, directory: &Path, path: Option<&OsString>) -> Result
 }
 
 fn executable(path: &Path) -> Option<CString> {
-    if path.is_dir() {
+    if !path.is_file() {
         return None;
     }
     let path = CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -163,5 +159,28 @@ fn account_paths() -> (PathBuf, OsString) {
             return (home, shell);
         }
         return (PathBuf::from("/"), "/bin/sh".into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_lookup_uses_the_child_directory_and_execvp_default_path() {
+        let excluded_path = OsString::from("/dev/null");
+        assert_eq!(
+            resolve(OsStr::new("bin/sh"), Path::new("/"), Some(&excluded_path))
+                .unwrap()
+                .as_bytes(),
+            b"/bin/sh"
+        );
+        assert_eq!(
+            resolve(OsStr::new("sh"), Path::new("/"), None)
+                .unwrap()
+                .as_bytes(),
+            b"/bin/sh"
+        );
+        assert!(resolve(OsStr::new("sh"), Path::new("/"), Some(&excluded_path)).is_err());
     }
 }

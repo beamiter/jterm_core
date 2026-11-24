@@ -136,6 +136,13 @@ The ordinary local jsh route also defaults to the shared runtime with
 `terminal_mode = "vte"`. Native X11 acceptance checks Bash startup, separate
 split identities, and a real app restart that restores jsh's session ID,
 working directory and exported state. `JTERM_SHARED_RUNTIME=0` selects VTE.
+The local Linux `--execute` route also uses the shared runtime in conventional
+terminal mode. Named local tool tabs use the same launch path with their own
+argv and working directory. The native probe in
+`crates/jterm_gtk_view/tests/native_explicit.py` checks argument boundaries,
+executable text, the exact query reply and keyboard input, reaping, and the
+visible exec failure. Run it against each app built with `shared-terminal` on
+X11 and on a private compositor with `--backend wayland` and a keyboard seat.
 Linux native Forge and Anvil packages built with `shared-terminal` use the
 shared runtime for both Vim9 displays by default. The native fixtures check
 this default and save a real file with no `JTERM_SHARED_RUNTIME` override.
