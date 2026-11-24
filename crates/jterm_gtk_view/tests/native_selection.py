@@ -103,8 +103,7 @@ def exercise(binary, app, mode, root):
         directory = root / key
         directory.mkdir(mode=0o700)
         env[key] = str(directory)
-    env.update(GDK_BACKEND="x11", GSK_RENDERER="cairo", GTK_A11Y="atspi", GTK_IM_MODULE="simple",
-               JTERM_SHARED_ACTIVE_TERMINAL="1")
+    env.update(GDK_BACKEND="x11", GSK_RENDERER="cairo", GTK_A11Y="atspi", GTK_IM_MODULE="simple")
 
     with application(binary, config, env, root / f"{app}.log", restore=False) as process:
         pid = process.pid

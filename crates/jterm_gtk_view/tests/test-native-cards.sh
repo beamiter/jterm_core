@@ -48,8 +48,7 @@ run_case() {
     "$test_binary" --exact "$test_name" --ignored --test-threads=1 \
     | tee "$output/$scenario.log"
 }
-run_case shared_live_output_keeps_the_owned_shell_through_alternate_screen \
-  JTERM_SHARED_ACTIVE_TERMINAL=1 JTERM_SHARED_TRANSCRIPT=1
+run_case shared_live_output_keeps_the_owned_shell_through_alternate_screen
 for scenario in "${cases[@]}"; do
   run_case "$scenario"
 done

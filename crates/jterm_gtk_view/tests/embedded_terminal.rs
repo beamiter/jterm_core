@@ -107,10 +107,12 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
     assert!(embedded.resize(0, 10).is_err());
     embedded.resize(18, 8).unwrap();
     let mut fullscreen = vec![b'\r'; MAX_FEED_BYTES - 1];
-    fullscreen.extend_from_slice(b"\x1b[?1049h\x1b[5;7H\x1b[6n\x1b[c\x1b[?u\x1b[?4m\x1b[>q");
+    fullscreen
+        .extend_from_slice(b"\x1b[?1049h\x1b[5;7H\x1b[6n\x1b[c\x1b[>31u\x1b[?u\x1b[?4m\x1b[>q");
     output.apply(&fullscreen).unwrap();
     assert_eq!(pane.grid_size(), (18, 8));
     assert!(embedded.inspect(|terminal| terminal.alternate_screen_active()));
+    pane.write_text("你e\u{301}").unwrap();
     assert_eq!(
         *events.borrow(),
         [
@@ -118,9 +120,11 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
             TransportEvent::Input(b"run".to_vec()),
             TransportEvent::Resize(18, 8),
             TransportEvent::Reply(
-                b"\x1b[5;7R\x1b[?1;2c\x1b[?0u\x1b[>4;0m\x1bP>|jterm\x1b\\".to_vec()
+                b"\x1b[5;7R\x1b[?1;2c\x1b[?1u\x1b[>4;0m\x1bP>|jterm\x1b\\".to_vec()
             ),
             TransportEvent::Output,
+            TransportEvent::BeforeInput,
+            TransportEvent::Input("你e\u{301}".as_bytes().to_vec()),
         ]
     );
     output.apply(b"\x1b[?1049l").unwrap();

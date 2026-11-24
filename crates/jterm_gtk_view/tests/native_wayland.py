@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise an opt-in shared GTK terminal on a private Wayland compositor."""
+"""Exercise shared GTK terminals on a private Wayland compositor."""
 import argparse
 import os
 from pathlib import Path
@@ -36,11 +36,13 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
     def clipboard():
         return subprocess.check_output(["wl-paste", "--no-newline"], env=env, timeout=5)
 
-    if not args.ordinary_pane:
+    if not (args.ordinary_pane or args.structured_pane):
         new_tab = wait_for("Wayland shared tab action", lambda: named("New shared terminal tab"))
         assert new_tab.get_action_iface().do_action(0)
     focused = wait_for("Wayland shared screen focus", screen)
-    if args.shared_runtime or args.ordinary_pane:
+    if args.structured_pane:
+        assert focused.get_description() == "Shared active terminal", focused.get_description()
+    elif args.shared_runtime or args.ordinary_pane:
         assert focused.get_description() == "Shared runtime session", focused.get_description()
     if args.ordinary_pane:
         line = prepare_split_line(process.pid, command)
@@ -76,6 +78,11 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
     assert receipt.read_bytes() == committed, receipt.read_bytes()
     wait_for("GTK preedit cleared after commit", lambda: named("ni") is None)
     assert ime.wait(timeout=5) == 0
+    expected = committed
+    if args.structured_pane and args.keyboard_disambiguation:
+        key("-M", "ctrl", "-k", "u", "-m", "ctrl")
+        expected += b"\x1b[117;5u"
+        wait_for("disambiguated Ctrl+U in the live PTY", lambda: receipt.read_bytes() == expected)
 
     clipboard_text = b"wayland-paste\n"
     clipboard_file = root / "clipboard-payload"
@@ -84,12 +91,13 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
         spawn(["wl-copy", "--foreground", "--type", "text/plain;charset=utf-8"], "clipboard", env, data)
     wait_for("external Wayland clipboard ownership", lambda: clipboard() == clipboard_text)
     key("-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl")
-    expected = committed + clipboard_text.rstrip(b"\n")
+    expected += clipboard_text.rstrip(b"\n")
     wait_for("clipboard in the live PTY", lambda: receipt.stat().st_size >= len(expected))
     time.sleep(0.2)
     assert receipt.read_bytes() == expected, receipt.read_bytes()
 
-    trace = (root / f"{app}.log").read_text(errors="replace")
+    trace_file = root / f"{app}.log"
+    trace = trace_file.read_text(errors="replace")
     logical_width, logical_height = OUTPUT_WIDTH // args.scale, OUTPUT_HEIGHT // args.scale
     origins = re.findall(rf"set_window_geometry\((\d+), (\d+), {logical_width}, {logical_height}\)", trace)
     assert origins, "missing expected Wayland window geometry"
@@ -111,15 +119,21 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
         pointer = spawn([pointer_client], "pointer", env, subprocess.PIPE)
         pointer_log = root / "pointer.log"
         wait_for("Wayland virtual pointer", lambda: "ready" in pointer_log.read_text())
-        click = f"click {x - origin_x + 32} {y - origin_y + height // 2} {logical_width} {logical_height}\n"
-        pointer.stdin.write(click.encode() * 2)
+        position = f"{x - origin_x + 32} {y - origin_y + height // 2} {logical_width} {logical_height}\n"
+        pointer.stdin.write(f"move {position}".encode())
         pointer.stdin.flush()
-        wait_for("real Wayland double-click", lambda: pointer_log.read_text().count("done") >= 2)
+        wait_for("GTK surface entered by Wayland pointer", lambda: re.search(
+            r"wl_pointer[@#]\d+\.enter\(", trace_file.read_text(errors="replace")[len(trace):]
+        ))
+        pointer.stdin.write(f"click {position}".encode() * 2)
+        pointer.stdin.flush()
+        wait_for("real Wayland double-click", lambda: pointer_log.read_text().count("done") == 3)
         key("-M", "ctrl", "-M", "shift", "-k", "c", "-m", "shift", "-m", "ctrl")
         wait_for("Wayland clipboard contains the selected terminal word", lambda: clipboard() == witness.encode())
         assert receipt.read_bytes() == expected, receipt.read_bytes()
     clipboard_checks = "clipboard paste and pointer copy" if pointer_client else "clipboard paste"
-    print(f"{app} native Wayland passed at scale {args.scale}: GTK accessible preedit, cursor rectangle, exact UTF-8 PTY commit and {clipboard_checks}")
+    mode = args.structured_pane or "ordinary"
+    print(f"{app} {mode} native Wayland passed at scale {args.scale}: GTK accessible preedit, cursor rectangle, exact UTF-8 PTY commit and {clipboard_checks}")
 
     if args.ordinary_pane:
         def new_input_method(name):
@@ -218,7 +232,8 @@ def run(args):
     if args.compositor_libraries:
         compositor_env["LD_LIBRARY_PATH"] = str(args.compositor_libraries.resolve(strict=True))
     config = root / f"{args.app}.toml"
-    contents = 'shell = "/bin/sh"\nterminal_mode = "vte"\n'
+    mode = args.structured_pane or "vte"
+    contents = f'shell = "/bin/sh"\nterminal_mode = "{mode}"\n'
     document = root / "vim-ime.txt"
     if args.vim9:
         contents += f'[vim9]\nnative_buffer = {str(args.vim9 == "native").lower()}\nstatus_bar = true\n'
@@ -281,10 +296,13 @@ def main():
     parser.add_argument("--ime-client", type=Path, required=True)
     parser.add_argument("--pointer-client", type=Path)
     parser.add_argument("--shared-runtime", action="store_true")
-    parser.add_argument("--ordinary-pane", action="store_true", help="use the normal startup terminal")
+    pane = parser.add_mutually_exclusive_group()
+    pane.add_argument("--ordinary-pane", action="store_true", help="use the normal startup terminal")
+    pane.add_argument("--structured-pane", choices=("block", "chat", "unified"),
+                      help="use the default structured startup terminal")
+    pane.add_argument("--vim9", choices=("native", "compatibility"), help="compose and save inside real Vim9")
     parser.add_argument("--keyboard-disambiguation", action="store_true",
                         help="negotiate Kitty disambiguation before IME composition")
-    parser.add_argument("--vim9", choices=("native", "compatibility"), help="compose and save inside real Vim9")
     parser.add_argument("--sway", default="sway")
     parser.add_argument("--wtype", default="wtype")
     parser.add_argument("--compositor-libraries", type=Path)

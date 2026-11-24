@@ -1,4 +1,4 @@
-/* Send clicks only to the private native Wayland test compositor. */
+/* Move and click only in the private native Wayland test compositor. */
 #define _POSIX_C_SOURCE 200809L
 #include <linux/input-event-codes.h>
 #include <stdint.h>
@@ -42,8 +42,10 @@ int main(void) {
     char line[160];
     while (fgets(line, sizeof(line), stdin)) {
         unsigned x, y, width, height;
+        char action[6];
         char extra;
-        if (sscanf(line, "click %u %u %u %u %c", &x, &y, &width, &height, &extra) != 4 ||
+        if (sscanf(line, "%5s %u %u %u %u %c", action, &x, &y, &width, &height, &extra) != 5 ||
+            (strcmp(action, "click") != 0 && strcmp(action, "move") != 0) ||
             x >= width || y >= height)
             return 2;
         struct timespec now;
@@ -51,9 +53,11 @@ int main(void) {
             return 1;
         uint32_t time_ms = (uint32_t)((uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000);
         zwlr_virtual_pointer_v1_motion_absolute(pointer, time_ms, x, y, width, height);
-        zwlr_virtual_pointer_v1_button(pointer, time_ms, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
-        zwlr_virtual_pointer_v1_frame(pointer);
-        zwlr_virtual_pointer_v1_button(pointer, time_ms, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+        if (strcmp(action, "click") == 0) {
+            zwlr_virtual_pointer_v1_button(pointer, time_ms, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
+            zwlr_virtual_pointer_v1_frame(pointer);
+            zwlr_virtual_pointer_v1_button(pointer, time_ms, BTN_LEFT, WL_POINTER_BUTTON_STATE_RELEASED);
+        }
         zwlr_virtual_pointer_v1_frame(pointer);
         if (wl_display_roundtrip(display) < 0)
             return 1;

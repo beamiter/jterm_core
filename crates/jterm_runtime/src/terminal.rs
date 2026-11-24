@@ -87,6 +87,7 @@ impl<P: Pty> TerminalOutput<P> {
         engine.enable_grapheme_clusters();
         engine.enable_hyperlinks(links);
         engine.enable_window_updates();
+        engine.enable_keyboard_disambiguation();
         match profile {
             TerminalProfile::Standalone => engine.enable_primary_reflow(),
             TerminalProfile::Embedded => {

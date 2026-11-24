@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 
 from native import Atspi, accessible_text, application_nodes, start_accessibility, wait_for
-from native_jsh import application, xdotool
+from native_jsh import application
 
 
 SHELL = r"""#!/usr/bin/python3
@@ -65,7 +65,7 @@ def stopped(pid):
         return True
 
 
-def run(app, binary, mode, root):
+def run(app, binary, mode, root, rollback):
     root.mkdir(mode=0o700)
     shell = root / "shell"
     shell.write_text(SHELL)
@@ -81,16 +81,21 @@ def run(app, binary, mode, root):
         folder = root / key
         folder.mkdir(mode=0o700)
         env[key] = str(folder)
-    env.update(GDK_BACKEND="x11", GTK_A11Y="atspi", GTK_IM_MODULE="simple", GSK_RENDERER="cairo",
-               JTERM_SHARED_ACTIVE_TERMINAL="1", JTERM_SHARED_TRANSCRIPT="1")
+    env.update(GDK_BACKEND="x11", GTK_A11Y="atspi", GTK_IM_MODULE="simple", GSK_RENDERER="cairo")
+    if rollback:
+        env["JTERM_SHARED_TRANSCRIPT" if mode == "unified" else "JTERM_SHARED_ACTIVE_TERMINAL"] = "0"
     with application(binary, config, env, root / "app.log", restore=False) as process:
-        def screen_text():
-            screen = next((node for node in application_nodes(process.pid)
-                           if node.get_description() == "Shared active terminal"
-                           and node.get_state_set().contains(Atspi.StateType.SHOWING)), None)
-            return accessible_text(screen)
+        def terminal_ready():
+            for node in application_nodes(process.pid):
+                if not node.get_state_set().contains(Atspi.StateType.SHOWING):
+                    continue
+                if rollback and node.get_role() == Atspi.Role.TERMINAL:
+                    return True
+                if not rollback and node.get_description() == "Shared active terminal":
+                    return "prepared-pty-ready" in accessible_text(node)
+            return False
 
-        wait_for("early PTY output painted", lambda: "prepared-pty-ready" in screen_text())
+        wait_for("VTE rollback surface" if rollback else "early PTY output painted", terminal_ready)
         reply = root / "reply"
         wait_for("device status reply", lambda: reply.is_file() and len(reply.read_bytes()) >= 4)
         assert reply.read_bytes() == b"\x1b[0n", reply.read_bytes()
@@ -100,15 +105,21 @@ def run(app, binary, mode, root):
         descendant = int(child.read_text())
         assert os.getpgid(descendant) == descendant != os.getpgid(leader)
         names = thread_names(process.pid)
-        assert names.count("pty-reader") == names.count("pty-writer") == 1, names
-        assert not any(name.startswith(f"{app}-pty-") for name in names), names
+        shared_workers = [name for name in names if name in {"pty-reader", "pty-writer"}]
+        legacy_workers = [name for name in names if name.startswith(f"{app}-pty-")]
+        if rollback:
+            assert not shared_workers and len(legacy_workers) == 2, names
+            workers = set(legacy_workers)
+        else:
+            assert sorted(shared_workers) == ["pty-reader", "pty-writer"] and not legacy_workers, names
+            workers = set(shared_workers)
 
         (root / "finish").touch()
         wait_for("leader reaped", lambda: not Path(f"/proc/{leader}").exists())
         wait_for("separate background group stopped", lambda: stopped(descendant))
-        wait_for("shared PTY workers stopped", lambda: not {"pty-reader", "pty-writer"}.intersection(
-            thread_names(process.pid)))
-    print(f"{app} {mode} shared worker ownership, PTY reply and child cleanup passed", flush=True)
+        wait_for("PTY workers stopped", lambda: workers.isdisjoint(thread_names(process.pid)))
+    backend = "VTE rollback" if rollback else "default shared"
+    print(f"{app} {mode} {backend} worker ownership, PTY reply and child cleanup passed", flush=True)
 
 
 def main():
@@ -120,7 +131,8 @@ def main():
     start_accessibility()
     with tempfile.TemporaryDirectory(prefix="gtk-prepared-pty-") as directory:
         for mode in args.mode or ("block", "chat", "unified"):
-            run(args.app, args.binary.resolve(strict=True), mode, Path(directory) / mode)
+            run(args.app, args.binary.resolve(strict=True), mode, Path(directory) / mode, False)
+            run(args.app, args.binary.resolve(strict=True), mode, Path(directory) / f"{mode}-rollback", True)
 
 
 if __name__ == "__main__":

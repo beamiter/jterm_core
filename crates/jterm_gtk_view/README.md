@@ -52,10 +52,10 @@ GTK renders its frames and history and keeps draining output when the tab is
 hidden. `JTERM_SHARED_RUNTIME=0` selects the existing compatibility route.
 Host-bridged shells and custom command launches use the compatibility transport.
 
-With `JTERM_SHARED_RUNTIME=1` and `terminal_mode = "vte"`, ordinary local jsh
-panes also use the shared runtime. The application passes its pane's saved
-session ID to jsh as a separate argv value. The Bash startup wrapper keeps
-the same process and terminal while it changes its executable to jsh.
+Ordinary local jsh panes configured with `terminal_mode = "vte"` also default
+to the shared runtime. The application passes its pane's saved session ID to
+jsh as a separate argv value. The Bash startup wrapper keeps the same process
+and terminal while it changes its executable to jsh.
 
 Use `--ordinary-panes` for the X11 fixture and `--ordinary-pane` for the
 Wayland fixture to check the default. For the standalone tab action, use
@@ -77,7 +77,9 @@ dbus-run-session -- xvfb-run -a /usr/bin/python3 -B crates/jterm_gtk_view/tests/
 
 The shared terminal displays GTK input method preedit at the painted cursor
 and exposes the composition through accessibility. Only committed text enters
-the PTY. Leaving the tab or scrolling into history cancels composition.
+the PTY. Ordinary and embedded panes both advertise Kitty keyboard
+disambiguation and deliver committed strings as UTF-8 while it is active.
+Leaving the tab or scrolling into history cancels composition.
 
 The native fixture needs Sway, `wtype`, `wl-copy`, `wl-paste`, PyGObject
 AT-SPI and the input-method-v2 test client from the sibling Frost checkout.
@@ -108,6 +110,9 @@ The fixture checks terminal and preedit text through AT-SPI, nonzero
 text-input-v3 cursor geometry, exact committed UTF-8 captured by the live
 PTY, and a Wayland clipboard paste with a trailing newline. The pointer
 option verifies native double-click selection and external clipboard copy.
+Use `--structured-pane block`, `--structured-pane chat`, or
+`--structured-pane unified` with `--keyboard-disambiguation` to verify the
+default structured pane's keyboard negotiation and PTY key bytes.
 
 ### Retained output
 
@@ -128,8 +133,10 @@ dbus-run-session -- xvfb-run -a cargo test --offline --locked --release \
 ## Completed command rows
 
 Forge and Anvil builds with `shared-terminal` use a shared command view for
-eligible shell-reported Block and Chat commands. The view preserves syntax
+eligible shell-reported Block and Chat commands, including literal paths and
+multiline commands within the document budget. The view preserves syntax
 colors, native selection, per-card search and bounded cross-card copying.
+Control-click on an allowed HTTP or HTTPS link uses the host opener.
 Set `JTERM_SHARED_FINISHED_COMMANDS=0` to use VTE for the entire card.
 
 ## Completed output rows
@@ -158,10 +165,13 @@ rendering for unsupported ANSI.
 
 ## Running command output
 
-Set `JTERM_SHARED_ACTIVE_TERMINAL=1` for Block and Chat and
-`JTERM_SHARED_TRANSCRIPT=1` for Unified in a `shared-terminal` build. These
-panes render the Rust terminal runtime's screen and history. Find navigates
-the mapped GTK screen, including the active alternate screen.
+Native Linux `shared-terminal` builds use the shared runtime and GTK renderer
+by default for new Block, Chat, and Unified panes. The Flatpak host bridge
+retains its existing default. Set `JTERM_SHARED_ACTIVE_TERMINAL=0` for Block
+and Chat or `JTERM_SHARED_TRANSCRIPT=0` for Unified to launch with VTE. A pane
+keeps its original renderer until it closes.
+
+Find navigates the mapped GTK screen, including the active alternate screen.
 
 The native card fixture above launches a shell through each product's pane
 constructor in all three modes. It checks distinct Unicode output rows, Find

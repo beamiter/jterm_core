@@ -101,8 +101,7 @@ def run(app, binary, mode, root):
         folder = root / key
         folder.mkdir(mode=0o700)
         env[key] = str(folder)
-    env.update(GDK_BACKEND="x11", GTK_A11Y="atspi", GTK_IM_MODULE="simple", GSK_RENDERER="cairo",
-               JTERM_SHARED_ACTIVE_TERMINAL="1", JTERM_SHARED_TRANSCRIPT="1")
+    env.update(GDK_BACKEND="x11", GTK_A11Y="atspi", GTK_IM_MODULE="simple", GSK_RENDERER="cairo")
     fg, bg, cursor = CHAT_DEFAULTS[app] if mode == "chat" else DEFAULTS[mode]
     default_replies = (
         color_reply("10", fg, BEL) + color_reply("11", bg, ST) + color_reply("12", cursor, BEL)

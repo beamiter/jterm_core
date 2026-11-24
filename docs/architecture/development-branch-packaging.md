@@ -132,10 +132,10 @@ focused shared pane. Native X11 tests cover copying matches across soft wraps,
 searching older rows while the PTY writes, and independent searches in two tabs.
 Native Wayland tests cover preedit cancellation
 when switching tabs, one commit in the focused pane, and clipboard transfer.
-The ordinary local jsh route uses the existing `JTERM_SHARED_RUNTIME=1`
-switch with `terminal_mode = "vte"`. Native X11 acceptance checks
-Bash startup, separate split identities, and a real app restart that
-restores jsh's session ID, working directory and exported state.
+The ordinary local jsh route also defaults to the shared runtime with
+`terminal_mode = "vte"`. Native X11 acceptance checks Bash startup, separate
+split identities, and a real app restart that restores jsh's session ID,
+working directory and exported state. `JTERM_SHARED_RUNTIME=0` selects VTE.
 Linux native Forge and Anvil packages built with `shared-terminal` use the
 shared runtime for both Vim9 displays by default. The native fixtures check
 this default and save a real file with no `JTERM_SHARED_RUNTIME` override.
@@ -151,11 +151,13 @@ HTTPS and HTTP links. The native tests cover fold-aware find, output filters,
 cross-card clipboard and rebuilding cards after Undo. Captures outside the
 document profile use VTE. `JTERM_SHARED_FINISHED_OUTPUT=0` selects VTE for
 output. `JTERM_SHARED_FINISHED_COMMANDS=0` selects VTE for the entire card.
-`JTERM_SHARED_ACTIVE_TERMINAL=1` selects the shared runtime and live GTK
-terminal for Block and Chat. `JTERM_SHARED_TRANSCRIPT=1` selects it for
-Unified. The native card fixture verifies that each mode keeps its session
-and terminal view through Find, an alternate-screen application and the
-completion of consecutive commands.
+Native Linux packages built with `shared-terminal` default to the shared
+runtime and live GTK terminal for new Block, Chat, and Unified panes.
+`JTERM_SHARED_ACTIVE_TERMINAL=0` rolls back Block and Chat at launch.
+`JTERM_SHARED_TRANSCRIPT=0` rolls back Unified at launch. Flatpak keeps its
+existing host-bridge default. The native card fixture checks that each mode
+keeps its session and terminal view through Find, an alternate-screen
+application and the completion of consecutive commands.
 
 Release acceptance still requires the complete shared session lifecycle,
 Aether's remaining product journeys, the GTK production migration, and

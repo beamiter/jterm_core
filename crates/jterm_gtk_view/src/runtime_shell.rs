@@ -82,6 +82,12 @@ impl Update {
 }
 
 impl RuntimeShell {
+    /// Whether an ordinary local shell can use the shared runtime. Hosts use
+    /// this to keep the ordinary pane layout when a launch selects VTE.
+    pub fn supports_local_shell(argv: &[String], host_bridge: bool) -> bool {
+        admit_local_argv(argv, host_bridge, None)
+    }
+
     pub fn admits_candidate(argv: &[String], host_bridge: bool) -> bool {
         admit_local_argv(
             argv,

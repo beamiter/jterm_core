@@ -20,7 +20,7 @@ pub(crate) fn admit_local_argv(
         && (matches!(argv, [program, arguments @ ..]
             if matches!(program.as_str(), "/bin/sh" | "/usr/bin/sh" | "/bin/bash" | "/usr/bin/bash")
                 && arguments.iter().all(|arg| matches!(arg.as_str(), "-i" | "-l")))
-            || (runtime_override == Some(OsStr::new("1")) && local_jsh_profile(argv).is_some()))
+            || local_jsh_profile(argv).is_some())
 }
 
 fn local_jsh_profile(argv: &[String]) -> Option<(&Path, &[String])> {
@@ -81,7 +81,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_jsh_opt_in_preserves_the_owned_session_and_final_exec_image() {
+    fn local_jsh_defaults_to_shared_and_preserves_session_and_exec_image() {
         use jterm_runtime::local_shell::VIM9_SHELL_EXEC;
 
         let program = "/absolute/path with spaces/jsh";
@@ -91,7 +91,7 @@ mod tests {
         for argv in [wrapped.as_slice(), direct.as_slice()] {
             assert!(admit_local_argv(argv, false, enabled));
             assert!(!admit_local_argv(argv, true, enabled));
-            assert!(!admit_local_argv(argv, false, None));
+            assert!(admit_local_argv(argv, false, None));
             assert!(!admit_local_argv(argv, false, Some(OsStr::new("0"))));
             let session = with_jsh_session(argv, "owned-session_4").unwrap();
             assert!(admit_local_argv(&session, false, enabled));

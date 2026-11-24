@@ -1,12 +1,12 @@
-use std::ops::Range;
-
 use gtk4::{gdk, pango, prelude::*};
 use jterm_engine::{
     archived_text::{is_literal_archive_unicode, ArchiveStyle, ArchivedText},
     grid::{Color, UnderlineStyle},
 };
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell},
+    ops::Range,
     rc::Rc,
 };
 
@@ -18,17 +18,13 @@ use crate::{
 
 const MAX_COMMAND_BYTES: usize = 96;
 
-/// A completed command with a literal text and highlighting projection.
-/// Path-like text, terminal controls and multiline commands require the
-/// existing renderer's recognition and geometry.
+/// A bounded literal command, with LF as the only permitted line break.
 pub fn supports_finished_command(command: &str) -> bool {
     !command.is_empty()
         && command == command.trim()
         && command.len() <= MAX_COMMAND_BYTES
         && command.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || " _-+'\"$|&;><=,%!?()[]{}".contains(ch)
-                || is_literal_archive_unicode(ch)
+            ch.is_ascii_graphic() || matches!(ch, ' ' | '\n') || is_literal_archive_unicode(ch)
         })
 }
 
@@ -59,8 +55,15 @@ impl FinishedTextView {
             return None;
         }
         let highlighted = std::str::from_utf8(highlighted).ok()?;
+        // Both GTK hosts prepare terminal line breaks for their VTE renderer.
+        // The document keeps the original shell command's logical newlines.
+        let highlighted = if highlighted.contains('\r') {
+            Cow::Owned(highlighted.replace("\r\n", "\n"))
+        } else {
+            Cow::Borrowed(highlighted)
+        };
         let mut source = command;
-        let mut remaining = highlighted;
+        let mut remaining = highlighted.as_ref();
         let mut runs = Vec::new();
         let mut style = 0;
         while !remaining.is_empty() {
@@ -408,16 +411,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_profile_leaves_paths_and_terminal_controls_to_the_legacy_view() {
+    fn command_profile_accepts_literal_paths_and_multiline_commands() {
         assert!(supports_finished_command("echo needle needle"));
         assert!(supports_finished_command("printf '%s' value"));
         assert!(supports_finished_command("echo 好 e\u{301} 👩‍💻"));
+        assert!(supports_finished_command(
+            "cd ./src && \\\nrg file.rs:9 https://example.test"
+        ));
         for command in [
             "",
-            "echo path/to/file",
-            "echo https://example.test",
-            "echo file.rs:9",
-            "echo two\nlines",
+            "echo one\rtwo",
+            "echo one\ttwo",
             "echo \x1b[31mcolor",
             "echo \u{202e}unsafe",
             "echo trailing ",
@@ -433,9 +437,10 @@ mod tests {
         let font = pango::FontDescription::from_string("Monospace 12");
         let foreground = gdk::RGBA::WHITE;
         let palette = [gdk::RGBA::RED; 16];
+        let command = "echo hit hit \\\n./script https://example.test";
         let view = FinishedTextView::command(
-            "echo hit hit",
-            b"\x1b[1;36mecho\x1b[0m hit hit",
+            command,
+            b"\x1b[1;36mecho\x1b[0m hit hit \\\r\n./script https://example.test",
             font.clone(),
             1.0,
             foreground,
@@ -463,6 +468,31 @@ mod tests {
         }
         let buffer = view.widget().buffer();
         assert!(view.widget().is_mapped());
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            command
+        );
+        const URL: &str = "https://example.test";
+        let offset = command.find(URL).unwrap() as i32;
+        let rect = view.widget().iter_location(&buffer.iter_at_offset(offset));
+        let (x, y) = view.widget().buffer_to_window_coords(
+            gtk4::TextWindowType::Widget,
+            rect.x() + rect.width() / 2,
+            rect.y() + rect.height() / 2,
+        );
+        let link = link_at(
+            view.widget(),
+            &[],
+            Some(|line, offset| {
+                let start = line.find(URL)?;
+                let span = start..start + URL.len();
+                span.contains(&offset).then_some(span)
+            }),
+            f64::from(x),
+            f64::from(y),
+        )
+        .expect("resolve a link in the second logical line");
+        assert_eq!(link.target.as_ref(), URL);
         assert!(buffer
             .start_iter()
             .tags()

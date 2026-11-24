@@ -9,6 +9,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import termios
 
 from native import Atspi, accessible_text, application_nodes, first_named, start_accessibility, wait_for
 
@@ -80,9 +81,17 @@ def application(binary, config, environment, log_path, restore):
                     process.wait()
 
 
-def close_window(process):
+def close_window(process, confirmation=None):
     button = wait_for("Close window button", lambda: first_named(process.pid, "Close window"))
     assert Atspi.Action.do_action(button.get_action_iface(), 0)
+    if confirmation:
+        choice = wait_for("window closed or requested confirmation", lambda: (
+            True if process.poll() is not None else next(
+                (node for node in application_nodes(process.pid)
+                 if node.get_name() == confirmation and node.get_role() == Atspi.Role.PUSH_BUTTON
+                 and node.get_state_set().contains(Atspi.StateType.SHOWING)), None)))
+        if choice is not True:
+            assert Atspi.Action.do_action(choice.get_action_iface(), 0)
     try:
         wait_for("closed terminal window", lambda: process.poll() is not None)
     except RuntimeError as error:
@@ -101,12 +110,14 @@ def exercise(args, root):
         directory = root / name
         directory.mkdir(mode=0o700)
         environment[name] = str(directory)
-    environment.update(GDK_BACKEND="x11", GSK_RENDERER="cairo", GTK_A11Y="atspi", JTERM_SHARED_RUNTIME="1")
+    environment.update(GDK_BACKEND="x11", GSK_RENDERER="cairo",
+                       GTK_A11Y="atspi", GTK_IM_MODULE="simple")
+    environment.pop("JTERM_SHARED_RUNTIME", None)
     environment.pop(f"{args.app.upper()}_SHELL", None)
     environment.pop("BASH_ENV", None)
     home = Path(environment["HOME"])
     (home / ".bashrc").write_text("printf 'shared-jsh-bootstrap\\n'\n")
-    working = root / "saved working directory"
+    working = home / "saved working directory"
     working.mkdir()
     with application(args.binary, config, environment, root / "initial.log", restore=False) as process:
         pid = process.pid
@@ -150,18 +161,29 @@ def exercise(args, root):
         close_window(process)
     assert not Path(f"/proc/{restored[session]}").exists(), "the restored jsh child survived app exit"
 
-    for override in (None, "0"):
-        if override is None:
-            environment.pop("JTERM_SHARED_RUNTIME")
-        else:
-            environment["JTERM_SHARED_RUNTIME"] = override
-        with application(args.binary, config, environment, root / f"legacy-{override}.log", restore=False) as process:
-            pid = process.pid
-            wait_for("the compatibility terminal", lambda: next(
-                (node for node in application_nodes(pid) if node.get_role() == Atspi.Role.TERMINAL
-                 and node.get_state_set().contains(Atspi.StateType.SHOWING)), None))
-            assert shared_screen(pid, Atspi.StateType.SHOWING) is None
-            wait_for("jsh in the compatibility terminal", lambda: shells(pid, args.jsh))
+    environment["JTERM_SHARED_RUNTIME"] = "0"
+    with application(args.binary, config, environment, root / "legacy.log", restore=False) as process:
+        pid = process.pid
+        wait_for("the compatibility terminal", lambda: next(
+            (node for node in application_nodes(pid) if node.get_role() == Atspi.Role.TERMINAL
+             and node.get_state_set().contains(Atspi.StateType.SHOWING)), None))
+        legacy = wait_for("jsh in the compatibility terminal", lambda: shells(pid, args.jsh))
+        assert len(legacy) == 1, legacy
+        legacy_child = next(iter(legacy.values()))
+        fd = os.open(f"/proc/{legacy_child}/fd/0", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            # exec reaches /proc before jsh enables its raw-mode input editor.
+            wait_for("jsh input editor in the compatibility PTY", lambda: (
+                termios.tcgetattr(fd)[3] & termios.ICANON == 0))
+        finally:
+            os.close(fd)
+        receipt = root / "legacy-input"
+        send("printf 'legacy-jsh' > " + shlex.quote(str(receipt)))
+        wait_for("input reached the compatibility PTY", lambda: (
+            receipt.is_file() and receipt.read_bytes() == b"legacy-jsh"))
+        assert shared_screen(pid, Atspi.StateType.SHOWING) is None
+        close_window(process, confirmation="Close Window" if args.app == "forge" else "Close")
+    wait_for("compatibility jsh child stopped", lambda: not Path(f"/proc/{legacy_child}").exists())
     print(f"{args.app} X11 jsh passed: bootstrap, independent split, same saved shell id, cwd, environment and rollback")
 
 
