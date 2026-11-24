@@ -138,9 +138,9 @@ fn dispatch_cursor_csi(
     true
 }
 
-/// Apply Frost's local cursor, rendition and query controls. Apply the returned
-/// effects before the next event. Paint-dependent queries and host lifecycle
-/// commands stay unhandled.
+/// Apply Frost's local cursor, rendition, character edits and queries. Apply
+/// the returned effects before the next event. Host lifecycle, paint queries
+/// and commands that archive or replace physical rows stay unhandled.
 pub fn dispatch_frost_legacy_csi(
     screen: &mut ScreenState,
     protocol: &mut ProtocolState,
@@ -158,6 +158,7 @@ pub fn dispatch_frost_legacy_csi(
     }
 
     let first = params.first().copied();
+    let count = usize::from(first.unwrap_or(1).max(1));
     let mut effects = Effects::new();
     let reply = match (cmd, private_prefix, intermediates, first) {
         (b'c', _, _, _) => {
@@ -212,12 +213,70 @@ pub fn dispatch_frost_legacy_csi(
             screen.cursor_shape = cursor_shape(u16::from(first.unwrap_or(0) as u8));
             None
         }
+        (b's', None, b"", _) => {
+            screen.save_cursor_state(protocol);
+            None
+        }
+        (b'u', None, b"", _) => {
+            let _ = screen.restore_cursor();
+            None
+        }
+        (b'u', Some(prefix), b"", _) => apply_kitty_keyboard_csi(protocol, prefix, params),
+        // The Frost profile has always admitted these final bytes with any
+        // prefix and uses the same erase for regular and DEC-private EL.
+        (b'K', _, _, _) => {
+            let cols = screen.grid.cols();
+            let span = match first.unwrap_or(0) {
+                0 => screen.cursor_col..cols,
+                1 => 0..screen.cursor_col + 1,
+                2 => 0..cols,
+                _ => return Dispatch::Handled(effects),
+            };
+            effects.push(Effect::Row(screen.erase_frost_legacy_cells(span)));
+            None
+        }
+        (b'@', _, _, _) => {
+            effects.extend(screen.insert_frost_legacy_blanks(count).map(Effect::Row));
+            None
+        }
+        (b'P', _, _, _) => {
+            effects.push(Effect::Row(screen.delete_frost_legacy_characters(count)));
+            None
+        }
+        (b'X', _, _, _) => {
+            let col = screen.cursor_col;
+            effects.push(Effect::Row(
+                screen.erase_frost_legacy_cells(col..col.saturating_add(count)),
+            ));
+            None
+        }
         _ => return Dispatch::Unhandled,
     };
     if let Some(reply) = reply {
         effects.push(Effect::Reply(reply));
     }
     Dispatch::Handled(effects)
+}
+
+fn apply_kitty_keyboard_csi(
+    protocol: &mut ProtocolState,
+    prefix: u8,
+    params: &[u16],
+) -> Option<Vec<u8>> {
+    let first = params.first().copied();
+    match prefix {
+        b'?' => {
+            return Some(format!("\x1b[?{}u", protocol.keyboard_enhancement_flags()).into_bytes())
+        }
+        b'=' => protocol.set_keyboard_enhancement_flags(
+            first.unwrap_or(0),
+            params.get(1).copied().unwrap_or(1),
+        ),
+        b'>' => protocol.push_keyboard_enhancement_flags(first.unwrap_or(0)),
+        b'<' => protocol.pop_keyboard_enhancement_flags(usize::from(first.unwrap_or(1))),
+        _ => {}
+    }
+    None
 }
 
 fn set_xterm_modify_other_keys(protocol: &mut ProtocolState, params: &[u16]) {
@@ -444,23 +503,13 @@ pub(crate) fn dispatch_local_with_underline(
                 }
                 b'u' => {
                     if intermediates.is_empty() {
-                        match private_prefix {
-                            None => restore_cursor_state(screen, protocol, underline),
-                            Some(b'?') => effects.push(Effect::Reply(
-                                format!("\x1b[?{}u", protocol.keyboard_enhancement_flags())
-                                    .into_bytes(),
-                            )),
-                            Some(b'=') => protocol.set_keyboard_enhancement_flags(
-                                first.unwrap_or(0),
-                                params.get(1).copied().unwrap_or(1),
-                            ),
-                            Some(b'>') => {
-                                protocol.push_keyboard_enhancement_flags(first.unwrap_or(0))
-                            }
-                            Some(b'<') => {
-                                protocol.pop_keyboard_enhancement_flags(first.unwrap_or(1) as usize)
-                            }
-                            _ => {}
+                        if let Some(prefix) = private_prefix {
+                            effects.extend(
+                                apply_kitty_keyboard_csi(protocol, *prefix, params)
+                                    .map(Effect::Reply),
+                            );
+                        } else {
+                            restore_cursor_state(screen, protocol, underline);
                         }
                     }
                 }

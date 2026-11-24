@@ -1403,6 +1403,47 @@ impl ScreenState {
         Some(effect)
     }
 
+    /// Frost uses the same insertion for ICH and printable insert mode. It
+    /// clears both cells of wide pairs at the boundary and retains deferred wrap.
+    pub fn insert_frost_legacy_blanks(&mut self, count: usize) -> Option<RowMutation> {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let blank = self.create_blank_cell();
+        let effect = self.row_mutation(row, col, self.grid.cols(), None);
+        self.grid
+            .insert_blank_cells(
+                row,
+                col,
+                count,
+                blank,
+                WideCellEditPolicy::ClearBoundaryPairs,
+            )
+            .then_some(effect)
+    }
+
+    pub(crate) fn delete_frost_legacy_characters(&mut self, count: usize) -> RowMutation {
+        let row = self.cursor_row;
+        let col = self.cursor_col;
+        let blank = self.create_blank_cell();
+        let effect = self.row_mutation(row, col, self.grid.cols(), None);
+        self.grid.delete_cells(
+            row,
+            col,
+            count,
+            blank,
+            WideCellEditPolicy::ClearBoundaryPairs,
+        );
+        effect
+    }
+
+    pub(crate) fn erase_frost_legacy_cells(&mut self, cols: Range<usize>) -> RowMutation {
+        let row = self.cursor_row;
+        let blank = self.create_blank_cell();
+        let effect = self.row_mutation(row, cols.start, cols.end, None);
+        self.grid.erase_cells(row, cols, blank);
+        effect
+    }
+
     /// At most one effect per eligible run, bounded by the width of this row.
     /// Protected-only selective erasure leaves the Last Column Flag untouched.
     pub fn erase_span(

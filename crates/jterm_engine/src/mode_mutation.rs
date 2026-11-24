@@ -1,6 +1,5 @@
-//! Ember per-parameter mode mutations. The host retains CSI admission, ordered
-//! iteration, observer cadence and all lifecycle hooks. This is not a policy
-//! for other terminal profiles and does not dispatch whole CSI sequences.
+//! Profile-specific mode mutations. The host applies each parameter and its
+//! effects in wire order, including the alternate-screen and sync lifecycle.
 use crate::{protocol_state::ProtocolState, screen::ScreenState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,4 +43,63 @@ pub fn apply_ember_mode(
         },
     }
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrostModeEffect {
+    None,
+    MouseReportingChanged,
+    AlternateScreen,
+    SynchronizedOutput,
+}
+
+/// Apply one FrostLegacyV1 mode parameter. A mouse change requires the host
+/// to revoke queued scroll input before proceeding to the next parameter.
+/// Alternate screen and sync leave screen and protocol state to the host
+/// until it can take the required snapshots and apply the transition.
+pub fn apply_frost_mode(
+    screen: &mut ScreenState,
+    protocol: &mut ProtocolState,
+    namespace: ModeNamespace,
+    mode: u16,
+    enabled: bool,
+) -> FrostModeEffect {
+    use FrostModeEffect::{AlternateScreen, MouseReportingChanged, None, SynchronizedOutput};
+
+    if namespace == ModeNamespace::Ansi {
+        if mode == 4 {
+            screen.insert_mode = enabled;
+        }
+        return None;
+    }
+
+    let effect = match mode {
+        47 | 1047 | 1049 => return AlternateScreen,
+        2026 => return SynchronizedOutput,
+        6 => {
+            screen.cursor_controls().set_origin_mode(enabled);
+            return None;
+        }
+        1048 => {
+            if enabled {
+                screen.save_cursor_state(protocol);
+            } else {
+                // Frost restores the saved drawing state with live DECAWM.
+                let _ = screen.restore_cursor();
+            }
+            None
+        }
+        1000..=1003 | 1005 | 1006 | 1015 if protocol.modes().contains(&mode) != enabled => {
+            MouseReportingChanged
+        }
+        1 | 7 | 25 | 66 | 1004 | 2004 | 2031 | 5522 => None,
+        _ => return None,
+    };
+
+    if enabled {
+        protocol.modes_mut().insert(mode);
+    } else {
+        protocol.modes_mut().remove(&mode);
+    }
+    effect
 }

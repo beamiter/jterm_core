@@ -301,8 +301,8 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('self.grid.cells_mut().fill(blank)', screen)
 
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
-        frost_modes = frost.split('fn set_mode(', 1)[1].split('pub fn scrollback_len(', 1)[0]
-        entry, exit = frost_modes.split('fn reset_mode(', 1)
+        frost_modes = frost.split('fn enter_alternate_screen(', 1)[1].split('pub fn scrollback_len(', 1)[0]
+        entry, exit = frost_modes.split('fn leave_alternate_screen(', 1)
         self.assertLess(entry.index('.enter(true, autowrap)'), entry.index('self.protocol.switch_screen()'))
         self.assertLess(entry.index('self.protocol.switch_screen()'), entry.index('self.clear_screen()'))
         self.assertLess(exit.index('.leave(AlternateRestorePolicy::Frost)'), exit.index('self.protocol.switch_screen()'))
@@ -331,11 +331,15 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('dispatch_frost_legacy_csi(', csi)
         self.assertIn('Effect::Reply(bytes)', csi)
         self.assertIn('Effect::GlobalBackground(color)', csi)
+        self.assertIn('Effect::Row(mutation) => self.mark_row_dirty(mutation.row)', csi)
         fallback = csi.split('let count = first.unwrap_or(1)', 1)[1]
-        for final_byte in ('A', 'B', 'H', 'f', 'g', 'm', 'c', 'p', 'r'):
+        for final_byte in ('A', 'B', 'H', 'f', 'g', 'm', 'c', 'p', 'r', 's', 'u', 'K', '@', 'P', 'X'):
             self.assertNotRegex(fallback, rf"(?m)^\s*'{final_byte}'\s*(?:=>|if)")
         frost_semantics = semantic.split('pub fn dispatch_frost_legacy_csi(', 1)[1]
         self.assertIn('frost_legacy_sgr(', frost_semantics.split('fn set_xterm_modify_other_keys(', 1)[0])
+        self.assertIn('apply_kitty_keyboard_csi(', frost_semantics)
+        self.assertIn('self.screen.insert_frost_legacy_blanks(width)', frost)
+        self.assertNotIn('fn shift_cells_right(', frost)
         self.assertNotIn('fn handle_sgr(', frost)
         self.assertNotIn('fn parse_sgr_groups(', frost)
 
@@ -349,8 +353,16 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn('modes_mut().remove(&mode)', modes)
         pure = (ENGINE / 'src/mode_mutation.rs').read_text()
         self.assertIn('1004 | 47 | 1047 | 1048 | 1049 | 2026 | 5522 => return false', pure)
-        self.assertNotIn('screen.pending_wrap =', pure)
-        self.assertNotIn('mode_mutation::', frost)
+        self.assertNotIn('screen.pending_wrap =', pure.split('pub enum FrostModeEffect', 1)[0])
+        frost_modes = frost.split('fn apply_mode(', 1)[1].split('fn enter_alternate_screen(', 1)[0]
+        self.assertRegex(
+            frost_modes,
+            r'apply_frost_mode\(\s*&mut self\.screen,\s*&mut self\.protocol,\s*namespace,\s*mode,\s*enabled,?\s*\)',
+        )
+        self.assertIn('FrostModeEffect::MouseReportingChanged => self.projection_scroll_guard.revoke()', frost_modes)
+        self.assertIn('self.finish_synchronized_output()', frost_modes)
+        self.assertNotIn('modes_mut().insert(mode)', frost_modes)
+        self.assertNotIn('modes_mut().remove(&mode)', frost_modes)
 
     def test_osc_color_commands_have_one_shared_owner(self):
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
