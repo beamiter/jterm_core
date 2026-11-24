@@ -931,6 +931,12 @@ impl TerminalGrid {
     }
 }
 
+impl AsRef<TerminalGrid> for TerminalGrid {
+    fn as_ref(&self) -> &TerminalGrid {
+        self
+    }
+}
+
 impl std::ops::Index<usize> for TerminalGrid {
     type Output = [TerminalCell];
     fn index(&self, row: usize) -> &[TerminalCell] {
