@@ -511,7 +511,7 @@ fn attach_request(
     });
     let mut sequence = snapshot.event_sequence;
     let mut size = (cols, rows);
-    let mut input = [0u8; OUTPUT_CHUNK_BYTES];
+    let mut input = [0u8; INPUT_CHUNK_BYTES];
     let mut result = Ok(0);
     let mut exited = false;
     'attach: loop {
@@ -608,6 +608,7 @@ fn attach_request(
                     client: client.clone(),
                     epoch: epoch.clone(),
                     bytes: input[..n as usize].to_vec(),
+                    kind: InputKind::User,
                 },
             ) {
                 result = Err(error);

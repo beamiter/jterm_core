@@ -1,7 +1,7 @@
 //! A session whose native host prepared the child and PTY master.
 
-use super::transport::{resize_master, write_master};
 use crate::child_lifecycle::{observe_child_exit, ChildLifecycle, EscalationPolicy};
+use crate::pty_io::{resize_master, write_master};
 use crate::pty_reader::read_master;
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{

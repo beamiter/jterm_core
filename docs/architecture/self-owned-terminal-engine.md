@@ -78,6 +78,28 @@ Validation enters the pinned directory by descriptor. The Host registers the
 lease after the I/O worker starts and drains the bounded exit tail before
 publishing the terminal result.
 
+### Persistent session I/O
+
+The Session Host gives the native master and exclusive child wait to
+`SessionActor`. Its Workspace coordinator owns the durable lease, attachment
+epoch, raw capture and recovery screen. The actor handles the PTY reads,
+nonblocking writes, window size and group supervision. Detach releases the
+view while admitted input and background output continue. Stop retires input,
+sends TERM to the owned group and escalates after two seconds.
+
+The hosted FIFO admits 64 KiB of user input and 64 KiB of protocol replies,
+with 16 of its 128 entries reserved for replies. Each attachment can have one
+decoded input awaiting admission. User and paste frames are capped at 16 KiB.
+An input expires after ten seconds in the FIFO, and a write without progress
+expires after ten seconds. Reviewed Aether paste is one logical frame.
+If it has started when Stop retires it, the writer gets a bounded attempt
+to send the remainder of the closing marker. The Host reports an incomplete
+paste when that attempt fails.
+
+The attached Aether parser labels its replies for the reserved FIFO. Output
+continues draining into the Host's recovery screen and raw capture while
+detached.
+
 ## Initial host-context seam (Ember)
 
 `TerminalState::new_with_host_context` accepts an owned hostname and trusted

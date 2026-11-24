@@ -497,6 +497,222 @@ fn reserved_reply_entries_survive_user_saturation_and_keep_fifo_order() {
 }
 
 #[test]
+fn interrupted_bracketed_paste_only_repairs_its_markers() {
+    let paste = b"\x1b[200~sample\x1b[201~";
+    assert_eq!(paste_closure(paste, 0), None);
+    assert_eq!(paste_closure(paste, paste.len()), None);
+    assert_eq!(paste_closure(b"unbracketed", 3), None);
+    assert_eq!(
+        paste_closure(paste, 3),
+        Some((b"00~".as_slice(), b"\x1b[201~".as_slice()))
+    );
+    assert_eq!(
+        paste_closure(paste, 9),
+        Some((b"".as_slice(), b"\x1b[201~".as_slice()))
+    );
+    assert_eq!(
+        paste_closure(paste, paste.len() - 2),
+        Some((b"".as_slice(), b"1~".as_slice()))
+    );
+}
+
+#[test]
+fn failed_bracketed_paste_attempts_only_the_closer_and_discards_later_writes() {
+    use std::os::unix::net::UnixStream;
+
+    struct ShortWriter {
+        descriptor: UnixStream,
+        calls: usize,
+        written: Vec<u8>,
+        block_closer: bool,
+    }
+
+    impl AsFd for ShortWriter {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.descriptor.as_fd()
+        }
+    }
+
+    impl SessionTransport for ShortWriter {
+        fn read(&mut self, _: &mut [u8]) -> Result<ReadOutcome, String> {
+            unreachable!()
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<WriteOutcome, String> {
+            self.calls += 1;
+            let count = match self.calls {
+                1 => 8,
+                2 => return Err("fixture partial write".into()),
+                _ if self.block_closer => return Ok(WriteOutcome::WouldBlock),
+                _ => bytes.len().min(2),
+            };
+            self.written.extend_from_slice(&bytes[..count]);
+            Ok(WriteOutcome::Written(count))
+        }
+
+        fn resize(&mut self, _: usize, _: usize) -> Result<(), String> {
+            unreachable!()
+        }
+
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+
+        fn try_reap(&mut self) -> Option<i32> {
+            unreachable!()
+        }
+
+        fn wait_timeout(&mut self, _: u64) -> Result<i32, String> {
+            unreachable!()
+        }
+
+        fn signal_terminate(&mut self) {}
+
+        fn force_kill_and_reap(&mut self) {}
+    }
+
+    for block_closer in [false, true] {
+        let (descriptor, _peer) = UnixStream::pair().unwrap();
+        let polling = Arc::new(descriptor.as_fd().try_clone_to_owned().unwrap());
+        let transport = Arc::new(Mutex::new(ShortWriter {
+            descriptor,
+            calls: 0,
+            written: Vec::new(),
+            block_closer,
+        }));
+        let queue = Arc::new(WriteQueue::new(WriteQueueLimits::PRODUCTION));
+        queue
+            .try_enqueue_input(
+                WriteOrigin::Paste,
+                b"\x1b[200~example\x1b[201~".as_slice().into(),
+            )
+            .unwrap();
+        queue
+            .try_enqueue_input(WriteOrigin::Reply, b"later reply".as_slice().into())
+            .unwrap();
+        let (tx, rx) = bounded(1);
+        let (_stop, stop) = bounded(0);
+        SessionActor::<ShortWriter>::writer_loop(
+            transport.clone(),
+            WorkerEvents {
+                tx,
+                stop,
+                wake: WakeSink::new(|| {}),
+            },
+            polling,
+            queue.clone(),
+        );
+        let (expected_bytes, expected_message) = if block_closer {
+            (
+                b"\x1b[200~ex".as_slice(),
+                "closing marker may be incomplete",
+            )
+        } else {
+            (
+                b"\x1b[200~ex\x1b[201~".as_slice(),
+                "closing marker was sent",
+            )
+        };
+        assert_eq!(transport.lock().written, expected_bytes);
+        assert!(matches!(rx.try_recv(), Ok(SessionEvent::Error(error))
+            if error.contains(expected_message)));
+        assert_eq!(queue.drained(), Err(WriteError::Closed));
+        assert!(queue.state.lock().pending.is_empty());
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn hosted_pty_reply_waits_for_the_whole_partially_written_paste() {
+    use crate::native_pty_launch::launch_hosted_pty;
+    use std::{fs::File, io::Write, process::Command, time::Instant};
+
+    fn read_until(actor: &SessionActor<HostedPty>, output: &mut Vec<u8>, suffix: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !output.ends_with(suffix) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match actor
+                .events()
+                .recv_timeout(remaining)
+                .expect("fixture output")
+            {
+                SessionEvent::Output(batch) => output.extend(batch.into_bytes()),
+                other => panic!("unexpected PTY event: {other:?}"),
+            }
+        }
+    }
+
+    const PASTE_BYTES: usize = 48 * 1024;
+    const READ_PREFIX: usize = 8192;
+    const REPLY: &[u8] = b"\x1b[1;1R";
+    let (gate, release) = shutdown_pipe().unwrap();
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.resize(PASTE_BYTES - 6, b'p');
+    paste.extend_from_slice(b"\x1b[201~");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-ec",
+        r#"stty raw -echo
+printf READY
+dd bs=1 count="$2" status=none
+printf HOLD
+dd if="/proc/self/fd/$1" of=/dev/null bs=1 count=1 status=none
+dd bs=1 count="$3" status=none
+printf FINAL
+exit 23"#,
+        "jterm-pty-fifo",
+        &gate.as_raw_fd().to_string(),
+        &READ_PREFIX.to_string(),
+        &(PASTE_BYTES + REPLY.len() - READ_PREFIX).to_string(),
+    ]);
+    let (master, child) = launch_hosted_pty(&command, None, 24, 80, &[gate.as_fd()]).unwrap();
+    let actor = SessionActor::start_hosted(
+        master,
+        child,
+        SplitWriteLimits {
+            user_bytes: PASTE_BYTES,
+            response_bytes: REPLY.len(),
+            entries: 2,
+            coalesce_bytes: 0,
+        },
+        1,
+        4096,
+        WakeSink::new(|| {}),
+    )
+    .unwrap();
+
+    let mut output = Vec::new();
+    read_until(&actor, &mut output, b"READY");
+    actor.write_paste(paste.clone()).unwrap();
+    read_until(&actor, &mut output, b"HOLD");
+    assert_eq!(
+        &output[b"READY".len()..output.len() - b"HOLD".len()],
+        &paste[..READ_PREFIX]
+    );
+    assert!(matches!(
+        actor.can_queue_user_input(1),
+        Err(WriteError::Full { .. })
+    ));
+    actor.write_response(REPLY.to_vec()).unwrap();
+    assert_eq!(actor.input_backlog().unwrap().response_bytes, REPLY.len());
+    File::from(release).write_all(b"go").unwrap();
+
+    let mut tail = Vec::new();
+    read_until(&actor, &mut tail, b"FINAL");
+    let mut expected = paste[READ_PREFIX..].to_vec();
+    expected.extend_from_slice(REPLY);
+    assert!(
+        tail.strip_suffix(b"FINAL") == Some(expected.as_slice()),
+        "the reserved reply must follow every byte of the paste"
+    );
+    assert!(matches!(
+        actor.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+        SessionEvent::Exit(23)
+    ));
+    assert!(actor.hosted_cleanup_verified());
+}
+
+#[test]
 fn retiring_admission_allows_an_inflight_message_to_finish() {
     let queue = WriteQueue::new(tiny_limits());
     queue.try_enqueue(b"release".to_vec()).unwrap();

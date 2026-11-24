@@ -4,6 +4,29 @@ use std::io::{BufRead, Write};
 
 pub(super) const MAX_FRAME_BYTES: usize = 12 * 1024 * 1024;
 pub(super) const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
+pub(super) const INPUT_CHUNK_BYTES: usize = 16 * 1024;
+pub(super) const REPLY_CHUNK_BYTES: usize = 64 * 1024;
+// A byte is at most three decimal digits plus one separator in the wire
+// array. Leave room for the bounded attachment identity and frame fields.
+pub(super) const MAX_ATTACHMENT_FRAME_BYTES: usize = REPLY_CHUNK_BYTES * 4 + 2048;
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum InputKind {
+    #[default]
+    User,
+    Reply,
+    Paste,
+}
+
+impl InputKind {
+    pub(super) fn limit(self) -> usize {
+        match self {
+            Self::User | Self::Paste => INPUT_CHUNK_BYTES,
+            Self::Reply => REPLY_CHUNK_BYTES,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkspaceCommand {
@@ -290,6 +313,8 @@ pub(super) enum Request {
         client: String,
         epoch: String,
         bytes: Vec<u8>,
+        #[serde(default, skip_serializing_if = "is_user_input")]
+        kind: InputKind,
     },
     Resize {
         client: String,
@@ -301,6 +326,10 @@ pub(super) enum Request {
         client: String,
         epoch: String,
     },
+}
+
+fn is_user_input(kind: &InputKind) -> bool {
+    matches!(kind, InputKind::User)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -337,6 +366,13 @@ pub(super) fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Re
 pub(super) fn read_frame<T: serde::de::DeserializeOwned>(
     reader: &mut impl BufRead,
 ) -> Result<Option<T>, String> {
+    read_frame_bounded(reader, MAX_FRAME_BYTES)
+}
+
+pub(super) fn read_frame_bounded<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> Result<Option<T>, String> {
     let mut bytes = Vec::new();
     loop {
         let buf = reader.fill_buf().map_err(|e| e.to_string())?;
@@ -351,7 +387,7 @@ pub(super) fn read_frame<T: serde::de::DeserializeOwned>(
             .iter()
             .position(|b| *b == b'\n')
             .map_or(buf.len(), |i| i + 1);
-        if bytes.len() + count > MAX_FRAME_BYTES {
+        if bytes.len() + count > max_bytes {
             return Err("Workspace protocol frame exceeds its limit".into());
         }
         let done = buf[count - 1] == b'\n';
@@ -368,6 +404,41 @@ pub(super) fn read_frame<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_input_preserves_the_legacy_wire_and_bounds_protocol_replies() {
+        let legacy = serde_json::json!({"Input": {
+            "client": "client",
+            "epoch": "epoch",
+            "bytes": [1, 2, 3]
+        }});
+        let decoded = serde_json::from_value::<Request>(legacy.clone()).unwrap();
+        assert!(matches!(
+            &decoded,
+            Request::Input {
+                kind: InputKind::User,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+
+        let reply = Request::Input {
+            client: "client".into(),
+            epoch: "epoch".into(),
+            bytes: vec![255; REPLY_CHUNK_BYTES],
+            kind: InputKind::Reply,
+        };
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &reply).unwrap();
+        let rejected = read_frame_bounded::<Request>(&mut encoded.as_slice(), INPUT_CHUNK_BYTES);
+        assert!(rejected.is_err());
+        assert!(matches!(
+            read_frame_bounded::<Request>(&mut encoded.as_slice(), MAX_ATTACHMENT_FRAME_BYTES)
+                .unwrap(),
+            Some(Request::Input { bytes, kind: InputKind::Reply, .. })
+                if bytes.len() == REPLY_CHUNK_BYTES
+        ));
+    }
 
     #[test]
     fn boxed_result_replies_preserve_the_legacy_wire_frame() {

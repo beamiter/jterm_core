@@ -8,6 +8,8 @@ use crate::exit_status::{ExitTail, PtyExit};
 use crate::native_pty_launch::{
     launch_bundled_bash, launch_standalone_pty, BundledBash, PendingPty, PtyLaunchError,
 };
+#[cfg(test)]
+use crate::pty_io::bounded_write;
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{SessionActor, SessionEvent};
 use crate::supervised::require_waitable_sigchld;
@@ -55,22 +57,6 @@ impl InputBoundary {
             Self::Queued(start) | Self::Raw { start, .. } => start,
         }
     }
-}
-
-/// Bounded EINTR retry; zero progress means the caller retains all bytes.
-fn bounded_write(
-    input: &[u8],
-    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
-) -> io::Result<usize> {
-    for _ in 0..8 {
-        match write(input) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
-            Ok(0) if !input.is_empty() => return Err(std::io::ErrorKind::WriteZero.into()),
-            result => return result,
-        }
-    }
-    Ok(0)
 }
 
 mod reaper {

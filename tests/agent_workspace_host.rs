@@ -632,9 +632,8 @@ fn restarted_host_cannot_duplicate_or_stop_a_surviving_runtime() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        if let Ok(WorkspaceReply::Catalog { rows }) =
-            request(&h.client(), WorkspaceCommand::Refresh)
-        {
+        let refresh = request(&h.client(), WorkspaceCommand::Refresh);
+        if let Ok(WorkspaceReply::Catalog { rows }) = &refresh {
             if rows
                 .iter()
                 .any(|row| row.id == original.id && row.runtime == RuntimeState::Conflict)
@@ -644,7 +643,9 @@ fn restarted_host_cannot_duplicate_or_stop_a_surviving_runtime() {
         }
         assert!(
             Instant::now() < deadline,
-            "surviving runtime was not reported as a conflict"
+            "surviving runtime {} was not reported as a conflict: {refresh:?}; restarted host: {}",
+            original.pid,
+            std::fs::read_to_string(h.root.join("restarted-host-errors")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(20));
     }

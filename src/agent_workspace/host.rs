@@ -5,18 +5,21 @@ use super::store::Store;
 use super::PROTOCOL_VERSION;
 use crate::agent_sessions::{AgentSession, SessionProvider, SessionStatus};
 use crate::native_pty_launch::{launch_hosted_pty, PtyLaunchError};
-use crate::pty_reader::{drain_ready_exit_tail, read_master, ReadOutcome};
 use crate::screen_replay::ScreenReplay;
 use crate::supervised::SupervisedChild;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use jterm_runtime::{
+    exit_status::ExitTail,
+    runtime_wake::WakeSink,
+    session_actor::{HostedPty, SessionActor, SessionEvent, SplitWriteLimits},
+};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -25,6 +28,9 @@ use std::time::{Duration, Instant};
 const MAX_RUNTIMES: usize = 16;
 const MAX_CLIENTS: usize = 64;
 const MAX_INPUT: usize = 64 * 1024;
+const HOSTED_INPUT_ENTRIES: usize = 128;
+const HOSTED_REPLY_ENTRIES: usize = 16;
+const STOP_GRACE: Duration = Duration::from_secs(2);
 const RUNTIME_OUTPUT_BYTES: usize = 128 * 1024;
 const RUNTIME_SCREEN_BYTES: usize = 2 * 1024 * 1024;
 
@@ -85,6 +91,8 @@ pub(super) enum Control {
         client: String,
         epoch: String,
         bytes: Vec<u8>,
+        kind: InputKind,
+        processed: Sender<()>,
     },
     Resize {
         client: String,
@@ -619,17 +627,27 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
                 let _ = output_stream.shutdown(std::net::Shutdown::Both);
             });
             stream.set_read_timeout(None).map_err(|e| e.to_string())?;
-            while let Ok(Some(request)) = read_frame::<Request>(&mut reader) {
+            let (processed, admission) = bounded(1);
+            while let Ok(Some(request)) =
+                read_frame_bounded::<Request>(&mut reader, MAX_ATTACHMENT_FRAME_BYTES)
+            {
                 let control = match request {
                     Request::Input {
                         client: c,
                         epoch: e,
                         bytes,
-                    } if c == client && e == epoch && bytes.len() <= OUTPUT_CHUNK_BYTES => {
+                        kind,
+                    } if c == client
+                        && e == epoch
+                        && !bytes.is_empty()
+                        && bytes.len() <= kind.limit() =>
+                    {
                         Control::Input {
                             client: c,
                             epoch: e,
                             bytes,
+                            kind,
+                            processed: processed.clone(),
                         }
                     }
                     Request::Resize {
@@ -649,7 +667,10 @@ fn connection(mut stream: UnixStream, host: Sender<HostRequest>) -> Result<(), S
                     } if c == client && e == epoch => break,
                     _ => break,
                 };
-                if runtime.control.try_send(control).is_err() {
+                let awaits_admission = matches!(&control, Control::Input { .. });
+                if runtime.control.try_send(control).is_err()
+                    || (awaits_admission && admission.recv_timeout(Duration::from_secs(3)).is_err())
+                {
                     break;
                 }
             }
@@ -838,12 +859,18 @@ pub(super) struct RuntimePty<G> {
     pub guard: G,
 }
 
+struct RegisteredPty<G> {
+    actor: SessionActor<HostedPty>,
+    lease: Lease,
+    guard: G,
+}
+
 pub(super) fn register_pty<G: Send + 'static>(
     id: ConversationId,
     (cols, rows): (u16, u16),
     thread_name: &str,
     detail: &str,
-    mut pty: RuntimePty<G>,
+    pty: RuntimePty<G>,
 ) -> Result<RuntimeHandle, PtyLaunchError> {
     let pid = pty.child.process_group_id() as u32;
     let Some(start) = supervised_process_start(&pty.child) else {
@@ -874,9 +901,27 @@ pub(super) fn register_pty<G: Send + 'static>(
         host_start,
         runtime: snapshot.clone(),
     };
+    let mut pty = RegisteredPty {
+        actor: SessionActor::start_hosted(
+            pty.master,
+            pty.child,
+            SplitWriteLimits {
+                user_bytes: MAX_INPUT,
+                response_bytes: REPLY_CHUNK_BYTES,
+                entries: HOSTED_INPUT_ENTRIES,
+                coalesce_bytes: 0,
+            },
+            HOSTED_REPLY_ENTRIES,
+            OUTPUT_CHUNK_BYTES,
+            WakeSink::new(|| {}),
+        )
+        .map_err(|error| PtyLaunchError::ExecConfirmed(io::Error::other(error)))?,
+        lease: pty.lease,
+        guard: pty.guard,
+    };
     let view = Arc::new(Mutex::new(snapshot));
     let (control, rx) = bounded(128);
-    let (registered, registration) = bounded::<(RuntimePty<G>, LeaseRecord)>(1);
+    let (registered, registration) = bounded::<(RegisteredPty<G>, LeaseRecord)>(1);
     let output = Arc::new(Mutex::new(RuntimeOutput::default()));
     let thread_output = output.clone();
     let thread_view = view.clone();
@@ -884,24 +929,15 @@ pub(super) fn register_pty<G: Send + 'static>(
         .name(thread_name.into())
         .spawn(move || {
             if let Ok((
-                RuntimePty {
-                    master,
-                    child,
+                RegisteredPty {
+                    actor,
                     lease,
                     guard: _guard,
                 },
                 record,
             )) = registration.recv()
             {
-                runtime_loop(
-                    File::from(master),
-                    child,
-                    lease,
-                    record,
-                    rx,
-                    thread_view,
-                    thread_output,
-                );
+                runtime_loop(actor, lease, record, rx, thread_view, thread_output);
             }
         })
         .map_err(|error| {
@@ -936,7 +972,7 @@ fn publish_output(
     output: &Mutex<RuntimeOutput>,
     owner: &mut Option<Attachment>,
     sequence: &mut u64,
-) -> bool {
+) {
     screen.feed(bytes);
     {
         let mut capture = output.lock();
@@ -960,15 +996,12 @@ fn publish_output(
                 owner,
                 "Output consumer fell behind. Reattach to restore the current screen.",
             );
-            return false;
         }
     }
-    true
 }
 
 fn runtime_loop(
-    mut master: File,
-    mut child: SupervisedChild,
+    actor: SessionActor<HostedPty>,
     mut lease: Lease,
     mut record: LeaseRecord,
     controls: Receiver<Control>,
@@ -981,17 +1014,24 @@ fn runtime_loop(
         RUNTIME_OUTPUT_BYTES,
     );
     let mut owner: Option<Attachment> = None;
-    let mut pending: VecDeque<u8> = VecDeque::new();
-    let mut stopping: Option<Instant> = None;
-    let mut bytes = [0u8; OUTPUT_CHUNK_BYTES];
-    loop {
+    let mut kill_at: Option<Instant> = None;
+    let mut next_control = None;
+    let mut next_event = None;
+    let mut tail = ExitTail::Complete;
+
+    let exit = 'running: loop {
         if owner
             .as_ref()
             .is_some_and(|(_, _, closed)| closed.load(Ordering::Relaxed))
         {
             owner = None;
         }
-        for control in controls.try_iter().take(64) {
+        for control in next_control
+            .take()
+            .into_iter()
+            .chain(controls.try_iter())
+            .take(64)
+        {
             match control {
                 Control::Attach {
                     client,
@@ -1007,14 +1047,16 @@ fn runtime_loop(
                         continue;
                     }
                     if owner.is_some() {
-                        let _=ack.try_send(Err("This session is attached to another terminal. Detach that terminal with Ctrl+] before attaching here.".into()));
+                        let _ = ack.try_send(Err("This session is attached to another terminal. Detach that terminal with Ctrl+] before attaching here.".into()));
                         continue;
                     }
-                    if stopping.is_some() || !pending.is_empty() {
-                        let _=ack.try_send(Err("This session is stopping or draining previously accepted input. Retry after it settles.".into()));
+                    if record.runtime.state == RuntimeState::Stopping
+                        || actor.input_drained() != Ok(true)
+                    {
+                        let _ = ack.try_send(Err("The session is stopping or its input queue is unavailable. Retry after it settles.".into()));
                         continue;
                     }
-                    resize(&master, &mut screen, &mut record.runtime, cols, rows);
+                    resize(&actor, &mut screen, &mut record.runtime, cols, rows);
                     let replay = match screen.snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES) {
                         Ok(replay) => replay,
                         Err(error) => {
@@ -1044,18 +1086,28 @@ fn runtime_loop(
                     client,
                     epoch,
                     bytes,
-                } if stopping.is_none()
-                    && valid_owner(&owner, &client, &epoch, &record.runtime) =>
-                {
-                    if pending.len() + bytes.len() > MAX_INPUT {
-                        detach_with_error(
-                            &mut owner,
-                            "Terminal input queue is full. Reattach after the provider responds.",
-                        );
-                        pending.clear();
-                    } else {
-                        pending.extend(bytes);
+                    kind,
+                    processed,
+                } => {
+                    if record.runtime.state != RuntimeState::Stopping
+                        && valid_owner(&owner, &client, &epoch, &record.runtime)
+                    {
+                        let result = match kind {
+                            InputKind::User => actor.write_sender().try_send(bytes),
+                            InputKind::Reply => actor.write_response(bytes),
+                            InputKind::Paste => actor.write_paste(bytes),
+                        };
+                        if let Err(error) = result {
+                            // Keep earlier accepted writes and their FIFO order.
+                            detach_with_error(
+                                &mut owner,
+                                &format!("Workspace input rejected. {error}"),
+                            );
+                        }
                     }
+                    // At most one decoded input can wait outside the actor's
+                    // byte budget per attachment, including under socket load.
+                    let _ = processed.try_send(());
                 }
                 Control::Resize {
                     client,
@@ -1063,137 +1115,61 @@ fn runtime_loop(
                     cols,
                     rows,
                 } if valid_owner(&owner, &client, &epoch, &record.runtime) => {
-                    resize(&master, &mut screen, &mut record.runtime, cols, rows)
+                    resize(&actor, &mut screen, &mut record.runtime, cols, rows);
                 }
                 Control::Detach { client, epoch }
                     if valid_owner(&owner, &client, &epoch, &record.runtime) =>
                 {
                     owner = None;
                 }
-                Control::Stop if stopping.is_none() => {
-                    pending.clear();
-                    let _ = child.terminate_group();
-                    stopping = Some(Instant::now());
+                Control::Stop if record.runtime.state != RuntimeState::Stopping => {
+                    if let Err(error) = actor.signal_host_stop(false) {
+                        log::warn!("Could not signal provider to stop: {error}");
+                    }
+                    kill_at = Some(Instant::now() + STOP_GRACE);
                     record.runtime.state = RuntimeState::Stopping;
                 }
                 _ => {}
             }
         }
-        if !pending.is_empty() {
-            let contiguous = pending.make_contiguous();
-            match master.write(contiguous) {
-                Ok(n) => {
-                    pending.drain(..n);
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    pending.clear();
-                    detach_with_error(&mut owner, "The provider closed its input terminal");
-                }
-            }
-        }
-        for _ in 0..32 {
-            match read_master(master.as_fd(), &mut bytes) {
-                Ok(ReadOutcome::Data(n)) => {
-                    if !publish_output(
-                        &bytes[..n],
-                        &mut screen,
-                        &output,
-                        &mut owner,
-                        &mut record.runtime.event_sequence,
-                    ) {
-                        pending.clear();
-                    }
-                }
-                Ok(ReadOutcome::WouldBlock | ReadOutcome::Eof | ReadOutcome::Hangup) | Err(_) => {
-                    break
-                }
-            }
-        }
-        match child.root_has_exited() {
-            Ok(exited)
-                if exited
-                    || stopping.is_some_and(|time| time.elapsed() > Duration::from_secs(2)) =>
-            {
-                // WNOWAIT retains the leader's PID until the group has been
-                // killed. A TERM-ignoring tool cannot outlive early root exit.
-                let group = child.process_group_id();
-                let status = match child.reap_after_group_kill() {
-                    Ok(status) => status,
-                    Err(error) => {
-                        record.runtime.state = RuntimeState::Failed;
-                        record.runtime.detail = format!("Could not stop provider group: {error}");
-                        detach_with_error(&mut owner, &record.runtime.detail);
-                        let _ = lease.write(&record);
-                        output.lock().screen = screen
-                            .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
-                            .unwrap_or_default();
-                        *view.lock() = record.runtime;
-                        return;
-                    }
-                };
-                let empty = wait_group_empty(group, Duration::from_secs(2));
-                let tail = drain_ready_exit_tail(
-                    master.as_fd(),
-                    |bytes| {
+
+        for event in next_event
+            .take()
+            .into_iter()
+            .chain(actor.events().try_iter())
+            .take(32)
+        {
+            match event {
+                SessionEvent::Output(batch) => {
+                    for bytes in batch.into_bytes().chunks(OUTPUT_CHUNK_BYTES) {
                         publish_output(
-                            &bytes,
+                            bytes,
                             &mut screen,
                             &output,
                             &mut owner,
                             &mut record.runtime.event_sequence,
                         );
-                        // The retained capture still needs the tail if the live
-                        // attachment fell behind.
-                        true
-                    },
-                    || false,
-                );
-                record.runtime.cleanup_verified = empty;
-                record.runtime.state = RuntimeState::Exited;
-                record.runtime.exit_code = Some(
-                    status
-                        .code()
-                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
-                );
-                if !empty {
-                    record.runtime.detail="Provider exited; descendant cleanup is still pending. Its inherited lease prevents a second writer.".into();
+                    }
                 }
-                if let Some(notice) = tail.and_then(|tail| tail.notice()) {
-                    output.lock().truncated = true;
-                    record.runtime.detail.push(' ');
-                    record.runtime.detail.push_str(notice);
+                SessionEvent::ExitTail(status) => tail = status,
+                SessionEvent::Exit(code) => break 'running Ok(code),
+                SessionEvent::Error(error) => {
+                    if let Some(exit_error) = actor.hosted_exit_error() {
+                        break 'running Err(exit_error);
+                    }
+                    record.runtime.detail = error.clone();
+                    detach_with_error(&mut owner, &error);
                 }
-                record.runtime.event_sequence = record.runtime.event_sequence.saturating_add(1);
-                let (sequence, code) = (record.runtime.event_sequence, record.runtime.exit_code);
-                let _ = lease.write(&record);
-                output.lock().screen = screen
-                    .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
-                    .unwrap_or_default();
-                *view.lock() = record.runtime;
-                if let Some((_, output, _)) = owner.take() {
-                    let _ = output.try_send(Response::Exited { sequence, code });
-                }
-                return;
             }
-            Err(error) => {
-                let _ = child.reap_after_group_kill();
-                record.runtime.state = RuntimeState::Failed;
-                record.runtime.detail = format!("Could not observe provider exit: {error}");
-                detach_with_error(&mut owner, &record.runtime.detail);
-                let _ = lease.write(&record);
-                output.lock().screen = screen
-                    .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
-                    .unwrap_or_default();
-                *view.lock() = record.runtime;
-                return;
-            }
-            Ok(false) => {}
-            Ok(true) => unreachable!(),
         }
-        if stopping.is_none() {
+
+        if kill_at.is_some_and(|deadline| Instant::now() >= deadline) {
+            kill_at = None;
+            if let Err(error) = actor.signal_host_stop(true) {
+                log::warn!("Could not escalate provider stop: {error}");
+            }
+        }
+        if record.runtime.state != RuntimeState::Stopping {
             record.runtime.state = if owner.is_some() {
                 RuntimeState::Attached
             } else {
@@ -1201,14 +1177,59 @@ fn runtime_loop(
             };
         }
         *view.lock() = record.runtime.clone();
-        let mut descriptor = libc::pollfd {
-            fd: master.as_raw_fd(),
-            events: libc::POLLIN | if pending.is_empty() { 0 } else { libc::POLLOUT },
-            revents: 0,
-        };
-        unsafe {
-            libc::poll(&mut descriptor, 1, 15);
+        let timeout = kill_at.map_or(Duration::from_secs(60), |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        crossbeam_channel::select! {
+            recv(controls) -> message => match message {
+                Ok(control) => next_control = Some(control),
+                Err(_) => break Err("Session Host released the PTY coordinator".into()),
+            },
+            recv(actor.events()) -> message => match message {
+                Ok(event) => next_event = Some(event),
+                Err(_) => break Err("Shared PTY actor stopped before publishing exit".into()),
+            },
+            default(timeout) => {}
         }
+    };
+
+    match exit {
+        Ok(code) => {
+            record.runtime.cleanup_verified = actor.hosted_cleanup_verified();
+            record.runtime.state = RuntimeState::Exited;
+            record.runtime.exit_code = Some(code);
+            if !record.runtime.cleanup_verified {
+                record.runtime.detail.push_str(" Descendant cleanup is still pending. Its inherited lease prevents a second writer.");
+            }
+            if let Some(notice) = tail.notice() {
+                output.lock().truncated = true;
+                record.runtime.detail.push(' ');
+                record.runtime.detail.push_str(notice);
+            }
+            record.runtime.event_sequence = record.runtime.event_sequence.saturating_add(1);
+        }
+        Err(error) => {
+            record.runtime.state = RuntimeState::Failed;
+            record.runtime.detail = error;
+        }
+    }
+    // Synchronous fallback cleanup keeps the leases through the owned wait.
+    drop(actor);
+    let event = if record.runtime.state == RuntimeState::Exited {
+        Response::Exited {
+            sequence: record.runtime.event_sequence,
+            code: record.runtime.exit_code,
+        }
+    } else {
+        Response::Error(record.runtime.detail.clone())
+    };
+    let _ = lease.write(&record);
+    output.lock().screen = screen
+        .snapshot_ansi_bounded(RUNTIME_SCREEN_BYTES)
+        .unwrap_or_default();
+    *view.lock() = record.runtime;
+    if let Some((_, output, _)) = owner.take() {
+        let _ = output.try_send(event);
     }
 }
 
@@ -1228,22 +1249,9 @@ fn detach_with_error(owner: &mut Option<Attachment>, error: &str) {
         let _ = output.try_send(Response::Error(error.into()));
     }
 }
-fn wait_group_empty(group: i32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if unsafe { libc::kill(-group, 0) } < 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
-}
+
 fn resize(
-    master: &File,
+    actor: &SessionActor<HostedPty>,
     screen: &mut ScreenReplay,
     snapshot: &mut RuntimeSnapshot,
     cols: u16,
@@ -1253,13 +1261,7 @@ fn resize(
     if snapshot.cols == cols && snapshot.rows == rows {
         return;
     }
-    let winsize = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) } == 0 {
+    if actor.resize(cols as usize, rows as usize).is_ok() {
         screen.resize(cols as usize, rows as usize);
         snapshot.cols = cols;
         snapshot.rows = rows;

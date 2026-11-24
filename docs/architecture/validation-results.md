@@ -298,3 +298,18 @@ reaping after an exec-confirmed registration failure.
   to core `7982ef5` with Frost's local pin commit `df100c0`. Frost checked all
   targets against that Git dependency with `--locked`. The hosted PTY candidate
   was tested with a local core override.
+
+## Shared Actor for persistent PTYs (2026-11-24)
+
+- The Runtime suite passed 125 unit cases and one wait-ownership integration
+  case. A real PTY held a 48 KiB bracketed paste across partial writes while
+  a reply occupied reserved capacity. The provider read the entire paste
+  and its closing marker before the reply. A fault fixture verified the
+  writer sends only the remaining markers when possible and reports an
+  incomplete closer when the transport refuses the repair.
+- The Workspace library suite passed 117 cases. The attachment frame tests
+  cover legacy input and the larger reserved reply frame.
+- Aether's native X11 Workspace fixture checked the cursor-position reply,
+  confirmed multiline paste byte for byte, reopened the same provider PTY,
+  and displayed its final output before handling exit. The native task
+  fixture reopened the same running verification in a real user systemd scope.

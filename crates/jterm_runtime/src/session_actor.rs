@@ -23,8 +23,11 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+mod hosted;
+pub use hosted::HostedPty;
 
 pub use crate::pty_reader::ReadOutcome;
 
@@ -49,12 +52,21 @@ pub trait SessionTransport: AsFd + Send + 'static {
     fn observe_before_reap_pid(&self) -> Option<i32> {
         None
     }
+    /// Hosts that must stop surviving group members before the last read can
+    /// complete their owned cleanup when the reader observes the leader exit.
+    fn prepare_exit_tail(&mut self) {}
+    fn exit_after_tail(&mut self) -> Result<Option<i32>, String> {
+        Ok(self.try_reap())
+    }
     /// Hosts may limit a hangup when the launched child cannot reopen a slave.
     fn hangup_timeout(&self) -> Option<Duration> {
         None
     }
     /// Limit one reader dispatch for a view with a smaller paint budget.
     fn read_batch_bytes(&self) -> Option<usize> {
+        None
+    }
+    fn max_input_queue_wait(&self) -> Option<Duration> {
         None
     }
     /// Begin cleanup after fatal reader failure. A true return asks the
@@ -130,6 +142,40 @@ fn drain_exited_pty_output(
         cancelled,
     );
     tail.is_some_and(|tail| tail == ExitTail::Complete || emit(SessionEvent::ExitTail(tail)))
+}
+
+fn paste_closure(bytes: &[u8], written: usize) -> Option<(&[u8], &[u8])> {
+    const OPEN: &[u8] = b"\x1b[200~";
+    const CLOSE: &[u8] = b"\x1b[201~";
+    if written == 0 || written >= bytes.len() {
+        return None;
+    }
+    bytes.strip_prefix(OPEN)?.strip_suffix(CLOSE)?;
+    let open = &OPEN[written.min(OPEN.len())..];
+    let close = &CLOSE[written.saturating_sub(bytes.len() - CLOSE.len())..];
+    Some((open, close))
+}
+
+fn try_close_paste<T: SessionTransport>(pty: &Mutex<T>, open: &[u8], close: &[u8]) -> bool {
+    // Finish a partly written opening marker before the close. Never write
+    // more of the cancelled payload or wait for a blocked slave to become ready.
+    let mut repair = [0; 12];
+    repair[..open.len()].copy_from_slice(open);
+    repair[open.len()..open.len() + close.len()].copy_from_slice(close);
+    let mut remaining = &repair[..open.len() + close.len()];
+    let mut transport = pty.lock();
+    if !transport.control_input_available() {
+        return false;
+    }
+    while !remaining.is_empty() {
+        match transport.write(remaining) {
+            Ok(WriteOutcome::Written(count)) if (1..=remaining.len()).contains(&count) => {
+                remaining = &remaining[count..];
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// 事件 channel 容量上限。每个事件最多 ~128KB(BATCH_SIZE_THRESHOLD),
@@ -241,11 +287,13 @@ struct WriteQueueState {
 enum WriteOrigin {
     User,
     Reply,
+    Paste,
 }
 
 struct WriteMessage {
     origin: WriteOrigin,
     bytes: Vec<u8>,
+    expires_at: Option<Instant>,
 }
 
 /// Independent byte allowances for the user and the terminal parser, sharing
@@ -273,7 +321,9 @@ struct WriteQueue {
     reply_entries: usize,
     input_admitted: fn() -> bool,
     owner_writes: bool,
+    max_queue_wait: Option<Duration>,
     closed: AtomicBool,
+    recover_cancelled_paste: AtomicBool,
 }
 
 impl WriteQueue {
@@ -296,7 +346,9 @@ impl WriteQueue {
             reply_entries: 0,
             input_admitted: || true,
             owner_writes: false,
+            max_queue_wait: None,
             closed: AtomicBool::new(false),
+            recover_cancelled_paste: AtomicBool::new(false),
         }
     }
 
@@ -312,11 +364,13 @@ impl WriteQueue {
     ) -> (usize, usize, usize) {
         if let Some(split) = self.split {
             let (used, capacity) = match origin {
-                WriteOrigin::User => (state.accounted_bytes - state.reply_bytes, split.user_bytes),
+                WriteOrigin::User | WriteOrigin::Paste => {
+                    (state.accounted_bytes - state.reply_bytes, split.user_bytes)
+                }
                 WriteOrigin::Reply => (state.reply_bytes, split.response_bytes),
             };
             let entries = match origin {
-                WriteOrigin::User => split.entries - self.reply_entries,
+                WriteOrigin::User | WriteOrigin::Paste => split.entries - self.reply_entries,
                 WriteOrigin::Reply => split.entries,
             };
             return (used, capacity, entries);
@@ -362,12 +416,13 @@ impl WriteQueue {
         if self.owner_writes || self.is_closed() || state.retiring || !(self.input_admitted)() {
             return Err(WriteError::Closed);
         }
-        let coalesce = self.split.is_some_and(|split| {
-            state.pending.back().is_some_and(|back| {
-                back.origin == origin
-                    && requested_bytes <= split.coalesce_bytes.saturating_sub(back.bytes.len())
-            })
-        });
+        let coalesce = origin != WriteOrigin::Paste
+            && self.split.is_some_and(|split| {
+                state.pending.back().is_some_and(|back| {
+                    back.origin == origin
+                        && requested_bytes <= split.coalesce_bytes.saturating_sub(back.bytes.len())
+                })
+            });
         if requested_bytes > byte_capacity.saturating_sub(queued_bytes)
             || (!coalesce && state.accounted_messages >= message_capacity)
         {
@@ -405,6 +460,9 @@ impl WriteQueue {
             state.pending.push_back(WriteMessage {
                 origin,
                 bytes: data.into_owned(),
+                expires_at: self
+                    .max_queue_wait
+                    .and_then(|budget| Instant::now().checked_add(budget)),
             });
         }
         state.admission_sequence = state.admission_sequence.saturating_add(1);
@@ -480,10 +538,30 @@ impl WriteQueue {
     }
 
     fn close(&self) {
+        self.close_locked(&mut self.state.lock(), false);
+    }
+
+    fn close_for_host_stop(&self, wait: Duration) {
+        let start = std::time::Instant::now();
         let mut state = self.state.lock();
-        if self.closed.swap(true, Ordering::AcqRel) {
+        state.retiring = true;
+        self.close_locked(&mut state, true);
+        while state.accounted_messages != 0 {
+            let remaining = wait.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            self.ready.wait_for(&mut state, remaining);
+        }
+    }
+
+    fn close_locked(&self, state: &mut WriteQueueState, recover_paste: bool) {
+        if self.is_closed() {
             return;
         }
+        self.recover_cancelled_paste
+            .store(recover_paste, Ordering::Relaxed);
+        self.closed.store(true, Ordering::Release);
         while let Some(message) = state.pending.pop_front() {
             state.accounted_bytes -= message.bytes.len();
             state.accounted_messages -= 1;
@@ -595,6 +673,7 @@ impl<T: SessionTransport> SessionActor<T> {
         queue.reply_entries = reply_entries;
         queue.input_admitted = T::input_admitted;
         queue.owner_writes = owner_writes;
+        queue.max_queue_wait = transport.max_input_queue_wait();
         let mut actor = Self {
             source: source.epoch(),
             pty: Arc::new(Mutex::new(transport)),
@@ -691,18 +770,44 @@ impl<T: SessionTransport> SessionActor<T> {
                 queue.finish(&message);
                 break;
             }
-            if let Err(error) = Self::write_to_pty(&pty, &descriptor, &queue, &message.bytes) {
-                // No later message may follow an incomplete logical input.
+            let mut offset = 0;
+            let write = if message
+                .expires_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                Err("PTY input expired while waiting for the writer".into())
+            } else {
+                Self::write_to_pty(&pty, &descriptor, &queue, &message.bytes, &mut offset)
+            };
+            let may_recover = (write.is_err() && !queue.is_closed())
+                || queue.recover_cancelled_paste.load(Ordering::Acquire);
+            if write.is_err() {
+                // Retire later messages before trying to close a paste.
                 queue.close();
-                queue.finish(&message);
-                drop(message);
-                log::error!("Failed to write to PTY: {error}");
-                events.send(SessionEvent::Error(format!(
+            }
+            let recovered = (message.origin == WriteOrigin::Paste)
+                .then(|| paste_closure(&message.bytes, offset))
+                .flatten()
+                .map(|(open, close)| may_recover && try_close_paste(&pty, open, close));
+            queue.finish(&message);
+            let error = match (write, recovered) {
+                (Err(error), Some(true)) => Some(format!(
+                    "PTY writer stopped during a paste. Its closing marker was sent. {error}"
+                )),
+                (_, Some(false)) => Some(format!(
+                    "Bracketed paste was interrupted after {offset}/{} bytes. Its closing marker may be incomplete.",
+                    message.bytes.len()
+                )),
+                (Err(error), None) => Some(format!(
                     "PTY writer stopped after a partial or failed write: {error}"
-                )));
+                )),
+                (Ok(()), _) => None,
+            };
+            if let Some(error) = error {
+                log::warn!("{error}");
+                events.send(SessionEvent::Error(error));
                 return;
             }
-            queue.finish(&message);
         }
         queue.close();
     }
@@ -721,20 +826,28 @@ impl<T: SessionTransport> SessionActor<T> {
     ) {
         let retire_input = |exiting| {
             // Serialize retirement against the native writer's last syscall.
-            let _guard = transport.lock();
+            let mut transport = transport.lock();
             if exiting {
                 leader_exited.store(true, Ordering::Release);
             }
             queue.close();
+            if exiting {
+                transport.prepare_exit_tail();
+            }
         };
         let publish_exit = |tail| {
             while !shutdown.load(Ordering::Acquire) {
-                let reaped = transport.lock().try_reap();
-                if let Some(code) = reaped {
-                    if tail != ExitTail::Complete && !events.send(SessionEvent::ExitTail(tail)) {
-                        return false;
+                let reaped = transport.lock().exit_after_tail();
+                match reaped {
+                    Ok(Some(code)) => {
+                        if tail != ExitTail::Complete && !events.send(SessionEvent::ExitTail(tail))
+                        {
+                            return false;
+                        }
+                        return events.send(SessionEvent::Exit(code));
                     }
-                    return events.send(SessionEvent::Exit(code));
+                    Ok(None) => {}
+                    Err(error) => return events.send(SessionEvent::Error(error)),
                 }
                 if !matches!(
                     poll_reader(-1, shutdown_read.as_raw_fd(), 25),
@@ -1150,12 +1263,12 @@ impl<T: SessionTransport> SessionActor<T> {
         descriptor: &OwnedFd,
         queue: &WriteQueue,
         data: &[u8],
+        offset: &mut usize,
     ) -> Result<(), String> {
-        let mut offset = 0;
         let mut last_progress = std::time::Instant::now();
         let stall_timeout = std::time::Duration::from_secs(10);
 
-        while offset < data.len() {
+        while *offset < data.len() {
             if queue.is_closed() {
                 return Ok(());
             }
@@ -1173,15 +1286,16 @@ impl<T: SessionTransport> SessionActor<T> {
                 if queue.is_closed() {
                     return Ok(());
                 }
-                match pty.write(&data[offset..]) {
-                    Ok(WriteOutcome::Written(n)) if n > 0 => {
-                        offset += n;
+                let remaining = &data[*offset..];
+                match pty.write(remaining) {
+                    Ok(WriteOutcome::Written(n)) if (1..=remaining.len()).contains(&n) => {
+                        *offset += n;
                         last_progress = std::time::Instant::now();
                         continue; // 写成功(可能 partial)，立刻尝试写剩余部分
                     }
                     Ok(WriteOutcome::Written(_)) => {
                         return Err(format!(
-                            "PTY write returned zero after {offset}/{} bytes",
+                            "PTY write returned an invalid count after {offset}/{} bytes",
                             data.len()
                         ));
                     }
@@ -1236,6 +1350,15 @@ impl<T: SessionTransport> SessionActor<T> {
         self.write_tx
             .queue
             .try_enqueue_input(WriteOrigin::Reply, data.into())
+    }
+
+    /// Admit one complete paste as a user-budget message with a stable frame
+    /// boundary. If bracketed bytes are interrupted, only the writer can
+    /// attempt the remaining closing marker.
+    pub fn write_paste(&self, data: Vec<u8>) -> Result<(), WriteError> {
+        self.write_tx
+            .queue
+            .try_enqueue_input(WriteOrigin::Paste, data.into())
     }
 
     /// Observe input admission only at an idle writer boundary. This stamp

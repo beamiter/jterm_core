@@ -3,13 +3,14 @@ use super::{
     client::connect,
     model::descriptor,
     ownership::Paths,
-    protocol::{read_frame, write_frame, Request, Response, OUTPUT_CHUNK_BYTES},
+    protocol::{read_frame, write_frame, InputKind, Request, Response, OUTPUT_CHUNK_BYTES},
     RuntimeSnapshot, RuntimeState, PROTOCOL_VERSION,
 };
 use crate::agent_sessions::AgentSession;
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use std::{
-    io::BufReader, net::Shutdown, os::unix::net::UnixStream, thread::JoinHandle, time::Duration,
+    borrow::Cow, io::BufReader, net::Shutdown, os::unix::net::UnixStream, thread::JoinHandle,
+    time::Duration,
 };
 
 const SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
@@ -163,13 +164,26 @@ impl WorkspaceTerminalAttachment {
     /// Send one bounded operation to the actual lease. A successful send is
     /// delivery to the socket; the provider supplies application-level output.
     pub fn input(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.is_empty() || bytes.len() > OUTPUT_CHUNK_BYTES {
+        self.send_input(bytes.into(), InputKind::User)
+    }
+
+    pub fn input_reply(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.send_input(bytes.into(), InputKind::Reply)
+    }
+
+    pub fn input_paste(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.send_input(bytes.into(), InputKind::Paste)
+    }
+
+    fn send_input(&mut self, bytes: Cow<'_, [u8]>, kind: InputKind) -> Result<(), String> {
+        if bytes.is_empty() || bytes.len() > kind.limit() {
             return Err("Workspace terminal input exceeds its bound".into());
         }
         self.send(Request::Input {
             client: self.client.clone(),
             epoch: self.epoch.clone(),
-            bytes: bytes.to_vec(),
+            bytes: bytes.into_owned(),
+            kind,
         })
     }
 

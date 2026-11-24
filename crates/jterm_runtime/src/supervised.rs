@@ -383,6 +383,23 @@ impl SupervisedChild {
         Ok(())
     }
 
+    /// Escalate an owned PTY stop while leaving the exact wait for its reader.
+    #[cfg(all(unix, feature = "session-actor"))]
+    pub(crate) fn force_group_exit(&self) -> io::Result<()> {
+        self.probe_unix_root()?;
+        require_waitable_sigchld()?;
+        self.signal_group();
+        // SAFETY: the root remains our exact unreaped child. Also signal it
+        // directly in case the process-group signal raced the child's exit.
+        if unsafe { libc::kill(self.process_group, libc::SIGKILL) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn signal_group(&self) {
         // SAFETY: getpgrp has no preconditions and only reads process state.
