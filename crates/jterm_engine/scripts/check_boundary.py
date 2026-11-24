@@ -59,16 +59,20 @@ class BoundaryTests(unittest.TestCase):
             source = (ENGINE / 'src' / name).read_text()
             self.assertNotRegex(source, r'\b(?:Instant|SystemTime|TerminalState|ProjectedViewport|KittyGraphics)\b')
 
-    def test_frost_retained_history_uses_shared_codec(self):
+    def test_frost_retained_history_and_reflow_have_one_owner(self):
         host = (FAMILY / 'frost/src/terminal.rs').read_text()
-        row = host.split('pub struct ScrollbackLine {', 1)[1].split('\n}', 1)[0]
-        self.assertEqual(row.strip(), 'storage: jterm_engine::ScrollbackLine,')
-        adapter = host.split('impl ScrollbackLine {', 1)[1].split('const _: () =', 1)[0]
-        self.assertIn('jterm_engine::ScrollbackLine::compress_preserving_blink(', adapter)
-        self.assertIn('self.storage.decompress()', adapter)
-        self.assertIn('self.storage.visit_search_cells(visit)', adapter)
-        self.assertNotIn('fn encode_cells(', adapter)
-        self.assertNotIn('fn decode_cells(', adapter)
+        self.assertRegex(host, r'pub use jterm_engine::\{[^}]*\bScrollbackLine\b')
+        self.assertIn('pub scrollback: RetainedHistory<ScrollbackLine>', host)
+        self.assertIn('SearchLine::from_retained(', host)
+        self.assertNotRegex(host, r'(?:struct|impl) ScrollbackLine\b')
+        for name in ('encode_cells', 'decode_cells', 'reflow_lines_bounded'):
+            self.assertNotIn(f'fn {name}(', host)
+        normalize = host.split('pub fn normalize_scrollback_width(', 1)[1]
+        self.assertIn('std::mem::take(&mut self.scrollback).reflow_frost_legacy(', normalize)
+        history = (ENGINE / 'src/retained_history.rs').read_text()
+        self.assertIn('impl RetainedHistory<ScrollbackLine> {', history)
+        self.assertIn('ScrollbackLine::compress_frost_legacy(cells, wrapped)', history)
+        self.assertIn('while result.needs_room_for(&line, row_limit)', history)
 
     def test_vertical_motion_owns_real_physical_scroll(self):
         engine = (ENGINE / 'src/screen.rs').read_text()
@@ -152,35 +156,39 @@ class BoundaryTests(unittest.TestCase):
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
         lane = frost.split('    fn put_ascii_run(', 1)[1].split('    fn create_blank_cell(', 1)[0]
         order = [
-            'self.last_printed_char =',
+            'self.screen.last_printed_char =',
             'while pos < bytes.len()',
             'self.wrap_to_next_line()',
             'self.note_idle_background_cells(',
             '.overwrite_ascii(',
-            'self.cursor_col += chunk_len',
+            'self.screen.cursor_col += chunk_len',
             'self.mark_row_dirty(',
             'self.mark_command_echo_extent(',
-            'self.pending_wrap = true',
+            'self.screen.pending_wrap = true',
         ]
         self.assertEqual(sorted(order, key=lane.index), order)
         self.assertIn('AsciiOverwritePolicy::FrostLegacy', lane)
-        self.assertNotIn('self.grid.get_mut(', lane)
+        self.assertNotIn('.grid.get_mut(', lane)
         screen = (ENGINE / 'src/screen.rs').read_text()
         shared = screen.split('    pub fn write_ascii_in_row(', 1)[1].split('    pub fn combining_target(', 1)[0]
         self.assertIn('.overwrite_ascii(', shared)
         self.assertIn('AsciiOverwritePolicy::SharedScreen', shared)
 
     def test_live_screen_has_one_explicit_owner(self):
-        host = (FAMILY / 'ember/src/terminal/mod.rs').read_text().split('pub struct TerminalState {', 1)[1].split('\n}', 1)[0]
-        self.assertIn('pub screen: ScreenState,', host)
-        for field in ('grid', 'alt_grid', 'cursor_row', 'cursor_col', 'pending_wrap',
-                      'current_fg', 'current_bg', 'current_flags', 'saved_state',
-                      'tab_stops', 'scroll_region_top', 'scroll_region_bottom'):
-            self.assertNotRegex(host, rf'(?m)^\s*(?:pub )?{field}:')
+        for path in ('ember/src/terminal/mod.rs', 'frost/src/terminal.rs'):
+            host = (FAMILY / path).read_text().split('pub struct TerminalState {', 1)[1].split('\n}', 1)[0]
+            self.assertRegex(host, r'(?m)^\s*(?:pub(?:\(crate\))? )?screen: ScreenState,')
+            for field in ('grid', 'alt_grid', 'cursor_row', 'cursor_col', 'pending_wrap',
+                          'current_fg', 'current_bg', 'current_flags', 'saved_state',
+                          'tab_stops', 'scroll_region_top', 'scroll_region_bottom'):
+                self.assertNotRegex(host, rf'(?m)^\s*(?:pub(?:\(crate\))? )?{field}:')
+            self.assertNotRegex(host, r'impl(?:<[^>]*>)?\s+(?:std::ops::)?Deref')
         screen = (ENGINE / 'src/screen.rs').read_text()
-        live = screen.split('pub struct ScreenState {', 1)[1].split('\n}', 1)[0]
+        live = screen.split('pub struct ScreenState<Grid = TerminalGrid> {', 1)[1].split('\n}', 1)[0]
+        self.assertIn('pub grid: Grid,', live)
+        self.assertIn('pub alt_grid: Grid,', live)
         self.assertNotRegex(live, r'(?m)^\s*(?:pub )?autowrap:')
-        self.assertNotRegex(host + screen, r'impl(?:<[^>]*>)?\s+(?:std::ops::)?Deref')
+        self.assertNotRegex(screen, r'impl(?:<[^>]*>)?\s+(?:std::ops::)?Deref')
         state = (FAMILY / 'ember/src/terminal/state.rs').read_text()
         for operation in ('write_char_in_row', 'step_ascii_write', 'erase_span',
                           'save_cursor_state', 'restore_cursor_state'):
@@ -194,8 +202,12 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('pub use jterm_runtime::pty_session::Session;', adapter)
         self.assertNotRegex(adapter, r'\b(?:struct (?:Terminal|Session)|openpty|waitpid)\b')
         runtime = (ENGINE.parent / 'jterm_runtime/src/pty_session.rs').read_text()
-        self.assertIn('terminal: Terminal,', runtime)
-        self.assertIn('self.terminal.feed(&bytes[..n])?', runtime)
+        self.assertIn('terminal: Emulator,', runtime)
+        self.assertIn('terminal: Emulator { engine: terminal },', runtime)
+        self.assertIn('self.terminal.apply(&bytes[..n])?', runtime)
+        emulator = (ENGINE.parent / 'jterm_runtime/src/terminal.rs').read_text()
+        self.assertIn('engine: Terminal,', emulator)
+        self.assertIn('self.engine.feed(chunk)', emulator)
         self.assertIn('SessionActor::start_with_owner_writes(', runtime)
         bridge = (FAMILY / 'aether/bridge/src/live.rs').read_text()
         self.assertIn('Session::spawn_with_epoch(rows, cols, epoch)', bridge)
@@ -239,11 +251,16 @@ class BoundaryTests(unittest.TestCase):
                     'self.screen.tab_stops.resize(', 'self.fill_untracked_grid_row_ids('):
             self.assertNotIn(old, resize)
         screen = (ENGINE / 'src/screen.rs').read_text()
-        geometry = screen.split('pub fn resize_geometry(', 1)[1].split('pub fn scroll_region_one(', 1)[0]
+        geometry = screen.split('pub fn resize_geometry(', 1)[1].split('\n    }', 1)[0]
         self.assertIn('self.grid.resize(rows, cols, blank)', geometry)
         self.assertIn('self.alt_grid.resize(rows, cols, hidden_blank)', geometry)
         self.assertNotIn('self.use_alt_buffer', geometry)
         self.assertNotIn('self.saved_primary_screen_state', geometry)
+        frost = (FAMILY / 'frost/src/terminal.rs').read_text()
+        frost_resize = frost.split('pub fn on_resize(', 1)[1].split('\n    }', 1)[0]
+        self.assertIn('self.screen.resize_frost_legacy(rows, cols)', frost_resize)
+        self.assertIn('for line in geometry.transferred', frost_resize)
+        self.assertNotIn('.grid.resize', frost_resize)
 
     def test_alternate_transitions_execute_in_screen_with_host_hooks(self):
         parser = (FAMILY / 'ember/src/terminal/parser.rs').read_text()
@@ -273,8 +290,9 @@ class BoundaryTests(unittest.TestCase):
         self.assertLess(entry.index('.enter(true, autowrap)'), entry.index('self.protocol.switch_screen()'))
         self.assertLess(entry.index('self.protocol.switch_screen()'), entry.index('self.clear_screen()'))
         self.assertLess(exit.index('.leave(AlternateRestorePolicy::Frost)'), exit.index('self.protocol.switch_screen()'))
-        self.assertIn('grid: &mut self.grid,', frost)
-        self.assertIn('alt_grid: &mut self.alt_grid,', frost)
+        self.assertEqual(frost_modes.count('.alternate_screen_controls()'), 2)
+        self.assertIn('grid: &mut self.grid,', screen)
+        self.assertIn('alt_grid: &mut self.alt_grid,', screen)
         self.assertNotIn('std::mem::swap(', frost_modes)
         self.assertNotIn('SavedCursorState {', frost_modes)
 

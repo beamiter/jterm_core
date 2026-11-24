@@ -1397,6 +1397,27 @@ pub enum ScrollbackContent<'a> {
     Encoded(&'a [u8]),
 }
 
+/// A row's text or cells before matching. Plain history has identity columns.
+/// Encoded history can stream through the codec without building a cell vector.
+pub enum SearchLine<'a> {
+    Text(&'a str),
+    Cells(std::borrow::Cow<'a, [TerminalCell]>),
+    Scrollback(&'a ScrollbackLine),
+}
+
+impl<'a> SearchLine<'a> {
+    /// Use bulk decode for encoded rows past the caller's streaming threshold.
+    pub fn from_retained(line: &'a ScrollbackLine, stream_columns: usize) -> Self {
+        match line.content() {
+            ScrollbackContent::Plain(text, _) => Self::Text(text),
+            ScrollbackContent::Encoded(_) if line.columns() > stream_columns => {
+                Self::Cells(std::borrow::Cow::Owned(line.decompress()))
+            }
+            ScrollbackContent::Encoded(_) => Self::Scrollback(line),
+        }
+    }
+}
+
 impl ScrollbackLine {
     #[inline]
     pub fn columns(&self) -> usize {
@@ -1411,6 +1432,15 @@ impl ScrollbackLine {
     /// default codec drops blink while preserving all its other encoded flags.
     pub fn compress_preserving_blink(cells: &[TerminalCell], is_wrapped: bool) -> Self {
         Self::compress_with_style(cells, is_wrapped, true)
+    }
+
+    /// Archive an independent Frost row, preserving blink and assigning a fresh
+    /// identity even when the archived cells came from another tracked row.
+    pub fn compress_frost_legacy(cells: &[TerminalCell], is_wrapped: bool) -> Self {
+        let id = RawRowId::allocate_process_unique();
+        let mut line = Self::compress_preserving_blink(cells, is_wrapped);
+        line.set_raw_row_id(id);
+        line
     }
 
     fn compress_with_style(cells: &[TerminalCell], is_wrapped: bool, preserve_blink: bool) -> Self {

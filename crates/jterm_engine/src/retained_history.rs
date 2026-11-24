@@ -1,7 +1,7 @@
 //! Byte accounting for compressed terminal scrollback.
 use std::{collections::VecDeque, fmt, ops::Deref};
 
-use crate::ScrollbackLine;
+use crate::{history_reflow::reflow_cell_rows, ScrollbackLine, TerminalCell};
 
 pub const RETAINED_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROW_SCALED_HISTORY_BYTES: usize = 32 * 1024 * 1024;
@@ -160,6 +160,56 @@ impl<Row: RetainedRow> RetainedHistory<Row> {
     }
 }
 
+impl RetainedHistory<ScrollbackLine> {
+    /// Normalize Frost's physical history after a resize. Source rows are
+    /// consumed one at a time and the output retains only the newest tail.
+    /// Every emitted row receives a fresh identity, including discarded rows.
+    pub fn reflow_frost_legacy(
+        self,
+        columns: usize,
+        blank: TerminalCell,
+        row_limit: usize,
+    ) -> Self {
+        let mut result = Self::with_byte_limit(self.byte_limit);
+        let source = self.rows.into_iter().map(|line| {
+            let cells = line.decompress();
+            #[cfg(test)]
+            FROST_REFLOW_PEAK.with(|peak| {
+                let (source, row, retained) = peak.get();
+                peak.set((source.max(cells.len()), row, retained));
+            });
+            (cells, line.is_wrapped)
+        });
+        reflow_cell_rows(source, columns, blank, |cells, wrapped| {
+            let line = ScrollbackLine::compress_frost_legacy(cells, wrapped);
+            if row_limit == 0 || line.retained_bytes() > result.byte_limit {
+                // An unretainable row ends the previous tail. Later rows
+                // can start a new contiguous tail within the same budget.
+                if !result.is_empty() {
+                    result.clear();
+                }
+            } else {
+                while result.needs_room_for(&line, row_limit) {
+                    result.pop_front();
+                }
+                result.push_back(line);
+            }
+            #[cfg(test)]
+            FROST_REFLOW_PEAK.with(|peak| {
+                let (source, row, retained) = peak.get();
+                peak.set((source, row.max(cells.len()), retained.max(result.len())));
+            });
+        });
+        result
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FROST_REFLOW_PEAK: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +220,59 @@ mod tests {
         fn retained_bytes(&self) -> usize {
             self.0
         }
+    }
+
+    #[test]
+    fn frost_reflow_scratch_and_retained_tail_are_bounded() {
+        let blank = TerminalCell::default();
+        let printed = TerminalCell {
+            character: 'x',
+            ..blank
+        };
+        let make_history = |rows, columns, wrapped| {
+            let mut history = RetainedHistory::default();
+            for _ in 0..rows {
+                history.push_back(ScrollbackLine::compress_frost_legacy(
+                    &vec![printed; columns],
+                    wrapped,
+                ));
+            }
+            history
+        };
+        FROST_REFLOW_PEAK.with(|peak| peak.set((0, 0, 0)));
+        let history = make_history(64, 64, false).reflow_frost_legacy(1, blank, 64);
+        assert_eq!(history.len(), 64);
+        assert_eq!(FROST_REFLOW_PEAK.with(|peak| peak.get()), (64, 1, 64));
+
+        FROST_REFLOW_PEAK.with(|peak| peak.set((0, 0, 0)));
+        let history = make_history(256, 128, true).reflow_frost_legacy(3, blank, 16);
+        assert_eq!(history.len(), 16);
+        assert_eq!(FROST_REFLOW_PEAK.with(|peak| peak.get()), (128, 3, 16));
+    }
+
+    #[test]
+    fn frost_reflow_preserves_the_byte_limit_and_retains_a_contiguous_tail() {
+        let blank = TerminalCell::default();
+        let small = TerminalCell {
+            character: 'a',
+            ..blank
+        };
+        let large = TerminalCell {
+            character: '界',
+            background: crate::Color::Red,
+            ..blank
+        };
+        let row_bytes = ScrollbackLine::compress_frost_legacy(&[small; 80], false).retained_bytes();
+        let mut history = RetainedHistory::with_byte_limit(row_bytes * 2);
+        for row in [[small; 80], [large; 80], [small; 80]] {
+            history.push_back(ScrollbackLine::compress_frost_legacy(&row, false));
+        }
+        assert!(history[1].retained_bytes() > row_bytes * 2);
+        let history = history.reflow_frost_legacy(80, blank, 8);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.retained_bytes(), row_bytes);
+        assert_eq!(history[0].decompress(), [small; 80]);
+        assert!(!history.over_budget(8));
     }
 
     #[test]
