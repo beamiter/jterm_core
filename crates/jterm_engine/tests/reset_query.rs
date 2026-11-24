@@ -107,6 +107,62 @@ fn seeded(seed: usize) -> Original {
         output_buffer: b"existing-reply".to_vec(),
     }
 }
+
+#[test]
+fn frost_cursor_keyboard_and_inline_edits_keep_the_legacy_state() {
+    let mut screen = ScreenState::with_grids(TerminalGrid::new(3, 6), TerminalGrid::new(3, 6));
+    let mut protocol = ProtocolState::default();
+    protocol.modes_mut().insert(7);
+    screen.cursor_row = 1;
+    screen.cursor_col = 3;
+    screen.current_fg = Color::Red;
+    screen.pending_wrap = true;
+    assert_eq!(
+        dispatch_frost_legacy_csi(&mut screen, &mut protocol, b"", &[], b's', None, b""),
+        Dispatch::Handled(Default::default()),
+    );
+    protocol.modes_mut().remove(&7);
+    screen.cursor_row = 2;
+    screen.cursor_col = 1;
+    screen.current_fg = Color::Blue;
+    screen.pending_wrap = false;
+    dispatch_frost_legacy_csi(&mut screen, &mut protocol, b"", &[], b'u', None, b"");
+    assert_eq!((screen.cursor_row, screen.cursor_col), (1, 3));
+    assert_eq!(screen.current_fg, Color::Red);
+    assert!(screen.pending_wrap);
+    assert!(!protocol.modes().contains(&7));
+
+    dispatch_frost_legacy_csi(
+        &mut screen,
+        &mut protocol,
+        b"3",
+        &[3],
+        b'u',
+        Some(b'>'),
+        b"",
+    );
+    let Dispatch::Handled(reply) =
+        dispatch_frost_legacy_csi(&mut screen, &mut protocol, b"", &[], b'u', Some(b'?'), b"")
+    else {
+        panic!("Frost keyboard flags query was unhandled");
+    };
+    assert_eq!(reply.as_slice(), &[Effect::Reply(b"\x1b[?3u".to_vec())]);
+
+    screen.grid[1][2].character = 'a';
+    screen.grid[1][3].character = 'b';
+    screen.grid[1][4].character = 'c';
+    let Dispatch::Handled(edit) =
+        dispatch_frost_legacy_csi(&mut screen, &mut protocol, b"", &[], b'K', None, b"")
+    else {
+        panic!("Frost erase in line was unhandled");
+    };
+    assert!(matches!(edit.as_slice(), [Effect::Row(row)] if row.row == 1));
+    assert_eq!(screen.grid[1][2].character, 'a');
+    assert_eq!(screen.grid[1][3].character, ' ');
+    assert_eq!(screen.grid[1][4].character, ' ');
+    assert!(screen.pending_wrap);
+}
+
 fn snapshot(t: &Original) -> Vec<String> {
     let s = &t.screen;
     let mut out = Vec::new();

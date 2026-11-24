@@ -1,12 +1,14 @@
 //! Local VT semantics. Host-dependent commands are returned without mutation.
 use crate::{
+    grid::{RegionDirection, RegionWrapPolicy, WideCellEditPolicy},
     parser::{Event, StringKind},
     protocol_state::ProtocolState,
     screen::{Charset, RowMutation, ScreenState},
-    Color, CursorShape, StyleFlags, UnderlineStyle,
+    Color, CursorShape, RawRowId, StyleFlags, UnderlineStyle,
 };
 use smallvec::SmallVec;
 use std::fmt::Write;
+use std::ops::RangeInclusive;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -138,9 +140,9 @@ fn dispatch_cursor_csi(
     true
 }
 
-/// Apply Frost's local cursor, rendition and query controls. Apply the returned
-/// effects before the next event. Paint-dependent queries and host lifecycle
-/// commands stay unhandled.
+/// Apply Frost's local cursor, line editing, rendition and query controls.
+/// Apply the returned effects before the next event. Paint-dependent queries
+/// and host lifecycle commands stay unhandled.
 pub fn dispatch_frost_legacy_csi(
     screen: &mut ScreenState,
     protocol: &mut ProtocolState,
@@ -155,6 +157,11 @@ pub fn dispatch_frost_legacy_csi(
         && dispatch_cursor_csi(screen, protocol, params, cmd, private_prefix, intermediates)
     {
         return Dispatch::Handled(Effects::new());
+    }
+
+    if matches!(cmd, b'K' | b'@' | b'P' | b'X') {
+        let mutation = edit_frost_legacy_line(screen, params, cmd);
+        return Dispatch::Handled(mutation.into_iter().map(Effect::Row).collect());
     }
 
     let first = params.first().copied();
@@ -207,6 +214,16 @@ pub fn dispatch_frost_legacy_csi(
             }
             None
         }
+        (b's', None, b"", _) => {
+            screen.save_cursor(protocol.modes().contains(&7));
+            None
+        }
+        (b'u', None, b"", _) => {
+            // Frost restores the drawing state and keeps the live DECAWM.
+            let _ = screen.restore_cursor();
+            None
+        }
+        (b'u', Some(prefix), b"", _) => kitty_keyboard_csi(protocol, params, prefix),
         (b'q', None, b" ", _) => {
             // Frost historically truncates the argument to one byte.
             screen.cursor_shape = cursor_shape(u16::from(first.unwrap_or(0) as u8));
@@ -446,21 +463,11 @@ pub(crate) fn dispatch_local_with_underline(
                     if intermediates.is_empty() {
                         match private_prefix {
                             None => restore_cursor_state(screen, protocol, underline),
-                            Some(b'?') => effects.push(Effect::Reply(
-                                format!("\x1b[?{}u", protocol.keyboard_enhancement_flags())
-                                    .into_bytes(),
-                            )),
-                            Some(b'=') => protocol.set_keyboard_enhancement_flags(
-                                first.unwrap_or(0),
-                                params.get(1).copied().unwrap_or(1),
-                            ),
-                            Some(b'>') => {
-                                protocol.push_keyboard_enhancement_flags(first.unwrap_or(0))
+                            Some(prefix) => {
+                                if let Some(reply) = kitty_keyboard_csi(protocol, params, *prefix) {
+                                    effects.push(Effect::Reply(reply));
+                                }
                             }
-                            Some(b'<') => {
-                                protocol.pop_keyboard_enhancement_flags(first.unwrap_or(1) as usize)
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -539,6 +546,105 @@ pub(crate) fn dispatch_local_with_underline(
         _ => return Dispatch::Unhandled,
     }
     Dispatch::Handled(effects)
+}
+
+/// Apply Frost's IL/DL row splice and return the range its viewport invalidates.
+pub fn frost_legacy_splice_lines(
+    screen: &mut ScreenState,
+    direction: RegionDirection,
+    count: usize,
+) -> RangeInclusive<usize> {
+    let cursor = screen.cursor_row;
+    let bottom = screen.scroll_region_bottom;
+    if (screen.scroll_region_top..=bottom).contains(&cursor) {
+        let blank = screen.create_blank_cell();
+        // Allocate each new row in order while keeping the wraps at their
+        // physical indices, as in the original Frost line edits.
+        for _ in 0..count.min(bottom - cursor + 1) {
+            screen.grid.shift_rows(
+                direction,
+                cursor..=bottom,
+                1,
+                blank,
+                RegionWrapPolicy::KeepPhysicalIndices,
+                RawRowId::allocate_process_unique,
+            );
+        }
+    }
+    cursor..=bottom
+}
+
+fn edit_frost_legacy_line(
+    screen: &mut ScreenState,
+    params: &[u16],
+    cmd: u8,
+) -> Option<RowMutation> {
+    let row = screen.cursor_row;
+    let col = screen.cursor_col;
+    let width = screen.grid.row_len();
+    let first = params.first().copied();
+    let count = first.unwrap_or(1).max(1) as usize;
+    let blank = screen.create_blank_cell();
+    match cmd {
+        b'K' => {
+            let span = match first.unwrap_or(0) {
+                0 => col..width,
+                1 => 0..col + 1,
+                2 => 0..width,
+                _ => return None,
+            };
+            screen.grid.erase_cells(row, span, blank);
+        }
+        b'@' => {
+            if !screen.grid.insert_blank_cells(
+                row,
+                col,
+                count,
+                blank,
+                WideCellEditPolicy::ClearBoundaryPairs,
+            ) {
+                return None;
+            }
+        }
+        b'P' => {
+            screen.grid.delete_cells(
+                row,
+                col,
+                count,
+                blank,
+                WideCellEditPolicy::ClearBoundaryPairs,
+            );
+        }
+        b'X' => {
+            screen
+                .grid
+                .erase_cells(row, col..col.saturating_add(count), blank);
+        }
+        _ => unreachable!("Frost line editing selector"),
+    }
+    Some(RowMutation {
+        row,
+        row_id: screen.grid.row_id(row),
+        changed: 0..width,
+        printed: None,
+    })
+}
+
+fn kitty_keyboard_csi(protocol: &mut ProtocolState, params: &[u16], prefix: u8) -> Option<Vec<u8>> {
+    let first = params.first().copied();
+    match prefix {
+        b'?' => {
+            return Some(format!("\x1b[?{}u", protocol.keyboard_enhancement_flags()).into_bytes())
+        }
+        b'=' => protocol.set_keyboard_enhancement_flags(
+            first.unwrap_or(0),
+            params.get(1).copied().unwrap_or(1),
+        ),
+        b'>' => protocol.push_keyboard_enhancement_flags(first.unwrap_or(0)),
+        b'<' => protocol.pop_keyboard_enhancement_flags(first.unwrap_or(1) as usize),
+        _ => {}
+    }
+    None
 }
 
 fn parse_sgr_extended_color(

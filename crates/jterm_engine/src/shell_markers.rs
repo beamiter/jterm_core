@@ -82,6 +82,86 @@ pub fn valid_cwd(cwd: &str, invisible: fn(char) -> bool) -> bool {
         && !cwd.chars().any(|ch| ch.is_control() || invisible(ch))
 }
 
+/// Decode the working directory from a legacy OSC 7 report. The frontend
+/// supplies its host and naming policies. A trailing incomplete percent escape
+/// retains its literal spelling to match the existing desktop parsers.
+pub fn decode_osc7_cwd(
+    value: &str,
+    accepts_host: impl FnOnce(&str) -> bool,
+    invisible: fn(char) -> bool,
+) -> Option<String> {
+    let path = if let Some(uri) = value.strip_prefix("file://") {
+        let slash = uri.find('/')?;
+        if !accepts_host(&uri[..slash]) {
+            return None;
+        }
+        &uri[slash..]
+    } else if value.starts_with('/') {
+        value
+    } else {
+        return None;
+    };
+    let limit = MAX_OSC133_CWD_BYTES;
+    if path.len() > limit * 3 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(path.len().min(limit));
+    let mut bytes = path.as_bytes();
+    while let Some((&byte, rest)) = bytes.split_first() {
+        if decoded.len() == limit {
+            return None;
+        }
+        if byte == b'%' && rest.len() >= 2 {
+            let high = (rest[0] as char).to_digit(16)? as u8;
+            let low = (rest[1] as char).to_digit(16)? as u8;
+            decoded.push((high << 4) | low);
+            bytes = &rest[2..];
+        } else {
+            decoded.push(byte);
+            bytes = rest;
+        }
+    }
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|cwd| valid_cwd(cwd, invisible))
+}
+
+#[cfg(test)]
+#[test]
+fn osc7_keeps_the_desktop_host_and_path_contract() {
+    let decode = |value: &str| {
+        decode_osc7_cwd(
+            value,
+            |host| host.is_empty() || host.eq_ignore_ascii_case("local"),
+            |character| character == '\u{202e}',
+        )
+    };
+    assert_eq!(
+        decode("file://LOCAL/tmp/my%20notebook%").as_deref(),
+        Some("/tmp/my notebook%")
+    );
+    assert_eq!(
+        decode("file:///tmp/notes%2").as_deref(),
+        Some("/tmp/notes%2")
+    );
+    assert_eq!(decode("/tmp/percent%25").as_deref(), Some("/tmp/percent%"));
+    for value in [
+        "file://somewhere-else/tmp/notes",
+        "file://local",
+        "relative/path",
+        "/tmp/%XY",
+        "/tmp/%00",
+        "/tmp/%0a",
+        "/tmp/%ff",
+        "/tmp/%e2%80%ae",
+    ] {
+        assert!(decode(value).is_none(), "{value}");
+    }
+    let at_limit = format!("/{}", "%61".repeat(MAX_OSC133_CWD_BYTES - 1));
+    assert_eq!(decode(&at_limit).unwrap().len(), MAX_OSC133_CWD_BYTES);
+    assert!(decode(&(at_limit + "%61")).is_none());
+}
+
 /// The metadata a shell attaches to its OSC 133 `C` and `D` packets.
 ///
 /// jsh — the family's own shell — carries the command line, the execution id it
