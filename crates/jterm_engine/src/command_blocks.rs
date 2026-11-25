@@ -4,7 +4,7 @@ use crate::{
     parser::{Event, StringKind},
     shell_markers::{self, ShellMarker},
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, ops::Range};
 use unicode_width::UnicodeWidthChar;
 
 const RETAINED_BLOCKS: usize = 8;
@@ -14,6 +14,56 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 pub enum OutputUnavailable {
     ScreenOperation,
     ByteLimit,
+}
+
+/// Original bytes between the accepted command-start and command-end marks.
+/// The offsets are relative to this terminal's observed PTY stream. They
+/// locate the source, even when presentation has omitted control sequences
+/// or could not retain any text from that range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOutputSource {
+    pub bytes: Range<u64>,
+    pub start_event: u64,
+    pub end_event: u64,
+    /// Columns and rows when the corresponding mark was consumed.
+    pub start_size: (usize, usize),
+    pub end_size: (usize, usize),
+    pub resized: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MarkerPosition {
+    sequence: u64,
+    start: u64,
+    end: u64,
+}
+
+#[derive(Default)]
+struct MarkerClock {
+    offset: u64,
+    sequence: u64,
+}
+
+impl MarkerClock {
+    fn begin_feed(&mut self, len: usize) -> Option<u64> {
+        let base = self.offset;
+        self.offset = base.saturating_add(len as u64);
+        (self.offset < u64::MAX).then_some(base)
+    }
+
+    fn osc(&mut self, end: Option<u64>, payload_len: usize, bel: bool) -> Option<MarkerPosition> {
+        let sequence = self.sequence.checked_add(1)?;
+        self.sequence = sequence;
+        let end = end?;
+        // Both OSC terminators are accepted across input splits. The parser
+        // provides the original, unmodified OSC payload.
+        let framed_len = payload_len as u64 + if bel { 3 } else { 4 };
+        Some(MarkerPosition {
+            sequence,
+            start: end.checked_sub(framed_len)?,
+            end,
+        })
+    }
 }
 
 /// A report from the PTY stream. Every field is display data; the PTY does
@@ -29,6 +79,7 @@ pub struct CommandBlock {
     pub outcome: CompletedBlockOutcome,
     pub provenance: CompletionProvenance,
     pub output: Result<String, OutputUnavailable>,
+    pub output_source: Option<CommandOutputSource>,
 }
 
 #[derive(Default)]
@@ -47,6 +98,9 @@ struct Active {
     cwd: Option<String>,
     output: Result<String, OutputUnavailable>,
     carriage_return: bool,
+    start_position: Option<MarkerPosition>,
+    start_size: (usize, usize),
+    resized: bool,
 }
 
 impl Active {
@@ -121,6 +175,7 @@ pub(crate) struct CommandBlocks {
     active: Option<Active>,
     completed: VecDeque<CommandBlock>,
     sequence: u64,
+    markers: MarkerClock,
 }
 
 impl CommandBlocks {
@@ -150,6 +205,17 @@ impl CommandBlocks {
         }
     }
 
+    pub(crate) fn resized(&mut self, dimensions_changed: bool) {
+        if let Some(active) = &mut self.active {
+            active.resized |= dimensions_changed;
+            active.unavailable();
+        }
+    }
+
+    pub(crate) fn begin_feed(&mut self, len: usize) -> Option<u64> {
+        self.markers.begin_feed(len)
+    }
+
     pub(crate) fn reset_live(&mut self) {
         self.prompt = Prompt::None;
         self.input_submitted = false;
@@ -157,7 +223,13 @@ impl CommandBlocks {
     }
 
     /// Return true when the view consumed a lifecycle packet.
-    pub(crate) fn observe(&mut self, event: &Event<'_>, alternate: bool) -> bool {
+    pub(crate) fn observe(
+        &mut self,
+        event: &Event<'_>,
+        alternate: bool,
+        event_end: Option<u64>,
+        size: (usize, usize),
+    ) -> bool {
         if alternate {
             self.prompt = Prompt::None;
             self.screen_changed();
@@ -166,11 +238,12 @@ impl CommandBlocks {
         if let Event::String {
             kind: StringKind::Osc,
             payload,
-            ..
+            bel_terminated,
         } = event
         {
             if let Some(marker) = shell_markers::decode(payload, hidden_label_character) {
-                self.observe_marker(marker);
+                let position = self.markers.osc(event_end, payload.len(), *bel_terminated);
+                self.observe_marker(marker, position, size);
                 return true;
             }
         }
@@ -180,7 +253,12 @@ impl CommandBlocks {
         false
     }
 
-    fn observe_marker(&mut self, marker: ShellMarker) {
+    fn observe_marker(
+        &mut self,
+        marker: ShellMarker,
+        position: Option<MarkerPosition>,
+        size: (usize, usize),
+    ) {
         match marker {
             ShellMarker::PromptStart => {
                 self.active = None;
@@ -206,6 +284,9 @@ impl CommandBlocks {
                                 cwd: meta.cwd,
                                 output: Ok(String::new()),
                                 carriage_return: false,
+                                start_position: position,
+                                start_size: size,
+                                resized: false,
                             });
                         }
                     }
@@ -226,6 +307,18 @@ impl CommandBlocks {
                 if self.completed.len() >= RETAINED_BLOCKS {
                     self.completed.pop_front();
                 }
+                let output_source = active
+                    .start_position
+                    .zip(position)
+                    .filter(|(start, end)| start.end <= end.start && start.sequence < end.sequence)
+                    .map(|(start, end)| CommandOutputSource {
+                        bytes: start.end..end.start,
+                        start_event: start.sequence,
+                        end_event: end.sequence,
+                        start_size: active.start_size,
+                        end_size: size,
+                        resized: active.resized,
+                    });
                 self.completed.push_back(CommandBlock {
                     sequence,
                     execution_id: active.execution_id,
@@ -236,6 +329,7 @@ impl CommandBlocks {
                     cwd: active.cwd,
                     provenance: CompletionProvenance::ShellReported,
                     output: active.output,
+                    output_source,
                 });
             }
         }

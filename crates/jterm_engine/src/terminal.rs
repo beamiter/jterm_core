@@ -1772,6 +1772,10 @@ impl Terminal {
         }
         self.begin_revision(self.revision.checked_add(1).ok_or("revision exhausted")?);
         self.parser.begin_feed();
+        let source_base = self
+            .command_blocks
+            .as_mut()
+            .and_then(|blocks| blocks.begin_feed(input.len()));
         let mut at = 0;
         let mut replies = Vec::new();
         let mut steps = 0;
@@ -1817,11 +1821,11 @@ impl Terminal {
                     }
                 }
             }
-            if self
-                .command_blocks
-                .as_mut()
-                .is_some_and(|blocks| blocks.observe(&event, self.screen.use_alt_buffer))
-            {
+            if self.command_blocks.as_mut().is_some_and(|blocks| {
+                let event_end = source_base.map(|base| base + at as u64);
+                let geometry = (self.screen.grid.cols(), self.screen.grid.rows());
+                blocks.observe(&event, self.screen.use_alt_buffer, event_end, geometry)
+            }) {
                 continue;
             }
             if let (
@@ -2006,7 +2010,7 @@ impl Terminal {
         resize_pty()?;
         self.finish_grapheme();
         if let Some(blocks) = &mut self.command_blocks {
-            blocks.screen_changed();
+            blocks.resized((rows, cols) != (self.screen.grid.rows(), self.screen.grid.cols()));
         }
         self.begin_revision(revision);
         if self.reflow_primary_on_resize && self.reflow_primary(rows, cols) {

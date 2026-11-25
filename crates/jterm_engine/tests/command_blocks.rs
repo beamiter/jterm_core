@@ -66,6 +66,13 @@ fn real_feed_markers_survive_every_fragment_boundary_without_capturing_prompt_or
         assert_eq!(block.output, Ok("输出\nsecond\n".into()));
         assert_eq!(block.outcome, CompletedBlockOutcome::Failed(7));
         assert_eq!(block.provenance, CompletionProvenance::ShellReported);
+        let source = block.output_source.as_ref().unwrap();
+        let end = packet.len() - END.len() - b"\x1b]133;A\x07NEXT PROMPT".len();
+        assert_eq!(source.bytes, START.len() as u64..end as u64);
+        assert_eq!((source.start_event, source.end_event), (3, 4));
+        assert_eq!(source.start_size, (8, 3));
+        assert_eq!(source.end_size, (8, 3));
+        assert!(!source.resized);
     }
 }
 
@@ -118,12 +125,18 @@ fn fullscreen_cursor_rewrites_and_large_outputs_leave_bounded_status_records() {
         .all(|block| block.output == Err(OutputUnavailable::ScreenOperation)));
 
     terminal.feed(START).unwrap();
-    terminal.feed(&vec![b'x'; 16 * 1024 + 1]).unwrap();
+    let oversized = vec![b'x'; 16 * 1024 + 1];
+    terminal.feed(&oversized).unwrap();
     terminal.feed(END).unwrap();
-    assert_eq!(
-        terminal.completed_command_blocks().unwrap()[4].output,
-        Err(OutputUnavailable::ByteLimit)
-    );
+    let records = terminal.completed_command_blocks().unwrap();
+    let resized = records[3].output_source.as_ref().unwrap();
+    assert_eq!(resized.start_size, (8, 3));
+    assert_eq!(resized.end_size, (9, 3));
+    assert!(resized.resized);
+    let limited = &records[4];
+    assert_eq!(limited.output, Err(OutputUnavailable::ByteLimit));
+    let bytes = &limited.output_source.as_ref().unwrap().bytes;
+    assert_eq!(bytes.end - bytes.start, oversized.len() as u64);
     for _ in 0..10 {
         terminal.feed(&[START, b"text", END].concat()).unwrap();
     }
