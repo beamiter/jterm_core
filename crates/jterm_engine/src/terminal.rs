@@ -1824,7 +1824,14 @@ impl Terminal {
             if self.command_blocks.as_mut().is_some_and(|blocks| {
                 let event_end = source_base.map(|base| base + at as u64);
                 let geometry = (self.screen.grid.cols(), self.screen.grid.rows());
-                blocks.observe(&event, self.screen.use_alt_buffer, event_end, geometry)
+                let style = crate::archived_text::ArchiveStyle::from_rendition(
+                    self.screen.current_fg,
+                    self.screen.current_bg,
+                    self.underline_pen.as_ref().map_or(Color::Default, |pen| pen.current),
+                    self.screen.current_flags,
+                );
+                let target = self.hyperlinks.as_ref().and_then(|(_, table)| table.resolve(self.screen.current_hyperlink));
+                blocks.observe(&event, self.screen.use_alt_buffer, event_end, geometry, style, target)
             }) {
                 continue;
             }

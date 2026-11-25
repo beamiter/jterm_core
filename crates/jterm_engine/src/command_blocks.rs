@@ -1,5 +1,6 @@
 //! Bounded read-only records from opt-in observed PTY shell markers.
 use crate::{
+    archived_text::{ArchiveAnnotationBuilder, ArchiveAnnotations, ArchiveStyle},
     block_contract::{classify_completed, CompletedBlockOutcome, CompletionProvenance},
     parser::{Event, StringKind},
     shell_markers::{self, ShellMarker},
@@ -98,6 +99,7 @@ pub struct CommandBlock {
     pub outcome: CompletedBlockOutcome,
     pub provenance: CompletionProvenance,
     pub output: Result<String, OutputUnavailable>,
+    pub output_annotations: Option<ArchiveAnnotations>,
     pub output_source: Option<CommandOutputSource>,
 }
 
@@ -116,6 +118,7 @@ struct Active {
     command: String,
     cwd: Option<String>,
     output: Result<String, OutputUnavailable>,
+    output_annotations: ArchiveAnnotationBuilder,
     carriage_return: bool,
     start_position: Option<ShellMarkerPosition>,
     start_size: (usize, usize),
@@ -123,12 +126,15 @@ struct Active {
 }
 
 impl Active {
-    fn append(&mut self, text: &str) {
+    fn append(&mut self, text: &str, style: ArchiveStyle, target: Option<&str>) {
         if let Ok(output) = &mut self.output {
             if output.len() + text.len() > MAX_OUTPUT_BYTES {
                 self.output = Err(OutputUnavailable::ByteLimit);
             } else {
+                let start = output.len();
                 output.push_str(text);
+                self.output_annotations
+                    .push(start..output.len(), style, target);
             }
         }
     }
@@ -139,20 +145,24 @@ impl Active {
         }
     }
 
-    fn observe_output(&mut self, event: &Event<'_>) {
+    fn observe_output(&mut self, event: &Event<'_>, style: ArchiveStyle, target: Option<&str>) {
         if self.output.is_err() {
             return;
         }
         match event {
             Event::Ascii(bytes) if !self.carriage_return => {
-                self.append(std::str::from_utf8(bytes).expect("ASCII parser run"));
+                self.append(
+                    std::str::from_utf8(bytes).expect("ASCII parser run"),
+                    style,
+                    target,
+                );
             }
             Event::Print(ch) if !self.carriage_return && matches!(ch.width(), Some(1 | 2)) => {
-                self.append(ch.encode_utf8(&mut [0; 4]));
+                self.append(ch.encode_utf8(&mut [0; 4]), style, target);
             }
-            Event::Control(b'\t') if !self.carriage_return => self.append("\t"),
+            Event::Control(b'\t') if !self.carriage_return => self.append("\t", style, target),
             Event::Control(b'\n') => {
-                self.append("\n");
+                self.append("\n", ArchiveStyle::default(), None);
                 self.carriage_return = false;
             }
             Event::Control(b'\r') => {
@@ -248,6 +258,8 @@ impl CommandBlocks {
         alternate: bool,
         event_end: Option<u64>,
         size: (usize, usize),
+        style: ArchiveStyle,
+        target: Option<&str>,
     ) -> bool {
         if alternate {
             self.prompt = Prompt::None;
@@ -267,7 +279,7 @@ impl CommandBlocks {
             }
         }
         if let Some(active) = &mut self.active {
-            active.observe_output(event);
+            active.observe_output(event, style, target);
         }
         false
     }
@@ -302,6 +314,7 @@ impl CommandBlocks {
                                 command,
                                 cwd: meta.cwd,
                                 output: Ok(String::new()),
+                                output_annotations: ArchiveAnnotationBuilder::default(),
                                 carriage_return: false,
                                 start_position: position,
                                 start_size: size,
@@ -347,6 +360,11 @@ impl CommandBlocks {
                     command: active.command,
                     cwd: active.cwd,
                     provenance: CompletionProvenance::ShellReported,
+                    output_annotations: active
+                        .output
+                        .is_ok()
+                        .then(|| active.output_annotations.finish())
+                        .flatten(),
                     output: active.output,
                     output_source,
                 });

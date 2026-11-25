@@ -1120,6 +1120,12 @@ const PRINTED_SPACE_BIT: u16 = 1 << 12;
 const TAB_PADDING_BIT: u16 = 1 << 13;
 
 impl StyleFlags {
+    /// Renderable attributes without live cell geometry or protection.
+    pub(crate) fn archive_rendition(self) -> Self {
+        Self(self.0 & (BOLD_BIT | ITALIC_BIT | UNDERLINE_MASK | INVERSE_BIT
+            | DIM_BIT | BLINK_BIT | STRIKETHROUGH_BIT))
+    }
+
     #[inline(always)]
     pub fn new() -> Self {
         Self(0)

@@ -5,10 +5,12 @@
 
 use crate::screen_replay::CapturedExecutionSource;
 use jterm_engine::block_contract::CompletionProvenance;
+pub use jterm_protocol::finished_output::OutputAnnotations;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, io, path::Path};
 
-const VERSION: u32 = 1;
+const TEXT_VERSION: u32 = 1;
+const STYLED_VERSION: u32 = 2;
 pub const MAX_RECORDS: usize = 1024;
 pub const MAX_RETAINED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CARD_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -51,6 +53,37 @@ pub struct Output {
     pub text: String,
     pub truncated: bool,
     pub total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<OutputAnnotations>,
+}
+
+impl Output {
+    pub fn capture(
+        text: &str,
+        truncated: bool,
+        total_bytes: u64,
+        annotations: Option<&jterm_engine::archived_text::ArchiveAnnotations>,
+        budget: usize,
+    ) -> Option<Self> {
+        let remaining = budget.checked_sub(text.len())?;
+        let annotations = annotations
+            .filter(|attributes| attributes.retained_bytes() <= remaining)
+            .and_then(|attributes| OutputAnnotations::new(text, attributes));
+        Some(Self {
+            text: text.to_owned(),
+            truncated,
+            total_bytes,
+            annotations,
+        })
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.text.len()
+            + self
+                .annotations
+                .as_ref()
+                .map_or(0, OutputAnnotations::retained_bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,13 +112,13 @@ pub struct Card {
 }
 
 impl Card {
-    pub fn retained_text_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         self.shell_id.len()
             + self.shell_session_id.as_ref().map_or(0, String::len)
             + self.command.as_ref().map_or(0, String::len)
             + self.cwd.as_ref().map_or(0, String::len)
             + self.cwd_after.as_ref().map_or(0, String::len)
-            + self.output.as_ref().map_or(0, |output| output.text.len())
+            + self.output.as_ref().map_or(0, Output::retained_bytes)
     }
 
     fn is_valid(&self) -> bool {
@@ -118,6 +151,10 @@ impl Card {
             && self.output.as_ref().is_none_or(|output| {
                 output.text.len() <= MAX_CARD_OUTPUT_BYTES
                     && (output.truncated || output.text.len() as u64 <= output.total_bytes)
+                    && output
+                        .annotations
+                        .as_ref()
+                        .is_none_or(|attributes| attributes.clone().restore(&output.text).is_some())
             })
     }
 }
@@ -150,7 +187,7 @@ fn decode_cards<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec
                 if cards.len() >= MAX_RECORDS {
                     return Err(A::Error::custom("too many completed cards"));
                 }
-                budget.charge("records", card.retained_text_bytes())?;
+                budget.charge("records", card.retained_bytes())?;
                 cards.push(card);
             }
             Ok(cards)
@@ -163,7 +200,16 @@ fn decode_cards<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec
 impl Checkpoint {
     pub fn new(pane: String, next_sequence: u64, records: Vec<Card>) -> io::Result<Self> {
         let checkpoint = Self {
-            version: VERSION,
+            version: if records.iter().any(|record| {
+                record
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.annotations.is_some())
+            }) {
+                STYLED_VERSION
+            } else {
+                TEXT_VERSION
+            },
             pane,
             next_sequence,
             records,
@@ -177,7 +223,7 @@ impl Checkpoint {
     }
 
     fn validate(&self, pane: &str) -> io::Result<()> {
-        if self.version != VERSION {
+        if !matches!(self.version, TEXT_VERSION | STYLED_VERSION) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "unsupported completed history version",
@@ -185,17 +231,22 @@ impl Checkpoint {
         }
         let mut executions = HashSet::new();
         let mut last_sequence = 0;
-        let mut text_bytes = 0;
+        let mut bytes = 0;
         let records_valid = self.records.len() <= MAX_RECORDS
             && self.records.iter().all(|record| {
-                text_bytes += record.retained_text_bytes();
+                bytes += record.retained_bytes();
                 let in_order =
                     record.sequence > last_sequence && record.sequence < self.next_sequence;
                 last_sequence = record.sequence;
                 record.is_valid()
                     && in_order
                     && executions.insert(record.source.execution_id())
-                    && text_bytes <= MAX_RETAINED_TEXT_BYTES
+                    && (self.version == STYLED_VERSION
+                        || record
+                            .output
+                            .as_ref()
+                            .is_none_or(|output| output.annotations.is_none()))
+                    && bytes <= MAX_RETAINED_TEXT_BYTES
             });
         if self.pane != pane
             || !crate::execution_journal::is_valid_jsh_session_id(pane)
@@ -287,6 +338,7 @@ mod tests {
                 text: "last line\n".into(),
                 truncated: true,
                 total_bytes: 200,
+                annotations: None,
             }),
         }
     }
@@ -321,7 +373,7 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         let mut future = checkpoint;
-        future.version += 1;
+        future.version = STYLED_VERSION + 1;
         let original = serde_json::to_vec(&future).unwrap();
         crate::snapshot_file::write_atomic_private(&path, &original).unwrap();
         assert_eq!(
@@ -348,10 +400,45 @@ mod tests {
             total_bytes: text.len() as u64,
             text,
             truncated: false,
+            annotations: None,
         });
         let checkpoint = Checkpoint::new("pane-id".into(), 8, vec![card]).unwrap();
         let decoded: Checkpoint =
             serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
         assert_eq!(decoded, checkpoint);
+    }
+
+    #[test]
+    fn annotated_snapshot_has_a_new_version_with_the_original_source() {
+        use jterm_engine::{
+            archived_text::{ArchiveAnnotationBuilder, ArchiveStyle},
+            Color, StyleFlags,
+        };
+        let mut card = sample();
+        let output = card.output.as_mut().unwrap();
+        let mut attributes = ArchiveAnnotationBuilder::default();
+        attributes.push(
+            0..4,
+            ArchiveStyle::from_rendition(
+                Color::Rgb(21, 76, 191),
+                Color::Default,
+                Color::Default,
+                StyleFlags::default(),
+            ),
+            None,
+        );
+        let attributes = attributes.finish().unwrap();
+        output.annotations = OutputAnnotations::new(&output.text, &attributes);
+        let styled = Checkpoint::new("pane-id".into(), 8, vec![card]).unwrap();
+        assert_eq!(styled.version, STYLED_VERSION);
+        let decoded: Checkpoint =
+            serde_json::from_slice(&serde_json::to_vec(&styled).unwrap()).unwrap();
+        decoded.validate("pane-id").unwrap();
+        assert_eq!(decoded, styled);
+        let unstyled_version = Checkpoint {
+            version: TEXT_VERSION,
+            ..decoded
+        };
+        assert!(unstyled_version.validate("pane-id").is_err());
     }
 }

@@ -459,6 +459,33 @@ fn native_keyboard_reports_only_disambiguation_and_keeps_ime_text_whole() {
 }
 
 #[test]
+fn completed_output_annotations_follow_the_live_pen_and_link_bytes() {
+    let mut terminal = Terminal::new(4, 20).unwrap();
+    terminal.enable_underline_colors();
+    terminal.enable_hyperlinks(|_, target| target == "https://example.test/card");
+    terminal.observe_command_blocks();
+    let wire = "\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C;id=one;command=first\x07\
+                \x1b[1;38;2;31;171;193;4:3;58;2;2;4;6m\x1b]8;;https://example.test/card\x1b\\中\
+                \x1b]8;;\x1b\\\x1b[0m plain\r\n\x1b]133;D;0;id=one\x07";
+    for chunk in wire.as_bytes().chunks(3) {
+        assert!(terminal.feed(chunk).unwrap().is_empty());
+    }
+    let block = terminal.completed_command_blocks().unwrap().back().unwrap();
+    let text = block.output.as_ref().unwrap();
+    assert_eq!(text, "中 plain\n");
+    let annotations = block.output_annotations.as_ref().unwrap();
+    assert!(annotations.valid_for(text));
+    let [span] = annotations.spans.as_slice() else { panic!("expected one style run"); };
+    assert_eq!(&text[span.bytes.clone()], "中");
+    assert_eq!(span.style.foreground, Color::Rgb(31, 171, 193));
+    assert_eq!(span.style.underline_color, Color::Rgb(2, 4, 6));
+    assert_eq!(span.style.flags.underline(), crate::UnderlineStyle::Curly);
+    assert!(span.style.flags.bold());
+    assert_eq!(&text[annotations.links[0].bytes.clone()], "中");
+    assert_eq!(annotations.links[0].target, "https://example.test/card");
+}
+
+#[test]
 fn hard_reset_clears_both_screens_and_live_protocol_state() {
     let mut terminal = Terminal::new(3, 20).unwrap();
     terminal.enable_keyboard_disambiguation();
