@@ -14,6 +14,7 @@ const MAGIC: &[u8; 10] = b"JTERM-DOC\0";
 const HEADER_BYTES: usize = 16;
 const ARCHIVE_ALIGNMENT: usize = 16;
 const VERSION: u16 = 1;
+const SOURCE_ONLY_VERSION: u16 = 2;
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
 /// The accepted lifecycle and raw PTY ranges behind a retained projection.
@@ -35,7 +36,7 @@ pub struct FinishedExecutionSource {
 }
 
 /// The running record's first accepted marker, scoped to one PTY.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RunningExecutionSource {
     execution_id: Uuid,
     start: ShellMarkerPosition,
@@ -83,6 +84,34 @@ impl RunningExecutionSource {
     }
 }
 
+/// Execution provenance paired with the geometry used by a completed view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapturedExecutionSource {
+    #[serde(flatten)]
+    pub execution: FinishedExecutionSource,
+    pub capture_size: (u16, u16),
+}
+
+impl std::fmt::Display for CapturedExecutionSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let execution = &self.execution;
+        write!(
+            formatter,
+            "Execution `{}`, PTY `{}`, bytes `{}..{}`, markers `{}..{}`, grid `{}×{}` to `{}×{}`",
+            execution.execution_id,
+            execution.stream_id,
+            execution.output_bytes.start,
+            execution.output_bytes.end,
+            execution.start_event,
+            execution.capture_event,
+            execution.start_size.0,
+            execution.start_size.1,
+            self.capture_size.0,
+            self.capture_size.1,
+        )
+    }
+}
+
 impl FinishedExecutionSource {
     fn valid(&self) -> bool {
         !self.execution_id.is_nil()
@@ -120,34 +149,10 @@ impl FinishedDocument {
         })
     }
 
-    /// Keep provenance on an admissible plain projection even when the rich
-    /// output contains a style or operation the document renderer cannot keep.
-    pub fn capture_with_source(
-        output: &str,
-        plain_output: &str,
-        size: (u16, u16),
-        source: Option<FinishedExecutionSource>,
-    ) -> Option<Self> {
-        let mut document = Self::capture(output, size).or_else(|| {
-            source.as_ref()?;
-            Self::plain(plain_output, size)
-        })?;
-        document.execution_source = source;
-        Some(document)
-    }
-
-    fn plain(text: &str, size: (u16, u16)) -> Option<Self> {
-        if !is_bounded_document_text(text) {
-            return None;
-        }
-        Some(Self {
-            archive: ArchivedText {
-                text: text.to_owned(),
-                spans: Vec::new(),
-                links: Vec::new(),
-            },
-            capture_size: (size.0 != 0 && size.1 != 0).then_some(size),
-            execution_source: None,
+    pub fn output_source(&self) -> Option<CapturedExecutionSource> {
+        Some(CapturedExecutionSource {
+            execution: self.execution_source.clone()?,
+            capture_size: self.capture_size?,
         })
     }
 
@@ -188,16 +193,20 @@ impl FinishedDocument {
         let Some(metadata) = MetadataV1::encode(self) else {
             return Cow::Borrowed(record);
         };
-        let padded = (HEADER_BYTES + metadata.len()).next_multiple_of(ARCHIVE_ALIGNMENT);
-        let mut frame = Vec::with_capacity(padded + record.len());
-        frame.extend_from_slice(MAGIC);
-        frame.extend_from_slice(&VERSION.to_le_bytes());
-        frame.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&metadata);
-        frame.resize(padded, 0);
-        frame.extend_from_slice(record);
-        Cow::Owned(frame)
+        attach_metadata(VERSION, &metadata, record)
     }
+}
+
+fn attach_metadata<'a>(version: u16, metadata: &[u8], record: &'a [u8]) -> Cow<'a, [u8]> {
+    let padded = (HEADER_BYTES + metadata.len()).next_multiple_of(ARCHIVE_ALIGNMENT);
+    let mut frame = Vec::with_capacity(padded + record.len());
+    frame.extend_from_slice(MAGIC);
+    frame.extend_from_slice(&version.to_le_bytes());
+    frame.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    frame.extend_from_slice(metadata);
+    frame.resize(padded, 0);
+    frame.extend_from_slice(record);
+    Cow::Owned(frame)
 }
 
 /// A borrowed view of a decompressed history frame. Older frames have no
@@ -206,6 +215,7 @@ impl FinishedDocument {
 pub struct FinishedHistoryFrame<'a> {
     pub record: &'a [u8],
     metadata: Option<&'a [u8]>,
+    version: u16,
 }
 
 impl<'a> FinishedHistoryFrame<'a> {
@@ -213,6 +223,7 @@ impl<'a> FinishedHistoryFrame<'a> {
         let legacy = Self {
             record: frame,
             metadata: None,
+            version: 0,
         };
         let Some(header) = frame
             .get(..HEADER_BYTES)
@@ -232,12 +243,41 @@ impl<'a> FinishedHistoryFrame<'a> {
         };
         Self {
             record,
-            metadata: (version == VERSION).then_some(&frame[HEADER_BYTES..end]),
+            metadata: matches!(version, VERSION | SOURCE_ONLY_VERSION)
+                .then_some(&frame[HEADER_BYTES..end]),
+            version,
         }
     }
 
     pub fn document(&self, plain: &str) -> Option<FinishedDocument> {
+        if self.version != VERSION {
+            return None;
+        }
         MetadataV1::decode(self.metadata?, plain)
+    }
+
+    /// Capture metadata survives even when the output requires legacy replay
+    /// or no bounded styled document could be produced.
+    pub fn attach_source(source: &CapturedExecutionSource, record: &'a [u8]) -> Cow<'a, [u8]> {
+        let metadata = MetadataV1 {
+            capture_size: Some(source.capture_size),
+            execution_source: Some(source.execution.clone()),
+            spans: Vec::new(),
+            links: Vec::new(),
+        };
+        match serde_json::to_vec(&metadata) {
+            Ok(metadata) => attach_metadata(SOURCE_ONLY_VERSION, &metadata, record),
+            Err(_) => Cow::Borrowed(record),
+        }
+    }
+
+    pub fn output_source(&self) -> Option<CapturedExecutionSource> {
+        let metadata: MetadataV1 = serde_json::from_slice(self.metadata?).ok()?;
+        let (cols, rows) = metadata.capture_size?;
+        (cols > 0 && rows > 0).then_some(CapturedExecutionSource {
+            execution: metadata.execution_source?,
+            capture_size: (cols, rows),
+        })
     }
 }
 
@@ -476,6 +516,14 @@ mod tests {
             Some(document.clone())
         );
         assert_eq!(loaded.record, b"legacy record");
+        let captured = document.output_source().unwrap();
+        assert_eq!(loaded.output_source(), Some(captured.clone()));
+
+        let source_frame = FinishedHistoryFrame::attach_source(&captured, loaded.record);
+        let source_only = FinishedHistoryFrame::read(&source_frame);
+        assert_eq!(source_only.record, loaded.record);
+        assert!(source_only.document(&document.archive.text).is_none());
+        assert_eq!(source_only.output_source(), Some(captured));
 
         let mut metadata: serde_json::Value =
             serde_json::from_slice(loaded.metadata.unwrap()).unwrap();
@@ -503,7 +551,7 @@ mod tests {
         assert_eq!(decoded.record, record);
         assert!(decoded.document(plain).is_none());
 
-        frame[10] = 2;
+        frame[10] = 3;
         let decoded = FinishedHistoryFrame::read(&frame);
         assert_eq!(decoded.record, record);
         assert!(decoded.document(plain).is_none());

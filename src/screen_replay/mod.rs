@@ -107,7 +107,8 @@ pub use archived_text::{
     project_finished_output,
 };
 pub use finished_document::{
-    FinishedDocument, FinishedExecutionSource, FinishedHistoryFrame, RunningExecutionSource,
+    CapturedExecutionSource, FinishedDocument, FinishedExecutionSource, FinishedHistoryFrame,
+    RunningExecutionSource,
 };
 mod emulator;
 mod grid;
