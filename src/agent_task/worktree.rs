@@ -1,6 +1,6 @@
 //! Hardened Git worktree lifecycle for Agent tasks.
 //!
-//! This service deliberately invokes a verified system Git directly, never a
+//! This service deliberately invokes a verified Git executable directly, never a
 //! shell. Managed paths are canonical, symlink-free children of one private
 //! root. Retirement archives a worktree by default; irreversible removal is an
 //! explicit clean-only operation that first creates a recovery ref.
@@ -1190,10 +1190,41 @@ fn trusted_git_path() -> Result<PathBuf, String> {
             Err(error) => failures.push(format!("{candidate}: {error}")),
         }
     }
+    #[cfg(target_os = "linux")]
+    if Path::new("/.flatpak-info").is_file() {
+        match flatpak_task_git() {
+            Ok(path) => return Ok(path),
+            Err(error) => failures.push(format!("bundled Flatpak Git: {error}")),
+        }
+    }
     Err(format!(
         "no trusted system Git executable is available ({})",
         failures.join("; ")
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn flatpak_task_git() -> Result<PathBuf, String> {
+    use std::{mem::MaybeUninit, os::unix::fs::PermissionsExt};
+
+    let path = Path::new("/app/libexec/jterm/git");
+    let resolved = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(&resolved).map_err(|error| error.to_string())?;
+    if resolved != path || !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err("the packaged executable is missing or redirected".to_string());
+    }
+    // User installations can own the payload with the app's uid. Trust the
+    // fixed executable on the read-only app mount, independently of ownership.
+    let mut filesystem = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the literal is NUL-terminated and the output is writable.
+    if unsafe { libc::statvfs(c"/app/libexec/jterm/git".as_ptr(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    // SAFETY: a successful statvfs call initialized the result.
+    if unsafe { filesystem.assume_init() }.f_flag & libc::ST_RDONLY == 0 {
+        return Err("the packaged executable is on a writable filesystem".to_string());
+    }
+    Ok(resolved)
 }
 
 fn validate_trusted_git_candidate(candidate: &Path) -> Result<PathBuf, String> {
