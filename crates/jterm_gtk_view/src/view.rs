@@ -594,6 +594,9 @@ impl TerminalView {
     ) -> Style {
         let mut foreground = theme.color(cell.foreground, theme.foreground());
         let mut background = theme.color(cell.background, theme.background());
+        if cell.flags.dim() && !matches!(cell.foreground, Color::Rgb(..)) {
+            foreground = faint_palette_color(foreground);
+        }
         if cell.flags.inverse() {
             std::mem::swap(&mut foreground, &mut background);
             foreground.set_alpha(1.0);
@@ -1143,6 +1146,16 @@ fn font_row_height(pango_height: i32) -> i32 {
 fn rgb16(color: gdk::RGBA) -> [u16; 3] {
     [color.red(), color.green(), color.blue()]
         .map(|component| (component * f32::from(u16::MAX)).round() as u16)
+}
+
+pub(crate) fn faint_palette_color(color: gdk::RGBA) -> gdk::RGBA {
+    let intensity = 2.0 / 3.0;
+    gdk::RGBA::new(
+        color.red() * intensity,
+        color.green() * intensity,
+        color.blue() * intensity,
+        color.alpha(),
+    )
 }
 
 pub(crate) fn terminal_color(

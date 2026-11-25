@@ -323,6 +323,9 @@ struct SpanV1 {
     bytes: Range<usize>,
     colors: [u32; 3],
     flags: u8,
+    // Older readers can still use the original colors, flags, and source.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    faint: bool,
 }
 
 impl MetadataV1 {
@@ -422,7 +425,8 @@ impl SpanV1 {
                 UnderlineStyle::Curly => 3 << 4,
                 _ => return None,
             };
-        if Self::decode_flags(flags)? != style.flags {
+        let faint = style.flags.dim();
+        if Self::decode_flags(flags, faint)? != style.flags {
             return None;
         }
         Some(Self {
@@ -433,6 +437,7 @@ impl SpanV1 {
                 encode_color(style.underline_color)?,
             ],
             flags,
+            faint,
         })
     }
 
@@ -443,14 +448,15 @@ impl SpanV1 {
                 foreground: decode_color(self.colors[0])?,
                 background: decode_color(self.colors[1])?,
                 underline_color: decode_color(self.colors[2])?,
-                flags: Self::decode_flags(self.flags)?,
+                flags: Self::decode_flags(self.flags, self.faint)?,
             },
         })
     }
 
-    fn decode_flags(bits: u8) -> Option<StyleFlags> {
+    fn decode_flags(bits: u8, faint: bool) -> Option<StyleFlags> {
         let mut flags = StyleFlags::new();
         flags.set_bold(bits & 1 != 0);
+        flags.set_dim(faint);
         flags.set_italic(bits & 2 != 0);
         flags.set_inverse(bits & 4 != 0);
         flags.set_strikethrough(bits & 8 != 0);
@@ -517,7 +523,7 @@ mod tests {
         assert_eq!(source.output_bytes, 32..54);
         assert_eq!(source.tail_bytes, Some(68..79));
         let mut document =
-            FinishedDocument::capture("\x1b[1mdurable output\x1b[0m", (90, 30)).unwrap();
+            FinishedDocument::capture("\x1b[1;2mdurable output\x1b[0m", (90, 30)).unwrap();
         document.execution_source = Some(source.clone());
         let frame = document.attach(&document.archive.text, b"legacy record");
         let loaded = FinishedHistoryFrame::read(&frame);
@@ -537,6 +543,18 @@ mod tests {
 
         let mut metadata: serde_json::Value =
             serde_json::from_slice(loaded.metadata.unwrap()).unwrap();
+        let mut old_metadata = metadata.clone();
+        assert_eq!(metadata["spans"][0]["faint"], true);
+        old_metadata["spans"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("faint");
+        let old_metadata = serde_json::to_vec(&old_metadata).unwrap();
+        let old = MetadataV1::decode(&old_metadata, &document.archive.text).unwrap();
+        assert_eq!(old.output_source(), document.output_source());
+        assert!(old.archive.spans[0].style.flags.bold());
+        assert!(!old.archive.spans[0].style.flags.dim());
+
         metadata["execution_source"]["end_event"] = serde_json::json!(1);
         let metadata = serde_json::to_vec(&metadata).unwrap();
         let loaded = MetadataV1::decode(&metadata, &document.archive.text).unwrap();

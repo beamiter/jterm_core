@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     text_link::connect_links,
-    view::{link_for_offset, terminal_color, text_at_point, PresentedLink},
+    view::{faint_palette_color, link_for_offset, terminal_color, text_at_point, PresentedLink},
     LinkActions, PlainLinkFinder,
 };
 
@@ -23,8 +23,7 @@ const MAX_REFERENCE_DOCUMENT_CHARS: i32 = 256 * 1024;
 /// A literal command within the shell integration budget. Tabs retain their
 /// terminal stop width, and LF is the only line break.
 pub fn supports_finished_command(command: &str) -> bool {
-    !command.is_empty()
-        && command == command.trim()
+    !command.trim().is_empty()
         && command.len() <= MAX_OSC133_COMMAND_BYTES
         && command.chars().all(|ch| {
             ch.is_ascii_graphic()
@@ -483,6 +482,9 @@ fn set_span_colors(
         |value| (value != Color::Default).then(|| terminal_color(value, gdk::RGBA::BLACK, palette));
     let mut foreground = color(style.foreground);
     let mut background = color(style.background);
+    if style.flags.dim() && !matches!(style.foreground, Color::Rgb(..)) {
+        foreground = Some(faint_palette_color(foreground.unwrap_or(defaults.0)));
+    }
     if style.flags.inverse() {
         let mut ink = background.unwrap_or(defaults.1);
         ink.set_alpha(1.0);
@@ -615,14 +617,17 @@ mod tests {
         assert!(supports_finished_command("echo one\ttwo"));
         assert!(supports_finished_command("echo 好 e\u{301} 👩‍💻"));
         assert!(supports_finished_command(
+            "  echo leading and trailing \t\n"
+        ));
+        assert!(supports_finished_command(
             "cd ./src && \\\nrg file.rs:9 https://example.test"
         ));
         for command in [
             "",
+            " \t\n",
             "echo one\rtwo",
             "echo \x1b[31mcolor",
             "echo \u{202e}unsafe",
-            "echo trailing ",
         ] {
             assert!(!supports_finished_command(command), "{command:?}");
         }
@@ -679,6 +684,57 @@ mod tests {
         view.set_colors(new_foreground, &palette);
         assert_eq!(tag.foreground_rgba(), Some(background));
         assert_eq!(tag.background_rgba(), Some(new_foreground));
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn finished_documents_dim_default_and_indexed_ink_before_inverse() {
+        use jterm_engine::archived_text::ArchiveSpan;
+
+        gtk4::init().expect("GTK display");
+        let palette = crate::default_ansi_palette();
+        let font = pango::FontDescription::from_string("Monospace 13");
+        let background = gdk::RGBA::new(0.1, 0.2, 0.3, 1.0);
+        let mut style = ArchiveStyle::default();
+        style.flags.set_dim(true);
+        style.flags.set_inverse(true);
+        let archive = ArchivedText {
+            text: "abc".to_owned(),
+            spans: [Color::Default, Color::Indexed(196), Color::Rgb(77, 88, 99)]
+                .into_iter()
+                .enumerate()
+                .map(|(start, foreground)| ArchiveSpan {
+                    bytes: start..start + 1,
+                    style: ArchiveStyle {
+                        foreground,
+                        ..style
+                    },
+                })
+                .collect(),
+            ..ArchivedText::default()
+        };
+        let view = FinishedTextView::output(&archive, font, 1.0, gdk::RGBA::WHITE, &palette);
+        view.set_terminal_background(background);
+        let tags = view.output_tags.borrow();
+        assert!(tags
+            .iter()
+            .all(|(tag, _)| tag.foreground_rgba() == Some(background)));
+        assert_eq!(
+            tags[0].0.background_rgba(),
+            Some(gdk::RGBA::new(2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 1.0))
+        );
+        assert_eq!(
+            tags[1].0.background_rgba(),
+            Some(gdk::RGBA::new(2.0 / 3.0, 0.0, 0.0, 1.0))
+        );
+        assert_eq!(
+            tags[2].0.background_rgba(),
+            Some(terminal_color(
+                Color::Rgb(77, 88, 99),
+                gdk::RGBA::WHITE,
+                &palette
+            ))
+        );
     }
 
     #[test]

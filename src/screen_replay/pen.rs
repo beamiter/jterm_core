@@ -168,6 +168,7 @@ pub(super) fn supported_archive_sgr(params: &Params) -> bool {
             -1
             | 0
             | 1
+            | 2
             | 3
             | 4
             | 7

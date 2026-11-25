@@ -1,4 +1,6 @@
-use super::pen::{apply_sgr, supported_archive_sgr, Color, Pen, BOLD, ITALIC, REVERSE, STRIKE};
+use super::pen::{
+    apply_sgr, supported_archive_sgr, Color, Pen, BOLD, DIM, ITALIC, REVERSE, STRIKE,
+};
 use super::{parser::Params, ScreenReplay, MAX_COLS, MAX_COMPLETED_CAPTURE_BYTES};
 use jterm_engine::archived_text::{
     is_literal_archive_unicode, ArchiveLink, ArchiveSpan, ArchiveStyle, ArchivedText,
@@ -151,18 +153,33 @@ pub fn project_bounded_command_archive(capture: &str, command: &str) -> Option<A
     if command.is_empty() || command.len() > jterm_engine::shell_markers::MAX_OSC133_COMMAND_BYTES {
         return None;
     }
+    if command.ends_with('\n') {
+        if let Some(archive) =
+            project_literal_runs(capture, false).filter(|archive| archive.text == command)
+        {
+            return Some(archive);
+        }
+    }
     let archive = project_literal_archive(capture)?;
     (archive.text == command).then_some(archive)
 }
 
 fn project_literal_archive(capture: &str) -> Option<ArchivedText> {
+    project_literal_runs(capture, true)
+}
+
+fn project_literal_runs(capture: &str, strip_final_line_end: bool) -> Option<ArchivedText> {
     if capture.len() > MAX_COMPLETED_CAPTURE_BYTES {
         return None;
     }
-    let capture = capture
-        .strip_suffix("\r\n")
-        .or_else(|| capture.strip_suffix('\n'))
-        .unwrap_or(capture);
+    let capture = if strip_final_line_end {
+        capture
+            .strip_suffix("\r\n")
+            .or_else(|| capture.strip_suffix('\n'))
+            .unwrap_or(capture)
+    } else {
+        capture
+    };
     let mut output = ArchivedText::default();
     let mut pen = Pen::default();
     let mut style_changes = 0;
@@ -258,6 +275,7 @@ fn project_literal_archive(capture: &str) -> Option<ArchivedText> {
 fn project_style(pen: &Pen) -> ArchiveStyle {
     let mut flags = StyleFlags::new();
     flags.set_bold(pen.flags & BOLD != 0);
+    flags.set_dim(pen.flags & DIM != 0);
     flags.set_italic(pen.flags & ITALIC != 0);
     flags.set_inverse(pen.flags & REVERSE != 0);
     flags.set_strikethrough(pen.flags & STRIKE != 0);
@@ -409,6 +427,14 @@ mod tests {
         assert_eq!(project_bounded_archive(&marked).unwrap(), archive);
         assert!(project_bounded_command_archive(&marked, "printf changed").is_none());
         assert!(project_bounded_command_archive(&format!("{marked}\x1b[2J"), command).is_none());
+        let padded = "  printf value \t\n";
+        let marked = "\x1b[32m  printf value \t\x1b[0m\r\n";
+        let archive = project_bounded_command_archive(marked, padded).unwrap();
+        assert_eq!(archive.text, padded);
+        assert_eq!(
+            &archive.text[archive.spans[0].bytes.clone()],
+            "  printf value \t"
+        );
     }
 
     #[test]
@@ -488,7 +514,7 @@ mod tests {
     fn ineligible_legacy_archive_bytes_cannot_enter_the_document() {
         for input in [
             "capture \x1b[2J after repaint",
-            "capture \x1b[2m dim",
+            "capture \x1b[5m blink",
             "capture \x1b[4:5m dash",
             "capture \x1b[38;2;100m invalid",
             "capture \x1b]8;;file:///tmp/item\x1b\\linked\x1b]8;;\x07",
@@ -528,7 +554,11 @@ mod tests {
         assert!(project_finished_output("\r\x1b[2Jmust use screen geometry", 80).is_none());
         assert!(project_finished_output("\r\x1b]0;title\x07outside the archive", 80).is_none());
         assert!(project_finished_output("\r\u{202e}spoofed", 80).is_none());
-        assert!(project_finished_output("\r\x1b[2munsupported dim", 80).is_none());
+        let faint = project_finished_output("old\r\x1b[K\x1b[2mfaint\x1b[22m strong", 80).unwrap();
+        assert_eq!(faint.text, "faint strong");
+        assert_eq!(faint.spans.len(), 1);
+        assert_eq!(faint.spans[0].bytes, 0..5);
+        assert!(faint.spans[0].style.flags.dim());
     }
 
     #[test]
