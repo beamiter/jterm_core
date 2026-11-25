@@ -6,7 +6,8 @@ use crate::child_lifecycle::{
 };
 use crate::exit_status::{ExitTail, PtyExit};
 use crate::native_pty_launch::{
-    launch_bundled_bash, launch_standalone_pty, BundledBash, PendingPty, PtyLaunchError,
+    launch_bundled_bash, launch_standalone_pty, BundledBash, PendingPty, PtyLaunch, PtyLaunchError,
+    WorkingDirectory,
 };
 #[cfg(test)]
 use crate::pty_io::bounded_write;
@@ -24,6 +25,7 @@ use std::{
     ffi::OsString,
     io::{self, Cursor, Read},
     num::NonZeroU64,
+    os::fd::BorrowedFd,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -497,7 +499,7 @@ impl Session {
             "/bin/sh".into(),
             &[("TERM", "dumb"), ("PS1", "$ "), ("ENV", "/dev/null")],
         )?;
-        Self::spawn_program(rows, cols, terminal, command)
+        Self::spawn_program(terminal, command.spec(rows as u16, cols as u16))
     }
 
     /// Explicitly launch the local user's installed jsh with output observation.
@@ -513,7 +515,7 @@ impl Session {
             .ok_or("jsh executable not found on the application PATH")?;
         let command = Program::interactive(path, &[("TERM", "xterm")])?;
         terminal.observe_command_blocks();
-        Self::spawn_program(rows, cols, terminal, command)
+        Self::spawn_program(terminal, command.spec(rows as u16, cols as u16))
     }
 
     /// Start one local PTY using the caller's prepared command and environment.
@@ -540,7 +542,31 @@ impl Session {
             return Err("PTY working directory is not a directory".into());
         }
         let command = Program::command(argv, &cwd, env)?;
-        let mut session = Self::spawn_program(rows, cols, terminal, command)?;
+        let mut session = Self::spawn_program(terminal, command.spec(rows as u16, cols as u16))?;
+        session.enable_ordered_input();
+        Ok(session)
+    }
+
+    /// Start an already resolved program in the exact open task directory.
+    /// The child enters the directory and closes the descriptor before exec.
+    pub fn spawn_pinned_command(
+        rows: usize,
+        cols: usize,
+        argv: &[OsString],
+        directory: BorrowedFd<'_>,
+        env: &[(OsString, OsString)],
+    ) -> Result<Self, String> {
+        if !argv
+            .first()
+            .is_some_and(|program| Path::new(program).is_absolute())
+        {
+            return Err("a pinned PTY command requires an absolute executable".into());
+        }
+        let terminal = Terminal::new(rows, cols)?;
+        let command = Program::command(argv, Path::new("/"), env)?;
+        let mut spec = command.spec(rows as u16, cols as u16);
+        spec.directory = WorkingDirectory::Descriptor(directory);
+        let mut session = Self::spawn_program(terminal, spec)?;
         session.enable_ordered_input();
         Ok(session)
     }
@@ -572,16 +598,10 @@ impl Session {
         Ok(session)
     }
 
-    fn spawn_program(
-        rows: usize,
-        cols: usize,
-        terminal: Terminal,
-        command: Program,
-    ) -> Result<Self, String> {
+    fn spawn_program(terminal: Terminal, spec: PtyLaunch<'_>) -> Result<Self, String> {
         require_waitable_sigchld().map_err(|error| error.to_string())?;
         let lease = reaper::global()?.reserve()?;
-        let pending =
-            launch_standalone_pty(command.spec(rows as u16, cols as u16)).map_err(launch_error)?;
+        let pending = launch_standalone_pty(spec).map_err(launch_error)?;
         Self::register_program(pending, lease, terminal)
     }
 
@@ -1257,6 +1277,62 @@ mod tests {
             .visible_text()
             .contains("LAUNCHED sh last /"));
         assert!(unsafe { libc::fcntl(ambient.as_raw_fd(), libc::F_GETFD) } >= 0);
+        session.close().unwrap();
+        await_cleanup(&session);
+    }
+
+    #[test]
+    fn pinned_command_uses_the_open_directory_and_retires_its_descriptor() {
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::os::unix::fs::DirBuilderExt;
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("jterm-pinned-command-{}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        let scratch = Scratch(path);
+        let selected = scratch.0.join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("receipt"), "PINNED_DIRECTORY\n").unwrap();
+        let pinned = std::fs::File::open(&selected).unwrap();
+        std::fs::rename(&selected, scratch.0.join("retained")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        let args = [
+            "/bin/sh".into(),
+            "-c".into(),
+            concat!(
+                "test ! -e \"/proc/self/fd/$DIRECTORY_FD\" || exit 78; ",
+                "IFS= read -r receipt < receipt || exit 79; ",
+                "printf '%s:%s\\n' \"$receipt\" \"$VALIDATION_ENV\"; exit 7"
+            )
+            .into(),
+        ];
+        let environment = [
+            ("DIRECTORY_FD".into(), pinned.as_raw_fd().to_string().into()),
+            ("VALIDATION_ENV".into(), "isolated".into()),
+        ];
+        let mut session = Session::spawn_pinned_command(4, 80, &args, pinned.as_fd(), &environment)
+            .expect("launch pinned validation command");
+        drop(pinned);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.is_drained() {
+            assert!(Instant::now() < deadline, "pinned command did not drain");
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.exit_code(), Some(7));
+        assert!(session
+            .terminal()
+            .visible_text()
+            .contains("PINNED_DIRECTORY:isolated"));
         session.close().unwrap();
         await_cleanup(&session);
     }

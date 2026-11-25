@@ -1,6 +1,7 @@
 use std::{
     cell::OnceCell,
     ffi::{CString, OsString},
+    os::fd::BorrowedFd,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard, TryLockError, Weak},
@@ -187,13 +188,33 @@ impl RuntimeShell {
         if !Self::admits_explicit_command(host_bridge) {
             return Ok(None);
         }
-        let cwd = match cwd {
-            Some(cwd) => PathBuf::from(cwd),
-            None => std::env::current_dir().map_err(|error| error.to_string())?,
-        };
-        let runtime = Self::spawn_program(argv, &cwd, prepare_environment()?)?;
-        runtime.enable_primary_reflow()?;
-        Ok(Some(runtime))
+        Self::spawn_pane_command(argv, cwd, None, prepare_environment()?).map(Some)
+    }
+
+    /// Launch the command approved by the application in its own PTY. An
+    /// open directory takes precedence over the path used for pane metadata.
+    pub fn spawn_pane_command(
+        argv: &[String],
+        cwd: Option<&str>,
+        pinned_directory: Option<BorrowedFd<'_>>,
+        environment: Vec<CString>,
+    ) -> Result<Rc<Self>, String> {
+        let argv = argv.iter().map(OsString::from).collect::<Vec<_>>();
+        let env = runtime_environment(environment)?;
+        let mut session = match pinned_directory {
+            Some(directory) => {
+                Session::spawn_pinned_command(INITIAL_ROWS, INITIAL_COLUMNS, &argv, directory, &env)
+            }
+            None => Session::spawn_command(
+                INITIAL_ROWS,
+                INITIAL_COLUMNS,
+                &argv,
+                cwd.map(Path::new),
+                &env,
+            ),
+        }?;
+        session.enable_primary_reflow();
+        Ok(Self::new(session))
     }
 
     /// Start the frontend's host-approved attachment relay in a local PTY.

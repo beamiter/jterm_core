@@ -106,6 +106,7 @@ type OnEvent = Box<dyn Fn(PaneEvent)>;
 enum InputStyle {
     Terminal,
     HostedAttachment { inline_history: bool },
+    InlineTask { inline_history: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -743,6 +744,27 @@ impl<P: Pty> TerminalPane<P> {
             links,
             None,
             InputStyle::HostedAttachment {
+                inline_history: std::env::var_os("JTERM_AGENT_SCROLLBACK")
+                    .is_none_or(|value| value != "0"),
+            },
+            GridSize::Allocation,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_inline_task(
+        runtime: Rc<RuntimeShell>,
+        theme: Theme,
+        status_text: fn(&str, usize) -> String,
+        links: LinkActions,
+    ) -> Result<(gtk4::Widget, Rc<Self>), String> {
+        Self::attach(
+            Backend::Runtime(runtime),
+            theme,
+            status_text,
+            links,
+            None,
+            InputStyle::InlineTask {
                 inline_history: std::env::var_os("JTERM_AGENT_SCROLLBACK")
                     .is_none_or(|value| value != "0"),
             },
@@ -1493,6 +1515,8 @@ impl<P: Pty> TerminalPane<P> {
             && !(matches!(
                 self.input_style,
                 InputStyle::HostedAttachment {
+                    inline_history: true
+                } | InputStyle::InlineTask {
                     inline_history: true
                 }
             ) && matches!(
