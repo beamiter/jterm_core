@@ -11,6 +11,7 @@ use std::{collections::HashSet, io, path::Path};
 const VERSION: u32 = 1;
 pub const MAX_RECORDS: usize = 1024;
 pub const MAX_RETAINED_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CARD_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,7 +90,7 @@ impl Card {
 
     fn is_valid(&self) -> bool {
         use crate::execution_journal::{
-            is_valid_jsh_cwd, MAX_COMMAND_BYTES, MAX_EXECUTION_ID_BYTES, MAX_OUTPUT_BYTES,
+            is_valid_jsh_cwd, MAX_COMMAND_BYTES, MAX_EXECUTION_ID_BYTES,
         };
 
         self.sequence > 0
@@ -115,7 +116,7 @@ impl Card {
                 Completion::ShellReported | Completion::JournalRecovered
             ) || self.exit_code.is_none())
             && self.output.as_ref().is_none_or(|output| {
-                output.text.len() <= MAX_OUTPUT_BYTES
+                output.text.len() <= MAX_CARD_OUTPUT_BYTES
                     && (output.truncated || output.text.len() as u64 <= output.total_bytes)
             })
     }
@@ -337,5 +338,20 @@ mod tests {
         repeated.sequence += 1;
         assert!(Checkpoint::new("pane-id".into(), 8, vec![card.clone(), repeated]).is_err());
         assert!(Checkpoint::new("pane-id".into(), card.sequence, vec![card]).is_err());
+    }
+
+    #[test]
+    fn frost_sized_capture_remains_a_complete_projection() {
+        let mut card = sample();
+        let text = "x".repeat(MAX_CARD_OUTPUT_BYTES);
+        card.output = Some(Output {
+            total_bytes: text.len() as u64,
+            text,
+            truncated: false,
+        });
+        let checkpoint = Checkpoint::new("pane-id".into(), 8, vec![card]).unwrap();
+        let decoded: Checkpoint =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert_eq!(decoded, checkpoint);
     }
 }
