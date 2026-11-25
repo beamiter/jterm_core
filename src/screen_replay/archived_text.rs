@@ -83,13 +83,21 @@ fn archive_link(fields: &str) -> Option<(Option<&str>, &str)> {
     Some((target, tail))
 }
 
+fn skip_device_status_query(input: &str) -> Option<&str> {
+    ["\x1b[5n", "\x1b[6n", "\x1b[?6n"]
+        .into_iter()
+        .find_map(|query| input.strip_prefix(query))
+}
+
 /// Admit edits only when their meaning is independent of the live viewport
 /// height and its modes. Unknown controls keep the existing replay route.
 fn has_safe_horizontal_edits(mut capture: &str) -> bool {
     let mut has_edit = false;
     let mut link = None;
     while !capture.is_empty() {
-        if let Some(sequence) = capture.strip_prefix("\x1b[") {
+        if let Some(rest) = skip_device_status_query(capture) {
+            capture = rest;
+        } else if let Some(sequence) = capture.strip_prefix("\x1b[") {
             let Some(end) =
                 sequence.find(|ch: char| !ch.is_ascii_digit() && ch != ';' && ch != ':')
             else {
@@ -162,6 +170,12 @@ fn project_literal_archive(capture: &str) -> Option<ArchivedText> {
     let mut link = None;
     let mut rest = capture;
     while !rest.is_empty() {
+        // A status query has no painted cells. Keep the exact raw range on
+        // the execution source while rendering the surrounding text and styles.
+        if let Some(tail) = skip_device_status_query(rest) {
+            rest = tail;
+            continue;
+        }
         if let Some(sequence) = rest.strip_prefix("\x1b[") {
             style_changes += 1;
             if style_changes >= MAX_SPANS {
@@ -454,6 +468,20 @@ mod tests {
         let text = "https://user:token@example.test";
         assert_eq!(project_bounded_archive(text).unwrap().text, text);
         assert!(crate::link::document_url_at(text, 1).is_none());
+    }
+
+    #[test]
+    fn status_queries_leave_literal_and_replayed_output_unchanged() {
+        let capture = "tag \x1b[31mline\x1b[0m\r\n";
+        let queried = "tag \x1b[5n\x1b[31mli\x1b[6nne\x1b[?6n\x1b[0m\r\n";
+        assert_eq!(
+            project_finished_output(queried, 80),
+            project_finished_output(capture, 80)
+        );
+        assert_eq!(
+            project_finished_output("old\x1b[5n\r\x1b[Knew", 80),
+            project_finished_output("old\r\x1b[Knew", 80)
+        );
     }
 
     #[test]
