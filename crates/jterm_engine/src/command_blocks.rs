@@ -31,34 +31,53 @@ pub struct CommandOutputSource {
     pub resized: bool,
 }
 
-#[derive(Clone, Copy)]
-struct MarkerPosition {
+/// A marker's location in its source stream, independent of PTY read boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShellMarkerPosition {
     sequence: u64,
     start: u64,
     end: u64,
 }
 
+impl ShellMarkerPosition {
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    pub fn packet_bytes(self) -> Range<u64> {
+        self.start..self.end
+    }
+}
+
+/// Position clock for the shell marker observer owned by one PTY.
 #[derive(Default)]
-struct MarkerClock {
+pub struct ShellMarkerClock {
     offset: u64,
     sequence: u64,
 }
 
-impl MarkerClock {
-    fn begin_feed(&mut self, len: usize) -> Option<u64> {
+impl ShellMarkerClock {
+    /// Advance the observed byte position and return this feed's starting offset.
+    pub fn begin_feed(&mut self, len: usize) -> Option<u64> {
         let base = self.offset;
         self.offset = base.saturating_add(len as u64);
         (self.offset < u64::MAX).then_some(base)
     }
 
-    fn osc(&mut self, end: Option<u64>, payload_len: usize, bel: bool) -> Option<MarkerPosition> {
+    /// Count one recognized OSC lifecycle marker at the exclusive packet end.
+    pub fn osc(
+        &mut self,
+        end: Option<u64>,
+        payload_len: usize,
+        bel: bool,
+    ) -> Option<ShellMarkerPosition> {
         let sequence = self.sequence.checked_add(1)?;
         self.sequence = sequence;
-        let end = end?;
+        let end = end.filter(|end| *end <= self.offset)?;
         // Both OSC terminators are accepted across input splits. The parser
         // provides the original, unmodified OSC payload.
-        let framed_len = payload_len as u64 + if bel { 3 } else { 4 };
-        Some(MarkerPosition {
+        let framed_len = (payload_len as u64).checked_add(if bel { 3 } else { 4 })?;
+        Some(ShellMarkerPosition {
             sequence,
             start: end.checked_sub(framed_len)?,
             end,
@@ -98,7 +117,7 @@ struct Active {
     cwd: Option<String>,
     output: Result<String, OutputUnavailable>,
     carriage_return: bool,
-    start_position: Option<MarkerPosition>,
+    start_position: Option<ShellMarkerPosition>,
     start_size: (usize, usize),
     resized: bool,
 }
@@ -175,7 +194,7 @@ pub(crate) struct CommandBlocks {
     active: Option<Active>,
     completed: VecDeque<CommandBlock>,
     sequence: u64,
-    markers: MarkerClock,
+    markers: ShellMarkerClock,
 }
 
 impl CommandBlocks {
@@ -256,7 +275,7 @@ impl CommandBlocks {
     fn observe_marker(
         &mut self,
         marker: ShellMarker,
-        position: Option<MarkerPosition>,
+        position: Option<ShellMarkerPosition>,
         size: (usize, usize),
     ) {
         match marker {

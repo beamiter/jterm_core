@@ -2,9 +2,11 @@
 
 use super::archived_text::{is_bounded_document_text, MAX_LINKS, MAX_SPANS};
 use jterm_engine::archived_text::{ArchiveLink, ArchiveSpan, ArchiveStyle, ArchivedText};
+use jterm_engine::command_blocks::ShellMarkerPosition;
 use jterm_engine::grid::{Color, StyleFlags, UnderlineStyle};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, mem::size_of, ops::Range};
+use uuid::Uuid;
 
 // rkyv finds the legacy root at the end of the frame. Prepending a multiple
 // of its archive alignment keeps the original root and relative pointers valid.
@@ -14,11 +16,99 @@ const ARCHIVE_ALIGNMENT: usize = 16;
 const VERSION: u16 = 1;
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
+/// The accepted lifecycle and raw PTY ranges behind a retained projection.
+/// A stream ID identifies one PTY incarnation. Its original byte intervals
+/// can include control traffic omitted by the finished document renderer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FinishedExecutionSource {
+    execution_id: Uuid,
+    stream_id: Uuid,
+    start_event: u64,
+    end_event: u64,
+    capture_event: u64,
+    output_bytes: Range<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tail_bytes: Option<Range<u64>>,
+    start_size: (u16, u16),
+    pub head_dropped: bool,
+    pub tail_dropped: bool,
+}
+
+/// The running record's first accepted marker, scoped to one PTY.
+#[derive(Clone)]
+pub struct RunningExecutionSource {
+    execution_id: Uuid,
+    start: ShellMarkerPosition,
+    reported_end: Option<ShellMarkerPosition>,
+    start_size: (u16, u16),
+}
+
+impl RunningExecutionSource {
+    pub fn new(start: ShellMarkerPosition, start_size: (u16, u16)) -> Self {
+        Self {
+            execution_id: Uuid::new_v4(),
+            start,
+            reported_end: None,
+            start_size,
+        }
+    }
+
+    pub fn report_end(&mut self, reported_end: ShellMarkerPosition) {
+        self.reported_end = Some(reported_end);
+    }
+
+    pub fn finish(
+        self,
+        stream_id: Uuid,
+        capture_end: ShellMarkerPosition,
+    ) -> Option<FinishedExecutionSource> {
+        let end = self.reported_end.unwrap_or(capture_end);
+        let output_bytes = self.start.packet_bytes().end..end.packet_bytes().start;
+        let tail_bytes = self
+            .reported_end
+            .map(|end| end.packet_bytes().end..capture_end.packet_bytes().start);
+        let source = FinishedExecutionSource {
+            execution_id: self.execution_id,
+            stream_id,
+            start_event: self.start.sequence(),
+            end_event: end.sequence(),
+            capture_event: capture_end.sequence(),
+            output_bytes,
+            tail_bytes,
+            start_size: self.start_size,
+            head_dropped: false,
+            tail_dropped: false,
+        };
+        source.valid().then_some(source)
+    }
+}
+
+impl FinishedExecutionSource {
+    fn valid(&self) -> bool {
+        !self.execution_id.is_nil()
+            && !self.stream_id.is_nil()
+            && self.start_size.0 > 0
+            && self.start_size.1 > 0
+            && self.start_event > 0
+            && self.end_event > self.start_event
+            && self.output_bytes.start <= self.output_bytes.end
+            && match &self.tail_bytes {
+                Some(tail) => {
+                    self.capture_event > self.end_event
+                        && tail.start > self.output_bytes.end
+                        && tail.start <= tail.end
+                }
+                None => self.capture_event == self.end_event,
+            }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinishedDocument {
     pub archive: ArchivedText,
     /// Last geometry sent to the child, in columns and rows.
     pub capture_size: Option<(u16, u16)>,
+    pub execution_source: Option<FinishedExecutionSource>,
 }
 
 impl FinishedDocument {
@@ -26,6 +116,38 @@ impl FinishedDocument {
         Some(Self {
             archive: super::project_finished_output(output, usize::from(size.0))?,
             capture_size: (size.0 != 0 && size.1 != 0).then_some(size),
+            execution_source: None,
+        })
+    }
+
+    /// Keep provenance on an admissible plain projection even when the rich
+    /// output contains a style or operation the document renderer cannot keep.
+    pub fn capture_with_source(
+        output: &str,
+        plain_output: &str,
+        size: (u16, u16),
+        source: Option<FinishedExecutionSource>,
+    ) -> Option<Self> {
+        let mut document = Self::capture(output, size).or_else(|| {
+            source.as_ref()?;
+            Self::plain(plain_output, size)
+        })?;
+        document.execution_source = source;
+        Some(document)
+    }
+
+    fn plain(text: &str, size: (u16, u16)) -> Option<Self> {
+        if !is_bounded_document_text(text) {
+            return None;
+        }
+        Some(Self {
+            archive: ArchivedText {
+                text: text.to_owned(),
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
+            capture_size: (size.0 != 0 && size.1 != 0).then_some(size),
+            execution_source: None,
         })
     }
 
@@ -124,8 +246,26 @@ impl<'a> FinishedHistoryFrame<'a> {
 #[derive(Serialize, Deserialize)]
 struct MetadataV1 {
     capture_size: Option<(u16, u16)>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_execution_source"
+    )]
+    execution_source: Option<FinishedExecutionSource>,
     spans: Vec<SpanV1>,
     links: Vec<(Range<usize>, String)>,
+}
+
+fn read_execution_source<'de, D>(
+    deserializer: D,
+) -> Result<Option<FinishedExecutionSource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<FinishedExecutionSource>(value)
+        .ok()
+        .filter(FinishedExecutionSource::valid))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +283,7 @@ impl MetadataV1 {
         }
         let metadata = Self {
             capture_size: document.capture_size,
+            execution_source: document.execution_source.clone(),
             spans: archive
                 .spans
                 .iter()
@@ -164,6 +305,7 @@ impl MetadataV1 {
         }
         let Self {
             capture_size,
+            execution_source,
             spans,
             links,
         } = serde_json::from_slice(metadata).ok()?;
@@ -187,6 +329,7 @@ impl MetadataV1 {
         valid_document(&archive).then_some(FinishedDocument {
             archive,
             capture_size,
+            execution_source,
         })
     }
 }
@@ -306,6 +449,42 @@ mod tests {
         let decoded = FinishedHistoryFrame::read(&frame);
         assert_eq!(decoded.record, record);
         assert_eq!(decoded.document(&document.archive.text), Some(document));
+    }
+
+    #[test]
+    fn execution_source_survives_the_legacy_document_frame_and_invalid_source_degrades() {
+        use jterm_engine::command_blocks::ShellMarkerClock;
+
+        let mut clock = ShellMarkerClock::default();
+        clock.begin_feed(128).unwrap();
+        let start = clock.osc(Some(32), 10, true).unwrap();
+        let end = clock.osc(Some(68), 10, false).unwrap();
+        let prompt = clock.osc(Some(88), 6, true).unwrap();
+        let mut running = RunningExecutionSource::new(start, (80, 24));
+        running.report_end(end);
+        let mut source = running.finish(Uuid::new_v4(), prompt).unwrap();
+        source.head_dropped = true;
+        assert_eq!(source.output_bytes, 32..54);
+        assert_eq!(source.tail_bytes, Some(68..79));
+        let mut document =
+            FinishedDocument::capture("\x1b[1mdurable output\x1b[0m", (90, 30)).unwrap();
+        document.execution_source = Some(source.clone());
+        let frame = document.attach(&document.archive.text, b"legacy record");
+        let loaded = FinishedHistoryFrame::read(&frame);
+        assert_eq!(
+            loaded.document(&document.archive.text),
+            Some(document.clone())
+        );
+        assert_eq!(loaded.record, b"legacy record");
+
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(loaded.metadata.unwrap()).unwrap();
+        metadata["execution_source"]["end_event"] = serde_json::json!(1);
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        let loaded = MetadataV1::decode(&metadata, &document.archive.text).unwrap();
+        assert_eq!(loaded.archive, document.archive);
+        assert_eq!(loaded.capture_size, document.capture_size);
+        assert!(loaded.execution_source.is_none());
     }
 
     #[test]

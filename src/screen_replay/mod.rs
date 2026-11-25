@@ -106,7 +106,9 @@ pub use archived_text::{
     filter_archived_output, project_bounded_archive, project_bounded_command_archive,
     project_finished_output,
 };
-pub use finished_document::{FinishedDocument, FinishedHistoryFrame};
+pub use finished_document::{
+    FinishedDocument, FinishedExecutionSource, FinishedHistoryFrame, RunningExecutionSource,
+};
 mod emulator;
 mod grid;
 mod parser;

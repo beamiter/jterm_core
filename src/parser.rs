@@ -20,6 +20,8 @@ const MAX_DCS_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_CLIPBOARD_BASE64_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OSC7_URI_BYTES: usize = 16 * 1024;
 const MAX_TITLE_BYTES: usize = 4 * 1024;
+use jterm_engine::command_blocks::ShellMarkerClock;
+pub use jterm_engine::command_blocks::ShellMarkerPosition;
 use jterm_engine::shell_markers::{self, ShellMarker};
 pub use jterm_engine::shell_markers::{
     CommandMeta, MAX_OSC133_COMMAND_BYTES, MAX_OSC133_CWD_BYTES, MAX_OSC133_ID_BYTES,
@@ -181,6 +183,15 @@ pub enum ParserEvent {
     /// through; the caller owns the stacks (see [`crate::kitty_keyboard`])
     /// and must answer the matching `CSI ? u` query from them.
     KittyKeyboard(KittyKeyboardOp),
+}
+
+impl ParserEvent {
+    pub fn is_shell_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::PromptStart | Self::PromptEnd | Self::CommandStart(_) | Self::CommandEnd { .. }
+        )
+    }
 }
 
 /// Longest accepted OSC 10/11/12 color spec. X11 names and rgb: forms are
@@ -392,6 +403,7 @@ pub enum MouseEncoding {
 }
 
 pub struct Parser {
+    marker_clock: ShellMarkerClock,
     state: State,
     passthrough: Vec<u8>,
     ground_utf8_tail: GroundUtf8Tail,
@@ -544,6 +556,7 @@ impl Parser {
 
     pub fn with_config(config: ParserConfig) -> Self {
         Parser {
+            marker_clock: ShellMarkerClock::default(),
             state: State::default(),
             passthrough: Vec::with_capacity(4096),
             ground_utf8_tail: GroundUtf8Tail::default(),
@@ -564,7 +577,10 @@ impl Parser {
 
     /// Reset stream and reporting state while retaining the live color owner.
     pub fn reset_with_config(&mut self, config: ParserConfig) {
-        *self = Self::with_config(config).with_live_terminal_colors(self.live_terminal_colors);
+        let mut parser =
+            Self::with_config(config).with_live_terminal_colors(self.live_terminal_colors);
+        std::mem::swap(&mut self.marker_clock, &mut parser.marker_clock);
+        *self = parser;
     }
 
     fn finish_osc(&self, payload: &[u8], terminator: &[u8], events: &mut Vec<ParserEvent>) {
@@ -680,6 +696,33 @@ impl Parser {
     }
 
     pub fn feed(&mut self, data: &[u8], events: &mut Vec<ParserEvent>) {
+        self.feed_inner(data, events, &mut |_| {});
+    }
+
+    /// Add one source position per shell lifecycle event, in event order.
+    /// Byte and display events may be coalesced without invalidating the positions.
+    pub fn feed_with_marker_positions(
+        &mut self,
+        data: &[u8],
+        events: &mut Vec<ParserEvent>,
+        positions: &mut Vec<Option<ShellMarkerPosition>>,
+    ) {
+        self.feed_inner(data, events, &mut |position| positions.push(position));
+    }
+
+    /// Account for an opaque segment consumed by the PTY frontend before
+    /// parsing. Call for the original length, even if the segment was dropped.
+    pub fn skip_source_bytes(&mut self, len: usize) {
+        let _ = self.marker_clock.begin_feed(len);
+    }
+
+    fn feed_inner(
+        &mut self,
+        data: &[u8],
+        events: &mut Vec<ParserEvent>,
+        position: &mut impl FnMut(Option<ShellMarkerPosition>),
+    ) {
+        let source_base = self.marker_clock.begin_feed(data.len());
         self.passthrough.clear();
 
         macro_rules! flush {
@@ -688,6 +731,24 @@ impl Parser {
                     events.push(ParserEvent::Bytes(std::mem::take(&mut self.passthrough)));
                 }
             };
+        }
+
+        macro_rules! finish_osc {
+            ($payload:expr, $terminator:expr, $end:expr) => {{
+                flush!();
+                let first = events.len();
+                self.finish_osc(&$payload, $terminator, events);
+                if events
+                    .get(first)
+                    .is_some_and(ParserEvent::is_shell_lifecycle)
+                {
+                    let end = source_base.map(|base| base + $end as u64);
+                    position(
+                        self.marker_clock
+                            .osc(end, $payload.len(), $terminator.len() == 1),
+                    );
+                }
+            }};
         }
 
         macro_rules! hard_reset {
@@ -1087,8 +1148,7 @@ impl Parser {
                     0x07 => {
                         let payload = std::mem::take(buf);
                         self.state = State::Ground;
-                        flush!();
-                        self.finish_osc(&payload, b"\x07", events);
+                        finish_osc!(payload, b"\x07", i);
                     }
                     0x1b => {
                         let payload = std::mem::take(buf);
@@ -1110,8 +1170,7 @@ impl Parser {
                     if b == b'\\' {
                         let payload = std::mem::take(payload);
                         self.state = State::Ground;
-                        flush!();
-                        self.finish_osc(&payload, b"\x1b\\", events);
+                        finish_osc!(payload, b"\x1b\\", i);
                     } else {
                         // ESC followed by a non-ST byte aborts the incomplete
                         // OSC. Do not accept its payload (especially OSC 133),
@@ -1562,6 +1621,43 @@ fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn marker_positions_count_original_bytes_through_fragmentation_and_skips() {
+        let prefix = b"prefix\x1b]133;A\x07$ \x1b]133;B\x1b\\";
+        let start = b"\x1b]133;C;id=run;command=fixture\x07";
+        let output = b"\x1b[31mraw result\x1b[0m";
+        let opaque = b"\x1b_opaque string\x1b\\";
+        let done = b"\x1b]133;D;0;id=run\x1b\\";
+        let input = [prefix.as_slice(), start, output].concat();
+        for split in 0..=input.len() {
+            let mut parser = super::Parser::new();
+            let mut events = Vec::new();
+            let mut positions = Vec::new();
+            for bytes in [&input[..split], &input[split..]] {
+                parser.feed_with_marker_positions(bytes, &mut events, &mut positions);
+            }
+            parser.skip_source_bytes(opaque.len());
+            parser.feed_with_marker_positions(done, &mut events, &mut positions);
+            let lifecycle = events
+                .iter()
+                .filter(|event| event.is_shell_lifecycle())
+                .count();
+            assert_eq!(lifecycle, positions.len());
+            let markers = positions.into_iter().collect::<Option<Vec<_>>>().unwrap();
+            assert_eq!(markers[2].sequence(), 3);
+            assert_eq!(
+                markers[2].packet_bytes(),
+                prefix.len() as u64..(prefix.len() + start.len()) as u64
+            );
+            assert_eq!(markers[3].sequence(), 4);
+            let end_start = (input.len() + opaque.len()) as u64;
+            assert_eq!(
+                markers[3].packet_bytes(),
+                end_start..end_start + done.len() as u64
+            );
+        }
+    }
+
     use super::*;
 
     fn collect_bytes(events: &[ParserEvent]) -> Vec<u8> {
