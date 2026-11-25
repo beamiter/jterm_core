@@ -2,6 +2,7 @@
 
 use crate::child_lifecycle::{observe_child_exit, ChildExitOutcome};
 use crate::exit_status::ExitTail;
+use std::cell::Cell;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -12,6 +13,58 @@ pub enum ReadOutcome {
     WouldBlock,
     Eof,
     Hangup,
+}
+
+type FirstOutputCallbacks = Vec<Box<dyn FnOnce()>>;
+
+/// A one-shot notification from the live PTY reader. Rendered diagnostics,
+/// history replay and empty reads do not count as child output.
+pub struct FirstPtyOutput(Cell<Option<FirstOutputCallbacks>>);
+
+impl Default for FirstPtyOutput {
+    fn default() -> Self {
+        Self(Cell::new(Some(Vec::new())))
+    }
+}
+
+impl FirstPtyOutput {
+    pub fn connect(&self, callback: impl FnOnce() + 'static) {
+        if let Some(mut callbacks) = self.0.take() {
+            callbacks.push(Box::new(callback));
+            self.0.set(Some(callbacks));
+        } else {
+            callback();
+        }
+    }
+
+    pub fn observe(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            if let Some(callbacks) = self.0.take() {
+                for callback in callbacks {
+                    callback();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn first_pty_output_ignores_empty_reads_and_settles_once() {
+    use std::rc::Rc;
+
+    let signal = FirstPtyOutput::default();
+    let calls = Rc::new(Cell::new(0));
+    let early = calls.clone();
+    signal.connect(move || early.set(early.get() + 1));
+    signal.observe(b"");
+    assert_eq!(calls.get(), 0);
+    signal.observe(b"banner");
+    signal.observe(b"shell output");
+    assert_eq!(calls.get(), 1);
+    let late = calls.clone();
+    signal.connect(move || late.set(late.get() + 1));
+    assert_eq!(calls.get(), 2);
 }
 
 /// Read a nonblocking master without mistaking a temporarily closed slave
