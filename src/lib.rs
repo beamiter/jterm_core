@@ -20,6 +20,7 @@ pub mod child_env;
 pub mod click_cursor;
 pub mod command_correction;
 pub mod command_history;
+pub mod completed_history;
 pub mod cross_block_search;
 pub mod desktop_sessions;
 pub mod developer_workspace;

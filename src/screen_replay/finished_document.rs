@@ -92,6 +92,16 @@ pub struct CapturedExecutionSource {
     pub capture_size: (u16, u16),
 }
 
+impl CapturedExecutionSource {
+    pub fn execution_id(&self) -> Uuid {
+        self.execution.execution_id
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        self.execution.valid() && self.capture_size.0 > 0 && self.capture_size.1 > 0
+    }
+}
+
 impl std::fmt::Display for CapturedExecutionSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let execution = &self.execution;
