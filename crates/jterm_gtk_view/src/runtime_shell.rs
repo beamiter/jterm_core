@@ -89,6 +89,15 @@ impl RuntimeShell {
         admit_configured_shell(argv, host_bridge, None)
     }
 
+    /// Preserve the pane's saved jsh session before the frontend applies a
+    /// host bridge that changes the outer executable and its argument list.
+    pub fn configured_shell_argv<'a>(
+        argv: &'a [String],
+        session_id: &str,
+    ) -> Option<std::borrow::Cow<'a, [String]>> {
+        with_jsh_session(argv, session_id)
+    }
+
     pub fn admits_candidate(argv: &[String], host_bridge: bool) -> bool {
         admit_local_argv(
             argv,
