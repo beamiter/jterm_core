@@ -1,7 +1,7 @@
 use std::{
     cell::OnceCell,
     ffi::{CString, OsString},
-    os::fd::BorrowedFd,
+    os::fd::{BorrowedFd, RawFd},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, MutexGuard, TryLockError, Weak},
@@ -213,6 +213,27 @@ impl RuntimeShell {
                 &env,
             ),
         }?;
+        session.enable_primary_reflow();
+        Ok(Self::new(session))
+    }
+
+    /// Open the shared PTY for a host bridge that forwards one directory fd.
+    pub fn spawn_forwarded_pane_command(
+        argv: &[String],
+        directory: BorrowedFd<'_>,
+        child_fd: RawFd,
+        environment: Vec<CString>,
+    ) -> Result<Rc<Self>, String> {
+        let argv = argv.iter().map(OsString::from).collect::<Vec<_>>();
+        let env = runtime_environment(environment)?;
+        let mut session = Session::spawn_command_with_forwarded_fd(
+            INITIAL_ROWS,
+            INITIAL_COLUMNS,
+            &argv,
+            directory,
+            child_fd,
+            &env,
+        )?;
         session.enable_primary_reflow();
         Ok(Self::new(session))
     }

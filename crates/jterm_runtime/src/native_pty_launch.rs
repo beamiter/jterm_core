@@ -44,6 +44,19 @@ pub struct PtyLaunch<'a> {
     pub parent_death_signal: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardedFd<'a> {
+    pub source: BorrowedFd<'a>,
+    pub child_fd: RawFd,
+}
+
+#[derive(Default)]
+struct ChildDescriptors<'a> {
+    inherited: &'a [BorrowedFd<'a>],
+    close_in_child: Option<BorrowedFd<'a>>,
+    forwarded: Option<ForwardedFd<'a>>,
+}
+
 #[derive(Debug)]
 pub enum PtyLaunchError {
     Prepare(io::Error),
@@ -153,18 +166,23 @@ impl Drop for PendingChild {
 }
 
 pub fn launch_pty(spec: PtyLaunch<'_>) -> Result<PendingPty, PtyLaunchError> {
-    launch_with_inherited_fds(spec, &[], None, None, None)
+    launch_with_inherited_fds(spec, ChildDescriptors::default(), None, None)
 }
 
 /// Preserve the standalone runtime's isolated descriptor and signal policy.
 #[cfg(all(target_os = "linux", feature = "linux-pty"))]
-pub(crate) fn launch_standalone_pty(spec: PtyLaunch<'_>) -> Result<PendingPty, PtyLaunchError> {
+pub(crate) fn launch_standalone_pty(
+    spec: PtyLaunch<'_>,
+    forwarded: Option<ForwardedFd<'_>>,
+) -> Result<PendingPty, PtyLaunchError> {
     // Preserve execvp's executable-text fallback in the same child.
     let executable = spec.executable.to_owned();
     launch_with_inherited_fds(
         spec,
-        &[],
-        None,
+        ChildDescriptors {
+            forwarded,
+            ..ChildDescriptors::default()
+        },
         Some(descriptor_ceiling()?),
         Some(std::slice::from_ref(&executable)),
     )
@@ -172,13 +190,22 @@ pub(crate) fn launch_standalone_pty(spec: PtyLaunch<'_>) -> Result<PendingPty, P
 
 fn launch_with_inherited_fds(
     spec: PtyLaunch<'_>,
-    inherited: &[BorrowedFd<'_>],
-    close_in_child: Option<BorrowedFd<'_>>,
+    descriptors: ChildDescriptors<'_>,
     isolated_fd_ceiling: Option<RawFd>,
     search: Option<&[CString]>,
 ) -> Result<PendingPty, PtyLaunchError> {
     if spec.argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "PTY argv is empty").into());
+    }
+    let ChildDescriptors {
+        inherited,
+        close_in_child,
+        forwarded,
+    } = descriptors;
+    if forwarded.is_some_and(|fd| {
+        fd.source.as_raw_fd() <= libc::STDERR_FILENO || fd.child_fd <= libc::STDERR_FILENO
+    }) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid forwarded PTY fd").into());
     }
     require_waitable_sigchld()?;
     let argv = exec_pointers(spec.argv);
@@ -196,10 +223,16 @@ fn launch_with_inherited_fds(
     // one another's status writers before they are closed in the parent.
     let registration = lock_registration();
     let (master, slave) = pty_pair(spec.rows, spec.columns)?;
-    let (status_reader, status_writer) = startup_status::channel()?;
+    let (status_reader, mut status_writer) = startup_status::channel()?;
+    if forwarded.is_some_and(|fd| fd.child_fd == status_writer.as_raw_fd()) {
+        // Keep the CLOEXEC startup pipe private even when its original slot
+        // is the one the launched bridge requests.
+        status_writer = status_writer.try_clone()?;
+    }
     #[cfg(target_os = "linux")]
     let retained = isolated_fd_ceiling.map(|_| {
         let mut fds = inherited.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+        fds.extend(forwarded.map(|fd| fd.child_fd));
         fds.push(status_writer.as_raw_fd());
         fds.sort_unstable();
         fds.dedup();
@@ -230,16 +263,21 @@ fn launch_with_inherited_fds(
                 &status_writer,
             );
             attach_child_pty(slave.as_raw_fd(), spec.directory, &status_writer);
+            if let Some(fd) = forwarded {
+                let source = fd.source.as_raw_fd();
+                if libc::dup2(source, fd.child_fd) < 0 {
+                    child_failed(&status_writer, StartupStage::ShellIdentity);
+                }
+                // dup2 leaves CLOEXEC unchanged when the source and target
+                // are the same descriptor.
+                inherit_child_fd(fd.child_fd, &status_writer);
+            }
             #[cfg(target_os = "linux")]
             if let (Some(ceiling), Some(retained)) = (isolated_fd_ceiling, retained.as_deref()) {
                 close_unlisted_descriptors(retained, ceiling);
             }
             for fd in inherited {
-                let fd = fd.as_raw_fd();
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    child_failed(&status_writer, StartupStage::ShellIdentity);
-                }
+                inherit_child_fd(fd.as_raw_fd(), &status_writer);
             }
             if let (Some(candidates), Some(shell_argv)) = (search, shell_argv.as_mut()) {
                 status_writer.entering_exec();
@@ -259,6 +297,15 @@ fn launch_with_inherited_fds(
     drop(instance_lock);
     drop(registration);
     pending.confirm(status_reader, STARTUP_TIMEOUT)
+}
+
+/// # Safety
+/// The forked child owns the open descriptor.
+unsafe fn inherit_child_fd(fd: RawFd, status: &StartupWriter) {
+    let flags = libc::fcntl(fd, libc::F_GETFD);
+    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+        child_failed(status, StartupStage::ShellIdentity);
+    }
 }
 
 /// # Safety

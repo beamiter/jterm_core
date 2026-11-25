@@ -394,6 +394,44 @@ pub fn wrap_argv(argv: &[String], cwd: Option<&str>, env_extra: &[(&str, &str)])
     wrap_argv_for(is_flatpak(), argv, cwd, env_extra)
 }
 
+#[cfg(target_os = "linux")]
+pub const FLATPAK_VALIDATION_DIRECTORY_FD: std::os::fd::RawFd = 9;
+
+// The received descriptor can belong to a sandbox bind mount, outside the
+// host's mount tree. Reopen its current path in the host namespace and compare
+// both open descriptors before entering. The trailing slash requires a
+// directory, and both handles are retired before executing the user's command.
+#[cfg(target_os = "linux")]
+const PINNED_VALIDATION_LAUNCHER: &str = r#"fail() {
+    printf '%s\n' 'Could not enter the pinned validation directory on the host.' >&2
+    exit 126
+}
+directory=$(PATH=/usr/bin:/bin:/run/current-system/sw/bin readlink -n /proc/self/fd/9 && printf .) || fail
+directory=${directory%.}
+case $directory in /*) ;; *) fail ;; esac
+{
+    [ /proc/self/fd/8 -ef /proc/self/fd/9 ] || fail
+    CDPATH= cd -P /proc/self/fd/8 || fail
+    exec "$@" 8<&- 9<&-
+} 8<"$directory/" || fail
+"#;
+
+/// Build the host command for Flatpak validation. The local PTY must forward
+/// the already verified worktree directory using `FLATPAK_VALIDATION_DIRECTORY_FD`.
+#[cfg(target_os = "linux")]
+pub fn wrap_pinned_validation_argv(argv: &[String], env_extra: &[(&str, &str)]) -> Vec<String> {
+    let mut wrapped = wrap_argv_for(true, &[], Some("/"), env_extra);
+    wrapped.extend([
+        format!("--forward-fd={FLATPAK_VALIDATION_DIRECTORY_FD}"),
+        "/bin/sh".into(),
+        "-c".into(),
+        PINNED_VALIDATION_LAUNCHER.into(),
+        "jterm-flatpak-validation".into(),
+    ]);
+    wrapped.extend_from_slice(argv);
+    wrapped
+}
+
 /// Prepare the approved attachment relay and the cwd of its local PTY child.
 /// A Flatpak host directory belongs to the bridged process. The local bridge
 /// starts in the sandbox root even when the project is invisible there.

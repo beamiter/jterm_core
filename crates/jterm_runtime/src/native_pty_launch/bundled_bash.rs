@@ -71,8 +71,11 @@ pub(crate) fn launch_bundled_bash(spec: BundledBash<'_>) -> Result<PendingPty, P
             columns: spec.columns,
             parent_death_signal: false,
         },
-        &[token_reader.as_fd(), script_file.as_fd()],
-        Some(token_writer.as_fd()),
+        super::ChildDescriptors {
+            inherited: &[token_reader.as_fd(), script_file.as_fd()],
+            close_in_child: Some(token_writer.as_fd()),
+            ..super::ChildDescriptors::default()
+        },
         None,
         None,
     )?;

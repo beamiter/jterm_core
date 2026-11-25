@@ -6,11 +6,12 @@ use crate::child_lifecycle::{
 };
 use crate::exit_status::{ExitTail, PtyExit};
 use crate::native_pty_launch::{
-    launch_bundled_bash, launch_standalone_pty, BundledBash, PendingPty, PtyLaunch, PtyLaunchError,
-    WorkingDirectory,
+    launch_bundled_bash, launch_standalone_pty, BundledBash, ForwardedFd, PendingPty, PtyLaunch,
+    PtyLaunchError, WorkingDirectory,
 };
 #[cfg(test)]
 use crate::pty_io::bounded_write;
+use crate::pty_reader::move_above_stdio;
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{SessionActor, SessionEvent};
 use crate::supervised::require_waitable_sigchld;
@@ -25,7 +26,7 @@ use std::{
     ffi::OsString,
     io::{self, Cursor, Read},
     num::NonZeroU64,
-    os::fd::BorrowedFd,
+    os::fd::{AsFd, BorrowedFd, RawFd},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -499,7 +500,7 @@ impl Session {
             "/bin/sh".into(),
             &[("TERM", "dumb"), ("PS1", "$ "), ("ENV", "/dev/null")],
         )?;
-        Self::spawn_program(terminal, command.spec(rows as u16, cols as u16))
+        Self::spawn_program(terminal, command.spec(rows as u16, cols as u16), None)
     }
 
     /// Explicitly launch the local user's installed jsh with output observation.
@@ -515,7 +516,7 @@ impl Session {
             .ok_or("jsh executable not found on the application PATH")?;
         let command = Program::interactive(path, &[("TERM", "xterm")])?;
         terminal.observe_command_blocks();
-        Self::spawn_program(terminal, command.spec(rows as u16, cols as u16))
+        Self::spawn_program(terminal, command.spec(rows as u16, cols as u16), None)
     }
 
     /// Start one local PTY using the caller's prepared command and environment.
@@ -542,7 +543,8 @@ impl Session {
             return Err("PTY working directory is not a directory".into());
         }
         let command = Program::command(argv, &cwd, env)?;
-        let mut session = Self::spawn_program(terminal, command.spec(rows as u16, cols as u16))?;
+        let mut session =
+            Self::spawn_program(terminal, command.spec(rows as u16, cols as u16), None)?;
         session.enable_ordered_input();
         Ok(session)
     }
@@ -566,7 +568,36 @@ impl Session {
         let command = Program::command(argv, Path::new("/"), env)?;
         let mut spec = command.spec(rows as u16, cols as u16);
         spec.directory = WorkingDirectory::Descriptor(directory);
-        let mut session = Self::spawn_program(terminal, spec)?;
+        let mut session = Self::spawn_program(terminal, spec, None)?;
+        session.enable_ordered_input();
+        Ok(session)
+    }
+
+    /// Start the sandbox-side PTY bridge from `/` with exactly one extra
+    /// descriptor at the number its protocol expects. The parent keeps its
+    /// original descriptor and flags.
+    pub fn spawn_command_with_forwarded_fd(
+        rows: usize,
+        cols: usize,
+        argv: &[OsString],
+        directory: BorrowedFd<'_>,
+        child_fd: RawFd,
+        env: &[(OsString, OsString)],
+    ) -> Result<Self, String> {
+        let terminal = Terminal::new(rows, cols)?;
+        let command = Program::command(argv, Path::new("/"), env)?;
+        let forwarded = directory
+            .try_clone_to_owned()
+            .and_then(move_above_stdio)
+            .map_err(|error| format!("could not pin PTY bridge descriptor: {error}"))?;
+        let mut session = Self::spawn_program(
+            terminal,
+            command.spec(rows as u16, cols as u16),
+            Some(ForwardedFd {
+                source: forwarded.as_fd(),
+                child_fd,
+            }),
+        )?;
         session.enable_ordered_input();
         Ok(session)
     }
@@ -598,10 +629,14 @@ impl Session {
         Ok(session)
     }
 
-    fn spawn_program(terminal: Terminal, spec: PtyLaunch<'_>) -> Result<Self, String> {
+    fn spawn_program(
+        terminal: Terminal,
+        spec: PtyLaunch<'_>,
+        forwarded: Option<ForwardedFd<'_>>,
+    ) -> Result<Self, String> {
         require_waitable_sigchld().map_err(|error| error.to_string())?;
         let lease = reaper::global()?.reserve()?;
-        let pending = launch_standalone_pty(spec).map_err(launch_error)?;
+        let pending = launch_standalone_pty(spec, forwarded).map_err(launch_error)?;
         Self::register_program(pending, lease, terminal)
     }
 
@@ -1333,6 +1368,53 @@ mod tests {
             .terminal()
             .visible_text()
             .contains("PINNED_DIRECTORY:isolated"));
+        session.close().unwrap();
+        await_cleanup(&session);
+    }
+
+    #[test]
+    fn forwarded_command_receives_only_the_requested_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let directory = std::fs::File::open("/tmp").unwrap();
+        let unrelated = std::fs::File::open("/").unwrap();
+        let child_fd = 9;
+        let args = [
+            "/bin/sh".into(),
+            "-c".into(),
+            concat!(
+                "test /proc/self/fd/9 -ef /tmp && test \"$PWD\" = / || exit 78; ",
+                "test ! \"/proc/self/fd/$UNRELATED_FD\" -ef / || exit 79; ",
+                "printf FORWARDED; exit 7"
+            )
+            .into(),
+        ];
+        let env = [(
+            "UNRELATED_FD".into(),
+            unrelated.as_raw_fd().to_string().into(),
+        )];
+        let mut session = Session::spawn_command_with_forwarded_fd(
+            4,
+            80,
+            &args,
+            directory.as_fd(),
+            child_fd,
+            &env,
+        )
+        .expect("launch descriptor-forwarding command");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.is_drained() {
+            assert!(
+                Instant::now() < deadline,
+                "forwarding command did not drain"
+            );
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.exit_code(), Some(7));
+        assert!(session.terminal().visible_text().contains("FORWARDED"));
+        let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
         session.close().unwrap();
         await_cleanup(&session);
     }

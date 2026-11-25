@@ -98,8 +98,10 @@ pub fn launch_hosted_pty(
             columns,
             parent_death_signal: false,
         },
-        inherited,
-        None,
+        super::ChildDescriptors {
+            inherited,
+            ..super::ChildDescriptors::default()
+        },
         Some(descriptor_ceiling()?),
         Some(&candidates),
     )?;

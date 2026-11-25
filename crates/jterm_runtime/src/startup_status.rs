@@ -1,6 +1,6 @@
 //! A private Unix fork-to-exec status pipe. Child lifetime belongs to the spawner.
 
-use crate::pty_reader::cloexec_pipe_above_stdio;
+use crate::pty_reader::{cloexec_pipe_above_stdio, move_above_stdio};
 use std::ffi::CStr;
 use std::fmt;
 use std::io;
@@ -136,6 +136,12 @@ impl AsRawFd for StartupReader {
 impl AsRawFd for StartupWriter {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
+    }
+}
+
+impl StartupWriter {
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        self.0.try_clone().and_then(move_above_stdio).map(Self)
     }
 }
 
