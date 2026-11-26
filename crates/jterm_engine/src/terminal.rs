@@ -1119,7 +1119,9 @@ impl Terminal {
             return;
         }
         let row_id = line.raw_row_id();
-        let retained = self.history.retain_latest(line, self.history_row_limit, drop);
+        let retained = self
+            .history
+            .retain_latest(line, self.history_row_limit, drop);
         if let Some(sources) = &mut self.row_sources {
             if retained {
                 sources.appended(row_id, self.history_end);
