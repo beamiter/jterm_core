@@ -14,8 +14,10 @@ authenticated Unix socket owned by the running GUI. The originating PTY
 identifies the destination even after a tab switch. Shell output and restored
 session metadata cannot request an editor. Closing an editor/tab asks Vim to
 quit and retains unsaved-buffer protection; the helper completes only after
-actual editor exit. A rejected or abandoned handoff returns failure to the
-shell rather than opening a duplicate editor.
+actual editor exit. A shell that outlives its GUI starts Vim directly on its
+own terminal when the host socket is missing or refuses the connection. Once
+the connection is established, a rejected or abandoned handoff returns
+failure to the shell.
 
 The shell first performs its usual expansions and argument quoting. A private,
 executable cache shim forwards those arguments one by one via

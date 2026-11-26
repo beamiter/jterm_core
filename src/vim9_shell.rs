@@ -61,7 +61,7 @@ impl Vim9ShellIntegration {
             // keeps precedence, and `command vim` remains an explicit bypass.
             (
                 "BASH_FUNC_vim%%".into(),
-                "() { \"$JTERM_VIM9_SHIM_DIR/vim\" \"$@\"; }".into(),
+                "() { if [ -n \"${JTERM_VIM9_SHIM_DIR-}\" ] && [ -x \"$JTERM_VIM9_SHIM_DIR/vim\" ]; then \"$JTERM_VIM9_SHIM_DIR/vim\" \"$@\"; else command vim \"$@\"; fi; }".into(),
             ),
         ];
         environment.extend(super::shell_host::host_environment()?);
@@ -179,6 +179,8 @@ mod tests {
 
     #[test]
     fn shell_environment_is_child_local_durable_and_does_not_duplicate_path() {
+        use std::os::unix::fs::PermissionsExt;
+
         let directory = std::env::temp_dir().join(format!("vim-shell-{}", uuid::Uuid::new_v4()));
         let before = std::env::var_os("PATH");
         let first = Vim9ShellIntegration::materialize(
@@ -207,6 +209,25 @@ mod tests {
                 .unwrap();
             assert!(output.status.success());
             assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "function");
+
+            let original = directory.join("original");
+            std::fs::create_dir(&original).unwrap();
+            let vim = original.join("vim");
+            std::fs::write(&vim, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+            std::fs::set_permissions(vim, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let output = std::process::Command::new("/bin/bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    "unset JTERM_VIM9_SHIM_DIR; vim --version 'with spaces'",
+                ])
+                .envs(second.env())
+                .env("PATH", original)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output);
+            assert_eq!(output.stdout, b"--version\nwith spaces\n");
         }
         std::fs::remove_dir_all(directory).unwrap();
     }

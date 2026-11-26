@@ -5,7 +5,9 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -152,7 +154,7 @@ pub fn take_shell_vim_requests() -> Vec<Vim9ShellInvocation> {
 
 /// Call before toolkit/window initialization. None keeps the standalone CLI
 /// path; Some waits for the owning GUI and returns the real editor exit code.
-/// Once handed off, transport failure is an error, never a duplicate editor.
+/// If the owning GUI is gone, run Vim on the current PTY before any handoff.
 pub fn forward_shell_vim(args: &[OsString]) -> Option<Result<i32, String>> {
     if args.first().is_none_or(|arg| arg != "--vim-shell") {
         return None;
@@ -164,7 +166,20 @@ pub fn forward_shell_vim(args: &[OsString]) -> Option<Result<i32, String>> {
             // Validate locally before connecting; the host repeats this validation.
             shell_vim_request(args).map_err(io::Error::other)?;
             let tty = std::fs::read_link("/proc/self/fd/0")?;
-            let mut stream = UnixStream::connect(socket)?;
+            let mut stream = match UnixStream::connect(socket) {
+                Ok(stream) => stream,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    // A restored or detached shell can outlive its GUI. No
+                    // request has been sent, so the original Vim can run here.
+                    return Err(Command::new(&args[1]).args(&args[3..]).exec());
+                }
+                Err(error) => return Err(error),
+            };
             stream.set_write_timeout(Some(Duration::from_secs(2)))?;
             let launch = Launch {
                 token,
@@ -195,6 +210,50 @@ pub fn forward_shell_vim(args: &[OsString]) -> Option<Result<i32, String>> {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn lost_host_runs_original_argv_and_preserves_exit_status() {
+        const CHILD: &str = "JTERM_TEST_LOST_VIM_HOST";
+        if std::env::var_os(CHILD).is_some() {
+            let args = [
+                "--vim-shell",
+                "/bin/sh",
+                "--",
+                "-c",
+                "printf '%s\\n' \"$1\"; exit 7",
+                "sh",
+                "file with spaces",
+            ]
+            .map(Into::into);
+            panic!(
+                "expected original command to replace the helper: {:?}",
+                forward_shell_vim(&args)
+            );
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("vim-shell-lost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("host.sock");
+        for refused in [false, true] {
+            if refused {
+                drop(UnixListener::bind(&socket).unwrap());
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vim9::shell_host::tests::lost_host_runs_original_argv_and_preserves_exit_status",
+                ])
+                .env(CHILD, "1")
+                .env("JTERM_VIM9_HOST_SOCKET", &socket)
+                .env("JTERM_VIM9_HOST_TOKEN", "test")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(7), "{output:?}");
+            assert!(output.stdout.ends_with(b"file with spaces\n"), "{output:?}");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn authenticated_handoff_preserves_cwd_argv_pty_and_exit_status() {
