@@ -28,6 +28,8 @@ struct Storage {
     lease: RetainedBytes,
 }
 
+// Return the original frame on a budget miss so callers can retry without allocating.
+#[allow(clippy::result_large_err)]
 impl RetainedCellFrame {
     pub fn try_retain(
         frame: CellFrame,
