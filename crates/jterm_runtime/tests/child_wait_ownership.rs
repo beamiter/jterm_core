@@ -3,6 +3,7 @@
 use jterm_runtime::pty_session::Session;
 use std::{
     mem::MaybeUninit,
+    path::Path,
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, AtomicI32, Ordering},
     thread,
@@ -60,46 +61,63 @@ fn until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+fn bundled_bash() -> Result<Session, String> {
+    Session::spawn_anvil_bash(
+        6,
+        72,
+        Path::new("/bin/bash"),
+        b"PS1='test> '\n",
+        Path::new("/"),
+        &[("HISTFILE".into(), "/dev/null".into())],
+    )
+}
+
 // This is the only test in this process because SIGCHLD is process-wide.
 #[test]
 fn separate_child_watches_leave_pty_exit_status_with_its_owner() {
     let handler = watch_child as *const () as libc::sighandler_t;
+    let launchers: [fn() -> Result<Session, String>; 2] = [|| Session::spawn(6, 72), bundled_bash];
     {
         let _restore = install_action(handler, libc::SA_RESTART | libc::SA_NOCLDSTOP);
-        let mut watched = Command::new("/bin/sh")
-            .args(["-c", "read release"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        WATCHED_PID.store(watched.id().try_into().unwrap(), Ordering::Relaxed);
+        for launch in launchers {
+            WATCHED_REAPED.store(false, Ordering::Relaxed);
+            let mut watched = Command::new("/bin/sh")
+                .args(["-c", "read release"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            WATCHED_PID.store(watched.id().try_into().unwrap(), Ordering::Relaxed);
 
-        let mut session = Session::spawn(6, 72).unwrap();
-        drop(watched.stdin.take());
-        session
-            .submit_input(b"printf 'PTY_%s\\n' WAIT_OK; exit 7\r".to_vec())
-            .unwrap();
-        until("PTY child to exit and drain", || {
-            session.drive().unwrap();
-            session.is_drained()
-        });
-        assert_eq!(session.exit_code(), Some(7));
-        assert!(session.terminal().visible_text().contains("PTY_WAIT_OK"));
-        session.close().unwrap();
-        until("PTY child cleanup", || !session.cleanup_pending());
-        until("the registered child to be reaped", || {
-            WATCHED_REAPED.load(Ordering::Acquire)
-        });
-        assert_eq!(
-            watched.try_wait().unwrap_err().raw_os_error(),
-            Some(libc::ECHILD)
-        );
+            let mut session = launch().unwrap();
+            drop(watched.stdin.take());
+            session
+                .submit_input(b"printf 'PTY_%s\\n' WAIT_OK; exit 7\r".to_vec())
+                .unwrap();
+            until("PTY child to exit and drain", || {
+                session.drive().unwrap();
+                session.is_drained()
+            });
+            assert_eq!(session.exit_code(), Some(7));
+            assert!(session.terminal().visible_text().contains("PTY_WAIT_OK"));
+            session.close().unwrap();
+            until("PTY child cleanup", || !session.cleanup_pending());
+            until("the registered child to be reaped", || {
+                WATCHED_REAPED.load(Ordering::Acquire)
+            });
+            assert_eq!(
+                watched.try_wait().unwrap_err().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
     }
 
     for (handler, flags) in [(libc::SIG_IGN, 0), (handler, libc::SA_NOCLDWAIT)] {
         let _restore = install_action(handler, flags);
-        assert_eq!(
-            Session::spawn(6, 72).err().as_deref(),
-            Some("child supervision requires a waitable SIGCHLD disposition"),
-        );
+        for launch in launchers {
+            assert_eq!(
+                launch().err().as_deref(),
+                Some("child supervision requires a waitable SIGCHLD disposition"),
+            );
+        }
     }
 }

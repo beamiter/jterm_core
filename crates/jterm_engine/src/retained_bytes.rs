@@ -59,6 +59,8 @@ impl RetainedBytesBudget {
         if bytes == 0 {
             return true;
         }
+        // Atomic::try_update is unavailable on the engine's Rust 1.86 MSRV.
+        #[allow(deprecated)]
         let Ok(previous) =
             self.retained
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {

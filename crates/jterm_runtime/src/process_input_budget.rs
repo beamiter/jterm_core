@@ -103,6 +103,8 @@ impl Charge {
         } else {
             self.budget.capacity - self.budget.reply_reserve
         };
+        // Atomic::try_update is unavailable on the runtime's Rust 1.89 MSRV.
+        #[allow(deprecated)]
         let previous = self
             .budget
             .pending
