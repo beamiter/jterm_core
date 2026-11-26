@@ -134,6 +134,17 @@ fn same_shared_table<T: ?Sized>(before: &Option<Arc<T>>, after: &Option<Arc<T>>)
     }
 }
 
+fn same_underline_runs(
+    before: Option<&Arc<[UnderlineColorRun]>>,
+    after: Option<&Arc<[UnderlineColorRun]>>,
+) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before == after,
+        (Some(runs), None) | (None, Some(runs)) => runs.is_empty(),
+        (None, None) => true,
+    }
+}
+
 pub(crate) fn underline_color_at(runs: &[UnderlineColorRun], col: usize) -> Option<Color> {
     let run = runs.get(runs.partition_point(|run| usize::from(run.end) <= col))?;
     (usize::from(run.start) <= col).then_some(run.color)
@@ -390,18 +401,18 @@ impl CellFrame {
         }
         let mut delta = Delta::new(self.stamp(), next_stamp, next.cursor, Vec::new());
         delta.hyperlinks = HyperlinkDelta::Snapshot(next.shared_hyperlinks());
+        let same_underlines = same_shared_table(&self.underline_colors, &next.underline_colors);
+        let same_annotations = same_shared_table(&self.annotations, &next.annotations);
         // Cursor-only publications keep all three immutable paint tables.
         // The snapshot of hyperlink targets and the new cursor still travel.
-        if Arc::ptr_eq(&self.rows, &next.rows)
-            && same_shared_table(&self.underline_colors, &next.underline_colors)
-            && same_shared_table(&self.annotations, &next.annotations)
-        {
+        if Arc::ptr_eq(&self.rows, &next.rows) && same_underlines && same_annotations {
             return Ok(delta);
         }
         for (index, (before, after)) in self.rows.iter().zip(next.rows.iter()).enumerate() {
             if before != after
-                || self.underline_color_runs(index) != next.underline_color_runs(index)
-                || self.row_annotations(index) != next.row_annotations(index)
+                || (!same_underlines
+                    && !same_underline_runs(self.underline_row(index), next.underline_row(index)))
+                || (!same_annotations && self.row_annotations(index) != next.row_annotations(index))
             {
                 delta.rows.push((index, after.clone()));
                 if let Some(runs) = next.underline_row(index) {

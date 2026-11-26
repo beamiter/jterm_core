@@ -5,8 +5,41 @@ use jterm_engine::{
     parser::{Event, Parser, ParserLimits, ParserProfile, PendingKind},
     protocol_state::ProtocolState,
     screen::ScreenState,
-    semantics::{dispatch_local, Dispatch, Effect},
+    semantics::{dispatch_frost_legacy_csi, dispatch_local, Dispatch, Effect},
 };
+
+#[test]
+fn frost_modify_other_keys_query_reports_effective_level_and_preserves_rendition() {
+    let mut screen = ScreenState::new(2, 8);
+    screen.current_fg = jterm_engine::Color::Red;
+    screen.current_flags.set_bold(true);
+    let rendition = screen.current_flags;
+    let mut protocol = ProtocolState::default();
+    for (level, expected) in [
+        (0, b"\x1b[>4;0m".as_slice()),
+        (1, b"\x1b[>4;1m"),
+        (2, b"\x1b[>4;2m"),
+        (65535, b"\x1b[>4;2m"),
+    ] {
+        protocol.set_xterm_modify_other_keys(level);
+        for raw in [b"4".as_slice(), b"04", b"0004"] {
+            assert_eq!(
+                dispatch_frost_legacy_csi(
+                    &mut screen,
+                    &mut protocol,
+                    raw,
+                    &[4],
+                    b'm',
+                    Some(b'?'),
+                    b""
+                ),
+                Dispatch::Handled([Effect::Reply(expected.to_vec())].into_iter().collect())
+            );
+        }
+        assert_eq!(screen.current_fg, jterm_engine::Color::Red);
+        assert_eq!(screen.current_flags, rendition);
+    }
+}
 
 struct Session {
     parser: Parser,

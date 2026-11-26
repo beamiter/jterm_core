@@ -109,7 +109,6 @@ fn device_answer(event: &Event<'_>) -> Option<&'static [u8]> {
         (Some(b'>'), b'c', [] | [0]) => Some(b"\x1b[>0;0;0c"),
         (Some(b'='), b'c', [] | [0]) => Some(b"\x1bP!|00000000\x1b\\"),
         (Some(b'>'), b'q', [] | [0]) => Some(b"\x1bP>|jterm\x1b\\"),
-        (Some(b'?'), b'm', [4]) => Some(b"\x1b[>4;0m"),
         _ => None,
     }
 }

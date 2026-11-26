@@ -25,6 +25,11 @@ pub enum Dispatch {
     Handled(Effects),
 }
 
+fn modify_other_keys_reply(protocol: &ProtocolState) -> Vec<u8> {
+    // The encoder treats all nonzero levels above one as level two.
+    format!("\x1b[>4;{}m", protocol.xterm_modify_other_keys().min(2)).into_bytes()
+}
+
 pub(crate) struct UnderlinePen {
     pub current: Color,
     pub primary: Option<Color>,
@@ -199,6 +204,11 @@ pub fn dispatch_frost_legacy_csi(
             }
             (!response.is_empty()).then(|| response.into_bytes())
         }
+        (b'm', Some(b'?'), b"", Some(4))
+            if params == [4] && raw_params.iter().all(u8::is_ascii_digit) =>
+        {
+            Some(modify_other_keys_reply(protocol))
+        }
         (b'm', Some(b'>'), b"", _) => {
             set_xterm_modify_other_keys(protocol, params);
             None
@@ -271,6 +281,19 @@ pub(crate) fn dispatch_local_with_underline(
 ) -> Dispatch {
     let mut effects = Effects::new();
     match event {
+        Event::Csi {
+            params,
+            colon_flags,
+            private_prefix: Some(b'?'),
+            intermediates,
+            final_byte: b'm',
+            ..
+        } if params.as_slice() == [4]
+            && !colon_flags.iter().any(|colon| *colon)
+            && intermediates.is_empty() =>
+        {
+            effects.push(Effect::Reply(modify_other_keys_reply(protocol)));
+        }
         Event::Csi {
             private_prefix,
             intermediates,

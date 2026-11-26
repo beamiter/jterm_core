@@ -1119,6 +1119,40 @@ fn immutable_capture_shares_idle_and_unchanged_rows() {
 }
 
 #[test]
+fn modify_other_keys_query_tracks_the_encoder_without_painting() {
+    for device_answers in [false, true] {
+        for chunk in 1..=8 {
+            let mut terminal = Terminal::new(2, 12).unwrap();
+            if device_answers {
+                terminal.enable_device_answers();
+            }
+            terminal.feed(b"\x1b[31;44;1mX").unwrap();
+            let before = terminal.frame().unwrap();
+            let rendition = terminal.vt.screen.current_flags;
+            for (level, effective) in [(0, 0), (1, 1), (2, 2), (65535, 2), (0, 0)] {
+                let stream = format!("\x1b[>4;{level}m\x1b[?04m");
+                let mut reply = Vec::new();
+                for bytes in stream.as_bytes().chunks(chunk) {
+                    reply.extend(terminal.feed(bytes).unwrap());
+                }
+                assert_eq!(reply, format!("\x1b[>4;{effective}m").as_bytes());
+                assert_eq!(terminal.frame().unwrap(), before);
+                assert_eq!(terminal.vt.screen.current_flags, rendition);
+                let encoded = terminal.encode_key("a", false, false, true).unwrap();
+                assert_eq!(
+                    encoded,
+                    if effective == 2 {
+                        b"\x1b[27;5;97~".as_slice()
+                    } else {
+                        b"\x01"
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn nonpaint_output_keeps_the_frame_revision_and_the_next_delta_base() {
     let mut terminal = Terminal::new(3, 20).unwrap();
     terminal.enable_device_answers();
