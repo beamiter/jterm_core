@@ -12,6 +12,8 @@ FAMILY = ENGINE.parents[2] if ENGINE.parent.name == 'crates' else ENGINE.parent
 
 
 class BoundaryTests(unittest.TestCase):
+    aether_checkout = FAMILY / 'aether'
+
     def test_dependency_direction(self):
         manifest = tomllib.loads((ENGINE / 'Cargo.toml').read_text())
         self.assertFalse(manifest['package']['publish'])
@@ -391,7 +393,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('if let Some(printed) = effect.printed', state)
 
     def test_aether_uses_the_shared_pty_and_terminal_owners(self):
-        adapter = (FAMILY / 'aether/session/src/lib.rs').read_text()
+        adapter = (self.aether_checkout / 'session/src/lib.rs').read_text()
         self.assertIn('pub use jterm_engine::terminal::{HistoryPage, Terminal};', adapter)
         self.assertIn('pub use jterm_runtime::pty_session::Session;', adapter)
         self.assertNotRegex(adapter, r'\b(?:struct (?:Terminal|Session)|openpty|waitpid)\b')
@@ -865,7 +867,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine-only', action='store_true',
                         help='check pure crate boundaries without frontend checkouts')
+    parser.add_argument('--aether-checkout', type=Path, default=FAMILY / 'aether',
+                        help='use an isolated Aether worktree for consumer checks')
     args = parser.parse_args()
+    BoundaryTests.aether_checkout = args.aether_checkout.resolve()
     if args.engine_only:
         suite = unittest.TestSuite(BoundaryTests(name) for name in (
             'test_dependency_direction', 'test_storage_vectors_remain_private'))

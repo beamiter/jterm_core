@@ -141,6 +141,21 @@ class EngineRoutingTests(unittest.TestCase):
              patch.object(runner.subprocess, 'run', side_effect=run):
             self.assertEqual(runner.main(), 0)
 
+    def test_aether_candidate_uses_the_selected_worktree(self):
+        worktree = self.family / 'aether-candidate'
+        for crate in ('src-tauri', 'bridge', 'session'):
+            self.crate(worktree / crate, crate)
+
+        def run(command, cwd, env):
+            self.assertEqual((Path(cwd) / 'src').resolve(), worktree / 'src-tauri/src')
+            self.assertFalse((Path(cwd) / 'Cargo.lock').is_symlink())
+            return type('Result', (), {'returncode': 0})()
+
+        with patch.object(runner, '__file__', str(self.script)), \
+             patch.object(sys, 'argv', [str(RUNNER), '--aether-checkout', str(worktree), 'aether', 'check']), \
+             patch.object(runner.subprocess, 'run', side_effect=run):
+            self.assertEqual(runner.main(), 0)
+
     def test_aether_desktop_workspace_dependency_mirrors_one_core_tree(self):
         source = self.family / 'aether'
         for name in ('session', 'bridge'):

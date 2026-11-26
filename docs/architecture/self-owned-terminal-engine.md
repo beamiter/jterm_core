@@ -169,7 +169,7 @@ Production fragmentation snapshots retain separately named protocol lanes.
 This completes that narrow protocol/input slice, not full VT parsing, live
 screen/history ownership or a cross-frontend renderer.
 
-## Live screen operations and shared Frost cells
+## Live screen state in Ember and Frost
 
 Ember stores its only live active/hidden grids and drawing state in ScreenState.
 Engine row writes, wide edits, erasure and cursor operations return immediate
@@ -177,10 +177,13 @@ row effects with identity and distinct changed/printed spans. Host retains
 structural scrolling/history/resize, graphics, row allocation and provenance.
 Pre-extraction row goldens establish compatibility independently of new code.
 
-Frost now reuses cell/style/color/cursor and opaque hyperlink types and a single
-engine grid backing store, retaining its row identity revision, scrollback format, streaming
-search and richer keyboard policies. These differences need explicit adapters
-before storage or parser convergence; the migration is not a wholesale swap.
+The Frost candidate also stores both live grids and their drawing state in
+`ScreenState`. Its grid adapter travels with the row identity revision when
+the screens swap. The shared state holds cursor and saved cursor positions,
+margins, deferred wrap, tab stops, charset, pen, and the current hyperlink.
+Renderers read this state directly. Frost keeps its live DECAWM flag when it
+restores the cursor drawing. The host owns Frost's alternate-screen settings,
+projection, history admission, and effect delivery.
 
 ## Incremental parser ownership
 
