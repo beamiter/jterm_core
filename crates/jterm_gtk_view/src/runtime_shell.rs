@@ -442,6 +442,12 @@ impl RuntimeShell {
         (state.session.child_pid() == Some(pid)).then_some(value)
     }
 
+    pub(crate) fn foreground_is_inline_codex(&self) -> bool {
+        self.state.try_lock().is_ok_and(|state| {
+            !state.session.terminal().alternate_screen_active() && state.session.foreground_is_codex()
+        })
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
         self.lock().ok()?.session.exit_code()
     }

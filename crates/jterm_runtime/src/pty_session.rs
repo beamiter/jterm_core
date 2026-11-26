@@ -10,6 +10,7 @@ use crate::native_pty_launch::{
     PtyLaunchError, WorkingDirectory,
 };
 use crate::process_input_budget::{shared_budget, Charge};
+use crate::process_stat::process_stat;
 #[cfg(test)]
 use crate::pty_io::bounded_write;
 use crate::pty_reader::move_above_stdio;
@@ -41,6 +42,68 @@ use input_queue::InputQueue;
 pub use prepared::PreparedPty;
 use program::Program;
 use transport::Transport;
+
+fn codex_executable(executable: &Path, argv: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = executable.file_name().and_then(|name| name.to_str());
+    if name == Some("codex") {
+        return true;
+    }
+    if !matches!(name, Some("node" | "nodejs")) {
+        return false;
+    }
+    // The official npm wrapper is an actual node executable with codex.js as
+    // its script. Require that position, not an arbitrary argument substring.
+    let mut arguments = argv.split(|byte| *byte == 0);
+    let _ = arguments.next();
+    let Some(script) = arguments.next() else {
+        return false;
+    };
+    Path::new(std::ffi::OsStr::from_bytes(script))
+        .file_name()
+        .is_some_and(|name| name == "codex.js")
+}
+
+fn foreground_codex_program(pid: i32) -> bool {
+    use std::fs::{read_link, File};
+
+    let Ok(executable) = read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    if codex_executable(&executable, &[]) {
+        return true;
+    }
+    if !matches!(
+        executable.file_name().and_then(|name| name.to_str()),
+        Some("node" | "nodejs")
+    ) {
+        return false;
+    }
+    let Ok(file) = File::open(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let mut argv = Vec::new();
+    if file.take(4097).read_to_end(&mut argv).is_err() || argv.len() > 4096 {
+        return false;
+    }
+    codex_executable(&executable, &argv)
+}
+
+#[cfg(test)]
+#[test]
+fn foreground_codex_program_requires_executable_and_exact_npm_script() {
+    let is_codex = |exe, argv: &[u8]| codex_executable(Path::new(exe), argv);
+    assert!(is_codex("/opt/codex", b"codex\0--no-alt-screen\0"));
+    assert!(is_codex(
+        "/usr/bin/node",
+        b"node\0/opt/@openai/codex/bin/codex.js\0"
+    ));
+    assert!(!is_codex("/usr/bin/bash", b"codex\0"));
+    assert!(!is_codex("/usr/bin/node", b"node\0parent.js\0codex.js\0"));
+    assert!(!is_codex("/usr/bin/node", b"node\0codex.js.bak\0"));
+    assert!(!is_codex("/usr/bin/less", b"less\0codex\0"));
+}
 
 const INPUT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(2);
 const BOUNDARY_STALLED: &str = "logical input boundary stalled; input disabled until shell closes";
@@ -861,6 +924,31 @@ impl Session {
 
     pub fn input_idle(&self) -> bool {
         self.input.is_empty() && self.input_boundary.is_none()
+    }
+
+    /// Read-only UI hint for an inline Codex reader. Require the actual
+    /// PTY's foreground group and the live child session; output text and
+    /// shell-reported escape sequences cannot acquire this local binding.
+    pub fn foreground_is_codex(&self) -> bool {
+        let Some(child) = self.child_pid() else {
+            return false;
+        };
+        let Some(io) = &self.io else {
+            return false;
+        };
+        let Some(group) = io.actor.foreground_pgid() else {
+            return false;
+        };
+        let observed = process_stat(child)
+            .zip(process_stat(group))
+            .is_some_and(|(owner, process)| {
+                owner.is_live()
+                    && process.is_live()
+                    && owner.session == process.session
+                    && process.process_group == group
+                    && process.foreground_group == group
+            });
+        observed && foreground_codex_program(group) && io.actor.foreground_pgid() == Some(group)
     }
 
     /// Both the integrated prompt and the kernel foreground group must still

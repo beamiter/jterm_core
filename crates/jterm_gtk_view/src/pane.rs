@@ -1891,6 +1891,22 @@ impl<P: Pty> TerminalPane<P> {
         true
     }
 
+    fn inline_codex_history(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if std::env::var_os("JTERM_AGENT_SCROLLBACK").is_some_and(|value| value == "0")
+                || matches!(self.input_style, InputStyle::HostedAttachment { .. })
+                || self.history_rail.borrow().extent.is_empty()
+            {
+                return false;
+            }
+            self.runtime()
+                .is_some_and(|runtime| runtime.foreground_is_inline_codex())
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     fn scroll_key(&self, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
         use gdk::ModifierType;
         if modifiers.intersects(
@@ -1903,23 +1919,28 @@ impl<P: Pty> TerminalPane<P> {
             return false;
         }
         let shifted = modifiers.contains(ModifierType::SHIFT_MASK);
-        if !shifted
-            && !(matches!(
+        if !shifted {
+            let page_key = matches!(
+                key,
+                gdk::Key::Page_Up
+                    | gdk::Key::Page_Down
+                    | gdk::Key::KP_Page_Up
+                    | gdk::Key::KP_Page_Down
+            );
+            if !page_key {
+                return false;
+            }
+            let fixed_inline = matches!(
                 self.input_style,
                 InputStyle::HostedAttachment {
                     inline_history: true
                 } | InputStyle::InlineTask {
                     inline_history: true
                 }
-            ) && matches!(
-                key,
-                gdk::Key::Page_Up
-                    | gdk::Key::Page_Down
-                    | gdk::Key::KP_Page_Up
-                    | gdk::Key::KP_Page_Down
-            ) && self.inspect(Terminal::alternate_screen_active) == Ok(false))
-        {
-            return false;
+            ) && self.inspect(Terminal::alternate_screen_active) == Ok(false);
+            if !fixed_inline && !self.inline_codex_history() {
+                return false;
+            }
         }
         let page = self.dimensions.get().0.saturating_sub(1).max(1) as i64;
         let delta = match key {
@@ -1968,7 +1989,12 @@ impl<P: Pty> TerminalPane<P> {
                 session.pointer_wheel.set(0.0);
                 return glib::Propagation::Proceed;
             }
-            if let Some(event) = controller.current_event() {
+            if session.inline_codex_history() {
+                // The main-screen Codex transcript belongs to the host when it
+                // has retained rows. In alternate screen (e.g. Ctrl+T), keep
+                // the application's existing mouse priority.
+                session.pointer_wheel.set(0.0);
+            } else if let Some(event) = controller.current_event() {
                 if session.report_wheel(&event, dy, controller.unit()) {
                     return glib::Propagation::Stop;
                 }

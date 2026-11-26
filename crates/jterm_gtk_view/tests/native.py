@@ -801,6 +801,85 @@ def exercise(app, pid, root, underline_colors, osc8_links, shared_runtime):
     command("key", "shift+End")
     output(r"(?m)^scroll-row-120")
 
+    if shared_runtime:
+        # This is a real foreground executable on the test PTY, not Codex
+        # itself. Its known output, mouse mode and expected input prove the
+        # GTK ownership route without requesting a model, account or network.
+        source = root / "inline-codex-fixture.c"
+        executable = root / "codex"
+        source.write_text(r"""
+#include <stdio.h>
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
+
+int main(void) {
+    struct termios original, raw;
+    char key;
+    if (tcgetattr(STDIN_FILENO, &original) != 0)
+        return 2;
+    raw = original;
+    cfmakeraw(&raw);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0)
+        return 2;
+    for (int i = 1; i <= 120; ++i)
+        printf("codex-history-%03d\r\n", i);
+    printf("codex-inline-ready\r\n\033[?1000h\033[?1006h");
+    fflush(stdout);
+    int admitted = read(STDIN_FILENO, &key, 1) == 1 && key == 'x';
+    printf("\033[?1000l\033[?1006l\r\ncodex-input-%s\r\n", admitted ? "clean" : "leaked");
+    if (admitted) {
+        // An application-owned full-screen view still receives plain paging.
+        printf("\033[?1049hcodex-alt-ready\r\n");
+        fflush(stdout);
+        const char expected[] = "\033[5~";
+        for (size_t i = 0; i < strlen(expected); ++i) {
+            if (read(STDIN_FILENO, &key, 1) != 1 || key != expected[i]) {
+                admitted = 0;
+                break;
+            }
+        }
+        printf("\033[?1049l\r\ncodex-alt-%s\r\n", admitted ? "clean" : "lost");
+    }
+    fflush(stdout);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &original) != 0)
+        return 2;
+    return !admitted;
+}
+""")
+        subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(executable)],
+                       check=True, timeout=10)
+        type_command(shlex.quote(str(executable)))
+        output(r"(?m)^codex-inline-ready")
+
+        def codex_row():
+            match = re.search(r"(?m)^codex-history-(\d+)", read_screen())
+            return int(match[1]) if match else None
+
+        codex_live = wait_for("last live Codex rows", codex_row)
+        command("key", "Page_Up")
+        codex_page = wait_for(
+            "bare PageUp reached retained Codex history",
+            lambda: (row if (row := codex_row()) is not None and row < codex_live else None),
+        )
+        assert codex_live - codex_page >= 5, (codex_live, codex_page)
+        command("key", "Page_Down")
+        output(r"(?m)^codex-inline-ready")
+        bounds = wait_for("Codex terminal screen coordinates", screen_extents)
+        command("mousemove", "--window", window, str(bounds.x + bounds.width // 2),
+                str(bounds.y + bounds.height // 2), "click", "4")
+        wait_for(
+            "unmodified wheel reached retained Codex history despite application mouse mode",
+            lambda: (row if (row := codex_row()) is not None and row < codex_live else None),
+        )
+        command("key", "shift+End")
+        output(r"(?m)^codex-inline-ready")
+        command("key", "x")
+        output(r"(?m)^codex-alt-ready")
+        command("key", "Page_Up")
+        output(r"(?m)^codex-input-clean")
+        output(r"(?m)^codex-alt-clean")
+
     visible_marker = root / "visible-ready"
     hidden_marker = root / "hidden-ready"
     release_hidden = root / "emit-hidden"
