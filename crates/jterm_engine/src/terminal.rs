@@ -1794,8 +1794,9 @@ impl Terminal {
                                 }
                                 self.vt.screen.pending_wrap = false;
                             }
+                            // XTerm extends ED and DECSED with saved-line erasure.
                             // Alternate applications cannot erase primary history.
-                            3 if !selective => {
+                            3 => {
                                 if !self.vt.screen.use_alt_buffer {
                                     self.history.clear();
                                     self.clear_transcript_archive();

@@ -123,7 +123,7 @@ class BoundaryTests(unittest.TestCase):
         history = (ENGINE / 'src/retained_history.rs').read_text()
         self.assertIn('impl RetainedHistory<ScrollbackLine> {', history)
         self.assertIn('ScrollbackLine::compress_frost_legacy(cells, wrapped)', history)
-        self.assertIn('while result.needs_room_for(&line, row_limit)', history)
+        self.assertIn('result.retain_latest(line, row_limit, drop)', history)
 
     def test_frost_osc8_interner_owns_admission_and_link_state(self):
         engine = (ENGINE / 'src/hyperlink.rs').read_text().split('pub struct FrostHyperlinkTable', 1)[1]
@@ -411,9 +411,11 @@ class BoundaryTests(unittest.TestCase):
 
     def test_ember_shell_owns_one_shared_io_actor(self):
         adapter = (FAMILY / 'ember/src/shell.rs').read_text().split('#[cfg(test)]', 1)[0]
-        self.assertIn('actor: SessionActor<Pty>,', adapter)
-        self.assertIn('SessionActor::start(pty, repaint_ctx)', adapter)
+        self.assertIn('actor: SessionHandle<Pty>,', adapter)
+        self.assertIn('SessionHandle::start_ordered(pty, repaint_ctx)', adapter)
         self.assertNotRegex(adapter, r'\b(?:fn (?:io_loop|write_to_pty)|struct WriteQueue)\b')
+        actor = (ENGINE.parent / 'jterm_runtime/src/session_actor.rs').read_text()
+        self.assertIn('pub type SessionHandle<T> = SessionActor<T, OrderedOutput>;', actor)
         source = (FAMILY / 'ember/src/output_batch.rs').read_text()
         self.assertIn('pub use jterm_core::output_batch::*;', source)
 
@@ -814,7 +816,7 @@ class BoundaryTests(unittest.TestCase):
         hosted = (ENGINE / 'src/terminal.rs').read_text()
         self.assertNotIn('sync_started:', hosted)
         for method in ('begin_hosted', 'end_hosted', 'reflect_query', 'finish_query'):
-            self.assertIn(f'self.vt.sync_output.{method}(', hosted)
+            self.assertRegex(hosted, rf'\bself\s*\.vt\s*\.sync_output\s*\.{method}\(')
 
     def test_native_terminal_is_the_only_active_vt_state_and_event_executor(self):
         owner = (ENGINE / 'src/vt_state.rs').read_text().split('#[cfg(test)]', 1)[0]

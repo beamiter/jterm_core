@@ -868,10 +868,23 @@ impl TerminalGrid {
 
     /// Erase a row span and its wide partners. Callers select any protected runs.
     pub fn erase_cells(&mut self, row: usize, cols: Range<usize>, blank: TerminalCell) {
-        if row >= self.rows {
+        let end = cols.end.min(self.cols);
+        if row >= self.rows || cols.start >= end {
             return;
         }
-        for col in cols.start..cols.end.min(self.cols) {
+        if end == self.cols {
+            // No wide partner can extend past the right margin. Only the
+            // first continuation can extend the erase to the left.
+            let mut start = cols.start;
+            if start > 0 && self.get(row, start).flags.wide_continuation() {
+                start -= 1;
+            }
+            self.row_cells_mut(row, start..end).fill(blank);
+            self.set_underline_color(row, start..end, Color::Default);
+            self.erase_annotations(row, start..end);
+            return;
+        }
+        for col in cols.start..end {
             let flags = self.get(row, col).flags;
             if col > 0 && flags.wide_continuation() {
                 *self.get_mut(row, col - 1) = blank;
@@ -2270,6 +2283,63 @@ fn graphic_overwrite_repairs_both_partners_with_bce_and_preserves_archive_proven
             }]
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn clipped_right_edge_erase_repairs_wide_lead_and_retains_outside_metadata() {
+    let mut grid = TerminalGrid::new(1, 7);
+    let blank = TerminalCell {
+        background: Color::Blue,
+        ..TerminalCell::default()
+    };
+    let outside = TerminalCell {
+        character: 'a',
+        foreground: Color::Red,
+        ..TerminalCell::default()
+    };
+    grid.overwrite_graphic(
+        0,
+        0,
+        1,
+        outside,
+        blank,
+        WideContinuationProtection::FromLead,
+    );
+    grid.overwrite_graphic(
+        0,
+        2,
+        2,
+        TerminalCell {
+            character: '界',
+            ..outside
+        },
+        blank,
+        WideContinuationProtection::FromLead,
+    );
+    grid.set_cluster_text(0, 0, "a\u{301}").unwrap();
+    grid.set_cluster_text(0, 2, "界\u{301}").unwrap();
+    grid.set_cluster_text(0, 5, " \u{301}").unwrap();
+    grid.set_underline_color(0, 0..7, Color::Red);
+    let captured = grid.row_annotations(0).unwrap().clone();
+
+    grid.erase_cells(0, 3..usize::MAX, blank);
+
+    assert_eq!(*grid.get(0, 0), outside);
+    assert!(grid[0][2..].iter().all(|cell| *cell == blank));
+    assert_eq!(grid.row_annotations(0).unwrap().text(0), Some("a\u{301}"));
+    assert_eq!(grid.row_annotations(0).unwrap().text(2), None);
+    assert_eq!(grid.row_annotations(0).unwrap().text(5), None);
+    assert_eq!(captured.text(2), Some("界\u{301}"));
+    assert_eq!(captured.text(5), Some(" \u{301}"));
+    assert_eq!(
+        grid.underline_color_runs(0).collect::<Vec<_>>(),
+        [UnderlineColorRun {
+            start: 0,
+            end: 2,
+            color: Color::Red
+        }]
+    );
 }
 
 #[cfg(test)]

@@ -766,6 +766,40 @@ fn alternate_and_partial_margins_never_archive_or_expose_primary_history() {
 }
 
 #[test]
+fn private_ed3_clears_primary_history_without_erasing_visible_cells() {
+    let sequence = b"\x1b[?3J";
+    for split in 0..=sequence.len() {
+        let mut terminal = Terminal::new(2, 4).unwrap();
+        terminal.feed(b"old\r\nnext\r\n").unwrap();
+        let retained = terminal.history_retained_bytes();
+        assert!(retained > 0);
+        terminal.feed(b"\x1b[?1049hALT").unwrap();
+        terminal.feed(&sequence[..split]).unwrap();
+        terminal.feed(&sequence[split..]).unwrap();
+        assert_eq!(terminal.history_retained_bytes(), retained);
+        terminal.feed(b"\x1b[?1049l").unwrap();
+        assert_eq!(terminal.history_page(0, 128).unwrap().text, "old");
+
+        terminal.feed("\x1b[1\"q中XQ".as_bytes()).unwrap();
+        let history_end = terminal.history_extent().end;
+        let before = terminal.frame().unwrap();
+        assert!(before.cursor().pending_wrap);
+        assert!(before.rows()[1].cells[0].flags.protected());
+        terminal.feed(&sequence[..split]).unwrap();
+        terminal.feed(&sequence[split..]).unwrap();
+        assert_eq!(terminal.history_rows(), 0);
+        assert_eq!(terminal.history_retained_bytes(), 0);
+        assert_eq!(terminal.history_extent(), history_end..history_end);
+        assert!(terminal.history_page(0, 128).unwrap().text.is_empty());
+        let after = terminal.frame().unwrap();
+        assert_eq!(after.rows(), before.rows());
+        assert_eq!(after.cursor(), before.cursor());
+        assert!(terminal.vt.screen.current_flags.protected());
+        assert_eq!(terminal.unsupported_count(), 0);
+    }
+}
+
+#[test]
 fn history_eviction_and_page_limits_are_bounded() {
     let mut t = Terminal::new(1, 8).unwrap();
     for n in 0..1030 {
