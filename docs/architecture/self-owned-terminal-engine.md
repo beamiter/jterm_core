@@ -18,6 +18,24 @@ docs/architecture/family-release-2026-11-22.json`. Run with
 the recorded core commit. The checker reads committed Git objects. Native
 tests, platform coverage and upgrade evidence are separate release inputs.
 
+For the published 2026-11-26 release, fetch the six exact public revisions
+named in `family-release-2026-11-26.json` into sibling checkouts called
+`jterm_core`, `aether`, `anvil`, `ember`, `forge` and `frost`. No branch
+checkout is required. Run:
+
+```sh
+python3 scripts/terminal-family-release.py --root /path/to/checkouts \
+  --verify docs/architecture/family-release-2026-11-26.json
+```
+
+This verifies the six release trees and all seven production lock pins against
+the published shared core. It does not fetch Git objects, load native
+acceptance receipts, compare binaries, verify the NAR hash, or run native
+scenarios. It reports each validation candidate's separate local availability
+and never labels the recorded acceptance as verified. Keep the original
+acceptance record, not the verifier's source-only output, as the release
+attestation.
+
 | Component | Retained responsibility |
 | --- | --- |
 | jterm_engine | Extracted pure terminal primitives; eventually incremental VT state, modes, input encoding and ordered effects |

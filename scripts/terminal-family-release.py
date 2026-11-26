@@ -12,6 +12,7 @@ import tomllib
 
 
 FAMILY_ROOT = Path(__file__).resolve().parents[2]
+RELEASE_SCHEMA = "jterm-family-release/v1"
 CORE_URL = "https://github.com/beamiter/jterm_core"
 SHA = re.compile(r"[0-9a-f]{40}")
 CORE_PACKAGES = {"jterm_core", "jterm_engine", "jterm_runtime", "jterm_protocol",
@@ -136,6 +137,80 @@ def snapshot(root, commits=None):
     }
 
 
+def object_id(value, label):
+    if not isinstance(value, str) or not SHA.fullmatch(value):
+        raise ValueError(f"{label}: expected a full lowercase Git object ID")
+    return value
+
+
+def source_entry(row, name, commit_key):
+    if not isinstance(row, dict) or row.get("repository") != f"beamiter/{name}":
+        raise ValueError(f"{name}: expected repository beamiter/{name}")
+    return (
+        object_id(row.get(commit_key), f"{name}/{commit_key}"),
+        object_id(row.get("tree"), f"{name}/tree"),
+        object_id(row.get("validated_source_commit"), f"{name}/validated_source_commit"),
+    )
+
+
+def candidate_relation(repository, candidate, published_tree):
+    """Local availability is not a proof of native execution or publication."""
+    try:
+        kind = git(repository, "cat-file", "-t", candidate)
+    except subprocess.CalledProcessError:
+        return {"availability": "not_available_locally"}
+    if kind != b"commit\n":
+        raise ValueError("validated_source_commit must name a commit when present locally")
+    tree = git(repository, "rev-parse", "--verify", f"{candidate}^{{tree}}").decode().strip()
+    return {
+        "availability": "present_locally",
+        "tree": tree,
+        "equals_published_tree": tree == published_tree,
+    }
+
+
+def verify_published_release(root, record):
+    """Verify public build inputs without treating attested test results as replayed."""
+    shared = record.get("shared_core")
+    apps = record.get("applications")
+    if not isinstance(apps, dict) or set(apps) != set(APP_LOCKS):
+        raise ValueError("published release must name all five applications")
+    sources = {"jterm_core": source_entry(shared, "jterm_core", "release_source_commit")}
+    core = sources["jterm_core"][0]
+    for name, data in apps.items():
+        sources[name] = source_entry(data, name, "release_commit")
+        if object_id(data.get("core_pin"), f"{name}/core_pin") != core:
+            raise ValueError(f"{name}: recorded app pin differs from the published core")
+
+    acceptance = record.get("acceptance")
+    if not isinstance(acceptance, dict) or not isinstance(acceptance.get("scope"), str):
+        raise ValueError("published release must describe the scope of its recorded acceptance")
+    observed = snapshot(root, {name: row[0] for name, row in sources.items()})
+    if observed["common_core_mismatches"]:
+        labels = ", ".join(sorted(observed["common_core_mismatches"]))
+        raise ValueError(f"published locks disagree with the shared core: {labels}")
+
+    for name, (commit, expected_tree, candidate) in sources.items():
+        repository = root / name
+        tree = git(repository, "rev-parse", "--verify", f"{commit}^{{tree}}").decode().strip()
+        if tree != expected_tree:
+            raise ValueError(f"{name}: published tree differs from the release record")
+        info = observed["repositories"][name]
+        info["tree"] = tree
+        info["validated_source_commit"] = candidate
+        info["validated_source_relation"] = candidate_relation(repository, candidate, tree)
+
+    return {
+        "schema": RELEASE_SCHEMA,
+        "verification_scope": "git_source_and_production_locks_only",
+        "recorded_acceptance_verified": False,
+        "external_evidence_note": "This check does not replay native scenarios or verify binaries, NAR hashes, or receipt contents.",
+        "production_lockfiles_verified": sum(len(locks) for locks in APP_LOCKS.values()),
+        "repositories": observed["repositories"],
+        "common_core_mismatches": observed["common_core_mismatches"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=FAMILY_ROOT, help="parent of the six Git checkouts")
@@ -146,7 +221,11 @@ def main():
     record = commits = None
     if args.verify:
         record = json.loads(args.verify.read_text())
-        if not isinstance(record, dict) or record.get("schema") != 1:
+        if isinstance(record, dict) and record.get("schema") == RELEASE_SCHEMA:
+            report = verify_published_release(args.root, record)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+        if not isinstance(record, dict) or type(record.get("schema")) is not int or record["schema"] != 1:
             raise ValueError("expected a schema 1 family release record")
         commits = {name: repo["commit"] for name, repo in record["repositories"].items()}
     observed = snapshot(args.root, commits)
