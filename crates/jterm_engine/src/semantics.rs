@@ -88,7 +88,6 @@ pub fn legacy_device_attributes_reply(
 
 fn dispatch_cursor_csi(
     screen: &mut ScreenState,
-    protocol: &mut ProtocolState,
     params: &[u16],
     cmd: u8,
     private_prefix: Option<u8>,
@@ -111,19 +110,10 @@ fn dispatch_cursor_csi(
         }
         b'G' | b'`' => screen.set_cursor_column(first.unwrap_or(1) as usize),
         b'd' => screen.set_cursor_row(first.unwrap_or(1) as usize),
-        b'H' | b'f' => {
-            if cmd == b'f' && private_prefix == Some(b'>') && intermediates.is_empty() {
-                screen.pending_wrap = false;
-                if first == Some(4) {
-                    protocol.set_xterm_format_other_keys(params.get(1).copied().unwrap_or(0));
-                }
-            } else {
-                screen.set_cursor_position(
-                    first.unwrap_or(1) as usize,
-                    params.get(1).copied().unwrap_or(1) as usize,
-                );
-            }
-        }
+        b'H' | b'f' => screen.set_cursor_position(
+            first.unwrap_or(1) as usize,
+            params.get(1).copied().unwrap_or(1) as usize,
+        ),
         b'I' => screen.tab_forward(count),
         b'Z' => screen.tab_backward(count),
         b'g' => match first.unwrap_or(0) {
@@ -157,9 +147,13 @@ pub fn dispatch_frost_legacy_csi(
     private_prefix: Option<u8>,
     intermediates: &[u8],
 ) -> Dispatch {
+    if cmd == b'f' && private_prefix == Some(b'>') && intermediates.is_empty() {
+        set_xterm_format_other_keys(protocol, params);
+        return Dispatch::Handled(Effects::new());
+    }
     // The older profile omits the four cursor-movement aliases.
     if !matches!(cmd, b'a' | b'e' | b'j' | b'k')
-        && dispatch_cursor_csi(screen, protocol, params, cmd, private_prefix, intermediates)
+        && dispatch_cursor_csi(screen, params, cmd, private_prefix, intermediates)
     {
         return Dispatch::Handled(Effects::new());
     }
@@ -250,6 +244,12 @@ pub fn dispatch_frost_legacy_csi(
 fn set_xterm_modify_other_keys(protocol: &mut ProtocolState, params: &[u16]) {
     if params.first() == Some(&4) {
         protocol.set_xterm_modify_other_keys(params.get(1).copied().unwrap_or(0));
+    }
+}
+
+fn set_xterm_format_other_keys(protocol: &mut ProtocolState, params: &[u16]) {
+    if params.first() == Some(&4) {
+        protocol.set_xterm_format_other_keys(params.get(1).copied().unwrap_or(0));
     }
 }
 
@@ -412,6 +412,13 @@ pub(crate) fn dispatch_local_with_underline(
         }
         Event::Csi {
             params,
+            private_prefix: Some(b'>'),
+            intermediates,
+            final_byte: b'f',
+            ..
+        } if intermediates.is_empty() => set_xterm_format_other_keys(protocol, params),
+        Event::Csi {
+            params,
             colon_flags,
             private_prefix,
             intermediates,
@@ -451,14 +458,7 @@ pub(crate) fn dispatch_local_with_underline(
             } else if matches!(cmd, b'C' | b'D' | b'G' | b'`' | b'I' | b'Z' | b'a' | b'j') {
                 effects.push(Effect::CursorReposition { non_linear: false });
             }
-            if dispatch_cursor_csi(
-                screen,
-                protocol,
-                params,
-                cmd,
-                *private_prefix,
-                intermediates,
-            ) {
+            if dispatch_cursor_csi(screen, params, cmd, *private_prefix, intermediates) {
                 return Dispatch::Handled(effects);
             }
             let first = params.first().copied();

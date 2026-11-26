@@ -161,6 +161,103 @@ fn valid_underline_colors(runs: &[UnderlineColorRun], cols: usize) -> bool {
         valid
     })
 }
+
+#[cfg(test)]
+#[test]
+fn recapture_validates_changed_metadata_geometry_and_current_limits() {
+    let limits = Limits {
+        max_rows: 2,
+        max_cols: 4,
+        max_cells: 8,
+    };
+    let stamp = Stamp {
+        epoch: 1,
+        revision: 1,
+        layout: 1,
+        screen: Screen::Primary,
+    };
+    let cursor = Cursor {
+        row: 0,
+        col: 0,
+        pending_wrap: false,
+        visible: true,
+        shape: CursorShape::Block,
+    };
+    let rows: Arc<[Row]> = vec![
+        Row {
+            cells: vec![TerminalCell::default(); 4].into(),
+            wrapped: false
+        };
+        2
+    ]
+    .into();
+    let colors: UnderlineRows = vec![
+        Some(
+            vec![UnderlineColorRun {
+                start: 0,
+                end: 4,
+                color: Color::Red,
+            }]
+            .into(),
+        ),
+        None,
+    ]
+    .into();
+    let base = CellFrame::new_with_underline_colors(
+        stamp,
+        4,
+        rows.clone(),
+        cursor,
+        limits,
+        Some(colors.clone()),
+        None,
+    )
+    .unwrap();
+    let capture = |cols, rows, cursor, limits, colors| {
+        CellFrame::new_with_underline_colors(stamp, cols, rows, cursor, limits, colors, Some(&base))
+    };
+    assert_eq!(
+        capture(4, rows.clone(), cursor, limits, Some(colors.clone())),
+        Ok(base.clone())
+    );
+    let invalid: UnderlineRows = vec![
+        colors[0].clone(),
+        Some(
+            vec![UnderlineColorRun {
+                start: 0,
+                end: 5,
+                color: Color::Blue,
+            }]
+            .into(),
+        ),
+    ]
+    .into();
+    assert_eq!(
+        capture(4, rows.clone(), cursor, limits, Some(invalid)),
+        Err(Error::Bounds)
+    );
+    assert_eq!(
+        capture(3, rows.clone(), cursor, limits, Some(colors.clone())),
+        Err(Error::Bounds)
+    );
+    assert_eq!(
+        capture(
+            4,
+            rows.clone(),
+            cursor,
+            Limits {
+                max_cells: 7,
+                ..limits
+            },
+            Some(colors.clone())
+        ),
+        Err(Error::Bounds)
+    );
+    assert_eq!(
+        capture(4, rows, Cursor { col: 4, ..cursor }, limits, Some(colors)),
+        Err(Error::Cursor)
+    );
+}
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_rows: usize,
@@ -215,7 +312,7 @@ impl CellFrame {
         cursor: Cursor,
         limits: Limits,
     ) -> Result<Self, Error> {
-        Self::new_with_underline_colors(stamp, cols, rows, cursor, limits, None)
+        Self::new_with_underline_colors(stamp, cols, rows, cursor, limits, None, None)
     }
 
     pub(crate) fn new_with_underline_colors(
@@ -225,8 +322,11 @@ impl CellFrame {
         cursor: Cursor,
         limits: Limits,
         underline_colors: Option<UnderlineRows>,
+        previous: Option<&Self>,
     ) -> Result<Self, Error> {
         let stamp = stamp.try_into()?;
+        let previous =
+            previous.filter(|frame| frame.cols == cols && frame.rows.len() == rows.len());
         if cols == 0
             || rows.is_empty()
             || cols > limits.max_cols
@@ -235,21 +335,28 @@ impl CellFrame {
                 .len()
                 .checked_mul(cols)
                 .is_none_or(|n| n > limits.max_cells)
-            || rows.iter().any(|r| r.cells.len() != cols)
+            || (!previous.is_some_and(|frame| Arc::ptr_eq(&frame.rows, &rows))
+                && rows.iter().any(|r| r.cells.len() != cols))
         {
             return Err(Error::Bounds);
         }
         if cursor.row >= rows.len() || cursor.col >= cols {
             return Err(Error::Cursor);
         }
-        if underline_colors.as_ref().is_some_and(|colors| {
-            colors.len() != rows.len()
-                || colors
-                    .iter()
-                    .flatten()
-                    .any(|runs| !valid_underline_colors(runs, cols))
-        }) {
-            return Err(Error::Bounds);
+        if let Some(colors) = &underline_colors {
+            let previous_colors = previous.and_then(|frame| frame.underline_colors.as_ref());
+            let shared_table = previous_colors.is_some_and(|old| Arc::ptr_eq(old, colors));
+            if colors.len() != rows.len()
+                || (!shared_table
+                    && colors.iter().enumerate().any(|(row, runs)| {
+                        let Some(runs) = runs else { return false };
+                        let old = previous_colors.and_then(|table| table[row].as_ref());
+                        !old.is_some_and(|old| Arc::ptr_eq(old, runs))
+                            && !valid_underline_colors(runs, cols)
+                    }))
+            {
+                return Err(Error::Bounds);
+            }
         }
         Ok(Self {
             stamp,

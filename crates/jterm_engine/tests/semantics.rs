@@ -251,17 +251,19 @@ fn cursor_queries_keep_origin_and_last_column_flag_semantics() {
 }
 
 #[test]
-fn cursor_prelude_also_applies_to_existing_private_format_keys_branch() {
+fn private_key_format_preserves_wrap_and_hvp_repositions() {
     let mut s = screen();
     let mut p = ProtocolState::default();
     s.pending_wrap = true;
+    assert!(handled(&mut s, &mut p, &csi(b'f', &[4, 1], Some(b'>'), &[])).is_empty());
+    assert!(s.pending_wrap);
+    assert_eq!(p.xterm_format_other_keys(), 1);
     assert_eq!(
-        handled(&mut s, &mut p, &csi(b'f', &[4, 1], Some(b'>'), &[])),
+        handled(&mut s, &mut p, &csi(b'f', &[2, 5], None, &[])),
         [Effect::CursorReposition { non_linear: true }]
     );
     assert!(!s.pending_wrap);
-    assert_eq!(p.xterm_format_other_keys(), 1);
-    s.cursor_col = 4;
+    assert_eq!((s.cursor_row, s.cursor_col), (1, 4));
     assert_eq!(
         handled(&mut s, &mut p, &csi(b'D', &[0], None, &[])),
         [Effect::CursorReposition { non_linear: false }]

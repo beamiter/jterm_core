@@ -9,6 +9,35 @@ use jterm_engine::{
 };
 
 #[test]
+fn frost_key_format_commands_preserve_wrap_and_cursor() {
+    let mut screen = ScreenState::new(2, 4);
+    let mut protocol = ProtocolState::default();
+    screen.cursor_col = 3;
+    screen.pending_wrap = true;
+    for (raw, params, expected) in [
+        (b"4;1", [4, 1], 1),
+        (b"9;0", [9, 0], 1),
+        (b"4;0", [4, 0], 0),
+    ] {
+        assert_eq!(
+            dispatch_frost_legacy_csi(
+                &mut screen,
+                &mut protocol,
+                raw,
+                &params,
+                b'f',
+                Some(b'>'),
+                b""
+            ),
+            Dispatch::Handled(Default::default())
+        );
+        assert!(screen.pending_wrap);
+        assert_eq!((screen.cursor_row, screen.cursor_col), (0, 3));
+        assert_eq!(protocol.xterm_format_other_keys(), expected);
+    }
+}
+
+#[test]
 fn frost_modify_other_keys_query_reports_effective_level_and_preserves_rendition() {
     let mut screen = ScreenState::new(2, 8);
     screen.current_fg = jterm_engine::Color::Red;

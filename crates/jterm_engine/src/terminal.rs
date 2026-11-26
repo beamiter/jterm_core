@@ -2328,6 +2328,7 @@ impl Terminal {
                 max_cells: MAX_ROWS * self.max_cols,
             },
             underline_colors,
+            previous,
         )
         .map_err(|e| format!("{e:?}"))?
         .with_annotations(annotations);

@@ -2,6 +2,26 @@ use super::*;
 use crate::history_reflow::HistoryAnchor;
 
 #[test]
+fn key_format_negotiation_preserves_pending_wrap_and_changes_key_bytes() {
+    let negotiation = b"\x1b[>4;2m\x1b[>4;1f";
+    for cut in 0..=negotiation.len() {
+        let mut terminal = Terminal::new(2, 4).unwrap();
+        terminal.feed(b"ABCD").unwrap();
+        let before = terminal.frame().unwrap();
+        assert!(before.cursor().pending_wrap);
+        terminal.feed(&negotiation[..cut]).unwrap();
+        terminal.feed(&negotiation[cut..]).unwrap();
+        assert_eq!(terminal.frame().unwrap(), before);
+        assert_eq!(
+            terminal.encode_key("a", false, false, true).unwrap(),
+            b"\x1b[97;5u"
+        );
+        terminal.feed(b"X").unwrap();
+        assert_eq!(terminal.visible_text(), "ABCD\nX   ");
+    }
+}
+
+#[test]
 fn directory_reports_keep_authority_and_ignore_invalid_paths() {
     let mut terminal = Terminal::new(2, 8).unwrap();
     terminal.enable_window_updates();
