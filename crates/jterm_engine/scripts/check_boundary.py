@@ -12,6 +12,8 @@ FAMILY = ENGINE.parents[2] if ENGINE.parent.name == 'crates' else ENGINE.parent
 
 
 class BoundaryTests(unittest.TestCase):
+    aether_checkout = FAMILY / 'aether'
+
     def test_dependency_direction(self):
         manifest = tomllib.loads((ENGINE / 'Cargo.toml').read_text())
         self.assertFalse(manifest['package']['publish'])
@@ -152,19 +154,19 @@ class BoundaryTests(unittest.TestCase):
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
         lane = frost.split('    fn put_ascii_run(', 1)[1].split('    fn create_blank_cell(', 1)[0]
         order = [
-            'self.last_printed_char =',
+            'self.screen.last_printed_char =',
             'while pos < bytes.len()',
             'self.wrap_to_next_line()',
             'self.note_idle_background_cells(',
             '.overwrite_ascii(',
-            'self.cursor_col += chunk_len',
+            'self.screen.cursor_col += chunk_len',
             'self.mark_row_dirty(',
             'self.mark_command_echo_extent(',
-            'self.pending_wrap = true',
+            'self.screen.pending_wrap = true',
         ]
         self.assertEqual(sorted(order, key=lane.index), order)
         self.assertIn('AsciiOverwritePolicy::FrostLegacy', lane)
-        self.assertNotIn('self.grid.get_mut(', lane)
+        self.assertNotIn('self.screen.grid.get_mut(', lane)
         screen = (ENGINE / 'src/screen.rs').read_text()
         shared = screen.split('    pub fn write_ascii_in_row(', 1)[1].split('    pub fn combining_target(', 1)[0]
         self.assertIn('.overwrite_ascii(', shared)
@@ -173,12 +175,18 @@ class BoundaryTests(unittest.TestCase):
     def test_live_screen_has_one_explicit_owner(self):
         host = (FAMILY / 'ember/src/terminal/mod.rs').read_text().split('pub struct TerminalState {', 1)[1].split('\n}', 1)[0]
         self.assertIn('pub screen: ScreenState,', host)
-        for field in ('grid', 'alt_grid', 'cursor_row', 'cursor_col', 'pending_wrap',
-                      'current_fg', 'current_bg', 'current_flags', 'saved_state',
-                      'tab_stops', 'scroll_region_top', 'scroll_region_bottom'):
-            self.assertNotRegex(host, rf'(?m)^\s*(?:pub )?{field}:')
+        frost = (FAMILY / 'frost/src/terminal.rs').read_text()
+        frost_state = frost.split('pub struct TerminalState {', 1)[1].split('\n}', 1)[0]
+        self.assertEqual(frost_state.count('screen: ScreenState<TerminalGrid>,'), 1)
+        self.assertIn('screen: ScreenState::with_grid_pair(grid, alt_grid, TabStopOrigin::Clear)', frost)
+        self.assertIn('type Target = ScreenState<TerminalGrid>;', frost)
+        self.assertNotRegex(frost, r'impl\s+(?:std::ops::)?DerefMut\s+for\s+TerminalState')
         screen = (ENGINE / 'src/screen.rs').read_text()
-        live = screen.split('pub struct ScreenState {', 1)[1].split('\n}', 1)[0]
+        live = screen.split('pub struct ScreenState<Grid = TerminalGrid> {', 1)[1].split('\n}', 1)[0]
+        fields = re.findall(r'(?m)^\s*pub (\w+):', live)
+        for field in (*fields, 'saved_cursor'):
+            self.assertNotRegex(host, rf'(?m)^\s*(?:pub )?{field}:')
+            self.assertNotRegex(frost_state, rf'(?m)^\s*(?:pub )?{field}:')
         self.assertNotRegex(live, r'(?m)^\s*(?:pub )?autowrap:')
         self.assertNotRegex(host + screen, r'impl(?:<[^>]*>)?\s+(?:std::ops::)?Deref')
         state = (FAMILY / 'ember/src/terminal/state.rs').read_text()
@@ -189,7 +197,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('if let Some(printed) = effect.printed', state)
 
     def test_aether_uses_the_shared_pty_and_terminal_owners(self):
-        adapter = (FAMILY / 'aether/session/src/lib.rs').read_text()
+        adapter = (self.aether_checkout / 'session/src/lib.rs').read_text()
         self.assertIn('pub use jterm_engine::terminal::{HistoryPage, Terminal};', adapter)
         self.assertIn('pub use jterm_runtime::pty_session::Session;', adapter)
         self.assertNotRegex(adapter, r'\b(?:struct (?:Terminal|Session)|openpty|waitpid)\b')
@@ -197,17 +205,33 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('terminal: Terminal,', runtime)
         self.assertIn('self.terminal.feed(&bytes[..n])?', runtime)
         self.assertIn('SessionActor::start_with_owner_writes(', runtime)
-        bridge = (FAMILY / 'aether/bridge/src/live.rs').read_text()
+        bridge = (self.aether_checkout / 'bridge/src/live.rs').read_text()
         self.assertIn('Session::spawn_with_epoch(rows, cols, epoch)', bridge)
         self.assertIn('let mut session = spawn(frame_epoch)?;', bridge)
 
     def test_ember_shell_owns_one_shared_io_actor(self):
-        adapter = (FAMILY / 'ember/src/shell.rs').read_text().split('#[cfg(test)]', 1)[0]
-        self.assertIn('actor: SessionActor<Pty>,', adapter)
-        self.assertIn('SessionActor::start(pty, repaint_ctx)?', adapter)
-        self.assertNotRegex(adapter, r'\b(?:fn (?:io_loop|write_to_pty)|struct WriteQueue)\b')
-        source = (FAMILY / 'ember/src/output_batch.rs').read_text()
+        ember = FAMILY / 'ember/src'
+        adapter = (ember / 'shell.rs').read_text().split('#[cfg(test)]', 1)[0]
+        self.assertIn('actor: SessionHandle<Pty>,', adapter)
+        self.assertIn('SessionHandle::start_ordered(pty, repaint_ctx)', adapter)
+        self.assertNotRegex(adapter, r'\b(?:fn (?:io_loop|write_to_pty|events)|struct WriteQueue)\b')
+        self.assertNotRegex((ember / 'session.rs').read_text(), r'\bpending_output\s*:')
+        for pump in ('main.rs', 'session_manager.rs'):
+            source = (ember / pump).read_text()
+            self.assertIn('session.shell.poll_output(', source)
+            self.assertNotIn('session.shell.events()', source)
+        source = (ember / 'output_batch.rs').read_text()
         self.assertIn('pub use jterm_core::output_batch::*;', source)
+
+    def test_native_desktops_delegate_pty_launch_and_own_the_adopted_master(self):
+        for frontend in ('ember', 'frost'):
+            with self.subTest(frontend=frontend):
+                source = (FAMILY / frontend / 'src/pty.rs').read_text().split('#[cfg(test)]', 1)[0]
+                self.assertIn('launch_pty(PtyLaunch {', source)
+                self.assertIn('.adopt(|master, child_pid|', source)
+                self.assertIn('master: OwnedFd,', source)
+                self.assertNotRegex(source, r'libc::(?:fork|openpty|execve)\(')
+                self.assertNotIn('inherited_instance_lock_fd', source)
 
     def test_region_mutations_execute_in_engine_without_host_policy(self):
         state = (FAMILY / 'ember/src/terminal/state.rs').read_text()
@@ -273,8 +297,11 @@ class BoundaryTests(unittest.TestCase):
         self.assertLess(entry.index('.enter(true, autowrap)'), entry.index('self.protocol.switch_screen()'))
         self.assertLess(entry.index('self.protocol.switch_screen()'), entry.index('self.clear_screen()'))
         self.assertLess(exit.index('.leave(AlternateRestorePolicy::Frost)'), exit.index('self.protocol.switch_screen()'))
-        self.assertIn('grid: &mut self.grid,', frost)
-        self.assertIn('alt_grid: &mut self.alt_grid,', frost)
+        for transition in (entry, exit):
+            self.assertRegex(transition, r'self\s*\.\s*screen\s*\.alternate_screen_controls\(\)')
+        self.assertIn('grid: &mut self.grid,', screen)
+        self.assertIn('alt_grid: &mut self.alt_grid,', screen)
+        self.assertNotIn('fn alternate_screen_controls(', frost)
         self.assertNotIn('std::mem::swap(', frost_modes)
         self.assertNotIn('SavedCursorState {', frost_modes)
 
@@ -354,7 +381,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine-only', action='store_true',
                         help='check pure crate boundaries without frontend checkouts')
+    parser.add_argument('--aether-checkout', type=Path, default=FAMILY / 'aether',
+                        help='use an isolated Aether worktree for consumer checks')
     args = parser.parse_args()
+    BoundaryTests.aether_checkout = args.aether_checkout.resolve()
     if args.engine_only:
         suite = unittest.TestSuite(BoundaryTests(name) for name in (
             'test_dependency_direction', 'test_storage_vectors_remain_private'))

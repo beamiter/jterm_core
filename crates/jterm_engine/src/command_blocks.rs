@@ -116,6 +116,7 @@ impl Active {
 #[derive(Default)]
 pub(crate) struct CommandBlocks {
     prompt: Prompt,
+    prompt_generation: u64,
     input_submitted: bool,
     active: Option<Active>,
     completed: VecDeque<CommandBlock>,
@@ -125,6 +126,14 @@ pub(crate) struct CommandBlocks {
 impl CommandBlocks {
     pub(crate) fn prompt_ready(&self) -> bool {
         matches!(self.prompt, Prompt::Ready) && !self.input_submitted && self.active.is_none()
+    }
+
+    pub(crate) fn prompt_generation(&self) -> Option<u64> {
+        (self.prompt_ready() && self.prompt_generation < u64::MAX).then_some(self.prompt_generation)
+    }
+
+    pub(crate) fn command_running(&self) -> bool {
+        self.active.is_some()
     }
 
     pub(crate) fn input_submitted(&mut self) {
@@ -180,6 +189,7 @@ impl CommandBlocks {
             ShellMarker::PromptEnd => {
                 if matches!(self.prompt, Prompt::Started) {
                     self.prompt = Prompt::Ready;
+                    self.prompt_generation = self.prompt_generation.saturating_add(1);
                     self.input_submitted = false;
                 }
             }

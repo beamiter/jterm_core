@@ -59,6 +59,23 @@ pub fn shutdown_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(pipe)
 }
 
+pub(crate) fn move_above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
+    if fd.as_raw_fd() > libc::STDERR_FILENO {
+        return Ok(fd);
+    }
+    // SAFETY: `fd` pins the source, and fcntl returns a new CLOEXEC descriptor.
+    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+pub(crate) fn cloexec_pipe_above_stdio() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (reader, writer) = shutdown_pipe()?;
+    Ok((move_above_stdio(reader)?, move_above_stdio(writer)?))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReaderPoll {
     Shutdown,

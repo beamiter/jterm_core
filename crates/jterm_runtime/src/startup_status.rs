@@ -1,12 +1,26 @@
-//! A private Linux fork-to-exec status pipe. Child lifetime belongs to the spawner.
+//! A private Unix fork-to-exec status pipe. Child lifetime belongs to the spawner.
 
-use crate::shell_identity::cloexec_pipe_above_stdio;
+use crate::pty_reader::cloexec_pipe_above_stdio;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 const RECORD_LEN: usize = 2 * std::mem::size_of::<libc::c_int>();
+const ENTERING_EXEC: [libc::c_int; 2] = [0, 0];
+
+/// Capture the child thread's errno without formatting or allocating.
+pub(crate) fn errno() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    // SAFETY: errno addresses the calling thread's libc storage.
+    unsafe {
+        *libc::__errno_location()
+    }
+    #[cfg(not(target_os = "linux"))]
+    io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
@@ -58,6 +72,7 @@ pub enum StartupError {
     IncompleteRecord {
         received: usize,
     },
+    ExecUnconfirmed,
     InvalidRecord,
     Pipe(io::Error),
     Child {
@@ -77,6 +92,7 @@ impl fmt::Display for StartupError {
             Self::IncompleteRecord { received } => write!(
                 f, "incomplete shell startup status ({received}/{RECORD_LEN} bytes)"
             ),
+            Self::ExecUnconfirmed => f.write_str("PTY child closed the startup pipe before exec"),
             Self::InvalidRecord => f.write_str("invalid shell startup status record"),
             Self::Pipe(error) => write!(f, "shell startup status pipe failed: {error}"),
             Self::Child { stage, error } => write!(f, "could not {stage}: {error}"),
@@ -100,6 +116,7 @@ impl From<StartupError> for io::Error {
             StartupError::IncompleteRecord { .. } | StartupError::InvalidRecord => {
                 io::ErrorKind::InvalidData
             }
+            StartupError::ExecUnconfirmed => io::ErrorKind::UnexpectedEof,
             StartupError::Pipe(error) | StartupError::Child { error, .. } => error.kind(),
         };
         Self::new(kind, error)
@@ -134,13 +151,15 @@ pub fn channel() -> io::Result<(StartupReader, StartupWriter)> {
 }
 
 impl StartupReader {
-    /// Drop the parent's writer before waiting. An empty EOF is the exec
-    /// barrier, while child setup failures report their stage before exiting.
+    /// Drop the parent's writer before waiting. A complete entering-exec
+    /// record followed by clean EOF is the exec barrier. Child setup failures
+    /// report their stage before exiting, including execve errors.
     /// The spawner retains responsibility for observing or reaping the child.
     pub fn wait(self, timeout: Duration) -> Result<(), StartupError> {
         let started = Instant::now();
         let mut record = [0_u8; RECORD_LEN];
         let mut received = 0;
+        let mut entering_exec = false;
         let fd = self.as_raw_fd();
         loop {
             let elapsed = started.elapsed();
@@ -183,7 +202,11 @@ impl StartupReader {
             if read > 0 {
                 received += read as usize;
                 if received == RECORD_LEN {
-                    return Err(decode_record(record));
+                    if record != [0; RECORD_LEN] || entering_exec {
+                        return Err(decode_record(record));
+                    }
+                    entering_exec = true;
+                    received = 0;
                 }
             } else if read == 0 {
                 if received != 0 {
@@ -194,7 +217,11 @@ impl StartupReader {
                         "poll reported an error",
                     )));
                 }
-                return Ok(());
+                return if entering_exec {
+                    Ok(())
+                } else {
+                    Err(StartupError::ExecUnconfirmed)
+                };
             } else {
                 let error = io::Error::last_os_error();
                 match error.kind() {
@@ -208,10 +235,24 @@ impl StartupReader {
 }
 
 impl StartupWriter {
+    /// Mark the transition immediately before execve. EOF before this record
+    /// can come from a child killed during setup, with no failure errno.
+    pub(crate) fn entering_exec(&self) {
+        if !self.write_record(ENTERING_EXEC) {
+            // SAFETY: exit the forked child if its startup report was lost.
+            unsafe { libc::_exit(126) }
+        }
+    }
+
     /// Report a captured errno and exit in the forked child without allocating,
     /// locking, or running Rust destructors. Capture errno before other calls.
-    pub fn report_and_exit(&self, stage: StartupStage, errno: i32, exit_code: i32) -> ! {
-        let record = [stage as libc::c_int, errno];
+    pub fn report_and_exit(&self, stage: StartupStage, child_errno: i32, exit_code: i32) -> ! {
+        self.write_record([stage as libc::c_int, child_errno]);
+        // SAFETY: exit this child without calling any atexit handlers.
+        unsafe { libc::_exit(exit_code) }
+    }
+
+    fn write_record(&self, record: [libc::c_int; 2]) -> bool {
         let ptr = record.as_ptr().cast::<u8>();
         let fd = self.as_raw_fd();
         let mut offset = 0;
@@ -220,12 +261,11 @@ impl StartupWriter {
             let written = unsafe { libc::write(fd, ptr.add(offset).cast(), RECORD_LEN - offset) };
             if written > 0 {
                 offset += written as usize;
-            } else if written == 0 || unsafe { *libc::__errno_location() } != libc::EINTR {
-                break;
+            } else if written == 0 || errno() != libc::EINTR {
+                return false;
             }
         }
-        // SAFETY: exit this child without calling any atexit handlers.
-        unsafe { libc::_exit(exit_code) }
+        true
     }
 }
 
@@ -305,8 +345,9 @@ mod tests {
                 c"exit 127".as_ptr(),
                 std::ptr::null(),
             ];
+            writer.entering_exec();
             libc::execv(c"/bin/sh".as_ptr(), args.as_ptr());
-            writer.report_and_exit(StartupStage::Exec, *libc::__errno_location(), 126);
+            writer.report_and_exit(StartupStage::Exec, errno(), 126);
         });
         reader.wait(Duration::from_secs(2)).unwrap();
         let status = child.reap();
@@ -319,8 +360,9 @@ mod tests {
         let (reader, mut child) = fork_with(|writer| unsafe {
             let path = c"/dev/null/jterm-child";
             let args = [path.as_ptr(), std::ptr::null()];
+            writer.entering_exec();
             libc::execv(path.as_ptr(), args.as_ptr());
-            writer.report_and_exit(StartupStage::Exec, *libc::__errno_location(), 127);
+            writer.report_and_exit(StartupStage::Exec, errno(), 127);
         });
         match reader.wait(Duration::from_secs(2)).unwrap_err() {
             StartupError::Child {
@@ -335,39 +377,15 @@ mod tests {
     }
 
     #[test]
-    fn partial_eof_and_stalled_partial_record_are_distinct() {
-        let (reader, _child) = fork_with(|writer| unsafe {
-            libc::write(writer.as_raw_fd(), b"E".as_ptr().cast(), 1);
+    fn child_death_during_setup_does_not_confirm_exec() {
+        let (reader, mut child) = fork_with(|_| unsafe {
+            libc::raise(libc::SIGKILL);
         });
         assert!(matches!(
             reader.wait(Duration::from_secs(2)),
-            Err(StartupError::IncompleteRecord { received: 1 })
+            Err(StartupError::ExecUnconfirmed)
         ));
-
-        let (reader, _child) = fork_with(|writer| unsafe {
-            // This child deliberately delays exec. Release any other tests'
-            // inherited startup pipes before holding our own writer open.
-            for fd in 3..1024 {
-                if fd != writer.as_raw_fd() {
-                    libc::close(fd);
-                }
-            }
-            libc::write(writer.as_raw_fd(), b"E".as_ptr().cast(), 1);
-            loop {
-                libc::pause();
-            }
-        });
-        let mut ready = libc::pollfd {
-            fd: reader.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `ready` is one live descriptor; leave the byte for wait().
-        assert_eq!(unsafe { libc::poll(&mut ready, 1, 2000) }, 1);
-        let timeout = Duration::from_millis(25);
-        assert!(
-            matches!(reader.wait(timeout), Err(StartupError::TimedOut { timeout: actual, received: 1 }) if actual == timeout)
-        );
+        assert_eq!(libc::WTERMSIG(child.reap()), libc::SIGKILL);
     }
 
     #[test]

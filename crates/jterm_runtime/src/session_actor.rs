@@ -24,6 +24,9 @@ use std::{
 };
 
 pub use crate::pty_reader::ReadOutcome;
+pub use ordered_output::{OrderedOutput, OutputNotice, OutputProgress};
+
+mod ordered_output;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
@@ -517,16 +520,19 @@ impl WriteSender {
 }
 
 /// Owns the transport and serializes a session's input and lifecycle.
-pub struct SessionActor<T: SessionTransport> {
+pub struct SessionActor<T: SessionTransport, Output = Receiver<SessionEvent>> {
     source: Option<u64>,
     pty: Arc<Mutex<T>>,
-    event_rx: Receiver<SessionEvent>,
+    output: Output,
     shutdown: Arc<AtomicBool>,
     leader_exited: Arc<AtomicBool>,
     teardown_started: AtomicBool,
     stop: Mutex<WorkerShutdown>,
     write_tx: WriteSender,
 }
+
+/// A local session whose output and terminal notices are consumed in order.
+pub type SessionHandle<T> = SessionActor<T, OrderedOutput>;
 
 struct WorkerShutdown {
     events: Option<Sender<()>>,
@@ -535,7 +541,7 @@ struct WorkerShutdown {
 
 impl<T: SessionTransport> SessionActor<T> {
     pub fn start(transport: T, wake: WakeSink) -> Result<Self, String> {
-        Self::start_with_limits(transport, wake, None, false)
+        Self::start_with_limits(transport, wake, None, false, std::convert::identity)
     }
 
     pub fn start_with_split_writes(
@@ -553,7 +559,7 @@ impl<T: SessionTransport> SessionActor<T> {
         {
             return Err("invalid PTY write queue limits".into());
         }
-        Self::start_with_limits(transport, wake, Some(limits), false)
+        Self::start_with_limits(transport, wake, Some(limits), false, std::convert::identity)
     }
 
     /// The parser owner drives the bounded input FIFO when its callers need
@@ -561,14 +567,63 @@ impl<T: SessionTransport> SessionActor<T> {
     /// the actor, and the dedicated reader works independently of the owner.
     #[cfg(all(target_os = "linux", feature = "linux-pty"))]
     pub(crate) fn start_with_owner_writes(transport: T, wake: WakeSink) -> Result<Self, String> {
-        Self::start_with_limits(transport, wake, None, true)
+        Self::start_with_limits(transport, wake, None, true, std::convert::identity)
     }
 
+    pub fn events(&self) -> &Receiver<SessionEvent> {
+        &self.output
+    }
+
+    /// Retire a raw event consumer after it has applied output through `Exit`.
+    pub fn freeze_after_exit(&self) {
+        self.stop_workers();
+        while self.output.try_recv().is_ok() {}
+    }
+}
+
+impl<T: SessionTransport> SessionHandle<T> {
+    pub fn start_ordered(transport: T, wake: WakeSink) -> Result<Self, String> {
+        Self::start_with_limits(transport, wake, None, false, OrderedOutput::new)
+    }
+
+    /// Apply a bounded amount of output to its sole terminal owner. The gate
+    /// is sampled after collecting bytes so replies queued during collection
+    /// can hold them. An exit becomes observable only after `apply` returns
+    /// for all earlier bytes. A zero budget leaves the reader queue untouched.
+    pub fn poll_output(
+        &mut self,
+        budget: usize,
+        admit: impl FnOnce() -> bool,
+        apply: impl FnOnce(&OutputBuffer, bool),
+    ) -> OutputProgress {
+        let progress = self.output.advance(budget, admit, apply);
+        if matches!(progress.notice, Some(OutputNotice::Exited { .. })) {
+            self.stop_workers();
+            self.output.discard_after_exit();
+        }
+        progress
+    }
+
+    pub fn has_pending_output(&self) -> bool {
+        self.output.has_pending()
+    }
+
+    pub fn buffered_output_bytes(&self) -> usize {
+        self.output.buffered_bytes()
+    }
+
+    pub fn output_finished(&self) -> bool {
+        self.output.is_finished()
+    }
+}
+
+impl<T: SessionTransport, Output> SessionActor<T, Output> {
     fn start_with_limits(
         transport: T,
         wake: WakeSink,
         limits: Option<SplitWriteLimits>,
         owner_writes: bool,
+        make_output: impl FnOnce(Receiver<SessionEvent>) -> Output,
     ) -> Result<Self, String> {
         let child_pid = transport.observe_before_reap_pid();
         // The observe-before-reap reader may emit a whole MiB per event.
@@ -592,7 +647,7 @@ impl<T: SessionTransport> SessionActor<T> {
         let mut actor = Self {
             source: source.epoch(),
             pty: Arc::new(Mutex::new(transport)),
-            event_rx,
+            output: make_output(event_rx),
             shutdown: Arc::new(AtomicBool::new(false)),
             leader_exited: Arc::new(AtomicBool::new(false)),
             teardown_started: AtomicBool::new(false),
@@ -755,10 +810,6 @@ impl<T: SessionTransport> SessionActor<T> {
 
     pub fn output_source(&self) -> Option<u64> {
         self.source
-    }
-
-    pub fn events(&self) -> &Receiver<SessionEvent> {
-        &self.event_rx
     }
 
     #[cfg(all(target_os = "linux", feature = "linux-pty"))]
@@ -1301,16 +1352,6 @@ impl<T: SessionTransport> SessionActor<T> {
         self.write_tx.clone()
     }
 
-    /// Stop every producer after the child exit event has been consumed while
-    /// keeping the already-rendered terminal transcript alive. Closing the
-    /// queue wakes an idle writer thread and makes every outstanding sender
-    /// fail closed; draining discards only events ordered after the observed
-    /// `Exit` (for example, a racing writer error).
-    pub fn freeze_after_exit(&self) {
-        self.stop_workers();
-        while self.event_rx.try_recv().is_ok() {}
-    }
-
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {
         let mut pty = self.pty.lock();
         if self.shutdown.load(Ordering::Acquire) {
@@ -1384,7 +1425,7 @@ impl<T: SessionTransport> SessionActor<T> {
     }
 }
 
-impl<T: SessionTransport> Drop for SessionActor<T> {
+impl<T: SessionTransport, Output> Drop for SessionActor<T, Output> {
     fn drop(&mut self) {
         self.stop();
     }

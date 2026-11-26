@@ -96,6 +96,8 @@ def main() -> int:
                         help="build Forge's opt-in shared terminal in the private checkout")
     parser.add_argument("--anvil-shared-terminal", action="store_true",
                         help="build Anvil's opt-in shared terminal in the private checkout")
+    parser.add_argument("--aether-checkout", type=Path,
+                        help="use a separate Aether worktree for candidate builds")
     parser.add_argument("project", choices=(*PROJECTS, "all"))
     parser.add_argument("cargo_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -106,6 +108,8 @@ def main() -> int:
     for app in sorted(gtk_apps):
         if args.project not in {app, "all"}:
             parser.error(f"--{app}-shared-terminal requires {app} or all")
+    if args.aether_checkout is not None and args.project not in {*AETHER_CRATES, "all"}:
+        parser.error("--aether-checkout requires an Aether target or all")
     cargo_args = args.cargo_args or ["check", "--all-targets"]
     if cargo_args[0] == "--":
         cargo_args = cargo_args[1:]
@@ -118,7 +122,7 @@ def main() -> int:
 
     family = Path(__file__).resolve().parents[2]
     sources = {project: family / project for project in PROJECTS if project not in AETHER_CRATES}
-    sources["aether"] = family / "aether"
+    sources["aether"] = args.aether_checkout.resolve() if args.aether_checkout else family / "aether"
     # Canonical publication lives in the existing core repository. Retain the
     # legacy sibling layout for older local family checkouts only.
     nested_engine = sources["jterm_core"] / "crates" / "jterm_engine"

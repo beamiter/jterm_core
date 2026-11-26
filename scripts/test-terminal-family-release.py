@@ -40,6 +40,16 @@ class ReleaseGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one full Git pin"):
             self.pins()
 
+    def test_capture_uses_explicit_revisions_without_reading_checkout_heads(self):
+        commits = {name: REVISION for name in GATE["REPOSITORIES"]}
+        arguments = [f"{name}={revision}" for name, revision in commits.items()]
+        self.assertEqual(GATE["capture_commits"](Path("nonexistent"), arguments), commits)
+        for invalid in ("aether=master", "aether=abcd", f"unknown={REVISION}"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "REPOSITORY=FULL_SHA"):
+                GATE["capture_commits"](Path("nonexistent"), [invalid])
+        with self.assertRaisesRegex(ValueError, "specified twice"):
+            GATE["capture_commits"](Path("nonexistent"), arguments + arguments[:1])
+
     def test_null_verification_file_never_captures_current_checkouts(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "release.json"

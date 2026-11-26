@@ -507,6 +507,18 @@ impl CursorControls<'_> {
     }
 }
 
+/// Geometry of a physical grid carried by the shared live screen. Hosts may
+/// include projection metadata that must move together with their grid.
+pub trait ScreenGrid {
+    fn dimensions(&self) -> (usize, usize);
+}
+
+impl ScreenGrid for TerminalGrid {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.rows(), self.cols())
+    }
+}
+
 /// Sole live owner of the active and inactive grids and their drawing state.
 /// Autowrap is deliberately absent: ProtocolState mode 7 is authoritative.
 ///
@@ -514,9 +526,9 @@ impl CursorControls<'_> {
 /// operations. It must keep both grids nonempty, cursor positions in bounds and
 /// margins valid before calling row operations, and immediately consume their
 /// effects. Rows keep their identities throughout each nonstructural operation.
-pub struct ScreenState {
-    pub grid: TerminalGrid,
-    pub alt_grid: TerminalGrid,
+pub struct ScreenState<Grid = TerminalGrid> {
+    pub grid: Grid,
+    pub alt_grid: Grid,
     pub use_alt_buffer: bool,
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -544,9 +556,47 @@ pub struct ScreenState {
     pub active_charset: Charset,
 }
 
-impl ScreenState {
-    fn alternate_screen_controls(&mut self) -> AlternateScreenControls<'_, TerminalGrid> {
-        let rows = self.grid.rows();
+impl<Grid: ScreenGrid> ScreenState<Grid> {
+    /// Adopt both real grids and retain their existing row identities.
+    /// # Panics
+    /// Both grids must have matching, nonzero dimensions.
+    pub fn with_grid_pair(grid: Grid, alt_grid: Grid, tab_stop_origin: TabStopOrigin) -> Self {
+        let (rows, cols) = grid.dimensions();
+        assert!(rows > 0 && cols > 0);
+        assert_eq!((rows, cols), alt_grid.dimensions());
+        Self {
+            grid,
+            alt_grid,
+            use_alt_buffer: false,
+            cursor_row: 0,
+            cursor_col: 0,
+            saved_cursor_row: 0,
+            saved_cursor_col: 0,
+            alt_cursor_row: 0,
+            alt_cursor_col: 0,
+            cursor_shape: CursorShape::default(),
+            saved_primary_cursor_shape: None,
+            saved_state: None,
+            saved_primary_screen_state: None,
+            insert_mode: false,
+            last_printed_char: None,
+            origin_mode: false,
+            tab_stops: default_tab_stops(cols, tab_stop_origin),
+            pending_wrap: false,
+            current_fg: Color::Default,
+            current_bg: Color::Default,
+            current_flags: StyleFlags::default(),
+            current_hyperlink: HyperlinkId::NONE,
+            scroll_region_top: 0,
+            scroll_region_bottom: rows - 1,
+            g0_charset: Charset::Ascii,
+            g1_charset: Charset::Ascii,
+            active_charset: Charset::Ascii,
+        }
+    }
+
+    pub fn alternate_screen_controls(&mut self) -> AlternateScreenControls<'_, Grid> {
+        let (rows, _) = self.grid.dimensions();
         AlternateScreenControls {
             grid: &mut self.grid,
             alt_grid: &mut self.alt_grid,
@@ -571,9 +621,10 @@ impl ScreenState {
     }
 
     pub fn cursor_controls(&mut self) -> CursorControls<'_> {
+        let (rows, cols) = self.grid.dimensions();
         CursorControls {
-            rows: self.grid.rows(),
-            cols: self.grid.cols(),
+            rows,
+            cols,
             row: &mut self.cursor_row,
             col: &mut self.cursor_col,
             top: &mut self.scroll_region_top,
@@ -584,6 +635,23 @@ impl ScreenState {
         }
     }
 
+    pub fn save_cursor_drawing(&mut self, autowrap: bool) {
+        self.saved_state = Some(self.alternate_screen_controls().cursor.snapshot(autowrap));
+    }
+
+    /// Restore the saved drawing state and return its DECAWM flag. Each
+    /// compatibility profile decides whether to apply that flag to its modes.
+    pub fn restore_cursor_drawing(&mut self) -> Option<bool> {
+        let saved = self.saved_state.clone();
+        let (rows, cols) = self.grid.dimensions();
+        self.alternate_screen_controls()
+            .cursor
+            .restore(saved.as_ref(), rows, cols);
+        saved.map(|drawing| drawing.autowrap)
+    }
+}
+
+impl ScreenState {
     /// NEL's first stage. The host must notify cursor reposition immediately
     /// after this call, BEFORE running LineFeed. Pending wrap is deliberately
     /// retained until that second stage; no action can span protocol events.
@@ -997,42 +1065,7 @@ impl ScreenState {
     /// # Panics
     /// Both grids must have matching, nonzero dimensions.
     pub fn with_grids(grid: TerminalGrid, alt_grid: TerminalGrid) -> Self {
-        assert!(grid.rows() > 0 && grid.cols() > 0);
-        assert_eq!(
-            (grid.rows(), grid.cols()),
-            (alt_grid.rows(), alt_grid.cols())
-        );
-        let rows = grid.rows();
-        let cols = grid.cols();
-        Self {
-            grid,
-            alt_grid,
-            use_alt_buffer: false,
-            cursor_row: 0,
-            cursor_col: 0,
-            saved_cursor_row: 0,
-            saved_cursor_col: 0,
-            alt_cursor_row: 0,
-            alt_cursor_col: 0,
-            cursor_shape: CursorShape::default(),
-            saved_primary_cursor_shape: None,
-            saved_state: None,
-            saved_primary_screen_state: None,
-            insert_mode: false,
-            last_printed_char: None,
-            origin_mode: false,
-            tab_stops: Self::default_tab_stops(cols),
-            pending_wrap: false,
-            current_fg: Color::Default,
-            current_bg: Color::Default,
-            current_flags: StyleFlags::default(),
-            current_hyperlink: HyperlinkId::NONE,
-            scroll_region_top: 0,
-            scroll_region_bottom: rows - 1,
-            g0_charset: Charset::Ascii,
-            g1_charset: Charset::Ascii,
-            active_charset: Charset::Ascii,
-        }
+        Self::with_grid_pair(grid, alt_grid, TabStopOrigin::Set)
     }
 
     pub fn default_tab_stops(cols: usize) -> Vec<bool> {
@@ -1048,21 +1081,12 @@ impl ScreenState {
     }
 
     pub fn save_cursor_state(&mut self, protocol: &ProtocolState) {
-        self.saved_state = Some(
-            self.alternate_screen_controls()
-                .cursor
-                .snapshot(protocol.modes().contains(&7)),
-        );
+        self.save_cursor_drawing(protocol.modes().contains(&7));
     }
 
     pub fn restore_cursor_state(&mut self, protocol: &mut ProtocolState) {
-        let saved = self.saved_state.clone();
-        let (rows, cols) = (self.grid.rows(), self.grid.cols());
-        self.alternate_screen_controls()
-            .cursor
-            .restore(saved.as_ref(), rows, cols);
-        if let Some(s) = saved {
-            if s.autowrap {
+        if let Some(autowrap) = self.restore_cursor_drawing() {
+            if autowrap {
                 protocol.modes_mut().insert(7);
             } else {
                 protocol.modes_mut().remove(&7);

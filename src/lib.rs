@@ -81,7 +81,10 @@ pub mod session_parity;
 
 pub mod companion_host;
 pub use jterm_remote_client;
+#[cfg(unix)]
+pub use jterm_runtime::native_pty_launch;
 pub use jterm_runtime::output_batch;
+pub use jterm_runtime::pty_instance_lock;
 #[cfg(unix)]
 pub use jterm_runtime::pty_reader;
 #[cfg(all(unix, feature = "terminal-session-actor"))]

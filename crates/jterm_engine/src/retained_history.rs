@@ -4,6 +4,9 @@ use std::{collections::VecDeque, fmt, ops::Deref};
 use crate::ScrollbackLine;
 
 pub const RETAINED_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ROW_SCALED_HISTORY_BYTES: usize = 32 * 1024 * 1024;
+// Allow for a 120-column ASCII row plus its retained entry.
+const ROW_SCALED_HISTORY_BYTES_PER_ROW: usize = 192;
 
 pub trait RetainedRow {
     /// Charge the row and the backing storage it retains. Keep this cost
@@ -33,6 +36,14 @@ impl<Row> RetainedHistory<Row> {
             bytes: 0,
             byte_limit,
         }
+    }
+
+    /// Scale the byte allowance for an explicitly configured scrollback size.
+    /// The owner still enforces both limits and retires identities for rows it evicts.
+    pub fn scale_byte_limit_for_rows(&mut self, row_limit: usize) {
+        self.byte_limit = row_limit
+            .saturating_mul(ROW_SCALED_HISTORY_BYTES_PER_ROW)
+            .clamp(RETAINED_HISTORY_BYTES, MAX_ROW_SCALED_HISTORY_BYTES);
     }
 }
 

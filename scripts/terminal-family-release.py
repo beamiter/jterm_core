@@ -27,6 +27,7 @@ APP_LOCKS = {
     "forge": {"Cargo.lock": {"jterm_core"}},
     "frost": {"Cargo.lock": {"jterm_core", "jterm_engine"}},
 }
+REPOSITORIES = (*APP_LOCKS, "jterm_core")
 
 
 def git(repository, *arguments):
@@ -88,10 +89,9 @@ def app_core_pins(manifest, lock, required, label):
 
 def snapshot(root, commits=None):
     repositories = {}
-    names = [*APP_LOCKS, "jterm_core"]
-    if commits is not None and set(commits) != set(names):
+    if commits is not None and set(commits) != set(REPOSITORIES):
         raise ValueError("record must identify all six repositories")
-    for name in names:
+    for name in REPOSITORIES:
         repository = root / name
         commit = git(repository, "rev-parse", "HEAD").decode().strip() if commits is None else commits[name]
         if not SHA.fullmatch(commit) or git(repository, "cat-file", "-t", commit) != b"commit\n":
@@ -136,10 +136,28 @@ def snapshot(root, commits=None):
     }
 
 
+def capture_commits(root, arguments):
+    overrides = {}
+    for argument in arguments:
+        name, _, commit = argument.partition("=")
+        if name not in REPOSITORIES or not SHA.fullmatch(commit):
+            raise ValueError(f"--rev expects a known REPOSITORY=FULL_SHA: {argument}")
+        if name in overrides:
+            raise ValueError(f"--rev specified twice for {name}")
+        overrides[name] = commit
+    return {
+        name: overrides.get(name) or git(root / name, "rev-parse", "HEAD").decode().strip()
+        for name in REPOSITORIES
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=FAMILY_ROOT, help="parent of the six Git checkouts")
-    parser.add_argument("--verify", type=Path, help="verify a saved record against its exact Git commits")
+    revisions = parser.add_mutually_exclusive_group()
+    revisions.add_argument("--verify", type=Path, help="verify a saved record against its exact Git commits")
+    revisions.add_argument("--rev", action="append", metavar="REPOSITORY=FULL_SHA",
+                           help="capture a specific local commit instead of HEAD (repeatable)")
     parser.add_argument("--require-common-core", action="store_true",
                         help="fail if an app lock resolves to a different commit than the recorded core")
     args = parser.parse_args()
@@ -149,6 +167,8 @@ def main():
         if not isinstance(record, dict) or record.get("schema") != 1:
             raise ValueError("expected a schema 1 family release record")
         commits = {name: repo["commit"] for name, repo in record["repositories"].items()}
+    elif args.rev:
+        commits = capture_commits(args.root, args.rev)
     observed = snapshot(args.root, commits)
     if record is not None and record != observed:
         raise ValueError("saved record differs from the immutable Git inputs")

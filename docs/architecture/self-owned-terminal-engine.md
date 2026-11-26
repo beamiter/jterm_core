@@ -18,6 +18,14 @@ docs/architecture/family-release-2026-11-22.json`. Run with
 the recorded core commit. The checker reads committed Git objects. Native
 tests, platform coverage and upgrade evidence are separate release inputs.
 
+`family-candidate-2026-11-23.json` records the first common source candidate
+in this series. All seven app lockfiles resolve to `afb42aaba56b7cdb256a287a3c31e9f76a734744`.
+Verify the candidate with `python3 scripts/terminal-family-release.py
+--require-common-core --verify docs/architecture/family-candidate-2026-11-23.json`.
+To record a later source candidate while retaining work on a separate
+checkout, pass `--rev REPOSITORY=FULL_SHA` for each selected local commit.
+The script reads the manifests and locks directly from those commits.
+
 | Component | Retained responsibility |
 | --- | --- |
 | jterm_engine | Extracted pure terminal primitives; eventually incremental VT state, modes, input encoding and ordered effects |
@@ -47,6 +55,38 @@ same as moving ownership of the state machine.
 Wake callbacks must be nonblocking, thread-safe and non-panicking. Publish data
 before waking and do not hold queue locks while calling the sink. Wakes may
 coalesce; payloads may not. The sink does not own cancellation or a process.
+
+## Ordered output and exit in Ember
+
+Ember opens one runtime `SessionHandle` for each real PTY. Both the active pane
+and the inactive-session pump consume its budgeted output through the same
+callback. The handle retains split batches and their reader provenance across
+pump calls, including while the host reply queue is backpressured. It releases
+the final exit status once after the parser has applied all earlier bytes.
+Ember can retain an exited command for review once that delivery completes.
+The application still owns the frame budgets, terminal parser adapter, and
+command, clipboard and notification effects.
+
+## Native PTY startup ownership
+
+Ember, Frost and the GTK bundled Bash profile use the runtime's Unix PTY
+launcher. Each host prepares executable, arguments, environment and working
+directory policy. The launcher owns both freshly allocated descriptors and the
+specific child wait. It reports setup failures with the failing stage and
+errno, and distinguishes a reported exec failure from a program that execs
+and immediately exits with status 127. The status pipe requires a complete
+record before exec and EOF. An external fatal signal between the record and
+the syscall can still prevent exec while closing the pipe.
+
+The launcher pins the registered instance lock through fork so the child can
+close its inherited description before setup. After the exec handshake, the
+transport adopts the owned master and exclusive child wait. Registration
+errors carry the post-exec phase because the program may already have run.
+Ember and Frost retry a saved session in its default directory after a
+confirmed directory failure. Other launch failures surface the reported phase.
+Aether's ordinary `Session::spawn_program` path still uses the separate
+portable-pty launcher. Ember and Frost retain their existing stop and reaper
+policies after adoption.
 
 ## Initial host-context seam (Ember)
 
@@ -91,7 +131,7 @@ Production fragmentation snapshots retain separately named protocol lanes.
 This completes that narrow protocol/input slice, not full VT parsing, live
 screen/history ownership or a cross-frontend renderer.
 
-## Live screen operations and shared Frost cells
+## Live screen state in Ember and Frost
 
 Ember stores its only live active/hidden grids and drawing state in ScreenState.
 Engine row writes, wide edits, erasure and cursor operations return immediate
@@ -99,10 +139,13 @@ row effects with identity and distinct changed/printed spans. Host retains
 structural scrolling/history/resize, graphics, row allocation and provenance.
 Pre-extraction row goldens establish compatibility independently of new code.
 
-Frost now reuses cell/style/color/cursor and opaque hyperlink types and a single
-engine grid backing store, retaining its row identity revision, scrollback format, streaming
-search and richer keyboard policies. These differences need explicit adapters
-before storage or parser convergence; the migration is not a wholesale swap.
+The Frost candidate also stores both live grids and their drawing state in
+`ScreenState`. Its grid adapter travels with the row identity revision when
+the screens swap. The shared state holds cursor and saved cursor positions,
+margins, deferred wrap, tab stops, charset, pen, and the current hyperlink.
+Renderers read this state directly. Frost keeps its live DECAWM flag when it
+restores the cursor drawing. The host owns Frost's alternate-screen settings,
+projection, history admission, and effect delivery.
 
 ## Incremental parser ownership
 

@@ -61,7 +61,7 @@ fn validate_unix_child(mut child: Child) -> io::Result<(Child, i32)> {
 }
 
 #[cfg(unix)]
-fn require_waitable_sigchld() -> io::Result<()> {
+pub(crate) fn require_waitable_sigchld() -> io::Result<()> {
     // SAFETY: action is writable and a null new-action pointer makes sigaction
     // a read-only query of the process-wide disposition.
     let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
@@ -72,7 +72,7 @@ fn require_waitable_sigchld() -> io::Result<()> {
     if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "supervised helpers require a waitable SIGCHLD disposition",
+            "child supervision requires a waitable SIGCHLD disposition",
         ));
     }
     Ok(())

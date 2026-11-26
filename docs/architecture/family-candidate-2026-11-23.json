@@ -1,0 +1,128 @@
+{
+  "common_core_mismatches": {},
+  "repositories": {
+    "aether": {
+      "app_core_pins": {
+        "bridge/Cargo.lock": {
+          "jterm_engine": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_protocol": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_runtime": "afb42aaba56b7cdb256a287a3c31e9f76a734744"
+        },
+        "session/Cargo.lock": {
+          "jterm_engine": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_runtime": "afb42aaba56b7cdb256a287a3c31e9f76a734744"
+        },
+        "src-tauri/Cargo.lock": {
+          "jterm_core": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_engine": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_protocol": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_remote_client": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_runtime": "afb42aaba56b7cdb256a287a3c31e9f76a734744"
+        }
+      },
+      "commit": "a540e028e9e331326cb69c67b62ec707204e403a",
+      "lock_sha256": {
+        "bridge/Cargo.lock": "9ed1785b00b20904cf7efb8cd9445c4a951c69781ecad0da07b5736c157b3e55",
+        "session/Cargo.lock": "5532ab1876ff962ae5254e03f11f0a9a1c5cdfe84c9e09c7c04018f7fd29017b",
+        "src-tauri/Cargo.lock": "36fbdf04c2bcc3cf724f87b69cc0c06a92decab583103477e6e6b9c09bb2beb2"
+      }
+    },
+    "anvil": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_engine": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_gtk_view": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_remote_client": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_runtime": "afb42aaba56b7cdb256a287a3c31e9f76a734744"
+        }
+      },
+      "commit": "3f20f7f6bf0132449e87564ce4abd39084b0262d",
+      "lock_sha256": {
+        "Cargo.lock": "109659d68d6c51c796bc651060cd69a9b67d0af2a1419b5cacdc36a26b0f28ab",
+        "scripts/link-recovery/Cargo.lock": "f71735572bf0371ef6ea2d692aa27f9316b1f5ad9802aa10d270946bb77490dd"
+      }
+    },
+    "ember": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_engine": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_remote_client": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_runtime": "afb42aaba56b7cdb256a287a3c31e9f76a734744"
+        }
+      },
+      "commit": "97702a76325b610bbcbf8ed72badc696702b3ca0",
+      "lock_sha256": {
+        "Cargo.lock": "b3991dd98afb40de5b57dd70e740092ab93473502eb0c03cd6c5feed8fb43ee4",
+        "font-group-harness/Cargo.lock": "ab9c4e45c2ad72687999c4aaac38728396fcc2c03c17d26d09b6241aa3a598d7",
+        "tools/eva-render-harness/Cargo.lock": "df7b1b0b5a74003c4efaedc6a07474ac89f4b30cad821a5d99f49cd98a926cc1",
+        "tools/native-feedback-harness/Cargo.lock": "e015e232d6ddb3b84cbcb74008c20cf0d4cd019f172f211421656c5b2923b875",
+        "vendor/eframe/Cargo.lock": "19f7d98a0e65f84bc5ea3b95d5dac091ae5c5a460dd75af15a4e1f47758cd770",
+        "vendor/egui-wgpu/Cargo.lock": "9a36e580750555cc488a9293a651009b3721fc840a553ce862f63f44552628c7",
+        "vendor/egui-winit/Cargo.lock": "64b3f04fca38fd8577898619b61cae5ae376355ba1754099b0c397f9d3c69332",
+        "vendor/smithay-clipboard/Cargo.lock": "67e58ea42a92f2ea5e182ee7644b4ed640839a03966aae39421f8f254d52f118",
+        "vendor/wgpu-hal/Cargo.lock": "c4da0b85155fcc10a596cfc7deb55a7e5c6ae2c8cbbdb80a7e7bf083f9e7b74c",
+        "vendor/winit/Cargo.lock": "b6183ac90e9aabac21f3fd993380cd8d8f7a28c7b7b67f8ae5549e95bedc205f"
+      }
+    },
+    "forge": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_engine": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_gtk_view": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_remote_client": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_runtime": "afb42aaba56b7cdb256a287a3c31e9f76a734744"
+        }
+      },
+      "commit": "ead3f9770a2fb3f6076ba062b70769d77fd8c656",
+      "lock_sha256": {
+        "Cargo.lock": "69da75d4cf5a11053691be8145a46d8f900e2d182825f7d6d5da3f4c50a5a84b",
+        "prototypes/ascii-organism/Cargo.lock": "a64ef4f10604631b0b0e7c4167802250a5de7970742832f24d377216520c73e2",
+        "scripts/mission-acceptance/harness/Cargo.lock": "c8a308b18dea029c47a3ff8acdb3e69fbf27fdf11b32553659f7f1bc710b03f4",
+        "scripts/pr19-gtk-cellframe/Cargo.lock": "d5cb45a3267e20848d82cc4f4e57f9ac22080c61bc68d887a8483ab50d898859",
+        "tools/eva-native-render/Cargo.lock": "cccb1760041331eff84208a29433b5ad3c815a5e810030632dbbafb52f768d77"
+      }
+    },
+    "frost": {
+      "app_core_pins": {
+        "Cargo.lock": {
+          "jterm_core": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_engine": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_remote_client": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+          "jterm_runtime": "afb42aaba56b7cdb256a287a3c31e9f76a734744"
+        }
+      },
+      "commit": "f59d17d2e8b7a5f4b1cba01c690fd83bce090cee",
+      "lock_sha256": {
+        "Cargo.lock": "423bdf0fe664089a1023b970fc25be639f71401dbc42951295887e9957179f42",
+        "scripts/provider-acceptance/Cargo.lock": "ca787fccdb384c3f8560b8c235af4849d52a2082e29af88ad15371a4b7975d22",
+        "tools/native-feedback-harness/Cargo.lock": "e74e8a53ebb72734ae90788868b7f4109f3eac1177e9a0ebe2942f8c94c4ab15",
+        "vendor/clipboard_x11/Cargo.lock": "8bdd797e584214d7794e7462730c063303bd6f9800c4c25f5a1d2652fe4b911a",
+        "vendor/iced_futures/Cargo.lock": "8305114c4dc354e0d21e73c15435c595b78f9ddf282785aefce7602553652c9b",
+        "vendor/iced_winit/Cargo.lock": "e5c7caef014e9e48b9c3ac1aed216c004425648dcf9144da358fd94100d0ede3",
+        "vendor/smithay-clipboard/Cargo.lock": "67e58ea42a92f2ea5e182ee7644b4ed640839a03966aae39421f8f254d52f118",
+        "vendor/wasmtimer/Cargo.lock": "76c1ea0d306651336927d72385a65271ac706ae6199d73d12288fcb7b80e0821",
+        "vendor/wayland-client/Cargo.lock": "74804d2dae5953bda810645a487dc6516d0602812556c0d10fde481efbb5673f",
+        "vendor/wgpu-hal/Cargo.lock": "45fc44d45ce69fa1420d367969799c71f262dd2ed88bbd659af025ef22e89b6f",
+        "vendor/window_clipboard/Cargo.lock": "7eb91904452ec34dde8313863abeec23b42983705657e0b0c1930cc140796246",
+        "vendor/winit/Cargo.lock": "b6183ac90e9aabac21f3fd993380cd8d8f7a28c7b7b67f8ae5549e95bedc205f"
+      }
+    },
+    "jterm_core": {
+      "app_core_pins": {},
+      "commit": "afb42aaba56b7cdb256a287a3c31e9f76a734744",
+      "lock_sha256": {
+        "Cargo.lock": "2dc91d3d1e347bd15ccd694cd6cee76e93928ee028195059e4856ad48e89d11b",
+        "crates/jterm_engine/Cargo.lock": "9116f51244151d09f754672cb9418842401e0668509bf7f079991c77e786d3ef",
+        "crates/jterm_gtk_view/Cargo.lock": "d6a967ab6dd22f97472730f14b531eb1e4051b7d530ef50407f94f204396688a",
+        "crates/jterm_protocol/Cargo.lock": "30d654b355d91728cc49ab28a96d5baccacfe77021831f506372f97514e1cd97",
+        "crates/jterm_remote_client/Cargo.lock": "230a6382dfd8bb93d10675d0f0ac664f576bcec88e773640eb82ae198a6d1a26",
+        "crates/jterm_runtime/Cargo.lock": "1ce714fa9b732f669d12652b65e4d6df64d64364c67c5eb100f2a8024602a45f",
+        "tools/companion-host-harness/Cargo.lock": "40191027e60cd99f8da2743610778ff6419d07ba1f67107984ab78506c8099f8"
+      }
+    }
+  },
+  "schema": 1
+}
