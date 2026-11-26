@@ -4,16 +4,19 @@ use std::{
     os::fd::{BorrowedFd, RawFd},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex, MutexGuard, TryLockError, Weak},
     thread::{self, Thread},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_channel::mpsc::{self, Receiver, Sender};
 use jterm_engine::{
     colors::TerminalDefaultColors,
+    frame_retention::process_frame_budget,
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
+    retained_bytes::{RetainedBytes, RetainedBytesBudget},
     terminal::{Terminal, WindowUpdates},
 };
 use jterm_runtime::{exit_status::PtyExit, pty_session::Session, runtime_wake::WakeSink};
@@ -31,24 +34,36 @@ use crate::viewport::{ViewportFrame, ViewportRequest};
 pub struct RuntimeShell {
     state: Arc<Mutex<State>>,
     updates: Arc<Mutex<Update>>,
+    live_viewport: Arc<AtomicBool>,
     worker: OnceCell<Thread>,
+    observers: Arc<crate::runtime_observer::ObserverHub>,
 }
 
 struct State {
     session: Session,
+    attachment: Option<crate::attachment::ViewAttachment>,
     closed: bool,
     shutdown: bool,
     write_error_reported: bool,
     view_revision: u64,
     viewport_request: Option<ViewportRequest>,
     captured_viewport: Option<CapturedViewport>,
+    viewport_budget: Arc<RetainedBytesBudget>,
+    viewport_retry_at: Option<Instant>,
 }
 
 struct CapturedViewport {
     request: ViewportRequest,
     revision: u64,
-    frame: Result<ViewportFrame, String>,
+    frame: Result<(ViewportFrame, RetainedBytes), String>,
 }
+
+type ViewportDelivery = (ViewportFrame, bool, RetainedBytes);
+
+const LIVE_VIEWPORT: ViewportRequest = ViewportRequest {
+    top: None,
+    painted_history: None,
+};
 
 #[derive(Default)]
 pub(crate) struct Update {
@@ -130,6 +145,26 @@ impl RuntimeShell {
         let runtime = Self::spawn_program(argv, &cwd, prepare_environment()?)?;
         runtime.enable_primary_reflow()?;
         Ok(runtime)
+    }
+
+    /// Start an ordinary local shell in the shared runtime. Executable lookup
+    /// uses the prepared child PATH and directory. Preserve a valid jsh session
+    /// identity when the caller supplies one.
+    pub fn spawn_configured_shell(
+        argv: &[String],
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+        directory_available: fn(&str) -> bool,
+        prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
+    ) -> Result<Rc<Self>, String> {
+        let argv = match session_id {
+            Some(id) => with_jsh_session(argv, id).ok_or_else(|| {
+                "configured jsh session identity is invalid or conflicts with its arguments"
+                    .to_owned()
+            })?,
+            None => std::borrow::Cow::Borrowed(argv),
+        };
+        Self::spawn_interactive(&argv, cwd, directory_available, prepare_environment)
     }
 
     /// Open a new ordinary pane with the host's saved or freshly minted jsh id.
@@ -268,6 +303,25 @@ impl RuntimeShell {
         {
             return Ok(None);
         }
+        Self::spawn_bundled_bash(
+            Path::new(program),
+            cwd,
+            directory_available,
+            startup_script,
+            prepare_environment,
+        )
+        .map(Some)
+    }
+
+    /// Launch the application's bundled Bash startup script under the shared
+    /// runtime, retaining its private shell identity channel.
+    pub fn spawn_bundled_bash(
+        program: &Path,
+        cwd: Option<&str>,
+        directory_available: fn(&str) -> bool,
+        startup_script: &[u8],
+        prepare_environment: impl FnOnce() -> Result<Vec<CString>, String>,
+    ) -> Result<Rc<Self>, String> {
         let cwd = local_directory(cwd, directory_available)?
             .canonicalize()
             .map_err(|error| format!("invalid PTY working directory: {error}"))?;
@@ -275,29 +329,105 @@ impl RuntimeShell {
         let mut session = Session::spawn_anvil_bash(
             INITIAL_ROWS,
             INITIAL_COLUMNS,
-            Path::new(program),
+            program,
             startup_script,
             &cwd,
             &env,
         )?;
         session.enable_primary_reflow();
-        Ok(Some(Self::new(session)))
+        Ok(Self::new(session))
     }
 
     fn new(session: Session) -> Rc<Self> {
+        let attachment = session
+            .terminal()
+            .frame()
+            .ok()
+            .and_then(|frame| u32::try_from(frame.stamp().epoch).ok())
+            .map(crate::attachment::ViewAttachment::new);
         Rc::new(Self {
             state: Arc::new(Mutex::new(State {
                 session,
+                attachment,
                 closed: false,
                 shutdown: false,
                 write_error_reported: false,
                 view_revision: 0,
                 viewport_request: None,
                 captured_viewport: None,
+                viewport_budget: Arc::clone(process_frame_budget()),
+                viewport_retry_at: None,
             })),
             updates: Arc::new(Mutex::new(Update::default())),
+            live_viewport: Arc::new(AtomicBool::new(false)),
             worker: OnceCell::new(),
+            observers: Arc::default(),
         })
+    }
+
+    /// Identity of the current view; detach preserves its session and actor epoch.
+    pub fn view_attachment(&self) -> Result<crate::Attachment, String> {
+        self.lock()?
+            .attachment
+            .as_ref()
+            .map(|view| view.ticket())
+            .ok_or_else(|| "terminal epoch cannot be represented".into())
+    }
+
+    pub fn view_is_attached(&self) -> bool {
+        self.lock().ok().is_some_and(|state| {
+            state
+                .attachment
+                .as_ref()
+                .is_some_and(|view| view.attached())
+        })
+    }
+
+    pub(crate) fn switch_view(
+        &self,
+        expected: &crate::Attachment,
+        attach: bool,
+    ) -> Result<crate::Attachment, String> {
+        let mut state = self.lock()?;
+        if state.shutdown || state.closed {
+            return Err("terminal session is closed".into());
+        }
+        let ticket = state
+            .attachment
+            .as_mut()
+            .ok_or("terminal attachment unavailable")?
+            .switch(expected, attach)?;
+        state.viewport_request = None;
+        state.captured_viewport = None;
+        state.viewport_retry_at = None;
+        self.live_viewport.store(false, Ordering::Relaxed);
+        Ok(ticket)
+    }
+
+    pub(crate) fn input_for(
+        &self,
+        expected: &crate::Attachment,
+        bytes: Vec<u8>,
+    ) -> Result<bool, String> {
+        let mut state = self.lock()?;
+        if !state
+            .attachment
+            .as_ref()
+            .is_some_and(|view| view.admits(expected))
+        {
+            return Err("stale terminal view attachment".into());
+        }
+        if bytes.len() > jterm_engine::terminal::MAX_INPUT_BYTES {
+            return Err("terminal input byte limit".into());
+        }
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        state.session.submit_input(bytes)?;
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
+        Ok(true)
     }
 
     pub fn child_pid(&self) -> Option<i32> {
@@ -316,12 +446,33 @@ impl RuntimeShell {
         self.lock().ok()?.session.exit_code()
     }
 
+    /// Subscribe without acquiring input, geometry, or lifecycle authority.
+    pub fn observe(&self) -> Result<crate::RuntimeObserver, String> {
+        if self.worker.get().is_none() {
+            return Err("The terminal owner is not attached".into());
+        }
+        let observer = self.observers.subscribe()?;
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
+        Ok(observer)
+    }
+
     pub fn close(&self) {
         if let Ok(mut state) = self.lock() {
             state.shutdown = true;
             state.viewport_request = None;
             state.captured_viewport = None;
             state.close();
+            if self.observers.active() {
+                if let Ok(Some(frame)) = LIVE_VIEWPORT.capture(state.session.terminal(), true) {
+                    self.observers
+                        .publish(frame, true, state.session.exit_code());
+                }
+            }
+            self.observers.close(state.session.exit_code());
+        } else {
+            self.observers.close(None);
         }
         if let Some(worker) = self.worker.get() {
             worker.unpark();
@@ -357,12 +508,14 @@ impl RuntimeShell {
         state.session.enable_history_preserving_resize();
         let owner = Arc::downgrade(&self.state);
         let pending = self.updates.clone();
+        let live_viewport = self.live_viewport.clone();
+        let observers = self.observers.clone();
         // A single producer always has one reserved slot. Wakes coalesce while
         // GTK is busy because State owns the actual presentation status.
         let (updates, receiver) = mpsc::channel(0);
         let worker = thread::Builder::new()
             .name("gtk-terminal-runtime".into())
-            .spawn(move || drive(owner, pending, updates))
+            .spawn(move || drive(owner, pending, updates, live_viewport, observers))
             .map_err(|error| format!("terminal worker unavailable: {error}"))?
             .thread()
             .clone();
@@ -404,6 +557,13 @@ impl RuntimeShell {
         encode: impl FnOnce(&Terminal) -> Result<Vec<u8>, String>,
     ) -> Result<bool, String> {
         let mut state = self.lock()?;
+        if !state
+            .attachment
+            .as_ref()
+            .is_some_and(|view| view.attached())
+        {
+            return Err("terminal view is detached".into());
+        }
         let bytes = encode(state.session.terminal())?;
         if bytes.is_empty() {
             return Ok(false);
@@ -416,7 +576,16 @@ impl RuntimeShell {
     }
 
     pub(crate) fn paste(&self, text: &str) -> Result<bool, String> {
-        let accepted = self.lock()?.session.submit_native_paste(text)?;
+        let mut state = self.lock()?;
+        if !state
+            .attachment
+            .as_ref()
+            .is_some_and(|view| view.attached())
+        {
+            return Err("terminal view is detached".into());
+        }
+        let accepted = state.session.submit_native_paste(text)?;
+        drop(state);
         if accepted {
             if let Some(worker) = self.worker.get() {
                 worker.unpark();
@@ -427,9 +596,20 @@ impl RuntimeShell {
 
     pub(crate) fn resize(&self, rows: usize, columns: usize) -> Result<(), String> {
         let mut state = self.lock()?;
+        if !state
+            .attachment
+            .as_ref()
+            .is_some_and(|view| view.attached())
+        {
+            return Err("terminal view is detached".into());
+        }
         state.session.resize(rows, columns)?;
         state.view_revision = state.view_revision.wrapping_add(1);
         state.captured_viewport = None;
+        self.observers.request_refresh();
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
         Ok(())
     }
 
@@ -438,6 +618,10 @@ impl RuntimeShell {
         state.session.set_history_row_limit(rows);
         state.view_revision = state.view_revision.wrapping_add(1);
         state.captured_viewport = None;
+        self.observers.request_refresh();
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
         Ok(())
     }
 
@@ -446,6 +630,10 @@ impl RuntimeShell {
         state.session.set_color_defaults(defaults);
         state.view_revision = state.view_revision.wrapping_add(1);
         state.captured_viewport = None;
+        self.observers.request_refresh();
+        if let Some(worker) = self.worker.get() {
+            worker.unpark();
+        }
         Ok(())
     }
 
@@ -454,7 +642,7 @@ impl RuntimeShell {
     pub(crate) fn poll_viewport(
         &self,
         request: ViewportRequest,
-    ) -> Result<Option<(ViewportFrame, bool)>, String> {
+    ) -> Result<Option<ViewportDelivery>, String> {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return Ok(None),
@@ -468,9 +656,13 @@ impl RuntimeShell {
             .take()
             .filter(|captured| captured.request == request)
         {
+            let newer_output = captured.revision != state.view_revision;
+            if newer_output {
+                self.queue_viewport(&mut state, request);
+            }
             return captured
                 .frame
-                .map(|frame| Some((frame, captured.revision != state.view_revision)));
+                .map(|(frame, delivery)| Some((frame, newer_output, delivery)));
         }
         self.queue_viewport(&mut state, request);
         Ok(None)
@@ -480,6 +672,13 @@ impl RuntimeShell {
         if let Ok(mut state) = self.state.try_lock() {
             self.queue_viewport(&mut state, request);
         }
+    }
+
+    /// A mapped, unselected pane at the live edge can use a snapshot captured
+    /// in the same worker turn as its child output. This is a hint; explicit
+    /// viewport requests still own resize, scroll and selection transitions.
+    pub(crate) fn set_live_viewport(&self, visible: bool) {
+        self.live_viewport.store(visible, Ordering::Relaxed);
     }
 
     fn queue_viewport(&self, state: &mut State, request: ViewportRequest) {
@@ -554,12 +753,26 @@ impl State {
         (read, update)
     }
 
-    fn capture_viewport(&mut self) {
-        let Some(request) = self.viewport_request else {
+    fn capture_viewport(&mut self, prefetch_live: bool) {
+        let request = self.viewport_request.or_else(|| {
+            (prefetch_live && self.captured_viewport.is_none()).then_some(LIVE_VIEWPORT)
+        });
+        let Some(request) = request else {
             return;
         };
+        let now = Instant::now();
+        if self.viewport_retry_at.is_some_and(|retry| now < retry) {
+            return;
+        }
         let frame = match request.capture(self.session.terminal(), self.closed) {
-            Ok(Some(frame)) => Ok(frame),
+            Ok(Some(frame)) => {
+                let Some(delivery) = frame.reserve_delivery(&self.viewport_budget) else {
+                    // The PTY can keep advancing while this request waits for space.
+                    self.viewport_retry_at = Some(Instant::now() + Duration::from_millis(64));
+                    return;
+                };
+                Ok((frame, delivery))
+            }
             Ok(None) => return,
             Err(error) => Err(error),
         };
@@ -569,6 +782,7 @@ impl State {
             frame,
         });
         self.viewport_request = None;
+        self.viewport_retry_at = None;
     }
 }
 
@@ -578,7 +792,23 @@ impl Drop for RuntimeShell {
     }
 }
 
-fn drive(owner: Weak<Mutex<State>>, pending: Arc<Mutex<Update>>, mut notifications: Sender<()>) {
+fn drive(
+    owner: Weak<Mutex<State>>,
+    pending: Arc<Mutex<Update>>,
+    mut notifications: Sender<()>,
+    live_viewport: Arc<AtomicBool>,
+    observers: Arc<crate::runtime_observer::ObserverHub>,
+) {
+    struct CloseObservers(Arc<crate::runtime_observer::ObserverHub>);
+    impl Drop for CloseObservers {
+        fn drop(&mut self) {
+            self.0.close(None);
+        }
+    }
+    // A disconnected/poisoned owner must not leave live-looking observers.
+    let _close_observers = CloseObservers(observers.clone());
+    let mut observer_dirty = false;
+    let mut observer_deadline = Instant::now();
     loop {
         let (read, retry, update) = {
             let Some(owner) = owner.upgrade() else { return };
@@ -587,10 +817,35 @@ fn drive(owner: Weak<Mutex<State>>, pending: Arc<Mutex<Update>>, mut notificatio
                 return;
             }
             let (read, update) = state.poll_session();
-            state.capture_viewport();
+            let prefetch_live = live_viewport.load(Ordering::Relaxed)
+                && (update.output_changed || update.exit_status.is_some() || update.stopped);
+            state.capture_viewport(prefetch_live);
+            observer_dirty |=
+                update.output_changed || update.exit_status.is_some() || update.stopped;
+            if observers.active()
+                && (observers.requested() || observer_dirty)
+                && ((state.closed && !observers.is_closed()) || Instant::now() >= observer_deadline)
+            {
+                match LIVE_VIEWPORT.capture(state.session.terminal(), state.closed) {
+                    Ok(Some(frame)) => {
+                        let published =
+                            observers.publish(frame, state.closed, state.session.exit_code());
+                        observer_dirty = !published;
+                        observer_deadline =
+                            Instant::now() + Duration::from_millis(if published { 16 } else { 64 });
+                    }
+                    Ok(None) => observers.request_refresh(),
+                    Err(error) => {
+                        observers.report_failure(&error);
+                        observer_dirty = false;
+                    }
+                }
+            }
             (
                 read,
-                state.session.needs_write_retry() || state.viewport_request.is_some(),
+                state.session.needs_write_retry()
+                    || state.viewport_request.is_some()
+                    || (observers.active() && (observer_dirty || observers.requested())),
                 update,
             )
         };
@@ -623,6 +878,172 @@ fn local_directory(cwd: Option<&str>, available: fn(&str) -> bool) -> Result<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_detached_views_keep_real_actors_drain_replies_and_reject_stale_input() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = std::env::temp_dir().join(format!(
+            "gtk-view-attachment-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let program = r#"stty raw -echo
+printf '\033[6;12H\033[5n\033[6n'
+head -c 11 > "$1/$2.first"
+printf 'READY'
+while [ ! -f "$1/advance" ]; do sleep .01; done
+yes detached | head -c 262144
+printf '\r\nDETACHEDTAIL-%s\r\n\033[6;12H\033[5n\033[6n' "$2"
+head -c 11 > "$1/$2.detached"
+head -c 1 > "$1/$2.input"
+printf '\r\nFINALTAIL-%s\r\n' "$2"
+exit 17"#;
+        let mut owners = Vec::new();
+        let mut notices = Vec::new();
+        for role in ["A", "B"] {
+            let argv = [
+                OsString::from("/bin/sh"),
+                "-c".into(),
+                program.into(),
+                "fixture".into(),
+                root.as_os_str().to_owned(),
+                role.into(),
+            ];
+            let session = Session::spawn_command(
+                INITIAL_ROWS,
+                INITIAL_COLUMNS,
+                &argv,
+                None,
+                &[("PATH".into(), "/usr/bin:/bin".into())],
+            )
+            .unwrap();
+            let owner = RuntimeShell::new(session);
+            notices.push(
+                owner
+                    .configure_view(|_, _| false, TerminalDefaultColors::default())
+                    .unwrap(),
+            );
+            owners.push(owner);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let wait_file = |path: &Path| {
+            while std::fs::metadata(path).map_or(true, |m| m.len() != 11) {
+                assert!(Instant::now() < deadline, "missing query reply {path:?}");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(std::fs::read(path).unwrap(), b"\x1b[0n\x1b[6;12R");
+        };
+        for role in ["A", "B"] {
+            wait_file(&root.join(format!("{role}.first")));
+        }
+        let pids: Vec<_> = owners
+            .iter()
+            .map(|owner| owner.child_pid().unwrap())
+            .collect();
+        assert_ne!(pids[0], pids[1]);
+        let initial: Vec<_> = owners
+            .iter()
+            .map(|owner| owner.view_attachment().unwrap())
+            .collect();
+        assert_ne!(initial[0].session, initial[1].session);
+        let detached: Vec<_> = owners
+            .iter()
+            .zip(&initial)
+            .map(|(owner, ticket)| owner.switch_view(ticket, false).unwrap())
+            .collect();
+        for (owner, ticket) in owners.iter().zip(&initial) {
+            assert!(owner.input_for(ticket, b"stale".to_vec()).is_err());
+            assert!(owner.input(|_| Ok(b"detached".to_vec())).is_err());
+            assert!(owner.paste("detached").is_err());
+            assert!(owner.resize(10, 10).is_err());
+        }
+        std::fs::write(root.join("advance"), b"go").unwrap();
+        for role in ["A", "B"] {
+            wait_file(&root.join(format!("{role}.detached")));
+        }
+        for (i, owner) in owners.iter().enumerate() {
+            assert_eq!(owner.child_pid(), Some(pids[i]));
+            let resumed = owner.switch_view(&detached[i], true).unwrap();
+            assert_eq!(resumed.session, initial[i].session);
+            assert_eq!(resumed.epoch, initial[i].epoch);
+            assert!(owner.input_for(&initial[i], b"stale".to_vec()).is_err());
+            assert!(owner.input_for(&detached[i], b"stale".to_vec()).is_err());
+            assert!(owner
+                .input_for(&owners[1 - i].view_attachment().unwrap(), b"peer".to_vec())
+                .is_err());
+            assert!(owner.input_for(&resumed, b"X".to_vec()).unwrap());
+        }
+        for (i, owner) in owners.iter().enumerate() {
+            loop {
+                let update = owner.take_update().unwrap();
+                if let Some(status) = update.exit_status {
+                    assert_eq!(status.code, 17);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "child did not finish");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                std::fs::read(root.join(format!("{}.input", ["A", "B"][i]))).unwrap(),
+                b"X"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_shell_resolves_child_path_and_recovers_an_unavailable_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let argv = vec![
+            "bash".to_owned(),
+            "--noprofile".to_owned(),
+            "--norc".to_owned(),
+            "-c".to_owned(),
+            "test -t 0 && test \"$PWD\" = \"$1\" && test \"$2\" = 'two words' || exit 18; exit 17"
+                .to_owned(),
+            "configured-fixture".to_owned(),
+            cwd.to_str().unwrap().to_owned(),
+            "two words".to_owned(),
+        ];
+        assert!(!RuntimeShell::supports_local_shell(&argv, false));
+        let owner = RuntimeShell::spawn_configured_shell(
+            &argv,
+            Some("/unavailable-restored-directory"),
+            None,
+            |_| false,
+            || Ok(vec![CString::new("PATH=/usr/bin:/bin").unwrap()]),
+        )
+        .expect("start the configured relative shell in the shared PTY");
+        owner
+            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut update = Update::default();
+        while update.exit_status.is_none() && std::time::Instant::now() < deadline {
+            update.merge(owner.take_update().unwrap());
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            update.exit_status,
+            Some(PtyExit::from(17)),
+            "{:?}",
+            update.failure
+        );
+        assert!(owner.child_pid().is_none());
+    }
 
     #[test]
     fn hosted_attachment_uses_the_prepared_argv_and_local_directory() {
@@ -700,7 +1121,7 @@ mod tests {
             top: None,
             painted_history: None,
         };
-        let (viewport, newer_output) = loop {
+        let (viewport, newer_output, _delivery) = loop {
             if let Some(captured) = owner.poll_viewport(request).unwrap() {
                 break captured;
             }
@@ -718,5 +1139,140 @@ mod tests {
                 .collect::<String>()
                 .contains("FINAL GTK PTY TAIL")
         }));
+    }
+
+    #[test]
+    fn full_viewport_budget_defers_paint_but_drains_the_real_pty_reply() {
+        let command = "stty raw -echo; printf '\\033[5n'; head -c 4 >/dev/null; printf 'VIEWPORT-AFTER-REPLY'; head -c 1 >/dev/null";
+        let arguments = ["/bin/sh", "-c", command].map(OsString::from);
+        let env = [("PATH".into(), "/usr/bin:/bin".into())];
+        let session = Session::spawn_command(INITIAL_ROWS, INITIAL_COLUMNS, &arguments, None, &env)
+            .expect("real PTY");
+        let owner = RuntimeShell::new(session);
+        let capacity = 1024 * 1024;
+        let budget = Arc::new(RetainedBytesBudget::new(capacity));
+        let busy = budget.reserve(capacity).unwrap();
+        owner.lock().unwrap().viewport_budget = Arc::clone(&budget);
+        let pid = owner.child_pid();
+        let _notifications = owner
+            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .unwrap();
+        let has_marker = |frame: &jterm_engine::frame::CellFrame| {
+            frame.rows().iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .contains("VIEWPORT-AFTER-REPLY")
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(owner.poll_viewport(LIVE_VIEWPORT).unwrap().is_none());
+            let state = owner.lock().unwrap();
+            if state.viewport_retry_at.is_some()
+                && has_marker(&state.session.terminal().frame().unwrap())
+            {
+                break;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "PTY did not receive the reply while paint waited"
+            );
+            thread::sleep(Duration::from_millis(4));
+        }
+        drop(busy);
+        let (viewport, stale, delivery) = loop {
+            if let Some(captured) = owner.poll_viewport(LIVE_VIEWPORT).unwrap() {
+                break captured;
+            }
+            assert!(Instant::now() < deadline, "viewport did not recover");
+            thread::sleep(Duration::from_millis(4));
+        };
+        assert!(!stale && has_marker(&viewport.frame));
+        assert_eq!(owner.child_pid(), pid);
+        assert_eq!(
+            budget.usage().retained_bytes,
+            viewport.frame.retained_delivery_bytes()
+        );
+        drop(viewport);
+        drop(delivery);
+        assert_eq!(budget.usage().retained_bytes, 0);
+        owner.close();
+    }
+
+    #[test]
+    fn visible_output_prefetch_is_bounded_and_hidden_output_needs_a_request() {
+        let arguments = [
+            "/bin/sh",
+            "-c",
+            "stty -echo; printf 'fixture ready\\r\\n'; while IFS= read -r line; do printf 'paint-%s\\r\\n' \"$line\"; done",
+        ]
+        .map(OsString::from);
+        let env = [("PATH".into(), "/usr/bin:/bin".into())];
+        let session = Session::spawn_command(INITIAL_ROWS, INITIAL_COLUMNS, &arguments, None, &env)
+            .expect("real PTY");
+        let owner = RuntimeShell::new(session);
+        let _notifications = owner
+            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .unwrap();
+        let contains = |frame: &jterm_engine::frame::CellFrame, text: &str| {
+            frame.rows().iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .contains(text)
+            })
+        };
+        let wait_for_marker = |marker: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let state = owner.lock().unwrap();
+                if contains(&state.session.terminal().frame().unwrap(), marker) {
+                    break;
+                }
+                drop(state);
+                assert!(std::time::Instant::now() < deadline, "missing {marker}");
+                thread::sleep(Duration::from_millis(4));
+            }
+        };
+        let send = |line: &str| {
+            owner
+                .input(|_| Ok(format!("{line}\n").into_bytes()))
+                .unwrap();
+            wait_for_marker(&format!("paint-{line}"));
+        };
+        let receive = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(snapshot) = owner.poll_viewport(LIVE_VIEWPORT).unwrap() {
+                    break snapshot;
+                }
+                assert!(std::time::Instant::now() < deadline, "viewport unavailable");
+                thread::sleep(Duration::from_millis(4));
+            }
+        };
+
+        wait_for_marker("fixture ready");
+        owner.set_live_viewport(true);
+        send("first");
+        assert!(owner.lock().unwrap().captured_viewport.is_some());
+        send("second");
+        let (first, stale, _delivery) = receive();
+        assert!(stale);
+        assert!(contains(&first.frame, "paint-first"));
+        assert!(!contains(&first.frame, "paint-second"));
+        let (second, stale, _delivery) = receive();
+        assert!(!stale);
+        assert!(contains(&second.frame, "paint-second"));
+
+        owner.set_live_viewport(false);
+        send("hidden");
+        assert!(owner.lock().unwrap().captured_viewport.is_none());
+        let (explicit, stale, _delivery) = receive();
+        assert!(!stale);
+        assert!(contains(&explicit.frame, "paint-hidden"));
     }
 }

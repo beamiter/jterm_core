@@ -7,6 +7,10 @@
 use crate::{
     exit_status::ExitTail,
     output_batch::{OutputBuffer, OutputSource},
+    process_input_budget::{
+        shared_budget, Budget as ProcessInputBudget, Charge, Full as ProcessInputFull,
+    },
+    pty_io::PtyWriteAttempt,
     pty_reader::{
         drain_exit_tail, poll_reader, run_observed, shutdown_pipe, PtyReadEvent, ReaderPoll,
     },
@@ -29,7 +33,13 @@ use std::{
 mod hosted;
 pub use hosted::HostedPty;
 
+pub use crate::process_input_budget::ProcessInputUsage;
 pub use crate::pty_reader::ReadOutcome;
+
+/// Owned input payload and reserved reply capacity across the shared PTY runtimes.
+pub fn process_input_usage() -> ProcessInputUsage {
+    shared_budget().usage()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
@@ -83,8 +93,7 @@ pub trait SessionTransport: AsFd + Send + 'static {
     /// Write once under the actor's immediate-control fence. An adapter may
     /// add a native input admission fence around this single syscall.
     fn write_control_byte(&mut self, byte: u8) -> bool {
-        // SAFETY: the actor holds this transport and confirms nonblocking mode.
-        unsafe { libc::write(self.as_fd().as_raw_fd(), (&byte as *const u8).cast(), 1) == 1 }
+        matches!(PtyWriteAttempt::new(self.as_fd(), &[byte]).run(), Ok(1))
     }
     fn termination_grace(&self) -> Duration {
         Duration::from_millis(30)
@@ -294,6 +303,7 @@ struct WriteMessage {
     origin: WriteOrigin,
     bytes: Vec<u8>,
     expires_at: Option<Instant>,
+    charge: Charge,
 }
 
 /// Independent byte allowances for the user and the terminal parser, sharing
@@ -317,6 +327,7 @@ struct WriteQueue {
     state: Mutex<WriteQueueState>,
     ready: Condvar,
     limits: WriteQueueLimits,
+    process_budget: Arc<ProcessInputBudget>,
     split: Option<SplitWriteLimits>,
     reply_entries: usize,
     input_admitted: fn() -> bool,
@@ -328,6 +339,13 @@ struct WriteQueue {
 
 impl WriteQueue {
     fn new(limits: WriteQueueLimits) -> Self {
+        Self::with_process_budget(limits, Arc::clone(shared_budget()))
+    }
+
+    fn with_process_budget(
+        limits: WriteQueueLimits,
+        process_budget: Arc<ProcessInputBudget>,
+    ) -> Self {
         debug_assert!(limits.max_message_bytes <= limits.byte_capacity);
         debug_assert!(limits.interactive_reserve_bytes < limits.byte_capacity);
         debug_assert!(limits.interactive_reserve_messages < limits.message_capacity);
@@ -342,6 +360,7 @@ impl WriteQueue {
             }),
             ready: Condvar::new(),
             limits,
+            process_budget,
             split: None,
             reply_entries: 0,
             input_admitted: || true,
@@ -443,27 +462,38 @@ impl WriteQueue {
         origin: WriteOrigin,
         data: std::borrow::Cow<'_, [u8]>,
     ) -> Result<(), WriteError> {
-        let coalesce = self.admission(state, origin, data.len())?;
-        state.accounted_bytes += data.len();
-        if origin == WriteOrigin::Reply {
-            state.reply_bytes += data.len();
-        }
+        let size = data.len();
+        let coalesce = self.admission(state, origin, size)?;
+        let message_capacity = self.effective_capacity(state, origin, size).2;
+        let queued_messages = state.accounted_messages;
+        let full = |error: ProcessInputFull| WriteError::Full {
+            requested_bytes: size,
+            queued_bytes: error.pending,
+            byte_capacity: error.capacity,
+            queued_messages,
+            message_capacity,
+        };
+        let reply = origin == WriteOrigin::Reply;
         if coalesce {
-            state
-                .pending
-                .back_mut()
-                .unwrap()
-                .bytes
-                .extend_from_slice(&data);
+            let message = state.pending.back_mut().unwrap();
+            message.charge.try_add(size, reply).map_err(full)?;
+            message.bytes.extend_from_slice(&data);
         } else {
-            state.accounted_messages += 1;
+            let mut charge = self.process_budget.empty_charge();
+            charge.try_add(size, reply).map_err(full)?;
             state.pending.push_back(WriteMessage {
                 origin,
                 bytes: data.into_owned(),
                 expires_at: self
                     .max_queue_wait
                     .and_then(|budget| Instant::now().checked_add(budget)),
+                charge,
             });
+            state.accounted_messages += 1;
+        }
+        state.accounted_bytes += size;
+        if reply {
+            state.reply_bytes += size;
         }
         state.admission_sequence = state.admission_sequence.saturating_add(1);
         self.ready.notify_one();

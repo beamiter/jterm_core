@@ -68,7 +68,7 @@ def stopped(pid):
         return True
 
 
-def run(app, binary, mode, root, rollback):
+def run(app, binary, mode, root, *, overrides=False, legacy=False):
     root.mkdir(mode=0o700)
     shell = root / "shell"
     shell.write_text(SHELL)
@@ -85,15 +85,16 @@ def run(app, binary, mode, root, rollback):
         folder.mkdir(mode=0o700)
         env[key] = str(folder)
     env.update(GDK_BACKEND="x11", GTK_A11Y="atspi", GTK_IM_MODULE="simple", GSK_RENDERER="cairo")
-    if rollback:
-        env["JTERM_SHARED_TRANSCRIPT" if mode == "unified" else "JTERM_SHARED_ACTIVE_TERMINAL"] = "0"
+    if overrides:
+        env.update(JTERM_SHARED_RUNTIME="0", JTERM_SHARED_TRANSCRIPT="0",
+                   JTERM_SHARED_ACTIVE_TERMINAL="0")
     with application(binary, config, env, root / "app.log", restore=False) as process:
         def shared_screen():
             return next((node for node in application_nodes(process.pid)
                          if node.get_state_set().contains(Atspi.StateType.SHOWING)
                          and node.get_description() == "Shared active terminal"), None)
 
-        if rollback:
+        if legacy:
             # Older libvte builds can draw the terminal without an AT-SPI
             # terminal node. Require pixels produced by this exact PTY.
             window = window_for(process.pid)
@@ -114,7 +115,7 @@ def run(app, binary, mode, root, rollback):
         names = thread_names(process.pid)
         shared_workers = [name for name in names if name in {"pty-reader", "pty-writer"}]
         legacy_workers = [name for name in names if name.startswith(f"{app}-pty-")]
-        if rollback:
+        if legacy:
             assert not shared_workers and len(legacy_workers) == 2, names
             workers = set(legacy_workers)
         else:
@@ -125,7 +126,7 @@ def run(app, binary, mode, root, rollback):
         wait_for("leader reaped", lambda: not Path(f"/proc/{leader}").exists())
         wait_for("separate background group stopped", lambda: stopped(descendant))
         wait_for("PTY workers stopped", lambda: workers.isdisjoint(thread_names(process.pid)))
-    backend = "VTE rollback" if rollback else "default shared"
+    backend = "legacy oracle" if legacy else "shared with old overrides" if overrides else "default shared"
     print(f"{app} {mode} {backend} worker ownership, PTY reply and child cleanup passed", flush=True)
 
 
@@ -133,13 +134,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("app", choices=("forge", "anvil"))
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--legacy-binary", type=Path,
+                        help="optional separate binary built with the old backend for comparison")
     parser.add_argument("--mode", choices=("block", "chat", "unified"), action="append")
     args = parser.parse_args()
     start_accessibility()
     with tempfile.TemporaryDirectory(prefix="gtk-prepared-pty-") as directory:
+        binary = args.binary.resolve(strict=True)
+        legacy = args.legacy_binary.resolve(strict=True) if args.legacy_binary else None
         for mode in args.mode or ("block", "chat", "unified"):
-            run(args.app, args.binary.resolve(strict=True), mode, Path(directory) / mode, False)
-            run(args.app, args.binary.resolve(strict=True), mode, Path(directory) / f"{mode}-rollback", True)
+            run(args.app, binary, mode, Path(directory) / mode)
+            run(args.app, binary, mode, Path(directory) / f"{mode}-old-overrides", overrides=True)
+            if legacy is not None:
+                run(args.app, legacy, mode, Path(directory) / f"{mode}-legacy", overrides=True, legacy=True)
 
 
 if __name__ == "__main__":

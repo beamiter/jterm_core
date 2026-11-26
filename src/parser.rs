@@ -10,7 +10,7 @@ const MAX_OSC_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// Per-field cap for app-driven desktop notifications (OSC 9 / OSC 777),
 /// matching the frost in-engine limit so the family behaves identically.
-pub const MAX_NOTIFICATION_CHARS: usize = 256;
+pub use jterm_engine::osc::MAX_NOTIFICATION_CHARS;
 /// Kitty graphics uses APC. Keep a practical encoded-image ceiling while
 /// preventing one unterminated sequence from retaining arbitrary PTY output.
 const MAX_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -1550,18 +1550,10 @@ fn safe_osc7_text(value: &str) -> bool {
 /// glyphs, collapse surrounding whitespace, and cap the length. Applications,
 /// not users, author these strings.
 fn bounded_notification_field(raw: &str) -> String {
-    raw.chars()
-        .map(|ch| {
-            if ch.is_control() || crate::review_input::is_terminal_visual_spoofing_character(ch) {
-                '\u{fffd}'
-            } else {
-                ch
-            }
-        })
-        .take(MAX_NOTIFICATION_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    jterm_engine::osc::bounded_notification_field(
+        raw,
+        crate::review_input::is_terminal_visual_spoofing_character,
+    )
 }
 
 fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {

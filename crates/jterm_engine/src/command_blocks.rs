@@ -120,6 +120,7 @@ struct Active {
     output: Result<String, OutputUnavailable>,
     output_annotations: ArchiveAnnotationBuilder,
     carriage_return: bool,
+    suspended_alternate: bool,
     start_position: Option<ShellMarkerPosition>,
     start_size: (usize, usize),
     resized: bool,
@@ -189,6 +190,32 @@ impl Active {
                 || [b"0;", b"1;", b"2;", b"7;", b"8;"]
                     .iter()
                     .any(|prefix| payload.starts_with(*prefix)) => {}
+            // Cursor visibility, keyboard protocol and title-stack cleanup
+            // emitted after Vim leaves 1049 do not rewrite main-screen text.
+            Event::Csi {
+                private_prefix: Some(b'?'),
+                params,
+                intermediates,
+                final_byte: b'h' | b'l',
+                ..
+            } if intermediates.is_empty() && params.as_slice() == [25] => {}
+            Event::Csi {
+                private_prefix: Some(b'>'),
+                params,
+                intermediates,
+                final_byte: b'm',
+                ..
+            } if intermediates.is_empty()
+                && params.first() == Some(&4)
+                && params.len() <= 2
+                && params.get(1).copied().unwrap_or(0) <= 2 => {}
+            Event::Csi {
+                private_prefix: None,
+                params,
+                intermediates,
+                final_byte: b't',
+                ..
+            } if intermediates.is_empty() && matches!(params.as_slice(), [22 | 23, 0, 0]) => {}
             // Cursor edits, graphics, fullscreen and other operations cannot
             // be represented faithfully by this line-oriented output view.
             _ => self.unavailable(),
@@ -228,12 +255,6 @@ impl CommandBlocks {
         &self.completed
     }
 
-    pub(crate) fn screen_changed(&mut self) {
-        if let Some(active) = &mut self.active {
-            active.unavailable();
-        }
-    }
-
     pub(crate) fn resized(&mut self, dimensions_changed: bool) {
         if let Some(active) = &mut self.active {
             active.resized |= dimensions_changed;
@@ -261,10 +282,40 @@ impl CommandBlocks {
         style: ArchiveStyle,
         target: Option<&str>,
     ) -> bool {
+        // Only the cursor-saving 1049 excursion is a lossless boundary for
+        // this main-screen line archive. Alternate bytes (including forged
+        // lifecycle OSCs) never belong to the completed command output.
+        let excursion = match event {
+            Event::Csi {
+                private_prefix: Some(b'?'),
+                params,
+                intermediates,
+                final_byte,
+                ..
+            } if intermediates.is_empty() && params.as_slice() == [1049] => Some(*final_byte),
+            _ => None,
+        };
         if alternate {
             self.prompt = Prompt::None;
-            self.screen_changed();
+            if let Some(active) = &mut self.active {
+                if !active.suspended_alternate {
+                    active.unavailable();
+                } else if excursion == Some(b'l') {
+                    active.suspended_alternate = false;
+                }
+            }
             return false;
+        }
+        if let Some(active) = &mut self.active {
+            if active.suspended_alternate {
+                // The terminal returned through an unsupported switch/reset.
+                active.suspended_alternate = false;
+                active.unavailable();
+            }
+            if excursion == Some(b'h') {
+                active.suspended_alternate = true;
+                return false;
+            }
         }
         if let Event::String {
             kind: StringKind::Osc,
@@ -316,6 +367,7 @@ impl CommandBlocks {
                                 output: Ok(String::new()),
                                 output_annotations: ArchiveAnnotationBuilder::default(),
                                 carriage_return: false,
+                                suspended_alternate: false,
                                 start_position: position,
                                 start_size: size,
                                 resized: false,

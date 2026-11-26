@@ -37,6 +37,44 @@ fn assert_reaped(pid: libc::pid_t) {
     );
 }
 
+#[cfg(feature = "session-actor")]
+#[test]
+fn shared_master_write_and_resize_reach_the_real_pty_slave() {
+    use crate::{
+        pty_io::{resize_master, write_native_master, PtyWriteAttempt},
+        session_actor::WriteOutcome,
+    };
+    use std::io::Read;
+
+    let (master, slave) = pty_pair(24, 80).unwrap();
+    resize_master(master.as_fd(), 101, 37).unwrap();
+    let mut size = initial_geometry(0, 0);
+    // SAFETY: the slave is owned and size is writable.
+    assert_eq!(
+        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
+        0
+    );
+    assert_eq!((size.ws_row, size.ws_col), (37, 101));
+    assert_eq!((size.ws_xpixel, size.ws_ypixel), (0, 0));
+
+    let input = b"input\n";
+    assert_eq!(
+        write_native_master(master.as_fd(), input, PtyWriteAttempt::run).unwrap(),
+        WriteOutcome::Written(input.len())
+    );
+    let mut events = libc::pollfd {
+        fd: slave.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: events is writable and holds the live slave's descriptor.
+    assert_eq!(unsafe { libc::poll(&mut events, 1, 1000) }, 1);
+    assert_eq!(events.revents & libc::POLLIN, libc::POLLIN);
+    let mut received = [0; 32];
+    let count = File::from(slave).read(&mut received).unwrap();
+    assert_eq!(&received[..count], input);
+}
+
 #[test]
 fn launches_controlling_tty_with_exact_settings_and_preserves_exit_127() {
     let cwd = File::open("/tmp").unwrap();

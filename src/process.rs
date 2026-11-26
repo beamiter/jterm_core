@@ -902,8 +902,8 @@ pub fn foreground_process_name(pty_fd: i32, shell_pid: i32) -> Option<String> {
 // Preserve the existing frontend imports. Runtime is the sole implementation.
 pub use jterm_runtime::child_lifecycle::{
     decode_wait_status, exit_code_from_wait_status, observe_child_exit, ChildExitOutcome,
-    ChildLifecycle, EscalationPolicy, ProcessRef, ReapOwner, REQUIRED_QUIET_SESSION_SCANS,
-    SESSION_KILL_DRAIN_TIMEOUT, SESSION_SCAN_INTERVAL,
+    ChildLifecycle, EscalationPolicy, NativeChildPhase, NativePtyChild, ProcessRef, ReapOwner,
+    REQUIRED_QUIET_SESSION_SCANS, SESSION_KILL_DRAIN_TIMEOUT, SESSION_SCAN_INTERVAL,
 };
 
 #[cfg(test)]

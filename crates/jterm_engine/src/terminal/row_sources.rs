@@ -76,7 +76,10 @@ impl Terminal {
             (line.raw_row_id(), line.columns())
         } else {
             let index: usize = (point.row - history.end).try_into().ok()?;
-            (self.screen.grid.row_id(index), self.screen.grid.cols())
+            (
+                self.vt.screen.grid.row_id(index),
+                self.vt.screen.grid.cols(),
+            )
         };
         (row.is_tracked() && usize::from(point.column) <= columns).then_some(TranscriptAnchor {
             row,
@@ -95,6 +98,7 @@ impl Terminal {
             position
         } else {
             let index = self
+                .vt
                 .screen
                 .grid
                 .row_ids()
@@ -113,11 +117,12 @@ impl Terminal {
         if self.row_sources.is_some() {
             let sources = &mut self.row_sources;
             for id in self
+                .vt
                 .screen
                 .grid
                 .row_ids_mut()
                 .iter_mut()
-                .chain(self.screen.alt_grid.row_ids_mut())
+                .chain(self.vt.screen.alt_grid.row_ids_mut())
             {
                 *id = RowSources::allocate(sources);
             }
@@ -126,12 +131,12 @@ impl Terminal {
 
     pub(super) fn invalidate_clipped_sources(&mut self, columns: usize, transfer: usize) {
         let sources = &mut self.row_sources;
-        if sources.is_none() || columns >= self.screen.grid.cols() {
+        if sources.is_none() || columns >= self.vt.screen.grid.cols() {
             return;
         }
         for (grid, start) in [
-            (&mut self.screen.grid, transfer),
-            (&mut self.screen.alt_grid, 0),
+            (&mut self.vt.screen.grid, transfer),
+            (&mut self.vt.screen.alt_grid, 0),
         ] {
             for row in start..grid.rows() {
                 let clipped = grid[row][columns..]
@@ -155,7 +160,7 @@ impl Terminal {
 
     pub(super) fn renew_active_source_rows(&mut self) {
         if self.row_sources.is_some() {
-            for id in self.screen.grid.row_ids_mut() {
+            for id in self.vt.screen.grid.row_ids_mut() {
                 *id = RowSources::allocate(&mut self.row_sources);
             }
         }

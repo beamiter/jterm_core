@@ -1,5 +1,5 @@
-//! Profile-specific mode mutations. The host applies each parameter and its
-//! effects in wire order, including the alternate-screen and sync lifecycle.
+//! Profile-specific mode mutations. Shared native commands commit parameters
+//! in wire order; hosts consume ordered window, archive and sync effects.
 use crate::{protocol_state::ProtocolState, screen::ScreenState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,4 +102,214 @@ pub fn apply_frost_mode(
         protocol.modes_mut().remove(&mode);
     }
     effect
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeModeProfile {
+    Ember,
+    FrostLegacy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeModeEffect {
+    None,
+    Reply(&'static [u8]),
+    RevokePasteGrant,
+    MouseReportingChanged,
+    AlternateScreen { mode: u16, enabled: bool },
+    SynchronizedOutput { enabled: bool },
+}
+
+/// One parameter is committed before its effect is returned. The caller must
+/// consume that effect before advancing to another parameter or input event.
+pub struct NativeModeCommand<'a> {
+    profile: NativeModeProfile,
+    namespace: ModeNamespace,
+    params: std::slice::Iter<'a, u16>,
+    enabled: bool,
+}
+
+/// Both legacy profiles ignore intermediates for h/l. Ember admits ANSI and
+/// DEC-private only; Frost historically treats every other namespace as ANSI.
+pub fn prepare_native_mode_command<'a>(
+    profile: NativeModeProfile,
+    params: &'a [u16],
+    cmd: char,
+    prefix: Option<u8>,
+) -> Option<NativeModeCommand<'a>> {
+    let enabled = match cmd {
+        'h' => true,
+        'l' => false,
+        _ => return None,
+    };
+    let namespace = match prefix {
+        Some(b'?') => ModeNamespace::DecPrivate,
+        None => ModeNamespace::Ansi,
+        _ if profile == NativeModeProfile::FrostLegacy => ModeNamespace::Ansi,
+        _ => return None,
+    };
+    Some(NativeModeCommand {
+        profile,
+        namespace,
+        params: params.iter(),
+        enabled,
+    })
+}
+
+impl NativeModeCommand<'_> {
+    pub fn step(
+        &mut self,
+        screen: &mut ScreenState,
+        protocol: &mut ProtocolState,
+        focused: bool,
+    ) -> Option<NativeModeEffect> {
+        let mode = *self.params.next()?;
+        Some(apply_native_mode_parameter(
+            self.profile,
+            screen,
+            protocol,
+            self.namespace,
+            mode,
+            self.enabled,
+            focused,
+        ))
+    }
+}
+
+/// Apply a single native mode parameter, including the previously host-owned
+/// focus/paste bits and Ember's DECSC/DECRC mode. Snapshot/archive and native
+/// window clock operations remain ordered callbacks with unchanged policies.
+pub fn apply_native_mode_parameter(
+    profile: NativeModeProfile,
+    screen: &mut ScreenState,
+    protocol: &mut ProtocolState,
+    namespace: ModeNamespace,
+    mode: u16,
+    enabled: bool,
+    focused: bool,
+) -> NativeModeEffect {
+    if profile == NativeModeProfile::FrostLegacy {
+        return match apply_frost_mode(screen, protocol, namespace, mode, enabled) {
+            FrostModeEffect::None => NativeModeEffect::None,
+            FrostModeEffect::MouseReportingChanged => NativeModeEffect::MouseReportingChanged,
+            FrostModeEffect::AlternateScreen => NativeModeEffect::AlternateScreen { mode, enabled },
+            FrostModeEffect::SynchronizedOutput => NativeModeEffect::SynchronizedOutput { enabled },
+        };
+    }
+    if apply_ember_mode(screen, protocol, namespace, mode, enabled) {
+        return NativeModeEffect::None;
+    }
+    match mode {
+        1004 => {
+            let newly = !protocol.modes().contains(&1004);
+            if enabled {
+                protocol.modes_mut().insert(1004);
+            } else {
+                protocol.modes_mut().remove(&1004);
+            }
+            if enabled && newly && focused {
+                NativeModeEffect::Reply(b"\x1b[I")
+            } else {
+                NativeModeEffect::None
+            }
+        }
+        5522 => {
+            if enabled {
+                protocol.modes_mut().insert(5522);
+                NativeModeEffect::None
+            } else {
+                protocol.modes_mut().remove(&5522);
+                NativeModeEffect::RevokePasteGrant
+            }
+        }
+        1048 => {
+            if enabled {
+                screen.save_cursor_state(protocol);
+                protocol.modes_mut().insert(1048);
+            } else {
+                screen.restore_cursor_state(protocol);
+                protocol.modes_mut().remove(&1048);
+            }
+            NativeModeEffect::None
+        }
+        47 | 1047 | 1049 => NativeModeEffect::AlternateScreen { mode, enabled },
+        2026 => NativeModeEffect::SynchronizedOutput { enabled },
+        _ => unreachable!("legacy pure mutation left an unknown host mode"),
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    #[test]
+    fn admission_and_focus_reply_are_profiled_and_parameter_ordered() {
+        let params = [1004, 1004, 5522];
+        let mut screen = ScreenState::new(2, 3);
+        let mut protocol = ProtocolState::default();
+        let mut command =
+            prepare_native_mode_command(NativeModeProfile::Ember, &params, 'h', Some(b'?'))
+                .unwrap();
+        assert_eq!(
+            command.step(&mut screen, &mut protocol, true),
+            Some(NativeModeEffect::Reply(b"\x1b[I"))
+        );
+        assert!(!protocol.modes().contains(&5522));
+        assert_eq!(
+            command.step(&mut screen, &mut protocol, true),
+            Some(NativeModeEffect::None)
+        );
+        assert_eq!(
+            command.step(&mut screen, &mut protocol, true),
+            Some(NativeModeEffect::None)
+        );
+        assert!(protocol.modes().contains(&5522));
+        let mut command =
+            prepare_native_mode_command(NativeModeProfile::Ember, &[5522], 'l', Some(b'?'))
+                .unwrap();
+        assert_eq!(
+            command.step(&mut screen, &mut protocol, false),
+            Some(NativeModeEffect::RevokePasteGrant)
+        );
+        assert!(!protocol.modes().contains(&5522));
+        assert!(
+            prepare_native_mode_command(NativeModeProfile::Ember, &params, 'h', Some(b'>'))
+                .is_none()
+        );
+        assert!(prepare_native_mode_command(
+            NativeModeProfile::FrostLegacy,
+            &params,
+            'h',
+            Some(b'>')
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn cursor_save_restore_mode_is_owned_by_the_engine() {
+        let mut screen = ScreenState::new(3, 4);
+        let mut protocol = ProtocolState::default();
+        screen.cursor_row = 1;
+        screen.cursor_col = 2;
+        apply_native_mode_parameter(
+            NativeModeProfile::Ember,
+            &mut screen,
+            &mut protocol,
+            ModeNamespace::DecPrivate,
+            1048,
+            true,
+            false,
+        );
+        screen.cursor_row = 0;
+        screen.cursor_col = 0;
+        apply_native_mode_parameter(
+            NativeModeProfile::Ember,
+            &mut screen,
+            &mut protocol,
+            ModeNamespace::DecPrivate,
+            1048,
+            false,
+            false,
+        );
+        assert_eq!((screen.cursor_row, screen.cursor_col), (1, 2));
+    }
 }

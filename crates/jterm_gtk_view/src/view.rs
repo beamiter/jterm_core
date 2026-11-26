@@ -10,7 +10,7 @@ use jterm_engine::{
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::Arc,
 };
 
@@ -24,7 +24,7 @@ pub(crate) struct TerminalView {
     pub(crate) widget: gtk4::TextView,
     preedit: gtk4::Label,
     cursor_offset: Cell<Option<i32>>,
-    presentation: RefCell<Option<Presentation>>,
+    presentation: Rc<RefCell<Option<Presentation>>>,
     find_tags: RefCell<Option<[gtk4::TextTag; 2]>>,
     theme: RefCell<Theme>,
     background_style: gtk4::CssProvider,
@@ -39,6 +39,56 @@ struct Presentation {
     font: gtk4::TextTag,
     rows: Vec<PresentedRow>,
     live: Option<(CellFrame, u128)>,
+}
+
+type LiveSelection = Weak<RefCell<Option<Presentation>>>;
+
+thread_local! {
+    // The adapter stays associated with this GTK object even when the host
+    // renames its widget. The entry neither owns the widget nor keeps frames alive.
+    static LIVE_SELECTIONS: RefCell<HashMap<*mut gtk4::ffi::GtkTextView, LiveSelection>> =
+        RefCell::default();
+}
+
+fn live_selection(view: &gtk4::TextView) -> Option<Rc<RefCell<Option<Presentation>>>> {
+    LIVE_SELECTIONS.with(|entries| entries.borrow().get(&view.as_ptr())?.upgrade())
+}
+
+/// Identify a live terminal or a finished command or output text surface.
+pub fn is_terminal_text_view(widget: &gtk4::Widget) -> bool {
+    widget.downcast_ref::<gtk4::TextView>().is_some_and(|view| {
+        !view.is_editable()
+            && (live_selection(view).is_some() || crate::command::is_finished_text_view(view))
+    })
+}
+
+/// Read an explicit selection with the same logical line breaks as terminal copy.
+pub fn terminal_view_selection(widget: &gtk4::Widget) -> Option<String> {
+    let view = widget.downcast_ref::<gtk4::TextView>()?;
+    if view.is_editable() {
+        return None;
+    }
+    if let Some(live) = live_selection(view) {
+        let shown = live.borrow();
+        let current = shown
+            .as_ref()
+            .filter(|shown| shown.buffer == view.buffer())?;
+        return selected_text(view, Some(current));
+    }
+    if !crate::command::is_finished_text_view(view) {
+        return None;
+    }
+    let buffer = view.buffer();
+    let (start, end) = buffer.selection_bounds()?;
+    Some(buffer.text(&start, &end, true).to_string())
+}
+
+impl Drop for TerminalView {
+    fn drop(&mut self) {
+        let _ = LIVE_SELECTIONS.try_with(|entries| {
+            entries.borrow_mut().remove(&self.widget.as_ptr());
+        });
+    }
 }
 
 struct PresentedRow {
@@ -225,7 +275,7 @@ impl TerminalView {
             widget,
             preedit,
             cursor_offset: Cell::new(None),
-            presentation: RefCell::default(),
+            presentation: Rc::default(),
             find_tags: RefCell::default(),
             theme: RefCell::new(theme),
             background_style,
@@ -234,6 +284,11 @@ impl TerminalView {
             appearance_changed: Cell::new(false),
             palette_revision: Cell::new(0),
         };
+        LIVE_SELECTIONS.with(|entries| {
+            entries
+                .borrow_mut()
+                .insert(view.widget.as_ptr(), Rc::downgrade(&view.presentation));
+        });
         view.paint_background(background);
         view
     }
@@ -246,6 +301,15 @@ impl TerminalView {
                 "textview {{ background-color: {background}; }} text {{ background-color: transparent; }}"
             ));
         }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.presentation.take();
+        self.widget.buffer().set_text("");
+    }
+
+    pub(crate) fn theme(&self) -> Theme {
+        self.theme.borrow().clone()
     }
 
     pub(crate) fn set_theme(&self, theme: Theme) {
@@ -522,20 +586,7 @@ impl TerminalView {
     }
 
     pub(crate) fn selected_text(&self) -> Option<String> {
-        let buffer = self.widget.buffer();
-        let (start, end) = buffer.selection_bounds()?;
-        let selected = buffer.text(&start, &end, true);
-        let shown = self.presentation.borrow();
-        let rows = shown.as_ref().map_or(&[][..], |view| view.rows.as_slice());
-        Some(logical_selection(
-            &selected,
-            start.line() as usize,
-            start.line_offset() as usize,
-            |index| {
-                rows.get(index)
-                    .map_or_else(CopyRow::default, |row| row.copy)
-            },
-        ))
+        selected_text(&self.widget, self.presentation.borrow().as_ref())
     }
 
     pub(crate) fn show_preedit(&self, text: &str, attributes: pango::AttrList) {
@@ -728,6 +779,24 @@ fn plain_link_at(
     ))
 }
 
+fn selected_text(view: &gtk4::TextView, shown: Option<&Presentation>) -> Option<String> {
+    let buffer = view.buffer();
+    let (start, end) = buffer.selection_bounds()?;
+    let selected = buffer.text(&start, &end, true);
+    let rows = shown
+        .filter(|shown| shown.buffer == buffer)
+        .map_or(&[][..], |shown| shown.rows.as_slice());
+    Some(logical_selection(
+        &selected,
+        start.line() as usize,
+        start.line_offset() as usize,
+        |index| {
+            rows.get(index)
+                .map_or_else(CopyRow::default, |row| row.copy)
+        },
+    ))
+}
+
 fn logical_selection(
     selected: &str,
     first_row: usize,
@@ -876,13 +945,21 @@ fn selection_joins_wide_wraps_in_live_and_archived_rows() {
         palette: default_ansi_palette(),
         cursor: None,
     });
+    view.widget.set_widget_name("host-renamed-editor");
+    assert!(is_terminal_text_view(view.widget.upcast_ref()));
+    assert_eq!(terminal_view_selection(view.widget.upcast_ref()), None);
     let select = || {
         let buffer = view.widget.buffer();
         buffer.select_range(
             &buffer.iter_at_line_offset(0, 1).unwrap(),
             &buffer.iter_at_line_offset(1, 2).unwrap(),
         );
-        view.selected_text().unwrap()
+        let selected = view.selected_text().unwrap();
+        assert_eq!(
+            terminal_view_selection(view.widget.upcast_ref()).as_deref(),
+            Some(selected.as_str())
+        );
+        selected
     };
     terminal.feed("ae\u{301}cde界Z".as_bytes()).unwrap();
     view.present(
@@ -901,6 +978,29 @@ fn selection_joins_wide_wraps_in_live_and_archived_rows() {
         None,
     );
     assert_eq!(select(), "e\u{301}cde界Z");
+
+    let widget = view.widget.clone();
+    drop(view);
+    assert!(!is_terminal_text_view(widget.upcast_ref()));
+    assert_eq!(terminal_view_selection(widget.upcast_ref()), None);
+
+    let finished = crate::FinishedTextView::plain_command(
+        "printf 界",
+        pango::FontDescription::from_string("Monospace 12"),
+        1.0,
+        gdk::RGBA::WHITE,
+        &default_ansi_palette(),
+    );
+    let finished = finished.widget();
+    let buffer = finished.buffer();
+    buffer.select_range(&buffer.start_iter(), &buffer.end_iter());
+    assert!(is_terminal_text_view(finished.upcast_ref()));
+    assert_eq!(
+        terminal_view_selection(finished.upcast_ref()).as_deref(),
+        Some("printf 界")
+    );
+    widget.set_widget_name("shared-finished-command");
+    assert!(!is_terminal_text_view(widget.upcast_ref()));
 }
 
 fn live_updates(before: &CellFrame, after: &CellFrame, changed_gaps: u128) -> Option<Vec<usize>> {

@@ -67,6 +67,33 @@ class EngineRoutingTests(unittest.TestCase):
                     self.assertEqual(runner.main(), 0)
                 self.assertEqual(source.read_text(), baseline)
 
+    def test_published_gtk_view_defaults_to_the_local_core_candidate(self):
+        for app in ('forge', 'anvil'):
+            with self.subTest(app=app):
+                manifest = self.family / app / 'Cargo.toml'
+                baseline = manifest.read_text() + (
+                    '\n[dependencies]\n'
+                    'jterm_gtk_view = { git = "https://github.com/beamiter/jterm_core.git" }\n'
+                )
+                manifest.write_text(baseline)
+
+                def run(command, cwd, env):
+                    core = Path(cwd).parent / 'jterm_core'
+                    prefix = 'patch."https://github.com/beamiter/jterm_core.git".'
+                    self.assertIn(prefix + 'jterm_core.path=' + json.dumps(str(core)), command)
+                    view = core / 'crates/jterm_gtk_view'
+                    self.assertIn(prefix + 'jterm_gtk_view.path=' + json.dumps(str(view)), command)
+                    self.assertEqual((view / 'src').resolve(), self.nested.with_name('jterm_gtk_view') / 'src')
+                    self.assertNotIn('--features', command)
+                    self.assertNotIn(f'JTERM_{app.upper()}_SHARED_TERMINAL', env)
+                    self.assertEqual((Path(cwd) / 'Cargo.toml').read_text(), baseline)
+                    return type('Result', (), {'returncode': 0})()
+
+                with patch.object(runner, '__file__', str(self.script)), \
+                     patch.object(sys, 'argv', [str(RUNNER), app, 'check']), \
+                     patch.object(runner.subprocess, 'run', side_effect=run):
+                    self.assertEqual(runner.main(), 0)
+
     def test_aether_local_core_crates_resolve_inside_private_siblings(self):
         source = self.family / 'aether'
         for crate in ('session', 'bridge'):

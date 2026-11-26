@@ -278,7 +278,14 @@ print("history-search-appended", flush=True)
     wait_text("history-search-ready")
 
     def open_find():
-        key("ctrl+shift+f")
+        active = wait_for("terminal before opening retained history", screen)
+        bounds = Atspi.Component.get_extents(active.get_component_iface(), Atspi.CoordType.WINDOW)
+        subprocess.run(["xdotool", "mousemove", "--window", window, str(bounds.x + bounds.width // 2),
+                        str(bounds.y + bounds.height // 2), "click", "3"], check=True, timeout=5)
+        wait_for("terminal context menu", lambda: first_named(pid, "Context menu"))
+        # A read-only terminal with no selection puts initial focus on
+        # Select All. The one additional action is the next enabled row.
+        key("Down", "Return")
         dialog = wait_for("native history search window", lambda: subprocess.check_output(
             ["xdotool", "search", "--onlyvisible", "--all", "--pid", str(pid), "--name", "^Find terminal history$"],
             text=True, timeout=5, stderr=subprocess.DEVNULL).split()[0])

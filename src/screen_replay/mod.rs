@@ -108,7 +108,7 @@ pub use archived_text::{
 };
 pub use finished_document::{
     CapturedExecutionSource, FinishedDocument, FinishedExecutionSource, FinishedHistoryFrame,
-    RunningExecutionSource,
+    FinishedOutputProjection, RunningExecutionSource,
 };
 mod emulator;
 mod grid;
@@ -305,44 +305,68 @@ impl Replay {
             .expect("an allocated string cannot exceed usize::MAX bytes")
     }
 
-    fn to_ansi_with_budget(&self, max_bytes: usize) -> Option<String> {
-        let mut out = String::new();
-        let mut scratch = SgrScratch::default();
-        let mut pen = Pen::default();
-        let mut link = 0u32;
-        // Visible length of the previous row when it soft-wrapped.
+    fn painted_rows(&self) -> impl Iterator<Item = (&Row, usize, bool)> + '_ {
         let mut prev_wrapped_len = None;
-        for (index, row) in self.rows.iter().enumerate() {
-            // A soft-wrapped row continues when it fills the width, or leaves
-            // only the last column free for a wide character that did not
-            // fit (the target leaves that gap and wraps it the same way). A
-            // continued row starts at the pending-wrap position, where a
-            // `\t` would do nothing; its tabs stay spaces there.
+        self.rows.iter().map(move |row| {
+            // A full previous row keeps its wrap. An early wrap immediately
+            // preceding a wide character does too.
             let starts_wide = row
                 .cells
                 .first()
                 .is_some_and(|c| c.code & grid::WIDE != 0 && !c.is_fragment());
             let continued = prev_wrapped_len
                 .is_some_and(|len| len == self.cols || (starts_wide && len + 1 == self.cols));
-            if index > 0 && !continued {
-                out.push_str("\r\n");
-            }
-            // Blanks before a soft wrap are inside the logical line. Keep
-            // them so the next row autowraps instead of becoming a hard break.
             let end = if row.wrapped {
                 row.cells.len()
             } else {
                 visible_len(&self.tables, row)
             };
             prev_wrapped_len = row.wrapped.then_some(end);
-            let mut skip_until = 0;
-            for (col, &cell) in row.cells[..end].iter().enumerate() {
-                if col < skip_until {
-                    continue;
+            (row, end, continued)
+        })
+    }
+
+    fn painted_cells(
+        row: &Row,
+        end: usize,
+        continued: bool,
+    ) -> impl Iterator<Item = (grid::Cell, bool)> + '_ {
+        let mut skip_until = 0;
+        row.cells[..end]
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(move |(col, cell)| {
+                if col < skip_until || (cell.is_fragment() && !cell.is_tab_head_fragment()) {
+                    return None;
                 }
-                if cell.is_fragment() && !cell.is_tab_head_fragment() {
-                    continue;
+                let tab_width = if cell.is_tab_head() {
+                    row.tab_width(col)
+                } else {
+                    0
+                };
+                // A continued row begins in pending wrap. HT in its first
+                // column would be lost, so preserve the tab's physical space.
+                let tab = tab_width > 0
+                    && !(continued && col == 0)
+                    && tab_ends_on_default_stop(col, tab_width);
+                if tab {
+                    skip_until = col + tab_width;
                 }
+                Some((cell, tab))
+            })
+    }
+
+    fn to_ansi_with_budget(&self, max_bytes: usize) -> Option<String> {
+        let mut out = String::new();
+        let mut scratch = SgrScratch::default();
+        let mut pen = Pen::default();
+        let mut link = 0u32;
+        for (index, (row, end, continued)) in self.painted_rows().enumerate() {
+            if index > 0 && !continued {
+                out.push_str("\r\n");
+            }
+            for (cell, tab) in Self::painted_cells(row, end, continued) {
                 let cell_pen = *self.tables.pen(cell.pen);
                 if cell_pen.link != link {
                     out.push_str("\x1b]8;");
@@ -358,17 +382,8 @@ impl Replay {
                     write_sgr_transition(&mut out, &mut scratch, &pen, &cell_pen);
                     pen = cell_pen;
                 }
-                let tab_width = if cell.is_tab_head() {
-                    row.tab_width(col)
-                } else {
-                    0
-                };
-                if tab_width > 0
-                    && !(continued && col == 0)
-                    && tab_ends_on_default_stop(col, tab_width)
-                {
+                if tab {
                     out.push('\t');
-                    skip_until = col + tab_width;
                 } else if cell.is_tab_head() || cell.is_tab_head_fragment() {
                     out.push(' ');
                 } else {

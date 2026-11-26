@@ -13,5 +13,6 @@ repository = "https://github.com/beamiter/jterm_core"
 smallvec = "1.15"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
+unicode-normalization = "=0.1.26"
 
 [workspace]

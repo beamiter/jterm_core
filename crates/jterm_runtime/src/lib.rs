@@ -13,11 +13,13 @@ pub mod output_batch;
 #[allow(unsafe_code)] // Nonblocking descriptors for separately captured pipes.
 pub mod pipe_job;
 pub mod process_argv;
+#[cfg(all(unix, feature = "session-actor"))]
+mod process_input_budget;
 pub mod process_stat;
 pub mod pty_instance_lock;
 #[cfg(all(unix, feature = "session-actor"))]
 #[allow(unsafe_code)] // Bounded writes and resize on a borrowed PTY master.
-mod pty_io;
+pub mod pty_io;
 #[cfg(unix)]
 #[allow(unsafe_code)] // Unix PTY descriptors, polling and pipe ownership.
 pub mod pty_reader;
@@ -38,5 +40,7 @@ pub mod startup_status;
 pub mod supervised;
 #[cfg(feature = "terminal")]
 pub mod terminal;
+#[cfg(all(target_os = "linux", feature = "linux-pty"))]
+pub mod terminal_profile;
 #[cfg(feature = "terminal")]
 pub mod viewport;

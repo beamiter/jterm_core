@@ -2,6 +2,32 @@
 //! Events are delivered one at a time, before any following input is interpreted.
 use std::{borrow::Cow, ops::Range};
 
+#[inline]
+fn printable_ascii_prefix(input: &[u8]) -> usize {
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    const PRINTABLE_START: u64 = 0x2020_2020_2020_2020;
+    const FIRST_REJECTED: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let mut words = input.chunks_exact(8);
+    for (index, bytes) in words.by_ref().enumerate() {
+        // Set each byte's high bit before subtraction so neighboring bytes
+        // never borrow from one another. Retain the original high bits too.
+        let word = u64::from_le_bytes(bytes.try_into().unwrap());
+        let lanes = word | HIGH_BITS;
+        let below = !lanes.wrapping_sub(PRINTABLE_START);
+        let above = lanes.wrapping_sub(FIRST_REJECTED);
+        let rejected = (word | below | above) & HIGH_BITS;
+        if rejected != 0 {
+            return index * 8 + rejected.trailing_zeros() as usize / 8;
+        }
+    }
+    let tail = words.remainder();
+    let accepted = tail
+        .iter()
+        .take_while(|&&byte| (0x20..=0x7e).contains(&byte))
+        .count();
+    input.len() - tail.len() + accepted
+}
+
 /// Versioned scanner compatibility, not terminal semantic dispatch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ParserProfile {
@@ -324,8 +350,14 @@ impl Parser {
             State::DiscardEscape => PendingKind::Escape,
         }
     }
-    fn open_capture(&mut self, state: &State, at: usize) -> bool {
-        if !self.frost() || self.capture.is_some() {
+    fn open_capture(
+        profile: ParserProfile,
+        capture: &mut Option<OpenCapture>,
+        feed_offset: usize,
+        state: &State,
+        at: usize,
+    ) -> bool {
+        if profile != ParserProfile::FrostLegacyV1 || capture.is_some() {
             return false;
         }
         let mut prefix = Vec::new();
@@ -357,9 +389,9 @@ impl Parser {
             | State::DiscardEscape => private = true,
             State::Ground => {}
         }
-        self.capture = Some(OpenCapture {
+        *capture = Some(OpenCapture {
             prefix,
-            start: self.feed_offset + at,
+            start: feed_offset + at,
             private,
             escape,
         });
@@ -527,10 +559,218 @@ impl Parser {
             emit!(Event::Print('\u{fffd}'));
         }
         loop {
-            let state = std::mem::replace(&mut self.state, State::Ground);
-            if at < input.len() || !matches!(state, State::Ground) {
-                started |= self.open_capture(&state, at);
+            if at < input.len() || !matches!(self.state, State::Ground) {
+                started |= Self::open_capture(
+                    self.profile,
+                    &mut self.capture,
+                    self.feed_offset,
+                    &self.state,
+                    at,
+                );
             }
+            if at == input.len()
+                && (matches!(self.state, State::Ground | State::Csi { .. })
+                    || (self.bounded && matches!(self.state, State::String { .. })))
+            {
+                abandon!(None);
+            }
+            // Ordinary carry bytes do not change the active state. Append them
+            // in place, avoiding a move of the Vec-bearing state for each byte
+            // (including fragmented single-byte PTY reads). Special bytes and
+            // exact overflow boundaries still enter the original reducer below.
+            match &mut self.state {
+                State::Ground => {
+                    let Some(&byte) = input.get(at) else {
+                        abandon!(None);
+                    };
+                    if !self.utf8.is_empty() {
+                        if byte & 0xc0 != 0x80 {
+                            self.utf8.clear();
+                            emit_open!(Event::Print('\u{fffd}'));
+                        }
+                        self.utf8.push(byte);
+                        at += 1;
+                        if self.frost() {
+                            if self.utf8.len() == self.utf8_expected as usize {
+                                let ch = std::str::from_utf8(&self.utf8)
+                                    .ok()
+                                    .and_then(|s| s.chars().next())
+                                    .unwrap_or('\u{fffd}');
+                                self.utf8.clear();
+                                emit!(Event::Print(ch));
+                            }
+                            emit!(Event::Boundary);
+                        }
+                        match std::str::from_utf8(&self.utf8) {
+                            Ok(text) => {
+                                let ch = text.chars().next().unwrap();
+                                self.utf8.clear();
+                                emit!(Event::Print(ch));
+                            }
+                            Err(error) => {
+                                if let Some(invalid) = error.error_len() {
+                                    self.replacements = self.utf8.len() - invalid;
+                                    self.utf8.clear();
+                                    emit!(Event::Print('\u{fffd}'));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    at += 1;
+                    match byte {
+                        0x1b => {
+                            if let Some(capture) = self.capture.as_mut() {
+                                capture.escape = true;
+                            }
+                            // A present two-byte string introducer has no
+                            // intermediate public event. Enter its active state
+                            // directly instead of moving an empty Escape state
+                            // through another reducer iteration. Split prefixes
+                            // retain the ordinary Escape path below.
+                            let kind = if self.bounded {
+                                match input.get(at) {
+                                    Some(b']') => Some(StringKind::Osc),
+                                    Some(b'P') => Some(StringKind::Dcs),
+                                    Some(b'X') => Some(StringKind::Sos),
+                                    Some(b'^') => Some(StringKind::Pm),
+                                    Some(b'_') => Some(StringKind::Apc),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(kind) = kind {
+                                at += 1;
+                                self.state = State::String {
+                                    kind,
+                                    data: Vec::new(),
+                                };
+                                self.string_carried = false;
+                                if let Some(capture) = self.capture.as_mut() {
+                                    capture.private = true;
+                                }
+                            } else {
+                                self.state = State::Escape(Vec::new());
+                            }
+                        }
+                        32..=126 => {
+                            let start = at - 1;
+                            if self.ascii_batching {
+                                at += printable_ascii_prefix(&input[at..]);
+                            }
+                            emit!(Event::Ascii(&input[start..at]));
+                        }
+                        0xc2..=0xf4 => {
+                            let expected = if byte <= 0xdf {
+                                2
+                            } else if byte <= 0xef {
+                                3
+                            } else {
+                                4
+                            };
+                            self.utf8_expected = expected;
+                            if self.frost() {
+                                if at - 1 + expected as usize <= input.len() {
+                                    let bytes = &input[at - 1..at - 1 + expected as usize];
+                                    if bytes[1..].iter().all(|b| b & 0xc0 == 0x80) {
+                                        at += expected as usize - 1;
+                                        let ch = std::str::from_utf8(bytes)
+                                            .ok()
+                                            .and_then(|s| s.chars().next())
+                                            .unwrap_or('\u{fffd}');
+                                        emit!(Event::Print(ch));
+                                    }
+                                    emit!(Event::Print('\u{fffd}'));
+                                }
+                                self.utf8.push(byte);
+                                emit!(Event::Boundary);
+                            }
+                            self.utf8.push(byte);
+                        }
+                        0x80..=0xff => emit!(Event::Print('\u{fffd}')),
+                        7..=15 => emit!(Event::Control(byte)),
+                        _ => {
+                            if self.frost() {
+                                emit!(Event::Boundary);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                State::Csi {
+                    params,
+                    intermediates,
+                } => {
+                    if let Some(&byte) = input.get(at) {
+                        if (0x30..=0x3f).contains(&byte) {
+                            let limit = if self.profile == ParserProfile::FrostLegacyV1 {
+                                128
+                            } else {
+                                256
+                            };
+                            if params.len() < limit {
+                                params.push(byte);
+                            }
+                            at += 1;
+                            continue;
+                        }
+                        if (0x20..=0x2f).contains(&byte) {
+                            if intermediates.len() < 8 {
+                                intermediates.push(byte);
+                            }
+                            at += 1;
+                            continue;
+                        }
+                    }
+                }
+                State::String { kind, data }
+                    if !self.bounded
+                        && input.len() - at == 1
+                        && data.last() != Some(&0x1b)
+                        && data
+                            .len()
+                            .saturating_add(input.len() - at)
+                            .saturating_add(2)
+                            <= self.limits.pending_bytes
+                        && input[at..].iter().all(|byte| {
+                            !matches!(byte, 0x1b | 0x18 | 0x1a)
+                                && (*kind != StringKind::Osc || *byte != 7)
+                        }) =>
+                {
+                    // No framing byte and no admission boundary can occur in
+                    // this span. Preserve legacy end-of-feed capture/retention
+                    // while keeping the payload buffer in its active state.
+                    data.extend_from_slice(&input[at..]);
+                    at = input.len();
+                    abandon!(None);
+                }
+                State::String { kind, data }
+                    if self.bounded && !data.is_empty() && data.last() != Some(&0x1b) =>
+                {
+                    let limit = match kind {
+                        StringKind::Apc => self.apc_bytes.unwrap_or(self.limits.pending_bytes),
+                        _ => self.limits.pending_bytes,
+                    };
+                    let available = limit.saturating_sub(data.len());
+                    let remaining = &input[at..];
+                    let ordinary = remaining
+                        .iter()
+                        .take(available)
+                        .position(|byte| {
+                            matches!(byte, 0x1b | 0x18 | 0x1a)
+                                || (*kind == StringKind::Osc && *byte == 7)
+                        })
+                        .unwrap_or(remaining.len().min(available));
+                    if ordinary > 0 {
+                        data.extend_from_slice(&remaining[..ordinary]);
+                        at += ordinary;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            let state = std::mem::replace(&mut self.state, State::Ground);
             match state {
                 State::DiscardString {
                     kind,
@@ -655,11 +895,9 @@ impl Parser {
                 State::String { kind, mut data } => {
                     let remaining = &input[at..];
                     let previous_escape = data.last() == Some(&0x1b);
-                    if let Some((used, restore)) = crate::framing::control_string_abort(
-                        remaining,
-                        previous_escape,
-                        kind == StringKind::Osc,
-                    ) {
+                    let boundary =
+                        legacy_string_boundary(remaining, previous_escape, kind == StringKind::Osc);
+                    if let LegacyStringBoundary::Abort(used, restore) = boundary {
                         let recovery = self.recovery(&data, &remaining[..used]);
                         at += used;
                         if restore {
@@ -689,21 +927,11 @@ impl Parser {
                     {
                         abandon!(Some(Event::Boundary));
                     }
-                    let terminator = if previous_escape && remaining.first() == Some(&b'\\') {
-                        Some((0, 1, false, true))
-                    } else {
-                        let mut found = None;
-                        for (i, byte) in remaining.iter().enumerate() {
-                            if kind == StringKind::Osc && *byte == 7 {
-                                found = Some((i, i + 1, true, false));
-                                break;
-                            }
-                            if *byte == 0x1b && remaining.get(i + 1) == Some(&b'\\') {
-                                found = Some((i, i + 2, false, false));
-                                break;
-                            }
+                    let terminator = match boundary {
+                        LegacyStringBoundary::End(body_end, consumed, bel, split) => {
+                            Some((body_end, consumed, bel, split))
                         }
-                        found
+                        _ => None,
                     };
                     if let Some((body_end, consumed, bel, split)) = terminator {
                         let too_large = data.len().saturating_add(consumed).saturating_add(2)
@@ -817,98 +1045,7 @@ impl Parser {
                     self.state = State::DiscardApc { previous_escape };
                     abandon!(None);
                 }
-                State::Ground => {
-                    let Some(&byte) = input.get(at) else {
-                        abandon!(None);
-                    };
-                    if !self.utf8.is_empty() {
-                        if byte & 0xc0 != 0x80 {
-                            self.utf8.clear();
-                            emit_open!(Event::Print('\u{fffd}'));
-                        }
-                        self.utf8.push(byte);
-                        at += 1;
-                        if self.frost() {
-                            if self.utf8.len() == self.utf8_expected as usize {
-                                let ch = std::str::from_utf8(&self.utf8)
-                                    .ok()
-                                    .and_then(|s| s.chars().next())
-                                    .unwrap_or('\u{fffd}');
-                                self.utf8.clear();
-                                emit!(Event::Print(ch));
-                            }
-                            emit!(Event::Boundary);
-                        }
-                        match std::str::from_utf8(&self.utf8) {
-                            Ok(text) => {
-                                let ch = text.chars().next().unwrap();
-                                self.utf8.clear();
-                                emit!(Event::Print(ch));
-                            }
-                            Err(error) => {
-                                if let Some(invalid) = error.error_len() {
-                                    self.replacements = self.utf8.len() - invalid;
-                                    self.utf8.clear();
-                                    emit!(Event::Print('\u{fffd}'));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    at += 1;
-                    match byte {
-                        0x1b => {
-                            self.state = State::Escape(Vec::new());
-                            if let Some(capture) = self.capture.as_mut() {
-                                capture.escape = true;
-                            }
-                        }
-                        32..=126 => {
-                            let start = at - 1;
-                            if self.ascii_batching {
-                                let remaining = &input[at..];
-                                let stop =
-                                    remaining.iter().position(|byte| !(32..=126).contains(byte));
-                                at += stop.unwrap_or(remaining.len());
-                            }
-                            emit!(Event::Ascii(&input[start..at]));
-                        }
-                        0xc2..=0xf4 => {
-                            let expected = if byte <= 0xdf {
-                                2
-                            } else if byte <= 0xef {
-                                3
-                            } else {
-                                4
-                            };
-                            self.utf8_expected = expected;
-                            if self.frost() {
-                                if at - 1 + expected as usize <= input.len() {
-                                    let bytes = &input[at - 1..at - 1 + expected as usize];
-                                    if bytes[1..].iter().all(|b| b & 0xc0 == 0x80) {
-                                        at += expected as usize - 1;
-                                        let ch = std::str::from_utf8(bytes)
-                                            .ok()
-                                            .and_then(|s| s.chars().next())
-                                            .unwrap_or('\u{fffd}');
-                                        emit!(Event::Print(ch));
-                                    }
-                                    emit!(Event::Print('\u{fffd}'));
-                                }
-                                self.utf8.push(byte);
-                                emit!(Event::Boundary);
-                            }
-                            self.utf8.push(byte);
-                        }
-                        0x80..=0xff => emit!(Event::Print('\u{fffd}')),
-                        7..=15 => emit!(Event::Control(byte)),
-                        _ => {
-                            if self.frost() {
-                                emit!(Event::Boundary);
-                            }
-                        }
-                    }
-                }
+                State::Ground => unreachable!("ground is advanced in place"),
                 State::Charset(bank) => {
                     let Some(&designator) = input.get(at) else {
                         self.state = State::Charset(bank);
@@ -1094,6 +1231,42 @@ impl Parser {
     }
 }
 
+/// A single ordered scan replaces the legacy abort scan followed by a
+/// separate terminator scan. In particular, a fresh ESC aborts before any
+/// later BEL, while a real terminator ends scanning before later cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyStringBoundary {
+    Abort(usize, bool),
+    End(usize, usize, bool, bool),
+    Incomplete,
+}
+
+fn legacy_string_boundary(input: &[u8], previous_escape: bool, osc: bool) -> LegacyStringBoundary {
+    if previous_escape {
+        return match input.first() {
+            Some(b'\\') => LegacyStringBoundary::End(0, 1, false, true),
+            Some(0x18 | 0x1a) => LegacyStringBoundary::Abort(1, false),
+            Some(_) => LegacyStringBoundary::Abort(0, true),
+            None => LegacyStringBoundary::Incomplete,
+        };
+    }
+    for (index, byte) in input.iter().copied().enumerate() {
+        match byte {
+            0x18 | 0x1a => return LegacyStringBoundary::Abort(index + 1, false),
+            7 if osc => return LegacyStringBoundary::End(index, index + 1, true, false),
+            0x1b => {
+                return match input.get(index + 1) {
+                    Some(b'\\') => LegacyStringBoundary::End(index, index + 2, false, false),
+                    Some(_) => LegacyStringBoundary::Abort(index, false),
+                    None => LegacyStringBoundary::Incomplete,
+                }
+            }
+            _ => {}
+        }
+    }
+    LegacyStringBoundary::Incomplete
+}
+
 pub fn parse_csi_params(bytes: &[u8]) -> (Vec<u16>, Vec<bool>) {
     parse_profiled_csi_params(bytes, ParserProfile::EmberV1)
 }
@@ -1133,4 +1306,215 @@ fn parse_profiled_csi_params(bytes: &[u8], profile: ParserProfile) -> (Vec<u16>,
         flags.push(colon);
     }
     (params, flags)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/support/parser_f243_frozen.rs"]
+mod frozen_f243;
+
+#[cfg(test)]
+#[path = "../tests/support/framing_f243_frozen.rs"]
+mod frozen_f243_framing;
+
+#[cfg(test)]
+mod hot_path_parity {
+    use super::*;
+
+    #[test]
+    fn printable_prefix_matches_a_byte_scan_at_every_word_and_tail_offset() {
+        for offset in 0..8 {
+            for length in 0..=27 {
+                let mut storage = [b'x'; 40];
+                let bytes = &mut storage[offset..offset + length];
+                assert_eq!(printable_ascii_prefix(bytes), length);
+                for index in 0..length {
+                    for byte in 0..=u8::MAX {
+                        bytes[index] = byte;
+                        let expected = bytes
+                            .iter()
+                            .take_while(|&&b| (0x20..=0x7e).contains(&b))
+                            .count();
+                        assert_eq!(printable_ascii_prefix(bytes), expected);
+                    }
+                    bytes[index] = b'x';
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_scan_matches_independent_legacy_abort_then_terminator_scans() {
+        fn reference(input: &[u8], previous_escape: bool, osc: bool) -> LegacyStringBoundary {
+            if let Some((used, restore)) =
+                frozen_f243_framing::control_string_abort(input, previous_escape, osc)
+            {
+                return LegacyStringBoundary::Abort(used, restore);
+            }
+            if previous_escape && input.first() == Some(&b'\\') {
+                return LegacyStringBoundary::End(0, 1, false, true);
+            }
+            for (i, byte) in input.iter().enumerate() {
+                if osc && *byte == 7 {
+                    return LegacyStringBoundary::End(i, i + 1, true, false);
+                }
+                if *byte == 0x1b && input.get(i + 1) == Some(&b'\\') {
+                    return LegacyStringBoundary::End(i, i + 2, false, false);
+                }
+            }
+            LegacyStringBoundary::Incomplete
+        }
+        let alphabet = [0, 7, 0x1b, 0x18, 0x1a, b'\\', b'x', 255];
+        for len in 0..=5 {
+            for mut code in 0..alphabet.len().pow(len) {
+                let mut input = vec![0; len as usize];
+                for byte in &mut input {
+                    *byte = alphabet[code % alphabet.len()];
+                    code /= alphabet.len();
+                }
+                for previous_escape in [false, true] {
+                    for osc in [false, true] {
+                        assert_eq!(
+                            legacy_string_boundary(&input, previous_escape, osc),
+                            reference(&input, previous_escape, osc),
+                            "{input:?} previous_escape={previous_escape} osc={osc}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn trace(new: &mut Parser, old: &mut frozen_f243::Parser, input: &[u8]) {
+        new.begin_feed();
+        old.begin_feed();
+        let mut at = 0;
+        let mut steps = 0;
+        loop {
+            let a = new.next(&input[at..]);
+            let e = old.next(&input[at..]);
+            assert_eq!(
+                (
+                    a.consumed,
+                    a.abandoned_apc,
+                    format!("{:?}", a.event),
+                    format!("{:?}", a.capture)
+                ),
+                (
+                    e.consumed,
+                    e.abandoned_apc,
+                    format!("{:?}", e.event),
+                    format!("{:?}", e.capture)
+                ),
+                "offset={at} input={input:?}"
+            );
+            // Preserve zero-copy complete packet admission as well as the
+            // visible event bytes; ordinary carried spans must stay owned.
+            assert_eq!(
+                matches!(
+                    &a.event,
+                    Some(Event::String {
+                        payload: Cow::Borrowed(_),
+                        ..
+                    })
+                ),
+                matches!(
+                    &e.event,
+                    Some(frozen_f243::Event::String {
+                        payload: Cow::Borrowed(_),
+                        ..
+                    })
+                ),
+                "packet ownership offset={at} input={input:?}"
+            );
+            at += a.consumed;
+            let done = a.event.is_none();
+            assert_eq!(
+                format!("{:?}", new.snapshot()),
+                format!("{:?}", old.snapshot())
+            );
+            assert_eq!(new.rejected_count(), old.rejected_count());
+            steps += 1;
+            assert!(steps <= input.len() * 5 + 32);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(at, input.len());
+    }
+    #[test]
+    fn optimized_steps_match_independent_f243_parser_at_every_split() {
+        let mut inputs = vec![
+            b"printable ABC xyz\r\n\t\x07\x0e\x0f".to_vec(),
+            b"\x1b[;:12:;65536mX\x1b[2\n;4H".to_vec(),
+            b"\x1b]0;title\x07x\x1bP$qm\x1b\\Z".to_vec(),
+            b"\x1b_Gi=4,m=1;x\x1b\\\x1b_Gi=4;\x18A".to_vec(),
+            b"\x1b(0q\x1b(Bz\x1b( % 5\x1bcX".to_vec(),
+            b"\xe0\x80A\xf0\x9f\x99\x82\xff\xc2Z".to_vec(),
+            b"\x1b]8;;secret\x1b[6n\x07A".to_vec(),
+        ];
+        // Every folded introducer, including prefix-only EOF, terminal and
+        // cancelled payloads. The existing matrix also splits after ESC and
+        // after the introducer, tests empty feeds, and compares capture/ownership.
+        for &introducer in b"]PX^_" {
+            for suffix in [b"".as_slice(), b"x\x1b\\Z", b"x\x18Z"] {
+                inputs.push([&[0x1b, introducer], suffix].concat());
+            }
+        }
+        inputs.push((0..=255).collect());
+        inputs.push([b"\x1b]0;".as_slice(), &[b'x'; 64], b"\x1b\\ok"].concat());
+        for frost in [false, true] {
+            for bounded in [false, true] {
+                for batching in [false, true] {
+                    for inline in [false, true] {
+                        for limit in [1, 8, 32] {
+                            for input in &inputs {
+                                for split in 0..=input.len() {
+                                    let np = if frost {
+                                        ParserProfile::FrostLegacyV1
+                                    } else {
+                                        ParserProfile::EmberV1
+                                    };
+                                    let op = if frost {
+                                        frozen_f243::ParserProfile::FrostLegacyV1
+                                    } else {
+                                        frozen_f243::ParserProfile::EmberV1
+                                    };
+                                    let nl = ParserLimits {
+                                        pending_bytes: limit,
+                                        kitty_recovery_bytes: 12,
+                                    };
+                                    let ol = frozen_f243::ParserLimits {
+                                        pending_bytes: limit,
+                                        kitty_recovery_bytes: 12,
+                                    };
+                                    let mut n = if bounded {
+                                        Parser::with_bounded_profile(nl, np).unwrap()
+                                    } else {
+                                        Parser::with_profile(nl, np)
+                                    };
+                                    let mut o = if bounded {
+                                        frozen_f243::Parser::with_bounded_profile(ol, op).unwrap()
+                                    } else {
+                                        frozen_f243::Parser::with_profile(ol, op)
+                                    };
+                                    n.set_ascii_batching(batching);
+                                    o.set_ascii_batching(batching);
+                                    if inline {
+                                        n.enable_inline_graphics_packets();
+                                        o.enable_inline_graphics_packets();
+                                    }
+                                    for chunk in
+                                        [&input[..split], &input[split..], b"", b" A\xe0\x80Z", b""]
+                                    {
+                                        trace(&mut n, &mut o, chunk);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

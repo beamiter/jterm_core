@@ -88,7 +88,7 @@ impl Terminal {
     /// its archive. The alternate screen and restricted scrolling regions
     /// address physical cells and use their coordinate-preserving resize.
     pub(super) fn reflow_primary(&mut self, rows: usize, columns: usize) -> bool {
-        let screen = &self.screen;
+        let screen = &self.vt.screen;
         let hidden = screen.use_alt_buffer;
         let primary = if hidden {
             &screen.alt_grid
@@ -124,7 +124,7 @@ impl Terminal {
                 row: screen.cursor_row,
                 column: screen.cursor_col,
                 pending_wrap: screen.pending_wrap,
-                autowrap: self.protocol.modes().contains(&7),
+                autowrap: self.vt.protocol.modes().contains(&7),
             }
         };
         let saved = screen
@@ -192,26 +192,26 @@ impl Terminal {
         let saved = saved_place.map(|(saved, place)| saved.in_viewport(&grid, place, archived));
 
         // Reuse the established margins, tabs and alternate-grid resize.
-        self.screen.resize_geometry(rows, columns, 0, || {
+        self.vt.screen.resize_geometry(rows, columns, 0, || {
             RowSources::allocate(&mut self.row_sources)
         });
         if hidden {
-            self.screen.alt_grid = grid;
-            self.screen.alt_cursor_row = current.row;
-            self.screen.alt_cursor_col = current.column;
-            if let Some(saved) = &mut self.screen.saved_primary_screen_state {
-                self.screen.saved_cursor_row = current.row;
-                self.screen.saved_cursor_col = current.column;
+            self.vt.screen.alt_grid = grid;
+            self.vt.screen.alt_cursor_row = current.row;
+            self.vt.screen.alt_cursor_col = current.column;
+            if let Some(saved) = &mut self.vt.screen.saved_primary_screen_state {
+                self.vt.screen.saved_cursor_row = current.row;
+                self.vt.screen.saved_cursor_col = current.column;
                 saved.row = current.row;
                 saved.col = current.column;
                 saved.pending_wrap = current.pending_wrap;
             }
         } else {
-            self.screen.grid = grid;
-            self.screen.cursor_row = current.row;
-            self.screen.cursor_col = current.column;
-            self.screen.pending_wrap = current.pending_wrap;
-            if let (Some(state), Some(saved)) = (&mut self.screen.saved_state, saved) {
+            self.vt.screen.grid = grid;
+            self.vt.screen.cursor_row = current.row;
+            self.vt.screen.cursor_col = current.column;
+            self.vt.screen.pending_wrap = current.pending_wrap;
+            if let (Some(state), Some(saved)) = (&mut self.vt.screen.saved_state, saved) {
                 state.row = saved.row;
                 state.col = saved.column;
                 state.pending_wrap = saved.pending_wrap;

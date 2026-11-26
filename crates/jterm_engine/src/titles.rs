@@ -83,6 +83,27 @@ impl<const LIMIT: usize> ProfiledTitleState<LIMIT> {
             }
         }
     }
+
+    pub(crate) fn apply_title_window_op(
+        &mut self,
+        params: &[u16],
+        report_title: impl FnOnce(&str) -> String,
+    ) -> Option<Vec<u8>> {
+        match params.first().copied()? {
+            20 => {
+                return Some(format!("\x1b]L{}\x1b\\", report_title(&self.icon_title)).into_bytes())
+            }
+            21 => {
+                return Some(
+                    format!("\x1b]l{}\x1b\\", report_title(&self.window_title)).into_bytes(),
+                )
+            }
+            22 => self.save(params.get(1).copied().unwrap_or(0)),
+            23 => self.restore(params.get(1).copied().unwrap_or(0)),
+            _ => {}
+        }
+        None
+    }
 }
 
 impl ProfiledTitleState<200> {
@@ -90,16 +111,8 @@ impl ProfiledTitleState<200> {
     /// Reports always use ST, independent of the most recent OSC terminator.
     pub fn apply_window_op(&mut self, params: &[u16]) -> Effects {
         let mut effects = Effects::new();
-        match params.first().copied().unwrap_or(0) {
-            20 => effects.push(Effect::Reply(
-                format!("\x1b]L{}\x1b\\", Self::reportable_title(&self.icon_title)).into_bytes(),
-            )),
-            21 => effects.push(Effect::Reply(
-                format!("\x1b]l{}\x1b\\", Self::reportable_title(&self.window_title)).into_bytes(),
-            )),
-            22 => self.save(params.get(1).copied().unwrap_or(0)),
-            23 => self.restore(params.get(1).copied().unwrap_or(0)),
-            _ => {}
+        if let Some(reply) = self.apply_title_window_op(params, Self::reportable_title) {
+            effects.push(Effect::Reply(reply));
         }
         effects
     }

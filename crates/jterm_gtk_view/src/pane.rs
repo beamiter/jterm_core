@@ -145,6 +145,13 @@ pub struct RetainedTextSource {
 }
 
 impl<P: Pty> EmbeddedTerminal<P> {
+    pub(crate) fn for_find(pane: Rc<TerminalPane<P>>) -> Self {
+        Self {
+            pane,
+            source_owner: Rc::new(()),
+        }
+    }
+
     /// Attach the presentation to the runtime's existing terminal grid.
     pub fn attach(
         terminal: TerminalHandle<P>,
@@ -186,6 +193,88 @@ impl<P: Pty> EmbeddedTerminal<P> {
     /// The viewport-relative cursor row of the primary grid currently painted.
     pub fn painted_primary_cursor_row(&self) -> Option<usize> {
         Some(self.painted_primary_frame()?.cursor().row)
+    }
+
+    /// Observe an unmodified click on a cell of the currently published live grid.
+    /// Moving across cells, replacing the frame, or selecting text cancels it.
+    pub fn connect_primary_cell_click(
+        self: &Rc<Self>,
+        activate: impl Fn(&CellFrame, usize, usize) + 'static,
+    ) {
+        let pending = Rc::new(Cell::new(None));
+        let point = |owner: &Self, coordinates: (f64, f64)| {
+            let frame = owner.painted_primary_frame()?;
+            let (column, row) =
+                owner
+                    .pane
+                    .view
+                    .cell_at(coordinates, (frame.rows().len(), frame.cols()), false)?;
+            Some((frame.stamp(), column, row))
+        };
+        let press = gtk4::GestureClick::new();
+        press.set_button(gdk::BUTTON_PRIMARY);
+        press.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let owner = Rc::downgrade(self);
+        let pressed = pending.clone();
+        press.connect_pressed(move |gesture, count, x, y| {
+            let modifiers = gdk::ModifierType::CONTROL_MASK
+                | gdk::ModifierType::SHIFT_MASK
+                | gdk::ModifierType::ALT_MASK
+                | gdk::ModifierType::SUPER_MASK;
+            pressed.set(None);
+            if count == 1 && !gesture.current_event_state().intersects(modifiers) {
+                pressed.set(owner.upgrade().and_then(|owner| point(&owner, (x, y))));
+            }
+        });
+        self.pane.screen().add_controller(press);
+
+        let motion = gtk4::EventControllerMotion::new();
+        motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let owner = Rc::downgrade(self);
+        let moved = pending.clone();
+        motion.connect_motion(move |_, x, y| {
+            if moved.get().is_some()
+                && owner.upgrade().and_then(|owner| point(&owner, (x, y))) != moved.get()
+            {
+                moved.set(None);
+            }
+        });
+        let left = pending.clone();
+        motion.connect_leave(move |_| left.set(None));
+        self.pane.screen().add_controller(motion);
+
+        // Observe release even when the text view claimed the press for selection.
+        let release = gtk4::EventControllerLegacy::new();
+        release.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let owner = Rc::downgrade(self);
+        release.connect_event(move |_, event| {
+            let release = || {
+                if event.event_type() != gdk::EventType::ButtonRelease
+                    || event.downcast_ref::<gdk::ButtonEvent>()?.button() != gdk::BUTTON_PRIMARY
+                {
+                    return None;
+                }
+                let clicked = pending.take()?;
+                let owner = owner.upgrade()?;
+                let location = owner.pane.view.event_point(event)?;
+                if point(&owner, location)? != clicked || owner.pane.has_selection() {
+                    return None;
+                }
+                let (stamp, column, row) = clicked;
+                let frame = owner.painted_primary_frame()?;
+                let current = owner.inspect(|terminal| {
+                    !terminal.publication_held()
+                        && terminal.frame().is_ok_and(|frame| frame.stamp() == stamp)
+                });
+                if current {
+                    activate(&frame, column, row);
+                }
+                Some(())
+            };
+            release();
+            glib::Propagation::Proceed
+        });
+        self.pane.screen().add_controller(release);
     }
 
     /// Test an overlay footprint in the given widget's coordinates, with a
@@ -232,7 +321,8 @@ impl<P: Pty> EmbeddedTerminal<P> {
             return false;
         }
         let coords = gtk4::TextWindowType::Widget;
-        let (left, top) = screen.window_to_buffer_coords(coords, x.floor() as i32, y.floor() as i32);
+        let (left, top) =
+            screen.window_to_buffer_coords(coords, x.floor() as i32, y.floor() as i32);
         let (right, bottom) =
             screen.window_to_buffer_coords(coords, right.ceil() as i32, bottom.ceil() as i32);
         let first_row = (screen.line_at_y(top).0.line() as usize).saturating_sub(1);
@@ -254,7 +344,13 @@ impl<P: Pty> EmbeddedTerminal<P> {
                 view.text_cell_at(x, line_top + line_height / 2)
                     .filter(|&(_, found_row)| found_row == row)
                     .map(|(col, _)| col.min(last_col))
-                    .unwrap_or_else(|| if x <= screen.left_margin() { 0 } else { last_col })
+                    .unwrap_or_else(|| {
+                        if x <= screen.left_margin() {
+                            0
+                        } else {
+                            last_col
+                        }
+                    })
             };
             let (left, right) = (column_at(left), column_at(right));
             if left > right {
@@ -360,17 +456,33 @@ impl<P: Pty> EmbeddedTerminal<P> {
         byte_limit: usize,
         expired: &mut dyn FnMut() -> bool,
     ) -> Option<FindSnapshot> {
-        let top = self.pane.scroll_top.get();
-        self.inspect(|terminal| {
-            find::capture(
-                terminal,
-                Rc::downgrade(&self.source_owner),
-                region,
-                top,
-                byte_limit,
-                expired,
-            )
-        })
+        self.find_snapshot_at(region, self.pane.scroll_top.get(), byte_limit, expired)
+    }
+
+    pub(crate) fn find_origin(&self) -> Option<ScrollTarget> {
+        self.pane.scroll_top.get()
+    }
+
+    pub(crate) fn find_snapshot_at(
+        &self,
+        region: FindRegion,
+        top: Option<ScrollTarget>,
+        byte_limit: usize,
+        expired: &mut dyn FnMut() -> bool,
+    ) -> Option<FindSnapshot> {
+        self.pane
+            .inspect(|terminal| {
+                find::capture(
+                    terminal,
+                    Rc::downgrade(&self.source_owner),
+                    region,
+                    top,
+                    byte_limit,
+                    expired,
+                )
+            })
+            .ok()
+            .flatten()
     }
 
     pub fn find_is_current(&self, frame: &FindFrame) -> bool {
@@ -378,13 +490,15 @@ impl<P: Pty> EmbeddedTerminal<P> {
         if !source.owner.ptr_eq(&Rc::downgrade(&self.source_owner)) {
             return false;
         }
-        self.inspect(|terminal| {
-            !terminal.publication_held()
-                && terminal.history_extent() == (source.history_start..source.history_end)
-                && terminal
-                    .frame()
-                    .is_ok_and(|actual| actual.stamp() == source.stamp)
-        })
+        self.pane
+            .inspect(|terminal| {
+                !terminal.publication_held()
+                    && terminal.history_extent() == (source.history_start..source.history_end)
+                    && terminal
+                        .frame()
+                        .is_ok_and(|actual| actual.stamp() == source.stamp)
+            })
+            .unwrap_or(false)
     }
 
     /// Reveal the exact occurrence without changing GTK focus or starting a
@@ -405,7 +519,10 @@ impl<P: Pty> EmbeddedTerminal<P> {
         if !is_visible() {
             let top = if found.start.row < frame.0.history_rows {
                 let Some(anchor) = self
+                    .pane
                     .inspect(|terminal| terminal.history_layout().ok()?.anchor_at(found.start.row))
+                    .ok()
+                    .flatten()
                 else {
                     return false;
                 };
@@ -416,7 +533,17 @@ impl<P: Pty> EmbeddedTerminal<P> {
             self.pane.set_scroll_top(top);
             self.pane.paint();
         }
-        if !self.find_is_current(frame) || !is_visible() {
+        if !self.find_is_current(frame) {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        let pending_runtime = self.pane.runtime().is_some();
+        #[cfg(not(target_os = "linux"))]
+        let pending_runtime = false;
+        // Runtime viewport capture is asynchronous. Keep the validated source
+        // while the requested historical window arrives, then normal paint
+        // installs its highlights without selecting or pausing terminal text.
+        if !is_visible() && !pending_runtime {
             return false;
         }
         self.highlight_find(frame, hits, Some(current))
@@ -641,6 +768,7 @@ pub struct TerminalPane<P: Pty> {
     find_highlights: RefCell<Option<find::FindHighlights>>,
     transcript_painted: OnceCell<Box<dyn Fn()>>,
     history_search: OnceCell<Rc<HistorySearchView>>,
+    terminal_find: RefCell<Weak<crate::terminal_find::TerminalFind<P>>>,
     scroll_update: Cell<bool>,
     wheel_rows: Cell<f64>,
     reported_buttons: Cell<u8>,
@@ -651,6 +779,7 @@ pub struct TerminalPane<P: Pty> {
     dirty: Cell<bool>,
     exited: Cell<bool>,
     input_focused: Cell<bool>,
+    view_attached: Cell<bool>,
     input_method: gtk4::IMMulticontext,
     keys: gtk4::EventControllerKey,
     input_method_delegated: Cell<bool>,
@@ -659,6 +788,10 @@ pub struct TerminalPane<P: Pty> {
     paste_revision: Cell<u64>,
     paste_reader: RefCell<Option<glib::JoinHandle<()>>>,
     input_revision: Cell<u64>,
+    #[cfg(target_os = "linux")]
+    painted_input_revision: Cell<u64>,
+    #[cfg(target_os = "linux")]
+    interactive_paint_frame: Cell<Option<i64>>,
 }
 
 impl<P: Pty> TerminalPane<P> {
@@ -857,6 +990,7 @@ impl<P: Pty> TerminalPane<P> {
             find_highlights: RefCell::default(),
             transcript_painted: OnceCell::new(),
             history_search: OnceCell::new(),
+            terminal_find: RefCell::new(Weak::new()),
             scroll_update: Cell::new(false),
             wheel_rows: Cell::new(0.0),
             reported_buttons: Cell::new(0),
@@ -867,6 +1001,7 @@ impl<P: Pty> TerminalPane<P> {
             dirty: Cell::new(true),
             exited: Cell::new(false),
             input_focused: Cell::new(false),
+            view_attached: Cell::new(true),
             input_method: gtk4::IMMulticontext::new(),
             keys: gtk4::EventControllerKey::new(),
             input_method_delegated: Cell::new(false),
@@ -875,6 +1010,10 @@ impl<P: Pty> TerminalPane<P> {
             paste_revision: Cell::new(0),
             paste_reader: RefCell::new(None),
             input_revision: Cell::new(0),
+            #[cfg(target_os = "linux")]
+            painted_input_revision: Cell::new(0),
+            #[cfg(target_os = "linux")]
+            interactive_paint_frame: Cell::new(None),
         });
         if automatic_grid && session.pty().is_some() {
             session.resize(rows, columns);
@@ -892,6 +1031,22 @@ impl<P: Pty> TerminalPane<P> {
         );
         session.connect_pointer();
         session.connect_scroll(&scroll);
+        if automatic_grid && matches!(input_style, InputStyle::Terminal) {
+            session.install_history_search_menu();
+        }
+        #[cfg(target_os = "linux")]
+        if session.runtime().is_some() {
+            let weak = Rc::downgrade(&session);
+            session
+                .view
+                .widget
+                .buffer()
+                .connect_has_selection_notify(move |_| {
+                    if let Some(pane) = weak.upgrade() {
+                        pane.update_live_viewport();
+                    }
+                });
+        }
         let weak = Rc::downgrade(&session);
         let scroll = scroll.downgrade();
         session.view.widget.add_tick_callback(move |_, _| {
@@ -901,7 +1056,11 @@ impl<P: Pty> TerminalPane<P> {
             let Some(scroll) = scroll.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if automatic_grid && !session.exited.get() && scroll.width() > 0 && scroll.height() > 0
+            if automatic_grid
+                && session.view_attached.get()
+                && !session.exited.get()
+                && scroll.width() > 0
+                && scroll.height() > 0
             {
                 let (rows, columns) = session.view.dimensions(scroll.width(), scroll.height());
                 if session.dimensions.get() != (rows, columns) {
@@ -1040,11 +1199,27 @@ impl<P: Pty> TerminalPane<P> {
         if update.stopped && !self.exited.replace(true) {
             self.set_input_focus(false);
         }
-        if self.dirty.get()
+        if self.view_attached.get()
+            && self.dirty.get()
             && self.view.widget.is_mapped()
             && !self.view.widget.buffer().has_selection()
         {
             owner.prepare_viewport(self.viewport_request());
+            // Apply the first available update following local input before
+            // GTK's next layout pass. Sustained output remains frame paced.
+            if update.output_changed
+                && self.input_focused.get()
+                && self.scroll_top.get().is_none()
+                && self.input_revision.get() != self.painted_input_revision.get()
+            {
+                if let Some(clock) = self.view.widget.frame_clock() {
+                    let frame = Some(clock.frame_counter());
+                    if self.interactive_paint_frame.replace(frame) != frame {
+                        self.paint();
+                        self.sync_input_cursor();
+                    }
+                }
+            }
         }
     }
 
@@ -1066,6 +1241,11 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     fn notify(&self, event: PaneEvent) {
+        if matches!(&event, PaneEvent::Output) {
+            if let Some(controller) = self.terminal_find.borrow().upgrade() {
+                controller.observe_output();
+            }
+        }
         if let Some(handler) = self.event_handler.get() {
             handler(event);
         }
@@ -1086,6 +1266,12 @@ impl<P: Pty> TerminalPane<P> {
 
     pub fn window_title(&self) -> Option<String> {
         self.inspect(|terminal| terminal.window_title().map(str::to_owned))
+            .ok()
+            .flatten()
+    }
+
+    pub fn reported_directory_uri(&self) -> Option<String> {
+        self.inspect(|terminal| terminal.reported_directory_uri().map(str::to_owned))
             .ok()
             .flatten()
     }
@@ -1169,6 +1355,61 @@ impl<P: Pty> TerminalPane<P> {
             .map(|_| ())
     }
 
+    /// The actual actor epoch/session and the current writable view generation.
+    #[cfg(target_os = "linux")]
+    pub fn view_attachment(&self) -> Result<crate::Attachment, String> {
+        self.runtime()
+            .ok_or("view detach requires a retained runtime")?
+            .view_attachment()
+    }
+
+    pub fn view_is_attached(&self) -> bool {
+        self.view_attached.get()
+    }
+
+    /// Release only presentation/input authority, keeping the PTY actor alive.
+    #[cfg(target_os = "linux")]
+    pub fn switch_view_attachment(
+        &self,
+        expected: &crate::Attachment,
+        attach: bool,
+    ) -> Result<crate::Attachment, String> {
+        let owner = self
+            .runtime()
+            .ok_or("view detach requires a retained runtime")?;
+        // A rejected old generation must not even steal the current view's focus.
+        if owner.view_attachment()? != *expected || self.view_attached.get() == attach {
+            return Err("stale terminal view attachment".into());
+        }
+        if !attach {
+            self.set_input_focus(false);
+        }
+        let ticket = owner.switch_view(expected, attach)?;
+        self.view_attached.set(attach);
+        self.advance_paste_revision();
+        self.view.clear_preedit();
+        self.set_composition_active(false);
+        self.dirty.set(true);
+        if attach {
+            self.paint();
+        }
+        Ok(ticket)
+    }
+
+    /// Submit a delayed operation only with the generation that originated it.
+    #[cfg(target_os = "linux")]
+    pub fn write_input_for_attachment(
+        &self,
+        expected: &crate::Attachment,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let owner = self.runtime().ok_or("retained runtime unavailable")?;
+        if owner.input_for(expected, bytes)? {
+            self.input_admitted();
+        }
+        Ok(())
+    }
+
     pub fn input_revision(&self) -> u64 {
         self.input_revision.get()
     }
@@ -1188,11 +1429,19 @@ impl<P: Pty> TerminalPane<P> {
             return;
         }
         let pane = Rc::downgrade(self);
+        let attachment = self.view_attachment().ok();
         let commands = commands.to_vec();
         glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
             let Some(pane) = pane.upgrade() else { return };
             for command in commands {
-                if pane.exited.get() || pane.runtime().and_then(|runtime| runtime.child_pid()).is_none() {
+                if pane.exited.get()
+                    || !pane.view_attached.get()
+                    || pane.view_attachment().ok() != attachment
+                    || pane
+                        .runtime()
+                        .and_then(|runtime| runtime.child_pid())
+                        .is_none()
+                {
                     break;
                 }
                 let mut input = command.into_bytes();
@@ -1209,6 +1458,15 @@ impl<P: Pty> TerminalPane<P> {
         self.scroll_rows(lines);
     }
 
+    pub fn find_controller(self: &Rc<Self>) -> Rc<crate::terminal_find::TerminalFind<P>> {
+        if let Some(controller) = self.terminal_find.borrow().upgrade() {
+            return controller;
+        }
+        let controller = Rc::new(crate::terminal_find::TerminalFind::new(self.clone()));
+        self.terminal_find.replace(Rc::downgrade(&controller));
+        controller
+    }
+
     pub fn toggle_history_search(self: &Rc<Self>) {
         let Some(parent) = self.view.widget.root().and_downcast::<gtk4::Window>() else {
             return;
@@ -1216,6 +1474,75 @@ impl<P: Pty> TerminalPane<P> {
         self.history_search
             .get_or_init(|| HistorySearchView::new(self))
             .toggle(&parent);
+    }
+
+    /// Open a genuine concurrent read-only view of this pane's existing PTY.
+    /// The observer never acquires this pane's input, grid or close APIs.
+    #[cfg(target_os = "linux")]
+    pub fn open_observer(self: &Rc<Self>) -> Result<gtk4::Window, String> {
+        let owner = self
+            .runtime()
+            .ok_or("This terminal has no shared runtime")?;
+        let parent = self
+            .view
+            .widget
+            .root()
+            .and_downcast::<gtk4::Window>()
+            .ok_or("The terminal owner has no window")?;
+        let capability = owner.observe()?;
+        let weak = Rc::downgrade(self);
+        Ok(crate::observer::open(
+            capability,
+            self.view.theme(),
+            &parent,
+            move |images| {
+                if let Some(pane) = weak.upgrade() {
+                    if let Ok(source) = pane.inline_images.try_borrow() {
+                        images.share_from(&source);
+                    }
+                }
+            },
+        ))
+    }
+
+    fn install_history_search_menu(self: &Rc<Self>) {
+        use gtk4::gio;
+
+        let actions = gio::SimpleActionGroup::new();
+        let find = gio::SimpleAction::new("find-retained-history", None);
+        let pane = Rc::downgrade(self);
+        find.connect_activate(move |_, _| {
+            if let Some(pane) = pane.upgrade() {
+                pane.toggle_history_search();
+            }
+        });
+        actions.add_action(&find);
+        self.view
+            .widget
+            .insert_action_group("terminal", Some(&actions));
+        let menu = gio::Menu::new();
+        menu.append(
+            Some("Find in retained history"),
+            Some("terminal.find-retained-history"),
+        );
+        #[cfg(target_os = "linux")]
+        if self.runtime().is_some() {
+            let observe = gio::SimpleAction::new("open-observer", None);
+            let pane = Rc::downgrade(self);
+            observe.connect_activate(move |_, _| {
+                if let Some(pane) = pane.upgrade() {
+                    if let Err(error) = pane.open_observer() {
+                        pane.report(&error);
+                    }
+                }
+            });
+            actions.add_action(&observe);
+            menu.append(
+                Some("Open read-only observer"),
+                Some("terminal.open-observer"),
+            );
+        }
+        self.view.widget.set_extra_menu(Some(&menu));
     }
 
     pub(crate) async fn history_search_step(
@@ -1265,10 +1592,12 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     pub fn paste(self: &Rc<Self>) {
-        if self.exited.get() || !self.input_focused.get() {
+        if self.exited.get() || !self.view_attached.get() || !self.input_focused.get() {
             return;
         }
         let revision = self.advance_paste_revision();
+        #[cfg(target_os = "linux")]
+        let attachment = self.view_attachment().ok();
         let session = Rc::downgrade(self);
         let clipboard = self.view.widget.clipboard();
         let bounded = self.pty().is_none();
@@ -1285,7 +1614,12 @@ impl<P: Pty> TerminalPane<P> {
             let Some(session) = session.upgrade() else {
                 return;
             };
+            #[cfg(target_os = "linux")]
+            if session.view_attachment().ok() != attachment {
+                return;
+            }
             if session.exited.get()
+                || !session.view_attached.get()
                 || !session.input_focused.get()
                 || !session.view.widget.is_mapped()
                 || session.paste_revision.get() != revision
@@ -1342,6 +1676,9 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     fn resize_grid(&self, rows: usize, columns: usize) -> Result<(), String> {
+        if !self.view_attached.get() {
+            return Err("terminal view is detached".into());
+        }
         match &self.backend {
             Backend::Host { terminal, .. } => terminal.resize(rows, columns),
             #[cfg(target_os = "linux")]
@@ -1353,17 +1690,28 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     fn paint(&self) {
-        if !self.dirty.get() || self.view.widget.buffer().has_selection() {
+        if !self.view_attached.get()
+            || !self.dirty.get()
+            || self.view.widget.buffer().has_selection()
+        {
             return;
         }
         let exited = self.exited.get();
         let request = self.viewport_request();
         let snapshot = match &self.backend {
-            Backend::Host { terminal, .. } => terminal
-                .viewport(request)
-                .map(|frame| frame.map(|frame| (frame, false))),
+            Backend::Host { terminal, .. } => terminal.viewport(request).map(|frame| {
+                frame.map(|frame| {
+                    (
+                        frame,
+                        false,
+                        None::<jterm_engine::retained_bytes::RetainedBytes>,
+                    )
+                })
+            }),
             #[cfg(target_os = "linux")]
-            Backend::Runtime(owner) => owner.poll_viewport(request),
+            Backend::Runtime(owner) => owner.poll_viewport(request).map(|result| {
+                result.map(|(frame, newer, delivery)| (frame, newer, Some(delivery)))
+            }),
         };
         let (
             ViewportFrame {
@@ -1375,6 +1723,7 @@ impl<P: Pty> TerminalPane<P> {
                 evicted_anchor,
             },
             newer_output,
+            _delivery,
         ) = match snapshot {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => return,
@@ -1385,11 +1734,13 @@ impl<P: Pty> TerminalPane<P> {
         };
         let history_top = history.as_ref().map(|history| history.first);
         if frame.stamp().screen == Screen::Primary {
-            self.scroll_top.set(
-                history
-                    .as_ref()
-                    .map(|history| ScrollTarget::Source(history.anchor)),
-            );
+            let top = history
+                .as_ref()
+                .map(|history| ScrollTarget::Source(history.anchor));
+            if self.scroll_top.replace(top) != top {
+                #[cfg(target_os = "linux")]
+                self.update_live_viewport();
+            }
         }
         if evicted_anchor && !exited {
             self.report("Earlier scrollback is no longer retained");
@@ -1424,7 +1775,16 @@ impl<P: Pty> TerminalPane<P> {
         );
         self.painted_source.set(Some((frame.stamp(), history_top)));
         self.dirty.set(newer_output);
+        #[cfg(target_os = "linux")]
+        if !newer_output {
+            self.painted_input_revision.set(self.input_revision.get());
+        }
         self.paint_find();
+        // Resize and projection publication can invalidate Find without new
+        // child bytes. Refresh after painting, outside the runtime lock.
+        if let Some(controller) = self.terminal_find.borrow().upgrade() {
+            controller.observe_output();
+        }
         if let Some(observer) = self.transcript_painted.get() {
             observer();
         }
@@ -1445,15 +1805,45 @@ impl<P: Pty> TerminalPane<P> {
         if let Some(top) = self.painted_find_top(&find.frame) {
             self.view.paint_find(top, &find.hits, find.current);
         } else {
-            self.find_highlights.take();
+            #[cfg(target_os = "linux")]
+            let pending = self.runtime().is_some()
+                && find.frame.0.owner.strong_count() > 0
+                && self
+                    .inspect(|terminal| {
+                        !terminal.publication_held()
+                            && terminal.history_extent()
+                                == (find.frame.0.history_start..find.frame.0.history_end)
+                            && terminal
+                                .frame()
+                                .is_ok_and(|frame| frame.stamp() == find.frame.0.stamp)
+                    })
+                    .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let pending = false;
+            if !pending {
+                self.find_highlights.take();
+            }
             self.view.clear_find();
         }
     }
 
     fn viewport_request(&self) -> ViewportRequest {
+        let top = self.scroll_top.get();
         ViewportRequest {
-            top: self.scroll_top.get(),
-            painted_history: self.painted_history.get(),
+            top,
+            painted_history: top.and(self.painted_history.get()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_live_viewport(&self) {
+        if let Some(owner) = self.runtime() {
+            owner.set_live_viewport(
+                self.view_attached.get()
+                    && self.view.widget.is_mapped()
+                    && self.scroll_top.get().is_none()
+                    && !self.has_selection(),
+            );
         }
     }
 
@@ -1477,6 +1867,8 @@ impl<P: Pty> TerminalPane<P> {
             }
             self.clear_selection();
             self.dirty.set(true);
+            #[cfg(target_os = "linux")]
+            self.update_live_viewport();
         }
     }
 
@@ -1626,8 +2018,8 @@ impl<P: Pty> TerminalPane<P> {
         &self,
         encode: impl FnOnce(&Terminal) -> Result<Vec<u8>, String>,
     ) -> Result<bool, String> {
-        if self.exited.get() {
-            return Err("terminal input is closed".into());
+        if self.exited.get() || !self.view_attached.get() {
+            return Err("terminal input is closed or view detached".into());
         }
         match &self.backend {
             Backend::Host { terminal, .. } => terminal.inspect(encode).and_then(|bytes| {
@@ -1850,7 +2242,10 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     fn accepts_ime(&self) -> bool {
-        !self.exited.get() && self.view.widget.is_mapped() && self.view.widget.has_focus()
+        self.view_attached.get()
+            && !self.exited.get()
+            && self.view.widget.is_mapped()
+            && self.view.widget.has_focus()
     }
 
     fn set_composition_active(&self, active: bool) {
@@ -1867,6 +2262,7 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     fn set_input_focus(&self, focused: bool) {
+        let focused = focused && self.view_attached.get();
         if self.input_focused.replace(focused) == focused {
             return;
         }
@@ -1929,12 +2325,18 @@ impl<P: Pty> TerminalPane<P> {
         self.view.widget.connect_map(move |_| {
             if let Some(session) = weak.upgrade() {
                 session.set_input_focus(session.accepts_ime());
+                #[cfg(target_os = "linux")]
+                session.update_live_viewport();
             }
         });
         let weak = Rc::downgrade(self);
         self.view.widget.connect_unmap(move |_| {
             if let Some(session) = weak.upgrade() {
                 session.set_input_focus(false);
+                #[cfg(target_os = "linux")]
+                if let Some(owner) = session.runtime() {
+                    owner.set_live_viewport(false);
+                }
                 if let Some(search) = session.history_search.get() {
                     search.hide();
                 }
@@ -2130,13 +2532,8 @@ mod transcript_tests {
         let output =
             TerminalOutput::new(TestPty, cols, rows, TerminalProfile::Embedded, links.admit)
                 .unwrap();
-        let (widget, terminal) = EmbeddedTerminal::attach(
-            output.handle(),
-            theme,
-            |s, _| s.to_owned(),
-            links,
-        )
-        .unwrap();
+        let (widget, terminal) =
+            EmbeddedTerminal::attach(output.handle(), theme, |s, _| s.to_owned(), links).unwrap();
         (widget, terminal, output)
     }
 
@@ -2389,6 +2786,8 @@ mod transcript_tests {
         .upcast();
         let images = || terminal.pane.inline_images.borrow().painted_slices();
 
+        // Load the fonts before starting the engine's real 250 ms hold.
+        terminal.pane.view.cell_metrics();
         output.apply(b"\x1b[2;2H\x1b[?2026h").unwrap();
         let image = terminal
             .prepare_inline_image(
@@ -2403,6 +2802,7 @@ mod transcript_tests {
             )
             .unwrap();
         assert!(terminal.admit_inline_image(image));
+        assert!(terminal.inspect(Terminal::publication_held));
         terminal.pane.paint();
         assert_eq!(images(), 0);
 

@@ -1086,6 +1086,7 @@ pub enum UnderlineStyle {
 ///   bit 11: protected (DECSCA)
 ///   bit 12: a printed space, distinct from erase padding
 ///   bit 13: padding produced by a tab
+///   bits 14-15: overline and conceal in legacy document projections
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct StyleFlags(u16);
@@ -1118,12 +1119,22 @@ const WIDE_CONT_BIT: u16 = 1 << 10;
 const PROTECTED_BIT: u16 = 1 << 11;
 const PRINTED_SPACE_BIT: u16 = 1 << 12;
 const TAB_PADDING_BIT: u16 = 1 << 13;
+const OVERLINE_BIT: u16 = 1 << 14;
+const CONCEALED_BIT: u16 = 1 << 15;
 
 impl StyleFlags {
     /// Renderable attributes without live cell geometry or protection.
     pub(crate) fn archive_rendition(self) -> Self {
-        Self(self.0 & (BOLD_BIT | ITALIC_BIT | UNDERLINE_MASK | INVERSE_BIT
-            | DIM_BIT | BLINK_BIT | STRIKETHROUGH_BIT))
+        Self(
+            self.0
+                & (BOLD_BIT
+                    | ITALIC_BIT
+                    | UNDERLINE_MASK
+                    | INVERSE_BIT
+                    | DIM_BIT
+                    | BLINK_BIT
+                    | STRIKETHROUGH_BIT),
+        )
     }
 
     #[inline(always)]
@@ -1165,6 +1176,18 @@ impl StyleFlags {
     #[inline(always)]
     pub fn strikethrough(&self) -> bool {
         self.0 & STRIKETHROUGH_BIT != 0
+    }
+    pub fn overline(&self) -> bool {
+        self.0 & OVERLINE_BIT != 0
+    }
+    pub fn concealed(&self) -> bool {
+        self.0 & CONCEALED_BIT != 0
+    }
+    pub fn set_overline(&mut self, enabled: bool) {
+        self.0 = (self.0 & !OVERLINE_BIT) | if enabled { OVERLINE_BIT } else { 0 };
+    }
+    pub fn set_concealed(&mut self, enabled: bool) {
+        self.0 = (self.0 & !CONCEALED_BIT) | if enabled { CONCEALED_BIT } else { 0 };
     }
     #[inline(always)]
     pub fn wide(&self) -> bool {

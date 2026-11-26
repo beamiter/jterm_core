@@ -139,3 +139,17 @@ Tests cover descendant selection, real parent/child sampling, PID reuse, census
 churn, missing RSS, full payload/backpressure, fragmented replies, timeout, extraneous
 input, terminal restoration, PID reuse, RSS and metric sample plumbing. They install
 nothing and do not launch or impersonate any of the five terminal applications.
+
+## Shared engine frame publication
+
+```sh
+cargo run --locked --release --manifest-path crates/jterm_engine/Cargo.toml \
+  --example frame_publication_baseline > frame-publication.csv
+```
+
+This component probe records separate feed, capture and delta timings for
+query-only input, cursor movement and a single edited row. It warms up each
+workload and then records 400 observations at 120×40 and 256×128, with styled
+rows and grapheme annotations already present. For revision comparisons use
+the same example source, CPU, Rust toolchain and release profile on both
+source revisions. The CSV records a skipped delta as `changed_rows=-1`.

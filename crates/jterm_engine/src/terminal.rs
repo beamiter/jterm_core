@@ -22,11 +22,13 @@ use crate::{
     titles::TitleState,
     Color, HyperlinkId, RawRowId, ScrollbackLine, UnderlineColorRun,
 };
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     collections::VecDeque,
     num::NonZeroU64,
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -52,6 +54,27 @@ pub const MAX_INPUT_BYTES: usize = 4096;
 pub const MAX_STREAMED_PASTE_BYTES: usize = u16::MAX as usize;
 /// Maximum bytes consumed or returned as replies by a single feed.
 pub const MAX_FEED_BYTES: usize = 65536;
+
+/// Ordered whole replies retained for one feed, plus bytes refused once the
+/// reply budget was exhausted. Reply pressure does not stop parsing PTY bytes.
+#[derive(Default)]
+pub struct FeedReplies {
+    pub bytes: Vec<u8>,
+    pub refused_bytes: usize,
+    limit_error: Option<&'static str>,
+}
+
+impl FeedReplies {
+    fn push(&mut self, reply: &[u8], error: &'static str) {
+        if self.limit_error.is_some() || reply.len() > MAX_FEED_BYTES - self.bytes.len() {
+            self.limit_error.get_or_insert(error);
+            self.refused_bytes = self.refused_bytes.saturating_add(reply.len());
+        } else {
+            self.bytes.extend_from_slice(reply);
+        }
+    }
+}
+
 fn dimensions(rows: usize, cols: usize, max_cols: usize) -> Result<(), String> {
     if rows == 0 || cols == 0 || rows > MAX_ROWS || cols > max_cols {
         Err("viewport out of bounds".into())
@@ -113,6 +136,34 @@ struct HistoryCopyRow {
     synthetic_gap: Option<usize>,
 }
 impl HistoryPage {
+    /// Decoded page backing, including copy text and row annotations.
+    /// The image store accounts for referenced rasters.
+    pub fn retained_delivery_bytes(&self) -> usize {
+        let header = 2 * size_of::<usize>();
+        let rows = self.rows.capacity() * size_of::<HistoryCopyRow>();
+        let contents = self.rows.iter().map(|row| {
+            header
+                + row.row.cells.len() * size_of::<crate::TerminalCell>()
+                + row
+                    .underline_colors
+                    .as_ref()
+                    .map_or(0, |runs| header + std::mem::size_of_val(runs.as_ref()))
+                + row
+                    .annotations
+                    .as_ref()
+                    .map_or(0, |data| data.retained_bytes())
+        });
+        let links = self.hyperlinks.as_ref().map_or(0, |table| {
+            header
+                + std::mem::size_of_val(table.as_ref())
+                + table
+                    .iter()
+                    .map(|(_, uri)| header + uri.len())
+                    .sum::<usize>()
+        });
+        size_of::<Self>() + self.text.capacity() + rows + contents.sum::<usize>() + links
+    }
+
     /// Physical row and style snapshot for a viewport. Width can differ
     /// between rows retained before and after a resize.
     pub fn row(&self, index: usize) -> Option<&Row> {
@@ -315,9 +366,7 @@ fn extract_selection(
 pub struct Terminal {
     epoch: NonZeroU64,
     max_cols: usize,
-    parser: Parser,
-    screen: ScreenState,
-    protocol: ProtocolState,
+    vt: crate::vt_state::VtState,
     underline_pen: Option<UnderlinePen>,
     hyperlinks: Option<(HyperlinkPolicy, HyperlinkTable)>,
     graphemes: Option<GraphemeInput>,
@@ -340,7 +389,6 @@ pub struct Terminal {
     preserve_primary_on_resize: bool,
     reflow_primary_on_resize: bool,
     command_blocks: Option<CommandBlocks>,
-    sync_started: Option<Instant>,
     capture_sync_end: bool,
     completed_sync_frame: Option<CellFrame>,
     last_frame: Mutex<FrameCache>,
@@ -349,6 +397,10 @@ pub struct Terminal {
 #[derive(Default)]
 struct FrameCache {
     frame: Option<CellFrame>,
+    observed_revision: u64,
+    color_revision: u64,
+    history_extent: std::ops::Range<u64>,
+    row_identity_revision: u64,
     row_links: Vec<Vec<HyperlinkId>>,
 }
 
@@ -393,23 +445,48 @@ struct WindowState {
     titles: TitleState,
     title_changed: bool,
     bell: bool,
+    directory_uri: Option<String>,
 }
 
 impl WindowState {
-    fn handle(&mut self, event: &Event<'_>) -> Option<Effects> {
+    fn handle(
+        &mut self,
+        event: &Event<'_>,
+        osc: Option<crate::osc::OscPacket<'_>>,
+    ) -> Option<Effects> {
         match event {
             Event::String {
                 kind: StringKind::Osc,
-                payload,
                 ..
             } => {
-                let (command, title) = std::str::from_utf8(payload).ok()?.split_once(';')?;
-                if !matches!(command, "0" | "1" | "2") {
-                    return None;
+                use crate::osc::OscCode;
+
+                let packet = osc?;
+                packet.value_bytes()?; // Window OSCs require a delimiter.
+                let value = packet.text()?;
+                match packet.code() {
+                    OscCode::Directory => {
+                        // Keep the URI authority for local and remote panes to check.
+                        let accepts_host = |host: &str| {
+                            host.len() <= 255
+                                && host.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric() || b".-_:[]".contains(&byte)
+                                })
+                        };
+                        if value.starts_with("file://")
+                            && crate::shell_markers::decode_osc7_cwd(value, accepts_host, |_| false)
+                                .is_some()
+                        {
+                            self.directory_uri = Some(value.to_owned());
+                        }
+                    }
+                    OscCode::Title(command) => {
+                        let title = TitleState::reportable_title(value);
+                        self.title_changed |= command != "1" && title != self.titles.window_title;
+                        self.titles.set_osc(command, &title);
+                    }
+                    _ => return None,
                 }
-                let title = TitleState::reportable_title(title);
-                self.title_changed |= command != "1" && title != self.titles.window_title;
-                self.titles.set_osc(command, &title);
                 Some(Effects::new())
             }
             Event::Csi {
@@ -485,18 +562,24 @@ impl Terminal {
         max_cols: usize,
     ) -> Result<Self, String> {
         dimensions(rows, cols, max_cols)?;
+        let revision = 1;
+        let mut screen = ScreenState::new(rows, cols);
+        screen.grid.begin_capture_revision(revision);
+        screen.alt_grid.begin_capture_revision(revision);
         Ok(Self {
             epoch,
             max_cols,
-            parser: Parser::with_bounded_profile(
-                ParserLimits {
-                    pending_bytes: 4096,
-                    kitty_recovery_bytes: 4096,
-                },
-                ParserProfile::EmberV1,
-            )?,
-            screen: ScreenState::new(rows, cols),
-            protocol: initial_protocol(),
+            vt: crate::vt_state::VtState::adopt_hosted(
+                screen,
+                initial_protocol(),
+                Parser::with_bounded_profile(
+                    ParserLimits {
+                        pending_bytes: 4096,
+                        kitty_recovery_bytes: 4096,
+                    },
+                    ParserProfile::EmberV1,
+                )?,
+            ),
             underline_pen: None,
             hyperlinks: None,
             graphemes: None,
@@ -504,7 +587,7 @@ impl Terminal {
             device_answers: false,
             colors: None,
             color_revision: 0,
-            revision: 1,
+            revision,
             layout: 1,
             unsupported: 0,
             unsupported_events: Vec::new(),
@@ -519,7 +602,6 @@ impl Terminal {
             preserve_primary_on_resize: false,
             reflow_primary_on_resize: false,
             command_blocks: None,
-            sync_started: None,
             capture_sync_end: false,
             completed_sync_frame: None,
             last_frame: Mutex::new(FrameCache::default()),
@@ -545,7 +627,7 @@ impl Terminal {
 
     /// Enable bounded direct Kitty graphics on this terminal's own parser.
     pub fn enable_inline_graphics(&mut self, cell_pixels: (u16, u16), decode_png: PngDecoder) {
-        self.parser.enable_inline_graphics_packets();
+        self.vt.parser.enable_inline_graphics_packets();
         self.inline_graphics
             .get_or_insert_with(|| InlineGraphics::new(cell_pixels, decode_png));
     }
@@ -577,7 +659,8 @@ impl Terminal {
     /// Native key controllers supply the base key in the active layout and
     /// deliver committed IME text separately from physical key presses.
     pub fn enable_keyboard_disambiguation(&mut self) {
-        self.protocol
+        self.vt
+            .protocol
             .limit_keyboard_enhancements(u16::from(crate::input::KITTY_DISAMBIGUATE));
     }
 
@@ -611,30 +694,17 @@ impl Terminal {
         }
     }
 
-    fn color_event(&mut self, event: &Event<'_>) -> Option<Effects> {
-        let Event::String {
-            kind: StringKind::Osc,
-            payload,
-            bel_terminated,
-        } = event
-        else {
+    fn color_event(&mut self, packet: crate::osc::OscPacket<'_>) -> Option<Effects> {
+        let colors = self.colors.as_deref()?;
+        let crate::osc::OscCode::Color(command) = packet.code() else {
             return None;
         };
-        let colors = self.colors.as_deref()?;
-        let text = std::str::from_utf8(payload).ok()?;
-        let (command, value) = text.split_once(';').unwrap_or((text, ""));
-        if !matches!(
-            command,
-            "4" | "10" | "11" | "12" | "104" | "110" | "111" | "112"
-        ) {
-            return None;
-        }
-        if payload.len() > 4096 {
+        let value = packet.text()?;
+        if packet.payload_len() > 4096 {
             return Some(Effects::new());
         }
         let mut next = colors.clone();
-        let end: &[u8] = if *bel_terminated { b"\x07" } else { b"\x1b\\" };
-        let effects = next.apply_ember_osc(command, value, end);
+        let effects = next.apply_ember_osc(command, value, packet.terminator());
         self.publish_colors(next);
         Some(effects)
     }
@@ -643,6 +713,12 @@ impl Terminal {
         self.window
             .as_ref()
             .map(|window| window.titles.window_title.as_str())
+    }
+
+    /// The last terminal-reported directory URI. This is PTY output, so
+    /// applications still need pane and host authority before using it.
+    pub fn reported_directory_uri(&self) -> Option<&str> {
+        self.window.as_ref()?.directory_uri.as_deref()
     }
 
     fn finish_grapheme(&mut self) {
@@ -668,8 +744,7 @@ impl Terminal {
 
     /// Evaluate the publish barrier using the session's monotonic clock.
     pub fn publication_held_at(&self, now: Instant) -> bool {
-        self.sync_started
-            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_millis(250))
+        self.vt.sync_output.publication_held_at(now)
     }
 
     /// Begin a batch of feeds, optionally retaining the first completed
@@ -706,8 +781,8 @@ impl Terminal {
             encode_kitty_disambiguated_key, legacy_function_key_sequence,
             xterm_encode_modify_other_keys, Key, KittyKey, Modifiers,
         };
-        let flags = self.protocol.keyboard_enhancement_flags();
-        if flags != 0 && self.protocol.keyboard_enhancement_limit().is_none() {
+        let flags = self.vt.protocol.keyboard_enhancement_flags();
+        if flags != 0 && self.vt.protocol.keyboard_enhancement_limit().is_none() {
             return Err("Kitty keyboard flags are unsupported".into());
         }
         let key = match name {
@@ -770,7 +845,7 @@ impl Terminal {
             }
         }
         if let Some(sequence) =
-            legacy_function_key_sequence(key, modifiers, self.protocol.modes().contains(&1))
+            legacy_function_key_sequence(key, modifiers, self.vt.protocol.modes().contains(&1))
         {
             return Ok(sequence.as_bytes().to_vec());
         }
@@ -790,8 +865,8 @@ impl Terminal {
             if let Some(sequence) = xterm_encode_modify_other_keys(
                 key,
                 modifiers,
-                self.protocol.xterm_modify_other_keys(),
-                self.protocol.xterm_format_other_keys(),
+                self.vt.protocol.xterm_modify_other_keys(),
+                self.vt.protocol.xterm_format_other_keys(),
                 false,
                 text_character,
             ) {
@@ -834,7 +909,8 @@ impl Terminal {
     }
     /// Encode the focus notification requested by DECSET 1004.
     pub fn encode_focus(&self, focused: bool) -> Option<&'static [u8]> {
-        self.protocol
+        self.vt
+            .protocol
             .modes()
             .contains(&1004)
             .then_some(if focused { b"\x1b[I" } else { b"\x1b[O" })
@@ -847,10 +923,10 @@ impl Terminal {
         row: usize,
         modifiers: u8,
     ) -> Option<Vec<u8>> {
-        if column >= self.screen.grid.cols() || row >= self.screen.grid.rows() {
+        if column >= self.vt.screen.grid.cols() || row >= self.vt.screen.grid.rows() {
             return None;
         }
-        let modes = self.protocol.modes();
+        let modes = self.vt.protocol.modes();
         let modifiers = modifiers & 0x1c;
         match input {
             MouseInput::Press(button) => modes.get_mouse_report(button | modifiers, column, row),
@@ -866,7 +942,9 @@ impl Terminal {
             }
             MouseInput::WheelUp | MouseInput::WheelDown => {
                 let up = input == MouseInput::WheelUp;
-                if !modes.is_mouse_enabled() && self.screen.use_alt_buffer && modes.contains(&1007)
+                if !modes.is_mouse_enabled()
+                    && self.vt.screen.use_alt_buffer
+                    && modes.contains(&1007)
                 {
                     return self
                         .encode_key(
@@ -894,8 +972,8 @@ impl Terminal {
         if text.is_empty() {
             return Ok(Vec::new());
         }
-        if self.protocol.keyboard_enhancement_flags() != 0
-            && self.protocol.keyboard_enhancement_limit().is_none()
+        if self.vt.protocol.keyboard_enhancement_flags() != 0
+            && self.vt.protocol.keyboard_enhancement_limit().is_none()
         {
             return Err("IME committed text with Kitty keyboard flags is unsupported".into());
         }
@@ -909,7 +987,7 @@ impl Terminal {
     }
 
     pub fn bracketed_paste_active(&self) -> bool {
-        self.protocol.modes().contains(&2004)
+        self.vt.protocol.modes().contains(&2004)
     }
 
     /// The native clipboard shortcut preserves an explicit Enter in a shell
@@ -1022,10 +1100,10 @@ impl Terminal {
     }
     fn capture_history(&mut self, effect: Option<RegionMutation>) {
         if let Some(effect) = effect {
-            if !self.screen.use_alt_buffer
+            if !self.vt.screen.use_alt_buffer
                 && effect.direction == RegionDirection::Up
                 && effect.top == 0
-                && effect.bottom + 1 == self.screen.grid.rows()
+                && effect.bottom + 1 == self.vt.screen.grid.rows()
             {
                 for removed in effect.removed {
                     if let Some(line) = removed.captured {
@@ -1040,31 +1118,35 @@ impl Terminal {
         if self.history_row_limit == 0 {
             return;
         }
+        let row_id = line.raw_row_id();
+        let retained = self.history.retain_latest(line, self.history_row_limit, drop);
         if let Some(sources) = &mut self.row_sources {
-            sources.appended(line.raw_row_id(), self.history_end);
+            if retained {
+                sources.appended(row_id, self.history_end);
+            }
+            sources.trim_to(self.history.len());
         }
-        self.history.push_back(line);
         self.history_end = self
             .history_end
             .checked_add(1)
             .expect("terminal history row identity exhausted");
-        self.trim_history();
     }
     fn history_admitted(&self) -> bool {
         self.history_row_limit != 0
-            && !self.screen.use_alt_buffer
-            && self.screen.scroll_region_top == 0
-            && self.screen.scroll_region_bottom + 1 == self.screen.grid.rows()
+            && !self.vt.screen.use_alt_buffer
+            && self.vt.screen.scroll_region_top == 0
+            && self.vt.screen.scroll_region_bottom + 1 == self.vt.screen.grid.rows()
     }
     fn motion(&mut self, m: VerticalMotion) {
         let capture = self.history_admitted();
         let effect = self
+            .vt
             .screen
             .vertical_motion(m, capture, || RowSources::allocate(&mut self.row_sources));
         self.capture_history(effect.region);
     }
     pub fn history_rows(&self) -> usize {
-        if self.screen.use_alt_buffer {
+        if self.vt.screen.use_alt_buffer {
             0
         } else {
             self.history.len()
@@ -1107,7 +1189,7 @@ impl Terminal {
     /// Bits identify live rows whose final physical cell was skipped when a
     /// wide glyph wrapped early. Read alongside the matching paint frame.
     pub fn live_margin_gaps(&self) -> u128 {
-        let grid = &self.screen.grid;
+        let grid = &self.vt.screen.grid;
         (0..grid.rows())
             .filter(|&row| grid.synthetic_margin_gap(row).is_some())
             .fold(0, |gaps, row| gaps | (1 << row))
@@ -1177,7 +1259,7 @@ impl Terminal {
 
     /// The integrated shell has reported its primary-screen input prompt.
     pub fn command_prompt_ready(&self) -> bool {
-        !self.screen.use_alt_buffer
+        !self.vt.screen.use_alt_buffer
             && self
                 .command_blocks
                 .as_ref()
@@ -1201,7 +1283,7 @@ impl Terminal {
     }
 
     pub fn alternate_screen_active(&self) -> bool {
-        self.screen.use_alt_buffer
+        self.vt.screen.use_alt_buffer
     }
 
     /// A submitted line can start a foreground command before its PTY markers arrive.
@@ -1220,7 +1302,7 @@ impl Terminal {
         let Some(mut anchor) = input.active else {
             return false;
         };
-        let Some(base) = self.screen.last_printed_char else {
+        let Some(base) = self.vt.screen.last_printed_char else {
             return false;
         };
         if base.is_ascii() && ch.is_ascii() {
@@ -1228,13 +1310,14 @@ impl Terminal {
         }
         let mut scalar = [0; 4];
         let preceding = self
+            .vt
             .screen
             .grid
             .cluster_text(anchor.row, anchor.col)
             .unwrap_or_else(|| base.encode_utf8(&mut scalar));
         let mut buf = [0; MAX_CLUSTER_BYTES + 4];
         let Some(cluster) =
-            graphemes::extension(preceding, self.screen.translate_char(ch), &mut buf)
+            graphemes::extension(preceding, self.vt.screen.translate_char(ch), &mut buf)
         else {
             return false;
         };
@@ -1263,6 +1346,7 @@ impl Terminal {
             }
         }
         if let Some(stored) = self
+            .vt
             .screen
             .grid
             .set_cluster_text(anchor.row, anchor.col, cluster)
@@ -1288,15 +1372,15 @@ impl Terminal {
     ) -> Option<GraphicPosition> {
         let input = self.graphemes.as_mut()?;
         let checkpoint = input.provisional.as_ref()?;
-        let cols = self.screen.grid.cols();
-        let wrap = self.protocol.modes().contains(&7);
+        let cols = self.vt.screen.grid.cols();
+        let wrap = self.vt.protocol.modes().contains(&7);
         let (row, col, cleared) = if checkpoint.col + width <= cols {
             (checkpoint.row, checkpoint.col, false)
         } else if wrap {
             // A preflight wrap here is growth from a provisional narrow
             // print, so the live row is still the original departure row.
-            debug_assert_eq!(self.screen.cursor_row, checkpoint.row);
-            let (row, cleared) = self.screen.wrap_target();
+            debug_assert_eq!(self.vt.screen.cursor_row, checkpoint.row);
+            let (row, cleared) = self.vt.screen.wrap_target();
             (row, 0, cleared)
         } else {
             (checkpoint.row, cols - width, false)
@@ -1305,9 +1389,9 @@ impl Terminal {
             let line = if row == anchor.row {
                 checkpoint.footprint.row_annotations()
             } else {
-                self.screen.grid.row_annotations(row).map(Arc::as_ref)
+                self.vt.screen.grid.row_annotations(row).map(Arc::as_ref)
             };
-            let displaced = if self.screen.insert_mode {
+            let displaced = if self.vt.screen.insert_mode {
                 cols - width..cols
             } else {
                 col..col + width
@@ -1318,15 +1402,16 @@ impl Terminal {
         }
 
         let checkpoint = input.provisional.take()?;
-        self.screen
+        self.vt
+            .screen
             .grid
             .restore_print(anchor.row, checkpoint.footprint);
         if let Some(departure) = checkpoint.departure {
-            self.screen.grid.restore_wrap(departure);
+            self.vt.screen.grid.restore_wrap(departure);
         }
-        self.screen.cursor_row = checkpoint.row;
-        self.screen.cursor_col = checkpoint.col;
-        self.screen.pending_wrap = false;
+        self.vt.screen.cursor_row = checkpoint.row;
+        self.vt.screen.cursor_col = checkpoint.col;
+        self.vt.screen.pending_wrap = false;
         self.write_graphic(graphic, width);
         let placed = self.graphemes.as_ref()?.active?;
         debug_assert_eq!((placed.row, placed.col), (row, col));
@@ -1335,14 +1420,14 @@ impl Terminal {
 
     fn print(&mut self, ch: char) {
         if !self.extend_grapheme(ch) {
-            self.print_cell(ch, self.screen.translate_char(ch));
+            self.print_cell(ch, self.vt.screen.translate_char(ch));
         }
     }
 
     fn print_ascii(&mut self, bytes: &[u8]) {
         if bytes.len() < 4
-            || self.screen.insert_mode
-            || self.screen.active_charset != Charset::Ascii
+            || self.vt.screen.insert_mode
+            || self.vt.screen.active_charset != Charset::Ascii
         {
             for &byte in bytes {
                 self.print(char::from(byte));
@@ -1353,6 +1438,7 @@ impl Terminal {
         let (&first, tail) = bytes.split_first().expect("nonempty ASCII run");
         self.print(char::from(first));
         if !self
+            .vt
             .screen
             .last_printed_char
             .is_some_and(|ch| ch.is_ascii())
@@ -1366,13 +1452,14 @@ impl Terminal {
         // Keep both boundaries in the scalar path. The leading byte can join
         // a previous grapheme and the trailing byte owns any later extension.
         let (&last, mut middle) = tail.split_last().expect("ASCII run has a tail");
-        let autowrap = self.protocol.modes().contains(&7);
+        let autowrap = self.vt.protocol.modes().contains(&7);
         while !middle.is_empty() {
-            match self.screen.step_ascii_write(middle, autowrap) {
+            match self.vt.screen.step_ascii_write(middle, autowrap) {
                 AsciiWriteStep::NeedsWrap => self.motion(VerticalMotion::Wrap),
                 AsciiWriteStep::Written { consumed, mutation } => {
                     if let (Some(pen), Some(columns)) = (&self.underline_pen, mutation.printed) {
-                        self.screen
+                        self.vt
+                            .screen
                             .grid
                             .set_underline_color(mutation.row, columns, pen.current);
                     }
@@ -1400,30 +1487,30 @@ impl Terminal {
     }
 
     fn write_graphic(&mut self, translated: char, width: usize) {
-        let width = if self.reflow_primary_on_resize && !self.screen.use_alt_buffer {
-            width.min(self.screen.grid.cols())
+        let width = if self.reflow_primary_on_resize && !self.vt.screen.use_alt_buffer {
+            width.min(self.vt.screen.grid.cols())
         } else {
             width
         };
-        let wrap = self.protocol.modes().contains(&7);
-        if self.screen.take_pending_wrap(wrap) {
+        let wrap = self.vt.protocol.modes().contains(&7);
+        if self.vt.screen.take_pending_wrap(wrap) {
             self.motion(VerticalMotion::Wrap);
         }
-        let origin_row = self.screen.cursor_row;
-        let origin_col = self.screen.cursor_col;
+        let origin_row = self.vt.screen.cursor_row;
+        let origin_col = self.vt.screen.cursor_col;
         let presentation_can_change = self.graphemes.is_some()
-            && self.screen.grid.cols() >= 2
+            && self.vt.screen.grid.cols() >= 2
             && if width == 1 {
                 graphemes::may_grow(translated)
             } else {
                 graphemes::may_contract(translated)
             };
-        let early_wrap = self.screen.prepare_character_width(width, wrap);
-        let departure = (early_wrap && presentation_can_change && !self.screen.wrap_target().1)
-            .then(|| self.screen.grid.checkpoint_wrap(origin_row));
+        let early_wrap = self.vt.screen.prepare_character_width(width, wrap);
+        let departure = (early_wrap && presentation_can_change && !self.vt.screen.wrap_target().1)
+            .then(|| self.vt.screen.grid.checkpoint_wrap(origin_row));
         if early_wrap {
             let capture = self.history_admitted();
-            let effect = self.screen.vertical_early_wide_wrap(width, capture, || {
+            let effect = self.vt.screen.vertical_early_wide_wrap(width, capture, || {
                 RowSources::allocate(&mut self.row_sources)
             });
             self.capture_history(effect.region);
@@ -1435,16 +1522,16 @@ impl Terminal {
                 ProvisionalPrint {
                     row: origin_row,
                     col: origin_col,
-                    footprint: self.screen.grid.checkpoint_print(
-                        self.screen.cursor_row,
-                        self.screen.cursor_col,
+                    footprint: self.vt.screen.grid.checkpoint_print(
+                        self.vt.screen.cursor_row,
+                        self.vt.screen.cursor_col,
                         width,
-                        self.screen.insert_mode,
+                        self.vt.screen.insert_mode,
                     ),
                     departure,
                 }
             });
-        let written = self.screen.write_char_in_row(translated, width, wrap);
+        let written = self.vt.screen.write_char_in_row(translated, width, wrap);
         if let Some(input) = &mut self.graphemes {
             input.active = written.printed.as_ref().map(|cols| GraphicPosition {
                 row: written.row,
@@ -1455,15 +1542,16 @@ impl Terminal {
             input.last_cluster = None;
         }
         if let (Some(underline), Some(cols)) = (&self.underline_pen, written.printed) {
-            self.screen
+            self.vt
+                .screen
                 .grid
                 .set_underline_color(written.row, cols, underline.current);
         }
-        self.screen.last_printed_char = Some(translated);
+        self.vt.screen.last_printed_char = Some(translated);
     }
 
     fn repeat_print(&mut self, count: usize) {
-        let Some(ch) = self.screen.last_printed_char else {
+        let Some(ch) = self.vt.screen.last_printed_char else {
             return;
         };
         let cluster = self
@@ -1471,13 +1559,14 @@ impl Terminal {
             .as_ref()
             .and_then(|input| input.last_cluster.clone());
         if let Some(cluster) = cluster {
-            let width = cluster.width.min(self.screen.grid.cols());
+            let width = cluster.width.min(self.vt.screen.grid.cols());
             for _ in 0..count {
                 // The retained text already includes the translated base.
                 self.write_graphic(ch, width);
                 let anchor = self.graphemes.as_ref().and_then(|input| input.active);
                 if let Some(anchor) = anchor {
                     if self
+                        .vt
                         .screen
                         .grid
                         .set_cluster_text(anchor.row, anchor.col, &cluster.text)
@@ -1491,7 +1580,7 @@ impl Terminal {
                 input.last_cluster = Some(cluster);
             }
         } else {
-            let translated = self.screen.translate_char(ch);
+            let translated = self.vt.screen.translate_char(ch);
             for _ in 0..count {
                 self.print_cell(ch, translated);
             }
@@ -1501,16 +1590,16 @@ impl Terminal {
     // Apply profile-specific screen operations after shared local dispatch.
     fn reset_terminal(&mut self) {
         self.cancel_inline_upload();
-        let track_printed_spaces = self.screen.grid.track_printed_spaces;
-        self.screen = ScreenState::new(self.screen.grid.rows(), self.screen.grid.cols());
+        let track_printed_spaces = self.vt.screen.grid.track_printed_spaces;
+        self.vt.screen = ScreenState::new(self.vt.screen.grid.rows(), self.vt.screen.grid.cols());
         if track_printed_spaces {
             self.track_printed_spaces();
         }
         self.begin_revision(self.revision);
-        let keyboard_limit = self.protocol.keyboard_enhancement_limit();
-        self.protocol = initial_protocol();
+        let keyboard_limit = self.vt.protocol.keyboard_enhancement_limit();
+        self.vt.protocol = initial_protocol();
         if let Some(limit) = keyboard_limit {
-            self.protocol.limit_keyboard_enhancements(limit);
+            self.vt.protocol.limit_keyboard_enhancements(limit);
         }
         if let Some(pen) = &mut self.underline_pen {
             *pen = UnderlinePen::default();
@@ -1524,7 +1613,7 @@ impl Terminal {
         self.history.clear();
         self.clear_transcript_archive();
         self.renew_live_source_rows();
-        self.sync_started = None;
+        self.vt.sync_output.end_hosted();
         if let Some(blocks) = &mut self.command_blocks {
             blocks.reset_live();
         }
@@ -1538,7 +1627,7 @@ impl Terminal {
             } if intermediates.is_empty() => match final_byte {
                 b'D' => self.motion(VerticalMotion::LineFeed),
                 b'E' => {
-                    self.screen.begin_next_line();
+                    self.vt.screen.begin_next_line();
                     self.motion(VerticalMotion::LineFeed);
                 }
                 b'M' => self.motion(VerticalMotion::ReverseIndex),
@@ -1549,7 +1638,7 @@ impl Terminal {
                 intermediates,
                 final_byte: b'8',
             } if intermediates == b"#" => {
-                self.screen.screen_alignment_test();
+                self.vt.screen.screen_alignment_test();
                 self.renew_active_source_rows();
             }
             Event::Csi {
@@ -1567,41 +1656,41 @@ impl Terminal {
                         for &mode in params.iter() {
                             match mode {
                                 47 | 1047 | 1049 => {
-                                    if set != self.screen.use_alt_buffer {
+                                    if set != self.vt.screen.use_alt_buffer {
                                         self.cancel_inline_upload();
                                     }
                                     if set {
-                                        if let Some(entry) = self.screen.enter_alternate_screen(
+                                        if let Some(entry) = self.vt.screen.enter_alternate_screen(
                                             mode == 1049,
                                             mode != 47,
-                                            &self.protocol,
+                                            &self.vt.protocol,
                                         ) {
                                             if let Some(rows) = entry.cleared_rows {
-                                                self.screen.grid.row_wrapped[rows].fill(false);
+                                                self.vt.screen.grid.row_wrapped[rows].fill(false);
                                             }
                                             if mode == 1049 {
                                                 if let Some(underline) = &mut self.underline_pen {
                                                     underline.primary = Some(underline.current);
                                                 }
                                             }
-                                            self.protocol.switch_screen();
+                                            self.vt.protocol.switch_screen();
                                         }
                                     } else if let Some(effect) =
-                                        self.screen.leave_alternate_screen(mode == 1049)
+                                        self.vt.screen.leave_alternate_screen(mode == 1049)
                                     {
-                                        if self.protocol.keyboard_enhancement_limit().is_some() {
-                                            self.protocol.reset_keyboard_enhancement();
+                                        if self.vt.protocol.keyboard_enhancement_limit().is_some() {
+                                            self.vt.protocol.reset_keyboard_enhancement();
                                         }
-                                        self.protocol.switch_screen();
+                                        self.vt.protocol.switch_screen();
                                         if let Some(underline) = &mut self.underline_pen {
                                             underline.current =
                                                 underline.primary.take().unwrap_or(Color::Default);
                                         }
                                         if let Some(wrap) = effect.restore_autowrap {
                                             if wrap {
-                                                self.protocol.modes_mut().insert(7);
+                                                self.vt.protocol.modes_mut().insert(7);
                                             } else {
-                                                self.protocol.modes_mut().remove(&7);
+                                                self.vt.protocol.modes_mut().remove(&7);
                                             }
                                         }
                                     }
@@ -1609,32 +1698,32 @@ impl Terminal {
                                 1048 => {
                                     if set {
                                         semantics::save_cursor_state(
-                                            &mut self.screen,
-                                            &self.protocol,
+                                            &mut self.vt.screen,
+                                            &self.vt.protocol,
                                             self.underline_pen.as_mut(),
                                         );
                                     } else {
                                         semantics::restore_cursor_state(
-                                            &mut self.screen,
-                                            &mut self.protocol,
+                                            &mut self.vt.screen,
+                                            &mut self.vt.protocol,
                                             self.underline_pen.as_mut(),
                                         );
                                     }
                                 }
                                 6 => {
-                                    self.screen.origin_mode = set;
-                                    self.screen.set_cursor_position(1, 1);
+                                    self.vt.screen.origin_mode = set;
+                                    self.vt.screen.set_cursor_position(1, 1);
                                 }
                                 7 => {
                                     if !set {
-                                        self.screen.pending_wrap = false;
+                                        self.vt.screen.pending_wrap = false;
                                     }
                                 }
                                 2026 => {
                                     if set {
-                                        self.sync_started.get_or_insert(now);
+                                        self.vt.sync_output.begin_hosted(now);
                                     } else {
-                                        self.sync_started = None;
+                                        self.vt.sync_output.end_hosted();
                                     }
                                     continue;
                                 }
@@ -1645,63 +1734,67 @@ impl Terminal {
                                 }
                             }
                             if set {
-                                self.protocol.modes_mut().insert(mode);
+                                self.vt.protocol.modes_mut().insert(mode);
                             } else {
-                                self.protocol.modes_mut().remove(&mode);
+                                self.vt.protocol.modes_mut().remove(&mode);
                             }
                         }
                     }
                     (None, b'h' | b'l') => {
                         for &mode in params.iter() {
                             if mode == 4 {
-                                self.screen.insert_mode = *final_byte == b'h';
+                                self.vt.screen.insert_mode = *final_byte == b'h';
                             } else {
                                 self.unsupported();
                             }
                         }
                     }
                     (None, b'J') if first == 2 => {
-                        self.screen.erase_screen();
+                        self.vt.screen.erase_screen();
                         self.renew_active_source_rows();
                         // Erased physical rows no longer continue the previous
                         // text in the standalone terminal's logical projection.
-                        self.screen.grid.row_wrapped.fill(false);
+                        self.vt.screen.grid.row_wrapped.fill(false);
                     }
                     (None | Some(b'?'), b'J') => {
                         let selective = *private_prefix == Some(b'?');
-                        let rows = self.screen.grid.rows();
-                        let cols = self.screen.grid.cols();
-                        let cursor = self.screen.cursor_row;
+                        let rows = self.vt.screen.grid.rows();
+                        let cols = self.vt.screen.grid.cols();
+                        let cursor = self.vt.screen.cursor_row;
                         match first {
                             0..=2 => {
                                 for row in 0..rows {
                                     let span = match first {
                                         0 if row > cursor => Some((0, cols)),
-                                        0 if row == cursor => Some((self.screen.cursor_col, cols)),
+                                        0 if row == cursor => {
+                                            Some((self.vt.screen.cursor_col, cols))
+                                        }
                                         1 if row < cursor => Some((0, cols)),
-                                        1 if row == cursor => Some((0, self.screen.cursor_col + 1)),
+                                        1 if row == cursor => {
+                                            Some((0, self.vt.screen.cursor_col + 1))
+                                        }
                                         2 => Some((0, cols)),
                                         _ => None,
                                     };
                                     if let Some((start, end)) = span {
                                         let erased =
-                                            self.screen.erase_span(row, start, end, selective);
+                                            self.vt.screen.erase_span(row, start, end, selective);
                                         // A fully cleared physical row is no longer part of
                                         // the logical line previously wrapped at its margin.
                                         if matches!(erased.as_slice(), [change] if change.changed == (0..cols))
                                         {
-                                            self.screen.grid.row_wrapped[row] = false;
+                                            self.vt.screen.grid.row_wrapped[row] = false;
                                             // A shell's line editor redraws from its
                                             // prompt with ED0. Clearing cells in place
                                             // does not replace the physical source row.
                                         }
                                     }
                                 }
-                                self.screen.pending_wrap = false;
+                                self.vt.screen.pending_wrap = false;
                             }
                             // Alternate applications cannot erase primary history.
                             3 if !selective => {
-                                if !self.screen.use_alt_buffer {
+                                if !self.vt.screen.use_alt_buffer {
                                     self.history.clear();
                                     self.clear_transcript_archive();
                                 }
@@ -1710,22 +1803,24 @@ impl Terminal {
                         }
                     }
                     (None, b'L' | b'M') => {
-                        let top = self.screen.cursor_row;
-                        let bottom = self.screen.scroll_region_bottom;
-                        if top >= self.screen.scroll_region_top && top <= bottom {
+                        let top = self.vt.screen.cursor_row;
+                        let bottom = self.vt.screen.scroll_region_bottom;
+                        if top >= self.vt.screen.scroll_region_top && top <= bottom {
                             let direction = if *final_byte == b'L' {
                                 RegionDirection::Down
                             } else {
                                 RegionDirection::Up
                             };
-                            self.screen.edit_lines(direction, top, bottom, count, || {
-                                RowSources::allocate(&mut self.row_sources)
-                            });
+                            self.vt
+                                .screen
+                                .edit_lines(direction, top, bottom, count, || {
+                                    RowSources::allocate(&mut self.row_sources)
+                                });
                         }
                     }
                     (None, b'S' | b'T') => {
-                        let top = self.screen.scroll_region_top;
-                        let bottom = self.screen.scroll_region_bottom;
+                        let top = self.vt.screen.scroll_region_top;
+                        let bottom = self.vt.screen.scroll_region_bottom;
                         let direction = if *final_byte == b'S' {
                             RegionDirection::Up
                         } else {
@@ -1734,7 +1829,7 @@ impl Terminal {
                         for _ in 0..count.min(bottom - top + 1) {
                             let capture =
                                 self.history_admitted() && direction == RegionDirection::Up;
-                            let effect = self.screen.scroll_region_one(
+                            let effect = self.vt.screen.scroll_region_one(
                                 direction,
                                 top,
                                 bottom,
@@ -1761,231 +1856,257 @@ impl Terminal {
 
     fn begin_revision(&mut self, revision: u64) {
         self.revision = revision;
-        self.screen.grid.begin_capture_revision(revision);
-        self.screen.alt_grid.begin_capture_revision(revision);
+        self.vt.screen.grid.begin_capture_revision(revision);
+        self.vt.screen.alt_grid.begin_capture_revision(revision);
     }
 
     /// Apply bytes sampled at a monotonic instant supplied by the session.
+    /// A reply-limit error still consumes the entire input span.
     pub fn feed_at(&mut self, input: &[u8], now: Instant) -> Result<Vec<u8>, String> {
+        let replies = self.feed_bounded_at(input, now)?;
+        match replies.limit_error {
+            Some(error) => Err(error.into()),
+            None => Ok(replies.bytes),
+        }
+    }
+
+    /// Apply one bounded span and report reply pressure separately from parser
+    /// failure. Once the reply budget is exhausted, keep the admitted prefix at
+    /// whole-reply boundaries and continue processing output and effects.
+    pub fn feed_bounded_at(&mut self, input: &[u8], now: Instant) -> Result<FeedReplies, String> {
         if input.len() > MAX_FEED_BYTES {
             return Err("feed byte limit".into());
         }
         self.begin_revision(self.revision.checked_add(1).ok_or("revision exhausted")?);
-        self.parser.begin_feed();
+        use crate::feed::FeedError;
         let source_base = self
             .command_blocks
             .as_mut()
             .and_then(|blocks| blocks.begin_feed(input.len()));
-        let mut at = 0;
-        let mut replies = Vec::new();
-        let mut steps = 0;
-        while at < input.len() {
-            steps += 1;
-            if steps > input.len() * 2 + 16 {
-                return Err("parser made no progress".into());
-            }
-            let rejected_before = self.parser.rejected_count();
-            let step = self.parser.next(&input[at..]);
-            if step.abandoned_apc {
-                self.cancel_inline_upload();
-            }
-            if self.parser.rejected_count() != rejected_before {
-                if self.hyperlinks.is_some() {
-                    self.screen.current_hyperlink = HyperlinkId::NONE;
-                }
-                self.finish_grapheme();
-            }
-            at += step.consumed;
-            let Some(event) = step.event else { continue };
-            if !matches!(&event, Event::Print(_) | Event::Ascii(_)) {
-                self.finish_grapheme();
-            }
-            if let Event::String {
-                kind: StringKind::Apc,
-                payload,
-                ..
-            } = &event
-            {
-                if kitty_graphics::is_graphics_payload(payload) {
-                    if let Some(mut graphics) = self.inline_graphics.take() {
-                        let cursor = (self.screen.cursor_col, self.screen.cursor_row);
-                        let reply = graphics.apply(self, cursor, payload);
-                        self.inline_graphics = Some(graphics);
-                        if let Some(reply) = reply {
-                            if replies.len() + reply.len() > MAX_FEED_BYTES {
-                                return Err("reply byte limit".into());
-                            }
-                            replies.extend_from_slice(reply.as_bytes());
-                        }
-                        continue;
-                    }
-                }
-            }
-            if self.command_blocks.as_mut().is_some_and(|blocks| {
-                let event_end = source_base.map(|base| base + at as u64);
-                let geometry = (self.screen.grid.cols(), self.screen.grid.rows());
-                let style = crate::archived_text::ArchiveStyle::from_rendition(
-                    self.screen.current_fg,
-                    self.screen.current_bg,
-                    self.underline_pen.as_ref().map_or(Color::Default, |pen| pen.current),
-                    self.screen.current_flags,
-                );
-                let target = self.hyperlinks.as_ref().and_then(|(_, table)| table.resolve(self.screen.current_hyperlink));
-                blocks.observe(&event, self.screen.use_alt_buffer, event_end, geometry, style, target)
-            }) {
-                continue;
-            }
-            if let (
-                Some((policy, table)),
-                Event::String {
-                    kind: StringKind::Osc,
-                    payload,
-                    ..
-                },
-            ) = (&mut self.hyperlinks, &event)
-            {
-                if payload.as_ref() == b"8" {
-                    self.screen.current_hyperlink = HyperlinkId::NONE;
-                    continue;
-                }
-                if let Some(fields) = payload.strip_prefix(b"8;") {
-                    self.screen.current_hyperlink = std::str::from_utf8(fields)
-                        .map_or(HyperlinkId::NONE, |fields| {
-                            table.apply_osc8(fields, *policy)
-                        });
-                    continue;
-                }
-            }
-            if self.device_answers {
-                if let Some(reply) = device_answer(&event) {
-                    if replies.len() + reply.len() > MAX_FEED_BYTES {
-                        return Err("reply byte limit".into());
-                    }
-                    replies.extend_from_slice(reply);
-                    continue;
-                }
-            }
-            // Aether has no DA identity contract. A newer shared legacy
-            // dispatcher answers DA1/DA2 as Ember; do not inherit that identity.
-            // Count unsupported CSI c separately from ESC c (RIS).
-            if matches!(
-                &event,
-                Event::Csi {
-                    final_byte: b'c',
-                    ..
-                }
-            ) {
-                let before = self.unsupported;
-                self.unsupported();
-                if self.unsupported != before {
-                    self.record_unsupported_event(&event);
-                }
-                continue;
-            }
-            // Vim sends 0%m as an unknown-sequence probe. This profile
-            // preserves drawing state when SGR has a nonempty intermediate.
-            if matches!(&event, Event::Csi { intermediates, final_byte: b'm', .. } if !intermediates.is_empty())
-            {
-                self.unsupported();
-                self.record_unsupported_event(&event);
-                continue;
-            }
-            // Reflect the effective hold only for the shared mode-query reducer;
-            // do not sample the clock or touch the mode set on ordinary output.
-            let sync_query = matches!(&event, Event::Csi {
-                params,
-                private_prefix: Some(b'?'),
-                intermediates,
-                final_byte: b'p',
-                ..
-            } if intermediates == b"$" && params.first() == Some(&2026));
-            if sync_query && self.publication_held_at(now) {
-                self.protocol.modes_mut().insert(2026);
-            }
-            let capture_end = self.capture_sync_end
-                && self.sync_started.is_some()
-                && matches!(&event, Event::Csi { private_prefix: Some(b'?'), intermediates, final_byte: b'l', params, .. }
-                    if intermediates.is_empty() && params.contains(&2026));
-            let dispatch = self
-                .window
-                .as_mut()
-                .and_then(|window| window.handle(&event))
-                .or_else(|| self.color_event(&event))
-                .map_or_else(
-                    || {
-                        semantics::dispatch_local_with_underline(
-                            &mut self.screen,
-                            &mut self.protocol,
-                            &event,
-                            self.underline_pen.as_mut(),
-                        )
-                    },
-                    Dispatch::Handled,
-                );
-            if sync_query {
-                self.protocol.modes_mut().remove(&2026);
-            }
-            match dispatch {
-                Dispatch::Handled(effects) => {
-                    for effect in effects {
-                        // ScreenState has already applied row edits. Aether
-                        // captures paint rows from the resulting grid.
-                        match effect {
-                            Effect::Reply(bytes) => {
-                                if replies.len() + bytes.len() > MAX_FEED_BYTES {
-                                    return Err("reply limit".into());
-                                }
-                                replies.extend(bytes);
-                            }
-                            Effect::Bell => {
-                                if let Some(window) = &mut self.window {
-                                    window.bell = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Dispatch::Unhandled => match event {
-                    Event::Print(ch) => self.print(ch),
-                    Event::Ascii(bytes) => self.print_ascii(bytes),
-                    Event::Control(10..=12) => self.motion(VerticalMotion::LineFeed),
-                    Event::Control(0) | Event::Boundary => (),
-                    _ => {
-                        let before = self.unsupported;
-                        if matches!(&event, Event::String { kind: StringKind::Dcs, payload, .. } if payload.starts_with(b"+q") && payload.len() <= 4096)
-                        {
-                            // XTerm ctlseqs XTGETTCAP: an unknown first name
-                            // ends the list with DCS 0+r ST. No capability table
-                            // is advertised here, and no payload is reflected.
-                            const NEGATIVE: &[u8] = b"\x1bP0+r\x1b\\";
-                            if replies.len() + NEGATIVE.len() > MAX_FEED_BYTES {
-                                return Err("reply limit".into());
-                            }
-                            replies.extend_from_slice(NEGATIVE);
-                            self.negative_query_replies =
-                                self.negative_query_replies.saturating_add(1);
-                            self.unsupported();
-                        } else if !self.apply_profile_event(&event, now) {
-                            self.unsupported();
-                        }
-                        if self.unsupported != before {
-                            self.record_unsupported_event(&event);
-                        }
-                    }
-                },
-            }
-            if capture_end {
-                // Exactly one bounded immutable frame per opted-in PTY poll.
-                // Reserve a distinct live revision even when no more bytes arrive.
-                let next = self.revision.checked_add(1).ok_or("revision exhausted")?;
-                self.completed_sync_frame = Some(self.frame()?);
-                self.begin_revision(next);
-                self.capture_sync_end = false;
-            }
-        }
+        let mut replies = FeedReplies::default();
+        crate::vt_state::VtState::drive(
+            self,
+            input,
+            |terminal| &mut terminal.vt,
+            |terminal, step| terminal.dispatch_feed_step(step, source_base, now, &mut replies),
+        )
+        .map_err(|error| match error {
+            FeedError::NoProgress => "parser made no progress".into(),
+            FeedError::Dispatch(error) => error,
+        })?;
         Ok(replies)
     }
+
+    fn dispatch_feed_step(
+        &mut self,
+        step: crate::feed::FeedStep<'_>,
+        source_base: Option<u64>,
+        now: Instant,
+        replies: &mut FeedReplies,
+    ) -> Result<(), String> {
+        if step.abandoned_apc {
+            self.cancel_inline_upload();
+        }
+        if step.rejected_resource {
+            if self.hyperlinks.is_some() {
+                self.vt.screen.current_hyperlink = HyperlinkId::NONE;
+            }
+            self.finish_grapheme();
+        }
+        let Some(event) = step.event else {
+            return Ok(());
+        };
+        if !matches!(&event, Event::Print(_) | Event::Ascii(_)) {
+            self.finish_grapheme();
+        }
+        if let Event::String {
+            kind: StringKind::Apc,
+            payload,
+            ..
+        } = &event
+        {
+            if kitty_graphics::is_graphics_payload(payload) {
+                if let Some(mut graphics) = self.inline_graphics.take() {
+                    let cursor = (self.vt.screen.cursor_col, self.vt.screen.cursor_row);
+                    let reply = graphics.apply(self, cursor, payload);
+                    self.inline_graphics = Some(graphics);
+                    if let Some(reply) = reply {
+                        replies.push(reply.as_bytes(), "reply byte limit");
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if self.command_blocks.as_mut().is_some_and(|blocks| {
+            let event_end = source_base.map(|base| base + step.end_offset as u64);
+            let geometry = (self.vt.screen.grid.cols(), self.vt.screen.grid.rows());
+            let style = crate::archived_text::ArchiveStyle::from_rendition(
+                self.vt.screen.current_fg,
+                self.vt.screen.current_bg,
+                self.underline_pen
+                    .as_ref()
+                    .map_or(Color::Default, |pen| pen.current),
+                self.vt.screen.current_flags,
+            );
+            let target = self
+                .hyperlinks
+                .as_ref()
+                .and_then(|(_, table)| table.resolve(self.vt.screen.current_hyperlink));
+            blocks.observe(
+                &event,
+                self.vt.screen.use_alt_buffer,
+                event_end,
+                geometry,
+                style,
+                target,
+            )
+        }) {
+            return Ok(());
+        }
+        let osc = match &event {
+            Event::String {
+                kind: StringKind::Osc,
+                payload,
+                bel_terminated,
+            } => Some(crate::osc::OscPacket::decode(payload, *bel_terminated)),
+            _ => None,
+        };
+        if let (Some((policy, table)), Some(packet)) = (&mut self.hyperlinks, osc) {
+            if packet.code() == crate::osc::OscCode::Hyperlink {
+                // In this profile invalid UTF-8, or a command without fields,
+                // closes the active link rather than leaving it on subsequent text.
+                self.vt.screen.current_hyperlink =
+                    packet.text().map_or(HyperlinkId::NONE, |fields| {
+                        table.apply_osc8(fields, *policy)
+                    });
+                return Ok(());
+            }
+        }
+        if self.device_answers {
+            if let Some(reply) = device_answer(&event) {
+                replies.push(reply, "reply byte limit");
+                return Ok(());
+            }
+        }
+        // Aether has no DA identity contract. A newer shared legacy
+        // dispatcher answers DA1/DA2 as Ember; do not inherit that identity.
+        // Count unsupported CSI c separately from ESC c (RIS).
+        if matches!(
+            &event,
+            Event::Csi {
+                final_byte: b'c',
+                ..
+            }
+        ) {
+            let before = self.unsupported;
+            self.unsupported();
+            if self.unsupported != before {
+                self.record_unsupported_event(&event);
+            }
+            return Ok(());
+        }
+        // Vim sends 0%m as an unknown-sequence probe. This profile
+        // preserves drawing state when SGR has a nonempty intermediate.
+        if matches!(&event, Event::Csi { intermediates, final_byte: b'm', .. } if !intermediates.is_empty())
+        {
+            self.unsupported();
+            self.record_unsupported_event(&event);
+            return Ok(());
+        }
+        // Reflect the effective hold only for the shared mode-query reducer;
+        // do not sample the clock or touch the mode set on ordinary output.
+        let sync_query = matches!(&event, Event::Csi {
+            params,
+            private_prefix: Some(b'?'),
+            intermediates,
+            final_byte: b'p',
+            ..
+        } if intermediates == b"$" && params.first() == Some(&2026));
+        if sync_query {
+            self.vt
+                .sync_output
+                .reflect_query(&mut self.vt.protocol, now);
+        }
+        let capture_end = self.capture_sync_end
+            && self.vt.sync_output.started.is_some()
+            && matches!(&event, Event::Csi { private_prefix: Some(b'?'), intermediates, final_byte: b'l', params, .. }
+                if intermediates.is_empty() && params.contains(&2026));
+        let dispatch = self
+            .window
+            .as_mut()
+            .and_then(|window| window.handle(&event, osc))
+            .or_else(|| self.color_event(osc?))
+            .map_or_else(
+                || {
+                    semantics::dispatch_local_with_underline(
+                        &mut self.vt.screen,
+                        &mut self.vt.protocol,
+                        &event,
+                        self.underline_pen.as_mut(),
+                    )
+                },
+                Dispatch::Handled,
+            );
+        if sync_query {
+            self.vt.sync_output.finish_query(&mut self.vt.protocol);
+        }
+        match dispatch {
+            Dispatch::Handled(effects) => {
+                for effect in effects {
+                    // ScreenState has already applied row edits. Aether
+                    // captures paint rows from the resulting grid.
+                    match effect {
+                        Effect::Reply(bytes) => {
+                            replies.push(&bytes, "reply limit");
+                        }
+                        Effect::Bell => {
+                            if let Some(window) = &mut self.window {
+                                window.bell = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Dispatch::Unhandled => match event {
+                Event::Print(ch) => self.print(ch),
+                Event::Ascii(bytes) => self.print_ascii(bytes),
+                Event::Control(10..=12) => self.motion(VerticalMotion::LineFeed),
+                Event::Control(0) | Event::Boundary => (),
+                _ => {
+                    let before = self.unsupported;
+                    if matches!(&event, Event::String { kind: StringKind::Dcs, payload, .. } if payload.starts_with(b"+q") && payload.len() <= 4096)
+                    {
+                        // XTerm ctlseqs XTGETTCAP: an unknown first name
+                        // ends the list with DCS 0+r ST. No capability table
+                        // is advertised here, and no payload is reflected.
+                        const NEGATIVE: &[u8] = b"\x1bP0+r\x1b\\";
+                        replies.push(NEGATIVE, "reply limit");
+                        if replies.limit_error.is_none() {
+                            self.negative_query_replies =
+                                self.negative_query_replies.saturating_add(1);
+                        }
+                        self.unsupported();
+                    } else if !self.apply_profile_event(&event, now) {
+                        self.unsupported();
+                    }
+                    if self.unsupported != before {
+                        self.record_unsupported_event(&event);
+                    }
+                }
+            },
+        }
+        if capture_end {
+            // Exactly one bounded immutable frame per opted-in PTY poll.
+            // Give any later screen mutations a separate revision.
+            let next = self.revision.checked_add(1).ok_or("revision exhausted")?;
+            self.completed_sync_frame = Some(self.frame()?);
+            self.begin_revision(next);
+            self.capture_sync_end = false;
+        }
+        Ok(())
+    }
+
     pub fn resize(&mut self, rows: usize, cols: usize) -> Result<(), String> {
         self.resize_with(rows, cols, || Ok(()))
     }
@@ -2017,16 +2138,17 @@ impl Terminal {
         resize_pty()?;
         self.finish_grapheme();
         if let Some(blocks) = &mut self.command_blocks {
-            blocks.resized((rows, cols) != (self.screen.grid.rows(), self.screen.grid.cols()));
+            blocks
+                .resized((rows, cols) != (self.vt.screen.grid.rows(), self.vt.screen.grid.cols()));
         }
         self.begin_revision(revision);
         if self.reflow_primary_on_resize && self.reflow_primary(rows, cols) {
             self.layout = layout;
             return Ok(());
         }
-        let transferred = if self.preserve_primary_on_resize && !self.screen.use_alt_buffer {
-            let grid = &self.screen.grid;
-            rows_to_archive_on_height_shrink(grid.rows(), rows, self.screen.cursor_row, |row| {
+        let transferred = if self.preserve_primary_on_resize && !self.vt.screen.use_alt_buffer {
+            let grid = &self.vt.screen.grid;
+            rows_to_archive_on_height_shrink(grid.rows(), rows, self.vt.screen.cursor_row, |row| {
                 grid[row]
                     .iter()
                     .all(crate::TerminalCell::is_reflow_trimmable_blank)
@@ -2037,7 +2159,7 @@ impl Terminal {
             0
         };
         self.invalidate_clipped_sources(cols, transferred);
-        if let Some(change) = self.screen.resize_geometry(rows, cols, transferred, || {
+        if let Some(change) = self.vt.screen.resize_geometry(rows, cols, transferred, || {
             RowSources::allocate(&mut self.row_sources)
         }) {
             for line in change.transferred {
@@ -2051,20 +2173,24 @@ impl Terminal {
         let mut cache = self.last_frame.lock().map_err(|_| "frame cache poisoned")?;
         let FrameCache {
             frame: last,
+            observed_revision,
+            color_revision,
+            history_extent,
+            row_identity_revision,
             row_links,
         } = &mut *cache;
         if let Some(frame) = last
             .as_ref()
-            .filter(|frame| frame.stamp().revision == self.revision)
+            .filter(|_| *observed_revision == self.revision)
         {
             return Ok(frame.clone());
         }
-        let screen = if self.screen.use_alt_buffer {
+        let screen = if self.vt.screen.use_alt_buffer {
             Screen::Alternate
         } else {
             Screen::Primary
         };
-        let grid = &self.screen.grid;
+        let grid = &self.vt.screen.grid;
         let capture_row = |index| Row {
             cells: Arc::from(&grid[index][..]),
             wrapped: grid.row_wrapped[index],
@@ -2075,8 +2201,39 @@ impl Terminal {
             let stamp = frame.stamp();
             stamp.layout == self.layout && stamp.screen == screen
         });
+        let cursor = Cursor {
+            row: self.vt.screen.cursor_row,
+            col: self.vt.screen.cursor_col,
+            pending_wrap: self.vt.screen.pending_wrap,
+            visible: self.vt.protocol.modes().contains(&25),
+            shape: self.vt.screen.cursor_shape,
+        };
+        let extent = self.history_extent();
+        let identity = grid.identity_revision();
+        let last_observation = *observed_revision;
         let may_have_changed =
-            |row| previous.is_none_or(|frame| grid.row_changed_after(row, frame.stamp().revision));
+            |row| previous.is_none() || grid.row_changed_after(row, last_observation);
+        if let Some(previous) = previous.filter(|frame| {
+            frame.cursor() == cursor
+                && *color_revision == self.color_revision
+                && *history_extent == extent
+                && *row_identity_revision == identity
+                && frame.rows().iter().enumerate().all(|(row, old)| {
+                    !may_have_changed(row) && old.wrapped == grid.row_wrapped[row]
+                })
+        }) {
+            // Parser carry, queries, and input modes may advance independently
+            // of paint. Keep the acknowledgement base when the view is unchanged.
+            debug_assert!(previous.rows().iter().enumerate().all(|(row, old)| {
+                old.cells.as_ref() == &grid[row][..]
+                    && grid
+                        .underline_color_runs(row)
+                        .eq(previous.underline_color_runs(row).iter().copied())
+                    && grid.row_annotations(row) == previous.row_annotations(row)
+            }));
+            *observed_revision = self.revision;
+            return Ok(previous.clone());
+        }
         let rows = if let Some(previous) = previous {
             let mut changed = None;
             for (index, row) in previous.rows().iter().enumerate() {
@@ -2162,13 +2319,7 @@ impl Terminal {
             },
             grid.cols(),
             rows,
-            Cursor {
-                row: self.screen.cursor_row,
-                col: self.screen.cursor_col,
-                pending_wrap: self.screen.pending_wrap,
-                visible: self.protocol.modes().contains(&25),
-                shape: self.screen.cursor_shape,
-            },
+            cursor,
             Limits {
                 max_rows: MAX_ROWS,
                 max_cols: self.max_cols,
@@ -2185,15 +2336,19 @@ impl Terminal {
             .and_then(|(_, table)| visible_hyperlinks(table, row_links, previous, frame.rows()));
         let frame = frame.with_hyperlinks(hyperlinks);
         *last = Some(frame.clone());
+        *observed_revision = self.revision;
+        *color_revision = self.color_revision;
+        *history_extent = extent;
+        *row_identity_revision = identity;
         Ok(frame)
     }
     pub fn visible_text(&self) -> String {
-        (0..self.screen.grid.rows())
+        (0..self.vt.screen.grid.rows())
             .map(|r| {
-                self.screen.grid[r].iter().enumerate().fold(
+                self.vt.screen.grid[r].iter().enumerate().fold(
                     String::new(),
                     |mut line, (col, cell)| {
-                        if let Some(cluster) = self.screen.grid.cluster_text(r, col) {
+                        if let Some(cluster) = self.vt.screen.grid.cluster_text(r, col) {
                             line.push_str(cluster);
                         } else {
                             line.push(cell.character);

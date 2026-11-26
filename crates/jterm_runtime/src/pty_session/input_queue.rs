@@ -1,3 +1,4 @@
+use crate::process_input_budget::{shared_budget, Charge};
 use std::{collections::VecDeque, num::NonZeroU16};
 
 pub(super) const INPUT_LIMIT: usize = 16 * 1024;
@@ -6,15 +7,29 @@ pub(super) const WRITE_BATCH: usize = 4096;
 // Keep the original contiguous payload batch and track opaque logical
 // boundaries separately. At most one metadata entry per pending byte; empty
 // events do not allocate anything. Only the oldest event can be partial.
-#[derive(Default)]
-#[cfg_attr(test, derive(Clone))]
 pub(super) struct InputQueue {
     bytes: VecDeque<u8>,
     lengths: VecDeque<NonZeroU16>,
     head_written: u16,
+    charge: Charge,
+}
+
+impl Default for InputQueue {
+    fn default() -> Self {
+        Self::with_charge(shared_budget().empty_charge())
+    }
 }
 
 impl InputQueue {
+    fn with_charge(charge: Charge) -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            lengths: VecDeque::new(),
+            head_written: 0,
+            charge,
+        }
+    }
+
     pub(super) fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -24,9 +39,11 @@ impl InputQueue {
     }
 
     pub(super) fn clear(&mut self) {
+        let pending = self.bytes.len();
         self.bytes.clear();
         self.lengths.clear();
         self.head_written = 0;
+        self.charge.release(pending);
     }
 
     pub(super) fn enqueue(&mut self, bytes: Vec<u8>) -> Result<(), String> {
@@ -43,6 +60,9 @@ impl InputQueue {
             return Err("input queue full; event not accepted".into());
         }
         if let Some(length) = NonZeroU16::new(bytes.len() as u16) {
+            self.charge
+                .try_add(bytes.len(), false)
+                .map_err(|_| "process input queue full; event not accepted")?;
             self.bytes.extend(bytes);
             self.lengths.push_back(length);
         }
@@ -79,6 +99,7 @@ impl InputQueue {
         let limit = WRITE_BATCH.min(self.len());
         let written = write(&self.bytes.make_contiguous()[..limit])?;
         self.bytes.drain(..written);
+        self.charge.release(written);
         let mut remaining = written;
         while remaining > 0 {
             let available = self.lengths.front().unwrap().get() - self.head_written;
@@ -97,6 +118,38 @@ impl InputQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_input_budget::Budget;
+    use std::sync::Arc;
+
+    #[test]
+    fn accepted_owner_bytes_across_sessions_share_the_cap_and_release_only_on_write() {
+        let budget = Arc::new(Budget::new(12, 4));
+        let mut first = InputQueue::with_charge(budget.empty_charge());
+        let mut second = InputQueue::with_charge(budget.empty_charge());
+        first.enqueue(b"abcde".to_vec()).unwrap();
+        second.enqueue(b"fgh".to_vec()).unwrap();
+        let message = b"ij".to_vec();
+        assert!(second.enqueue(message.clone()).is_err());
+        assert_eq!(second.bytes, VecDeque::from(*b"fgh"));
+        assert!(first.flush(|_| Err("closed".into())).is_err());
+        first.flush(|_| Ok(0)).unwrap();
+        assert_eq!(budget.usage().reserved_bytes, 8);
+
+        first
+            .flush(|offered| {
+                assert_eq!(offered, b"abcde");
+                Ok(2)
+            })
+            .unwrap();
+        assert_eq!(first.partial_remaining(), Some(3));
+        assert_eq!(budget.usage().reserved_bytes, 6);
+        second.enqueue(message).unwrap();
+        assert_eq!(second.bytes, VecDeque::from(*b"fghij"));
+        first.clear();
+        assert_eq!(budget.usage().reserved_bytes, 5);
+        drop(second);
+        assert_eq!(budget.usage().reserved_bytes, 0);
+    }
 
     #[test]
     fn empty_events_have_no_metadata_and_single_byte_events_bound_it() {
@@ -111,11 +164,11 @@ mod tests {
         }
         assert_eq!(queue.len(), INPUT_LIMIT);
         assert_eq!(queue.lengths.len(), INPUT_LIMIT);
-        let full = queue.clone();
+        let full = (queue.bytes.clone(), queue.lengths.clone());
         queue.enqueue(Vec::new()).unwrap();
         assert!(queue.enqueue(vec![8]).is_err());
-        assert_eq!(queue.bytes, full.bytes);
-        assert_eq!(queue.lengths, full.lengths);
+        assert_eq!(queue.bytes, full.0);
+        assert_eq!(queue.lengths, full.1);
         queue.flush(|batch| Ok(batch.len())).unwrap();
         assert_eq!(queue.len(), INPUT_LIMIT - WRITE_BATCH);
         assert_eq!(queue.lengths.len(), INPUT_LIMIT - WRITE_BATCH);
@@ -123,7 +176,7 @@ mod tests {
         queue.clear();
         assert!(queue.is_empty());
         assert!(queue.lengths.is_empty());
-        assert_eq!(full.len(), INPUT_LIMIT);
+        assert_eq!(full.0.len(), INPUT_LIMIT);
     }
 
     #[test]
@@ -139,7 +192,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(queue.head_written, 2);
-        let partly_written = queue.clone();
+        let partly_written = (
+            queue.bytes.clone(),
+            queue.lengths.clone(),
+            queue.head_written,
+        );
         queue
             .flush(|batch| {
                 assert_eq!(batch, b"defghi");
@@ -147,9 +204,9 @@ mod tests {
             })
             .unwrap();
         assert!(queue.flush(|_| Err("write failed".into())).is_err());
-        assert_eq!(queue.bytes, partly_written.bytes);
-        assert_eq!(queue.lengths, partly_written.lengths);
-        assert_eq!(queue.head_written, partly_written.head_written);
+        assert_eq!(queue.bytes, partly_written.0);
+        assert_eq!(queue.lengths, partly_written.1);
+        assert_eq!(queue.head_written, partly_written.2);
         queue
             .flush(|batch| {
                 assert_eq!(batch, b"defghi");
@@ -168,8 +225,8 @@ mod tests {
         assert!(queue.lengths.is_empty());
         assert_eq!(queue.head_written, 0);
         queue.flush(|_| panic!("no write without bytes")).unwrap();
-        assert_eq!(partly_written.head_written, 2);
-        assert_eq!(partly_written.len(), 6);
+        assert_eq!(partly_written.2, 2);
+        assert_eq!(partly_written.0.len(), 6);
     }
 
     #[test]

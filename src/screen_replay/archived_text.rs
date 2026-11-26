@@ -1,9 +1,14 @@
 use super::pen::{
-    apply_sgr, supported_archive_sgr, Color, Pen, BOLD, DIM, ITALIC, REVERSE, STRIKE,
+    apply_sgr, supported_archive_sgr, Color, Pen, BLINK, BOLD, DIM, INVISIBLE, ITALIC, OVERLINE,
+    REVERSE, STRIKE,
 };
-use super::{parser::Params, ScreenReplay, MAX_COLS, MAX_COMPLETED_CAPTURE_BYTES};
+use super::{
+    parser::Params, push_cell_text, Replay, ScreenReplay, MAX_COLS, MAX_COMPLETED_CAPTURE_BYTES,
+    MAX_ROWS,
+};
 use jterm_engine::archived_text::{
-    is_literal_archive_unicode, ArchiveLink, ArchiveSpan, ArchiveStyle, ArchivedText,
+    is_literal_archive_unicode, ArchiveAnnotationBuilder, ArchiveLink, ArchiveSpan, ArchiveStyle,
+    ArchivedText,
 };
 use jterm_engine::grid::{Color as GridColor, StyleFlags, UnderlineStyle};
 use std::{borrow::Cow, ops::Range};
@@ -27,8 +32,11 @@ fn literal_run_layout_units(text: &str) -> usize {
 }
 
 fn is_literal_run(text: &str) -> bool {
-    text.chars()
-        .all(|ch| matches!(ch, '\n' | '\t' | ' '..='~') || is_literal_archive_unicode(ch))
+    text.chars().all(is_literal_char)
+}
+
+fn is_literal_char(ch: char) -> bool {
+    matches!(ch, '\n' | '\t' | ' '..='~') || is_literal_archive_unicode(ch)
 }
 
 pub(super) fn is_bounded_document_text(text: &str) -> bool {
@@ -67,6 +75,81 @@ pub fn project_finished_output(capture: &str, columns: usize) -> Option<Archived
         }
         project_literal_archive(&replay.to_ansi_with_budget(MAX_COMPLETED_CAPTURE_BYTES)?)
     })
+}
+
+/// The read-only fallback walks the final replay grid directly, with no
+/// second ANSI serialization and no effects such as queries or clipboard I/O.
+pub(super) fn project_replayed_output(capture: &str, size: (u16, u16)) -> (ArchivedText, bool) {
+    let (cols, rows) = (usize::from(size.0), usize::from(size.1));
+    let width = if cols == 0 { 80 } else { cols.min(MAX_COLS) };
+    let height = if rows == 0 { 24 } else { rows }
+        .min(MAX_ROWS)
+        .min(MAX_LAYOUT_UNITS / width);
+    let mut end = capture.len().min(MAX_COMPLETED_CAPTURE_BYTES);
+    while !capture.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut replay = ScreenReplay::with_budget(width, height, MAX_LAYOUT_UNITS);
+    replay.feed(&capture.as_bytes()[..end]);
+    let replay = replay.finish();
+    let mut clipped = replay.head_dropped || end != capture.len() || width < cols || height < rows;
+    let mut text = String::new();
+    let mut annotations = ArchiveAnnotationBuilder::default();
+    let mut units = UNITS_PER_PARAGRAPH;
+    let mut glyph = String::new();
+    let mut active_link = (0, None);
+    'rows: for (index, (row, end, continued)) in replay.painted_rows().enumerate() {
+        if index > 0 && !continued {
+            if units + UNITS_PER_PARAGRAPH + 1 > MAX_LAYOUT_UNITS {
+                clipped = true;
+                break;
+            }
+            units += UNITS_PER_PARAGRAPH + 1;
+            text.push('\n');
+        }
+        for (cell, tab) in Replay::painted_cells(row, end, continued) {
+            glyph.clear();
+            if tab {
+                glyph.push('\t');
+            } else if cell.is_tab_head() || cell.is_tab_head_fragment() {
+                glyph.push(' ');
+            } else {
+                push_cell_text(&mut glyph, &replay.tables, cell);
+                if !is_literal_run(&glyph) {
+                    glyph = glyph
+                        .chars()
+                        .map(|ch| if is_literal_char(ch) { ch } else { '\u{fffd}' })
+                        .collect();
+                }
+            }
+            units += literal_run_layout_units(&glyph);
+            if units > MAX_LAYOUT_UNITS {
+                clipped = true;
+                break 'rows;
+            }
+            let start = text.len();
+            text.push_str(&glyph);
+            let pen = replay.tables.pen(cell.pen);
+            if active_link.0 != pen.link {
+                let target = (pen.link != 0)
+                    .then(|| replay.tables.link(pen.link))
+                    .and_then(|fields| fields.split_once(';'))
+                    .filter(|(params, target)| crate::link::is_openable_osc8(params, target))
+                    .map(|(_, target)| target);
+                active_link = (pen.link, target);
+            }
+            annotations.push(start..text.len(), project_style(pen), active_link.1);
+        }
+    }
+    let annotations = annotations.finish().unwrap_or_default();
+    (
+        ArchivedText {
+            text,
+            spans: annotations.spans,
+            links: annotations.links,
+        },
+        clipped,
+    )
 }
 
 fn archive_link(fields: &str) -> Option<(Option<&str>, &str)> {
@@ -278,9 +361,12 @@ fn project_style(pen: &Pen) -> ArchiveStyle {
     flags.set_dim(pen.flags & DIM != 0);
     flags.set_italic(pen.flags & ITALIC != 0);
     flags.set_inverse(pen.flags & REVERSE != 0);
+    flags.set_blink(pen.flags & BLINK != 0);
+    flags.set_concealed(pen.flags & INVISIBLE != 0);
+    flags.set_overline(pen.flags & OVERLINE != 0);
     flags.set_strikethrough(pen.flags & STRIKE != 0);
     flags.set_underline(match pen.underline() {
-        1 => UnderlineStyle::Single,
+        1 | 4 | 5 => UnderlineStyle::Single,
         2 => UnderlineStyle::Double,
         3 => UnderlineStyle::Curly,
         _ => UnderlineStyle::None,
@@ -514,7 +600,7 @@ mod tests {
     fn ineligible_legacy_archive_bytes_cannot_enter_the_document() {
         for input in [
             "capture \x1b[2J after repaint",
-            "capture \x1b[5m blink",
+            "capture \x1b[51m unsupported framing",
             "capture \x1b[4:5m dash",
             "capture \x1b[38;2;100m invalid",
             "capture \x1b]8;;file:///tmp/item\x1b\\linked\x1b]8;;\x07",

@@ -13,6 +13,7 @@ use crate::hyperlink::HyperlinkId;
 use crate::protocol_state::ProtocolState;
 use smallvec::SmallVec;
 use std::ops::{Range, RangeInclusive};
+use unicode_normalization::UnicodeNormalization;
 
 /// Choose how many primary rows to move into history on a height reduction.
 /// Use blank space below the cursor first and keep the cursor on screen.
@@ -29,6 +30,16 @@ pub fn rows_to_archive_on_height_shrink(
         .take_while(|&row| blank_row(row))
         .count();
     shrink.saturating_sub(blank_below).min(cursor_row)
+}
+
+/// NFC composition accepted by scalar-cell legacy profiles. Multi-scalar
+/// results stay unrepresented, as in the original Ember/Frost cell models.
+pub fn compose_scalar_pair(base: char, mark: char) -> Option<char> {
+    let mut normalized = [base, mark].into_iter().nfc();
+    match (normalized.next(), normalized.next()) {
+        (Some(ch), None) => Some(ch),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -162,6 +173,12 @@ pub struct RowMutation {
     pub row_id: RawRowId,
     pub changed: Range<usize>,
     pub printed: Option<Range<usize>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteProfile {
+    Ember,
+    FrostLegacy,
 }
 
 /// One printable-ASCII overwrite step, never an accumulated effect batch.
@@ -786,6 +803,44 @@ impl ScreenState {
         self.grid.fill_cells(blank);
     }
 
+    /// FrostLegacyV1 ED0/ED1 erase physical cells using the current BCE pen.
+    /// Row identities, wrap metadata, pending wrap and cursor state survive.
+    /// The host handles ED2 history, ED3 retention, provenance and damage.
+    pub fn erase_frost_legacy_display(&mut self, mode: u16) -> Option<RangeInclusive<usize>> {
+        let cols = self.grid.row_len();
+        let blank = self.create_blank_cell();
+        match mode {
+            0 => {
+                self.grid
+                    .erase_cells(self.cursor_row, self.cursor_col..cols, blank);
+                for row in self.cursor_row + 1..self.grid.rows() {
+                    self.grid.erase_cells(row, 0..cols, blank);
+                }
+                Some(self.cursor_row..=self.grid.rows().saturating_sub(1))
+            }
+            1 => {
+                for row in 0..self.cursor_row {
+                    self.grid.erase_cells(row, 0..cols, blank);
+                }
+                self.grid
+                    .erase_cells(self.cursor_row, 0..self.cursor_col + 1, blank);
+                Some(0..=self.cursor_row)
+            }
+            _ => None,
+        }
+    }
+
+    /// FrostLegacyV1 DECALN keeps its existing scrolling margins.
+    pub fn frost_legacy_alignment_test(&mut self) {
+        self.grid.fill_cells(TerminalCell {
+            character: 'E',
+            ..TerminalCell::default()
+        });
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.pending_wrap = false;
+    }
+
     /// DECALN: fill the physical active grid with default-style E cells, reset
     /// margins and home the cursor. Unlike ED2 this deliberately does not use
     /// the current background. Origin mode and all other drawing/saved state,
@@ -1240,7 +1295,28 @@ impl ScreenState {
     /// # Panics
     /// A zero/invalid width or an out-of-bounds host cursor violates this contract.
     pub fn write_char_in_row(&mut self, ch: char, width: usize, autowrap: bool) -> RowMutation {
-        assert!((1..=2).contains(&width));
+        self.write_char_profile(ch, width, autowrap, WriteProfile::Ember)
+    }
+
+    /// Frost's translated REP source, IRM edge repair and continuation style.
+    /// The host finishes wrapping and records output ownership before this call.
+    pub fn write_frost_legacy_char_in_row(
+        &mut self,
+        ch: char,
+        width: usize,
+        autowrap: bool,
+    ) -> RowMutation {
+        self.write_char_profile(ch, width, autowrap, WriteProfile::FrostLegacy)
+    }
+
+    fn write_char_profile(
+        &mut self,
+        ch: char,
+        width: usize,
+        autowrap: bool,
+        profile: WriteProfile,
+    ) -> RowMutation {
+        assert!(width > 0 && (profile == WriteProfile::FrostLegacy || width <= 2));
         let cols = self.grid.cols();
         let row = self.cursor_row;
         let col = self.cursor_col;
@@ -1253,12 +1329,17 @@ impl ScreenState {
             Some(col..end),
         );
         if self.insert_mode {
-            // Preserve the host's shift-then-repair ordering. The displaced
-            // continuation is at the right boundary repaired below.
-            for _ in 0..width {
-                self.grid.insert_cell_in_row(row, col, blank);
+            match profile {
+                WriteProfile::Ember => {
+                    for _ in 0..width {
+                        self.grid.insert_cell_in_row(row, col, blank);
+                    }
+                    self.grid.clear_dangling_wide_at_row_end(row, blank);
+                }
+                WriteProfile::FrostLegacy => {
+                    self.insert_frost_legacy_blanks(width);
+                }
             }
-            self.grid.clear_dangling_wide_at_row_end(row, blank);
         }
         self.grid.overwrite_graphic(
             row,
@@ -1272,7 +1353,10 @@ impl ScreenState {
                 hyperlink_id: self.current_hyperlink,
             },
             blank,
-            WideContinuationProtection::FromLead,
+            match profile {
+                WriteProfile::Ember => WideContinuationProtection::FromLead,
+                WriteProfile::FrostLegacy => WideContinuationProtection::FromBlank,
+            },
         );
         self.cursor_col += width;
         if self.cursor_col >= cols {
@@ -1280,6 +1364,9 @@ impl ScreenState {
             if autowrap {
                 self.pending_wrap = true;
             }
+        }
+        if profile == WriteProfile::FrostLegacy {
+            self.last_printed_char = Some(ch);
         }
         effect
     }
@@ -1313,6 +1400,25 @@ impl ScreenState {
         bytes: &[u8],
         autowrap: bool,
     ) -> Option<(usize, RowMutation)> {
+        self.write_ascii_profile(bytes, autowrap, WriteProfile::Ember)
+    }
+
+    /// Frost records REP once for the whole parser run before the first wrap.
+    /// Keep that source while sharing bounded writes and cursor advancement.
+    pub fn write_frost_legacy_ascii_in_row(
+        &mut self,
+        bytes: &[u8],
+        autowrap: bool,
+    ) -> Option<(usize, RowMutation)> {
+        self.write_ascii_profile(bytes, autowrap, WriteProfile::FrostLegacy)
+    }
+
+    fn write_ascii_profile(
+        &mut self,
+        bytes: &[u8],
+        autowrap: bool,
+        profile: WriteProfile,
+    ) -> Option<(usize, RowMutation)> {
         assert!(!self.insert_mode);
         let cols = self.grid.cols();
         let col = self.cursor_col;
@@ -1335,7 +1441,10 @@ impl ScreenState {
                 hyperlink_id: self.current_hyperlink,
             },
             blank,
-            AsciiOverwritePolicy::SharedScreen,
+            match profile {
+                WriteProfile::Ember => AsciiOverwritePolicy::SharedScreen,
+                WriteProfile::FrostLegacy => AsciiOverwritePolicy::FrostLegacy,
+            },
         );
         self.cursor_col += count;
         if self.cursor_col >= cols {
@@ -1344,11 +1453,17 @@ impl ScreenState {
                 self.pending_wrap = true;
             }
         }
-        self.last_printed_char = Some(bytes[count - 1] as char);
+        if profile == WriteProfile::Ember {
+            self.last_printed_char = Some(bytes[count - 1] as char);
+        }
         Some((count, effect))
     }
 
     pub fn combining_target(&self) -> Option<(usize, char)> {
+        self.combining_target_profile(WriteProfile::Ember)
+    }
+
+    fn combining_target_profile(&self, profile: WriteProfile) -> Option<(usize, char)> {
         let mut col = if self.pending_wrap {
             self.cursor_col
         } else {
@@ -1359,11 +1474,43 @@ impl ScreenState {
             .get(self.cursor_row, col)
             .flags
             .wide_continuation()
+            && (col > 0 || profile == WriteProfile::Ember)
         {
             col = col.checked_sub(1)?;
         }
         let ch = self.grid.get(self.cursor_row, col).character;
-        (!matches!(ch, ' ' | '\0')).then_some((col, ch))
+        (profile == WriteProfile::FrostLegacy || !matches!(ch, ' ' | '\0')).then_some((col, ch))
+    }
+
+    /// Ember commits only changed single-scalar compositions and retains
+    /// explicit underline color through the ordinary replacement primitive.
+    pub fn compose_combining_mark(&mut self, mark: char) -> Option<RowMutation> {
+        self.compose_mark_profile(mark, WriteProfile::Ember)
+    }
+
+    /// Frost invalidates the mutable row before normalizing, including when
+    /// the pair remains unrepresentable. A successful composition dirties its
+    /// cell even when the resulting scalar matches the previous value.
+    pub fn compose_frost_legacy_mark(&mut self, mark: char) -> Option<RowMutation> {
+        self.compose_mark_profile(mark, WriteProfile::FrostLegacy)
+    }
+
+    fn compose_mark_profile(&mut self, mark: char, profile: WriteProfile) -> Option<RowMutation> {
+        let (col, base) = self.combining_target_profile(profile)?;
+        if profile == WriteProfile::Ember {
+            let composed = compose_scalar_pair(base, mark)?;
+            return (composed != base).then(|| self.replace_combining_target(col, composed));
+        }
+        let row = self.cursor_row;
+        let mutation = RowMutation {
+            row,
+            row_id: self.grid.row_id(row),
+            changed: col..col + 1,
+            printed: Some(col..col + 1),
+        };
+        let cell = self.grid.get_mut(row, col);
+        cell.character = compose_scalar_pair(cell.character, mark)?;
+        Some(mutation)
     }
 
     /// Commit a normalized single-codepoint combination without moving the cursor.
@@ -1496,5 +1643,66 @@ impl ScreenState {
     }
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
         self.cursor_controls().set_scroll_region(top, bottom);
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_pair_keeps_the_single_scalar_nfc_contract() {
+        assert_eq!(compose_scalar_pair('e', '\u{0301}'), Some('é'));
+        assert_eq!(compose_scalar_pair('\u{1100}', '\u{1161}'), Some('가'));
+        assert_eq!(compose_scalar_pair('가', '\u{11a8}'), Some('각'));
+        assert_eq!(compose_scalar_pair('e', '\u{200d}'), None);
+        assert_eq!(compose_scalar_pair(' ', '\u{0301}'), None);
+        assert_eq!(compose_scalar_pair('e', '\u{05c8}'), None);
+    }
+
+    #[test]
+    fn composition_profiles_preserve_their_original_row_invalidation_and_attributes() {
+        for frost in [false, true] {
+            for (mark, accepted) in [('\u{0301}', true), ('\u{200d}', false)] {
+                let mut screen = ScreenState::new(1, 3);
+                screen.grid.get_mut(0, 1).character = 'e';
+                screen.grid.set_cluster_text(0, 1, "e\u{fe0e}").unwrap();
+                screen.grid.set_underline_color(0, 1..2, Color::Indexed(3));
+                screen.grid.begin_capture_revision(1);
+                screen.grid.begin_capture_revision(2);
+                screen.cursor_col = 2;
+                screen.last_printed_char = Some('e');
+                let effect = if frost {
+                    screen.compose_frost_legacy_mark(mark)
+                } else {
+                    screen.compose_combining_mark(mark)
+                };
+                assert_eq!(effect.is_some(), accepted);
+                assert_eq!(
+                    screen.grid.get(0, 1).character,
+                    if accepted { 'é' } else { 'e' }
+                );
+                assert_eq!(screen.grid.row_changed_after(0, 1), frost || accepted);
+                assert_eq!(
+                    screen.grid.cluster_text(0, 1),
+                    if frost || accepted {
+                        None
+                    } else {
+                        Some("e\u{fe0e}")
+                    }
+                );
+                assert_eq!(
+                    screen.grid.underline_colors(0)[1],
+                    if frost {
+                        Color::Default
+                    } else {
+                        Color::Indexed(3)
+                    }
+                );
+                assert_eq!(screen.cursor_col, 2);
+                assert!(!screen.pending_wrap);
+                assert_eq!(screen.last_printed_char, Some('e'));
+            }
+        }
     }
 }

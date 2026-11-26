@@ -109,7 +109,7 @@ fn fullscreen_cursor_rewrites_and_large_outputs_leave_bounded_status_records() {
     let mut terminal = Terminal::new(3, 8).unwrap();
     terminal.observe_command_blocks();
     for output in [
-        b"prefix\x1b[?1049hPRIVATE\x1b[?1049lpostfix".as_slice(),
+        b"prefix\x1b[?47hPRIVATE\x1b[?47lpostfix".as_slice(),
         b"overwrite\rnew",
         b"overwrite\x1b[2Knew",
     ] {
@@ -147,4 +147,63 @@ fn fullscreen_cursor_rewrites_and_large_outputs_leave_bounded_status_records() {
     assert!(retained
         .iter()
         .all(|block| block.output.as_deref() == Ok("text")));
+}
+
+#[test]
+fn sanctioned_alternate_excursion_preserves_only_main_output_across_every_feed_split() {
+    let bytes = [
+        START,
+        b"PRE\r\n\x1b[?1049h\x1b[2JSECRET\x1b]133;D;99;id=one\x07\x1b[?1049lPOST\r\n",
+        END,
+    ]
+    .concat();
+    for split in 0..=bytes.len() {
+        let mut terminal = Terminal::new(4, 20).unwrap();
+        terminal.observe_command_blocks();
+        terminal.feed(&bytes[..split]).unwrap();
+        terminal.feed(&bytes[split..]).unwrap();
+        let blocks = terminal.completed_command_blocks().unwrap();
+        assert_eq!(blocks.len(), 1, "split {split}");
+        assert_eq!(blocks[0].output, Ok("PRE\nPOST\n".into()), "split {split}");
+        assert_eq!(blocks[0].outcome, CompletedBlockOutcome::Failed(7));
+    }
+}
+
+#[test]
+fn non_saving_alternate_and_main_screen_operations_remain_unavailable() {
+    for output in [
+        b"PRE\x1b[?47hSECRET\x1b[?47lPOST".as_slice(),
+        b"PRE\x1b[?1047hSECRET\x1b[?1047lPOST",
+        b"PRE\x1b[2KPOST",
+        b"PRE\rREWRITE",
+        b"PRE\x1b[?1049hSECRET\x1b[?47lPOST",
+    ] {
+        let mut terminal = Terminal::new(4, 20).unwrap();
+        terminal.observe_command_blocks();
+        terminal.feed(&[START, output, END].concat()).unwrap();
+        assert_eq!(
+            terminal.completed_command_blocks().unwrap()[0].output,
+            Err(OutputUnavailable::ScreenOperation)
+        );
+    }
+}
+
+#[test]
+fn real_vim9_cursor_saved_excursion_retains_main_tags_not_the_fullscreen_ui() {
+    let mut terminal = Terminal::new(24, 80).unwrap();
+    terminal.observe_command_blocks();
+    terminal.feed(START).unwrap();
+    terminal.feed(b"BLOCK_PRE_TAG\r\n").unwrap();
+    for chunk in include_bytes!("fixtures/vim9-command-alt-excursion.bin").chunks(7) {
+        terminal.feed(chunk).unwrap();
+    }
+    terminal.feed(b"BLOCK_POST_TAG\r\n").unwrap();
+    terminal.feed(END).unwrap();
+    let blocks = terminal.completed_command_blocks().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].output,
+        Ok("BLOCK_PRE_TAG\nBLOCK_POST_TAG\n".into())
+    );
+    assert_eq!(blocks[0].outcome, CompletedBlockOutcome::Failed(7));
 }

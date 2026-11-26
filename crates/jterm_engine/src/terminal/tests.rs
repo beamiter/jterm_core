@@ -2,6 +2,31 @@ use super::*;
 use crate::history_reflow::HistoryAnchor;
 
 #[test]
+fn directory_reports_keep_authority_and_ignore_invalid_paths() {
+    let mut terminal = Terminal::new(2, 8).unwrap();
+    terminal.enable_window_updates();
+    assert_eq!(terminal.reported_directory_uri(), None);
+    terminal
+        .feed(b"\x1b]7;file://ssh-host/projects/shared%20terminal\x1b\\")
+        .unwrap();
+    assert_eq!(
+        terminal.reported_directory_uri(),
+        Some("file://ssh-host/projects/shared%20terminal")
+    );
+    for invalid in [
+        &b"\x1b]7;file://ssh-host/projects/%00\x07"[..],
+        &b"\x1b]7;file://guest@ssh-host/projects\x07"[..],
+        &b"\x1b]7;http://ssh-host/projects\x07"[..],
+    ] {
+        assert!(terminal.feed(invalid).unwrap().is_empty());
+        assert_eq!(
+            terminal.reported_directory_uri(),
+            Some("file://ssh-host/projects/shared%20terminal")
+        );
+    }
+}
+
+#[test]
 fn palette_queries_keep_order_and_only_changed_colors_publish() {
     let mut terminal = Terminal::new(2, 8).unwrap();
     let initial = TerminalDefaultColors {
@@ -139,15 +164,15 @@ fn alternate_saved_slots_repeated_entry_and_resize() {
     let mut t = Terminal::new(4, 12).unwrap();
     t.feed(b"PRIMARY\x1b[31m\x1b[?1049hALT\x1b[?1048hX\x1b[?1048lY\x1b[?1049h")
         .unwrap();
-    assert!(t.screen.use_alt_buffer);
+    assert!(t.vt.screen.use_alt_buffer);
     assert!(t.visible_text().starts_with("ALTY"));
     assert_eq!(t.frame().unwrap().stamp().screen, Screen::Alternate);
     t.resize(5, 14).unwrap();
     t.feed(b"\x1b[?7l\x1b[?1049lZ").unwrap();
-    assert!(!t.screen.use_alt_buffer);
+    assert!(!t.vt.screen.use_alt_buffer);
     assert!(t.visible_text().starts_with("PRIMARYZ"));
-    assert!(t.protocol.modes().contains(&7));
-    assert_eq!(t.screen.current_fg, crate::Color::Red);
+    assert!(t.vt.protocol.modes().contains(&7));
+    assert_eq!(t.vt.screen.current_fg, crate::Color::Red);
     assert_eq!(t.unsupported_count(), 0);
 }
 
@@ -155,14 +180,14 @@ fn alternate_saved_slots_repeated_entry_and_resize() {
 fn mode47_retains_alternate_1047_clears_and_keyboard_slots_swap_once() {
     let mut t = Terminal::new(4, 12).unwrap();
     t.feed(b"\x1b[=2u\x1b[?47hA\x1b[=4u\x1b[?47h").unwrap();
-    assert_eq!(t.protocol.keyboard_enhancement_flags(), 4);
+    assert_eq!(t.vt.protocol.keyboard_enhancement_flags(), 4);
     t.feed(b"\x1b[?47l").unwrap();
-    assert_eq!(t.protocol.keyboard_enhancement_flags(), 2);
+    assert_eq!(t.vt.protocol.keyboard_enhancement_flags(), 2);
     t.feed(b"\x1b[?47h").unwrap();
     assert!(t.visible_text().starts_with('A'));
     t.feed(b"\x1b[?47l\x1b[?1047h").unwrap();
     assert!(t.visible_text().trim().is_empty());
-    assert_eq!(t.screen.cursor_col, 0);
+    assert_eq!(t.vt.screen.cursor_col, 0);
 }
 
 #[test]
@@ -185,16 +210,16 @@ fn erase_and_region_edits_use_shared_screen() {
 fn ed2_replaces_protected_wide_cells_with_background_blanks() {
     let mut t = Terminal::new(2, 4).unwrap();
     t.feed("\x1b[41m\x1b[1\"q中XQ".as_bytes()).unwrap();
-    assert!(t.screen.pending_wrap);
+    assert!(t.vt.screen.pending_wrap);
     t.feed(b"\x1b[?2J").unwrap();
-    assert_eq!(t.screen.grid.get(0, 0).character, '中');
-    let (row, col) = (t.screen.cursor_row, t.screen.cursor_col);
+    assert_eq!(t.vt.screen.grid.get(0, 0).character, '中');
+    let (row, col) = (t.vt.screen.cursor_row, t.vt.screen.cursor_col);
     t.feed(b"\x1b[2J").unwrap();
-    assert_eq!((t.screen.cursor_row, t.screen.cursor_col), (row, col));
-    assert!(!t.screen.pending_wrap);
-    for row in 0..t.screen.grid.rows() {
-        for col in 0..t.screen.grid.cols() {
-            let cell = t.screen.grid.get(row, col);
+    assert_eq!((t.vt.screen.cursor_row, t.vt.screen.cursor_col), (row, col));
+    assert!(!t.vt.screen.pending_wrap);
+    for row in 0..t.vt.screen.grid.rows() {
+        for col in 0..t.vt.screen.grid.cols() {
+            let cell = t.vt.screen.grid.get(row, col);
             assert_eq!(cell.character, ' ');
             assert_eq!(cell.background, crate::Color::Red);
             assert_eq!(cell.flags, crate::StyleFlags::default());
@@ -257,7 +282,7 @@ fn host_sequences_fragment_identically_and_unknown_modes_stay_visible() {
         b.feed(&[*byte]).unwrap();
     }
     assert_eq!(a.visible_text(), b.visible_text());
-    assert_eq!(a.screen.cursor_col, b.screen.cursor_col);
+    assert_eq!(a.vt.screen.cursor_col, b.vt.screen.cursor_col);
     assert!(!a.frame().unwrap().cursor().visible);
     assert_eq!(a.unsupported_count(), 1);
 }
@@ -475,7 +500,9 @@ fn completed_output_annotations_follow_the_live_pen_and_link_bytes() {
     assert_eq!(text, "中 plain\n");
     let annotations = block.output_annotations.as_ref().unwrap();
     assert!(annotations.valid_for(text));
-    let [span] = annotations.spans.as_slice() else { panic!("expected one style run"); };
+    let [span] = annotations.spans.as_slice() else {
+        panic!("expected one style run");
+    };
     assert_eq!(&text[span.bytes.clone()], "中");
     assert_eq!(span.style.foreground, Color::Rgb(31, 171, 193));
     assert_eq!(span.style.underline_color, Color::Rgb(2, 4, 6));
@@ -582,7 +609,7 @@ fn vim_dcs_probe_is_opaque_without_reply_or_cursor_mutation() {
     let before = t.visible_text();
     assert!(t.feed(b"\x1bPzz\x1b\\").unwrap().is_empty());
     assert_eq!(t.visible_text(), before);
-    assert_eq!(t.screen.cursor_col, 2);
+    assert_eq!(t.vt.screen.cursor_col, 2);
     assert_eq!(t.unsupported_events(), &["DCS Vim compatibility probe"]);
     assert!(t
         .feed(b"\x1bPunknown_PRIVATE_payload\x1b\\")
@@ -603,8 +630,8 @@ fn vim_unknown_dcs_and_intermediate_sgr_probe_preserves_style_and_cpr() {
     let probe = b"\x1bPzz\x1b\\\x1b[0%m\x1b[6n";
     assert_eq!(t.feed(probe).unwrap(), b"\x1b[1;3R");
     assert_eq!(t.visible_text(), before);
-    assert_eq!(t.screen.current_fg, crate::Color::Red);
-    assert!(t.screen.current_flags.bold());
+    assert_eq!(t.vt.screen.current_fg, crate::Color::Red);
+    assert!(t.vt.screen.current_flags.bold());
     assert_eq!(t.unsupported_count(), 2);
     assert_eq!(t.negative_query_replies(), 0);
     let mut b = Terminal::new(3, 10).unwrap();
@@ -614,8 +641,8 @@ fn vim_unknown_dcs_and_intermediate_sgr_probe_preserves_style_and_cpr() {
         replies.extend(b.feed(&[*byte]).unwrap());
     }
     assert_eq!(replies, b"\x1b[1;3R");
-    assert_eq!(b.screen.current_fg, crate::Color::Red);
-    assert!(b.screen.current_flags.bold());
+    assert_eq!(b.vt.screen.current_fg, crate::Color::Red);
+    assert!(b.vt.screen.current_flags.bold());
     assert_eq!(b.visible_text(), before);
 }
 
@@ -824,6 +851,36 @@ fn history_extent_tracks_physical_rows_across_eviction_resize_and_clear() {
 }
 
 #[test]
+fn process_history_pressure_expires_the_original_anchor_without_reusing_its_row() {
+    use crate::retained_history::HistoryBudget;
+
+    let mut live = Terminal::new(1, 16).unwrap();
+    let mut peer = Terminal::new(1, 16).unwrap();
+    let mut calibration = Terminal::new(1, 16).unwrap();
+    calibration.feed(b"same\r\n").unwrap();
+    let one_row = calibration.history_retained_bytes();
+    let budget = Arc::new(HistoryBudget::new(one_row * 2));
+    live.history = RetainedHistory::with_process_budget(one_row * 4, Arc::clone(&budget));
+    peer.history = live.history.empty_sibling();
+    live.track_transcript_rows();
+    peer.feed(b"peer\r\n").unwrap();
+    live.feed(b"same\r\n").unwrap();
+    let old_point = crate::history_reflow::HistoryAnchor { row: 0, column: 0 };
+    let old = live.transcript_source_at(old_point).unwrap();
+    let pinned_page = live.history_page(0, 1).unwrap();
+    assert_eq!(budget.usage().retained_bytes, 2 * one_row);
+    assert_eq!(live.locate_transcript_source(old), Some(old_point));
+
+    live.feed(b"next\r\n").unwrap();
+    assert_eq!(live.history_extent(), 1..2);
+    assert_eq!(live.locate_transcript_source(old), None);
+    assert_eq!(live.history_page(0, 1).unwrap().text, "next");
+    assert_eq!(peer.history_page(0, 1).unwrap().text, "peer");
+    assert_eq!(pinned_page.text, "same");
+    assert_eq!(budget.usage().retained_bytes, 2 * one_row);
+}
+
+#[test]
 fn history_wide_softwrap_and_resize_keep_original_geometry() {
     let mut t = Terminal::new(1, 4).unwrap();
     t.feed("界abXY\r\n".as_bytes()).unwrap();
@@ -848,8 +905,8 @@ fn shared_parser_fragmentation_and_sgr() {
         b.feed(&[*byte]).unwrap();
     }
     assert_eq!(a.visible_text(), b.visible_text());
-    assert_eq!(a.screen.grid[1][0].foreground, crate::Color::Red);
-    assert_eq!(a.screen.grid[1][0].character, '世');
+    assert_eq!(a.vt.screen.grid[1][0].foreground, crate::Color::Red);
+    assert_eq!(a.vt.screen.grid[1][0].character, '世');
 }
 
 #[test]
@@ -862,7 +919,10 @@ fn utf8_every_split_preserves_wide_frame_and_colors() {
         t.feed(&bytes[..cut]).unwrap();
         t.feed(&bytes[cut..]).unwrap();
         for row in 0..3 {
-            assert_eq!(t.screen.grid[row], baseline.screen.grid[row], "cut={cut}");
+            assert_eq!(
+                t.vt.screen.grid[row], baseline.vt.screen.grid[row],
+                "cut={cut}"
+            );
         }
         assert_eq!(
             t.frame().unwrap().cursor(),
@@ -876,23 +936,23 @@ fn utf8_every_split_preserves_wide_frame_and_colors() {
 fn wide_overwrite_repairs_both_halves_and_wraps() {
     let mut t = Terminal::new(3, 4).unwrap();
     t.feed("界中".as_bytes()).unwrap();
-    assert!(t.screen.grid[0][0].flags.wide());
-    assert!(t.screen.grid[0][1].flags.wide_continuation());
+    assert!(t.vt.screen.grid[0][0].flags.wide());
+    assert!(t.vt.screen.grid[0][1].flags.wide_continuation());
     t.feed(b"X").unwrap();
-    assert_eq!(t.screen.grid[1][0].character, 'X');
+    assert_eq!(t.vt.screen.grid[1][0].character, 'X');
     t.feed(b"\x1b[1;2HA").unwrap();
-    assert_eq!(t.screen.grid[0][0].character, ' ');
-    assert_eq!(t.screen.grid[0][1].character, 'A');
-    assert!(!t.screen.grid[0][1].flags.wide_continuation());
+    assert_eq!(t.vt.screen.grid[0][0].character, ' ');
+    assert_eq!(t.vt.screen.grid[0][1].character, 'A');
+    assert!(!t.vt.screen.grid[0][1].flags.wide_continuation());
     t.feed(b"\x1b[1;3HB").unwrap();
-    assert_eq!(t.screen.grid[0][3].character, ' ');
-    assert!(!t.screen.grid[0][3].flags.wide_continuation());
+    assert_eq!(t.vt.screen.grid[0][3].character, ' ');
+    assert!(!t.vt.screen.grid[0][3].flags.wide_continuation());
     t.feed("\x1b[2;4H界".as_bytes()).unwrap();
-    assert_eq!(t.screen.grid[2][0].character, '界');
-    assert!(t.screen.grid[2][1].flags.wide_continuation());
+    assert_eq!(t.vt.screen.grid[2][0].character, '界');
+    assert!(t.vt.screen.grid[2][1].flags.wide_continuation());
     t.feed("\x1b[?7l\x1b[2;4H中".as_bytes()).unwrap();
-    assert_eq!(t.screen.grid[1][2].character, '中');
-    assert!(t.screen.grid[1][3].flags.wide_continuation());
+    assert_eq!(t.vt.screen.grid[1][2].character, '中');
+    assert!(t.vt.screen.grid[1][3].flags.wide_continuation());
     t.frame().unwrap();
 }
 
@@ -901,13 +961,13 @@ fn narrow_resize_repairs_pairs_and_single_column_retains_core_truncated_lead() {
     let mut t = Terminal::new(2, 4).unwrap();
     t.feed("ab界".as_bytes()).unwrap();
     t.resize(2, 3).unwrap();
-    assert_eq!(t.screen.grid[0][2].character, ' ');
-    assert!(!t.screen.grid[0][2].flags.wide());
+    assert_eq!(t.vt.screen.grid[0][2].character, ' ');
+    assert!(!t.vt.screen.grid[0][2].flags.wide());
     t.resize(2, 1).unwrap();
     t.feed("\x1b[H界".as_bytes()).unwrap();
-    assert_eq!(t.screen.grid[1][0].character, '界');
-    assert!(t.screen.grid[1][0].flags.wide());
-    assert!(!t.screen.grid[1][0].flags.wide_continuation());
+    assert_eq!(t.vt.screen.grid[1][0].character, '界');
+    assert!(t.vt.screen.grid[1][0].flags.wide());
+    assert!(!t.vt.screen.grid[1][0].flags.wide_continuation());
     assert_eq!(t.unsupported_count(), 0);
     t.frame().unwrap();
 }
@@ -916,9 +976,9 @@ fn narrow_resize_repairs_pairs_and_single_column_retains_core_truncated_lead() {
 fn combining_marks_are_explicitly_unsupported_without_cursor_or_base_damage() {
     let mut t = Terminal::new(2, 4).unwrap();
     t.feed("e\u{301}\u{200d}X".as_bytes()).unwrap();
-    assert_eq!(t.screen.grid[0][0].character, 'e');
-    assert_eq!(t.screen.grid[0][1].character, 'X');
-    assert_eq!(t.screen.cursor_col, 2);
+    assert_eq!(t.vt.screen.grid[0][0].character, 'e');
+    assert_eq!(t.vt.screen.grid[0][1].character, 'X');
+    assert_eq!(t.vt.screen.cursor_col, 2);
     assert_eq!(t.unsupported_count(), 2);
     assert_eq!(
         t.unsupported_events(),
@@ -934,7 +994,7 @@ fn unicode_023_halfwidth_marks_keep_four_cells_at_every_utf8_split() {
         t.feed(&input[..cut]).unwrap();
         t.feed(&input[cut..]).unwrap();
         for (col, character) in ['ﾊ', 'ﾟ', 'ｸ', 'ﾞ'].into_iter().enumerate() {
-            let cell = &t.screen.grid[0][col];
+            let cell = &t.vt.screen.grid[0][col];
             assert_eq!(cell.character, character, "cut={cut}, col={col}");
             assert!(!cell.flags.wide() && !cell.flags.wide_continuation());
         }
@@ -958,8 +1018,8 @@ fn unicode_023_halfwidth_marks_wrap_and_backspace_after_bytewise_feed() {
     for byte in "ﾞX".as_bytes() {
         t.feed(&[*byte]).unwrap();
     }
-    assert_eq!(t.screen.grid[1][0].character, 'ﾞ');
-    assert_eq!(t.screen.grid[1][1].character, 'X');
+    assert_eq!(t.vt.screen.grid[1][0].character, 'ﾞ');
+    assert_eq!(t.vt.screen.grid[1][1].character, 'X');
     t.feed(b"\x08Y").unwrap();
     let frame = t.frame().unwrap();
     assert_eq!(frame.rows()[1].cells[1].character, 'Y');
@@ -975,9 +1035,9 @@ fn unicode_023_zero_width_rejection_is_preserved_between_halfwidth_marks() {
         let mut t = Terminal::new(2, 4).unwrap();
         t.feed(&input[..cut]).unwrap();
         t.feed(&input[cut..]).unwrap();
-        assert_eq!(t.screen.grid[0][0].character, 'ﾟ', "cut={cut}");
-        assert_eq!(t.screen.grid[0][1].character, 'ﾞ', "cut={cut}");
-        assert_eq!(t.screen.cursor_col, 2);
+        assert_eq!(t.vt.screen.grid[0][0].character, 'ﾟ', "cut={cut}");
+        assert_eq!(t.vt.screen.grid[0][1].character, 'ﾞ', "cut={cut}");
+        assert_eq!(t.vt.screen.cursor_col, 2);
         assert_eq!(t.unsupported_count(), 2);
         assert_eq!(
             t.unsupported_events(),
@@ -1022,6 +1082,51 @@ fn immutable_capture_shares_idle_and_unchanged_rows() {
     let resized = terminal.frame().unwrap();
     assert_eq!((resized.rows().len(), resized.cols()), (5, 8));
     assert!(alternate.delta_to(&resized).is_err());
+}
+
+#[test]
+fn nonpaint_output_keeps_the_frame_revision_and_the_next_delta_base() {
+    let mut terminal = Terminal::new(3, 20).unwrap();
+    terminal.enable_device_answers();
+    terminal.enable_window_updates();
+    terminal.set_color_defaults(TerminalDefaultColors::default());
+    let first = terminal.frame().unwrap();
+
+    // Fragmented queries advance parsing and produce replies, but do not paint.
+    assert!(terminal.feed(b"\x1b[").unwrap().is_empty());
+    assert_eq!(terminal.frame().unwrap().stamp(), first.stamp());
+    assert_eq!(terminal.feed(b"6n\x1b[c").unwrap(), b"\x1b[1;1R\x1b[?1;2c");
+    assert_eq!(terminal.frame().unwrap().stamp(), first.stamp());
+
+    terminal
+        .feed(b"\x1b[?1004h\x1b]2;new title\x07\x07")
+        .unwrap();
+    assert_eq!(terminal.encode_focus(true), Some(b"\x1b[I".as_slice()));
+    let effects = terminal.take_window_updates();
+    assert!(effects.bell);
+    assert_eq!(effects.title.as_deref(), Some("new title"));
+    assert_eq!(terminal.frame().unwrap().stamp(), first.stamp());
+
+    terminal.feed(b"X").unwrap();
+    let edited = terminal.frame().unwrap();
+    let delta = first.delta_to(&edited).unwrap();
+    assert_eq!(delta.rows.len(), 1);
+    assert_eq!(delta.rows[0].1.cells[0].character, 'X');
+
+    // Theme and history consumers need a new observation even when the
+    // visible cell rows still use named colors or are all blank.
+    terminal.feed(b"\x1b]10;#102030\x07").unwrap();
+    let recolored = terminal.frame().unwrap();
+    assert!(recolored.stamp().revision > edited.stamp().revision);
+    assert!(Arc::ptr_eq(&edited.shared_rows(), &recolored.shared_rows()));
+    terminal.feed(b"\x1b[2J\x1b[3;1H").unwrap();
+    let blank = terminal.frame().unwrap();
+    terminal.feed(b"\n").unwrap();
+    let scrolled = terminal.frame().unwrap();
+    assert_eq!(blank.rows(), scrolled.rows());
+    assert_eq!(blank.cursor(), scrolled.cursor());
+    assert!(scrolled.stamp().revision > blank.stamp().revision);
+    assert_eq!(terminal.history_rows(), 1);
 }
 
 #[test]
@@ -1426,10 +1531,34 @@ fn resize_and_unknown_are_explicit() {
 fn wrap_scroll_and_bounds() {
     let mut t = Terminal::new(2, 3).unwrap();
     t.feed(b"abcdefg").unwrap();
-    assert_eq!(t.screen.grid[0][0].character, 'd');
-    assert_eq!(t.screen.grid[1][0].character, 'g');
+    assert_eq!(t.vt.screen.grid[0][0].character, 'd');
+    assert_eq!(t.vt.screen.grid[1][0].character, 'g');
     assert!(t.feed(&vec![b'a'; MAX_FEED_BYTES + 1]).is_err());
     assert!(Terminal::new(200, 30).is_err());
+}
+
+#[test]
+fn reply_budget_preserves_the_admitted_prefix_and_parses_the_rest_of_the_span() {
+    let mut terminal = Terminal::new(2, 20).unwrap();
+    const QUERY: &[u8] = b"\x1bP+q\x1b\\";
+    const REPLY: &[u8] = b"\x1bP0+r\x1b\\";
+    const STATUS: &[u8] = b"\x1b[0n";
+    let admitted = (MAX_FEED_BYTES - STATUS.len()) / REPLY.len();
+    let mut input = b"\x1b[5n".to_vec();
+    input.extend(QUERY.repeat(admitted + 2));
+    // This short reply would still fit, but it cannot jump over a refusal.
+    input.extend_from_slice(b"\x1b[5nexit-tail\x1b[");
+    let result = terminal.feed_bounded_at(&input, Instant::now()).unwrap();
+
+    assert_eq!(&result.bytes[..STATUS.len()], STATUS);
+    assert_eq!(result.bytes[STATUS.len()..], REPLY.repeat(admitted));
+    assert_eq!(result.refused_bytes, REPLY.len() * 2 + STATUS.len());
+    assert!(terminal.visible_text().starts_with("exit-tail"));
+    assert_eq!(terminal.feed(b"5n").unwrap(), STATUS);
+
+    let mut legacy = Terminal::new(2, 20).unwrap();
+    assert_eq!(legacy.feed(&input).unwrap_err(), "reply limit");
+    assert!(legacy.visible_text().starts_with("exit-tail"));
 }
 
 #[test]
@@ -1445,7 +1574,8 @@ fn one_complete_frame_per_poll_budget_reserves_live_revision() {
     assert!(t.revision > completed.stamp().revision);
     t.feed(b"\x1b[?2026l\x1b[?2026hD").unwrap();
     assert!(t.completed_sync_frame.is_none());
-    t.sync_started = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
+    t.vt.sync_output.started =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
     assert!(!t.publication_held());
     assert!(t.frame().unwrap().stamp().revision > completed.stamp().revision);
 }
@@ -1506,7 +1636,7 @@ fn oversized_strings_are_partition_independent_and_cannot_execute_nested_control
             for part in input.chunks(chunk) {
                 assert!(terminal.feed(part).unwrap().is_empty());
             }
-            assert_eq!(terminal.parser.rejected_count(), 1);
+            assert_eq!(terminal.vt.parser.rejected_count(), 1);
             assert_eq!(terminal.negative_query_replies(), 0);
             assert!(terminal.visible_text().starts_with("SAFEOK"));
             assert_eq!(
@@ -1532,7 +1662,7 @@ fn canceled_strings_recover_without_replaying_payload_or_replying() {
                     assert!(terminal.feed(part).unwrap().is_empty());
                 }
                 assert!(terminal.visible_text().starts_with("RECOVERED"));
-                assert_eq!(terminal.parser.rejected_count(), u64::from(oversize));
+                assert_eq!(terminal.vt.parser.rejected_count(), u64::from(oversize));
             }
         }
     }
@@ -1552,10 +1682,10 @@ fn dcs_exact_payload_limit_accepts_but_one_more_rejects_across_feeds() {
             }
             if payload_len <= 4096 {
                 assert_eq!(replies, b"\x1bP0+r\x1b\\");
-                assert_eq!(terminal.parser.rejected_count(), 0);
+                assert_eq!(terminal.vt.parser.rejected_count(), 0);
             } else {
                 assert!(replies.is_empty());
-                assert_eq!(terminal.parser.rejected_count(), 1);
+                assert_eq!(terminal.vt.parser.rejected_count(), 1);
             }
         }
     }
@@ -1570,7 +1700,7 @@ fn repeated_osc_oversize_recovers_on_bel_and_accepts_fresh_query() {
         for _ in 0..1024 {
             assert!(terminal.feed(&[b'x'; 1024]).unwrap().is_empty());
         }
-        assert_eq!(terminal.parser.rejected_count(), round);
+        assert_eq!(terminal.vt.parser.rejected_count(), round);
         assert!(terminal.feed(b"\x07OK").unwrap().is_empty());
     }
     assert!(terminal.visible_text().starts_with("SAFEOKOK"));
@@ -1603,4 +1733,14 @@ fn immutable_history_copy_boundaries_use_utf16_and_never_select_padding() {
     terminal.feed(b"\x1b[3J").unwrap();
     assert!(!terminal.retains_history_anchor(HistoryAnchor { row: 0, column: 2 }));
     assert_eq!(page.copy_offsets_utf16().unwrap(), offsets);
+}
+
+#[test]
+fn hosted_and_native_hold_the_identical_vt_owner_type() {
+    let terminal = Terminal::new(3, 12).unwrap();
+    let _: &crate::native_terminal::NativeTerminal = &terminal.vt;
+    assert_eq!(
+        std::any::type_name_of_val(&terminal.vt),
+        std::any::type_name::<crate::vt_state::VtState>()
+    );
 }

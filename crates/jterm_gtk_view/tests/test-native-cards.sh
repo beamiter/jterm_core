@@ -11,7 +11,11 @@ esac
 
 mkdir -p -- "$output"
 build_log="$output/$app-test-artifacts.jsonl"
-cargo test --locked --release --features shared-terminal "${target[@]}" \
+cargo_test=(cargo test)
+if [[ -f tools/vte-oracle/run.py ]]; then
+  cargo_test=(python3 -B tools/vte-oracle/run.py test)
+fi
+"${cargo_test[@]}" --locked --release --features shared-terminal "${target[@]}" \
   --no-run --message-format=json >"$build_log"
 test_binary=$(python3 -B - "$app" "$kind" "$build_log" <<'PY'
 import json

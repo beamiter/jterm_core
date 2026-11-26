@@ -1,5 +1,8 @@
 //! Unix child termination, process identity, and exclusive reaping.
 
+mod native;
+pub use native::{NativeChildPhase, NativePtyChild};
+
 use crate::process_stat::{process_stat, process_stat_result};
 use std::ffi::c_int;
 use std::io;

@@ -28,7 +28,7 @@ the anchored row remains in history.
 Typing resumes following the live screen. The journey verifies keyboard and
 wheel navigation, resize while reading, and returning to a tab that emitted
 output in the background. History reflow and full TUI support remain separate
-gates. Released Block and Chat builds use VTE for visible completed cards.
+gates.
 
 The standalone shared terminal paints explicit SGR 58 underline colors in
 live cells and retained history. Add `--underline-colors` to each X11 command
@@ -49,8 +49,11 @@ Linux Forge and Anvil builds with the `shared-terminal` feature use
 `terminal_mode = "vte"` and a direct local sh or Bash argv. The runtime
 owns the PTY, terminal state, bounded input queue, replies, resize and exit.
 GTK renders its frames and history and keeps draining output when the tab is
-hidden. `JTERM_SHARED_RUNTIME=0` selects the existing compatibility route.
-Host-bridged shells and custom command launches use the compatibility transport.
+hidden. Configured shells, explicit commands and the local endpoints of
+host-bridged shells use the shared runtime.
+The native probes verify that the same owner runs with the old override
+variables set. Supply `--legacy-binary` to compare with a separate older or
+featureless build.
 
 Ordinary local jsh panes configured with `terminal_mode = "vte"` also default
 to the shared runtime. The application passes its pane's saved session ID to
@@ -133,25 +136,23 @@ dbus-run-session -- xvfb-run -a cargo test --offline --locked --release \
 ## Completed command rows
 
 Forge and Anvil builds with `shared-terminal` use a shared command view for
-eligible shell-reported Block and Chat commands, including literal paths and
-multiline commands within the document budget. The view preserves syntax
-colors, native selection, per-card search and bounded cross-card copying.
-Control-click on an allowed HTTP or HTTPS link uses the host opener.
-Set `JTERM_SHARED_FINISHED_COMMANDS=0` to use VTE for the entire card.
+completed Block, Chat and Unified card headings. Matching shell markup
+provides syntax colors. Other headings preserve their bounded display text,
+selection, per-card search and cross-card copying. Control-click on an
+allowed HTTP or HTTPS link uses the host opener.
 
 ## Completed output rows
 
-The shared GTK document view displays eligible finalized output. Its capture
-can contain up to twelve logical lines, two KiB of visible text, and eight KiB
-of styled data. It also fits within the configured card viewport. The view
-preserves supported ANSI styles, grapheme clusters, OSC 8 links, and plain
-HTTP and HTTPS links. Images, partial captures, cursor controls and
-unsupported styles use the compatibility renderer. The retained payload
-supplies copy, export and filtering.
+Shared production builds display finalized output in a read-only GTK
+document. Supported ANSI styles, grapheme clusters and links are retained.
+The common replay projects cursor edits using the captured geometry. The
+preview is bounded independently of the retained output used for copy and
+export. A separate label describes clipped previews and omitted terminal
+effects. Filtering and selection use the displayed document.
 
-Set `JTERM_SHARED_FINISHED_OUTPUT=0` to use VTE for completed output.
 Run the native GTK card fixture from either application checkout against
-its locked core. It tests the default with both overrides unset.
+its locked core. It also exercises legacy render settings in the explicitly
+enabled test oracle.
 
 ```sh
 core=$(python3 scripts/shared-core-path.py)
@@ -160,16 +161,13 @@ bash "$core/crates/jterm_gtk_view/tests/test-native-cards.sh" forge /tmp/forge-c
 
 Use `anvil` as the first argument in an Anvil checkout. The fixtures feed OSC
 133 completion data through the PTY readers and check mapped styled lines,
-fold-aware search, filtering, mixed clipboard selection and compatibility
-rendering for unsupported ANSI.
+fold-aware search, filtering and mixed clipboard selection.
 
 ## Running command output
 
 Native Linux `shared-terminal` builds use the shared runtime and GTK renderer
-by default for new Block, Chat, and Unified panes. The Flatpak host bridge
-retains its existing default. Set `JTERM_SHARED_ACTIVE_TERMINAL=0` for Block
-and Chat or `JTERM_SHARED_TRANSCRIPT=0` for Unified to launch with VTE. A pane
-keeps its original renderer until it closes.
+for new Block, Chat and Unified panes. The local endpoint also owns PTY reads,
+writes and cleanup when a Flatpak host bridge launches the configured program.
 
 Find navigates the mapped GTK screen, including the active alternate screen.
 

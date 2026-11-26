@@ -1,9 +1,18 @@
 //! Byte accounting for compressed terminal scrollback.
-use std::{collections::VecDeque, fmt, ops::Deref};
+use std::{
+    collections::VecDeque,
+    fmt,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
+pub use crate::retained_bytes::{
+    RetainedBytesBudget as HistoryBudget, RetainedBytesUsage as HistoryUsage,
+};
 use crate::{history_reflow::reflow_cell_rows, ScrollbackLine, TerminalCell};
 
 pub const RETAINED_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+pub const PROCESS_RETAINED_HISTORY_BYTES: usize = 16 * RETAINED_HISTORY_BYTES;
 const MAX_ROW_SCALED_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 // Allow for a 120-column ASCII row plus its retained entry.
 const ROW_SCALED_HISTORY_BYTES_PER_ROW: usize = 192;
@@ -20,6 +29,15 @@ impl RetainedRow for ScrollbackLine {
     }
 }
 
+fn process_budget() -> &'static Arc<HistoryBudget> {
+    static PROCESS: OnceLock<Arc<HistoryBudget>> = OnceLock::new();
+    PROCESS.get_or_init(|| Arc::new(HistoryBudget::new(PROCESS_RETAINED_HISTORY_BYTES)))
+}
+
+pub fn process_history_usage() -> HistoryUsage {
+    process_budget().usage()
+}
+
 /// Tracks stored entries and their backing allocations. Spare collection
 /// capacity and separate renderer, image and document resources have their own
 /// lifetimes. The owner chooses when to evict so it can rebase row references.
@@ -27,15 +45,26 @@ pub struct RetainedHistory<Row> {
     rows: VecDeque<Row>,
     bytes: usize,
     byte_limit: usize,
+    process: Arc<HistoryBudget>,
 }
 
 impl<Row> RetainedHistory<Row> {
     pub fn with_byte_limit(byte_limit: usize) -> Self {
+        Self::with_process_budget(byte_limit, Arc::clone(process_budget()))
+    }
+
+    pub fn with_process_budget(byte_limit: usize, process: Arc<HistoryBudget>) -> Self {
         Self {
             rows: VecDeque::new(),
             bytes: 0,
             byte_limit,
+            process,
         }
+    }
+
+    /// Empty storage for a reversible or rebuilt history in the same budget.
+    pub fn empty_sibling(&self) -> Self {
+        Self::with_process_budget(self.byte_limit, Arc::clone(&self.process))
     }
 
     /// Scale the byte allowance for an explicitly configured scrollback size.
@@ -44,6 +73,12 @@ impl<Row> RetainedHistory<Row> {
         self.byte_limit = row_limit
             .saturating_mul(ROW_SCALED_HISTORY_BYTES_PER_ROW)
             .clamp(RETAINED_HISTORY_BYTES, MAX_ROW_SCALED_HISTORY_BYTES);
+    }
+}
+
+impl<Row> Drop for RetainedHistory<Row> {
+    fn drop(&mut self) {
+        self.process.release(self.bytes);
     }
 }
 
@@ -90,25 +125,75 @@ impl<Row: RetainedRow> RetainedHistory<Row> {
             || self.bytes.saturating_add(row.retained_bytes()) > self.byte_limit
     }
 
-    pub fn push_back(&mut self, row: Row) {
-        self.bytes += row.retained_bytes();
-        self.rows.push_back(row);
+    /// Append an already prepared row after process admission. Callers with
+    /// normal live scrollback should use `retain_latest` for local limits and
+    /// reporting evictions. This can also build a reversible stash.
+    pub fn push_back(&mut self, row: Row) -> bool {
+        self.try_push_back(row).is_ok()
     }
 
-    pub fn push_front(&mut self, row: Row) {
-        self.bytes += row.retained_bytes();
+    /// Keep the unadmitted row with the caller so it can expire old anchors
+    /// and try again without rebuilding compressed data.
+    pub fn try_push_back(&mut self, row: Row) -> Result<(), Row> {
+        let size = row.retained_bytes();
+        if !self.process.try_charge(size) {
+            return Err(row);
+        }
+        self.bytes += size;
+        self.rows.push_back(row);
+        Ok(())
+    }
+
+    pub fn push_front(&mut self, row: Row) -> bool {
+        let size = row.retained_bytes();
+        if !self.process.try_charge(size) {
+            return false;
+        }
+        self.bytes += size;
         self.rows.push_front(row);
+        true
+    }
+
+    /// Keep a contiguous newest tail. Evict this owner's oldest cached rows
+    /// before trying again and report each eviction so anchors can expire.
+    /// Another live session's history is never mutated from this caller.
+    pub fn retain_latest(
+        &mut self,
+        row: Row,
+        row_limit: usize,
+        mut on_evict: impl FnMut(Row),
+    ) -> bool {
+        let size = row.retained_bytes();
+        while self.rows.len() >= row_limit
+            || size > self.byte_limit.saturating_sub(self.bytes)
+            || !self.process.try_charge(size)
+        {
+            let Some(evicted) = self.pop_front() else {
+                return false;
+            };
+            on_evict(evicted);
+        }
+        self.bytes += size;
+        self.rows.push_back(row);
+        true
     }
 
     pub fn pop_front(&mut self) -> Option<Row> {
         let row = self.rows.pop_front()?;
-        self.bytes -= row.retained_bytes();
+        let size = row.retained_bytes();
+        self.bytes -= size;
+        self.process.release(size);
         Some(row)
     }
 
     pub fn replace(&mut self, index: usize, row: Row) -> Option<Row> {
         let old = self.rows.get_mut(index)?;
-        self.bytes = self.bytes - old.retained_bytes() + row.retained_bytes();
+        let (before, after) = (old.retained_bytes(), row.retained_bytes());
+        if !self.process.try_charge(after.saturating_sub(before)) {
+            return None;
+        }
+        self.process.release(before.saturating_sub(after));
+        self.bytes = self.bytes - before + after;
         Some(std::mem::replace(old, row))
     }
 
@@ -121,11 +206,13 @@ impl<Row: RetainedRow> RetainedHistory<Row> {
     }
 
     fn drain_prefix(&mut self, count: usize) -> impl Iterator<Item = Row> + '_ {
-        self.bytes -= self
+        let size = self
             .rows
             .range(..count)
             .map(RetainedRow::retained_bytes)
             .sum::<usize>();
+        self.bytes -= size;
+        self.process.release(size);
         self.rows.drain(..count)
     }
 
@@ -137,26 +224,47 @@ impl<Row: RetainedRow> RetainedHistory<Row> {
         self.drain_prefix(count).collect()
     }
 
+    /// Move a prefix to another owner without releasing its charge. Useful
+    /// when a clear operation retains rows for a later undo.
+    pub fn take_charged_prefix(&mut self, count: usize) -> Self {
+        let mut prefix = self.empty_sibling();
+        prefix.rows.extend(self.rows.drain(..count));
+        prefix.bytes = prefix.rows.iter().map(RetainedRow::retained_bytes).sum();
+        self.bytes -= prefix.bytes;
+        prefix
+    }
+
+    /// Restore already charged rows without allocating another reservation.
+    /// The caller can trim against its local row and byte limits afterwards.
+    pub fn prepend_charged(&mut self, mut prefix: Self) {
+        assert!(Arc::ptr_eq(&self.process, &prefix.process));
+        prefix.rows.append(&mut self.rows);
+        std::mem::swap(&mut self.rows, &mut prefix.rows);
+        self.bytes += std::mem::take(&mut prefix.bytes);
+    }
+
     pub fn truncate(&mut self, length: usize) {
         let end = length.min(self.rows.len());
-        self.bytes -= self
+        let size = self
             .rows
             .range(end..)
             .map(RetainedRow::retained_bytes)
             .sum::<usize>();
         self.rows.truncate(end);
+        self.bytes -= size;
+        self.process.release(size);
     }
 
     pub fn clear(&mut self) {
-        *self = Self::with_byte_limit(self.byte_limit);
+        *self = self.empty_sibling();
     }
 
     pub(crate) fn shrink_to_fit(&mut self) {
         self.rows.shrink_to_fit();
     }
 
-    pub fn into_rows(self) -> VecDeque<Row> {
-        self.rows
+    pub fn into_rows(mut self) -> VecDeque<Row> {
+        std::mem::take(&mut self.rows)
     }
 }
 
@@ -165,13 +273,13 @@ impl RetainedHistory<ScrollbackLine> {
     /// consumed one at a time and the output retains only the newest tail.
     /// Every emitted row receives a fresh identity, including discarded rows.
     pub fn reflow_frost_legacy(
-        self,
+        mut self,
         columns: usize,
         blank: TerminalCell,
         row_limit: usize,
     ) -> Self {
-        let mut result = Self::with_byte_limit(self.byte_limit);
-        let source = self.rows.into_iter().map(|line| {
+        let mut result = self.empty_sibling();
+        let source = std::iter::from_fn(|| self.pop_front()).map(|line| {
             let cells = line.decompress();
             #[cfg(test)]
             FROST_REFLOW_PEAK.with(|peak| {
@@ -182,18 +290,7 @@ impl RetainedHistory<ScrollbackLine> {
         });
         reflow_cell_rows(source, columns, blank, |cells, wrapped| {
             let line = ScrollbackLine::compress_frost_legacy(cells, wrapped);
-            if row_limit == 0 || line.retained_bytes() > result.byte_limit {
-                // An unretainable row ends the previous tail. Later rows
-                // can start a new contiguous tail within the same budget.
-                if !result.is_empty() {
-                    result.clear();
-                }
-            } else {
-                while result.needs_room_for(&line, row_limit) {
-                    result.pop_front();
-                }
-                result.push_back(line);
-            }
+            result.retain_latest(line, row_limit, drop);
             #[cfg(test)]
             FROST_REFLOW_PEAK.with(|peak| {
                 let (source, row, retained) = peak.get();
@@ -220,6 +317,49 @@ mod tests {
         fn retained_bytes(&self) -> usize {
             self.0
         }
+    }
+
+    #[test]
+    fn shared_limit_expires_the_writing_sessions_prefix_and_preserves_the_peer() {
+        let budget = Arc::new(HistoryBudget::new(10));
+        let mut active = RetainedHistory::with_process_budget(10, Arc::clone(&budget));
+        let mut peer = active.empty_sibling();
+        assert!(active.push_back(ChargedRow(4)));
+        assert!(active.push_back(ChargedRow(2)));
+        assert!(peer.push_back(ChargedRow(4)));
+        assert!(!peer.push_back(ChargedRow(1)));
+
+        let mut expired = Vec::new();
+        assert!(active.retain_latest(ChargedRow(3), 10, |row| expired.push(row.0)));
+        assert_eq!(expired, [4]);
+        assert_eq!(active.iter().map(|row| row.0).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(peer[0].0, 4);
+        assert_eq!(budget.usage().retained_bytes, 9);
+        assert_eq!(budget.usage().peak_retained_bytes, 10);
+        drop(peer);
+        drop(active);
+        assert_eq!(budget.usage().retained_bytes, 0);
+    }
+
+    #[test]
+    fn reversible_prefixes_keep_one_charge_and_restore_at_full_capacity() {
+        let budget = Arc::new(HistoryBudget::new(12));
+        let mut live = RetainedHistory::with_process_budget(12, Arc::clone(&budget));
+        for size in [2, 3, 7] {
+            assert!(live.push_back(ChargedRow(size)));
+        }
+        let stash = live.take_charged_prefix(2);
+        assert_eq!((live.retained_bytes(), stash.retained_bytes()), (7, 5));
+        assert_eq!(budget.usage().retained_bytes, 12);
+        assert!(!live.push_back(ChargedRow(1)));
+        assert!(live.replace(0, ChargedRow(8)).is_none());
+        live.prepend_charged(stash);
+        assert_eq!(live.iter().map(|row| row.0).collect::<Vec<_>>(), [2, 3, 7]);
+        assert_eq!(budget.usage().retained_bytes, 12);
+        live.truncate(2);
+        assert_eq!(budget.usage().retained_bytes, 5);
+        live.clear();
+        assert_eq!(budget.usage().retained_bytes, 0);
     }
 
     #[test]

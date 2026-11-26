@@ -134,9 +134,17 @@ def main() -> int:
         required.add("jagent")
     if any(project not in STANDALONE | {"jagent", "jsh"} for project in selected):
         required.add("jterm_core")
+    published_gtk = set()
+    for app in sorted({"forge", "anvil"}.intersection(selected)):
+        manifest = sources[app] / "Cargo.toml"
+        if manifest.is_file():
+            dependencies = tomllib.loads(manifest.read_text()).get("dependencies", {})
+            view = dependencies.get("jterm_gtk_view")
+            if isinstance(view, dict) and "git" in view:
+                published_gtk.add(app)
     if gtk_apps or any(project in {"ember", "frost", *AETHER_CRATES} for project in selected):
         required.add("jterm_engine")
-    if gtk_apps:
+    if gtk_apps or published_gtk:
         required.add("jterm_gtk_view")
     for project in sorted(required):
         manifest_roots = [sources[project]]
@@ -211,14 +219,9 @@ def main() -> int:
             for package, dependency in aether_dependencies.items():
                 if "path" in dependency:
                     mirror(sources[package], core_crates / package)
-        published_gtk = set()
-        for app in sorted(gtk_apps):
+        for app in sorted(gtk_apps - published_gtk):
             manifest = root / app / "Cargo.toml"
             text = manifest.read_text()
-            dependency = tomllib.loads(text).get("dependencies", {}).get("jterm_gtk_view")
-            if isinstance(dependency, dict) and "git" in dependency:
-                published_gtk.add(app)
-                continue
             if "[dependencies]\n" not in text:
                 parser.error(f"{app} manifest has no dependencies table")
             manifest.write_text(text.replace("[dependencies]\n",
@@ -264,9 +267,9 @@ def main() -> int:
                     "--config",
                     'patch."https://github.com/beamiter/jterm_core.git".jterm_gtk_view.path='
                     + json.dumps(str(mirror_paths["jterm_gtk_view"])),
-                    "--features",
-                    "shared-terminal",
                 ]
+                if project in gtk_apps:
+                    project_patches += ["--features", "shared-terminal"]
             if project in {"ember", "frost"} or (project in AETHER_CRATES and not local_aether_engine):
                 project_patches += [
                     "--config",

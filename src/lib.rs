@@ -86,6 +86,8 @@ pub use jterm_remote_client;
 pub use jterm_runtime::native_pty_launch;
 pub use jterm_runtime::output_batch;
 pub use jterm_runtime::pty_instance_lock;
+#[cfg(all(unix, feature = "terminal-session-actor"))]
+pub use jterm_runtime::pty_io;
 #[cfg(unix)]
 pub use jterm_runtime::pty_reader;
 #[cfg(all(unix, feature = "terminal-session-actor"))]

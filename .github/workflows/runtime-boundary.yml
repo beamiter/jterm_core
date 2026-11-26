@@ -51,6 +51,13 @@ jobs:
         run: cargo fetch --locked --manifest-path crates/jterm_runtime/Cargo.toml
       - name: Test independent helpers offline
         run: cargo test --offline --locked --all-targets --all-features --manifest-path crates/jterm_runtime/Cargo.toml
+      - name: Verify the installed terminfo capability contract
+        if: matrix.rust == 'stable'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ncurses-bin
+          cargo test --offline --locked --all-features --manifest-path crates/jterm_runtime/Cargo.toml \
+            terminal_profile::tests::compiled_profile_matches_source_and_engine -- --ignored --exact
       - name: Check runtime formatting, Clippy and docs
         if: matrix.rust == 'stable'
         env:

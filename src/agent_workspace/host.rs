@@ -1146,14 +1146,22 @@ fn runtime_loop(
                             &mut record.runtime.event_sequence,
                         );
                         for chunk in bytes.chunks(4096) {
-                            match screen.terminal.feed_at(chunk, batch_read_at) {
-                                Ok(reply) if !legacy_replies && !reply.is_empty() => {
-                                    if let Err(error) = actor.write_response(reply) {
-                                        if error != WriteError::Closed {
-                                            record.runtime.detail = format!(
-                                                "Workspace terminal reply rejected. {error}"
-                                            );
+                            match screen.terminal.feed_bounded_at(chunk, batch_read_at) {
+                                Ok(reply) if !legacy_replies => {
+                                    if !reply.bytes.is_empty() {
+                                        if let Err(error) = actor.write_response(reply.bytes) {
+                                            if error != WriteError::Closed {
+                                                record.runtime.detail = format!(
+                                                    "Workspace terminal reply rejected. {error}"
+                                                );
+                                            }
                                         }
+                                    }
+                                    if reply.refused_bytes != 0 {
+                                        record.runtime.detail = format!(
+                                            "Workspace terminal reply budget exceeded ({} bytes refused).",
+                                            reply.refused_bytes
+                                        );
                                     }
                                 }
                                 Ok(_) => {}

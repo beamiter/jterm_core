@@ -192,39 +192,51 @@ def exercise(args, root):
     assert not Path(f"/proc/{restored[session]}").exists(), "the restored jsh child survived app exit"
 
     environment["JTERM_SHARED_RUNTIME"] = "0"
-    with application(args.binary, config, environment, root / "legacy.log", restore=False) as process:
+    check_input(args, args.binary, config, environment, root, "old-override", shared=True)
+    if args.legacy_binary is not None:
+        check_input(args, args.legacy_binary, config, environment, root, "legacy", shared=False)
+    print(f"{args.app} X11 jsh passed: bootstrap, split reflow and draft, session restore and old override")
+
+
+def check_input(args, binary, config, environment, root, tag, *, shared):
+    with application(binary, config, environment, root / f"{tag}.log", restore=False) as process:
         pid = process.pid
-        legacy = wait_for("jsh in the compatibility terminal", lambda: shells(pid, args.jsh))
-        assert len(legacy) == 1, legacy
-        legacy_child = next(iter(legacy.values()))
-        fd = os.open(f"/proc/{legacy_child}/fd/0", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+        children = wait_for(f"jsh in the {tag} terminal", lambda: shells(pid, args.jsh))
+        assert len(children) == 1, children
+        child = next(iter(children.values()))
+        fd = os.open(f"/proc/{child}/fd/0", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
         try:
             # exec reaches /proc before jsh enables its raw-mode input editor.
-            wait_for("jsh input editor in the compatibility PTY", lambda: (
+            wait_for(f"jsh input editor in the {tag} PTY", lambda: (
                 termios.tcgetattr(fd)[3] & termios.ICANON == 0))
         finally:
             os.close(fd)
-        receipt = root / "legacy-input"
+        receipt = root / f"{tag}-input"
         window = window_for(pid)
-        send("printf 'legacy-jsh' > " + shlex.quote(str(receipt))
-             + r"; printf '\033[48;2;18;227;113mlegacy-jsh\033[0m\n'")
-        wait_for("input reached the compatibility PTY", lambda: (
-            receipt.is_file() and receipt.read_bytes() == b"legacy-jsh"))
-        wait_for("compatibility jsh output painted",
+        if shared:
+            assert wait_for("shared pane despite old runtime override", lambda: shared_screen(pid))
+        send("printf 'jsh-input' > " + shlex.quote(str(receipt))
+             + r"; printf '\033[48;2;18;227;113mjsh-input\033[0m\n'")
+        wait_for(f"input reached the {tag} PTY", lambda: (
+            receipt.is_file() and receipt.read_bytes() == b"jsh-input"))
+        wait_for(f"{tag} jsh output painted",
                  lambda: window_has_solid_color(window, (18, 227, 113)))
-        assert shared_screen(pid, Atspi.StateType.SHOWING) is None
+        assert (shared_screen(pid, Atspi.StateType.SHOWING) is not None) == shared
         close_window(process, confirmation="Close Window" if args.app == "forge" else "Close")
-    wait_for("compatibility jsh child stopped", lambda: not Path(f"/proc/{legacy_child}").exists())
-    print(f"{args.app} X11 jsh passed: bootstrap, split reflow and draft, session restore and rollback")
+    wait_for(f"{tag} jsh child stopped", lambda: not Path(f"/proc/{child}").exists())
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("app", choices=("forge", "anvil"))
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--legacy-binary", type=Path,
+                        help="optional separate binary using the old backend for comparison")
     parser.add_argument("--jsh", type=Path, required=True)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
+    if args.legacy_binary is not None:
+        args.legacy_binary = args.legacy_binary.resolve(strict=True)
     args.jsh = args.jsh.absolute()
     if args.jsh.name != "jsh" or not args.jsh.is_file() or not os.access(args.jsh, os.X_OK):
         parser.error("--jsh must point to an executable named jsh")

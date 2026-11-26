@@ -5,10 +5,11 @@ use crate::viewport::{ViewportFrame, ViewportRequest};
 use jterm_engine::colors::TerminalDefaultColors;
 use jterm_engine::hyperlink::HyperlinkPolicy;
 use jterm_engine::terminal::{
-    PlacedInlineImage, PreparedInlineImage, Terminal, WindowUpdates, MAX_FEED_BYTES,
+    FeedReplies, PlacedInlineImage, PreparedInlineImage, Terminal, WindowUpdates, MAX_FEED_BYTES,
 };
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
+use std::time::Instant;
 
 /// Input and process operations supplied by a native host.
 pub trait Pty: 'static {
@@ -49,8 +50,8 @@ pub(crate) struct Emulator {
 }
 
 impl Emulator {
-    pub(crate) fn apply(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
-        self.engine.feed(chunk)
+    pub(crate) fn apply(&mut self, chunk: &[u8]) -> Result<FeedReplies, String> {
+        self.engine.feed_bounded_at(chunk, Instant::now())
     }
 }
 
@@ -129,10 +130,18 @@ impl<P: Pty> TerminalOutput<P> {
                 .borrow_mut()
                 .apply(chunk)
                 .map_err(|error| format!("Terminal output failed: {error}"))?;
-            if !reply.is_empty() {
-                if let Err(error) = self.state.pty.write_reply(&reply) {
+            if !reply.bytes.is_empty() {
+                if let Err(error) = self.state.pty.write_reply(&reply.bytes) {
                     reply_error.get_or_insert(error);
                 }
+            }
+            if reply.refused_bytes != 0 {
+                reply_error.get_or_insert_with(|| {
+                    format!(
+                        "terminal feed reply budget exceeded ({} bytes refused)",
+                        reply.refused_bytes
+                    )
+                });
             }
             Ok(())
         });
@@ -240,13 +249,22 @@ impl<P: Pty> TerminalHandle<P> {
 mod tests {
     use super::*;
 
-    struct ReplySink(Rc<RefCell<Vec<&'static str>>>);
+    struct ReplySink {
+        events: Rc<RefCell<Vec<&'static str>>>,
+        expected: Vec<u8>,
+        refuse: bool,
+    }
 
     impl Pty for ReplySink {
         fn write(&self, bytes: &[u8]) -> Result<(), String> {
-            assert_eq!(bytes, b"\x1b[0n");
-            self.0.borrow_mut().push("reply refused");
-            Err("queue busy".into())
+            assert_eq!(bytes, self.expected);
+            if self.refuse {
+                self.events.borrow_mut().push("reply refused");
+                Err("queue busy".into())
+            } else {
+                self.events.borrow_mut().push("reply queued");
+                Ok(())
+            }
         }
 
         fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
@@ -268,7 +286,11 @@ mod tests {
     fn refused_reply_does_not_hide_later_output_or_the_exit() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let output = TerminalOutput::new(
-            ReplySink(Rc::clone(&events)),
+            ReplySink {
+                events: Rc::clone(&events),
+                expected: b"\x1b[0n".to_vec(),
+                refuse: true,
+            },
             20,
             4,
             TerminalProfile::Embedded,
@@ -300,5 +322,34 @@ mod tests {
         assert!(output.apply(b"late output").is_err());
         assert!(view.inspect(|terminal| terminal.visible_text().contains("exit-tail")));
         assert_eq!(*events.borrow(), ["reply refused", "output", "exit"]);
+    }
+
+    #[test]
+    fn overflowing_replies_do_not_hide_output_in_the_same_read() {
+        const REPLY: &[u8] = b"\x1bP0+r\x1b\\";
+        let admitted = MAX_FEED_BYTES / REPLY.len();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let output = TerminalOutput::new(
+            ReplySink {
+                events: Rc::clone(&events),
+                expected: REPLY.repeat(admitted),
+                refuse: false,
+            },
+            20,
+            4,
+            TerminalProfile::Embedded,
+            |_, _| false,
+        )
+        .unwrap();
+        let mut batch = b"\x1bP+q\x1b\\".repeat(admitted + 1);
+        batch.extend_from_slice(b"exit-tail");
+        assert_eq!(
+            output.apply(&batch).unwrap_err(),
+            "Terminal reply delivery failed: terminal feed reply budget exceeded (7 bytes refused)",
+        );
+        assert!(output
+            .handle()
+            .inspect(|terminal| terminal.visible_text().contains("exit-tail")));
+        assert_eq!(*events.borrow(), ["reply queued"]);
     }
 }

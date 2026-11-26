@@ -126,6 +126,14 @@ impl fmt::Debug for CellFrame {
 pub(crate) type UnderlineRows = Arc<[Option<Arc<[UnderlineColorRun]>>]>;
 pub(crate) type AnnotationRows = Arc<[Option<Arc<RowAnnotations>>]>;
 
+fn same_shared_table<T: ?Sized>(before: &Option<Arc<T>>, after: &Option<Arc<T>>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 pub(crate) fn underline_color_at(runs: &[UnderlineColorRun], col: usize) -> Option<Color> {
     let run = runs.get(runs.partition_point(|run| usize::from(run.end) <= col))?;
     (usize::from(run.start) <= col).then_some(run.color)
@@ -261,6 +269,42 @@ impl CellFrame {
         self.cursor
     }
 
+    /// Conservative application-storage charge for decoded rows and metadata.
+    /// Image raster backing is charged by its owning image store.
+    pub fn retained_delivery_bytes(&self) -> usize {
+        let header = 2 * size_of::<usize>();
+        let rows = self.rows.len().saturating_mul(
+            size_of::<Row>() + header + self.cols.saturating_mul(size_of::<TerminalCell>()),
+        );
+        let underlines = self.underline_colors.as_ref().map_or(0, |table| {
+            header
+                + table.len() * size_of::<Option<Arc<[UnderlineColorRun]>>>()
+                + table
+                    .iter()
+                    .flatten()
+                    .map(|runs| header + std::mem::size_of_val(runs.as_ref()))
+                    .sum::<usize>()
+        });
+        let links = self.hyperlinks.as_ref().map_or(0, |table| {
+            header
+                + std::mem::size_of_val(table.as_ref())
+                + table
+                    .iter()
+                    .map(|(_, uri)| header + uri.len())
+                    .sum::<usize>()
+        });
+        let annotations = self.annotations.as_ref().map_or(0, |table| {
+            header
+                + table.len() * size_of::<Option<Arc<RowAnnotations>>>()
+                + table
+                    .iter()
+                    .flatten()
+                    .map(|row| row.retained_bytes())
+                    .sum::<usize>()
+        });
+        rows + underlines + links + annotations + header + size_of::<Self>()
+    }
+
     pub(crate) fn with_hyperlinks(mut self, hyperlinks: Option<HyperlinkResources>) -> Self {
         self.hyperlinks = hyperlinks;
         self
@@ -346,6 +390,14 @@ impl CellFrame {
         }
         let mut delta = Delta::new(self.stamp(), next_stamp, next.cursor, Vec::new());
         delta.hyperlinks = HyperlinkDelta::Snapshot(next.shared_hyperlinks());
+        // Cursor-only publications keep all three immutable paint tables.
+        // The snapshot of hyperlink targets and the new cursor still travel.
+        if Arc::ptr_eq(&self.rows, &next.rows)
+            && same_shared_table(&self.underline_colors, &next.underline_colors)
+            && same_shared_table(&self.annotations, &next.annotations)
+        {
+            return Ok(delta);
+        }
         for (index, (before, after)) in self.rows.iter().zip(next.rows.iter()).enumerate() {
             if before != after
                 || self.underline_color_runs(index) != next.underline_color_runs(index)

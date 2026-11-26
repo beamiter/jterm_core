@@ -9,6 +9,7 @@ use crate::native_pty_launch::{
     launch_bundled_bash, launch_standalone_pty, BundledBash, ForwardedFd, PendingPty, PtyLaunch,
     PtyLaunchError, WorkingDirectory,
 };
+use crate::process_input_budget::{shared_budget, Charge};
 #[cfg(test)]
 use crate::pty_io::bounded_write;
 use crate::pty_reader::move_above_stdio;
@@ -386,10 +387,12 @@ mod reaper {
     }
 }
 
-/// Nonblocking PTY session for a fixed interactive shell.
-///
-/// This profile owns and reaps the direct shell. Broader process-tree
-/// containment is a separate launch policy.
+fn installed_jsh() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("PATH")
+        .and_then(|path| find_installed_jsh(&path))
+        .ok_or_else(|| "jsh executable not found on the application PATH".into())
+}
+
 fn find_installed_jsh(path: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -480,6 +483,8 @@ pub struct Session {
     ordered_input: bool,
     input_boundary: Option<InputBoundary>,
     replies: VecDeque<u8>,
+    reply_charge: Charge,
+    read_budget_blocked: bool,
     holding_replies: bool,
     exited: bool,
     exit_code: Option<i32>,
@@ -511,11 +516,29 @@ impl Session {
         epoch: NonZeroU64,
     ) -> Result<Self, String> {
         let mut terminal = Terminal::with_epoch(rows, cols, epoch)?;
-        let path = std::env::var_os("PATH")
-            .and_then(|path| find_installed_jsh(&path))
-            .ok_or("jsh executable not found on the application PATH")?;
-        let command = Program::interactive(path, &[("TERM", "xterm")])?;
+        let command = Program::interactive(installed_jsh()?, &[("TERM", "xterm")])?;
         terminal.observe_command_blocks();
+        Self::spawn_program(terminal, command.spec(rows as u16, cols as u16), None)
+    }
+
+    /// Start a shell with the shared emulator's own terminfo and device replies.
+    pub fn spawn_family_with_epoch(
+        rows: usize,
+        cols: usize,
+        epoch: NonZeroU64,
+        integrated: bool,
+    ) -> Result<Self, String> {
+        let mut terminal = Terminal::with_epoch(rows, cols, epoch)?;
+        terminal.enable_device_answers();
+        let mut environment = crate::terminal_profile::environment().to_vec();
+        let program = if integrated {
+            terminal.observe_command_blocks();
+            installed_jsh()?
+        } else {
+            environment.extend([("PS1", "$ "), ("ENV", "/dev/null")]);
+            "/bin/sh".into()
+        };
+        let command = Program::interactive(program, &environment)?;
         Self::spawn_program(terminal, command.spec(rows as u16, cols as u16), None)
     }
 
@@ -691,6 +714,8 @@ impl Session {
             ordered_input: false,
             input_boundary: None,
             replies: VecDeque::new(),
+            reply_charge: shared_budget().empty_charge(),
+            read_budget_blocked: false,
             holding_replies: false,
             exited: false,
             exit_code: None,
@@ -729,9 +754,10 @@ impl Session {
     /// An owner-mode writer may need to retry after EAGAIN without new output.
     pub fn needs_write_retry(&self) -> bool {
         !self.closed
-            && !self.is_exited()
-            && self.write_error.is_none()
-            && (!self.input_idle() || !self.replies.is_empty())
+            && (self.read_budget_blocked
+                || (!self.is_exited()
+                    && self.write_error.is_none()
+                    && (!self.input_idle() || !self.replies.is_empty())))
     }
 
     pub fn child_pid(&self) -> Option<i32> {
@@ -981,7 +1007,8 @@ impl Session {
             self.write_error = Some(message);
         }
         self.dropped_reply_bytes = self.dropped_reply_bytes.saturating_add(self.replies.len());
-        self.replies.clear();
+        self.clear_replies();
+        self.read_budget_blocked = false;
         self.holding_replies = false;
         if let Some(io) = &self.io {
             io.actor.close_input();
@@ -1102,6 +1129,7 @@ impl Session {
                 Ok(0) => break,
                 Ok(n) => {
                     self.replies.drain(..n);
+                    self.reply_charge.release(n);
                 }
                 Err(error) => {
                     self.fail_writer(error);
@@ -1110,15 +1138,34 @@ impl Session {
             }
         }
     }
-    fn queue_replies(&mut self, replies: Vec<u8>) {
+    fn clear_replies(&mut self) {
+        let pending = self.replies.len();
+        self.replies.clear();
+        self.reply_charge.release(pending);
+    }
+
+    fn queue_replies(&mut self, replies: Vec<u8>, reservation: &mut Charge) {
         if self.write_error.is_some() {
             self.dropped_reply_bytes = self.dropped_reply_bytes.saturating_add(replies.len());
         } else if self.replies.len() + replies.len() > READ_BUDGET {
             self.dropped_reply_bytes = self.dropped_reply_bytes.saturating_add(replies.len());
             self.fail_writer("pending reply byte limit".into());
         } else {
+            reservation.transfer_to(&mut self.reply_charge, replies.len());
             self.replies.extend(replies);
         }
+    }
+
+    fn reserve_read_replies(&mut self) -> Option<Charge> {
+        let mut reservation = self.reply_charge.sibling();
+        // Reserve the full remaining reply allowance before removing any
+        // bytes from the reader. Under pressure the bounded event channel
+        // backs up to the PTY instead of parsing and discarding replies.
+        self.read_budget_blocked = self.write_error.is_none()
+            && reservation
+                .try_add(READ_BUDGET - self.replies.len(), true)
+                .is_err();
+        (!self.read_budget_blocked).then_some(reservation)
     }
     pub fn take_completed_sync_frame(&mut self) -> Option<CellFrame> {
         self.terminal.engine.take_completed_sync_frame()
@@ -1172,6 +1219,9 @@ impl Session {
             if self.read_eof || total >= READ_BUDGET {
                 break;
             }
+            let Some(mut reply_reservation) = self.reserve_read_replies() else {
+                break;
+            };
             let mut bytes = [0; 4096];
             let remaining = (READ_BUDGET - total).min(bytes.len());
             match self.io.as_mut().ok_or("reader closed")?.read(
@@ -1192,7 +1242,15 @@ impl Session {
                 Ok(n) => {
                     total += n;
                     let replies = self.terminal.apply(&bytes[..n])?;
-                    self.queue_replies(replies);
+                    if replies.refused_bytes == 0 {
+                        self.queue_replies(replies.bytes, &mut reply_reservation);
+                    } else {
+                        self.dropped_reply_bytes = self
+                            .dropped_reply_bytes
+                            .saturating_add(replies.bytes.len())
+                            .saturating_add(replies.refused_bytes);
+                        self.fail_writer("terminal feed reply budget exceeded".into());
+                    }
                     if flush_replies {
                         self.flush_replies();
                     }
@@ -1231,7 +1289,8 @@ impl Session {
         self.input.clear();
         self.input_boundary = None;
         self.dropped_reply_bytes = self.dropped_reply_bytes.saturating_add(self.replies.len());
-        self.replies.clear();
+        self.clear_replies();
+        self.read_budget_blocked = false;
         if let Some(io) = self.io.take() {
             io.actor.stop();
         }
@@ -1247,6 +1306,95 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_test_replies(session: &mut Session, bytes: Vec<u8>) {
+        let mut reservation = session.reserve_read_replies().unwrap();
+        session.queue_replies(bytes, &mut reservation);
+    }
+
+    #[test]
+    fn process_reply_pressure_defers_the_exact_unread_stream_until_capacity_returns() {
+        use crate::process_input_budget::Budget;
+
+        let budget = Arc::new(Budget::new(READ_BUDGET, 0));
+        let mut session = Session::spawn(4, 80).unwrap();
+        session.reply_charge = budget.empty_charge();
+        session.terminal.engine.enable_device_answers();
+        session.test_io().reader = Some(Box::new(Available(Cursor::new(b"KEPT_OUTPUT\x1b[5n"))));
+        let mut other_owner = budget.empty_charge();
+        other_owner.try_add(1, true).unwrap();
+
+        assert_eq!(session.poll().unwrap(), 0);
+        assert!(session.needs_write_retry());
+        assert!(!session.terminal().visible_text().contains("KEPT_OUTPUT"));
+        assert_eq!(session.dropped_reply_bytes(), 0);
+        assert_eq!(budget.usage().reserved_bytes, 1);
+
+        drop(other_owner);
+        // Keep replies queued so the assertion sees the exact retained bytes.
+        session.holding_replies = true;
+        assert_eq!(session.poll().unwrap(), b"KEPT_OUTPUT\x1b[5n".len());
+        assert!(session.terminal().visible_text().contains("KEPT_OUTPUT"));
+        assert_eq!(session.replies, VecDeque::from(*b"\x1b[0n"));
+        assert_eq!(session.dropped_reply_bytes(), 0);
+        assert_eq!(budget.usage().reserved_bytes, 4);
+        session.clear_replies();
+        assert_eq!(budget.usage().reserved_bytes, 0);
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn real_pty_keeps_output_and_device_query_while_process_capacity_is_held() {
+        use crate::process_input_budget::Budget;
+
+        let argv = [
+            "/bin/sh".into(),
+            "-c".into(),
+            concat!(
+                "/usr/bin/stty raw -echo; printf 'BUDGET_BEFORE\\033[5n'; ",
+                "reply=$(/usr/bin/dd bs=1 count=4 status=none); ",
+                "[ \"$reply\" = \"$(printf '\\033[0n')\" ] || exit 42; ",
+                "printf '\\r\\nBUDGET_AFTER'; exit 17"
+            )
+            .into(),
+        ];
+        let budget = Arc::new(Budget::new(READ_BUDGET, 0));
+        let mut session = Session::spawn_command(4, 80, &argv, Some(Path::new("/")), &[]).unwrap();
+        session.terminal.engine.enable_device_answers();
+        session.reply_charge = budget.empty_charge();
+        let mut other_owner = budget.empty_charge();
+        other_owner.try_add(1, true).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.io.as_ref().unwrap().actor.events().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "PTY never published its first output event"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(session.drive().unwrap(), 0);
+        assert!(session.needs_write_retry());
+        assert!(!session.terminal().visible_text().contains("BUDGET_BEFORE"));
+        assert!(!session.io.as_ref().unwrap().actor.events().is_empty());
+
+        drop(other_owner);
+        while !session.is_drained() {
+            assert!(
+                Instant::now() < deadline,
+                "PTY did not recover after releasing the process budget"
+            );
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(session.exit_code(), Some(17));
+        let visible = session.terminal().visible_text();
+        assert!(visible.contains("BUDGET_BEFORE") && visible.contains("BUDGET_AFTER"));
+        assert_eq!(session.dropped_reply_bytes(), 0);
+        assert_eq!(budget.usage().reserved_bytes, 0);
+        session.close().unwrap();
+        await_cleanup(&session);
+    }
     use std::io::Write;
 
     impl Session {
@@ -1423,6 +1571,18 @@ mod tests {
         steps: VecDeque<Result<usize, std::io::ErrorKind>>,
         bytes: Vec<u8>,
     }
+
+    struct Available(Cursor<&'static [u8]>);
+    impl Read for Available {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(bytes)?;
+            if n == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            Ok(n)
+        }
+    }
+
     impl Write for ScriptedWriter {
         fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
             match self.steps.pop_front().unwrap_or(Ok(input.len())) {
@@ -1473,16 +1633,6 @@ mod tests {
         use std::io::{Cursor, ErrorKind};
         use std::sync::Mutex;
 
-        struct Available(Cursor<&'static [u8]>);
-        impl Read for Available {
-            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                let n = self.0.read(bytes)?;
-                if n == 0 {
-                    return Err(ErrorKind::WouldBlock.into());
-                }
-                Ok(n)
-            }
-        }
         struct Capture {
             steps: VecDeque<Result<usize, ErrorKind>>,
             wire: Arc<Mutex<Vec<u8>>>,
@@ -1596,8 +1746,8 @@ mod tests {
         assert!(session.write_transaction_chunk(b"wrong size").is_err());
         assert!(session.submit_input(b"ordinary input".to_vec()).is_err());
         assert_eq!(session.write(b"legacy input").unwrap(), 0);
-        let replies = session.terminal.apply(b"\x1b[6n").unwrap();
-        session.queue_replies(replies);
+        let replies = session.terminal.apply(b"\x1b[6n").unwrap().bytes;
+        queue_test_replies(&mut session, replies);
         assert_eq!(session.replies.len(), 6);
         assert_eq!(session.write_transaction_chunk(b"aw-line\n").unwrap(), 8);
         assert!(session.replies.is_empty());
@@ -1738,7 +1888,7 @@ mod tests {
             steps: [Ok(1), Err(std::io::ErrorKind::BrokenPipe)].into(),
             bytes: vec![],
         }));
-        session.replies.extend(b"reply");
+        queue_test_replies(&mut session, b"reply".to_vec());
         session.test_io().reader =
             Some(Box::new(std::io::Cursor::new(b"TAIL_AFTER_REPLY_FAILURE")));
         assert_eq!(session.poll().unwrap(), 24);
@@ -1771,15 +1921,92 @@ mod tests {
     #[test]
     fn reply_overflow_fails_only_writer_and_counts_discard() {
         let mut session = Session::spawn(4, 80).unwrap();
-        session.queue_replies(vec![b'a'; READ_BUDGET]);
-        session.queue_replies(vec![b'b'; 1]);
+        queue_test_replies(&mut session, vec![b'a'; READ_BUDGET]);
+        queue_test_replies(&mut session, vec![b'b'; 1]);
         assert_eq!(session.write_error(), Some("pending reply byte limit"));
         assert_eq!(session.dropped_reply_bytes(), READ_BUDGET + 1);
-        session.queue_replies(vec![b'c'; 2]);
+        queue_test_replies(&mut session, vec![b'c'; 2]);
         assert_eq!(session.dropped_reply_bytes(), READ_BUDGET + 3);
         assert!(session.replies.is_empty());
         session.close().unwrap();
     }
+
+    #[test]
+    fn one_read_can_exhaust_reply_budget_without_losing_its_output_tail() {
+        let mut session = Session::spawn(4, 80).unwrap();
+        session.enable_window_updates();
+        let title = "🦀".repeat(200);
+        let report_len = b"\x1b]l\x1b\\".len() + title.len();
+        let queries = READ_BUDGET / report_len + 1;
+        let mut bytes = format!("\x1b]2;{title}\x07").into_bytes();
+        bytes.extend(b"\x1b[21t".repeat(queries));
+        bytes.extend(b"TAIL_IN_THE_SAME_READ");
+        let read_len = bytes.len();
+        assert!(read_len < 4096);
+        session.test_io().reader = Some(Box::new(std::io::Cursor::new(bytes)));
+
+        assert_eq!(session.poll().unwrap(), read_len);
+        assert_eq!(
+            session.write_error(),
+            Some("terminal feed reply budget exceeded")
+        );
+        assert_eq!(session.dropped_reply_bytes(), report_len * queries);
+        assert!(session
+            .terminal()
+            .visible_text()
+            .contains("TAIL_IN_THE_SAME_READ"));
+        assert_eq!(session.poll().unwrap(), 0);
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn real_pty_status_query_replies_without_publishing_a_new_frame() {
+        let argv = [
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(
+                "stty raw -echo || exit 30; printf READY; IFS= read -r start || exit 31; \
+                 printf '\\033[5n'; answer=$(dd bs=1 count=4 2>/dev/null); \
+                 [ \"$answer\" = \"$(printf '\\033[0n')\" ] || exit 32; \
+                 IFS= read -r finish || exit 33; printf DONE",
+            ),
+        ];
+        let mut session = Session::spawn_command(4, 80, &argv, None, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.terminal().visible_text().contains("READY") {
+            assert!(
+                Instant::now() < deadline,
+                "child did not reach its input gate"
+            );
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let before = session.terminal().frame().unwrap().stamp();
+        session.submit_input(b"start\n".to_vec()).unwrap();
+        let mut read = 0;
+        while read < b"\x1b[5n".len() {
+            assert!(Instant::now() < deadline, "child did not send its query");
+            read += session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.terminal().frame().unwrap().stamp(), before);
+
+        session.submit_input(b"finish\n".to_vec()).unwrap();
+        while !session.is_drained() {
+            assert!(Instant::now() < deadline, "child did not finish");
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            session.exit_code(),
+            Some(0),
+            "child validates the reply bytes"
+        );
+        assert!(session.terminal().visible_text().contains("READYDONE"));
+        assert!(session.terminal().frame().unwrap().stamp().revision > before.revision);
+        session.close().unwrap();
+    }
+
     #[test]
     fn interrupted_reads_are_bounded_and_eio_marks_eof() {
         use std::sync::atomic::{AtomicUsize, Ordering};

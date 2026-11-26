@@ -153,14 +153,14 @@ impl Terminal {
         moves_cursor: bool,
     ) -> Option<PreparedInlineImage> {
         if self.alternate_screen_active()
-            || self.screen.pending_wrap
-            || cursor != (self.screen.cursor_col, self.screen.cursor_row)
+            || self.vt.screen.pending_wrap
+            || cursor != (self.vt.screen.cursor_col, self.vt.screen.cursor_row)
             || columns == 0
             || rows == 0
-            || cursor.0.checked_add(usize::from(columns))? > self.screen.grid.cols()
-            || usize::from(rows) > self.screen.grid.rows()
-            || (cursor.1 > self.screen.scroll_region_bottom
-                && cursor.1.checked_add(usize::from(rows))? > self.screen.grid.rows())
+            || cursor.0.checked_add(usize::from(columns))? > self.vt.screen.grid.cols()
+            || usize::from(rows) > self.vt.screen.grid.rows()
+            || (cursor.1 > self.vt.screen.scroll_region_bottom
+                && cursor.1.checked_add(usize::from(rows))? > self.vt.screen.grid.rows())
         {
             return None;
         }
@@ -217,7 +217,7 @@ impl Terminal {
         }
         self.next_inline_image_id = self.next_inline_image_id.checked_add(1)?;
         let image = InlineImageId(self.next_inline_image_id);
-        let blank = self.screen.create_blank_cell();
+        let blank = self.vt.screen.create_blank_cell();
         let lease = Arc::new(InlineImage {
             id: image,
             columns: prepared.columns,
@@ -225,9 +225,9 @@ impl Terminal {
             raster,
         });
         for slice in 0..prepared.rows {
-            let row = self.screen.cursor_row;
+            let row = self.vt.screen.cursor_row;
             let column = prepared.column;
-            let grid = &mut self.screen.grid;
+            let grid = &mut self.vt.screen.grid;
             grid.overwrite_graphic(
                 row,
                 column,
@@ -249,11 +249,11 @@ impl Terminal {
             }
         }
         if prepared.moves_cursor {
-            self.screen.cursor_col =
-                (prepared.column + usize::from(prepared.columns)).min(self.screen.grid.cols() - 1);
+            self.vt.screen.cursor_col = (prepared.column + usize::from(prepared.columns))
+                .min(self.vt.screen.grid.cols() - 1);
         } else {
-            self.screen.cursor_col = prepared.column;
-            self.screen.cursor_row = prepared.row;
+            self.vt.screen.cursor_col = prepared.column;
+            self.vt.screen.cursor_row = prepared.row;
         }
         Some(PlacedInlineImage {
             image,

@@ -12,26 +12,26 @@ impl Terminal {
     /// Distinguish spaces written into the live grid from erase padding. Enable
     /// before feeding text when later reads must prove an empty editor suffix.
     pub fn track_printed_spaces(&mut self) {
-        self.screen.grid.track_printed_spaces = true;
-        self.screen.alt_grid.track_printed_spaces = true;
+        self.vt.screen.grid.track_printed_spaces = true;
+        self.vt.screen.alt_grid.track_printed_spaces = true;
     }
 
     fn primary_cursor_column(&self) -> usize {
-        if self.screen.pending_wrap {
-            self.screen.grid.cols()
+        if self.vt.screen.pending_wrap {
+            self.vt.screen.grid.cols()
         } else {
-            self.screen.cursor_col
+            self.vt.screen.cursor_col
         }
     }
 
     /// Empty primary-grid cells after the cursor, including subsequent rows.
     /// A literal space or tab written by the shell keeps the suffix nonempty.
     pub fn primary_suffix_is_empty(&self) -> Option<bool> {
-        let grid = &self.screen.grid;
+        let grid = &self.vt.screen.grid;
         if self.alternate_screen_active() || !grid.track_printed_spaces {
             return None;
         }
-        let row = self.screen.cursor_row;
+        let row = self.vt.screen.cursor_row;
         let col = self.primary_cursor_column();
         Some((row..grid.rows()).all(|index| {
             let start = if index == row { col } else { 0 };
@@ -53,7 +53,7 @@ impl Terminal {
         Some(HistoryAnchor {
             row: self
                 .history_end
-                .checked_add(self.screen.cursor_row as u64)?,
+                .checked_add(self.vt.screen.cursor_row as u64)?,
             column: self.primary_cursor_column() as u16,
         })
     }
@@ -67,7 +67,7 @@ impl Terminal {
         end: HistoryAnchor,
     ) -> Result<String, String> {
         let history = self.history_extent();
-        let grid = &self.screen.grid;
+        let grid = &self.vt.screen.grid;
         let last = history
             .end
             .checked_add(grid.rows() as u64)
@@ -123,7 +123,7 @@ impl Terminal {
     /// the scrollback. A soft wrap joins rows, including at the archive edge.
     pub fn write_retained_text(&self, output: &mut impl io::Write) -> io::Result<()> {
         const SPACES: &[u8] = &[b' '; 256];
-        let grid = &self.screen.grid;
+        let grid = &self.vt.screen.grid;
         let mut row_text = String::new();
         let mut padding = 0;
         let mut separate = false;
@@ -174,13 +174,13 @@ impl Terminal {
                 )?;
             }
         }
-        let last_drawn = (self.screen.cursor_row..grid.rows())
+        let last_drawn = (self.vt.screen.cursor_row..grid.rows())
             .rfind(|&row| {
                 grid[row]
                     .iter()
                     .any(|cell| !cell.is_reflow_trimmable_blank())
             })
-            .unwrap_or(self.screen.cursor_row);
+            .unwrap_or(self.vt.screen.cursor_row);
         for row in 0..=last_drawn {
             write_row(
                 &grid[row],
@@ -196,7 +196,7 @@ impl Terminal {
     /// index while reading history, and repeated captures can reuse it.
     pub fn history_layout(&self) -> Result<Arc<HistoryLayout>, String> {
         let extent = self.history_extent();
-        let columns = self.screen.grid.cols();
+        let columns = self.vt.screen.grid.cols();
         let mut cache = self
             .retained_layout
             .lock()
@@ -294,7 +294,7 @@ impl Terminal {
             return Err("history page out of bounds".into());
         }
         if layout.extent != self.history_extent()
-            || layout.columns != self.screen.grid.cols()
+            || layout.columns != self.vt.screen.grid.cols()
             || !std::ptr::eq(self.history_layout()?.as_ref(), layout)
         {
             return Err("history layout is stale".into());

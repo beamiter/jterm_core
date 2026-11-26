@@ -1,0 +1,18 @@
+{
+  "source": "Real Vim9.2.0106 native PTY capture; TERM=xterm-256color; 24x80",
+  "binary_sha256": "a803e9ef57c97c5dc4da3bb114c37b24f2fea875f713ef1add0ec791eb0f2298",
+  "argv": [
+    "vim",
+    "-Nu",
+    "NONE",
+    "-i",
+    "NONE",
+    "-n",
+    "-X",
+    "/tmp/block-vim-capture.txt"
+  ],
+  "input_hex": "6943415054555245445f56494d5f544558541b3a77710d",
+  "bytes": 2471,
+  "sha256": "4a450ffb6cd9dc7c1ca9a35b1115f38b2c761c4eabe32f20c276d234b83a34af",
+  "scope": "Raw terminal output only. Main-screen tag framing is added independently by engine fixture; fullscreen data must be excluded from completed main-output card."
+}

@@ -148,6 +148,24 @@ pub struct FinishedDocument {
     /// Last geometry sent to the child, in columns and rows.
     pub capture_size: Option<(u16, u16)>,
     pub execution_source: Option<FinishedExecutionSource>,
+    presentation_reduced: bool,
+}
+
+/// Bounded visual output. The raw capture still owns export outside this
+/// projection when its retained grid or text exceeds the display budget.
+pub struct FinishedOutputProjection {
+    pub document: FinishedDocument,
+    pub clipped: bool,
+}
+
+impl FinishedOutputProjection {
+    pub fn notice(&self) -> Option<&'static str> {
+        if self.clipped {
+            Some("Output preview clipped. Copy or export for the full retained text.")
+        } else {
+            self.document.projection_notice()
+        }
+    }
 }
 
 impl FinishedDocument {
@@ -156,7 +174,32 @@ impl FinishedDocument {
             archive: super::project_finished_output(output, usize::from(size.0))?,
             capture_size: (size.0 != 0 && size.1 != 0).then_some(size),
             execution_source: None,
+            presentation_reduced: false,
         })
+    }
+
+    pub fn project_for_display(output: &str, size: (u16, u16)) -> FinishedOutputProjection {
+        if let Some(document) = Self::capture(output, size) {
+            return FinishedOutputProjection {
+                document,
+                clipped: false,
+            };
+        }
+        let (archive, clipped) = super::archived_text::project_replayed_output(output, size);
+        FinishedOutputProjection {
+            document: Self {
+                archive,
+                capture_size: (size.0 != 0 && size.1 != 0).then_some(size),
+                execution_source: None,
+                presentation_reduced: true,
+            },
+            clipped,
+        }
+    }
+
+    pub fn projection_notice(&self) -> Option<&'static str> {
+        self.presentation_reduced
+            .then_some("Output preview uses a terminal replay. Some effects may be omitted.")
     }
 
     pub fn output_source(&self) -> Option<CapturedExecutionSource> {
@@ -272,6 +315,7 @@ impl<'a> FinishedHistoryFrame<'a> {
         let metadata = MetadataV1 {
             capture_size: Some(source.capture_size),
             execution_source: Some(source.execution.clone()),
+            presentation_reduced: false,
             spans: Vec::new(),
             links: Vec::new(),
         };
@@ -302,6 +346,8 @@ struct MetadataV1 {
         deserialize_with = "read_execution_source"
     )]
     execution_source: Option<FinishedExecutionSource>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    presentation_reduced: bool,
     spans: Vec<SpanV1>,
     links: Vec<(Range<usize>, String)>,
 }
@@ -326,6 +372,12 @@ struct SpanV1 {
     // Older readers can still use the original colors, flags, and source.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     faint: bool,
+    #[serde(default, skip_serializing_if = "zero_extras")]
+    extras: u8,
+}
+
+fn zero_extras(value: &u8) -> bool {
+    *value == 0
 }
 
 impl MetadataV1 {
@@ -337,6 +389,7 @@ impl MetadataV1 {
         let metadata = Self {
             capture_size: document.capture_size,
             execution_source: document.execution_source.clone(),
+            presentation_reduced: document.presentation_reduced,
             spans: archive
                 .spans
                 .iter()
@@ -359,6 +412,7 @@ impl MetadataV1 {
         let Self {
             capture_size,
             execution_source,
+            presentation_reduced,
             spans,
             links,
         } = serde_json::from_slice(metadata).ok()?;
@@ -383,6 +437,7 @@ impl MetadataV1 {
             archive,
             capture_size,
             execution_source,
+            presentation_reduced,
         })
     }
 }
@@ -426,7 +481,10 @@ impl SpanV1 {
                 _ => return None,
             };
         let faint = style.flags.dim();
-        if Self::decode_flags(flags, faint)? != style.flags {
+        let extras = u8::from(style.flags.blink())
+            | (u8::from(style.flags.overline()) << 1)
+            | (u8::from(style.flags.concealed()) << 2);
+        if Self::decode_flags(flags, faint, extras)? != style.flags {
             return None;
         }
         Some(Self {
@@ -438,6 +496,7 @@ impl SpanV1 {
             ],
             flags,
             faint,
+            extras,
         })
     }
 
@@ -448,18 +507,24 @@ impl SpanV1 {
                 foreground: decode_color(self.colors[0])?,
                 background: decode_color(self.colors[1])?,
                 underline_color: decode_color(self.colors[2])?,
-                flags: Self::decode_flags(self.flags, self.faint)?,
+                flags: Self::decode_flags(self.flags, self.faint, self.extras)?,
             },
         })
     }
 
-    fn decode_flags(bits: u8, faint: bool) -> Option<StyleFlags> {
+    fn decode_flags(bits: u8, faint: bool, extras: u8) -> Option<StyleFlags> {
+        if extras & !0b111 != 0 {
+            return None;
+        }
         let mut flags = StyleFlags::new();
         flags.set_bold(bits & 1 != 0);
         flags.set_dim(faint);
         flags.set_italic(bits & 2 != 0);
         flags.set_inverse(bits & 4 != 0);
         flags.set_strikethrough(bits & 8 != 0);
+        flags.set_blink(extras & 1 != 0);
+        flags.set_overline(extras & 2 != 0);
+        flags.set_concealed(extras & 4 != 0);
         flags.set_underline(match bits >> 4 {
             0 => UnderlineStyle::None,
             1 => UnderlineStyle::Single,
@@ -492,6 +557,47 @@ fn decode_color(value: u32) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_replay_round_trips_extra_styles_and_its_notice() {
+        let capture =
+            "\x1b[2;1H\x1b[5mfirst\x1b[25m\x1b[3;1H\x1b[53mline\x1b[55m \x1b[8mhidden\x1b[28m";
+        let projection = FinishedDocument::project_for_display(capture, (80, 24));
+        assert!(!projection.clipped);
+        assert!(projection.notice().is_some());
+        let document = projection.document;
+        assert_eq!(document.archive.text, "first\nline hidden");
+        let [blink, overline, conceal] = document.archive.spans.as_slice() else {
+            panic!("unexpected spans: {:?}", document.archive.spans);
+        };
+        assert_eq!(blink.bytes, 0..5);
+        assert!(blink.style.flags.blink());
+        assert_eq!(overline.bytes, 6..10);
+        assert!(overline.style.flags.overline());
+        assert_eq!(conceal.bytes, 11..17);
+        assert!(conceal.style.flags.concealed());
+        let record = b"unchanged block record";
+        let frame = document.attach(&document.archive.text, record);
+        let restored = FinishedHistoryFrame::read(&frame);
+        assert_eq!(restored.record, record);
+        assert_eq!(restored.document(&document.archive.text).unwrap(), document);
+    }
+
+    #[test]
+    fn oversized_replay_marks_preview_without_inserting_text_into_copy() {
+        let mut capture = "budget row\r\n".repeat(6000);
+        capture.push_str("retained tail");
+        let projection = FinishedDocument::project_for_display(&capture, (80, 24));
+        assert!(projection.clipped);
+        assert!(projection.notice().unwrap().contains("preview clipped"));
+        assert!(is_bounded_document_text(&projection.document.archive.text));
+        assert!(!projection
+            .document
+            .archive
+            .text
+            .contains(projection.notice().unwrap()));
+        assert!(capture.ends_with("retained tail"));
+    }
 
     #[test]
     fn finished_document_round_trip_keeps_exact_text_style_links_and_geometry() {

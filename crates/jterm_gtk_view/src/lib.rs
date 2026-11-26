@@ -1,6 +1,8 @@
 //! GTK4 terminal view adapter. The embedding application supplies a PTY owner.
 #![forbid(unsafe_code)]
 
+mod attachment;
+pub use jterm_protocol::terminal::Attachment;
 mod command;
 mod document;
 mod find;
@@ -16,7 +18,12 @@ mod pty_dispatch;
 mod runtime_launch;
 #[cfg(target_os = "linux")]
 mod runtime_shell;
+#[cfg(target_os = "linux")]
+mod runtime_observer;
+#[cfg(target_os = "linux")]
+mod observer;
 mod text_link;
+mod terminal_find;
 mod transcript;
 mod view;
 mod viewport;
@@ -27,10 +34,13 @@ pub use command::{
 };
 pub use document::DocumentView;
 pub use find::{FindFrame, FindMatch, FindRegion, FindSnapshot, FindWindow};
+pub use terminal_find::{TerminalFind, TerminalFindStatus};
 pub use finished_output::{scroll_finished_output, FinishedOutputView};
 pub use history_checkpoint::HistoryCheckpoint;
 pub use inline_images::{InlineImageRequest, PendingInlineImage};
 pub use jterm_engine::authenticated_boundaries;
+pub use jterm_engine::frame::CellFrame;
+pub use jterm_engine::grid::Color;
 pub use jterm_engine::history_reflow::HistoryAnchor;
 pub use jterm_engine::terminal::TranscriptAnchor;
 pub use jterm_runtime::exit_status::PtyExit;
@@ -49,7 +59,7 @@ pub use pty_dispatch::{PtyDispatch, PtyEvent};
 #[cfg(target_os = "linux")]
 pub use runtime_shell::RuntimeShell;
 pub use transcript::{TranscriptRowChrome, TranscriptView, TranscriptZone, TranscriptZoneOrigin};
-pub use view::default_ansi_palette;
+pub use view::{default_ansi_palette, is_terminal_text_view, terminal_view_selection};
 
 /// Capabilities advertised by the shared standalone shell profile.
 pub const CHILD_ENV: [(&str, &str); 3] = [("TERM", "dumb"), ("VTE_VERSION", ""), ("COLORTERM", "")];
@@ -60,3 +70,6 @@ pub const INTERACTIVE_CHILD_ENV: [(&str, &str); 3] = [
     ("VTE_VERSION", ""),
     ("COLORTERM", "truecolor"),
 ];
+
+#[cfg(target_os = "linux")]
+pub use runtime_observer::{ObserverFrame, RuntimeObserver};

@@ -6,6 +6,7 @@ use jterm_engine::{
     colors::ColorState,
     frame::{CellFrame, Screen},
     history_reflow::{HistoryAnchor, HistoryLayout},
+    retained_bytes::{RetainedBytes, RetainedBytesBudget},
     terminal::{HistoryPage, Terminal},
 };
 
@@ -56,6 +57,21 @@ pub struct HistoryViewport {
     pub first: usize,
     pub window: HistoricalWindow,
     pub page: Option<HistoryPage>,
+}
+
+impl ViewportFrame {
+    pub fn reserve_delivery(&self, budget: &Arc<RetainedBytesBudget>) -> Option<RetainedBytes> {
+        let history_bytes = self
+            .history
+            .as_ref()
+            .and_then(|history| history.page.as_ref())
+            .map_or(0, HistoryPage::retained_delivery_bytes);
+        budget.reserve(
+            self.frame
+                .retained_delivery_bytes()
+                .saturating_add(history_bytes),
+        )
+    }
 }
 
 impl ViewportRequest {

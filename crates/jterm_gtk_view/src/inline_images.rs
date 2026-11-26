@@ -1,14 +1,21 @@
 use gtk4::{gdk, glib, graphene, prelude::*, subclass::prelude::*};
 use jterm_engine::{
     frame::{CellFrame, Screen},
+    retained_bytes::{RetainedBytes, RetainedBytesBudget},
     terminal::{
         HistoryPage, InlineImageId, InlineImageRow, PlacedInlineImage, PreparedInlineImage,
         Terminal,
     },
 };
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    sync::{Arc, OnceLock},
+};
 
 const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+const PROCESS_IMAGE_BYTES: usize = 8 * MAX_RETAINED_BYTES;
 const MAX_IMAGES: usize = 64;
 const IMAGE_BOOKKEEPING_BYTES: usize = 64 * 1024;
 
@@ -29,6 +36,7 @@ pub struct PendingInlineImage {
     columns: u16,
     rows: u16,
     charge: usize,
+    lease: RetainedBytes,
 }
 
 struct Image {
@@ -37,13 +45,27 @@ struct Image {
     columns: u16,
     rows: u16,
     charge: usize,
+    _lease: RetainedBytes,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct PaintSlice {
-    texture: gdk::Texture,
+    image: Rc<Image>,
     bounds: graphene::Rect,
     strip: graphene::Rect,
+}
+
+impl PartialEq for PaintSlice {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.image, &other.image)
+            && self.bounds == other.bounds
+            && self.strip == other.strip
+    }
+}
+
+fn process_image_budget() -> &'static Arc<RetainedBytesBudget> {
+    static PROCESS: OnceLock<Arc<RetainedBytesBudget>> = OnceLock::new();
+    PROCESS.get_or_init(|| Arc::new(RetainedBytesBudget::new(PROCESS_IMAGE_BYTES)))
 }
 
 mod imp {
@@ -67,7 +89,7 @@ mod imp {
         fn snapshot(&self, snapshot: &gtk4::Snapshot) {
             for slice in self.slices.borrow().iter() {
                 snapshot.push_clip(&slice.strip);
-                snapshot.append_texture(&slice.texture, &slice.bounds);
+                snapshot.append_texture(&slice.image.texture, &slice.bounds);
                 snapshot.pop();
             }
         }
@@ -82,13 +104,18 @@ glib::wrapper! {
 
 pub(crate) struct InlineImages {
     canvas: Canvas,
-    retained: HashMap<InlineImageId, Image>,
+    retained: HashMap<InlineImageId, Rc<Image>>,
     retained_bytes: usize,
     archived: Vec<(usize, usize, InlineImageRow)>,
+    process: Arc<RetainedBytesBudget>,
 }
 
 impl InlineImages {
     pub(crate) fn attach(viewport: &gtk4::Overlay) -> Self {
+        Self::with_budget(viewport, Arc::clone(process_image_budget()))
+    }
+
+    fn with_budget(viewport: &gtk4::Overlay, process: Arc<RetainedBytesBudget>) -> Self {
         let canvas = glib::Object::builder::<Canvas>()
             .property("can-target", false)
             .property("focusable", false)
@@ -105,6 +132,7 @@ impl InlineImages {
             retained: HashMap::new(),
             retained_bytes: 0,
             archived: Vec::new(),
+            process,
         }
     }
 
@@ -120,8 +148,7 @@ impl InlineImages {
         }
         let Some(origin) = self.canvas.parent().and_then(|viewport| {
             screen.compute_point(&viewport, &graphene::Point::new(rect.x(), rect.y()))
-        })
-        else {
+        }) else {
             return true;
         };
         let footprint = graphene::Rect::new(origin.x(), origin.y(), rect.width(), rect.height());
@@ -162,6 +189,7 @@ impl InlineImages {
         );
         let reservation =
             terminal.prepare_inline_image(cursor, columns, rows, request.move_cursor)?;
+        let lease = self.process.reserve(charge)?;
         Some(PendingInlineImage {
             owner: self.canvas.downgrade(),
             reservation,
@@ -169,6 +197,7 @@ impl InlineImages {
             columns,
             rows,
             charge,
+            lease,
         })
     }
 
@@ -186,15 +215,38 @@ impl InlineImages {
         self.retained_bytes += prepared.charge;
         self.retained.insert(
             source.id(),
-            Image {
+            Rc::new(Image {
                 source,
                 texture: prepared.texture,
                 columns: prepared.columns,
                 rows: prepared.rows,
                 charge: prepared.charge,
-            },
+                _lease: prepared.lease,
+            }),
         );
         true
+    }
+
+    pub(crate) fn missing_backing(&self, frame: &CellFrame) -> bool {
+        (0..frame.rows().len()).any(|row| {
+            frame
+                .inline_image_rows(row)
+                .any(|(_, image)| !self.retained.contains_key(&image.image))
+        })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.retained.clear();
+        self.retained_bytes = 0;
+        self.archived.clear();
+        self.canvas.imp().slices.borrow_mut().clear();
+        self.canvas.set_visible(false);
+    }
+
+    /// Share already admitted backing; no image reservation or raster copy.
+    pub(crate) fn share_from(&mut self, source: &Self) {
+        self.retained.clone_from(&source.retained);
+        self.retained_bytes = source.retained_bytes;
     }
 
     pub(crate) fn present(
@@ -265,7 +317,7 @@ impl InlineImages {
 
 impl Image {
     fn slice(
-        &self,
+        self: &Rc<Self>,
         row: usize,
         column: usize,
         slice: u16,
@@ -284,7 +336,7 @@ impl Image {
         let width = (i32::from(self.columns) * cell_width) as f32;
         let height = (i32::from(self.rows) * cell_height) as f32;
         Some(PaintSlice {
-            texture: self.texture.clone(),
+            image: Rc::clone(self),
             bounds: graphene::Rect::new(
                 x,
                 y - f32::from(slice) * cell_height as f32,
@@ -311,4 +363,69 @@ fn infer_columns(
         return None;
     }
     u32::try_from(numerator.div_ceil(denominator)).ok()
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a GTK display and a fresh process"]
+    fn observer_shares_admitted_image_backing_and_releases_it_on_detach() {
+        gtk4::init().unwrap();
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        let charge = 16 + IMAGE_BOOKKEEPING_BYTES;
+        let process = Arc::new(RetainedBytesBudget::new(charge));
+        let mut owner = InlineImages::with_budget(&gtk4::Overlay::new(), Arc::clone(&process));
+        let peer = InlineImages::with_budget(&gtk4::Overlay::new(), Arc::clone(&process));
+        let texture: gdk::Texture = gdk::MemoryTexture::new(
+            2,
+            2,
+            gdk::MemoryFormat::R8g8b8a8,
+            &glib::Bytes::from_static(&[255; 16]),
+            8,
+        )
+        .upcast();
+        let request = || InlineImageRequest {
+            columns: Some(3),
+            rows: 2,
+            move_cursor: false,
+            cursor: (0, 0),
+        };
+        let prepared = owner
+            .prepare(&terminal, texture.clone(), 0, request(), (8, 16))
+            .unwrap();
+        assert_eq!(process.usage().retained_bytes, charge);
+        assert!(peer
+            .prepare(&terminal, texture.clone(), 0, request(), (8, 16))
+            .is_none());
+        assert!(owner.admit(prepared, |r| terminal.place_inline_image(r)));
+        let frame = terminal.frame().unwrap();
+        let mut observer = InlineImages::with_budget(&gtk4::Overlay::new(), Arc::clone(&process));
+        assert!(observer.missing_backing(&frame));
+        observer.share_from(&owner);
+        assert!(!observer.missing_backing(&frame));
+        assert!(Rc::ptr_eq(
+            owner.retained.values().next().unwrap(),
+            observer.retained.values().next().unwrap()
+        ));
+        owner.clear();
+        assert_eq!(process.usage().retained_bytes, charge);
+        drop(terminal);
+        observer.present(&frame, None, || (0, 0, 8, 16));
+        assert_eq!(observer.painted_slices(), 2);
+        let painted = observer.canvas.imp().slices.borrow()[0].clone();
+        observer.clear();
+        assert_eq!(observer.painted_slices(), 0);
+        assert!(observer.retained.is_empty());
+        assert_eq!(process.usage().retained_bytes, charge);
+        drop(painted);
+        assert_eq!(process.usage().retained_bytes, 0);
+        let terminal = Terminal::new(4, 8).unwrap();
+        let admitted_after_clear = peer
+            .prepare(&terminal, texture, 0, request(), (8, 16))
+            .unwrap();
+        assert_eq!(process.usage().retained_bytes, charge);
+        drop(admitted_after_clear);
+        assert_eq!(process.usage().retained_bytes, 0);
+    }
 }

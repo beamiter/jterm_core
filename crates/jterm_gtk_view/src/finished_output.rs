@@ -12,6 +12,7 @@ struct OutputViewport {
     text: FinishedTextView,
     widget: OutputAllocation,
     scroll: ScrolledWindow,
+    notice: gtk4::Label,
     initial_rows: i64,
     collapsed_rows: Cell<i64>,
     expanded_rows: i64,
@@ -93,11 +94,22 @@ impl FinishedOutputView {
         let widget = glib::Object::builder::<OutputAllocation>()
             .property("hexpand", true)
             .build();
-        scroll.set_parent(&widget);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let notice = gtk4::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .build();
+        notice.add_css_class("dim-label");
+        notice.add_css_class("jterm-output-projection-notice");
+        content.append(&notice);
+        content.append(&scroll);
+        content.set_parent(&widget);
         let view = OutputViewport {
             text,
             widget,
             scroll,
+            notice,
             initial_rows,
             collapsed_rows: Cell::new(initial_rows),
             expanded_rows,
@@ -117,6 +129,15 @@ impl FinishedOutputView {
 
     pub fn adjustment(&self) -> gtk4::Adjustment {
         self.0.scroll.vadjustment()
+    }
+
+    /// Describe a clipped or partially represented preview outside the
+    /// selectable document. Filtering and replacing rows keeps this notice.
+    pub fn set_projection_notice(&self, message: Option<&str>) {
+        self.0.notice.set_label(message.unwrap_or_default());
+        self.0
+            .notice
+            .set_visible(message.is_some_and(|text| !text.is_empty()));
     }
 
     /// Reserve rows for pane chrome and the live prompt at the current scale.

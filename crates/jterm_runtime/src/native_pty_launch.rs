@@ -32,7 +32,7 @@ pub enum WorkingDirectory<'a> {
     Descriptor(BorrowedFd<'a>),
 }
 
-/// Product launch policy prepared in the parent, including argv[0].
+/// Product launch policy prepared in the parent, including `argv[0]`.
 pub struct PtyLaunch<'a> {
     pub executable: &'a CStr,
     pub argv: &'a [CString],

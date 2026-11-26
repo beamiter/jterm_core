@@ -1,4 +1,52 @@
 use super::*;
+
+#[test]
+fn shared_budget_counts_coalesced_and_in_flight_messages_and_reserves_replies() {
+    let budget = Arc::new(ProcessInputBudget::new(20, 5));
+    let first = WriteQueue::with_process_budget(WriteQueueLimits::PRODUCTION, Arc::clone(&budget));
+    let mut second =
+        WriteQueue::with_process_budget(WriteQueueLimits::PRODUCTION, Arc::clone(&budget));
+    second.split = Some(SplitWriteLimits {
+        user_bytes: 40,
+        response_bytes: 40,
+        entries: 10,
+        coalesce_bytes: 10,
+    });
+
+    first.try_enqueue(vec![1; 10]).unwrap();
+    let in_flight = first.take().unwrap();
+    second.try_enqueue(vec![2; 3]).unwrap();
+    second.try_enqueue(vec![3; 2]).unwrap();
+    assert!(matches!(
+        second.try_enqueue(vec![4]),
+        Err(WriteError::Full {
+            queued_bytes: 15,
+            byte_capacity: 15,
+            ..
+        })
+    ));
+    assert_eq!(second.state.lock().pending[0].bytes, [2, 2, 2, 3, 3]);
+    assert_eq!(second.state.lock().accounted_messages, 1);
+    second
+        .try_enqueue_input(WriteOrigin::Reply, vec![5; 5].into())
+        .unwrap();
+    assert!(matches!(
+        second.try_enqueue_input(WriteOrigin::Reply, vec![6].into()),
+        Err(WriteError::Full {
+            queued_bytes: 20,
+            byte_capacity: 20,
+            ..
+        })
+    ));
+
+    first.finish(&in_flight);
+    assert_eq!(budget.usage().reserved_bytes, 20);
+    drop(in_flight);
+    assert_eq!(budget.usage().reserved_bytes, 10);
+    second.close();
+    assert_eq!(budget.usage().reserved_bytes, 0);
+    assert_eq!(budget.usage().peak_reserved_bytes, 20);
+}
 use std::os::fd::BorrowedFd;
 
 #[test]
