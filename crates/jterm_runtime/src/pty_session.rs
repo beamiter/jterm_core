@@ -939,15 +939,16 @@ impl Session {
         let Some(group) = io.actor.foreground_pgid() else {
             return false;
         };
-        let observed = process_stat(child)
-            .zip(process_stat(group))
-            .is_some_and(|(owner, process)| {
-                owner.is_live()
-                    && process.is_live()
-                    && owner.session == process.session
-                    && process.process_group == group
-                    && process.foreground_group == group
-            });
+        let observed =
+            process_stat(child)
+                .zip(process_stat(group))
+                .is_some_and(|(owner, process)| {
+                    owner.is_live()
+                        && process.is_live()
+                        && owner.session == process.session
+                        && process.process_group == group
+                        && process.foreground_group == group
+                });
         observed && foreground_codex_program(group) && io.actor.foreground_pgid() == Some(group)
     }
 
