@@ -2,6 +2,45 @@ use super::*;
 use crate::history_reflow::HistoryAnchor;
 
 #[test]
+fn key_format_queries_report_encoding_and_preserve_tabs() {
+    for chunk in 1..=8 {
+        let mut terminal = Terminal::new(2, 16).unwrap();
+        terminal.feed(b"\x1b[>4;2m").unwrap();
+        let tabs = terminal.vt.screen.tab_stops.clone();
+        for (format, expected) in [(0, 0), (1, 1), (2, 0), (65535, 0), (1, 1)] {
+            let stream = format!("\x1b[>4;{format}f\x1b[?04g\x1b[?3g\x1b[?0g");
+            let mut reply = Vec::new();
+            for bytes in stream.as_bytes().chunks(chunk) {
+                reply.extend(terminal.feed(bytes).unwrap());
+            }
+            assert_eq!(reply, format!("\x1b[>4;{expected}f").as_bytes());
+            assert_eq!(terminal.vt.screen.tab_stops, tabs);
+            assert_eq!(
+                terminal.encode_key("a", false, false, true).unwrap(),
+                if expected == 1 {
+                    b"\x1b[97;5u".as_slice()
+                } else {
+                    b"\x1b[27;5;97~"
+                }
+            );
+        }
+        assert!(terminal
+            .feed(b"\x1b[?4:0g\x1b[?4;0g\x1b[?4 g")
+            .unwrap()
+            .is_empty());
+        assert_eq!(terminal.vt.screen.tab_stops, tabs);
+        terminal.feed(b"\t").unwrap();
+        assert_eq!(terminal.frame().unwrap().cursor().col, 8);
+        terminal.feed(b"\x1b[g\r\t").unwrap();
+        assert_eq!(terminal.frame().unwrap().cursor().col, 15);
+        terminal.feed(b"\x1b[4G\x1bH").unwrap();
+        assert!(terminal.vt.screen.tab_stops[3]);
+        terminal.feed(b"\x1b[3g").unwrap();
+        assert!(terminal.vt.screen.tab_stops.iter().all(|stop| !stop));
+    }
+}
+
+#[test]
 fn key_format_negotiation_preserves_pending_wrap_and_changes_key_bytes() {
     let negotiation = b"\x1b[>4;2m\x1b[>4;1f";
     for cut in 0..=negotiation.len() {
@@ -751,11 +790,15 @@ fn exceptionally_narrow_history_projection_retains_access_to_raw_rows() {
     let mut terminal = Terminal::new(1, 256).unwrap();
     let mut line = "x".repeat(256);
     line.push_str("\r\n");
-    for _ in 0..300 {
+    for _ in 0..299 {
         terminal.feed(line.as_bytes()).unwrap();
     }
+    terminal
+        .feed("\x1b[31mé\x1b[0msecond\r\n".as_bytes())
+        .unwrap();
     terminal.resize(1, 1).unwrap();
     let history = terminal.history_layout().unwrap();
+    assert!(history.projected.is_none());
     assert_eq!(history.len(), 300);
     assert_eq!(history.anchor_at(299).unwrap().row, 299);
     assert_eq!(
@@ -766,6 +809,21 @@ fn exceptionally_narrow_history_projection_retains_access_to_raw_rows() {
             .len(),
         256
     );
+    let tail = terminal.projected_history_page(&history, 299, 8).unwrap();
+    assert_eq!(tail.text, "ésecond");
+    assert_eq!((tail.row_count, tail.total_rows, tail.offset), (1, 300, 0));
+    assert_eq!(tail.row(0).unwrap().cells[0].foreground, Color::Red);
+    assert_eq!(tail.revision, terminal.history_page(0, 1).unwrap().revision);
+    let empty = terminal.projected_history_page(&history, 300, 8).unwrap();
+    assert_eq!(empty.text, "");
+    assert_eq!(
+        (empty.row_count, empty.total_rows, empty.offset),
+        (0, 300, 0)
+    );
+    assert!(terminal.projected_history_page(&history, 301, 8).is_err());
+    assert!(terminal.projected_history_page(&history, 0, 0).is_err());
+    terminal.set_history_row_limit(299);
+    assert!(terminal.projected_history_page(&history, 299, 8).is_err());
 }
 
 #[test]

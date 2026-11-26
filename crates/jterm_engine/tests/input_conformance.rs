@@ -1,4 +1,4 @@
-//! Independent literal wire fixtures; scope: Ember-compatible shared primitives.
+//! Independent literal wire fixtures for shared terminal input negotiation.
 use jterm_engine::{
     input::{self, Key, Modifiers},
     mode_mutation::{apply_ember_mode, ModeNamespace},
@@ -7,6 +7,38 @@ use jterm_engine::{
     screen::ScreenState,
     semantics::{dispatch_frost_legacy_csi, dispatch_local, Dispatch, Effect},
 };
+
+#[test]
+fn frost_format_queries_preserve_tabs_and_report_active_format() {
+    let mut screen = ScreenState::new(2, 16);
+    let tabs = screen.tab_stops.clone();
+    let mut protocol = ProtocolState::default();
+    for (stored, expected) in [(0, 0), (1, 1), (2, 0)] {
+        protocol.set_xterm_format_other_keys(stored);
+        for (raw, params) in [(b"04".as_slice(), 4), (b"3", 3), (b"0", 0)] {
+            let actual = dispatch_frost_legacy_csi(
+                &mut screen,
+                &mut protocol,
+                raw,
+                &[params],
+                b'g',
+                Some(b'?'),
+                b"",
+            );
+            let expected = if params == 4 {
+                Dispatch::Handled(
+                    [Effect::Reply(format!("\x1b[>4;{expected}f").into_bytes())]
+                        .into_iter()
+                        .collect(),
+                )
+            } else {
+                Dispatch::Handled(Default::default())
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(screen.tab_stops, tabs);
+        }
+    }
+}
 
 #[test]
 fn frost_key_format_commands_preserve_wrap_and_cursor() {

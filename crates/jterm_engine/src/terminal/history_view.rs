@@ -302,7 +302,11 @@ impl Terminal {
         let end = (first + limit).min(layout.len());
         let offset = layout.len() - end;
         let Some(projected) = &layout.projected else {
-            return self.history_page(offset, limit);
+            let count = end - first;
+            if count == 0 {
+                return self.make_history_page(offset, layout.len(), Vec::new());
+            }
+            return self.history_page(offset, count);
         };
         let mut reader = HistoryReader::new(&self.history, layout);
         let rows = projected[first..end]

@@ -872,16 +872,21 @@ impl TerminalGrid {
         if row >= self.rows || cols.start >= end {
             return;
         }
-        if end == self.cols {
-            // No wide partner can extend past the right margin. Only the
-            // first continuation can extend the erase to the left.
+        let right_partner = end < self.cols && self.get(row, end - 1).flags.wide();
+        // Adjacent malformed leads and wide blanks can change the flags that
+        // scalar erasure reads at the last selected cell.
+        let scalar_edges = end < self.cols
+            && (blank.flags.wide()
+                || (right_partner && end - cols.start > 1 && self.get(row, end - 2).flags.wide()));
+        if !scalar_edges {
             let mut start = cols.start;
             if start > 0 && self.get(row, start).flags.wide_continuation() {
                 start -= 1;
             }
-            self.row_cells_mut(row, start..end).fill(blank);
-            self.set_underline_color(row, start..end, Color::Default);
-            self.erase_annotations(row, start..end);
+            let affected_end = end + usize::from(right_partner);
+            self.row_cells_mut(row, start..affected_end).fill(blank);
+            self.set_underline_color(row, start..affected_end, Color::Default);
+            self.erase_annotations(row, start..affected_end);
             return;
         }
         for col in cols.start..end {
@@ -1639,13 +1644,17 @@ impl ScrollbackLine {
     pub fn decompress(&self) -> Vec<TerminalCell> {
         match self.content() {
             ScrollbackContent::Plain(text, trailing) => {
-                let mut cells: Vec<TerminalCell> = text
-                    .chars()
-                    .map(|ch| TerminalCell {
-                        character: ch,
-                        ..Default::default()
-                    })
-                    .collect();
+                let cell = |character| TerminalCell {
+                    character,
+                    ..TerminalCell::default()
+                };
+                let mut cells = if text.is_ascii() {
+                    let mut cells = Vec::with_capacity(self.columns());
+                    cells.extend(text.bytes().map(char::from).map(cell));
+                    cells
+                } else {
+                    text.chars().map(cell).collect()
+                };
                 cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
                 cells
             }
@@ -1942,8 +1951,8 @@ impl ScrollbackLine {
         let mut i = 0;
         while i < cells.len() {
             let cell = &cells[i];
-            let ch_str = cell.character.to_string();
-            let ch_bytes = ch_str.as_bytes();
+            let mut character = [0; 4];
+            let ch_bytes = cell.character.encode_utf8(&mut character).as_bytes();
 
             // RLE: count consecutive identical cells (packed flags comparison is a single u16 ==)
             let mut run = 1u8;
@@ -2340,6 +2349,57 @@ fn clipped_right_edge_erase_repairs_wide_lead_and_retains_outside_metadata() {
             color: Color::Red
         }]
     );
+}
+
+#[cfg(test)]
+#[test]
+fn middle_erase_matches_scalar_order_for_all_small_wide_flag_patterns() {
+    fn scalar(grid: &mut TerminalGrid, span: Range<usize>, blank: TerminalCell) {
+        for col in span.start..span.end.min(grid.cols()) {
+            let flags = grid.get(0, col).flags;
+            if col > 0 && flags.wide_continuation() {
+                *grid.get_mut(0, col - 1) = blank;
+            }
+            if col + 1 < grid.cols() && flags.wide() {
+                *grid.get_mut(0, col + 1) = blank;
+            }
+            *grid.get_mut(0, col) = blank;
+        }
+    }
+    for bits in 0..1024usize {
+        let mut seed = TerminalGrid::new(1, 5);
+        for col in 0..5 {
+            let cell = seed.get_mut(0, col);
+            cell.character = char::from(b'a' + col as u8);
+            cell.flags.set_wide(bits & (1 << (2 * col)) != 0);
+            cell.flags
+                .set_wide_continuation(bits & (2 << (2 * col)) != 0);
+            seed.set_cluster_text(0, col, "e\u{301}").unwrap();
+        }
+        seed.set_underline_color(0, 0..5, Color::Red);
+        for start in 0..5 {
+            for end in start + 1..=5 {
+                for blank_bits in 0..4 {
+                    let mut blank = TerminalCell {
+                        background: Color::Blue,
+                        ..TerminalCell::default()
+                    };
+                    blank.flags.set_wide(blank_bits & 1 != 0);
+                    blank.flags.set_wide_continuation(blank_bits & 2 != 0);
+                    let mut actual = seed.clone();
+                    let mut expected = seed.clone();
+                    actual.erase_cells(0, start..end, blank);
+                    scalar(&mut expected, start..end, blank);
+                    assert_eq!(
+                        actual.cells, expected.cells,
+                        "bits={bits} span={start}..{end} blank={blank_bits}"
+                    );
+                    assert_eq!(actual.underline_colors, expected.underline_colors);
+                    assert_eq!(actual.annotations, expected.annotations);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

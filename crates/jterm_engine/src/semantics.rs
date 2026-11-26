@@ -30,6 +30,11 @@ fn modify_other_keys_reply(protocol: &ProtocolState) -> Vec<u8> {
     format!("\x1b[>4;{}m", protocol.xterm_modify_other_keys().min(2)).into_bytes()
 }
 
+fn format_other_keys_reply(protocol: &ProtocolState) -> Vec<u8> {
+    let format = u8::from(protocol.xterm_format_other_keys() == 1);
+    format!("\x1b[>4;{format}f").into_bytes()
+}
+
 pub(crate) struct UnderlinePen {
     pub current: Color,
     pub primary: Option<Color>,
@@ -116,7 +121,7 @@ fn dispatch_cursor_csi(
         ),
         b'I' => screen.tab_forward(count),
         b'Z' => screen.tab_backward(count),
-        b'g' => match first.unwrap_or(0) {
+        b'g' if private_prefix.is_none() && intermediates.is_empty() => match first.unwrap_or(0) {
             0 => screen.clear_tab_stop(),
             3 => screen.clear_all_tab_stops(),
             _ => {}
@@ -147,6 +152,16 @@ pub fn dispatch_frost_legacy_csi(
     private_prefix: Option<u8>,
     intermediates: &[u8],
 ) -> Dispatch {
+    if cmd == b'g' && private_prefix == Some(b'?') && intermediates.is_empty() {
+        let effects = if params == [4] && raw_params.iter().all(u8::is_ascii_digit) {
+            [Effect::Reply(format_other_keys_reply(protocol))]
+                .into_iter()
+                .collect()
+        } else {
+            Effects::new()
+        };
+        return Dispatch::Handled(effects);
+    }
     if cmd == b'f' && private_prefix == Some(b'>') && intermediates.is_empty() {
         set_xterm_format_other_keys(protocol, params);
         return Dispatch::Handled(Effects::new());
@@ -281,6 +296,18 @@ pub(crate) fn dispatch_local_with_underline(
 ) -> Dispatch {
     let mut effects = Effects::new();
     match event {
+        Event::Csi {
+            params,
+            colon_flags,
+            private_prefix: Some(b'?'),
+            intermediates,
+            final_byte: b'g',
+            ..
+        } if intermediates.is_empty() => {
+            if params.as_slice() == [4] && !colon_flags.iter().any(|colon| *colon) {
+                effects.push(Effect::Reply(format_other_keys_reply(protocol)));
+            }
+        }
         Event::Csi {
             params,
             colon_flags,
@@ -430,7 +457,8 @@ pub(crate) fn dispatch_local_with_underline(
             // Classify BEFORE changing wrap/cursor or generating effects.
             let local = match cmd {
                 b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'H' | b'I' | b'Z' | b'a'
-                | b'd' | b'e' | b'f' | b'g' | b'j' | b'k' | b'`' | b'm' | b's' | b'u' => true,
+                | b'd' | b'e' | b'f' | b'j' | b'k' | b'`' | b'm' | b's' | b'u' => true,
+                b'g' => plain,
                 b'K' => intermediates.is_empty() && matches!(private_prefix, None | Some(b'?')),
                 b'@' | b'P' | b'X' | b'r' => plain,
                 b'q' => {
