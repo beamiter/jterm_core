@@ -109,6 +109,17 @@ mod tests {
             result.stdout
         };
         assert_eq!(cap(&["colors"]), b"256\n");
+        assert!(cap(&["rep", "88", "0"]).is_empty());
+        assert_eq!(cap(&["rep", "88", "1"]), b"X");
+        let repeat = cap(&["rep", "88", "25"]);
+        assert_eq!(repeat, b"X\x1b[24b");
+        let mut repeated = Terminal::new(3, 8).unwrap();
+        repeated.feed(&repeat).unwrap();
+        assert_eq!(repeated.history_page(0, 1).unwrap().text, "XXXXXXXX");
+        let frame = repeated.frame().unwrap();
+        assert_eq!((frame.cursor().row, frame.cursor().col), (2, 1));
+        assert!(repeated.visible_text().starts_with("XXXXXXXX\nXXXXXXXX\nX"));
+
         let mut terminal = Terminal::new(24, 80).unwrap();
         terminal.enable_device_answers();
         terminal.feed(&cap(&["smkx"])).unwrap();

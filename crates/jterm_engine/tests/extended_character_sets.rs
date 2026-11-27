@@ -51,6 +51,18 @@ fn saved_single_shift_is_consumed_by_one_graphic_space_after_cursor_restore() {
 }
 
 #[test]
+fn repeat_preserves_the_pending_single_shift_for_the_next_input_graphic() {
+    let packet = b"q\x1b*0\x1bN\x1b[5bqq";
+    for split in 0..=packet.len() {
+        let mut terminal = Terminal::new(2, 16).unwrap();
+        terminal.feed(&packet[..split]).unwrap();
+        terminal.feed(&packet[split..]).unwrap();
+        assert!(terminal.visible_text().starts_with("qqqqqq─q"));
+        assert_eq!(terminal.frame().unwrap().cursor().col, 8);
+    }
+}
+
+#[test]
 fn dec_special_control_pictures_survive_all_feed_partitions() {
     for packet in [
         b"\x1b(0bcdehi\x1b(Bbci".as_slice(),

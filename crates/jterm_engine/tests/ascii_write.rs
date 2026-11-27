@@ -1,5 +1,6 @@
 use jterm_engine::grid::{AsciiOverwritePolicy, Color, RawRowId, TerminalCell, TerminalGrid};
 use jterm_engine::screen::{AsciiWriteStep, RowMutation, ScreenState, VerticalMotion};
+use jterm_engine::terminal::Terminal;
 use jterm_engine::HyperlinkId;
 
 fn seed(cols: usize, row: usize, col: usize, pending: bool, wide: bool) -> ScreenState {
@@ -145,6 +146,73 @@ fn off_at_last_column_keeps_one_byte_batches_and_rep_source() {
         assert_eq!(s.last_printed_char, Some(*byte as char));
         assert_eq!(s.cursor_col, 0);
         assert!(!s.pending_wrap);
+    }
+}
+
+#[test]
+fn ascii_rep_matches_scalar_output_in_live_and_retained_rows() {
+    let cases: [(&[u8], u8, &str); 4] = [
+        (b"\x1b[3;4H", b'#', "\u{fe0f}\u{20e3}"),
+        (b"\x1b[?7l\x1b[2;4H", b' ', ""),
+        (b"\x1b[?1049h\x1b[2;3r\x1b[3;4H", b'X', ""),
+        (b"\x1b[4h\x1b[2;4H", b'X', ""),
+    ];
+    for (setup, byte, suffix) in cases {
+        let seed = || {
+            let mut terminal = Terminal::new(3, 8).unwrap();
+            terminal.enable_grapheme_clusters();
+            terminal.enable_underline_colors();
+            terminal.enable_hyperlinks(|_, _| true);
+            terminal.track_printed_spaces();
+            terminal.feed("old\r\nxx界tail".as_bytes()).unwrap();
+            terminal.feed(setup).unwrap();
+            terminal
+                .feed(b"\x1b[31;44;4:3;58;5;33m\x1b]8;;https://example.test/rep\x07")
+                .unwrap();
+            terminal
+        };
+        let mut literal = seed();
+        for _ in 0..21 {
+            literal.feed(&[byte]).unwrap();
+        }
+        literal.feed(suffix.as_bytes()).unwrap();
+        let baseline = literal.frame().unwrap();
+        let expected_history = literal.history_page(0, 8).unwrap();
+        let mut request = vec![byte];
+        request.extend_from_slice(b"\x1b[20b");
+        request.extend_from_slice(suffix.as_bytes());
+        for split in 0..=request.len() {
+            let mut repeated = seed();
+            repeated.feed(&request[..split]).unwrap();
+            repeated.feed(&request[split..]).unwrap();
+            let frame = repeated.frame().unwrap();
+            assert_eq!(frame.rows(), baseline.rows());
+            assert_eq!(frame.cursor(), baseline.cursor());
+            assert_eq!(repeated.visible_text(), literal.visible_text());
+            assert_eq!(repeated.unsupported_count(), literal.unsupported_count());
+            for row in 0..3 {
+                assert_eq!(
+                    frame.underline_color_runs(row),
+                    baseline.underline_color_runs(row)
+                );
+                for col in 0..8 {
+                    assert_eq!(
+                        frame.cluster_text(row, col),
+                        baseline.cluster_text(row, col)
+                    );
+                }
+            }
+            assert_eq!(repeated.history_extent(), literal.history_extent());
+            let history = repeated.history_page(0, 8).unwrap();
+            assert_eq!(history.text, expected_history.text);
+            for row in 0..history.row_count {
+                assert_eq!(history.row(row), expected_history.row(row));
+                assert_eq!(
+                    history.underline_color_runs(row),
+                    expected_history.underline_color_runs(row)
+                );
+            }
+        }
     }
 }
 #[test]

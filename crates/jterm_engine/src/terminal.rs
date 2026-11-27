@@ -1670,10 +1670,20 @@ impl Terminal {
 
         // Keep both boundaries in the scalar path. The leading byte can join
         // a previous grapheme and the trailing byte owns any later extension.
-        let (&last, mut middle) = tail.split_last().expect("ASCII run has a tail");
+        let (&last, middle) = tail.split_last().expect("ASCII run has a tail");
         let autowrap = self.vt.protocol.modes().contains(&7);
-        while !middle.is_empty() {
-            match self.vt.screen.step_ascii_write(middle, autowrap) {
+        let consumed = self.write_ascii_rows(middle, autowrap);
+        self.finish_grapheme();
+        for &byte in &middle[consumed..] {
+            self.print(char::from(byte));
+        }
+        self.print(char::from(last));
+    }
+
+    fn write_ascii_rows(&mut self, mut bytes: &[u8], autowrap: bool) -> usize {
+        let length = bytes.len();
+        while !bytes.is_empty() {
+            match self.vt.screen.step_ascii_write(bytes, autowrap) {
                 AsciiWriteStep::NeedsWrap => self.motion(VerticalMotion::Wrap),
                 AsciiWriteStep::Written { consumed, mutation } => {
                     if let (Some(pen), Some(columns)) = (&self.underline_pen, mutation.printed) {
@@ -1682,16 +1692,12 @@ impl Terminal {
                             .grid
                             .set_underline_color(mutation.row, columns, pen.current);
                     }
-                    middle = &middle[consumed..];
+                    bytes = &bytes[consumed..];
                 }
                 AsciiWriteStep::Stopped => break,
             }
         }
-        self.finish_grapheme();
-        for &byte in middle {
-            self.print(char::from(byte));
-        }
-        self.print(char::from(last));
+        length - bytes.len()
     }
 
     fn print_cell(&mut self, ch: char, translated: char) {
@@ -1769,7 +1775,7 @@ impl Terminal {
         self.vt.screen.last_printed_char = Some(translated);
     }
 
-    fn repeat_print(&mut self, count: usize) {
+    fn repeat_print(&mut self, mut count: usize) {
         let Some(ch) = self.vt.screen.last_printed_char else {
             return;
         };
@@ -1800,6 +1806,34 @@ impl Terminal {
             }
         } else {
             let translated = self.vt.screen.translate_char(ch);
+            if count >= 4
+                && (' '..='~').contains(&ch)
+                && translated == ch
+                && !self.vt.screen.insert_mode
+            {
+                let autowrap = self.vt.protocol.modes().contains(&7);
+                if !autowrap {
+                    // Further writes at the right margin overwrite the same glyph.
+                    let remaining = self
+                        .vt
+                        .screen
+                        .grid
+                        .cols()
+                        .saturating_sub(self.vt.screen.cursor_col)
+                        .max(1);
+                    count = count.min(remaining);
+                }
+                let repeated = [ch as u8; HOST_MAX_COLS];
+                // The last scalar can still receive a combining mark or widen.
+                while count > 1 {
+                    let length = (count - 1).min(repeated.len());
+                    let written = self.write_ascii_rows(&repeated[..length], autowrap);
+                    count -= written;
+                    if written < length {
+                        break;
+                    }
+                }
+            }
             for _ in 0..count {
                 self.print_cell(ch, translated);
             }
