@@ -142,13 +142,7 @@ fn da_queries_keep_wire_identity_and_interleave_with_other_replies() {
 
 #[test]
 fn da_unknown_prefixes_and_intermediates_leave_dispatch_unhandled() {
-    for bytes in [
-        b"\x1b[?0c".as_slice(),
-        b"\x1b[=0c",
-        b"\x1b[0$c",
-        b"\x1b[>0 c",
-        b"\x1bZ",
-    ] {
+    for bytes in [b"\x1b[?0c".as_slice(), b"\x1b[0$c", b"\x1b[>0 c", b"\x1bZ"] {
         check(bytes, true, false, &[]);
     }
 }
@@ -215,5 +209,21 @@ fn local_capability_policy_does_not_advertise_stored_unsupported_modes() {
 fn lookalike_queries_are_not_claimed_as_decrqm() {
     for bytes in [b"\x1b[>4$p".as_slice(), b"\x1b[?6p", b"\x1b[?6$z"] {
         check(bytes, true, false, &[]);
+    }
+}
+
+#[test]
+fn tertiary_unit_id_is_anonymous_read_only_and_has_a_distinct_namespace() {
+    for query in [b"\x1b[=c".as_slice(), b"\x1b[=0c", b"\x1b[=000c"] {
+        check(query, true, true, &[b"\x1bP!|00000000\x1b\\"]);
+    }
+    for query in [
+        b"\x1b[=1c".as_slice(),
+        b"\x1b[=0;0c",
+        b"\x1b[=0:0c",
+        b"\x1b[=0 c",
+        b"\x1b[=0$c",
+    ] {
+        check(query, true, false, &[]);
     }
 }

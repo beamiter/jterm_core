@@ -1892,7 +1892,7 @@ impl ScrollbackLine {
             ScrollbackLine {
                 data: CompressedLineData::Plain(text, trailing_blanks as u16),
                 is_wrapped,
-                archive_flags: 0,
+                archive_flags: u8::from(cells.len() > usize::from(u16::MAX)) << 2,
                 cols,
                 reflow_content_len,
                 reflow_wide_continuations,
@@ -2003,7 +2003,9 @@ impl ScrollbackLine {
                     cells.extend(text.bytes().map(char::from).map(cell));
                     cells
                 } else {
-                    text.chars().map(cell).collect()
+                    let mut cells = Vec::with_capacity(self.columns());
+                    cells.extend(text.chars().map(cell));
+                    cells
                 };
                 cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
                 cells
@@ -2213,8 +2215,15 @@ impl ScrollbackLine {
     ///   列映射跳过宽字符续接单元。
     pub fn search_text(&self) -> (std::borrow::Cow<'_, str>, Option<Vec<usize>>, usize) {
         match self.content() {
-            ScrollbackContent::Plain(text, _) => {
-                (std::borrow::Cow::Borrowed(text), None, text.chars().count())
+            ScrollbackContent::Plain(text, trailing) => {
+                // Ordinary archive widths and trailing blanks already count scalars.
+                // Public callers may compress wider rows than the u16 archive geometry.
+                let columns = if self.archive_flags & 4 == 0 {
+                    self.columns() - usize::from(trailing)
+                } else {
+                    text.chars().count()
+                };
+                (std::borrow::Cow::Borrowed(text), None, columns)
             }
             ScrollbackContent::Encoded(_) => {
                 let cells = self.decompress();
@@ -2325,23 +2334,18 @@ impl ScrollbackLine {
     }
 
     fn decode_flags(f: u8) -> StyleFlags {
-        let underline = match (f >> 2) & 0x7 {
-            0 => UnderlineStyle::None,
-            1 => UnderlineStyle::Single,
-            2 => UnderlineStyle::Double,
-            3 => UnderlineStyle::Curly,
-            4 => UnderlineStyle::Dotted,
-            5 => UnderlineStyle::Dashed,
-            _ => UnderlineStyle::None,
+        let bits = u16::from(f);
+        let underline = bits & UNDERLINE_MASK;
+        let underline = if underline <= 5 << UNDERLINE_SHIFT {
+            underline
+        } else {
+            0
         };
-        let mut flags = StyleFlags::new();
-        flags.set_bold(f & 1 != 0);
-        flags.set_italic(f & 2 != 0);
-        flags.set_underline(underline);
-        flags.set_inverse(f & 32 != 0);
-        flags.set_dim(f & 64 != 0);
-        flags.set_strikethrough(f & 128 != 0);
-        flags
+        StyleFlags(
+            (bits & (BOLD_BIT | ITALIC_BIT | INVERSE_BIT | DIM_BIT))
+                | underline
+                | ((bits & 128) << 1),
+        )
     }
 
     fn encode_cells(cells: &[TerminalCell], preserve_blink: bool) -> Vec<u8> {
@@ -2423,6 +2427,28 @@ impl ScrollbackLine {
         cells.resize(cols, TerminalCell::default());
     }
 
+    // Keep uncommon lengths out of the hot one-to-three-byte decoder.
+    #[inline(never)]
+    fn decode_uncommon_run_char(bytes: &[u8]) -> char {
+        if let [lead @ 0xf0..=0xf4, second @ 0x80..=0xbf, third @ 0x80..=0xbf, last @ 0x80..=0xbf] =
+            bytes
+        {
+            let scalar = (u32::from(lead & 7) << 18)
+                | (u32::from(second & 0x3f) << 12)
+                | (u32::from(third & 0x3f) << 6)
+                | u32::from(last & 0x3f);
+            // The lower bound excludes overlong F0; from_u32 enforces the upper bound.
+            if scalar >= 0x10000 {
+                return char::from_u32(scalar).unwrap_or(' ');
+            }
+            return ' ';
+        }
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or(' ')
+    }
+
     fn decode_run(
         data: &[u8],
         pos: &mut usize,
@@ -2430,10 +2456,22 @@ impl ScrollbackLine {
     ) -> Option<(TerminalCell, usize)> {
         let ch_len = usize::from(*data.get(*pos)?);
         *pos += 1;
-        let ch = std::str::from_utf8(data.get(*pos..*pos + ch_len)?)
-            .ok()
-            .and_then(|s| s.chars().next())
-            .unwrap_or(' ');
+        let bytes = data.get(*pos..*pos + ch_len)?;
+        let ch = match bytes {
+            [byte] if byte.is_ascii() => char::from(*byte),
+            [lead @ 0xc2..=0xdf, last @ 0x80..=0xbf] => {
+                let scalar = (u32::from(lead & 0x1f) << 6) | u32::from(last & 0x3f);
+                char::from_u32(scalar).unwrap_or(' ')
+            }
+            // E0 needs an overlong check. from_u32 rejects surrogate scalars.
+            [lead @ 0xe1..=0xef, middle @ 0x80..=0xbf, last @ 0x80..=0xbf] => {
+                let scalar = (u32::from(lead & 0x0f) << 12)
+                    | (u32::from(middle & 0x3f) << 6)
+                    | u32::from(last & 0x3f);
+                char::from_u32(scalar).unwrap_or(' ')
+            }
+            _ => Self::decode_uncommon_run_char(bytes),
+        };
         *pos += ch_len;
 
         let foreground = Self::decode_color(data, pos);
@@ -2966,6 +3004,44 @@ impl ScrollbackLine {
 #[cfg(test)]
 mod decoder_parity {
     use super::*;
+
+    #[test]
+    fn packed_archive_flags_match_scalar_reference_for_all_bytes() {
+        for byte in 0..=u8::MAX {
+            let mut expected = StyleFlags::default();
+            expected.set_bold(byte & 1 != 0);
+            expected.set_italic(byte & 2 != 0);
+            expected.set_underline(match (byte >> 2) & 7 {
+                1 => UnderlineStyle::Single,
+                2 => UnderlineStyle::Double,
+                3 => UnderlineStyle::Curly,
+                4 => UnderlineStyle::Dotted,
+                5 => UnderlineStyle::Dashed,
+                _ => UnderlineStyle::None,
+            });
+            expected.set_inverse(byte & 32 != 0);
+            expected.set_dim(byte & 64 != 0);
+            expected.set_strikethrough(byte & 128 != 0);
+            assert_eq!(ScrollbackLine::decode_flags(byte), expected, "{byte}");
+        }
+    }
+
+    #[test]
+    fn plain_search_columns_match_scalars_through_archive_geometry_overflow() {
+        for width in [0, 1, 96, 200, 65_535, 65_536, 65_537] {
+            for (character, trailing) in [('a', 0), ('é', 1), ('Ж', width / 2), (' ', width)] {
+                let mut row = vec![TerminalCell::default(); width];
+                for cell in row.iter_mut().take(width.saturating_sub(trailing)) {
+                    cell.character = character;
+                }
+                let line = ScrollbackLine::compress(&row, false);
+                let (text, map, columns) = line.search_text();
+                assert_eq!(columns, text.chars().count(), "width {width}");
+                assert!(map.is_none());
+            }
+        }
+    }
+
     #[test]
     fn reused_decode_scratch_replaces_prior_rows_and_keeps_capacity() {
         let mut scratch = Vec::with_capacity(600);
@@ -3024,6 +3100,46 @@ mod decoder_parity {
             }
         }
     }
+    #[test]
+    fn encoded_runs_preserve_valid_scalars_and_replace_invalid_utf8() {
+        let cell = TerminalCell {
+            character: '界',
+            foreground: Color::Red,
+            ..Default::default()
+        };
+        let encoded = ScrollbackLine::encode_cells(&[cell; 2], true);
+        for (bytes, character) in [
+            ([0xc2, 0x80].as_slice(), '\u{80}'),
+            ([0xc3, 0xa9].as_slice(), 'é'),
+            ([0xd0, 0x96].as_slice(), 'Ж'),
+            ([0xdf, 0xbf].as_slice(), '\u{7ff}'),
+            ([0xc0, 0x80].as_slice(), ' '),
+            ([0xc3, b'A'].as_slice(), ' '),
+            ([0xe0, 0xa0, 0x80].as_slice(), '\u{800}'),
+            ([0xe0, 0x9f, 0xbf].as_slice(), ' '),
+            ([0xe7, 0x95, 0x8c].as_slice(), '界'),
+            ([0xed, 0x9f, 0xbf].as_slice(), '\u{d7ff}'),
+            ([0xed, 0xa0, 0x80].as_slice(), ' '),
+            ([0xef, 0xbf, 0xbd].as_slice(), '\u{fffd}'),
+            ([0xf0, 0x90, 0x80, 0x80].as_slice(), '\u{10000}'),
+            ([0xf0, 0x9f, 0xa7, 0xaa].as_slice(), '🧪'),
+            ([0xf4, 0x8f, 0xbf, 0xbf].as_slice(), '\u{10ffff}'),
+            ([0xf0, 0x8f, 0xbf, 0xbf].as_slice(), ' '),
+            ([0xf4, 0x90, 0x80, 0x80].as_slice(), ' '),
+            ([0xf0, 0x90, 0x80, b'Y'].as_slice(), ' '),
+        ] {
+            let mut modified = vec![bytes.len() as u8];
+            modified.extend_from_slice(bytes);
+            modified.extend_from_slice(&encoded[4..]);
+            let expected = [TerminalCell { character, ..cell }; 2];
+            assert_eq!(
+                ScrollbackLine::decode_cells(&modified, 2, false),
+                expected,
+                "{bytes:02x?}"
+            );
+        }
+    }
+
     #[test]
     fn stored_decoder_matches_pinned_oracle_on_truncation_and_runs() {
         let mut seed = 0xdefaced_u64;

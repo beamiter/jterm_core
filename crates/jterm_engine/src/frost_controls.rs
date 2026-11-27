@@ -23,6 +23,7 @@ enum Operation {
     Designate { bank: u8, designator: u8 },
     DesignateLatin1(u8),
     CommitDesignation { bank: u8, charset: Charset },
+    CommitBritish(u8),
     AlignmentTest,
     Done,
 }
@@ -44,7 +45,7 @@ impl FrostStateCommand {
                 bank: intermediates[0],
                 designator,
             },
-            (b"*" | b"+", designator @ (b'B' | b'0')) => Operation::Designate {
+            (b"*" | b"+", designator @ (b'A' | b'B' | b'0')) => Operation::Designate {
                 bank: intermediates[0],
                 designator,
             },
@@ -138,6 +139,24 @@ impl FrostStateCommand {
             },
             Operation::AlignmentTest => Some(FrostStateEffect::AlignmentTest),
             Operation::Designate { bank, designator } => {
+                if designator == b'A' {
+                    let index = match bank {
+                        b'(' => 0,
+                        b')' => 1,
+                        b'*' => 2,
+                        _ => 3,
+                    };
+                    if index >= 2 {
+                        screen.designate_british(index);
+                        return None;
+                    }
+                    self.operation = Operation::CommitBritish(index);
+                    return Some(FrostStateEffect::CharsetNotice {
+                        bank,
+                        designator,
+                        charset: Charset::Ascii,
+                    });
+                }
                 let charset = if designator == b'0' {
                     Charset::DecSpecialGraphics
                 } else {
@@ -153,6 +172,10 @@ impl FrostStateCommand {
                     designator,
                     charset,
                 })
+            }
+            Operation::CommitBritish(index) => {
+                screen.designate_british(index);
+                None
             }
             Operation::CommitDesignation { bank, charset } => {
                 screen.designate_charset(bank != b'(', charset);

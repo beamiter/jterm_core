@@ -576,7 +576,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn('fn parse_sgr_groups(', frost)
         graphic = frost.split('    fn put_char(', 1)[1].split('    fn put_ascii_run(', 1)[0]
         self.assertIn('NativeTerminal::write_frost(', graphic)
-        self.assertIn('GraphicWrite::new_with_charset(', (ENGINE / 'src/vt_state.rs').read_text())
+        self.assertIn('GraphicWrite::new_translated(', (ENGINE / 'src/vt_state.rs').read_text())
         shared = (ENGINE / 'src/graphic_write.rs').read_text().split('#[cfg(test)]', 1)[0]
         self.assertIn('screen.take_pending_wrap(self.autowrap)', shared)
         self.assertIn('screen.prepare_character_width(self.width, self.autowrap)', shared)
@@ -674,9 +674,9 @@ class BoundaryTests(unittest.TestCase):
 
     def test_native_graphic_and_rep_transactions_have_one_owner(self):
         shared = (ENGINE / 'src/graphic_write.rs').read_text().split('#[cfg(test)]', 1)[0]
-        self.assertIn('charset.translate(original)', shared)
-        self.assertIn('screen.active_charset', shared)
-        self.assertIn('take_graphic_charset(ch)', (ENGINE / 'src/vt_state.rs').read_text())
+        self.assertIn('screen.translate_char(original)', shared)
+        self.assertIn('translate_graphic(ch)', (ENGINE / 'src/vt_state.rs').read_text())
+        self.assertIn('take_graphic_charset(ch)', (ENGINE / 'src/screen.rs').read_text())
         self.assertIn('screen.compose_combining_mark(self.translated)', shared)
         self.assertIn('screen.compose_frost_legacy_mark(self.translated)', shared)
         self.assertIn('screen.last_printed_char = Some(self.original)', shared)
@@ -686,7 +686,7 @@ class BoundaryTests(unittest.TestCase):
             host = (FAMILY / app / path).read_text()
             body = host.split('fn put_char(', 1)[1].split('fn put_ascii_run(', 1)[0]
             self.assertIn(f'NativeTerminal::write_{app}(', body)
-            self.assertIn('GraphicWrite::new_with_charset(', (ENGINE / 'src/vt_state.rs').read_text())
+            self.assertIn('GraphicWrite::new_translated(', (ENGINE / 'src/vt_state.rs').read_text())
             self.assertNotIn('prepare_character_width(', body)
             self.assertNotIn('last_printed_char =', body)
             dispatch = (ENGINE / f'src/{app}_csi.rs').read_text().split('#[cfg(test)]', 1)[0]

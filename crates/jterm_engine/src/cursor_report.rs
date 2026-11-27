@@ -22,7 +22,7 @@ pub(crate) fn cursor_information_report(screen: &ScreenState) -> Vec<u8> {
             _ => 0,
         };
     let designation = |index| {
-        if screen.charset_is_latin1(index) {
+        if screen.charset_is_latin1(index) || screen.charset_is_british(index) {
             'A'
         } else {
             match screen.charset_bank(index) {
@@ -61,6 +61,7 @@ struct RestoredCursor {
     pending_wrap: bool,
     banks: [Charset; 4],
     latin1: u8,
+    british: u8,
     invoked: u8,
     invoked_gr: u8,
     single_shift: Option<u8>,
@@ -121,9 +122,14 @@ fn parse_report(screen: &ScreenState, payload: &[u8]) -> Option<RestoredCursor> 
         return None;
     }
     let mut banks = [Charset::Ascii; 4];
+    let mut british = 0;
     for (index, &designator) in designators.iter().enumerate() {
         banks[index] = match (sizes & (1 << index) != 0, designator) {
             (true, b'A') | (false, b'B') => Charset::Ascii,
+            (false, b'A') => {
+                british |= 1 << index;
+                Charset::Ascii
+            }
             (false, b'0') => Charset::DecSpecialGraphics,
             _ => return None,
         };
@@ -137,6 +143,7 @@ fn parse_report(screen: &ScreenState, payload: &[u8]) -> Option<RestoredCursor> 
         pending_wrap: state & 8 != 0,
         banks,
         latin1: sizes,
+        british,
         invoked,
         invoked_gr,
         single_shift: if state & 2 != 0 {
@@ -174,6 +181,8 @@ pub(crate) fn restore_cursor_information(screen: &mut ScreenState, payload: &[u8
     for (index, charset) in state.banks.into_iter().enumerate() {
         if state.latin1 & (1 << index) != 0 {
             screen.designate_latin1(index as u8);
+        } else if state.british & (1 << index) != 0 {
+            screen.designate_british(index as u8);
         } else {
             screen.designate_charset_bank(index as u8, charset);
         }
@@ -312,7 +321,7 @@ mod tests {
             "1;1;1;@;@;@;4;2;@;BBBB",
             "1;1;1;@;@;@;0;4;@;BBBB",
             "1;1;1;@;@;@;0;2;L;BBBB",
-            "1;1;1;@;@;@;0;2;@;BBAA",
+            "1;1;1;@;@;@;0;2;@;BBZZ",
             "1;1;1;@;@;@;0;2;@;B%5BB",
             "1;1;1;@;@;@;0;2;@;BBBB;",
             "99999999999999999999999;1;1;@;@;@;0;2;@;BBBB",
@@ -427,11 +436,11 @@ mod tests {
         screen.designate_latin1(2);
         let before = cursor_information_report(&screen);
         for invalid in [
-            b"1;1;1;@;@;@;0;2;@;BBAB".as_slice(),
+            b"1;1;1;@;@;@;0;2;@;BBZB".as_slice(),
             b"1;1;1;@;@;@;0;2;D;BBBB",
             b"1;1;1;@;@;@;0;2;D;BB0B",
             b"1;1;1;@;@;@;0;2;P;AAAA",
-            b"1;1;1;@;@;@;0;2;O;AAAB",
+            b"1;1;1;@;@;@;0;2;O;AAAZ",
         ] {
             assert!(!restore_cursor_information(&mut screen, invalid));
             assert_eq!(cursor_information_report(&screen), before);

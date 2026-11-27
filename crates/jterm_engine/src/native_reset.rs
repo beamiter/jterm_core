@@ -38,7 +38,7 @@ pub fn reset_frost_attributes(screen: &mut ScreenState, protocol: &mut ProtocolS
     screen.saved_state = None;
     *protocol.modes_mut() = frost_initial_modes();
     protocol.clear_saved_dec_modes();
-    protocol.rectangular_attribute_extent = false;
+    protocol.set_attribute_change_extent(0);
     screen.insert_mode = false;
     screen.origin_mode = false;
     screen.pending_wrap = false;

@@ -257,7 +257,7 @@ fn frost_csi_retains_absolute_cursor_and_ordered_mode_replies() {
         )]
     );
 
-    for cmd in *b"aejk" {
+    for cmd in *b"jk" {
         assert_eq!(
             dispatch(&mut terminal, cmd, None, b"", &[2]),
             Dispatch::Unhandled

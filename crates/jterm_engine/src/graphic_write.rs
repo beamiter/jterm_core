@@ -2,7 +2,7 @@
 //! consume it before the next step, including wrap/history/provenance effects.
 //! Width policy stays an injected native cache. ASCII parser chunks keep their
 //! existing separate transaction boundary.
-use crate::screen::{Charset, RowMutation, ScreenState};
+use crate::screen::{RowMutation, ScreenState};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,25 +47,24 @@ impl GraphicWrite {
         track_idle: bool,
         width: impl FnMut(char) -> usize,
     ) -> Self {
-        Self::new_with_charset(
+        Self::new_translated(
             profile,
             original,
-            screen.active_charset,
+            screen.translate_char(original),
             autowrap,
             track_idle,
             width,
         )
     }
 
-    pub(crate) fn new_with_charset(
+    pub(crate) fn new_translated(
         profile: GraphicProfile,
         original: char,
-        charset: Charset,
+        translated: char,
         autowrap: bool,
         track_idle: bool,
         mut width: impl FnMut(char) -> usize,
     ) -> Self {
-        let translated = charset.translate(original);
         Self {
             profile,
             original,
@@ -180,14 +179,14 @@ mod tests {
     use crate::screen::{Charset, VerticalMotion};
 
     #[test]
-    fn explicit_charset_changes_translation_without_mutating_active_bank() {
+    fn translated_input_preserves_original_and_active_bank() {
         let mut screen = ScreenState::new(2, 8);
         screen.active_charset = Charset::Ascii;
         let mut observed = None;
-        let write = GraphicWrite::new_with_charset(
+        let write = GraphicWrite::new_translated(
             GraphicProfile::Ember,
             'q',
-            Charset::DecSpecialGraphics,
+            '─',
             true,
             false,
             |character| {

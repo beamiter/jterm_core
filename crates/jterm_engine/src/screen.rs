@@ -98,6 +98,7 @@ struct CharsetBanks {
     invoked: u8,
     invoked_gr: u8,
     latin1: u8,
+    british: u8,
     single_shift: Option<u8>,
 }
 impl Default for CharsetBanks {
@@ -107,6 +108,7 @@ impl Default for CharsetBanks {
             invoked: 0,
             invoked_gr: 2,
             latin1: 0,
+            british: 0,
             single_shift: None,
         }
     }
@@ -598,6 +600,9 @@ pub struct ScreenState<Grid = TerminalGrid> {
     pub g0_charset: Charset,
     pub g1_charset: Charset,
     pub active_charset: Charset,
+    // UK NRCS glyph selection over fixed UTF-8. DECNRCM changes this mapping
+    // without XTerm's separate UTF-8/ISO-2022 decoder switch and bank reset.
+    pub(crate) national_replacement_mode: bool,
     charset_banks: CharsetBanks,
     saved_cursor_banks: CharsetBanks,
     saved_primary_banks: CharsetBanks,
@@ -643,6 +648,7 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: Charset::Ascii,
+            national_replacement_mode: false,
             charset_banks: CharsetBanks::default(),
             saved_cursor_banks: CharsetBanks::default(),
             saved_primary_banks: CharsetBanks::default(),
@@ -757,12 +763,26 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
     /// Ordinary Unicode text uses take_graphic_charset and never this mapping.
     pub(crate) fn translate_fill_character(&self, value: u8) -> char {
         if value < 128 {
+            let bank = self
+                .single_shift_bank()
+                .unwrap_or(self.invoked_charset_bank());
+            if self.national_replacement_mode && self.charset_is_british(bank) && value == b'#' {
+                return '£';
+            }
             let charset = self
                 .single_shift_bank()
                 .map_or(self.active_charset, |index| self.charset_bank(index));
             return charset.translate(char::from(value));
         }
-        if self.charset_bank(self.invoked_gr_charset_bank()) == Charset::Ascii {
+        let bank = self.invoked_gr_charset_bank();
+        if self.national_replacement_mode && self.charset_is_british(bank) {
+            return if matches!(value, 0xa0 | 0xff) {
+                ' '
+            } else {
+                self.translate_bank(bank, char::from(value & 0x7f))
+            };
+        }
+        if self.charset_bank(bank) == Charset::Ascii {
             return char::from(value);
         }
         if matches!(value, 0xa0 | 0xff) {
@@ -795,6 +815,7 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
             return;
         }
         self.charset_banks.latin1 &= !(1 << index);
+        self.charset_banks.british &= !(1 << index);
         let invoked = self.invoked_charset_bank();
         match index {
             0 => self.g0_charset = charset,
@@ -803,6 +824,47 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
         }
         if invoked == index {
             self.invoke_charset_bank(index);
+        }
+    }
+    pub(crate) fn designate_british(&mut self, index: u8) {
+        self.designate_charset_bank(index, Charset::Ascii);
+        if index < 4 {
+            self.charset_banks.british |= 1 << index;
+        }
+    }
+    pub(crate) fn charset_is_british(&self, index: u8) -> bool {
+        index < 4
+            && self.charset_bank(index) == Charset::Ascii
+            && self.charset_banks.british & (1 << index) != 0
+    }
+    pub(crate) fn ascii_graphics(&self) -> bool {
+        self.active_charset == Charset::Ascii
+            && !(self.national_replacement_mode
+                && self.charset_is_british(self.invoked_charset_bank()))
+    }
+    fn translate_bank(&self, bank: u8, ch: char) -> char {
+        if self.national_replacement_mode && self.charset_is_british(bank) && ch == '#' {
+            '£'
+        } else {
+            self.charset_bank(bank).translate(ch)
+        }
+    }
+    pub(crate) fn translate_graphic(&mut self, ch: char) -> char {
+        if !self.national_replacement_mode {
+            return self.take_graphic_charset(ch).translate(ch);
+        }
+        let bank = if (' '..='~').contains(&ch) {
+            self.charset_banks
+                .single_shift
+                .unwrap_or(self.invoked_charset_bank())
+        } else {
+            self.invoked_charset_bank()
+        };
+        let charset = self.take_graphic_charset(ch);
+        if self.national_replacement_mode && self.charset_is_british(bank) && ch == '#' {
+            '£'
+        } else {
+            charset.translate(ch)
         }
     }
     pub(crate) fn single_shift(&mut self, index: u8) {
@@ -833,6 +895,7 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
 
     pub(crate) fn designate_charset(&mut self, g1: bool, charset: Charset) {
         self.charset_banks.latin1 &= !(1 << u8::from(g1));
+        self.charset_banks.british &= !(1 << u8::from(g1));
         if g1 {
             let active = self.invoked_g1();
             self.g1_charset = charset;
@@ -1428,7 +1491,14 @@ impl ScreenState {
     }
 
     pub fn translate_char(&self, ch: char) -> char {
-        self.active_charset.translate(ch)
+        if self.national_replacement_mode
+            && self.charset_is_british(self.invoked_charset_bank())
+            && ch == '#'
+        {
+            '£'
+        } else {
+            self.active_charset.translate(ch)
+        }
     }
 
     pub fn expanded_cell_mutation_span(

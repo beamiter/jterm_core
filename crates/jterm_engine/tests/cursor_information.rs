@@ -78,10 +78,10 @@ fn deccir_round_trips_latin1_designations_without_confusing_94_character_selecto
     terminal.feed(b"\x1b)A").unwrap();
     assert_eq!(
         terminal.feed(b"\x1b[1$w").unwrap(),
-        b"\x1bP1$u2;3;1;@;@;B;3;3;L;BBAA\x1b\\"
+        b"\x1bP1$u2;3;1;@;@;B;3;3;L;BAAA\x1b\\"
     );
     terminal
-        .feed(b"\x1b*0\x1b+B\x1b -A\x1b.B\x1b/B\x1b(0")
+        .feed(b"\x1b)B\x1b*0\x1b+B\x1b -A\x1b.B\x1b/B\x1b(0")
         .unwrap();
     assert_eq!(
         terminal.feed(b"\x1b[1$w").unwrap(),

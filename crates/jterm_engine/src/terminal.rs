@@ -15,7 +15,7 @@ use crate::{
     retained_history::RetainedHistory,
     row_annotations::RowAnnotations,
     screen::{
-        rows_to_archive_on_height_shrink, AsciiWriteStep, Charset, RegionDirection, RegionMutation,
+        rows_to_archive_on_height_shrink, AsciiWriteStep, RegionDirection, RegionMutation,
         ScreenState, VerticalMotion,
     },
     semantics::{self, Dispatch, Effect, Effects, UnderlinePen},
@@ -1547,17 +1547,14 @@ impl Terminal {
     }
 
     fn print(&mut self, ch: char) {
-        let translated = self.vt.screen.take_graphic_charset(ch).translate(ch);
+        let translated = self.vt.screen.translate_graphic(ch);
         if !self.extend_grapheme(ch, translated) {
             self.print_cell(ch, translated);
         }
     }
 
     fn print_ascii(&mut self, bytes: &[u8]) {
-        if bytes.len() < 4
-            || self.vt.screen.insert_mode
-            || self.vt.screen.active_charset != Charset::Ascii
-        {
+        if bytes.len() < 4 || self.vt.screen.insert_mode || !self.vt.screen.ascii_graphics() {
             for &byte in bytes {
                 self.print(char::from(byte));
             }
@@ -1802,6 +1799,7 @@ impl Terminal {
                 }
                 return;
             }
+            42 => self.vt.screen.national_replacement_mode = set,
             1 | 9 | 25 | 45 | 66 | 1000 | 1002..=1007 | 1015 | 2004 => (),
             _ => {
                 self.unsupported();
@@ -1887,6 +1885,12 @@ impl Terminal {
                 intermediates,
                 final_byte: b'8',
             } if intermediates == b"#" => {
+                // Hosted DECALN restores absolute addressing before homing.
+                self.vt.screen.origin_mode = false;
+                self.vt.protocol.modes_mut().remove(&6);
+                let protected = self.vt.screen.current_flags.protected();
+                self.vt.screen.current_flags = crate::StyleFlags::default();
+                self.vt.screen.current_flags.set_protected(protected);
                 self.vt.screen.screen_alignment_test();
                 self.renew_active_source_rows();
             }
@@ -1904,7 +1908,7 @@ impl Terminal {
                     *final_byte as char,
                     None,
                     intermediates,
-                    self.vt.protocol.rectangular_attribute_extent,
+                    self.vt.protocol.rectangular_attribute_extent(),
                 ) {
                     while rectangle.step(&mut self.vt.screen).is_some() {}
                 }
@@ -2064,7 +2068,7 @@ impl Terminal {
                                 });
                         }
                     }
-                    (None, b'S' | b'T') => {
+                    (None, b'S' | b'T' | b'^') => {
                         let top = self.vt.screen.scroll_region_top;
                         let bottom = self.vt.screen.scroll_region_bottom;
                         let direction = if *final_byte == b'S' {
@@ -2229,6 +2233,15 @@ impl Terminal {
                 return Ok(());
             }
         }
+        // Unsupported SCS designations leave the selected bank intact.
+        // The legacy native profiles retain their own designation policy.
+        if matches!(&event, Event::Charset { designator, .. }
+            if !matches!(designator, b'0' | b'A' | b'B'))
+        {
+            self.unsupported();
+            self.record_unsupported_event(&event);
+            return Ok(());
+        }
         if self.device_answers {
             if let Some(reply) = device_answer(&event) {
                 replies.push(reply, "reply byte limit");
@@ -2263,20 +2276,28 @@ impl Terminal {
                 return Ok(());
             }
         }
-        // Aether has no DA identity contract. A newer shared legacy
-        // dispatcher answers DA1/DA2 as Ember; do not inherit that identity.
-        // Count unsupported CSI c separately from ESC c (RIS).
-        if matches!(
-            &event,
-            Event::Csi {
-                final_byte: b'c',
-                ..
-            }
-        ) {
-            let before = self.unsupported;
-            self.unsupported();
-            if self.unsupported != before {
-                self.record_unsupported_event(&event);
+        // DA3 defines an anonymous unit ID. Hosted DA1/DA2 have no identity
+        // contract. Keep unsupported CSI c distinct from ESC c (RIS).
+        if let Event::Csi {
+            raw_params,
+            private_prefix,
+            intermediates,
+            final_byte: b'c',
+            ..
+        } = &event
+        {
+            if let Some(reply) = semantics::tertiary_device_attributes_reply(
+                *private_prefix,
+                raw_params,
+                intermediates,
+            ) {
+                replies.push(reply, "reply limit");
+            } else {
+                let before = self.unsupported;
+                self.unsupported();
+                if self.unsupported != before {
+                    self.record_unsupported_event(&event);
+                }
             }
             return Ok(());
         }

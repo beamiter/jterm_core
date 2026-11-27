@@ -42,8 +42,7 @@ fn frost_decst8c_replaces_custom_stops_without_moving_cursor() {
         (1, 24, true)
     );
     for (raw, params, prefix, intermediate) in [
-        (b"5".as_slice(), vec![5], None, b"".as_slice()),
-        (b"0", vec![0], Some(b'?'), b""),
+        (b"0".as_slice(), vec![0], Some(b'?'), b"".as_slice()),
         (b"5;0", vec![5, 0], Some(b'?'), b""),
         (b"5:0", vec![5], Some(b'?'), b""),
         (b"5", vec![5], Some(b'?'), b"$"),

@@ -48,6 +48,7 @@ impl TerminalModes {
             1034 => Some(23),
             9 => Some(24),
             45 => Some(25),
+            42 => Some(26),
             _ => None,
         }
     }
@@ -81,8 +82,8 @@ impl TerminalModes {
 pub struct ProtocolState {
     modes: TerminalModes,
     pub(crate) sgr_stack: crate::sgr_stack::SgrStack,
-    pub(crate) rectangular_attribute_extent: bool,
-    pub(crate) saved_dec_private_modes: [Option<u8>; 16],
+    attribute_change_extent: u8,
+    pub(crate) saved_dec_private_modes: [Option<u8>; 17],
     keyboard_enhancement_flags: u16,
     keyboard_enhancement_stack: Vec<u16>,
     alt_keyboard_enhancement_flags: u16,
@@ -125,6 +126,20 @@ impl std::fmt::Debug for ProtocolState {
 }
 
 impl ProtocolState {
+    pub(crate) fn attribute_change_extent(&self) -> u8 {
+        self.attribute_change_extent
+    }
+
+    pub(crate) fn rectangular_attribute_extent(&self) -> bool {
+        self.attribute_change_extent == 2
+    }
+
+    pub(crate) fn set_attribute_change_extent(&mut self, value: u16) {
+        if value <= 2 {
+            self.attribute_change_extent = value as u8;
+        }
+    }
+
     /// Transfer the widget-global XTerm rendition stack when RIS replaces mode
     /// state. DECSTR and primary/alternate screen switches leave it untouched.
     pub fn take_rendition_stack_from(&mut self, previous: &mut Self) {

@@ -29,6 +29,7 @@ fn saved_mode_slot(profile: SavedDecModeProfile, mode: u16) -> Option<(usize, &'
         1005 | 1006 | 1015 => (13, ENCODING_MODES),
         47 | 1047 | 1049 => (14, &[47][..]),
         45 => (15, &[45][..]),
+        42 => (16, &[42][..]),
         _ => return None,
     };
     if profile != SavedDecModeProfile::Ember && matches!(mode, 12 | 1034 | 1036) {
@@ -111,6 +112,14 @@ pub fn apply_ember_mode(
                 screen.cursor_row = if enabled { screen.scroll_region_top } else { 0 };
                 screen.cursor_col = 0;
             }
+            42 => {
+                screen.national_replacement_mode = enabled;
+                if enabled {
+                    protocol.modes_mut().insert(42);
+                } else {
+                    protocol.modes_mut().remove(&42);
+                }
+            }
             _ => {
                 if enabled {
                     protocol.modes_mut().insert(mode);
@@ -191,6 +200,10 @@ pub fn apply_frost_mode(
             if protocol.modes().contains(&mode) != enabled =>
         {
             MouseReportingChanged
+        }
+        42 => {
+            screen.national_replacement_mode = enabled;
+            None
         }
         1 | 7 | 25 | 45 | 66 | 1004 | 1007 | 2004 | 2031 | 5522 => None,
         _ => return None,

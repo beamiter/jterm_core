@@ -49,6 +49,12 @@ pub fn execute<H: EmberCsiHost>(
     prefix: Option<u8>,
     intermediates: &[u8],
 ) {
+    // ECMA-48 SD shares the VT420 scroll-down transaction.
+    let command = if command == '^' && prefix.is_none() && intermediates.is_empty() {
+        'T'
+    } else {
+        command
+    };
     execute_inner(host, params, command, prefix, intermediates);
     host.csi_effect(EmberCsiEffect::Completed);
 }
@@ -67,7 +73,7 @@ fn execute_inner<H: EmberCsiHost>(
             command,
             prefix,
             intermediates,
-            protocol.rectangular_attribute_extent,
+            protocol.rectangular_attribute_extent(),
         ) {
             while let Some(mutations) = rectangle.step(host.csi_state().0) {
                 if let Some(change) = mutations.first() {

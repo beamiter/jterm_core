@@ -67,6 +67,12 @@ pub fn execute<H: FrostCsiHost>(
     prefix: Option<u8>,
     intermediates: &[u8],
 ) {
+    // ECMA-48 SD shares the VT420 scroll-down transaction.
+    let command = if command == '^' && prefix.is_none() && intermediates.is_empty() {
+        'T'
+    } else {
+        command
+    };
     if prefix.is_none() && intermediates == b"$" && matches!(command, 'r' | 't') {
         let (screen, protocol) = host.csi_state();
         if !raw_params.contains(&b':') {
@@ -76,7 +82,7 @@ pub fn execute<H: FrostCsiHost>(
                 command,
                 prefix,
                 intermediates,
-                protocol.rectangular_attribute_extent,
+                protocol.rectangular_attribute_extent(),
             ) {
                 while let Some(mutations) = rectangle.step(host.csi_state().0) {
                     if let Some(change) = mutations.first() {

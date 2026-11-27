@@ -9,7 +9,7 @@ use crate::{
     graphic_write::{GraphicProfile, GraphicStep, GraphicWrite},
     parser::{CaptureEnd, Event, Parser, RejectReason, StringKind},
     protocol_state::ProtocolState,
-    screen::{Charset, ScreenState, VerticalMotion},
+    screen::{ScreenState, VerticalMotion},
     semantics::{self, Dispatch, Effects},
     synchronized_output::{SyncProfile, SynchronizedOutput},
     HyperlinkId,
@@ -115,7 +115,7 @@ impl VtState {
                 let state = owner(h);
                 if state.profile == VtProfile::Native(NativeProfile::FrostLegacy) {
                     state.parser.set_ascii_batching(
-                        state.screen.active_charset == Charset::Ascii && !state.screen.insert_mode,
+                        state.screen.ascii_graphics() && !state.screen.insert_mode,
                     );
                 }
                 &mut state.parser
@@ -193,7 +193,7 @@ impl VtState {
         match event {
             Event::Print(ch) => Self::write_ember(h, ch),
             Event::Ascii(bytes) => {
-                if h.native_terminal().screen.active_charset == Charset::Ascii {
+                if h.native_terminal().screen.ascii_graphics() {
                     Self::ascii_ember(h, bytes);
                 } else {
                     for &byte in bytes {
@@ -240,6 +240,15 @@ impl VtState {
                                 h.native_effect(NativeEffect::CursorReposition {
                                     non_linear: false,
                                 });
+                            }
+                        }
+                        b'Z' => {
+                            if let Some(reply) =
+                                semantics::legacy_device_attributes_reply(None, b"")
+                            {
+                                h.native_effect(NativeEffect::Local(smallvec::smallvec![
+                                    semantics::Effect::Reply(reply.to_vec()),
+                                ]));
                             }
                         }
                         b'c' => h.native_effect(NativeEffect::Reset),
@@ -373,7 +382,7 @@ impl VtState {
             Event::Print(ch) => Self::write_frost(h, ch, true),
             Event::Ascii(bytes) => {
                 let t = h.native_terminal();
-                if t.screen.active_charset == Charset::Ascii && !t.screen.insert_mode {
+                if t.screen.ascii_graphics() && !t.screen.insert_mode {
                     Self::ascii_frost(h, bytes);
                 } else {
                     for &byte in bytes {
@@ -382,6 +391,13 @@ impl VtState {
                 }
             }
             Event::Control(byte) => Self::frost_control(h, FrostStateCommand::control(byte)),
+            Event::Escape {
+                intermediates,
+                final_byte: b'Z',
+            } if intermediates.is_empty() => {
+                // Use Frost's primary DA transaction for the older DECID query.
+                crate::frost_csi::execute(h, &[], &[], 'c', None, b"");
+            }
             Event::Escape {
                 intermediates,
                 final_byte,
@@ -504,11 +520,11 @@ impl VtState {
         width: fn(char) -> usize,
     ) {
         let t = h.native_terminal();
-        let charset = t.screen.take_graphic_charset(ch);
-        let op = GraphicWrite::new_with_charset(
+        let translated = t.screen.translate_graphic(ch);
+        let op = GraphicWrite::new_translated(
             profile,
             ch,
-            charset,
+            translated,
             t.protocol.modes().contains(&7),
             track,
             width,
@@ -572,6 +588,7 @@ impl VtState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screen::Charset;
     use crate::{
         ember_csi::{EmberCsiEffect, EmberCsiHost},
         frost_csi::{FrostCsiEffect, FrostCsiHost},
@@ -657,6 +674,7 @@ mod tests {
                     }
                 }
                 NativeEffect::Local(effects) => {
+                    assert_eq!(self.vt.profile, VtProfile::Native(NativeProfile::Ember));
                     for effect in effects {
                         if let semantics::Effect::Reply(reply) = effect {
                             self.replies.extend(reply);
@@ -1050,7 +1068,7 @@ mod tests {
                 host.vt.screen.grid.row_wrapped[0] = true;
                 feed(&mut host, &packet[..split], None);
                 feed(&mut host, &packet[split..], None);
-                assert!(host.vt.protocol.rectangular_attribute_extent);
+                assert!(host.vt.protocol.rectangular_attribute_extent());
                 assert_eq!(host.vt.screen.grid.get(0, 0).character, 'A');
                 assert!(host.vt.screen.grid.get(0, 0).flags.bold());
                 assert!(!host.vt.screen.grid.get(0, 1).flags.bold());
@@ -1083,7 +1101,199 @@ mod tests {
                     None,
                 );
                 assert_eq!(host.dirty_rows, dirty);
-                assert!(host.vt.protocol.rectangular_attribute_extent);
+                assert!(host.vt.protocol.rectangular_attribute_extent());
+            }
+        }
+    }
+
+    #[test]
+    fn native_screen_line_status_reads_the_live_screen_across_partitions() {
+        let query = b"\x1bP$q*|\x1b\\";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=query.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, b"AB\x1b[2;3r\x1b[?6h", None);
+                let (row, column) = (host.vt.screen.cursor_row, host.vt.screen.cursor_col);
+                let dirty = host.dirty_rows.clone();
+                feed(&mut host, &query[..split], None);
+                feed(&mut host, &query[split..], None);
+                assert_eq!(host.replies, b"\x1bP1$r3*|\x1b\\", "{profile:?} {split}");
+                assert_eq!(
+                    (host.vt.screen.cursor_row, host.vt.screen.cursor_col),
+                    (row, column)
+                );
+                assert_eq!(host.dirty_rows, dirty);
+                host.vt
+                    .screen
+                    .resize_geometry(7, 16, 0, RawRowId::allocate_process_unique);
+                host.replies.clear();
+                feed(&mut host, query, None);
+                assert_eq!(host.replies, b"\x1bP1$r7*|\x1b\\", "{profile:?} {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_attribute_extent_queries_follow_the_live_owner_across_partitions() {
+        let packet =
+            b"\x1bP$q*x\x1b\\\x1b[2*x\x1bP$q*x\x1b\\\x1b[!p\x1bP$q*x\x1b\\\x1b[1*x\x1bP$q*x\x1b\\";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(
+                    host.replies,
+                    b"\x1bP1$r0*x\x1b\\\x1bP1$r2*x\x1b\\\x1bP1$r2*x\x1b\\\x1bP1$r1*x\x1b\\",
+                    "{profile:?}, split {split}"
+                );
+                assert!(!host.vt.protocol.rectangular_attribute_extent());
+            }
+        }
+    }
+
+    #[test]
+    fn native_tertiary_device_id_is_shared_across_scanners_and_partitions() {
+        let packet = b"\x1b[=c\x1b[=0c\x1b[=000c\x1b[=1c\x1b[=0;0c\x1b[=0:0c\x1b[=0$c";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(
+                    host.replies,
+                    b"\x1bP!|00000000\x1b\\\x1bP!|00000000\x1b\\\x1bP!|00000000\x1b\\",
+                    "{profile:?} split {split}"
+                );
+                assert_eq!(
+                    (host.vt.screen.cursor_row, host.vt.screen.cursor_col),
+                    (0, 0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_unsupported_cursor_styles_preserve_shape_at_every_split() {
+        let packet = b"\x1b[6 q\x1b[260 q\x1b[8 q\x1b[65535 q\x1bP$q q\x1b\\";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(host.replies, b"\x1bP1$r6 q\x1b\\", "{profile:?} {split}");
+                assert_eq!(host.vt.screen.cursor_shape, crate::CursorShape::Beam);
+                feed(&mut host, b"\x1b[4 q", None);
+                assert_eq!(host.vt.screen.cursor_shape, crate::CursorShape::Underline);
+            }
+        }
+    }
+
+    #[test]
+    fn native_printer_status_is_read_only_at_every_split() {
+        for packet in [b"\x1b[?15n".as_slice(), b"\x1b[?0015n"] {
+            for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+                let feed = match profile {
+                    NativeProfile::Ember => VtState::feed_ember::<Host>,
+                    NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+                };
+                for split in 0..=packet.len() {
+                    let mut host = Host::new(profile);
+                    feed(&mut host, b"TEXT\x1b[2;3H\x1b[31;44m", None);
+                    host.replies.clear();
+                    let before: Vec<_> = (0..host.vt.screen.grid.rows())
+                        .map(|row| host.vt.screen.grid[row].to_vec())
+                        .collect();
+                    feed(&mut host, &packet[..split], None);
+                    feed(&mut host, &packet[split..], None);
+                    assert_eq!(host.replies, b"\x1b[?13n", "{profile:?} {split}");
+                    for (row, cells) in before.iter().enumerate() {
+                        assert_eq!(&host.vt.screen.grid[row], cells.as_slice());
+                    }
+                    assert_eq!(
+                        (host.vt.screen.cursor_row, host.vt.screen.cursor_col),
+                        (1, 2)
+                    );
+                    assert_eq!(host.vt.screen.current_fg, crate::Color::Red);
+                    assert_eq!(host.vt.screen.current_bg, crate::Color::Blue);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_locator_status_is_independent_of_mouse_modes_at_every_split() {
+        let packet = b"\x1b[?1000;1006h\x1b[?55n\x1b[?56n";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, b"TEXT\x1b[2;3H", None);
+                host.replies.clear();
+                let before: Vec<_> = (0..host.vt.screen.grid.rows())
+                    .map(|row| host.vt.screen.grid[row].to_vec())
+                    .collect();
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(host.replies, b"\x1b[?53n\x1b[?57;0n", "{profile:?} {split}");
+                for (row, cells) in before.iter().enumerate() {
+                    assert_eq!(&host.vt.screen.grid[row], cells.as_slice());
+                }
+                assert_eq!(
+                    (host.vt.screen.cursor_row, host.vt.screen.cursor_col),
+                    (1, 2)
+                );
+                assert!(host.vt.protocol.modes().contains(&1000));
+                assert!(host.vt.protocol.modes().contains(&1006));
+            }
+        }
+    }
+
+    #[test]
+    fn native_forward_cursor_aliases_preserve_grid_and_report_at_every_partition() {
+        let packet =
+            b"\x1b[3;4H\x1b[2a\x1b[6n\x1b[1e\x1b[6n\x1b[0a\x1b[0e\x1b[6n\x1b[a\x1b[e\x1b[6n";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                host.vt.screen = ScreenState::new(6, 12);
+                host.vt.screen.grid[0][0].character = '界';
+                let before = host.vt.screen.grid.to_vec();
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(
+                    host.replies, b"\x1b[3;6R\x1b[4;6R\x1b[5;7R\x1b[6;8R",
+                    "{profile:?} {split}"
+                );
+                assert_eq!(host.vt.screen.grid.to_vec(), before);
+                assert_eq!(
+                    (host.vt.screen.cursor_row, host.vt.screen.cursor_col),
+                    (5, 7)
+                );
+                assert!(!host.vt.screen.pending_wrap);
             }
         }
     }
@@ -1130,7 +1340,7 @@ mod tests {
                 host.replies.clear();
                 feed(
                     &mut host,
-                    b"\x1bP1$t1;1;1;@;@;@;0;2;@;B0BA\x1b\\\x1b[1$w",
+                    b"\x1bP1$t1;1;1;@;@;@;0;2;@;B0BZ\x1b\\\x1b[1$w",
                     None,
                 );
                 assert_eq!(host.replies, expected); // Late invalid designation is atomic.
@@ -1141,6 +1351,114 @@ mod tests {
                         .collect::<Vec<_>>(),
                     ids
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn native_scroll_down_alias_reuses_margin_transaction_at_every_split() {
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for parameter in ["", "0", "1", "2", "65535"] {
+                let query = format!("\x1b[{parameter}^");
+                for split in 0..=query.len() {
+                    let mut host = Host::new(profile);
+                    host.vt.screen = ScreenState::new(4, 8);
+                    feed(&mut host, b"\x1b[1;1HAAAA\x1b[2;1HBBBB\x1b[3;1HCCCC\x1b[4;1HDDDD\x1b[2;3r\x1b[3;2H\x1b[1;31;44m", None);
+                    feed(&mut host, &query.as_bytes()[..split], None);
+                    feed(&mut host, &query.as_bytes()[split..], None);
+                    let text: Vec<String> = (0..4)
+                        .map(|row| {
+                            (0..8)
+                                .map(|col| host.vt.screen.grid.get(row, col).character)
+                                .collect()
+                        })
+                        .collect();
+                    let single = matches!(parameter, "" | "0" | "1");
+                    assert_eq!(
+                        text,
+                        [
+                            "AAAA    ",
+                            "        ",
+                            if single { "BBBB    " } else { "        " },
+                            "DDDD    "
+                        ],
+                        "{profile:?} {parameter:?} {split}"
+                    );
+                    assert_eq!(
+                        (host.vt.screen.cursor_row, host.vt.screen.cursor_col),
+                        (2, 1)
+                    );
+                    let blank = host.vt.screen.grid.get(1, 0);
+                    assert_eq!(
+                        (blank.foreground, blank.background),
+                        (crate::Color::Default, crate::Color::Blue)
+                    );
+                    assert_eq!(blank.flags, crate::StyleFlags::default());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_decid_matches_primary_da_at_every_partition_without_mutating_screen() {
+        let packet = b"\x1bZ\x1b[c";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, b"\x1b[31;44mSTATE\x1b[2;3H", None);
+                let before: Vec<_> = (0..host.vt.screen.grid.rows())
+                    .map(|row| host.vt.screen.grid[row].to_vec())
+                    .collect();
+                let cursor = (host.vt.screen.cursor_row, host.vt.screen.cursor_col);
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(
+                    host.replies, b"\x1b[?65;1;9c\x1b[?65;1;9c",
+                    "{profile:?} split {split}"
+                );
+                for (row, expected) in before.iter().enumerate() {
+                    assert_eq!(&host.vt.screen.grid[row], expected.as_slice());
+                }
+                assert_eq!(
+                    (host.vt.screen.cursor_row, host.vt.screen.cursor_col),
+                    cursor
+                );
+            }
+            for malformed in [b"\x1b Z".as_slice(), b"\x1b$Z", b"\x1b#Z"] {
+                let mut host = Host::new(profile);
+                feed(&mut host, malformed, None);
+                assert!(host.replies.is_empty(), "{profile:?} {malformed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_uk_nrcs_modes_and_banks_follow_negotiation_at_every_split() {
+        let packet = b"\x1b(A#\x1b[?42h#\x1b[?42s\x1b[?42l#\x1b[?42r#\x1b)A\x0e#\x0f\x1b(B\x1b*A\x1bN##\x1b+A\x1bO##\x1b[?42$p";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                let text: String = (0..9)
+                    .map(|column| host.vt.screen.grid.get(0, column).character)
+                    .collect();
+                assert_eq!(text, "#£#£££#£#", "{profile:?} split {split}");
+                assert_eq!(host.replies, b"\x1b[?42;1$y", "{profile:?} split {split}");
+                assert_eq!(host.vt.screen.cursor_col, 9);
+                assert!(!host.vt.screen.single_shift_pending());
             }
         }
     }
@@ -1789,6 +2107,35 @@ mod tests {
             None,
         );
         assert_eq!(host.replies, b"\x1bP1$r>4;2m\x1b\\\x1bP1$r>4;1f\x1b\\");
+    }
+
+    #[test]
+    fn native_character_tab_controls_match_hts_and_tbc_across_partitions() {
+        let packet=b"\x1b[5W\x1b[1;5H\x1b[W\x1b[H\t\x1b[6n\x1b[2W\x1b[H\t\x1b[6n\x1b[1;7H\x1b[5;0W\x1b[H\t\x1b[6n";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                host.vt.screen = ScreenState::new(3, 12);
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(
+                    host.replies, b"\x1b[1;5R\x1b[1;12R\x1b[1;7R",
+                    "{profile:?} split {split}"
+                );
+                let tabs = host.vt.screen.tab_stops.clone();
+                feed(&mut host, b"\x1b[5;0:2W\x1b[>5W\x1b[5 W", None);
+                assert_eq!(host.vt.screen.tab_stops, tabs);
+                feed(&mut host, b"\x1b[?5W", None);
+                assert_eq!(
+                    host.vt.screen.tab_stops,
+                    crate::screen::default_tab_stops(12, crate::screen::TabStopOrigin::Clear)
+                );
+            }
+        }
     }
 
     #[test]

@@ -158,6 +158,52 @@ pub fn legacy_device_attributes_reply(
     }
 }
 
+/// DA3 reports an anonymous terminal unit ID with the standard eight hex digits.
+pub(crate) fn tertiary_device_attributes_reply(
+    private_prefix: Option<u8>,
+    raw_params: &[u8],
+    intermediates: &[u8],
+) -> Option<&'static [u8]> {
+    (private_prefix == Some(b'=')
+        && intermediates.is_empty()
+        && raw_params.iter().all(|&byte| byte == b'0'))
+    .then_some(b"\x1bP!|00000000\x1b\\")
+}
+
+/// Unimplemented DEC devices have explicit capability responses.
+fn device_capability_status_reply(
+    private_prefix: Option<u8>,
+    params: &[u16],
+    raw_params: &[u8],
+    intermediates: &[u8],
+) -> Option<&'static [u8]> {
+    if private_prefix != Some(b'?')
+        || !intermediates.is_empty()
+        || raw_params.iter().any(|byte| !byte.is_ascii_digit())
+    {
+        return None;
+    }
+    match params {
+        [15] => Some(b"\x1b[?13n"),
+        [55] => Some(b"\x1b[?53n"),
+        [56] => Some(b"\x1b[?57;0n"),
+        _ => None,
+    }
+}
+
+// ECMA-48 CTC character stops use the terminal's shared horizontal tab map.
+// Line-specific and vertical tabulation operations are outside this model.
+fn control_character_tabs(screen: &mut ScreenState, params: &[u16]) {
+    for parameter in if params.is_empty() { &[0] } else { params } {
+        match parameter {
+            0 => screen.cursor_controls().set_tab_stop(true),
+            2 => screen.clear_tab_stop(),
+            5 => screen.clear_all_tab_stops(),
+            _ => {}
+        }
+    }
+}
+
 fn dispatch_cursor_csi(
     screen: &mut ScreenState,
     protocol: &ProtocolState,
@@ -225,6 +271,20 @@ pub fn dispatch_frost_legacy_csi(
     private_prefix: Option<u8>,
     intermediates: &[u8],
 ) -> Dispatch {
+    if cmd == b'n' {
+        if let Some(reply) =
+            device_capability_status_reply(private_prefix, params, raw_params, intermediates)
+        {
+            return Dispatch::Handled([Effect::Reply(reply.to_vec())].into_iter().collect());
+        }
+    }
+    if cmd == b'c' {
+        if let Some(reply) =
+            tertiary_device_attributes_reply(private_prefix, raw_params, intermediates)
+        {
+            return Dispatch::Handled([Effect::Reply(reply.to_vec())].into_iter().collect());
+        }
+    }
     if private_prefix.is_none() && intermediates == b"#" && matches!(cmd, b'{' | b'}' | b'p' | b'q')
     {
         let mut effects = Effects::new();
@@ -285,6 +345,16 @@ pub fn dispatch_frost_legacy_csi(
         return Dispatch::Handled([Effect::Reply(reply)].into_iter().collect());
     }
     if cmd == b'W'
+        && private_prefix.is_none()
+        && intermediates.is_empty()
+        && raw_params
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';')
+    {
+        control_character_tabs(screen, params);
+        return Dispatch::Handled(Effects::new());
+    }
+    if cmd == b'W'
         && private_prefix == Some(b'?')
         && intermediates.is_empty()
         && params == [5]
@@ -307,8 +377,8 @@ pub fn dispatch_frost_legacy_csi(
         set_xterm_format_other_keys(protocol, params);
         return Dispatch::Handled(Effects::new());
     }
-    // The older profile omits the four cursor-movement aliases.
-    if !matches!(cmd, b'a' | b'e' | b'j' | b'k')
+    // Frost retains its original policy for the backward movement aliases.
+    if !matches!(cmd, b'j' | b'k')
         && dispatch_cursor_csi(screen, protocol, params, cmd, private_prefix, intermediates)
     {
         return Dispatch::Handled(Effects::new());
@@ -405,8 +475,9 @@ pub fn dispatch_frost_legacy_csi(
         }
         (b'u', Some(prefix), b"", _) => kitty_keyboard_csi(protocol, params, prefix),
         (b'q', None, b" ", _) => {
-            // Frost historically truncates the argument to one byte.
-            screen.cursor_shape = cursor_shape(u16::from(first.unwrap_or(0) as u8));
+            if let Some(shape) = cursor_shape(first.unwrap_or(0)) {
+                screen.cursor_shape = shape;
+            }
             None
         }
         (b'q', None, b"\"", _) if params.len() <= 1 && !raw_params.contains(&b':') => {
@@ -433,11 +504,12 @@ fn set_xterm_format_other_keys(protocol: &mut ProtocolState, params: &[u16]) {
     }
 }
 
-fn cursor_shape(param: u16) -> CursorShape {
+fn cursor_shape(param: u16) -> Option<CursorShape> {
     match param {
-        3 | 4 => CursorShape::Underline,
-        5 | 6 => CursorShape::Beam,
-        _ => CursorShape::Block,
+        0..=2 | 7 => Some(CursorShape::Block),
+        3 | 4 => Some(CursorShape::Underline),
+        5 | 6 => Some(CursorShape::Beam),
+        _ => None,
     }
 }
 
@@ -450,11 +522,7 @@ fn set_character_protection(screen: &mut ScreenState, parameter: u16) {
 }
 
 fn select_attribute_extent(protocol: &mut ProtocolState, params: &[u16]) {
-    match params.first().copied().unwrap_or(0) {
-        0 | 1 => protocol.rectangular_attribute_extent = false,
-        2 => protocol.rectangular_attribute_extent = true,
-        _ => {}
-    }
+    protocol.set_attribute_change_extent(params.first().copied().unwrap_or(0));
 }
 
 /// Ember-compatible semantics, including its DECSTR policy (not Frost soft reset).
@@ -476,6 +544,22 @@ pub(crate) fn dispatch_local_with_underline(
     mut underline: Option<&mut UnderlinePen>,
 ) -> Dispatch {
     let mut effects = Effects::new();
+    if let Event::Csi {
+        raw_params,
+        params,
+        private_prefix,
+        intermediates,
+        final_byte: b'n',
+        ..
+    } = event
+    {
+        if let Some(reply) =
+            device_capability_status_reply(*private_prefix, params, raw_params, intermediates)
+        {
+            effects.push(Effect::Reply(reply.to_vec()));
+            return Dispatch::Handled(effects);
+        }
+    }
     match event {
         Event::Csi {
             params,
@@ -583,6 +667,20 @@ pub(crate) fn dispatch_local_with_underline(
         Event::Csi {
             raw_params,
             params,
+            private_prefix: None,
+            intermediates,
+            final_byte: b'W',
+            ..
+        } if intermediates.is_empty()
+            && raw_params
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';') =>
+        {
+            control_character_tabs(screen, params);
+        }
+        Event::Csi {
+            raw_params,
+            params,
             private_prefix: Some(b'?'),
             intermediates,
             final_byte: b'W',
@@ -619,12 +717,16 @@ pub(crate) fn dispatch_local_with_underline(
             effects.push(Effect::Reply(modify_other_keys_reply(protocol)));
         }
         Event::Csi {
+            raw_params,
             private_prefix,
             intermediates,
             final_byte: b'c',
             ..
         } => {
-            let Some(reply) = legacy_device_attributes_reply(*private_prefix, intermediates) else {
+            let reply =
+                tertiary_device_attributes_reply(*private_prefix, raw_params, intermediates)
+                    .or_else(|| legacy_device_attributes_reply(*private_prefix, intermediates));
+            let Some(reply) = reply else {
                 return Dispatch::Unhandled;
             };
             effects.push(Effect::Reply(reply.to_vec()));
@@ -706,13 +808,17 @@ pub(crate) fn dispatch_local_with_underline(
             } else {
                 Charset::Ascii
             };
-            screen.designate_charset(*bank != b'(', charset);
+            if *designator == b'A' {
+                screen.designate_british(u8::from(*bank != b'('));
+            } else {
+                screen.designate_charset(*bank != b'(', charset);
+            }
         }
         Event::Escape {
             intermediates,
             final_byte,
         } if matches!(intermediates.as_slice(), b"*" | b"+")
-            && matches!(final_byte, b'B' | b'0') =>
+            && matches!(final_byte, b'A' | b'B' | b'0') =>
         {
             let bank = if intermediates == b"*" { 2 } else { 3 };
             let charset = if *final_byte == b'0' {
@@ -720,7 +826,11 @@ pub(crate) fn dispatch_local_with_underline(
             } else {
                 Charset::Ascii
             };
-            screen.designate_charset_bank(bank, charset);
+            if *final_byte == b'A' {
+                screen.designate_british(bank);
+            } else {
+                screen.designate_charset_bank(bank, charset);
+            }
         }
         Event::Escape {
             intermediates,
@@ -918,7 +1028,9 @@ pub(crate) fn dispatch_local_with_underline(
                 }
                 b'q' => {
                     if intermediates == b" " {
-                        screen.cursor_shape = cursor_shape(first.unwrap_or(0));
+                        if let Some(shape) = cursor_shape(first.unwrap_or(0)) {
+                            screen.cursor_shape = shape;
+                        }
                     } else {
                         set_character_protection(screen, first.unwrap_or(0));
                     }
@@ -1521,6 +1633,8 @@ fn decrqss_reply(
             };
             format!("\x1bP1$r{n} q\x1b\\")
         }
+        b"*x" => format!("\x1bP1$r{}*x\x1b\\", protocol.attribute_change_extent()),
+        b"*|" => format!("\x1bP1$r{}*|\x1b\\", screen.grid.rows()),
         b"r" => format!(
             "\x1bP1$r{};{}r\x1b\\",
             screen.scroll_region_top + 1,
@@ -1662,6 +1776,7 @@ fn decrqm_private_mode_state(
         | 7
         | 9
         | 25
+        | 42
         | 45
         | 47
         | 66

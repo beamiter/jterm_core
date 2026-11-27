@@ -9,6 +9,29 @@ use crate::{
 };
 use std::{collections::VecDeque, io};
 
+// Keep the encoded formatter out of the plain-text export path.
+#[inline(never)]
+fn format_encoded_archive_row(line: &ScrollbackLine, text: &mut String) -> (usize, usize) {
+    text.clear();
+    let mut physical_end = 0;
+    let mut written_space_end = 0;
+    let gap = line.synthetic_margin_gap();
+    line.visit_search_cells(|column, cell| {
+        physical_end = column + 1;
+        if cell.flags.wide_continuation() || gap == Some(column) {
+            return;
+        }
+        text.push(cell.character);
+        if cell.flags.printed_space() {
+            written_space_end = text.len();
+        }
+    });
+    let end = text.trim_end_matches(' ').len().max(written_space_end);
+    let content_columns = line.columns() - usize::from(gap.is_some());
+    let implicit_padding = content_columns.saturating_sub(physical_end);
+    (end, text.len() - end + implicit_padding)
+}
+
 impl Terminal {
     /// Distinguish spaces written into the live grid from erase padding. Enable
     /// before feeding text when later reads must prove an empty editor suffix.
@@ -176,6 +199,13 @@ impl Terminal {
                         )?;
                         continue;
                     }
+                }
+                if matches!(line.content(), ScrollbackContent::Encoded(_))
+                    && line.row_annotations().is_none()
+                {
+                    let (end, trailing) = format_encoded_archive_row(line, &mut row_text);
+                    finish_row(&row_text[..end], trailing, line.is_wrapped)?;
+                    continue;
                 }
                 line.decompress_into(&mut decoded);
                 let end = format_row(

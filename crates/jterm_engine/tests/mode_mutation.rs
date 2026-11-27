@@ -6,9 +6,9 @@ use jterm_engine::{
     protocol_state::ProtocolState,
     screen::ScreenState,
 };
-const KNOWN: [u16; 26] = [
+const KNOWN: [u16; 27] = [
     1, 7, 9, 25, 1000, 1001, 1002, 1003, 1004, 1006, 1049, 2004, 2026, 2031, 5522, 47, 1047, 1048,
-    1005, 1015, 66, 1007, 12, 1036, 1034, 45,
+    1005, 1015, 66, 1007, 12, 1036, 1034, 45, 42,
 ];
 const HOST: [u16; 7] = [1004, 47, 1047, 1048, 1049, 2026, 5522];
 fn seeded(initial: bool) -> reference::Frozen {
