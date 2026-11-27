@@ -77,6 +77,19 @@ impl PreparedPty {
             .try_inspect_transport(|transport| inspect(transport.as_fd().as_raw_fd()))
     }
 
+    pub fn foreground_is_codex(&self) -> bool {
+        self.actor
+            .try_inspect_transport(|transport| {
+                let fd = transport.as_fd().as_raw_fd();
+                super::foreground_is_codex(transport.child.pid(), || {
+                    // SAFETY: the actor retains the PTY master for this probe.
+                    let group = unsafe { libc::tcgetpgrp(fd) };
+                    (group > 0).then_some(group)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     pub fn input_stamp(&self) -> Option<u64> {
         self.actor.display_idle_input_stamp()
     }

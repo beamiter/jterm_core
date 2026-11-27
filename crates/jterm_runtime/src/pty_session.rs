@@ -90,6 +90,22 @@ fn foreground_codex_program(pid: i32) -> bool {
     codex_executable(&executable, &argv)
 }
 
+fn foreground_is_codex(child: i32, foreground_pgid: impl Fn() -> Option<i32>) -> bool {
+    let Some(group) = foreground_pgid() else {
+        return false;
+    };
+    let observed = process_stat(child)
+        .zip(process_stat(group))
+        .is_some_and(|(owner, process)| {
+            owner.is_live()
+                && process.is_live()
+                && owner.session == process.session
+                && process.process_group == group
+                && process.foreground_group == group
+        });
+    observed && foreground_codex_program(group) && foreground_pgid() == Some(group)
+}
+
 #[cfg(test)]
 #[test]
 fn foreground_codex_program_requires_executable_and_exact_npm_script() {
@@ -936,20 +952,7 @@ impl Session {
         let Some(io) = &self.io else {
             return false;
         };
-        let Some(group) = io.actor.foreground_pgid() else {
-            return false;
-        };
-        let observed =
-            process_stat(child)
-                .zip(process_stat(group))
-                .is_some_and(|(owner, process)| {
-                    owner.is_live()
-                        && process.is_live()
-                        && owner.session == process.session
-                        && process.process_group == group
-                        && process.foreground_group == group
-                });
-        observed && foreground_codex_program(group) && io.actor.foreground_pgid() == Some(group)
+        foreground_is_codex(child, || io.actor.foreground_pgid())
     }
 
     /// Both the integrated prompt and the kernel foreground group must still

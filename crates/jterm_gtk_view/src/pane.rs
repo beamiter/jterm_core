@@ -1933,8 +1933,13 @@ impl<P: Pty> TerminalPane<P> {
             {
                 return false;
             }
-            self.runtime()
-                .is_some_and(|runtime| runtime.foreground_is_inline_codex())
+            match &self.backend {
+                Backend::Host { terminal, .. } => {
+                    !terminal.inspect(Terminal::alternate_screen_active)
+                        && terminal.pty().foreground_is_codex()
+                }
+                Backend::Runtime(runtime) => runtime.foreground_is_inline_codex(),
+            }
         }
         #[cfg(not(target_os = "linux"))]
         false

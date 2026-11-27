@@ -86,6 +86,10 @@ impl PreparedPtySession {
         self.actor()?.inspect_fd(inspect)
     }
 
+    pub fn foreground_is_codex(&self) -> bool {
+        self.actor().is_some_and(|actor| actor.foreground_is_codex())
+    }
+
     pub fn input_stamp(&self) -> Option<u64> {
         self.actor()?.input_stamp()
     }

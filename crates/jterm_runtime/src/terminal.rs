@@ -16,6 +16,11 @@ pub trait Pty: 'static {
     /// Finish any host-held output before encoding a user's next input.
     fn before_input(&self) {}
 
+    /// Whether a verified Codex process owns this PTY's foreground.
+    fn foreground_is_codex(&self) -> bool {
+        false
+    }
+
     fn write(&self, bytes: &[u8]) -> Result<(), String>;
 
     fn write_reply(&self, bytes: &[u8]) -> Result<(), String> {
