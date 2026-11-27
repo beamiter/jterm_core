@@ -11,6 +11,13 @@ pub enum MouseInput {
     WheelDown,
 }
 
+/// A zero-based point in the live grid or its measured physical text area.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MousePosition {
+    Cell { column: usize, row: usize },
+    Pixel { x: u32, y: u32 },
+}
+
 /// Enabled pointer tracking policy, independent of its wire encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MouseTracking {
@@ -109,6 +116,7 @@ impl TerminalModes {
         }
     }
 
+    /// Encode already validated coordinates in the negotiated coordinate space.
     pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
         let tracking = self.mouse_tracking()?;
         let button = if tracking == MouseTracking::PressOnly {
@@ -183,6 +191,28 @@ impl TerminalModes {
             MouseEncoding::Utf8 => Self::utf8_mouse_report(legacy_release, col, row),
             MouseEncoding::Legacy => Self::x10_mouse_report(legacy_release, col, row),
         })
+    }
+
+    pub fn get_mouse_report_at(&self, button: u8, position: MousePosition) -> Option<Vec<u8>> {
+        let (column, row) = self.mouse_coordinates(position)?;
+        self.get_mouse_report(button, column, row)
+    }
+
+    pub fn get_mouse_release_report_at(
+        &self,
+        button: u8,
+        position: MousePosition,
+    ) -> Option<Vec<u8>> {
+        let (column, row) = self.mouse_coordinates(position)?;
+        self.get_mouse_release_report(button, column, row)
+    }
+
+    fn mouse_coordinates(&self, position: MousePosition) -> Option<(usize, usize)> {
+        match (self.contains(&1016), position) {
+            (true, MousePosition::Pixel { x, y }) => Some((x as usize, y as usize)),
+            (false, MousePosition::Cell { column, row }) => Some((column, row)),
+            _ => None,
+        }
     }
 
     pub fn is_mouse_enabled(&self) -> bool {

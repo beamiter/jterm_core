@@ -11,12 +11,30 @@ impl TerminalModes {
     // Pixel reporting requires a frontend that can supply measured positions.
     const PIXEL_MOUSE_CAPABILITY: u32 = 1 << 31;
 
-    pub(crate) fn enable_pixel_mouse(&mut self) {
+    /// Enable DEC mode 1016 for an adapter that can report measured pixels.
+    pub fn enable_pixel_mouse(&mut self) {
         self.bits |= Self::PIXEL_MOUSE_CAPABILITY;
     }
 
-    pub(crate) fn supports_pixel_mouse(&self) -> bool {
+    pub fn supports_pixel_mouse(&self) -> bool {
         self.bits & Self::PIXEL_MOUSE_CAPABILITY != 0
+    }
+
+    pub(crate) fn set_mouse_encoding(&mut self, mode: u16, enabled: bool) {
+        if !enabled {
+            self.remove(&mode);
+            return;
+        }
+        match mode {
+            1016 if self.supports_pixel_mouse() => {
+                for cell_encoding in [1005, 1006, 1015] {
+                    self.remove(&cell_encoding);
+                }
+            }
+            1005 | 1006 | 1015 => self.remove(&1016),
+            _ => {}
+        }
+        self.insert(mode);
     }
 
     const fn bit_index(mode: u16) -> Option<u32> {

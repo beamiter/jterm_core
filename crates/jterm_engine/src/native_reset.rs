@@ -36,7 +36,11 @@ pub fn reset_frost_attributes(screen: &mut ScreenState, protocol: &mut ProtocolS
     screen.scroll_region_bottom = screen.grid.rows().saturating_sub(1);
     screen.tab_stops = default_tab_stops(screen.grid.row_len(), TabStopOrigin::Clear);
     screen.saved_state = None;
-    *protocol.modes_mut() = frost_initial_modes();
+    let mut modes = frost_initial_modes();
+    if protocol.modes().supports_pixel_mouse() {
+        modes.enable_pixel_mouse();
+    }
+    *protocol.modes_mut() = modes;
     protocol.clear_saved_dec_modes();
     protocol.set_attribute_change_extent(0);
     screen.insert_mode = false;
@@ -79,5 +83,18 @@ mod tests {
         assert_eq!(protocol.xterm_modify_other_keys(), 2);
         assert_eq!(protocol.keyboard_enhancement_flags(), 0);
         assert_eq!(protocol.inactive_keyboard_enhancement_flags(), 0);
+    }
+
+    #[test]
+    fn frost_ris_clears_pixel_mode_and_keeps_the_adapter_capability() {
+        let mut screen = ScreenState::new_frost_legacy(3, 12);
+        let mut protocol = ProtocolState::default();
+        protocol.modes_mut().enable_pixel_mouse();
+        protocol.modes_mut().insert(1002);
+        protocol.modes_mut().set_mouse_encoding(1016, true);
+        reset_frost_attributes(&mut screen, &mut protocol);
+        assert!(protocol.modes().supports_pixel_mouse());
+        assert!(!protocol.modes().contains(&1016));
+        assert!(!protocol.modes().is_mouse_enabled());
     }
 }

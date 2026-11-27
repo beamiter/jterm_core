@@ -130,6 +130,9 @@ pub fn apply_ember_mode(
                     protocol.modes_mut().remove(&42);
                 }
             }
+            1005 | 1006 | 1015 | 1016 => {
+                protocol.modes_mut().set_mouse_encoding(mode, enabled);
+            }
             _ => {
                 if enabled {
                     protocol.modes_mut().insert(mode);
@@ -185,6 +188,18 @@ pub fn apply_frost_mode(
         return None;
     }
 
+    if matches!(mode, 1005 | 1006 | 1015 | 1016) {
+        let modes = protocol.modes_mut();
+        let old = modes.contains(&mode);
+        let was_pixel = modes.contains(&1016);
+        modes.set_mouse_encoding(mode, enabled);
+        return if old != modes.contains(&mode) || was_pixel != modes.contains(&1016) {
+            MouseReportingChanged
+        } else {
+            None
+        };
+    }
+
     let effect = match mode {
         1 if protocol.modes().contains(&1) != enabled
             && native_alternate_scroll_profile(screen, protocol).is_some() =>
@@ -206,9 +221,7 @@ pub fn apply_frost_mode(
             }
             None
         }
-        9 | 1000..=1003 | 1005 | 1006 | 1007 | 1015
-            if protocol.modes().contains(&mode) != enabled =>
-        {
+        9 | 1000..=1003 | 1007 if protocol.modes().contains(&mode) != enabled => {
             MouseReportingChanged
         }
         42 => {
@@ -351,8 +364,15 @@ pub fn apply_native_mode_parameter(
             FrostModeEffect::SynchronizedOutput => NativeModeEffect::SynchronizedOutput { enabled },
         };
     }
+    let was_pixel = (namespace == ModeNamespace::DecPrivate
+        && matches!(mode, 1005 | 1006 | 1015 | 1016))
+    .then(|| protocol.modes().contains(&1016));
     if apply_ember_mode(screen, protocol, namespace, mode, enabled) {
-        return NativeModeEffect::None;
+        return if was_pixel.is_some_and(|old| old != protocol.modes().contains(&1016)) {
+            NativeModeEffect::MouseReportingChanged
+        } else {
+            NativeModeEffect::None
+        };
     }
     match mode {
         5522 => {

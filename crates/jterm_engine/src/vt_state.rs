@@ -801,6 +801,12 @@ mod tests {
             (&mut self.vt.screen, &mut self.vt.protocol)
         }
         fn csi_effect(&mut self, effect: FrostCsiEffect<'_>) {
+            if matches!(
+                effect,
+                FrostCsiEffect::Mode(crate::mode_mutation::NativeModeEffect::MouseReportingChanged)
+            ) {
+                self.wheel_retires += 1;
+            }
             if let FrostCsiEffect::Erase(crate::display_erase::DisplayEraseStep::DirtyRows(
                 ref rows,
             )) = effect
@@ -2213,6 +2219,90 @@ mod tests {
                 assert_eq!(host.replies, b"\x1b[?9;1$y\x1b[?9;2$y");
                 assert!(!host.vt.protocol.modes().is_mouse_enabled());
             }
+        }
+    }
+
+    #[test]
+    fn native_pixel_mouse_requires_opt_in_and_a_matching_coordinate_type() {
+        use crate::mouse::MousePosition;
+
+        let packet = b"\x1b[?1003;1006h\x1b[?1016$p\x1b[?1016h\x1b[?1016$p\x1b[?1006$p";
+        let pixel = MousePosition::Pixel { x: 26, y: 51 };
+        let cell = MousePosition::Cell { column: 2, row: 1 };
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                for enabled in [false, true] {
+                    let mut host = Host::new(profile);
+                    if enabled {
+                        host.vt.protocol.modes_mut().enable_pixel_mouse();
+                    }
+                    feed(&mut host, &packet[..split], None);
+                    feed(&mut host, &packet[split..], None);
+                    let modes = host.vt.protocol.modes();
+                    if enabled {
+                        assert_eq!(host.replies, b"\x1b[?1016;2$y\x1b[?1016;1$y\x1b[?1006;2$y");
+                        assert!(modes.get_mouse_report_at(0, cell).is_none());
+                        assert!(modes.get_mouse_release_report_at(0, cell).is_none());
+                        assert_eq!(
+                            modes.get_mouse_report_at(32, pixel).as_deref(),
+                            Some(b"\x1b[<32;27;52M".as_slice())
+                        );
+                        assert_eq!(
+                            modes.get_mouse_release_report_at(16, pixel).as_deref(),
+                            Some(b"\x1b[<16;27;52m".as_slice())
+                        );
+                    } else {
+                        assert_eq!(host.replies, b"\x1b[?1016;0$y\x1b[?1016;0$y\x1b[?1006;1$y");
+                        assert!(modes.get_mouse_report_at(0, pixel).is_none());
+                        assert!(modes.get_mouse_release_report_at(0, pixel).is_none());
+                        assert_eq!(
+                            modes.get_mouse_report_at(0, cell).as_deref(),
+                            Some(b"\x1b[<0;3;2M".as_slice())
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_saved_pixel_mode_notifies_the_host_at_each_coordinate_transition() {
+        use crate::mouse::MouseEncoding;
+
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            let mut host = Host::new(profile);
+            host.vt.protocol.modes_mut().enable_pixel_mouse();
+            feed(&mut host, b"\x1b[?1002;1016h\x1b[?1016s", None);
+            let before = host.wheel_retires;
+            feed(
+                &mut host,
+                b"\x1b[?1006h\x1b[?1016$p\x1b[?1006r\x1b[?1016$p",
+                None,
+            );
+            assert_eq!(host.replies, b"\x1b[?1016;2$y\x1b[?1016;1$y");
+            assert_eq!(
+                host.vt
+                    .protocol
+                    .modes()
+                    .mouse_report_profile()
+                    .unwrap()
+                    .encoding,
+                MouseEncoding::SgrPixels
+            );
+            let expected = if profile == NativeProfile::Ember {
+                2
+            } else {
+                3
+            };
+            assert_eq!(host.wheel_retires - before, expected);
         }
     }
 
