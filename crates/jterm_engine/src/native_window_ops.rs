@@ -39,7 +39,7 @@ impl NativeWindowGeometry {
         }
     }
 
-    fn cell_pixels(&self) -> (u32, u32) {
+    pub(crate) fn cell_pixels(&self) -> (u32, u32) {
         match self.pixels {
             NativeWindowPixels::Cell { width, height } => (height, width),
             NativeWindowPixels::Viewport { width, height } => {

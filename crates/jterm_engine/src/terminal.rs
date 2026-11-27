@@ -850,6 +850,19 @@ impl Terminal {
         Ok(())
     }
 
+    pub(crate) fn measured_cell_pixels(&self) -> Option<(u16, u16)> {
+        let grid = &self.vt.screen.grid;
+        let geometry = NativeWindowGeometry {
+            rows: grid.rows(),
+            columns: grid.cols(),
+            pixels: self.window_pixels?,
+        };
+        let (height, width) = geometry.cell_pixels();
+        let width = u16::try_from(width).ok()?;
+        let height = u16::try_from(height).ok()?;
+        (width != 0 && height != 0).then_some((width, height))
+    }
+
     /// Enable terminal identification and size reports for interactive
     /// frontends that advertise the shared terminal in their PTY.
     pub fn enable_device_answers(&mut self) {

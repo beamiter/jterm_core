@@ -240,7 +240,8 @@ impl InlineGraphics {
             {
                 return Err(Error::NotSupported("replacement of a retained image"));
             }
-            let (columns, rows) = placement.dimension((width, height), self.cell_pixels)?;
+            let cell_pixels = terminal.measured_cell_pixels().unwrap_or(self.cell_pixels);
+            let (columns, rows) = placement.dimension((width, height), cell_pixels)?;
             Some(
                 terminal
                     .prepare_inline_image(cursor, columns, rows, placement.moves_cursor)
@@ -278,6 +279,69 @@ mod tests {
         let mut terminal = Terminal::new(5, 80).unwrap();
         terminal.enable_inline_graphics((12, 24), |_, _, _| None);
         terminal
+    }
+
+    #[test]
+    fn implicit_image_placement_uses_the_reported_physical_cell() {
+        use crate::native_window_ops::NativeWindowPixels;
+
+        let mut terminal = terminal();
+        terminal.enable_device_answers();
+        let data = "////".repeat(24 * 48);
+        let place = |terminal: &mut Terminal, row, column, id, size: &str| {
+            let packet = format!(
+                "\x1b[{row};{column}H\x1b_Ga=T,i={id},s=24,v=48,f=24,C=1{size};{data}\x1b\\"
+            );
+            assert_eq!(
+                terminal.feed(packet.as_bytes()).unwrap(),
+                format!("\x1b_Gi={id};OK\x1b\\").as_bytes()
+            );
+        };
+        let check_size = |terminal: &Terminal, row, column, columns, rows| {
+            let frame = terminal.frame().unwrap();
+            let (_, image, _) = frame
+                .inline_images(row)
+                .find(|(at, _, _)| *at == column)
+                .unwrap();
+            assert_eq!((image.columns(), image.rows()), (columns, rows));
+            image.id()
+        };
+
+        let viewport = NativeWindowPixels::Viewport {
+            width: 1920,
+            height: 240,
+        };
+        terminal.set_window_pixels(5, 80, viewport).unwrap();
+        assert_eq!(terminal.feed(b"\x1b[16t").unwrap(), b"\x1b[6;48;24t");
+        place(&mut terminal, 1, 1, 51, "");
+        let first = check_size(&terminal, 0, 0, 1, 1);
+
+        let viewport = NativeWindowPixels::Viewport {
+            width: 960,
+            height: 120,
+        };
+        terminal.set_window_pixels(5, 80, viewport).unwrap();
+        assert_eq!(check_size(&terminal, 0, 0, 1, 1), first);
+        place(&mut terminal, 3, 5, 52, "");
+        check_size(&terminal, 2, 4, 2, 2);
+
+        let resized = NativeWindowPixels::Viewport {
+            width: 2016,
+            height: 288,
+        };
+        terminal
+            .resize_with_window_pixels(6, 84, Some(resized), || Ok(()))
+            .unwrap();
+        assert_eq!(check_size(&terminal, 0, 0, 1, 1), first);
+        place(&mut terminal, 3, 9, 53, "");
+        check_size(&terminal, 2, 8, 1, 1);
+        place(&mut terminal, 3, 13, 54, ",c=2,r=2");
+        check_size(&terminal, 2, 12, 2, 2);
+
+        terminal.resize(7, 85).unwrap();
+        assert_eq!(check_size(&terminal, 0, 0, 1, 1), first);
+        place(&mut terminal, 3, 17, 55, "");
+        check_size(&terminal, 2, 16, 2, 2);
     }
 
     #[test]
