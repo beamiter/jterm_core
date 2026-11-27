@@ -1690,6 +1690,37 @@ fn modify_other_keys_query_tracks_the_encoder_without_painting() {
 }
 
 #[test]
+fn hosted_character_size_queries_follow_the_current_grid() {
+    for enable in [
+        Terminal::enable_window_updates,
+        Terminal::enable_device_answers,
+    ] {
+        let mut terminal = Terminal::new(8, 21).unwrap();
+        assert!(terminal.feed(b"\x1b[18t").unwrap().is_empty());
+        enable(&mut terminal);
+        let before = terminal.frame().unwrap().stamp();
+        let query = b"\x1b[18t";
+        for cut in 0..query.len() {
+            assert!(terminal.feed(&query[..cut]).unwrap().is_empty());
+            assert_eq!(terminal.feed(&query[cut..]).unwrap(), b"\x1b[8;8;21t");
+        }
+        assert_eq!(
+            terminal.feed(b"\x1b[018t\x1b[6n").unwrap(),
+            b"\x1b[8;8;21t\x1b[1;1R",
+        );
+        assert!(terminal
+            .feed(b"\x1b[?18t\x1b[18:t\x1b[18;t\x1b[18$t")
+            .unwrap()
+            .is_empty());
+        assert_eq!(terminal.frame().unwrap().stamp(), before);
+
+        terminal.resize(11, 95).unwrap();
+        terminal.feed(b"\x1b[?1049h").unwrap();
+        assert_eq!(terminal.feed(query).unwrap(), b"\x1b[8;11;95t");
+    }
+}
+
+#[test]
 fn nonpaint_output_keeps_the_frame_revision_and_the_next_delta_base() {
     let mut terminal = Terminal::new(3, 20).unwrap();
     terminal.enable_device_answers();

@@ -2100,6 +2100,47 @@ mod tests {
     }
 
     #[test]
+    fn real_pty_text_area_query_follows_the_family_session_after_resize() {
+        let script = concat!(
+            "stty raw -echo || exit 30; ",
+            "check_size() { set -- $(stty size); ",
+            "expected=$(printf '\\033[8;%s;%st' \"$1\" \"$2\"); ",
+            "printf '\\033[18t'; actual=$(dd bs=1 count=\"${#expected}\" 2>/dev/null); ",
+            "[ \"$actual\" = \"$expected\" ]; }; ",
+            "check_size || exit 31; printf 'SIZE_%s\\r\\n' INITIAL; ",
+            "IFS= read -r resume || exit 32; check_size || exit 33; ",
+            "printf 'SIZE_%s\\r\\n' RESIZED; exit\n",
+        );
+        let mut session = Session::spawn_family_with_epoch(8, 21, NonZeroU64::MIN, false).unwrap();
+        session.enable_ordered_input();
+        session.submit_input(script.as_bytes().to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut resized = false;
+        while !session.is_drained() {
+            assert!(
+                Instant::now() < deadline,
+                "child did not complete the size queries: {}",
+                session.terminal().visible_text()
+            );
+            session.drive().unwrap();
+            if !resized && session.terminal().visible_text().contains("SIZE_INITIAL") {
+                session.resize(11, 95).unwrap();
+                session.submit_input(b"resume\n".to_vec()).unwrap();
+                resized = true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            session.exit_code(),
+            Some(0),
+            "child checks both reply sizes"
+        );
+        assert!(resized);
+        assert!(session.terminal().visible_text().contains("SIZE_RESIZED"));
+        session.close().unwrap();
+    }
+
+    #[test]
     fn interrupted_reads_are_bounded_and_eio_marks_eof() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct InterruptedReader(Arc<AtomicUsize>);

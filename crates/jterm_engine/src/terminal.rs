@@ -826,13 +826,13 @@ impl Terminal {
         self.graphemes.get_or_insert_with(GraphemeInput::default);
     }
 
-    /// Opt in to bounded Bell and OSC title notifications for the owning view.
+    /// Enable bounded bell and title notifications and text-area size reports.
     pub fn enable_window_updates(&mut self) {
         self.window.get_or_insert_with(WindowState::default);
     }
 
-    /// Enable terminal identification for interactive frontends that advertise
-    /// the shared terminal to applications in their own PTY.
+    /// Enable terminal identification and size reports for interactive
+    /// frontends that advertise the shared terminal in their PTY.
     pub fn enable_device_answers(&mut self) {
         self.device_answers = true;
     }
@@ -2463,6 +2463,24 @@ impl Terminal {
                 replies.push(reply, "reply byte limit");
                 return Ok(());
             }
+        }
+        if matches!(&event, Event::Csi {
+            params,
+            raw_params,
+            private_prefix: None,
+            intermediates,
+            final_byte: b't',
+            ..
+        } if (self.device_answers || self.window.is_some())
+            && intermediates.is_empty()
+            && params.as_slice() == [18]
+            && raw_params.iter().all(u8::is_ascii_digit))
+        {
+            let grid = &self.vt.screen.grid;
+            let mut reply = Vec::new();
+            crate::native_window_ops::write_text_area_chars(grid.rows(), grid.cols(), &mut reply);
+            replies.push(&reply, "reply byte limit");
+            return Ok(());
         }
         if let Event::String {
             kind: StringKind::Dcs,

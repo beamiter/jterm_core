@@ -43,6 +43,10 @@ impl NativeWindowGeometry {
     }
 }
 
+pub(crate) fn write_text_area_chars(rows: usize, columns: usize, replies: &mut Vec<u8>) {
+    write!(replies, "\x1b[8;{rows};{columns}t").unwrap();
+}
+
 /// Apply one already-admitted CSI `t` in place so queries stay in parser order.
 /// Without compositor coordinates, state is normal and position is origin.
 /// Monitor geometry mirrors the grid. Move, resize and iconify are ignored.
@@ -65,7 +69,7 @@ pub fn apply_native_window_op<const LIMIT: usize>(
             let (height, width) = geometry.cell_pixels();
             write!(replies, "\x1b[6;{height};{width}t").unwrap();
         }
-        18 => write!(replies, "\x1b[8;{rows};{columns}t").unwrap(),
+        18 => write_text_area_chars(rows, columns, replies),
         19 => write!(replies, "\x1b[9;{rows};{columns}t").unwrap(),
         _ => {
             if let Some(reply) = titles.apply_title_window_op(params, report_title) {
