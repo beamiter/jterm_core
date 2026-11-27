@@ -389,6 +389,7 @@ impl Parser {
         capture: &mut Option<OpenCapture>,
         feed_offset: usize,
         state: &State,
+        input: &[u8],
         at: usize,
     ) -> bool {
         if profile != ParserProfile::FrostLegacyV1 || capture.is_some() {
@@ -405,16 +406,24 @@ impl Parser {
         );
         match state {
             State::Escape(bytes) => {
-                prefix.push(0x1b);
-                prefix.extend(bytes);
+                let rest = &input[at..];
+                if !(rest.is_empty() || bytes.is_empty() && rest == b"[") {
+                    prefix.push(0x1b);
+                    prefix.extend(bytes);
+                }
             }
             State::Csi {
                 params,
                 intermediates,
             } => {
-                prefix.extend(b"\x1b[");
-                prefix.extend(params);
-                prefix.extend(intermediates);
+                // A lone parameter or intermediate byte cannot complete
+                // this capture before the current feed ends.
+                if !matches!(&input[at..], [] | [0x20..=0x3f]) {
+                    prefix = Vec::with_capacity(2 + params.len() + intermediates.len());
+                    prefix.extend(b"\x1b[");
+                    prefix.extend(params);
+                    prefix.extend(intermediates);
+                }
             }
             State::Charset(bank) => prefix.extend([0x1b, *bank]),
             State::String { .. }
@@ -601,6 +610,7 @@ impl Parser {
                     &mut self.capture,
                     self.feed_offset,
                     &self.state,
+                    input,
                     at,
                 );
             }

@@ -213,6 +213,83 @@ fn compare(bytes: &[u8], cuts: &[usize]) {
     }
 }
 #[test]
+fn carried_csi_reconstructs_capture_through_an_embedded_control() {
+    let profile = ParserProfile::FrostLegacyV1;
+    for bounded in [false, true] {
+        let mut parser = if bounded {
+            Parser::with_bounded_profile(limits(), profile).unwrap()
+        } else {
+            Parser::with_profile(limits(), profile)
+        };
+        for input in [
+            b"\x1b".as_slice(),
+            b"",
+            b"[",
+            b"?",
+            b"1",
+            b";",
+            b"2",
+            b"$",
+            b"",
+        ] {
+            parser.begin_feed();
+            let step = parser.next(input);
+            assert_eq!(step.consumed, input.len());
+            assert_eq!(step.event, None);
+            assert_eq!(
+                step.capture,
+                Some(CaptureStep {
+                    started: true,
+                    end: Some(CaptureEnd::Abandoned),
+                })
+            );
+        }
+
+        parser.begin_feed();
+        let step = parser.next(b"\x08pX");
+        assert_eq!(step.consumed, 1);
+        assert_eq!(step.event, Some(Event::Control(8)));
+        assert_eq!(
+            step.capture,
+            Some(CaptureStep {
+                started: true,
+                end: None,
+            })
+        );
+        let step = parser.next(b"pX");
+        assert_eq!(step.consumed, 1);
+        assert_eq!(
+            step.event,
+            Some(Event::Csi {
+                raw_params: b"1;2".to_vec(),
+                params: vec![1, 2],
+                colon_flags: vec![false, false],
+                private_prefix: Some(b'?'),
+                intermediates: vec![b'$'],
+                final_byte: b'p',
+            })
+        );
+        assert_eq!(
+            step.capture,
+            Some(CaptureStep {
+                started: false,
+                end: Some(CaptureEnd::Complete {
+                    token: Some(CaptureToken {
+                        prefix: b"\x1b[?1;2$".to_vec(),
+                        input_range: 0..2,
+                    }),
+                    escape: true,
+                }),
+            })
+        );
+        let step = parser.next(b"X");
+        assert_eq!(step.event, Some(Event::Ascii(b"X")));
+        assert_eq!(parser.pending_kind(), PendingKind::None);
+        assert_eq!(parser.next(b"").event, None);
+    }
+}
+
+#[test]
 fn frozen_original_scanner_matches_at_identical_partitions() {
     let cases: &[&[u8]] = &[
         b"\x1b(0abc\x1b(Bdef",
