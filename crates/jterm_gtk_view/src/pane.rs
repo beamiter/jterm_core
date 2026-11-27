@@ -1785,20 +1785,10 @@ impl<P: Pty> TerminalPane<P> {
         let total = rail.len();
         self.history_rail.replace(rail);
         self.sync_scrollback(total, history_top, frame.rows().len());
-        match &history {
-            Some(history) => {
-                if let Some(page) = &history.page {
-                    self.view
-                        .present(&frame, live_margin_gaps, Some(page), colors.as_ref());
-                }
-                self.painted_history.set(Some(history.window));
-            }
-            None => {
-                self.view
-                    .present(&frame, live_margin_gaps, None, colors.as_ref());
-                self.painted_history.set(None);
-            }
-        }
+        self.view
+            .present(&frame, live_margin_gaps, history.as_ref(), colors.as_ref());
+        self.painted_history
+            .set(history.as_ref().map(|history| history.window));
         self.inline_images.borrow_mut().present(
             &frame,
             history
