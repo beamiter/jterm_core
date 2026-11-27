@@ -105,7 +105,7 @@ pub(crate) struct TerminalView {
 
 struct Presentation {
     buffer: gtk4::TextBuffer,
-    font: gtk4::TextTag,
+    tags: PaintTags,
     rows: Vec<PresentedRow>,
     live: Option<(CellFrame, u128)>,
 }
@@ -163,10 +163,11 @@ impl Drop for TerminalView {
 }
 
 struct PresentedRow {
-    tags: Vec<gtk4::TextTag>,
+    tags: Vec<Rc<StyleTag>>,
     links: Vec<PresentedLink>,
     column_spans: Vec<ColumnSpan>,
     copy: CopyRow,
+    line_separators: Vec<(usize, char)>,
     cursor: Option<i32>,
     blank_tail: Option<usize>,
 }
@@ -257,7 +258,7 @@ pub(crate) struct PresentedLink {
     pub(crate) target: Rc<str>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Style {
     foreground: gdk::RGBA,
     background: gdk::RGBA,
@@ -266,6 +267,16 @@ struct Style {
     underline: pango::Underline,
     underline_color: Option<gdk::RGBA>,
     strikethrough: bool,
+}
+
+struct StyleTag {
+    style: Style,
+    tag: gtk4::TextTag,
+}
+
+struct PaintTags {
+    font: gtk4::TextTag,
+    styles: HashMap<Style, Rc<StyleTag>>,
 }
 
 struct PaintTheme<'a> {
@@ -894,27 +905,43 @@ fn selected_text(view: &gtk4::TextView, shown: Option<&Presentation>) -> Option<
         start.line() as usize,
         start.line_offset() as usize,
         |index| {
-            rows.get(index)
-                .map_or_else(CopyRow::default, |row| row.copy)
+            rows.get(index).map_or_else(
+                || (CopyRow::default(), &[][..]),
+                |row| (row.copy, row.line_separators.as_slice()),
+            )
         },
     ))
 }
 
-fn logical_selection(
+fn logical_selection<'a>(
     selected: &str,
     first_row: usize,
     first_offset: usize,
-    copy_row: impl Fn(usize) -> CopyRow,
+    copy_row: impl Fn(usize) -> (CopyRow, &'a [(usize, char)]),
 ) -> String {
     let mut text = String::with_capacity(selected.len());
     for (index, physical_row) in selected.split_inclusive('\n').enumerate() {
-        let row = copy_row(first_row + index);
+        let (row, separators) = copy_row(first_row + index);
         let physical_row = if row.wrapped {
             physical_row.strip_suffix('\n').unwrap_or(physical_row)
         } else {
             physical_row
         };
         let start = if index == 0 { first_offset } else { 0 };
+        if !separators.is_empty() {
+            let first = separators.partition_point(|&(column, _)| column < start);
+            let mut separators = separators[first..].iter().peekable();
+            for (index, displayed) in physical_row.chars().enumerate() {
+                let column = start + index;
+                let character = separators
+                    .next_if(|&&(offset, _)| offset == column)
+                    .map_or(displayed, |&(_, character)| character);
+                if row.margin_gap != Some(column) || character != ' ' {
+                    text.push(character);
+                }
+            }
+            continue;
+        }
         let gap = row
             .margin_gap
             .and_then(|column| column.checked_sub(start))
@@ -935,16 +962,26 @@ fn logical_selection(
 fn copy_joins_soft_wraps_and_keeps_explicit_newlines_and_spaces() {
     let selected = "👩‍💻- \n  continuation\nnext";
     assert_eq!(
-        logical_selection(selected, 1, 4, |row| CopyRow {
-            wrapped: row == 1,
-            margin_gap: None,
+        logical_selection(selected, 1, 4, |row| {
+            (
+                CopyRow {
+                    wrapped: row == 1,
+                    margin_gap: None,
+                },
+                &[],
+            )
         }),
         "👩‍💻-   continuation\nnext"
     );
     assert_eq!(
-        logical_selection(selected, 1, 4, |row| CopyRow {
-            wrapped: row == 1,
-            margin_gap: (row == 1).then_some(8),
+        logical_selection(selected, 1, 4, |row| {
+            (
+                CopyRow {
+                    wrapped: row == 1,
+                    margin_gap: (row == 1).then_some(8),
+                },
+                &[],
+            )
         }),
         "👩‍💻-  continuation\nnext"
     );
@@ -1032,6 +1069,137 @@ fn live_update_preserves_unchanged_buffer_rows_and_moves_the_caret() {
     let primary = first.text(&first.start_iter(), &first.end_iter(), true);
     assert!(primary.lines().next().unwrap().starts_with("stable"));
     window.close();
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires a GTK display"]
+fn literal_unicode_separators_preserve_terminal_rows_and_copy_text() {
+    gtk4::init().expect("GTK display");
+    let mut terminal = jterm_engine::terminal::Terminal::new(4, 12).unwrap();
+    terminal.enable_grapheme_clusters();
+    let view = TerminalView::new(Theme {
+        font: pango::FontDescription::from_string("Monospace 12"),
+        foreground: gdk::RGBA::WHITE,
+        background: gdk::RGBA::BLACK,
+        palette: default_ansi_palette(),
+        cursor: None,
+    });
+    let paint = |terminal: &jterm_engine::terminal::Terminal| {
+        view.present(
+            &terminal.frame().unwrap(),
+            terminal.live_margin_gaps(),
+            None,
+            None,
+        );
+    };
+    terminal
+        .feed("A\u{2029}B\u{2028}C\r\nkeep\r\nthird".as_bytes())
+        .unwrap();
+    paint(&terminal);
+    let buffer = view.widget.buffer();
+    assert_eq!(buffer.line_count(), 4);
+    assert!(buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+        .starts_with("A B C"));
+    let select = |line, start, expected| {
+        buffer.select_range(
+            &buffer.iter_at_line_offset(line, start).unwrap(),
+            &buffer.iter_at_line_offset(line, 5).unwrap(),
+        );
+        let text = terminal_view_selection(view.widget.upcast_ref());
+        buffer.place_cursor(&buffer.start_iter());
+        assert_eq!(text.as_deref(), Some(expected));
+    };
+    select(0, 1, "\u{2029}B\u{2028}C");
+    select(0, 3, "\u{2028}C");
+    terminal.feed(b"\x1b[2;1H!").unwrap();
+    paint(&terminal);
+    assert_eq!(buffer.iter_at_line(1).unwrap().char(), '!');
+    assert_eq!(buffer.line_count(), 4);
+    terminal.feed(b"\x1b[T").unwrap();
+    paint(&terminal);
+    assert_eq!(buffer.line_count(), 4);
+    select(1, 1, "\u{2029}B\u{2028}C");
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires a GTK display"]
+fn live_styles_share_tags_and_release_unused_colors() {
+    gtk4::init().expect("GTK display");
+    let mut terminal = jterm_engine::terminal::Terminal::new(4, 20).unwrap();
+    let view = TerminalView::new(Theme {
+        font: pango::FontDescription::from_string("Monospace 12"),
+        foreground: gdk::RGBA::WHITE,
+        background: gdk::RGBA::BLACK,
+        palette: default_ansi_palette(),
+        cursor: None,
+    });
+    let paint = |terminal: &jterm_engine::terminal::Terminal| {
+        view.present(
+            &terminal.frame().unwrap(),
+            terminal.live_margin_gaps(),
+            None,
+            None,
+        );
+    };
+    terminal
+        .feed(b"\x1b[?25l\x1b[31mfirst\r\nsecond\x1b[0m")
+        .unwrap();
+    paint(&terminal);
+    let buffer = view.widget.buffer();
+    let table = buffer.tag_table();
+    let foreground_tag = |row| {
+        buffer
+            .iter_at_line(row)
+            .unwrap()
+            .tags()
+            .into_iter()
+            .find(|tag| tag.foreground_rgba().is_some())
+            .unwrap()
+    };
+    let red = foreground_tag(0);
+    assert_eq!(red, foreground_tag(1));
+    let initial_count = table.size();
+    let added = Rc::new(Cell::new(0));
+    let removed = Rc::new(Cell::new(0));
+    table.connect_tag_added({
+        let count = added.clone();
+        move |_, _| count.set(count.get() + 1)
+    });
+    table.connect_tag_removed({
+        let count = removed.clone();
+        move |_, _| count.set(count.get() + 1)
+    });
+    terminal.feed(b"\x1b[1;1H\x1b[31mX\x1b[0m").unwrap();
+    paint(&terminal);
+    assert_eq!(red, foreground_tag(0));
+    assert_eq!((added.get(), removed.get()), (0, 0));
+
+    terminal
+        .feed(b"\x1b[1;1H\x1b[2K\x1b[34mblue\x1b[0m")
+        .unwrap();
+    paint(&terminal);
+    assert_eq!(red, foreground_tag(1));
+    assert_eq!(table.size(), initial_count + 1);
+    terminal
+        .feed(b"\x1b[2;1H\x1b[2K\x1b[34malso blue\x1b[0m")
+        .unwrap();
+    paint(&terminal);
+    assert_eq!(foreground_tag(0), foreground_tag(1));
+    assert_eq!(table.size(), initial_count);
+    assert_eq!(removed.get(), 1);
+
+    for red_component in 0..64 {
+        terminal
+            .feed(format!("\x1b[1;1H\x1b[2K\x1b[38;2;{red_component};12;17mX\x1b[0m").as_bytes())
+            .unwrap();
+        paint(&terminal);
+        assert_eq!(table.size(), initial_count + 1);
+    }
+    view.clear();
+    assert_eq!(table.size(), 0);
 }
 
 #[cfg(test)]
@@ -1259,14 +1427,14 @@ fn selection_joins_wide_wraps_in_live_and_archived_rows() {
         );
         selected
     };
-    terminal.feed("ae\u{301}cde界Z".as_bytes()).unwrap();
+    terminal.feed("ae\u{301}c\u{2029}e界Z".as_bytes()).unwrap();
     view.present(
         &terminal.frame().unwrap(),
         terminal.live_margin_gaps(),
         None,
         None,
     );
-    assert_eq!(select(), "e\u{301}cde界Z");
+    assert_eq!(select(), "e\u{301}c\u{2029}e界Z");
     terminal.feed(b"\r\nx\r\ny\r\n").unwrap();
     let history = terminal.history_page(0, 2).unwrap();
     view.present(
@@ -1275,7 +1443,7 @@ fn selection_joins_wide_wraps_in_live_and_archived_rows() {
         Some(&history),
         None,
     );
-    assert_eq!(select(), "e\u{301}cde界Z");
+    assert_eq!(select(), "e\u{301}c\u{2029}e界Z");
 
     let widget = view.widget.clone();
     drop(view);
@@ -1389,6 +1557,10 @@ impl Presentation {
             .font_desc(&theme.configured.font)
             .build();
         buffer.tag_table().add(&font);
+        let mut tags = PaintTags {
+            font,
+            styles: HashMap::new(),
+        };
         let mut end = buffer.end_iter();
         let archived = history
             .into_iter()
@@ -1399,7 +1571,7 @@ impl Presentation {
         let mut targets = HashMap::new();
         for (index, source) in archived.chain(live).take(frame.rows().len()).enumerate() {
             if index != 0 {
-                buffer.insert_with_tags(&mut end, "\n", &[&font]);
+                buffer.insert_with_tags(&mut end, "\n", &[&tags.font]);
             }
             let caret = (history.is_none() && cursor.paint_position().0 == index).then_some(cursor);
             rows.push(paint_row(
@@ -1407,14 +1579,14 @@ impl Presentation {
                 &mut end,
                 source,
                 theme,
-                &font,
+                &mut tags,
                 caret,
                 &mut targets,
             ));
         }
         Self {
             buffer,
-            font,
+            tags,
             rows,
             live: history.is_none().then(|| (frame.clone(), margin_gaps)),
         }
@@ -1423,10 +1595,11 @@ impl Presentation {
     fn remove_tags(&self) {
         remove_tags(
             &self.buffer,
-            self.rows
-                .iter()
-                .flat_map(|row| &row.tags)
-                .chain(std::iter::once(&self.font)),
+            self.tags
+                .styles
+                .values()
+                .map(|style| &style.tag)
+                .chain(std::iter::once(&self.tags.font)),
         );
     }
 
@@ -1513,16 +1686,12 @@ impl Presentation {
         if start != end {
             self.buffer.delete(&mut start, &mut end);
         }
-        remove_tags(
-            &self.buffer,
-            self.rows[old.clone()].iter().flat_map(|row| &row.tags),
-        );
         let cursor = frame.cursor();
         let mut painted = Vec::with_capacity(new.len());
         for index in new {
             if tail {
                 self.buffer
-                    .insert_with_tags(&mut start, "\n", &[&self.font]);
+                    .insert_with_tags(&mut start, "\n", &[&self.tags.font]);
             }
             let caret = (cursor.paint_position().0 == index).then_some(cursor);
             painted.push(paint_row(
@@ -1530,16 +1699,19 @@ impl Presentation {
                 &mut start,
                 RowSource::Live(frame, index, margin_gaps),
                 theme,
-                &self.font,
+                &mut self.tags,
                 caret,
                 targets,
             ));
             if !tail {
                 self.buffer
-                    .insert_with_tags(&mut start, "\n", &[&self.font]);
+                    .insert_with_tags(&mut start, "\n", &[&self.tags.font]);
             }
         }
-        self.rows.splice(old, painted);
+        self.tags.retire(
+            &self.buffer,
+            self.rows.splice(old, painted).flat_map(|row| row.tags),
+        );
         Some(())
     }
 
@@ -1550,7 +1722,6 @@ impl Presentation {
         theme: &PaintTheme<'_>,
         indices: Vec<usize>,
     ) {
-        let table = self.buffer.tag_table();
         let cursor = frame.cursor();
         let mut targets = HashMap::new();
         for index in indices {
@@ -1561,19 +1732,18 @@ impl Presentation {
             let mut end = start;
             end.forward_to_line_end();
             self.buffer.delete(&mut start, &mut end);
-            for tag in &self.rows[index].tags {
-                table.remove(tag);
-            }
             let caret = (cursor.paint_position().0 == index).then_some(cursor);
-            self.rows[index] = paint_row(
+            let painted = paint_row(
                 &self.buffer,
                 &mut start,
                 RowSource::Live(frame, index, margin_gaps),
                 theme,
-                &self.font,
+                &mut self.tags,
                 caret,
                 &mut targets,
             );
+            let replaced = std::mem::replace(&mut self.rows[index], painted);
+            self.tags.retire(&self.buffer, replaced.tags.into_iter());
         }
         self.live = Some((frame.clone(), margin_gaps));
     }
@@ -1584,7 +1754,7 @@ fn paint_row(
     end: &mut gtk4::TextIter,
     source: RowSource<'_>,
     theme: &PaintTheme<'_>,
-    font: &gtk4::TextTag,
+    tags: &mut PaintTags,
     cursor: Option<Cursor>,
     targets: &mut HashMap<HyperlinkId, Option<Rc<str>>>,
 ) -> PresentedRow {
@@ -1599,6 +1769,7 @@ fn paint_row(
             wrapped: row.wrapped,
             margin_gap: None,
         },
+        line_separators: Vec::new(),
         cursor: None,
         blank_tail: (!source.has_image()).then(|| {
             let trailing = row
@@ -1686,10 +1857,30 @@ fn paint_row(
         if let Some(old_style) = previous.filter(|old| *old != style) {
             result
                 .tags
-                .push(insert_run(buffer, end, &run, font, old_style));
+                .push(tags.insert_run(buffer, end, &run, old_style));
             run.clear();
         }
-        let length = source.push_text(&mut run, column, cell.character);
+        let length = if let Some(cluster) = source.cluster(column) {
+            let mut length = 0;
+            for character in cluster.chars() {
+                push_painted_character(
+                    &mut run,
+                    &mut result.line_separators,
+                    offset + length,
+                    character,
+                );
+                length += 1;
+            }
+            length
+        } else {
+            push_painted_character(
+                &mut run,
+                &mut result.line_separators,
+                offset,
+                cell.character,
+            );
+            1
+        };
         let end_offset = offset + length;
         if length != 1 || cell.flags.wide() {
             result.column_spans.push(ColumnSpan {
@@ -1725,9 +1916,24 @@ fn paint_row(
         previous = Some(style);
     }
     if let Some(style) = previous {
-        result.tags.push(insert_run(buffer, end, &run, font, style));
+        result.tags.push(tags.insert_run(buffer, end, &run, style));
     }
     result
+}
+
+fn push_painted_character(
+    run: &mut String,
+    separators: &mut Vec<(usize, char)>,
+    offset: i32,
+    character: char,
+) {
+    // Keep terminal cells inside one GTK display line and restore these characters on copy.
+    if matches!(character, '\u{2028}' | '\u{2029}') {
+        separators.push((offset as usize, character));
+        run.push(' ');
+    } else {
+        run.push(character);
+    }
 }
 
 fn font_row_height(pango_height: i32) -> i32 {
@@ -1810,29 +2016,51 @@ fn rgba(r: u8, g: u8, b: u8) -> gdk::RGBA {
     )
 }
 
-fn insert_run(
-    buffer: &gtk4::TextBuffer,
-    end: &mut gtk4::TextIter,
-    text: &str,
-    font: &gtk4::TextTag,
-    style: Style,
-) -> gtk4::TextTag {
-    let tag = gtk4::TextTag::builder()
-        .foreground_rgba(&style.foreground)
-        .background_rgba(&style.background)
-        .weight(if style.bold { 700 } else { 400 })
-        .style(if style.italic {
-            pango::Style::Italic
-        } else {
-            pango::Style::Normal
-        })
-        .underline(style.underline)
-        .strikethrough(style.strikethrough)
-        .build();
-    if let Some(color) = style.underline_color {
-        tag.set_underline_rgba(Some(&color));
+impl PaintTags {
+    fn insert_run(
+        &mut self,
+        buffer: &gtk4::TextBuffer,
+        end: &mut gtk4::TextIter,
+        text: &str,
+        style: Style,
+    ) -> Rc<StyleTag> {
+        let entry = self.styles.entry(style).or_insert_with(|| {
+            let tag = gtk4::TextTag::builder()
+                .foreground_rgba(&style.foreground)
+                .background_rgba(&style.background)
+                .weight(if style.bold { 700 } else { 400 })
+                .style(if style.italic {
+                    pango::Style::Italic
+                } else {
+                    pango::Style::Normal
+                })
+                .underline(style.underline)
+                .strikethrough(style.strikethrough)
+                .build();
+            if let Some(color) = style.underline_color {
+                tag.set_underline_rgba(Some(&color));
+            }
+            buffer.tag_table().add(&tag);
+            Rc::new(StyleTag { style, tag })
+        });
+        buffer.insert_with_tags(end, text, &[&self.font, &entry.tag]);
+        Rc::clone(entry)
     }
-    buffer.tag_table().add(&tag);
-    buffer.insert_with_tags(end, text, &[font, &tag]);
-    tag
+
+    fn retire(&mut self, buffer: &gtk4::TextBuffer, runs: impl Iterator<Item = Rc<StyleTag>>) {
+        let mut unused = Vec::new();
+        for run in runs {
+            // Only the cache and this retired run still own the tag. Process
+            // retired runs after painting so replacement text can reuse it.
+            if Rc::strong_count(&run) == 2 {
+                let Some(entry) = self.styles.remove(&run.style) else {
+                    continue;
+                };
+                unused.push(entry);
+            }
+        }
+        if !unused.is_empty() {
+            remove_tags(buffer, unused.iter().map(|entry| &entry.tag));
+        }
+    }
 }
