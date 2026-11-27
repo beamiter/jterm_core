@@ -1492,6 +1492,145 @@ fn immutable_capture_shares_idle_and_unchanged_rows() {
 }
 
 #[test]
+fn frame_reuses_moved_rows_across_scroll_batches_and_recaptures_edited_rows() {
+    let mut terminal = Terminal::new(6, 12).unwrap();
+    terminal.enable_underline_colors();
+    terminal.enable_grapheme_clusters();
+    terminal.enable_hyperlinks(|_, _| true);
+    terminal
+        .feed(
+            concat!(
+                "A\r\n\x1b]8;;https://example.test/b\x07\x1b[4;58;5;33mBe\u{301}",
+                "\x1b[0m\x1b]8;;\x07\r\nC\r\nD\r\nE\r\nF",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let before = terminal.frame().unwrap();
+    terminal.feed(b"\x1b[4;2HX\x1b[S").unwrap();
+    terminal.feed(b"\x1b[2;5r\x1b[T\x1b[5;2HQ").unwrap();
+    let after = terminal.frame().unwrap();
+
+    assert_eq!(
+        after
+            .rows()
+            .iter()
+            .map(|row| row.cells[0].character)
+            .collect::<String>(),
+        "B CDE "
+    );
+    assert!(Arc::ptr_eq(&before.rows()[1].cells, &after.rows()[0].cells));
+    assert!(Arc::ptr_eq(&before.rows()[2].cells, &after.rows()[2].cells));
+    assert_eq!(after.rows()[3].cells[1].character, 'X');
+    assert_eq!(after.rows()[4].cells[1].character, 'Q');
+    assert_eq!(before.rows()[3].cells[1].character, ' ');
+    assert_eq!(before.rows()[4].cells[1].character, ' ');
+    assert_eq!(after.cluster_text(0, 1), Some("e\u{301}"));
+    assert_eq!(after.underline_color(0, 0), Some(Color::Indexed(33)));
+    assert!(Arc::ptr_eq(
+        before.underline_row(1).unwrap(),
+        after.underline_row(0).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &before.shared_hyperlinks().unwrap(),
+        &after.shared_hyperlinks().unwrap()
+    ));
+    let link = after.rows()[0].cells[0].hyperlink_id;
+    assert_eq!(after.hyperlink_target(link), Some("https://example.test/b"));
+
+    terminal.feed(b"\x1b[r\x1b[S").unwrap();
+    let later = terminal.frame().unwrap();
+    assert!(Arc::ptr_eq(&after.rows()[3].cells, &later.rows()[2].cells));
+    assert_eq!(later.hyperlink_target(link), None);
+    assert_eq!(after.hyperlink_target(link), Some("https://example.test/b"));
+    let limits = Limits {
+        max_rows: 6,
+        max_cols: 12,
+        max_cells: 72,
+    };
+    assert_eq!(
+        after
+            .apply(&after.delta_to(&later).unwrap(), limits)
+            .unwrap(),
+        later
+    );
+}
+
+#[test]
+fn synchronized_capture_becomes_the_source_for_subsequent_scrolling() {
+    let mut terminal = Terminal::new(4, 8).unwrap();
+    terminal.feed(b"A\r\nB\r\nC\r\nD").unwrap();
+    let before = terminal.frame().unwrap();
+    terminal.begin_update(true);
+    terminal
+        .feed(b"\x1b[?2026h\x1b[S\x1b[?2026l\x1b[S")
+        .unwrap();
+    let completed = terminal.take_completed_sync_frame().unwrap();
+    let after = terminal.frame().unwrap();
+    assert_eq!(completed.rows()[0].cells[0].character, 'B');
+    assert_eq!(after.rows()[0].cells[0].character, 'C');
+    assert!(Arc::ptr_eq(
+        &before.rows()[1].cells,
+        &completed.rows()[0].cells
+    ));
+    assert!(Arc::ptr_eq(
+        &completed.rows()[1].cells,
+        &after.rows()[0].cells
+    ));
+}
+
+#[test]
+fn counted_scrolling_matches_single_steps_and_preserves_transcript_identity() {
+    for (alternate, inset, height) in [(false, false, 5), (true, false, 5), (false, true, 3)] {
+        let seeded = || {
+            let mut terminal = Terminal::new(5, 8).unwrap();
+            terminal.track_transcript_rows();
+            if alternate {
+                terminal.feed(b"\x1b[?1049h").unwrap();
+            }
+            terminal
+                .feed("1234567界Z\r\nC\r\nD\r\nE".as_bytes())
+                .unwrap();
+            if inset {
+                terminal.feed(b"\x1b[2;4r").unwrap();
+            }
+            terminal.frame().unwrap();
+            terminal
+        };
+        for command in ['S', 'T'] {
+            for count in [2, 9] {
+                let mut batched = seeded();
+                let mut stepped = seeded();
+                batched
+                    .feed(format!("\x1b[{count}{command}").as_bytes())
+                    .unwrap();
+                for _ in 0..count.min(height) {
+                    stepped.feed(format!("\x1b[{command}").as_bytes()).unwrap();
+                }
+                assert_eq!(
+                    batched.vt.screen.grid.row_ids(),
+                    stepped.vt.screen.grid.row_ids()
+                );
+                assert_eq!(
+                    batched.frame().unwrap().rows(),
+                    stepped.frame().unwrap().rows()
+                );
+                let batch = batched.history_page(0, 8).unwrap();
+                let steps = stepped.history_page(0, 8).unwrap();
+                assert_eq!(batch.row_count, steps.row_count);
+                assert_eq!(batch.text, steps.text);
+                for row in 0..batch.row_count {
+                    assert_eq!(
+                        batch.synthetic_margin_gap(row),
+                        steps.synthetic_margin_gap(row)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn modify_other_keys_query_tracks_the_encoder_without_painting() {
     for device_answers in [false, true] {
         for chunk in 1..=8 {

@@ -420,6 +420,31 @@ impl CellFrame {
         self.cursor
     }
 
+    pub(crate) fn recapture_cursor(
+        &self,
+        revision: u64,
+        cursor: Cursor,
+        paint_colors: Option<Arc<ColorState>>,
+    ) -> Result<Self, Error> {
+        let stamp = self.admit_delta_stamp(Stamp {
+            revision,
+            ..self.stamp()
+        })?;
+        if cursor.row >= self.rows.len() || cursor.col >= self.cols {
+            return Err(Error::Cursor);
+        }
+        Ok(Self {
+            stamp,
+            cols: self.cols,
+            rows: self.shared_rows(),
+            cursor,
+            underline_colors: self.shared_underline_rows(),
+            hyperlinks: self.shared_hyperlinks(),
+            annotations: self.shared_annotations(),
+            paint_colors,
+        })
+    }
+
     /// Colors captured with this immutable publication.
     pub fn paint_colors(&self) -> Option<&ColorState> {
         self.paint_colors.as_deref()

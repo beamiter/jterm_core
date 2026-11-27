@@ -109,6 +109,9 @@ pub struct TerminalGrid {
     capture_revision: u64,
     last_row_change: u64,
     row_changes: Vec<u64>,
+    frame_base_revision: u64,
+    scroll_origins_revision: u64,
+    scroll_origins: Vec<Option<usize>>,
     pub(crate) track_printed_spaces: bool,
 }
 
@@ -127,6 +130,9 @@ impl TerminalGrid {
             capture_revision: 0,
             last_row_change: 0,
             row_changes: Vec::new(),
+            frame_base_revision: 0,
+            scroll_origins_revision: 0,
+            scroll_origins: Vec::new(),
             track_printed_spaces: false,
         }
     }
@@ -151,6 +157,17 @@ impl TerminalGrid {
             self.row_changes.resize(self.rows, revision);
             self.last_row_change = revision;
         }
+    }
+
+    pub(crate) fn set_frame_base_revision(&mut self, revision: u64) {
+        self.frame_base_revision = revision;
+    }
+
+    /// Source row positions in a captured frame, before subsequent structural
+    /// moves. An inserted row has no source even if its cells match old paint.
+    pub(crate) fn scroll_origins(&self, revision: u64) -> Option<&[Option<usize>]> {
+        (revision != 0 && self.scroll_origins_revision == revision)
+            .then_some(self.scroll_origins.as_slice())
     }
 
     /// Grid users that do not start capture revisions have no change certificate.
@@ -861,10 +878,6 @@ impl TerminalGrid {
             return None;
         }
         let end = bottom + 1;
-        if self.capture_revision != 0 {
-            self.row_changes[top..end].fill(self.capture_revision);
-            self.last_row_change = self.capture_revision;
-        }
         let height = end - top;
         let count = count.min(height);
         let move_wraps = wrap_policy == RegionWrapPolicy::MoveWithRows;
@@ -873,6 +886,20 @@ impl TerminalGrid {
             RegionDirection::Up => (top + count..end, top, end - count..end),
             RegionDirection::Down => (top..end - count, top + count, top..top + count),
         };
+        if self.capture_revision != 0 {
+            self.row_changes.copy_within(source.clone(), target);
+            self.row_changes[blank_rows.clone()].fill(self.capture_revision);
+            self.last_row_change = self.capture_revision;
+            if self.frame_base_revision != 0 {
+                if self.scroll_origins_revision != self.frame_base_revision {
+                    self.scroll_origins.clear();
+                    self.scroll_origins.extend((0..self.rows).map(Some));
+                    self.scroll_origins_revision = self.frame_base_revision;
+                }
+                self.scroll_origins.copy_within(source.clone(), target);
+                self.scroll_origins[blank_rows.clone()].fill(None);
+            }
+        }
         if count < height && !self.underline_colors.is_empty() {
             let rows = &mut self.underline_colors[top..end];
             match direction {
@@ -1139,6 +1166,7 @@ impl TerminalGrid {
             self.row_changes.resize(new_rows, self.capture_revision);
             self.row_changes.fill(self.capture_revision);
             self.last_row_change = self.capture_revision;
+            self.scroll_origins_revision = 0;
         }
         let mut new_cells = vec![default_cell; new_rows * new_cols];
         let copy_rows = self.rows.min(new_rows);

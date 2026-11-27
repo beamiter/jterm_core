@@ -1355,10 +1355,21 @@ impl ScreenState {
         capture_outgoing: bool,
         allocate_id: impl FnMut() -> RawRowId,
     ) -> Option<RegionMutation> {
+        self.scroll_rows(direction, top..=bottom, 1, capture_outgoing, allocate_id)
+    }
+
+    pub(crate) fn scroll_rows(
+        &mut self,
+        direction: RegionDirection,
+        region: RangeInclusive<usize>,
+        count: usize,
+        capture_outgoing: bool,
+        allocate_id: impl FnMut() -> RawRowId,
+    ) -> Option<RegionMutation> {
         self.shift_region(
             direction,
-            top..=bottom,
-            1,
+            region,
+            count,
             RegionWrapPolicy::MoveWithRows,
             capture_outgoing,
             allocate_id,

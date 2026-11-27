@@ -3,9 +3,9 @@
 use crate::{
     colors::{ColorState, TerminalDefaultColors},
     command_blocks::{CommandBlock, CommandBlocks},
-    frame::{underline_color_at, CellFrame, Cursor, Limits, Row, Screen, Stamp},
+    frame::{underline_color_at, CellFrame, Cursor, Limits, Row, Screen, Stamp, UnderlineRows},
     graphemes::{self, MAX_CLUSTER_BYTES},
-    grid::{PrintCheckpoint, WrapCheckpoint},
+    grid::{PrintCheckpoint, TerminalGrid, WrapCheckpoint},
     history_reflow::HistoryLayout,
     hyperlink::{resolve_resource, HyperlinkPolicy, HyperlinkResources, HyperlinkTable},
     kitty_graphics::{self, inline::InlineGraphics},
@@ -482,48 +482,125 @@ struct FrameCache {
     color_revision: u64,
     history_extent: std::ops::Range<u64>,
     row_identity_revision: u64,
-    row_links: Vec<Vec<HyperlinkId>>,
-    row_link_scratch: Vec<HyperlinkId>,
+    links: FrameLinks,
 }
 
-fn visible_hyperlinks(
-    table: &HyperlinkTable,
-    row_links: &mut Vec<Vec<HyperlinkId>>,
-    scratch: &mut Vec<HyperlinkId>,
-    previous: Option<&CellFrame>,
-    rows: &[Row],
-) -> Option<HyperlinkResources> {
-    let reuse = previous.is_some() && row_links.len() == rows.len();
-    if let Some(frame) = previous.filter(|frame| reuse && std::ptr::eq(frame.rows(), rows)) {
-        return frame.shared_hyperlinks();
-    }
-    row_links.resize_with(rows.len(), Vec::new);
-    let mut links_changed = !reuse;
-    for (index, (row, ids)) in rows.iter().zip(row_links.iter_mut()).enumerate() {
-        if reuse
-            && previous.is_some_and(|frame| Arc::ptr_eq(&frame.rows()[index].cells, &row.cells))
-        {
-            continue;
+#[derive(Default)]
+struct FrameLinks {
+    rows: Vec<Vec<HyperlinkId>>,
+    relocated: Vec<Vec<HyperlinkId>>,
+    scratch: Vec<HyperlinkId>,
+}
+
+fn capture_row_links(row: &Row, ids: &mut Vec<HyperlinkId>) {
+    ids.clear();
+    for cell in row.cells.iter() {
+        let id = cell.hyperlink_id;
+        if !id.is_none() && ids.last() != Some(&id) {
+            ids.push(id);
         }
-        scratch.clear();
-        for cell in row.cells.iter() {
-            let id = cell.hyperlink_id;
-            if !id.is_none() && scratch.last() != Some(&id) {
-                scratch.push(id);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+}
+
+impl FrameLinks {
+    fn capture(
+        &mut self,
+        table: &HyperlinkTable,
+        previous: Option<&CellFrame>,
+        rows: &[Row],
+        scroll_origins: Option<&[Option<usize>]>,
+    ) -> Option<HyperlinkResources> {
+        let previous = previous.filter(|_| self.rows.len() == rows.len());
+        if let Some(frame) = previous.filter(|frame| std::ptr::eq(frame.rows(), rows)) {
+            return frame.shared_hyperlinks();
+        }
+        if let Some((previous, origins)) = previous.zip(scroll_origins) {
+            self.relocated.resize_with(rows.len(), Vec::new);
+            for (index, row) in rows.iter().enumerate() {
+                if let Some(origin) = origins[index]
+                    .filter(|&origin| Arc::ptr_eq(&previous.rows()[origin].cells, &row.cells))
+                {
+                    std::mem::swap(&mut self.rows[origin], &mut self.relocated[index]);
+                } else {
+                    capture_row_links(row, &mut self.relocated[index]);
+                }
+            }
+            std::mem::swap(&mut self.rows, &mut self.relocated);
+            let resources = table.snapshot(self.rows.iter().flatten().copied());
+            let before = previous.shared_hyperlinks();
+            return if before == resources {
+                before
+            } else {
+                resources
+            };
+        }
+
+        self.rows.resize_with(rows.len(), Vec::new);
+        let mut links_changed = previous.is_none();
+        for (index, (row, ids)) in rows.iter().zip(self.rows.iter_mut()).enumerate() {
+            if previous.is_some_and(|frame| Arc::ptr_eq(&frame.rows()[index].cells, &row.cells)) {
+                continue;
+            }
+            capture_row_links(row, &mut self.scratch);
+            if *ids != self.scratch {
+                std::mem::swap(ids, &mut self.scratch);
+                links_changed = true;
             }
         }
-        scratch.sort_unstable();
-        scratch.dedup();
-        if *ids != *scratch {
-            std::mem::swap(ids, scratch);
-            links_changed = true;
+        if !links_changed {
+            // IDs belong to this append-only table and keep their targets.
+            return previous.and_then(CellFrame::shared_hyperlinks);
         }
+        table.snapshot(self.rows.iter().flatten().copied())
     }
-    if !links_changed {
-        // IDs belong to this append-only table and keep their targets.
-        return previous.and_then(CellFrame::shared_hyperlinks);
-    }
-    table.snapshot(row_links.iter().flatten().copied())
+}
+
+#[inline(never)]
+fn capture_scrolled_rows(
+    grid: &TerminalGrid,
+    previous: &CellFrame,
+    origins: &[Option<usize>],
+    observed_revision: u64,
+    capture_underlines: bool,
+) -> (Arc<[Row]>, Option<UnderlineRows>) {
+    let mut underline_colors = None;
+    let rows = (0..grid.rows())
+        .map(|row| {
+            let retained = origins[row].filter(|_| !grid.row_changed_after(row, observed_revision));
+            let original = &previous.rows()[row];
+            let cells = if let Some(source) = retained {
+                let cells = &previous.rows()[source].cells;
+                debug_assert_eq!(cells.as_ref(), &grid[row][..]);
+                cells.clone()
+            } else if original.cells.as_ref() == &grid[row][..] {
+                original.cells.clone()
+            } else {
+                Arc::from(&grid[row][..])
+            };
+            if capture_underlines {
+                let value = if let Some(source) = retained {
+                    let runs = previous.underline_row(source);
+                    debug_assert!(grid
+                        .underline_color_runs(row)
+                        .eq(runs.map_or(&[][..], Arc::as_ref).iter().copied()));
+                    runs.cloned()
+                } else {
+                    let runs: Vec<_> = grid.underline_color_runs(row).collect();
+                    (!runs.is_empty()).then(|| runs.into())
+                };
+                if value.is_some() {
+                    underline_colors.get_or_insert_with(|| vec![None; grid.rows()])[row] = value;
+                }
+            }
+            Row {
+                cells,
+                wrapped: grid.row_wrapped[row],
+            }
+        })
+        .collect();
+    (rows, underline_colors.map(Arc::from))
 }
 
 #[derive(Default)]
@@ -1295,6 +1372,30 @@ impl Terminal {
             .screen
             .vertical_motion(m, capture, || RowSources::allocate(&mut self.row_sources));
         self.capture_history(effect.region);
+    }
+
+    fn scroll_rows(&mut self, direction: RegionDirection, count: usize) {
+        let top = self.vt.screen.scroll_region_top;
+        let bottom = self.vt.screen.scroll_region_bottom;
+        let count = count.min(bottom - top + 1);
+        let capture = direction == RegionDirection::Up
+            && bottom + 1 == self.vt.screen.grid.rows()
+            && self.history_admitted();
+        let mut incoming = Vec::new();
+        if direction == RegionDirection::Down && count > 1 && self.row_sources.is_some() {
+            // Repeated downward motion inserts at the top. The first ID
+            // allocated finishes at the bottom of the new rows.
+            incoming.extend((0..count).map(|_| RowSources::allocate(&mut self.row_sources)));
+        }
+        let effect = self
+            .vt
+            .screen
+            .scroll_rows(direction, top..=bottom, count, capture, || {
+                incoming
+                    .pop()
+                    .unwrap_or_else(|| RowSources::allocate(&mut self.row_sources))
+            });
+        self.capture_history(effect);
     }
     pub fn history_rows(&self) -> usize {
         if self.vt.screen.use_alt_buffer {
@@ -2091,26 +2192,12 @@ impl Terminal {
                         }
                     }
                     (None, b'S' | b'T' | b'^') => {
-                        let top = self.vt.screen.scroll_region_top;
-                        let bottom = self.vt.screen.scroll_region_bottom;
                         let direction = if *final_byte == b'S' {
                             RegionDirection::Up
                         } else {
                             RegionDirection::Down
                         };
-                        for _ in 0..count.min(bottom - top + 1) {
-                            let capture = self.history_admitted()
-                                && bottom + 1 == self.vt.screen.grid.rows()
-                                && direction == RegionDirection::Up;
-                            let effect = self.vt.screen.scroll_region_one(
-                                direction,
-                                top,
-                                bottom,
-                                capture,
-                                || RowSources::allocate(&mut self.row_sources),
-                            );
-                            self.capture_history(effect);
-                        }
+                        self.scroll_rows(direction, count);
                     }
                     (None, b'b') => {
                         self.repeat_print(count);
@@ -2129,8 +2216,14 @@ impl Terminal {
 
     fn begin_revision(&mut self, revision: u64) {
         self.revision = revision;
-        self.vt.screen.grid.begin_capture_revision(revision);
-        self.vt.screen.alt_grid.begin_capture_revision(revision);
+        let frame_base = self
+            .last_frame
+            .get_mut()
+            .map_or(0, |cache| cache.observed_revision);
+        for grid in [&mut self.vt.screen.grid, &mut self.vt.screen.alt_grid] {
+            grid.begin_capture_revision(revision);
+            grid.set_frame_base_revision(frame_base);
+        }
     }
 
     /// Apply bytes sampled at a monotonic instant supplied by the session.
@@ -2515,8 +2608,7 @@ impl Terminal {
             color_revision,
             history_extent,
             row_identity_revision,
-            row_links,
-            row_link_scratch,
+            links,
         } = &mut *cache;
         if let Some(frame) = last
             .as_ref()
@@ -2550,28 +2642,23 @@ impl Terminal {
         let extent = self.history_extent();
         let identity = grid.identity_revision();
         let last_observation = *observed_revision;
+        let rows_moved = *row_identity_revision != identity;
         let may_have_changed =
-            |row| previous.is_none() || grid.row_changed_after(row, last_observation);
+            |row| previous.is_none() || rows_moved || grid.row_changed_after(row, last_observation);
         let unchanged_paint = previous.filter(|frame| {
             *history_extent == extent
-                && *row_identity_revision == identity
+                && !rows_moved
                 && frame.cols() == grid.cols()
                 && frame.rows().len() == grid.rows()
+                && frame.rows().len() == grid.row_wrapped.len()
                 && grid.captured_rows_unchanged_after(last_observation)
                 && frame
                     .rows()
                     .iter()
-                    .enumerate()
-                    .all(|(row, old)| old.wrapped == grid.row_wrapped[row])
+                    .zip(&grid.row_wrapped)
+                    .all(|(old, wrapped)| old.wrapped == *wrapped)
         });
-        if let Some(previous) = unchanged_paint.filter(|frame| {
-            frame.cursor() == cursor
-                && *color_revision == self.color_revision
-                && *history_extent == extent
-                && *row_identity_revision == identity
-        }) {
-            // Parser carry, queries, and input modes may advance independently
-            // of paint. Keep the acknowledgement base when the view is unchanged.
+        if let Some(previous) = unchanged_paint {
             debug_assert!(previous.rows().iter().enumerate().all(|(row, old)| {
                 old.cells.as_ref() == &grid[row][..]
                     && grid
@@ -2579,41 +2666,62 @@ impl Terminal {
                         .eq(previous.underline_color_runs(row).iter().copied())
                     && grid.row_annotations(row) == previous.row_annotations(row)
             }));
+            if previous.cursor() == cursor && *color_revision == self.color_revision {
+                // Queries and parser carry do not advance the acknowledgement base.
+                *observed_revision = self.revision;
+                return Ok(previous.clone());
+            }
+            let frame = previous
+                .recapture_cursor(self.revision, cursor, self.colors.clone())
+                .map_err(|e| format!("{e:?}"))?;
+            *last = Some(frame.clone());
             *observed_revision = self.revision;
-            return Ok(previous.clone());
+            *color_revision = self.color_revision;
+            return Ok(frame);
         }
-        let rows = if let Some(previous) = unchanged_paint {
-            previous.shared_rows()
-        } else if let Some(previous) = previous {
-            let changes = previous
-                .rows()
-                .iter()
-                .enumerate()
-                .filter_map(|(index, row)| {
-                    let cells_changed = if may_have_changed(index) {
-                        row.cells.as_ref() != &grid[index][..]
-                    } else {
-                        debug_assert_eq!(row.cells.as_ref(), &grid[index][..]);
-                        false
-                    };
-                    let wrapped = grid.row_wrapped[index];
-                    (row.wrapped != wrapped || cells_changed).then(|| {
-                        let cells = if cells_changed {
-                            Arc::from(&grid[index][..])
-                        } else {
-                            row.cells.clone()
-                        };
-                        (index, Row { cells, wrapped })
-                    })
-                });
-            previous.update_rows(changes)
+        let scroll_origins = previous
+            .filter(|frame| {
+                rows_moved && frame.cols() == grid.cols() && frame.rows().len() == grid.rows()
+            })
+            .and_then(|_| grid.scroll_origins(last_observation));
+        let (rows, underline_colors) = if let Some((previous, origins)) =
+            previous.zip(scroll_origins)
+        {
+            capture_scrolled_rows(
+                grid,
+                previous,
+                origins,
+                last_observation,
+                self.underline_pen.is_some(),
+            )
         } else {
-            (0..grid.rows()).map(capture_row).collect()
-        };
-        let underline_colors = if self.underline_pen.is_some() {
-            if let Some(previous) = unchanged_paint {
-                previous.shared_underline_rows()
+            let rows = if let Some(previous) = previous {
+                let changes = previous
+                    .rows()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, row)| {
+                        let cells_changed = if may_have_changed(index) {
+                            row.cells.as_ref() != &grid[index][..]
+                        } else {
+                            debug_assert_eq!(row.cells.as_ref(), &grid[index][..]);
+                            false
+                        };
+                        let wrapped = grid.row_wrapped[index];
+                        (row.wrapped != wrapped || cells_changed).then(|| {
+                            let cells = if cells_changed {
+                                Arc::from(&grid[index][..])
+                            } else {
+                                row.cells.clone()
+                            };
+                            (index, Row { cells, wrapped })
+                        })
+                    });
+                previous.update_rows(changes)
             } else {
+                (0..grid.rows()).map(capture_row).collect()
+            };
+            let underline_colors = if self.underline_pen.is_some() {
                 let mut changed = None;
                 for row in 0..grid.rows() {
                     let before = previous.map_or(&[][..], |frame| frame.underline_color_runs(row));
@@ -2636,35 +2744,32 @@ impl Terminal {
                     Some(colors) => colors.iter().any(Option::is_some).then(|| colors.into()),
                     None => previous.and_then(CellFrame::shared_underline_rows),
                 }
-            }
-        } else {
-            None
+            } else {
+                None
+            };
+            (rows, underline_colors)
         };
         let annotations = if self.graphemes.is_some() || self.next_inline_image_id != 0 {
-            if let Some(previous) = unchanged_paint {
-                previous.shared_annotations()
-            } else {
-                let mut changed = None;
-                for row in 0..grid.rows() {
-                    let current = grid.row_annotations(row);
-                    let before = previous.and_then(|frame| frame.row_annotations(row));
-                    if !may_have_changed(row) {
-                        debug_assert_eq!(current, before);
-                        continue;
-                    }
-                    if current != before {
-                        let rows = changed.get_or_insert_with(|| {
-                            previous
-                                .and_then(CellFrame::shared_annotations)
-                                .map_or_else(|| vec![None; grid.rows()], |rows| rows.to_vec())
-                        });
-                        rows[row] = current.cloned();
-                    }
+            let mut changed = None;
+            for row in 0..grid.rows() {
+                let current = grid.row_annotations(row);
+                let before = previous.and_then(|frame| frame.row_annotations(row));
+                if !may_have_changed(row) {
+                    debug_assert_eq!(current, before);
+                    continue;
                 }
-                match changed {
-                    Some(rows) => rows.iter().any(Option::is_some).then(|| rows.into()),
-                    None => previous.and_then(CellFrame::shared_annotations),
+                if current != before {
+                    let rows = changed.get_or_insert_with(|| {
+                        previous
+                            .and_then(CellFrame::shared_annotations)
+                            .map_or_else(|| vec![None; grid.rows()], |rows| rows.to_vec())
+                    });
+                    rows[row] = current.cloned();
                 }
+            }
+            match changed {
+                Some(rows) => rows.iter().any(Option::is_some).then(|| rows.into()),
+                None => previous.and_then(CellFrame::shared_annotations),
             }
         } else {
             None
@@ -2693,9 +2798,7 @@ impl Terminal {
             .hyperlinks
             .as_ref()
             .filter(|(_, table)| !table.is_empty())
-            .and_then(|(_, table)| {
-                visible_hyperlinks(table, row_links, row_link_scratch, previous, frame.rows())
-            });
+            .and_then(|(_, table)| links.capture(table, previous, frame.rows(), scroll_origins));
         let frame = frame
             .with_hyperlinks(hyperlinks)
             .with_paint_colors(self.colors.clone());
