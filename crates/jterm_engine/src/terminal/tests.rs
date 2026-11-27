@@ -2487,6 +2487,52 @@ fn repeated_osc_oversize_recovers_on_bel_and_accepts_fresh_query() {
 }
 
 #[test]
+fn bounded_history_text_counts_committed_bytes_and_defers_soft_wrap_padding() {
+    let row = |text: &str, wrapped| HistoryCopyRow {
+        row: Row {
+            cells: text
+                .chars()
+                .map(|character| crate::TerminalCell {
+                    character,
+                    ..Default::default()
+                })
+                .collect(),
+            wrapped,
+        },
+        underline_colors: None,
+        annotations: None,
+        hyperlink_ids: None,
+        synthetic_gap: None,
+    };
+    let copy = |rows: &[HistoryCopyRow], limit| {
+        extract_selection_bounded::<true, true>(
+            rows,
+            (0, 0),
+            (rows.len(), 0),
+            false,
+            None,
+            Some(limit),
+        )
+        .unwrap()
+    };
+    let mut padded = [row("🐍   ", true), row("   ", false)];
+    assert_eq!(copy(&padded, 4).as_deref(), Some("🐍"));
+    assert_eq!(copy(&padded, 3), None);
+    assert_eq!(copy(&padded[..1], 4), None);
+
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.track_printed_spaces();
+    terminal.feed(b" ").unwrap();
+    Arc::make_mut(&mut padded[0].row.cells)[2] = terminal.frame().unwrap().rows()[0].cells[0];
+    assert_eq!(copy(&padded, 4), None);
+    assert_eq!(copy(&padded, 6).as_deref(), Some("🐍  "));
+
+    let separated = [row("🐍", false), row("", false)];
+    assert_eq!(copy(&separated, 4), None);
+    assert_eq!(copy(&separated, 5).as_deref(), Some("🐍\n"));
+}
+
+#[test]
 fn immutable_history_copy_boundaries_use_utf16_and_never_select_padding() {
     use crate::history_reflow::HistoryAnchor;
     let mut terminal = Terminal::new(2, 6).unwrap();

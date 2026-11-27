@@ -281,8 +281,28 @@ fn extract_selection<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
     start: (usize, usize),
     end: (usize, usize),
     require_literal: bool,
-    mut offsets: Option<&mut Vec<Vec<u32>>>,
+    offsets: Option<&mut Vec<Vec<u32>>>,
 ) -> Result<String, String> {
+    extract_selection_bounded::<MATERIALIZE, CHECK_COPY_BYTES>(
+        rows,
+        start,
+        end,
+        require_literal,
+        offsets,
+        None,
+    )
+    .map(|text| text.expect("unbounded copy returns text"))
+}
+
+fn extract_selection_bounded<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
+    rows: &[HistoryCopyRow],
+    start: (usize, usize),
+    end: (usize, usize),
+    require_literal: bool,
+    mut offsets: Option<&mut Vec<Vec<u32>>>,
+    text_limit: Option<usize>,
+) -> Result<Option<String>, String> {
+    debug_assert!(MATERIALIZE || text_limit.is_none());
     let valid = |(row, col): (usize, usize)| {
         rows.get(row).is_some_and(|row| col <= row.row.cells.len()) || row == rows.len() && col == 0
     };
@@ -294,6 +314,7 @@ fn extract_selection<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
     let mut trailing_spaces = 0usize;
     let mut printed_space_end = 0;
     let mut units = 0u32;
+    let mut checked_padding = text_limit.unwrap_or(0);
     for (index, source) in rows
         .iter()
         .enumerate()
@@ -365,7 +386,8 @@ fn extract_selection<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
             boundaries.push(units);
             offsets.push(boundaries);
         }
-        if index < end.0 && !source.row.wrapped {
+        let hard_line_end = index < end.0 && !source.row.wrapped;
+        if hard_line_end {
             // Physical trailing blank padding is not copied across a hard line.
             let length = if MATERIALIZE {
                 text.len()
@@ -417,8 +439,25 @@ fn extract_selection<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
         {
             return Err("selection byte limit".into());
         }
+        if let Some(limit) = text_limit {
+            if text.len() > limit {
+                // A later hard break can still trim trailing spaces. Scan
+                // each new overflow byte once across soft wraps.
+                if hard_line_end
+                    || printed_space_end > limit
+                    || text.as_bytes()[checked_padding..]
+                        .iter()
+                        .any(|&byte| byte != b' ')
+                {
+                    return Ok(None);
+                }
+                checked_padding = text.len();
+            } else {
+                checked_padding = limit;
+            }
+        }
     }
-    Ok(text)
+    Ok((!text_limit.is_some_and(|limit| text.len() > limit)).then_some(text))
 }
 
 /// Single owner of an incremental parser, screen, modes, history and frame revisions.
@@ -1432,6 +1471,27 @@ impl Terminal {
     /// Transferred primary rows retain their original width. The alternate
     /// screen exposes no history.
     pub fn history_page(&self, offset: usize, limit: usize) -> Result<HistoryPage, String> {
+        self.read_history_page(offset, limit, None)
+            .map(|page| page.expect("unbounded capture returns a page"))
+    }
+
+    /// Capture raw history within a caller's copy-text byte budget.
+    /// An oversized page returns `None` so the caller can try fewer rows.
+    pub fn history_page_with_text_limit(
+        &self,
+        offset: usize,
+        limit: usize,
+        text_limit: usize,
+    ) -> Result<Option<HistoryPage>, String> {
+        self.read_history_page(offset, limit, Some(text_limit))
+    }
+
+    fn read_history_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        text_limit: Option<usize>,
+    ) -> Result<Option<HistoryPage>, String> {
         let total_rows = self.history_rows();
         if limit == 0 || limit > MAX_ROWS || offset > self.history_row_limit {
             return Err("history page out of bounds".into());
@@ -1446,7 +1506,7 @@ impl Terminal {
             .take(end - start)
             .map(HistoryCopyRow::from_line)
             .collect();
-        self.make_history_page(offset, total_rows, rows, false)
+        self.make_history_page(offset, total_rows, rows, false, text_limit)
     }
 
     fn make_history_page(
@@ -1455,7 +1515,19 @@ impl Terminal {
         total_rows: usize,
         rows: Arc<[HistoryCopyRow]>,
         cached_links: bool,
-    ) -> Result<HistoryPage, String> {
+        text_limit: Option<usize>,
+    ) -> Result<Option<HistoryPage>, String> {
+        let Some(text) = extract_selection_bounded::<true, true>(
+            &rows,
+            (0, 0),
+            (rows.len(), 0),
+            false,
+            None,
+            text_limit,
+        )?
+        else {
+            return Ok(None);
+        };
         let hyperlinks = self.hyperlinks.as_ref().and_then(|(_, table)| {
             if cached_links {
                 table.snapshot(
@@ -1471,18 +1543,16 @@ impl Terminal {
                 )
             }
         });
-        let mut page = HistoryPage {
+        Ok(Some(HistoryPage {
             revision: self.revision,
             offset,
             total_rows,
             row_count: rows.len(),
-            text: String::new(),
+            text,
             hyperlinks,
             paint_colors: self.colors.clone(),
             rows,
-        };
-        page.text = page.selection_text(0, 0, page.row_count, 0)?;
-        Ok(page)
+        }))
     }
 
     /// Opt in before launching a shell with compatible OSC 133 integration.

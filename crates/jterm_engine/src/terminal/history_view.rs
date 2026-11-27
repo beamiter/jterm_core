@@ -414,7 +414,8 @@ impl Terminal {
         first: usize,
         limit: usize,
     ) -> Result<HistoryPage, String> {
-        self.read_projected_history_page(layout, first, limit, false)
+        self.read_projected_history_page(layout, first, limit, false, None)
+            .map(|page| page.expect("unbounded capture returns a page"))
     }
 
     /// Capture a scrolling viewport, sharing decoded rows with the previous
@@ -425,7 +426,20 @@ impl Terminal {
         first: usize,
         limit: usize,
     ) -> Result<HistoryPage, String> {
-        self.read_projected_history_page(layout, first, limit, true)
+        self.read_projected_history_page(layout, first, limit, true, None)
+            .map(|page| page.expect("unbounded capture returns a page"))
+    }
+
+    /// Reuse viewport rows while honoring a caller's copy-text byte budget.
+    /// An oversized page returns `None` without assembling its remaining text.
+    pub fn projected_history_viewport_page_with_text_limit(
+        &self,
+        layout: &HistoryLayout,
+        first: usize,
+        limit: usize,
+        text_limit: usize,
+    ) -> Result<Option<HistoryPage>, String> {
+        self.read_projected_history_page(layout, first, limit, true, Some(text_limit))
     }
 
     fn read_projected_history_page(
@@ -434,7 +448,8 @@ impl Terminal {
         first: usize,
         limit: usize,
         use_cache: bool,
-    ) -> Result<HistoryPage, String> {
+        text_limit: Option<usize>,
+    ) -> Result<Option<HistoryPage>, String> {
         if limit == 0 || limit > MAX_ROWS || first > layout.len() {
             return Err("history page out of bounds".into());
         }
@@ -465,7 +480,13 @@ impl Terminal {
         } else {
             ((first..end).map(materialize).collect(), false)
         };
-        self.make_history_page(layout.len() - end, layout.len(), rows, cached_links)
+        self.make_history_page(
+            layout.len() - end,
+            layout.len(),
+            rows,
+            cached_links,
+            text_limit,
+        )
     }
 }
 
