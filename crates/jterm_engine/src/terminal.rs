@@ -507,7 +507,21 @@ struct FrameCache {
     color_revision: u64,
     history_extent: std::ops::Range<u64>,
     row_identity_revision: u64,
+    wrapped_rows: Vec<bool>,
     links: FrameLinks,
+}
+
+fn row_indices(mut rows: u128) -> impl Iterator<Item = usize> {
+    let prefix = rows.trailing_ones();
+    rows &= u128::MAX.checked_shl(prefix).unwrap_or(0);
+    (0..prefix as usize).chain(std::iter::from_fn(move || {
+        if rows == 0 {
+            return None;
+        }
+        let row = rows.trailing_zeros() as usize;
+        rows &= rows - 1;
+        Some(row)
+    }))
 }
 
 #[derive(Default)]
@@ -2906,6 +2920,7 @@ impl Terminal {
             color_revision,
             history_extent,
             row_identity_revision,
+            wrapped_rows,
             links,
         } = &mut *cache;
         if let Some(frame) = last
@@ -2941,8 +2956,7 @@ impl Terminal {
         let identity = grid.identity_revision();
         let last_observation = *observed_revision;
         let rows_moved = *row_identity_revision != identity;
-        let may_have_changed =
-            |row| previous.is_none() || rows_moved || grid.row_changed_after(row, last_observation);
+        let same_wraps = wrapped_rows.as_slice() == grid.row_wrapped.as_slice();
         let unchanged_paint = previous.filter(|frame| {
             *history_extent == extent
                 && !rows_moved
@@ -2950,11 +2964,7 @@ impl Terminal {
                 && frame.rows().len() == grid.rows()
                 && frame.rows().len() == grid.row_wrapped.len()
                 && grid.captured_rows_unchanged_after(last_observation)
-                && frame
-                    .rows()
-                    .iter()
-                    .zip(&grid.row_wrapped)
-                    .all(|(old, wrapped)| old.wrapped == *wrapped)
+                && same_wraps
         });
         if let Some(previous) = unchanged_paint {
             debug_assert!(previous.rows().iter().enumerate().all(|(row, old)| {
@@ -2977,6 +2987,26 @@ impl Terminal {
             *color_revision = self.color_revision;
             return Ok(frame);
         }
+        // A hosted frame is at most 128 rows. Compute the candidate rows
+        // once, then visit just those rows for cells and both metadata tables.
+        const _: () = assert!(MAX_ROWS <= u128::BITS as usize);
+        let all_rows = u128::MAX >> (u128::BITS as usize - grid.rows());
+        let paint_rows = if previous.is_none() || rows_moved {
+            all_rows
+        } else {
+            grid.captured_row_changes_after(last_observation)
+                .unwrap_or(all_rows)
+        };
+        #[cfg(debug_assertions)]
+        if let Some(previous) = previous {
+            for row in row_indices(all_rows & !paint_rows) {
+                debug_assert_eq!(previous.rows()[row].cells.as_ref(), &grid[row][..]);
+                debug_assert!(grid
+                    .underline_color_runs(row)
+                    .eq(previous.underline_color_runs(row).iter().copied()));
+                debug_assert_eq!(grid.row_annotations(row), previous.row_annotations(row));
+            }
+        }
         let scroll_origins = previous
             .filter(|frame| {
                 rows_moved && frame.cols() == grid.cols() && frame.rows().len() == grid.rows()
@@ -2994,39 +3024,37 @@ impl Terminal {
             )
         } else {
             let rows = if let Some(previous) = previous {
-                let changes = previous
-                    .rows()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, row)| {
-                        let cells_changed = if may_have_changed(index) {
-                            row.cells.as_ref() != &grid[index][..]
+                // This legacy vector can change independently of the grid's
+                // mutation revisions.
+                let mut updated = paint_rows;
+                if !same_wraps {
+                    for (index, (row, wrapped)) in
+                        previous.rows().iter().zip(&grid.row_wrapped).enumerate()
+                    {
+                        updated |= u128::from(row.wrapped != *wrapped) << index;
+                    }
+                }
+                let changes = row_indices(updated).filter_map(|index| {
+                    let row = &previous.rows()[index];
+                    let cells_changed = row.cells.as_ref() != &grid[index][..];
+                    let wrapped = grid.row_wrapped[index];
+                    (row.wrapped != wrapped || cells_changed).then(|| {
+                        let cells = if cells_changed {
+                            Arc::from(&grid[index][..])
                         } else {
-                            debug_assert_eq!(row.cells.as_ref(), &grid[index][..]);
-                            false
+                            row.cells.clone()
                         };
-                        let wrapped = grid.row_wrapped[index];
-                        (row.wrapped != wrapped || cells_changed).then(|| {
-                            let cells = if cells_changed {
-                                Arc::from(&grid[index][..])
-                            } else {
-                                row.cells.clone()
-                            };
-                            (index, Row { cells, wrapped })
-                        })
-                    });
+                        (index, Row { cells, wrapped })
+                    })
+                });
                 previous.update_rows(changes)
             } else {
                 (0..grid.rows()).map(capture_row).collect()
             };
             let underline_colors = if self.underline_pen.is_some() {
                 let mut changed = None;
-                for row in 0..grid.rows() {
+                for row in row_indices(paint_rows) {
                     let before = previous.map_or(&[][..], |frame| frame.underline_color_runs(row));
-                    if !may_have_changed(row) {
-                        debug_assert!(grid.underline_color_runs(row).eq(before.iter().copied()));
-                        continue;
-                    }
                     if grid.underline_color_runs(row).eq(before.iter().copied()) {
                         continue;
                     }
@@ -3049,13 +3077,9 @@ impl Terminal {
         };
         let annotations = if self.graphemes.is_some() || self.next_inline_image_id != 0 {
             let mut changed = None;
-            for row in 0..grid.rows() {
+            for row in row_indices(paint_rows) {
                 let current = grid.row_annotations(row);
                 let before = previous.and_then(|frame| frame.row_annotations(row));
-                if !may_have_changed(row) {
-                    debug_assert_eq!(current, before);
-                    continue;
-                }
                 if current != before {
                     let rows = changed.get_or_insert_with(|| {
                         previous
@@ -3105,6 +3129,10 @@ impl Terminal {
         *color_revision = self.color_revision;
         *history_extent = extent;
         *row_identity_revision = identity;
+        if !same_wraps {
+            wrapped_rows.clear();
+            wrapped_rows.extend_from_slice(&grid.row_wrapped);
+        }
         Ok(frame)
     }
     pub fn visible_text(&self) -> String {
@@ -3304,5 +3332,35 @@ mod frame_certificate_regressions {
         advance(&mut t);
         t.vt.screen.grid.row_wrapped[1] = false;
         assert!(!t.frame().unwrap().rows()[1].wrapped);
+    }
+
+    #[test]
+    fn sparse_frame_keeps_legacy_wraps_and_paint_in_the_high_rows() {
+        let mut terminal = Terminal::new(MAX_ROWS, 8).unwrap();
+        terminal.enable_underline_colors();
+        terminal.enable_grapheme_clusters();
+        terminal.feed(b"\x1b[65;1HX\x1b[128;1HZ").unwrap();
+        let base = terminal.frame().unwrap();
+
+        advance(&mut terminal);
+        let grid = &mut terminal.vt.screen.grid;
+        grid.row_wrapped[63] = true;
+        grid.set_underline_color(64, 0..1, Color::Indexed(33));
+        let _ = grid.set_cluster_text(64, 0, "X\u{301}");
+        grid.get_mut(127, 0).character = 'Y';
+        let updated = terminal.frame().unwrap();
+
+        assert_eq!(base.changed_row_indices(&updated).unwrap(), [63, 64, 127]);
+        assert!(updated.rows()[63].wrapped);
+        assert!(Arc::ptr_eq(
+            &base.rows()[63].cells,
+            &updated.rows()[63].cells
+        ));
+        assert_eq!(updated.underline_color(64, 0), Some(Color::Indexed(33)));
+        assert_eq!(updated.cluster_text(64, 0), Some("X\u{301}"));
+        assert_eq!(updated.rows()[127].cells[0].character, 'Y');
+
+        terminal.feed(b"\x1b[6n").unwrap();
+        assert_eq!(terminal.frame().unwrap(), updated);
     }
 }

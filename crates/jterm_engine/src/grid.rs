@@ -247,6 +247,31 @@ impl TerminalGrid {
         self.row_changes.len() == self.rows && self.last_row_change <= revision
     }
 
+    /// Candidate paint rows for the hosted frame, which supports at most 128 rows.
+    /// A grid without capture revisions must be checked in full.
+    pub(crate) fn captured_row_changes_after(&self, revision: u64) -> Option<u128> {
+        if self.rows > u128::BITS as usize || self.row_changes.len() != self.rows {
+            return None;
+        }
+        if self.last_row_change <= revision {
+            return Some(0);
+        }
+        let prefix = self
+            .row_changes
+            .iter()
+            .position(|&changed_at| changed_at <= revision)
+            .unwrap_or(self.rows);
+        let mut rows = u128::MAX
+            .checked_shr(u128::BITS - prefix as u32)
+            .unwrap_or(0);
+        for (row, changed_at) in self.row_changes.iter().enumerate().skip(prefix) {
+            if *changed_at > revision {
+                rows |= 1u128 << row;
+            }
+        }
+        Some(rows)
+    }
+
     #[inline]
     fn mark_row_changed(&mut self, row: usize) {
         if self.capture_revision != 0 {
