@@ -7,7 +7,27 @@ use crate::{
     history_reflow::{source_columns, HistoryAnchor, ProjectedHistoryRow},
     TerminalCell,
 };
-use std::{collections::VecDeque, io};
+use std::{collections::VecDeque, io, ops::Range};
+
+fn format_cell_text(
+    text: &mut String,
+    cells: &[TerminalCell],
+    annotations: Option<&RowAnnotations>,
+    margin_gap: Option<usize>,
+) -> usize {
+    text.clear();
+    let mut written_space_end = 0;
+    for (column, cell) in cells.iter().enumerate() {
+        if cell.flags.wide_continuation() || margin_gap == Some(column) {
+            continue;
+        }
+        append_copy_cell(text, cell, annotations, column);
+        if cell.flags.printed_space() {
+            written_space_end = text.len();
+        }
+    }
+    text.trim_end_matches(' ').len().max(written_space_end)
+}
 
 // Keep the encoded formatter out of the plain-text export path.
 #[inline(never)]
@@ -30,6 +50,29 @@ fn format_encoded_archive_row(line: &ScrollbackLine, text: &mut String) -> (usiz
     let content_columns = line.columns() - usize::from(gap.is_some());
     let implicit_padding = content_columns.saturating_sub(physical_end);
     (end, text.len() - end + implicit_padding)
+}
+
+fn format_archive_row<'a>(
+    line: &'a ScrollbackLine,
+    text: &'a mut String,
+    decoded: &mut Vec<TerminalCell>,
+) -> (&'a str, usize) {
+    let annotations = line.row_annotations().map(Arc::as_ref);
+    let gap = line.synthetic_margin_gap();
+    match line.content() {
+        ScrollbackContent::Plain(text, trailing) if annotations.is_none() && gap.is_none() => {
+            let trimmed = text.trim_end_matches(' ');
+            return (trimmed, text.len() - trimmed.len() + usize::from(trailing));
+        }
+        ScrollbackContent::Encoded(_) if annotations.is_none() => {
+            let (end, trailing) = format_encoded_archive_row(line, text);
+            return (&text[..end], trailing);
+        }
+        _ => {}
+    }
+    line.decompress_into(decoded);
+    let end = format_cell_text(text, decoded, annotations, gap);
+    (&text[..end], text.len() - end)
 }
 
 impl Terminal {
@@ -151,23 +194,6 @@ impl Terminal {
         let mut row_text = String::new();
         let mut padding = 0;
         let mut separate = false;
-        let format_row = |text: &mut String,
-                          cells: &[TerminalCell],
-                          annotations: Option<&RowAnnotations>,
-                          margin_gap: Option<usize>| {
-            text.clear();
-            let mut written_space_end = 0;
-            for (column, cell) in cells.iter().enumerate() {
-                if cell.flags.wide_continuation() || margin_gap == Some(column) {
-                    continue;
-                }
-                append_copy_cell(text, cell, annotations, column);
-                if cell.flags.printed_space() {
-                    written_space_end = text.len();
-                }
-            }
-            text.trim_end_matches(' ').len().max(written_space_end)
-        };
         let mut finish_row = |text: &str, trailing: usize, wrapped: bool| {
             if separate {
                 output.write_all(b"\n")?;
@@ -189,32 +215,8 @@ impl Terminal {
         if !self.alternate_screen_active() {
             let mut decoded = Vec::new();
             for line in self.history.iter() {
-                if let ScrollbackContent::Plain(text, trailing) = line.content() {
-                    if line.row_annotations().is_none() && line.synthetic_margin_gap().is_none() {
-                        let trimmed = text.trim_end_matches(' ');
-                        finish_row(
-                            trimmed,
-                            text.len() - trimmed.len() + usize::from(trailing),
-                            line.is_wrapped,
-                        )?;
-                        continue;
-                    }
-                }
-                if matches!(line.content(), ScrollbackContent::Encoded(_))
-                    && line.row_annotations().is_none()
-                {
-                    let (end, trailing) = format_encoded_archive_row(line, &mut row_text);
-                    finish_row(&row_text[..end], trailing, line.is_wrapped)?;
-                    continue;
-                }
-                line.decompress_into(&mut decoded);
-                let end = format_row(
-                    &mut row_text,
-                    &decoded,
-                    line.row_annotations().map(Arc::as_ref),
-                    line.synthetic_margin_gap(),
-                );
-                finish_row(&row_text[..end], row_text.len() - end, line.is_wrapped)?;
+                let (text, trailing) = format_archive_row(line, &mut row_text, &mut decoded);
+                finish_row(text, trailing, line.is_wrapped)?;
             }
         }
         let last_drawn = (self.vt.screen.cursor_row..grid.rows())
@@ -228,7 +230,7 @@ impl Terminal {
             })
             .unwrap_or(self.vt.screen.cursor_row);
         for row in 0..=last_drawn {
-            let end = format_row(
+            let end = format_cell_text(
                 &mut row_text,
                 &grid[row],
                 grid.row_annotations(row).map(Arc::as_ref),
@@ -241,6 +243,49 @@ impl Terminal {
             )?;
         }
         Ok(())
+    }
+
+    /// Read an archive window without decoding its paint resources. Preserve
+    /// the boundary to a following row when search will append a newer prefix.
+    pub(crate) fn history_search_text(
+        &self,
+        rows: Range<usize>,
+        following_row: bool,
+        max_bytes: usize,
+    ) -> Option<(u64, String)> {
+        debug_assert!(rows.end <= self.history_rows());
+        let row_count = rows.len();
+        let mut text = String::new();
+        let mut row_text = String::new();
+        let mut decoded = Vec::new();
+        let mut padding = 0;
+        for (index, line) in self.history.range(rows).enumerate() {
+            let (row, trailing) = format_archive_row(line, &mut row_text, &mut decoded);
+            if !row.is_empty() {
+                if text.len() + padding + row.len() > max_bytes {
+                    return None;
+                }
+                text.extend(std::iter::repeat_n(' ', padding));
+                text.push_str(row);
+                padding = 0;
+            }
+            if line.is_wrapped {
+                padding += trailing;
+            } else {
+                padding = 0;
+                if following_row || index + 1 < row_count {
+                    if text.len() == max_bytes {
+                        return None;
+                    }
+                    text.push('\n');
+                }
+            }
+        }
+        if text.len() + padding > max_bytes {
+            return None;
+        }
+        text.extend(std::iter::repeat_n(' ', padding));
+        Some((self.revision, text))
     }
 
     /// Index the retained archive at the current width. The caller owns the

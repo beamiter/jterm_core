@@ -4,9 +4,6 @@ use std::{ops::Range, sync::Arc};
 use crate::terminal::Terminal;
 
 const SEARCH_ROWS: usize = 64;
-// Sixteen rows at the per-row text cap, plus the cross-page prefix, fit
-// the desktop consumers' smaller 128 KiB window budget.
-const MIN_SEARCH_ROWS: usize = 16;
 const MAX_QUERY_BYTES: usize = 128;
 
 pub fn validate_query(query: &str) -> Result<(), String> {
@@ -73,6 +70,8 @@ pub struct HistorySearch {
 }
 
 impl HistorySearch {
+    /// The byte limit includes the searched rows and any cross-window prefix.
+    /// Search can shrink a window to one complete row to fit the limit.
     pub fn new(query: String, max_window_bytes: usize) -> Result<Self, String> {
         validate_query(&query)?;
         if max_window_bytes < query.len() {
@@ -104,22 +103,21 @@ impl HistorySearch {
             Some(_) => return Err("History changed. Start a new search.".into()),
         };
         if self.window.is_none() {
-            let sentinel = usize::from(self.offset > 0);
-            let archive_offset = newer_rows + self.offset - sentinel;
-            let mut limit = SEARCH_ROWS;
-            let (total_rows, revision, row_count, mut text) = loop {
-                let page = terminal.history_page(archive_offset, limit + sentinel)?;
-                let row_count = page.row_count.saturating_sub(sentinel);
-                // Keep the real boundary after the final row in this window.
-                let text = if sentinel == 0 {
-                    page.text
-                } else {
-                    page.selection_text(0, 0, row_count, 0)?
-                };
-                if text.len() + self.newer_prefix.len() <= self.max_window_bytes {
-                    break (page.total_rows - newer_rows, page.revision, row_count, text);
+            let total_rows = (extent.end - extent.start) as usize - newer_rows;
+            let end = total_rows.saturating_sub(self.offset);
+            let max_bytes = self.max_window_bytes - self.newer_prefix.len();
+            let mut limit = end
+                .clamp(1, SEARCH_ROWS)
+                .next_power_of_two()
+                .min(SEARCH_ROWS);
+            let (revision, row_count, mut text) = loop {
+                let start = end.saturating_sub(limit);
+                if let Some((revision, text)) =
+                    terminal.history_search_text(start..end, self.offset > 0, max_bytes)
+                {
+                    break (revision, end - start, text);
                 }
-                if limit <= MIN_SEARCH_ROWS {
+                if limit == 1 {
                     return Err("history search snapshot exceeds its byte limit".into());
                 }
                 limit /= 2;
@@ -175,5 +173,70 @@ impl HistorySearch {
         } else {
             HistorySearchProgress::End
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_windows_find_a_soft_wrap_match_after_new_output() {
+        let mut terminal = Terminal::new(2, 4).unwrap();
+        terminal.feed(b"ABCDXY12\x1b[2S").unwrap();
+        let mut search = HistorySearch::new("CDXY".into(), 7).unwrap();
+        assert!(matches!(
+            search.step(&terminal).unwrap(),
+            HistorySearchProgress::More
+        ));
+        terminal.feed(b"\rnew\x1b[S").unwrap();
+        let HistorySearchProgress::Match(found) = search.step(&terminal).unwrap() else {
+            panic!("a match crossing the one-row window was lost");
+        };
+        assert_eq!(found.offset, 2);
+        assert_eq!(found.total_rows, 3);
+        assert_eq!(found.row_count, 1);
+        assert_eq!(&*found.text, "ABCDXY1");
+        assert_eq!(&found.text[found.range], "CDXY");
+        assert!(matches!(
+            search.step(&terminal).unwrap(),
+            HistorySearchProgress::End
+        ));
+    }
+
+    #[test]
+    fn small_windows_never_drop_a_hard_break_or_truncate_a_row() {
+        let mut terminal = Terminal::new(2, 4).unwrap();
+        terminal.feed(b"ABCD\r\nXY12\x1b[2S").unwrap();
+        let mut search = HistorySearch::new("CDXY".into(), 8).unwrap();
+        assert!(matches!(
+            search.step(&terminal).unwrap(),
+            HistorySearchProgress::More
+        ));
+        assert!(matches!(
+            search.step(&terminal).unwrap(),
+            HistorySearchProgress::End
+        ));
+        let mut search = HistorySearch::new("XY1".into(), 3).unwrap();
+        assert_eq!(
+            search.step(&terminal).unwrap_err(),
+            "history search snapshot exceeds its byte limit"
+        );
+    }
+
+    #[test]
+    fn empty_search_stays_at_its_original_archive_boundary() {
+        let mut terminal = Terminal::new(2, 6).unwrap();
+        let mut search = HistorySearch::new("needle".into(), 32).unwrap();
+        assert!(matches!(
+            search.step(&terminal).unwrap(),
+            HistorySearchProgress::End
+        ));
+        terminal.feed(b"needle\x1b[S").unwrap();
+        assert_eq!(terminal.history_rows(), 1);
+        assert!(matches!(
+            search.step(&terminal).unwrap(),
+            HistorySearchProgress::End
+        ));
     }
 }

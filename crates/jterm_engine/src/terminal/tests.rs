@@ -1874,6 +1874,59 @@ fn retained_text_joins_plain_archive_padding_to_encoded_and_live_rows() {
 }
 
 #[test]
+fn history_search_text_matches_selection_at_every_archive_boundary() {
+    for track_spaces in [false, true] {
+        let mut terminal = Terminal::new(3, 6).unwrap();
+        terminal.enable_grapheme_clusters();
+        terminal.enable_hyperlinks(|_, _| true);
+        if track_spaces {
+            terminal.track_printed_spaces();
+        }
+        terminal
+            .feed(
+                concat!(
+                    "ab    \x1b[31mC\x1b[0m\r\n\r\n",
+                    "abcde界Z\r\n",
+                    " \u{301}\r\n",
+                    "\x1b]8;;https://example.test\x07e\u{301}\x1b]8;;\x07  \r\n",
+                    "blank!  \r\nend\x1b[3S",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        terminal.resize(3, 12).unwrap();
+        terminal.feed(b"new width\x1b[3S").unwrap();
+        let total = terminal.history_rows();
+        for end in 1..=total {
+            for start in 0..end {
+                let following_row = end < total;
+                let sentinel = usize::from(following_row);
+                let count = end - start;
+                let page = terminal
+                    .history_page(total - end - sentinel, count + sentinel)
+                    .unwrap();
+                let expected = if following_row {
+                    page.selection_text(0, 0, count, 0).unwrap()
+                } else {
+                    page.text
+                };
+                let bytes = expected.len();
+                assert_eq!(
+                    terminal.history_search_text(start..end, following_row, bytes),
+                    Some((page.revision, expected)),
+                    "printed spaces {track_spaces}, range {start}..{end}"
+                );
+                if bytes > 0 {
+                    assert!(terminal
+                        .history_search_text(start..end, following_row, bytes - 1)
+                        .is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn retained_text_copies_archived_and_live_rows_with_exact_logical_boundaries() {
     let mut terminal = Terminal::new(3, 12).unwrap();
     terminal.track_printed_spaces();
