@@ -10,6 +10,7 @@ use jterm_engine::{
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    ops::Range,
     rc::{Rc, Weak},
     sync::Arc,
 };
@@ -375,10 +376,14 @@ impl TerminalView {
     }
 
     pub(crate) fn clear(&self) {
-        self.presentation.take();
+        let previous = self.presentation.take();
         self.cursor_offset.set(None);
         self.widget.set_cursor_stroke(None);
         self.widget.buffer().set_text("");
+        self.clear_find();
+        if let Some(previous) = previous {
+            previous.remove_tags();
+        }
     }
 
     pub(crate) fn theme(&self) -> Theme {
@@ -544,7 +549,14 @@ impl TerminalView {
             };
         let current = match (previous, updates) {
             (Some(mut previous), Some(updates)) => {
-                previous.update_live(frame, margin_gaps, &theme, updates);
+                let retained = previous.live.as_ref().and_then(|(before, before_gaps)| {
+                    retained_scroll_rows(before, frame, *before_gaps, margin_gaps, updates.len())
+                });
+                if let Some(retained) = retained {
+                    previous.update_scroll(frame, margin_gaps, &theme, &retained);
+                } else {
+                    previous.update_live(frame, margin_gaps, &theme, updates);
+                }
                 previous
             }
             (previous, _) => {
@@ -1025,6 +1037,126 @@ fn live_update_preserves_unchanged_buffer_rows_and_moves_the_caret() {
 #[cfg(test)]
 #[test]
 #[ignore = "requires a GTK display"]
+fn scrolling_keeps_existing_text_tags_and_moves_copy_and_caret_metadata() {
+    gtk4::init().expect("GTK display");
+    let mut terminal = jterm_engine::terminal::Terminal::new(7, 12).unwrap();
+    terminal.enable_underline_colors();
+    terminal.enable_grapheme_clusters();
+    terminal.enable_hyperlinks(|_, _| true);
+    let theme = Theme {
+        font: pango::FontDescription::from_string("Monospace 12"),
+        foreground: gdk::RGBA::WHITE,
+        background: gdk::RGBA::BLACK,
+        palette: default_ansi_palette(),
+        cursor: None,
+    };
+    let view = TerminalView::new(theme.clone());
+    let window = gtk4::Window::builder().child(&view.widget).build();
+    window.present();
+    terminal
+        .feed(
+            concat!(
+                "discard\r\n12345678901界Z\r\n",
+                "\x1b]8;;https://example.test/moved\x07\x1b[4;58;5;33me\u{301}界link",
+                "\x1b[0m\x1b]8;;\x07\r\nfour\r\nfive\r\nsix",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let present = |view: &TerminalView, terminal: &jterm_engine::terminal::Terminal| {
+        view.present(
+            &terminal.frame().unwrap(),
+            terminal.live_margin_gaps(),
+            None,
+            None,
+        );
+    };
+    present(&view, &terminal);
+    let buffer = view.widget.buffer();
+    let stable = buffer.iter_at_line(1).unwrap().tags();
+    let link_tags = buffer.iter_at_line(3).unwrap().tags();
+    terminal.feed(b"\x1b[S\x1b[7;1H\x1b[31mnew\x1b[0m").unwrap();
+    present(&view, &terminal);
+    assert_eq!(view.widget.buffer(), buffer);
+    assert_eq!(buffer.line_count(), 7);
+    assert_eq!(buffer.start_iter().tags(), stable);
+    assert_eq!(buffer.iter_at_line(2).unwrap().tags(), link_tags);
+    let caret = buffer.iter_at_mark(&buffer.get_insert());
+    assert_eq!((caret.line(), caret.line_offset()), (6, 3));
+    let retained = view.presentation.borrow();
+    let moved = &retained.as_ref().unwrap().rows[2];
+    assert_eq!(moved.column_spans.len(), 2);
+    assert_eq!(moved.links[0].target.as_ref(), "https://example.test/moved");
+    drop(retained);
+    while glib::MainContext::default().iteration(false) {}
+    let link = view.widget.iter_location(&buffer.iter_at_line(2).unwrap());
+    let (x, y) = view.widget.buffer_to_window_coords(
+        gtk4::TextWindowType::Widget,
+        link.x() + 1,
+        link.y() + link.height() / 2,
+    );
+    assert_eq!(
+        view.link_at(f64::from(x), f64::from(y), None)
+            .unwrap()
+            .target
+            .as_ref(),
+        "https://example.test/moved"
+    );
+
+    buffer.select_range(
+        &buffer.iter_at_line_offset(0, 2).unwrap(),
+        &buffer.iter_at_line_offset(1, 2).unwrap(),
+    );
+    assert_eq!(view.selected_text().as_deref(), Some("345678901界Z"));
+    buffer.place_cursor(&caret);
+
+    // Keep rows above and below an edited region while moving its survivors.
+    terminal
+        .feed(b"\x1b[3;6r\x1b[T\x1b[3;1H\x1b[34mreplacement\x1b[0m")
+        .unwrap();
+    present(&view, &terminal);
+    let reference = TerminalView::new(theme);
+    present(&reference, &terminal);
+    let expected = reference.widget.buffer();
+    assert_eq!(
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+        expected.text(&expected.start_iter(), &expected.end_iter(), true)
+    );
+    let styles = |tags: Vec<gtk4::TextTag>| {
+        tags.iter()
+            .map(|tag| {
+                (
+                    tag.foreground_rgba(),
+                    tag.background_rgba(),
+                    tag.underline(),
+                    tag.underline_rgba(),
+                    tag.weight(),
+                    tag.style(),
+                    tag.is_strikethrough(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for offset in 0..buffer.char_count() {
+        assert_eq!(
+            styles(buffer.iter_at_offset(offset).tags()),
+            styles(expected.iter_at_offset(offset).tags()),
+            "character {offset}"
+        );
+    }
+
+    let table = buffer.tag_table();
+    let foreign = gtk4::TextTag::builder().name("host-owned-tag").build();
+    table.add(&foreign);
+    view.clear();
+    assert_eq!(table.lookup("host-owned-tag"), Some(foreign));
+    assert_eq!(table.size(), 1);
+    window.close();
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires a GTK display"]
 fn cursor_strokes_use_text_geometry_and_leave_the_caret_available() {
     gtk4::init().expect("GTK display");
     let mut terminal = jterm_engine::terminal::Terminal::new(3, 8).unwrap();
@@ -1186,6 +1318,65 @@ fn live_updates(before: &CellFrame, after: &CellFrame, changed_gaps: u128) -> Op
     Some(rows)
 }
 
+fn retained_scroll_rows(
+    before: &CellFrame,
+    after: &CellFrame,
+    before_gaps: u128,
+    after_gaps: u128,
+    repaint_count: usize,
+) -> Option<Vec<(usize, usize)>> {
+    if repaint_count < 2 {
+        return None;
+    }
+    let old_cursor = before.cursor().paint_position().0;
+    let new_cursor = after.cursor().paint_position().0;
+    let mut sources: Vec<_> = before
+        .rows()
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| *row != old_cursor)
+        .map(|(index, row)| (row.cells.as_ptr(), index))
+        .collect();
+    sources.sort_unstable();
+    // Structural edits preserve the order of surviving rows. Keep that
+    // order so the buffer can edit gaps without copying the retained text.
+    let mut retained = Vec::new();
+    let mut next_source = 0;
+    for (target, row) in after.rows().iter().enumerate() {
+        if target == new_cursor {
+            continue;
+        }
+        let address = row.cells.as_ptr();
+        let start = sources.partition_point(|&(candidate, _)| candidate < address);
+        if let Some(source) = sources[start..]
+            .iter()
+            .take_while(|&&(candidate, _)| candidate == address)
+            .map(|&(_, index)| index)
+            .find(|&source| {
+                source >= next_source
+                    && ((before_gaps >> source) ^ (after_gaps >> target)) & 1 == 0
+                    && before.shares_row_paint_with(source, after, target)
+            })
+        {
+            retained.push((source, target));
+            next_source = source + 1;
+        }
+    }
+    (after.rows().len() - retained.len() < repaint_count
+        && retained.iter().any(|(source, target)| source != target))
+    .then_some(retained)
+}
+
+fn remove_tags<'a>(buffer: &gtk4::TextBuffer, tags: impl Iterator<Item = &'a gtk4::TextTag>) {
+    let table = buffer.tag_table();
+    let mut tags: Vec<_> = tags.collect();
+    // Remove the highest priorities first to avoid reordering the remaining tags.
+    tags.sort_unstable_by_key(|tag| std::cmp::Reverse(tag.priority()));
+    for tag in tags {
+        table.remove(tag);
+    }
+}
+
 impl Presentation {
     fn new(
         buffer: gtk4::TextBuffer,
@@ -1230,19 +1421,126 @@ impl Presentation {
     }
 
     fn remove_tags(&self) {
-        let table = self.buffer.tag_table();
-        let mut tags: Vec<_> = self
-            .rows
-            .iter()
-            .flat_map(|row| &row.tags)
-            .chain(std::iter::once(&self.font))
-            .collect();
-        // Removing the highest priority first avoids reordering the tags
-        // that are still in the table.
-        tags.sort_unstable_by_key(|tag| std::cmp::Reverse(tag.priority()));
-        for tag in tags {
-            table.remove(tag);
+        remove_tags(
+            &self.buffer,
+            self.rows
+                .iter()
+                .flat_map(|row| &row.tags)
+                .chain(std::iter::once(&self.font)),
+        );
+    }
+
+    fn rebuild_live(&mut self, frame: &CellFrame, margin_gaps: u128, theme: &PaintTheme<'_>) {
+        self.buffer.set_text("");
+        self.remove_tags();
+        *self = Self::new(self.buffer.clone(), frame, margin_gaps, None, theme);
+    }
+
+    fn update_scroll(
+        &mut self,
+        frame: &CellFrame,
+        margin_gaps: u128,
+        theme: &PaintTheme<'_>,
+        retained: &[(usize, usize)],
+    ) {
+        let mut targets = HashMap::new();
+        let mut old_end = self.rows.len();
+        let mut new_end = frame.rows().len();
+        // Edit from the bottom so the old line indices above each edit stay valid.
+        for &(source, target) in retained.iter().rev() {
+            if self
+                .replace_scroll_gap(
+                    frame,
+                    margin_gaps,
+                    theme,
+                    source + 1..old_end,
+                    target + 1..new_end,
+                    &mut targets,
+                )
+                .is_none()
+            {
+                self.rebuild_live(frame, margin_gaps, theme);
+                return;
+            }
+            old_end = source;
+            new_end = target;
         }
+        if self
+            .replace_scroll_gap(
+                frame,
+                margin_gaps,
+                theme,
+                0..old_end,
+                0..new_end,
+                &mut targets,
+            )
+            .is_none()
+            || self.buffer.line_count() as usize != frame.rows().len()
+        {
+            self.rebuild_live(frame, margin_gaps, theme);
+            return;
+        }
+        self.live = Some((frame.clone(), margin_gaps));
+    }
+
+    fn replace_scroll_gap(
+        &mut self,
+        frame: &CellFrame,
+        margin_gaps: u128,
+        theme: &PaintTheme<'_>,
+        old: Range<usize>,
+        new: Range<usize>,
+        targets: &mut HashMap<HyperlinkId, Option<Rc<str>>>,
+    ) -> Option<()> {
+        if old.is_empty() && new.is_empty() {
+            return Some(());
+        }
+        let tail = old.end == self.rows.len();
+        // Middle and leading gaps own the newline after each of their rows.
+        // A tail gap owns the newline immediately after the last retained row.
+        let (mut start, mut end) = if tail {
+            let mut start = self.buffer.iter_at_line(old.start.checked_sub(1)? as i32)?;
+            if !start.ends_line() {
+                start.forward_to_line_end();
+            }
+            (start, self.buffer.end_iter())
+        } else {
+            (
+                self.buffer.iter_at_line(old.start as i32)?,
+                self.buffer.iter_at_line(old.end as i32)?,
+            )
+        };
+        if start != end {
+            self.buffer.delete(&mut start, &mut end);
+        }
+        remove_tags(
+            &self.buffer,
+            self.rows[old.clone()].iter().flat_map(|row| &row.tags),
+        );
+        let cursor = frame.cursor();
+        let mut painted = Vec::with_capacity(new.len());
+        for index in new {
+            if tail {
+                self.buffer
+                    .insert_with_tags(&mut start, "\n", &[&self.font]);
+            }
+            let caret = (cursor.paint_position().0 == index).then_some(cursor);
+            painted.push(paint_row(
+                &self.buffer,
+                &mut start,
+                RowSource::Live(frame, index, margin_gaps),
+                theme,
+                &self.font,
+                caret,
+                targets,
+            ));
+            if !tail {
+                self.buffer
+                    .insert_with_tags(&mut start, "\n", &[&self.font]);
+            }
+        }
+        self.rows.splice(old, painted);
+        Some(())
     }
 
     fn update_live(
@@ -1257,9 +1555,7 @@ impl Presentation {
         let mut targets = HashMap::new();
         for index in indices {
             let Some(mut start) = self.buffer.iter_at_line(index as i32) else {
-                self.buffer.set_text("");
-                self.remove_tags();
-                *self = Self::new(self.buffer.clone(), frame, margin_gaps, None, theme);
+                self.rebuild_live(frame, margin_gaps, theme);
                 return;
             };
             let mut end = start;
