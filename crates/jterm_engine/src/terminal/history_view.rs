@@ -77,7 +77,11 @@ fn format_archive_row<'a>(line: &'a ScrollbackLine, text: &'a mut String) -> (&'
         (ScrollbackContent::Plain(text, trailing), None)
             if line.synthetic_margin_gap().is_none() =>
         {
-            let trimmed = text.trim_end_matches(' ');
+            let trimmed = if line.has_printed_spaces() {
+                text
+            } else {
+                text.trim_end_matches(' ')
+            };
             return (trimmed, text.len() - trimmed.len() + usize::from(trailing));
         }
         (_, Some(row)) => format_streamed_archive_row(line, text, row.texts()),

@@ -2007,7 +2007,7 @@ impl<'a> SearchLine<'a> {
     /// Use bulk decode for encoded rows past the caller's streaming threshold.
     pub fn from_retained(line: &'a ScrollbackLine, stream_columns: usize) -> Self {
         match line.content() {
-            ScrollbackContent::Plain(text, _) => Self::Text(text),
+            ScrollbackContent::Plain(text, _) => Self::Text(text.trim_end_matches(' ')),
             ScrollbackContent::Encoded(_) if line.columns() > stream_columns => {
                 Self::Cells(std::borrow::Cow::Owned(line.decompress()))
             }
@@ -2104,21 +2104,30 @@ impl ScrollbackLine {
                 });
             }
         }
-        let (data, archive_flags) =
-            if !needs_encoded_flags(row_flags) && active.iter().all(default_colors_and_no_link) {
-                let text: String = active.iter().map(|cell| cell.character).collect();
-                (
-                    CompressedLineData::Plain(text, (cells.len() - active_len) as u16),
-                    u8::from(cells.len() > usize::from(u16::MAX)) << 2,
-                )
-            } else {
-                (
-                    CompressedLineData::Encoded(Self::encode_cells(active, preserve_blink)),
-                    (u8::from(row_flags.printed_space()) * ARCHIVE_PRINTED_SPACES)
-                        | (u8::from(row_flags.0 & (OVERLINE_BIT | CONCEALED_BIT) != 0)
-                            * ARCHIVE_EXTENDED_RENDITION),
-                )
-            };
+        // A plain row can infer literal space metadata when every stored
+        // space is printed and all remaining cells have default attributes.
+        let plain_printed_spaces =
+            row_flags.0 == PRINTED_SPACE_BIT && cells.len() <= usize::from(u16::MAX);
+        let (data, archive_flags) = if (!needs_encoded_flags(row_flags) || plain_printed_spaces)
+            && active.iter().all(|cell| {
+                default_colors_and_no_link(cell)
+                    && (!plain_printed_spaces
+                        || (cell.character == ' ') == cell.flags.printed_space())
+            }) {
+            let text: String = active.iter().map(|cell| cell.character).collect();
+            (
+                CompressedLineData::Plain(text, (cells.len() - active_len) as u16),
+                (u8::from(cells.len() > usize::from(u16::MAX)) << 2)
+                    | (u8::from(plain_printed_spaces) * ARCHIVE_PRINTED_SPACES),
+            )
+        } else {
+            (
+                CompressedLineData::Encoded(Self::encode_cells(active, preserve_blink)),
+                (u8::from(row_flags.printed_space()) * ARCHIVE_PRINTED_SPACES)
+                    | (u8::from(row_flags.0 & (OVERLINE_BIT | CONCEALED_BIT) != 0)
+                        * ARCHIVE_EXTENDED_RENDITION),
+            )
+        };
         ScrollbackLine {
             data,
             is_wrapped,
@@ -2208,23 +2217,38 @@ impl ScrollbackLine {
         self.data.content()
     }
 
+    pub(crate) fn has_printed_spaces(&self) -> bool {
+        self.archive_flags & ARCHIVE_PRINTED_SPACES != 0
+    }
+
+    #[inline]
+    fn plain_cell(&self, character: char) -> TerminalCell {
+        let flags = StyleFlags(if character == ' ' && self.has_printed_spaces() {
+            PRINTED_SPACE_BIT
+        } else {
+            0
+        });
+        TerminalCell {
+            character,
+            flags,
+            ..TerminalCell::default()
+        }
+    }
+
+    fn decode_plain_into(&self, text: &str, trailing: u16, cells: &mut Vec<TerminalCell>) {
+        if text.is_ascii() {
+            cells.extend(text.bytes().map(|byte| self.plain_cell(char::from(byte))));
+        } else {
+            cells.extend(text.chars().map(|character| self.plain_cell(character)));
+        }
+        cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
+    }
+
     pub fn decompress(&self) -> Vec<TerminalCell> {
         let mut cells = match self.content() {
             ScrollbackContent::Plain(text, trailing) => {
-                let cell = |character| TerminalCell {
-                    character,
-                    ..TerminalCell::default()
-                };
-                let mut cells = if text.is_ascii() {
-                    let mut cells = Vec::with_capacity(self.columns());
-                    cells.extend(text.bytes().map(char::from).map(cell));
-                    cells
-                } else {
-                    let mut cells = Vec::with_capacity(self.columns());
-                    cells.extend(text.chars().map(cell));
-                    cells
-                };
-                cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
+                let mut cells = Vec::with_capacity(self.columns());
+                self.decode_plain_into(text, trailing, &mut cells);
                 cells
             }
             ScrollbackContent::Encoded(data) => {
@@ -2258,16 +2282,7 @@ impl ScrollbackLine {
         cells.reserve(self.columns());
         match self.content() {
             ScrollbackContent::Plain(text, trailing) => {
-                let cell = |character| TerminalCell {
-                    character,
-                    ..TerminalCell::default()
-                };
-                if text.is_ascii() {
-                    cells.extend(text.bytes().map(char::from).map(cell));
-                } else {
-                    cells.extend(text.chars().map(cell));
-                }
-                cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
+                self.decode_plain_into(text, trailing, cells);
             }
             ScrollbackContent::Encoded(data) => {
                 Self::decode_cells_into(data, self.cols as usize, self.archive_flags, cells);
@@ -2282,13 +2297,7 @@ impl ScrollbackLine {
         match self.content() {
             ScrollbackContent::Plain(text, _) => {
                 for (column, character) in text.chars().enumerate() {
-                    visit(
-                        column,
-                        TerminalCell {
-                            character,
-                            ..Default::default()
-                        },
-                    );
+                    visit(column, self.plain_cell(character));
                 }
             }
             ScrollbackContent::Encoded(data) => {
@@ -2356,10 +2365,7 @@ impl ScrollbackLine {
                     if cells.len() == cols {
                         return None;
                     }
-                    cells.push(TerminalCell {
-                        character,
-                        ..Default::default()
-                    });
+                    cells.push(self.plain_cell(character));
                 }
                 if cells.len().checked_add(usize::from(trailing))? != cols {
                     return None;
@@ -2424,14 +2430,15 @@ impl ScrollbackLine {
     pub fn search_text(&self) -> (std::borrow::Cow<'_, str>, Option<Vec<usize>>, usize) {
         match self.content() {
             ScrollbackContent::Plain(text, trailing) => {
+                let searchable = text.trim_end_matches(' ');
                 // Ordinary archive widths and trailing blanks already count scalars.
                 // Public callers may compress wider rows than the u16 archive geometry.
                 let columns = if self.archive_flags & 4 == 0 {
-                    self.columns() - usize::from(trailing)
+                    self.columns() - usize::from(trailing) - (text.len() - searchable.len())
                 } else {
-                    text.chars().count()
+                    searchable.chars().count()
                 };
-                (std::borrow::Cow::Borrowed(text), None, columns)
+                (std::borrow::Cow::Borrowed(searchable), None, columns)
             }
             ScrollbackContent::Encoded(_) => {
                 let cells = self.decompress();
@@ -3593,6 +3600,64 @@ mod rectangular_rendition_tests {
 #[cfg(test)]
 mod retained_drawn_space_tests {
     use super::*;
+
+    #[test]
+    fn compact_rows_distinguish_literal_spaces_from_erase_padding() {
+        let text = " a é  ";
+        let active_len = text.chars().count();
+        let mut cells: Vec<_> = text
+            .chars()
+            .map(|character| TerminalCell {
+                character,
+                flags: StyleFlags(if character == ' ' {
+                    PRINTED_SPACE_BIT
+                } else {
+                    0
+                }),
+                ..TerminalCell::default()
+            })
+            .collect();
+        cells.resize(active_len + 2, TerminalCell::default());
+        let line = ScrollbackLine::compress(&cells, false);
+        assert!(matches!(
+            line.content(),
+            ScrollbackContent::Plain(" a é  ", 2)
+        ));
+        assert_eq!(line.reflow_content_len(), active_len);
+        assert_eq!(line.decompress(), cells);
+        let mut scratch = Vec::new();
+        line.decompress_into(&mut scratch);
+        assert_eq!(scratch, cells);
+        assert_eq!(
+            line.decode_search_row(cells.len(), text.len()).unwrap(),
+            cells
+        );
+        assert!(line
+            .decode_search_row(cells.len(), text.len() - 1)
+            .is_none());
+        let mut visited = Vec::new();
+        line.visit_search_cells(|column, cell| {
+            assert_eq!(column, visited.len());
+            visited.push(cell);
+        });
+        assert_eq!(visited, cells[..active_len]);
+        assert_eq!(line.search_text(), (" a é".into(), None, 4));
+        assert!(matches!(
+            SearchLine::from_retained(&line, 0),
+            SearchLine::Text(" a é")
+        ));
+
+        for flags in [
+            StyleFlags::new(),
+            StyleFlags(PRINTED_SPACE_BIT | TAB_PADDING_BIT),
+        ] {
+            // An erased gap and an expanded tab need their own cell flags.
+            cells[2].flags = flags;
+            let line = ScrollbackLine::compress(&cells, false);
+            assert!(matches!(line.content(), ScrollbackContent::Encoded(_)));
+            assert_eq!(line.decompress(), cells);
+        }
+    }
 
     #[test]
     fn plain_and_encoded_rows_restore_untracked_drawn_spaces_including_trimmed_tail() {

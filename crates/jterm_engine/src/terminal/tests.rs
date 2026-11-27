@@ -2156,6 +2156,24 @@ fn archive_text_keeps_clusters_on_blanks_omitted_by_both_codecs() {
 }
 
 #[test]
+fn compact_history_exports_trailing_written_spaces() {
+    let mut terminal = Terminal::new(2, 8).unwrap();
+    terminal.track_printed_spaces();
+    terminal.feed("é a  \r\nnext\r\nlive".as_bytes()).unwrap();
+    assert_eq!(terminal.history_rows(), 1);
+    assert!(matches!(
+        terminal.history[0].content(),
+        crate::grid::ScrollbackContent::Plain("é a  ", 3)
+    ));
+    assert_eq!(terminal.history_page(0, 1).unwrap().text, "é a  ");
+    let (_, searched) = terminal.history_search_text(0..1, false, 8).unwrap();
+    assert_eq!(searched, "é a  ");
+    let mut output = Vec::new();
+    terminal.write_retained_text(&mut output).unwrap();
+    assert_eq!(output, "é a  \nnext\nlive".as_bytes());
+}
+
+#[test]
 fn retained_text_copies_archived_and_live_rows_with_exact_logical_boundaries() {
     let mut terminal = Terminal::new(3, 12).unwrap();
     terminal.track_printed_spaces();
