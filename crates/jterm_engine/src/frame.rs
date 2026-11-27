@@ -609,6 +609,23 @@ impl CellFrame {
         Ok(self.changed_rows(next).map(|(index, _)| index).collect())
     }
 
+    /// Check whether a row can use the same paint and resource references in
+    /// another frame. The caller owns stream admission and palette comparison.
+    pub fn shares_row_paint_with(&self, index: usize, other: &Self, target: usize) -> bool {
+        let Some((before, after)) = self.rows.get(index).zip(other.rows.get(target)) else {
+            return false;
+        };
+        before.wrapped == after.wrapped
+            && Arc::ptr_eq(&before.cells, &after.cells)
+            && same_underline_runs(self.underline_row(index), other.underline_row(target))
+            && self.row_annotations(index) == other.row_annotations(target)
+            && (same_shared_table(&self.hyperlinks, &other.hyperlinks)
+                || before.cells.iter().all(|cell| {
+                    let id = cell.hyperlink_id;
+                    id.is_none() || self.hyperlink_target(id) == other.hyperlink_target(id)
+                }))
+    }
+
     fn validate_delta_frame(&self, next: &Self) -> Result<(), Error> {
         self.admit_delta_stamp(next.stamp())?;
         if self.cols != next.cols || self.rows.len() != next.rows.len() {
@@ -836,6 +853,39 @@ impl Receiver {
         self.frame = Some(next);
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn shared_cells_require_the_same_row_decoration_and_link_targets() {
+    let mut terminal = crate::terminal::Terminal::new(3, 12).unwrap();
+    terminal.enable_hyperlinks(|_, _| true);
+    terminal.enable_underline_colors();
+    terminal.enable_grapheme_clusters();
+    terminal
+        .feed(b"\x1b]8;;https://example.test/one\x07\x1b[4;58;5;33mX")
+        .unwrap();
+    let base = terminal.frame().unwrap();
+    assert!(base.shares_row_paint_with(0, &base, 0));
+    assert!(!base.shares_row_paint_with(0, &base, base.rows().len()));
+
+    let link = base.rows()[0].cells[0].hyperlink_id;
+    let changed_target = base.clone().with_hyperlinks(Some(Arc::from([(
+        link,
+        Arc::from("https://example.test/two"),
+    )])));
+    assert!(!base.shares_row_paint_with(0, &changed_target, 0));
+
+    let mut changed_underline = base.clone();
+    changed_underline.underline_colors = None;
+    assert!(!base.shares_row_paint_with(0, &changed_underline, 0));
+
+    let mut line = RowAnnotations::default();
+    line.set(0, Arc::from("X\u{301}"));
+    let changed_cluster =
+        base.clone()
+            .with_annotations(Some(Arc::from([Some(Arc::new(line)), None, None])));
+    assert!(!base.shares_row_paint_with(0, &changed_cluster, 0));
 }
 
 #[cfg(test)]

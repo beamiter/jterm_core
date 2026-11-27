@@ -1,4 +1,4 @@
-//! Terminal Channel frames. Version 5 adds inline raster resources to version 4.
+//! Terminal Channel frames. Version 5 adds inline rasters and version 6 adds row moves.
 
 use crate::terminal::{self, Attachment, CursorShape, RgbColor, SessionStatus, WireFrame};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -7,6 +7,7 @@ use std::{fmt, num::NonZeroU64};
 pub use crate::terminal::{MAX_CELLS, MAX_COLUMNS, MAX_ROWS};
 pub const VERSION: u8 = 4;
 pub const IMAGE_VERSION: u8 = 5;
+pub const ROW_MOVE_VERSION: u8 = 6;
 pub const MAX_IMAGES: usize = 32;
 pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_IMAGE_DIMENSION: u32 = 4096;
@@ -23,6 +24,7 @@ pub enum SnapshotFormat {
     Compatibility,
     Channel,
     ChannelImages,
+    ChannelRowMoves,
 }
 
 impl SnapshotFormat {
@@ -31,6 +33,7 @@ impl SnapshotFormat {
             None | Some(terminal::VERSION) => Ok(Self::Compatibility),
             Some(VERSION) => Ok(Self::Channel),
             Some(IMAGE_VERSION) => Ok(Self::ChannelImages),
+            Some(ROW_MOVE_VERSION) => Ok(Self::ChannelRowMoves),
             Some(_) => Err("unsupported terminal snapshot version"),
         }
     }
@@ -40,7 +43,12 @@ impl SnapshotFormat {
             Self::Compatibility => None,
             Self::Channel => Some(VERSION),
             Self::ChannelImages => Some(IMAGE_VERSION),
+            Self::ChannelRowMoves => Some(ROW_MOVE_VERSION),
         }
+    }
+
+    pub fn supports_images(self) -> bool {
+        matches!(self, Self::ChannelImages | Self::ChannelRowMoves)
     }
 }
 
@@ -241,6 +249,16 @@ pub struct ChangedRow {
     pub row: Row,
 }
 
+/// Copy consecutive rows from the acknowledged base into the new frame.
+/// Sources refer to the immutable base even when the ranges overlap.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowMove {
+    pub from: u16,
+    pub to: u16,
+    pub count: u16,
+}
+
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stamp {
@@ -284,6 +302,8 @@ pub enum Update {
         stamp: Stamp,
         base_revision: Counter,
         rows: Vec<ChangedRow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        moves: Vec<RowMove>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hyperlinks: Vec<Hyperlink>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -337,6 +357,17 @@ pub struct Receipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_moves_negotiate_as_a_distinct_image_capable_format() {
+        let images = SnapshotFormat::negotiate(Some(IMAGE_VERSION)).unwrap();
+        let moves = SnapshotFormat::negotiate(Some(ROW_MOVE_VERSION)).unwrap();
+        assert_eq!(images, SnapshotFormat::ChannelImages);
+        assert_eq!(moves, SnapshotFormat::ChannelRowMoves);
+        assert!(images.supports_images() && moves.supports_images());
+        assert_eq!(moves.channel_version(), Some(ROW_MOVE_VERSION));
+        assert!(SnapshotFormat::negotiate(Some(ROW_MOVE_VERSION + 1)).is_err());
+    }
 
     #[test]
     fn counter_has_one_wire_type_and_exact_full_width_order() {
