@@ -350,7 +350,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('op.step(', owner)
         self.assertIn('NativeAsciiStep::ObserveIdle', lane)
         self.assertIn('NativeAsciiStep::Written', lane)
-        self.assertLess(lane.index('self.mark_row_dirty('), lane.index('self.mark_command_echo_extent('))
+        self.assertLess(lane.index('self.apply_content_mutation(mutation)'), lane.index('self.mark_command_echo_extent('))
         self.assertNotIn('while pos <', lane)
         self.assertNotIn('.write_frost_legacy_ascii_in_row(', lane)
         shared_batch = (ENGINE / 'src/ascii_write.rs').read_text().split('#[cfg(test)]', 1)[0]
@@ -563,7 +563,10 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('dispatch_frost_legacy_csi(', csi)
         self.assertIn('Effect::Reply(bytes)', frost)
         self.assertIn('Effect::GlobalBackground(color)', frost)
-        self.assertIn('Effect::Row(mutation) => self.mark_row_dirty(mutation.row)', frost)
+        self.assertIn('Effect::Row(mutation) => self.apply_content_mutation(mutation)', frost)
+        mutation = frost.split('    fn apply_content_mutation(', 1)[1].split('\n    fn ', 1)[0]
+        self.assertIn('self.mark_row_dirty(mutation.row)', mutation)
+        self.assertIn('mutation.changed', mutation)
         fallback = csi.split('RepeatGraphics::prepare(', 1)[1]
         for final_byte in ('A', 'B', 'H', 'f', 'g', 'm', 'c', 'p', 'r', 's', 'u', 'K', '@', 'P', 'X'):
             self.assertNotRegex(fallback, rf"(?m)^\s*'{final_byte}'\s*(?:=>|if)")
@@ -610,7 +613,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('NativeModeEffect::Reply(b"\\x1b[I")', parameter)
         frost_modes = frost.split('fn apply_mode_effect(', 1)[1].split('fn enter_alternate_screen(', 1)[0]
         self.assertRegex((ENGINE / 'src/csi_transaction.rs').read_text(), r'operation\s*\.step\(screen, protocol, focused\)')
-        self.assertIn('NativeModeEffect::MouseReportingChanged => self.projection_scroll_guard.revoke()', frost_modes)
+        self.assertRegex(frost_modes, r'NativeModeEffect::MouseReportingChanged\s*=>\s*\{\s*self\.projection_scroll_guard\.revoke\(\);\s*self\.retire_native_wheel\(\);\s*\}')
         self.assertIn('self.finish_synchronized_output()', frost_modes)
 
     def test_osc_color_commands_have_one_shared_owner(self):

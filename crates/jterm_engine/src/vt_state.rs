@@ -212,6 +212,36 @@ impl VtState {
             } => {
                 if intermediates.is_empty() {
                     match final_byte {
+                        b'6' | b'9' => {
+                            let terminal = h.native_terminal();
+                            let screen = &mut terminal.screen;
+                            let before =
+                                (screen.cursor_row, screen.cursor_col, screen.pending_wrap);
+                            if let Some(mut columns) = crate::column_edit::prepare_column_index(
+                                screen,
+                                final_byte == b'6',
+                                &terminal.protocol,
+                            ) {
+                                while let Some(mutation) =
+                                    columns.step(&mut h.native_terminal().screen)
+                                {
+                                    h.csi_effect(crate::ember_csi::EmberCsiEffect::Transaction(
+                                        crate::csi_transaction::CsiTransactionEffect::Erase(
+                                            crate::display_erase::DisplayEraseStep::Mutations(
+                                                smallvec::smallvec![mutation],
+                                            ),
+                                        ),
+                                    ));
+                                }
+                            }
+                            let screen = &h.native_terminal().screen;
+                            if before != (screen.cursor_row, screen.cursor_col, screen.pending_wrap)
+                            {
+                                h.native_effect(NativeEffect::CursorReposition {
+                                    non_linear: false,
+                                });
+                            }
+                        }
                         b'c' => h.native_effect(NativeEffect::Reset),
                         b'M' => {
                             h.native_effect(NativeEffect::Vertical(VerticalMotion::ReverseIndex))
@@ -352,6 +382,26 @@ impl VtState {
                 }
             }
             Event::Control(byte) => Self::frost_control(h, FrostStateCommand::control(byte)),
+            Event::Escape {
+                intermediates,
+                final_byte,
+            } if intermediates.is_empty() && matches!(final_byte, b'6' | b'9') => {
+                let terminal = h.native_terminal();
+                let screen = &mut terminal.screen;
+                if let Some(mut columns) = crate::column_edit::prepare_column_index(
+                    screen,
+                    final_byte == b'6',
+                    &terminal.protocol,
+                ) {
+                    while let Some(mutation) = columns.step(&mut h.native_terminal().screen) {
+                        h.csi_effect(crate::frost_csi::FrostCsiEffect::Erase(
+                            crate::display_erase::DisplayEraseStep::Mutations(smallvec::smallvec![
+                                mutation
+                            ]),
+                        ));
+                    }
+                }
+            }
             Event::Escape {
                 intermediates,
                 final_byte,
@@ -1194,6 +1244,50 @@ mod tests {
     }
 
     #[test]
+    fn native_column_index_edges_are_ordered_across_every_split() {
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for backward in [false, true] {
+                let packet = if backward { b"\x1b6" } else { b"\x1b9" };
+                for split in 0..=packet.len() {
+                    let mut host = Host::new(profile);
+                    for r in 0..3 {
+                        for c in 0..12 {
+                            host.vt.screen.grid.get_mut(r, c).character =
+                                char::from(b'A' + r as u8);
+                        }
+                    }
+                    host.vt.screen.cursor_col = if backward { 0 } else { 11 };
+                    host.vt.screen.pending_wrap = true;
+                    host.vt.screen.current_fg = crate::Color::Red;
+                    host.vt.screen.current_bg = crate::Color::Blue;
+                    feed(&mut host, &packet[..split], None);
+                    feed(&mut host, &packet[split..], None);
+                    assert_eq!(
+                        host.erased_rows.iter().map(|x| x.0).collect::<Vec<_>>(),
+                        vec![0, 1, 2]
+                    );
+                    // First callback sees the following row before its mutation.
+                    assert_eq!(host.erased_rows[0].1, 'B');
+                    assert!(host.vt.screen.pending_wrap);
+                    assert_eq!(host.vt.screen.cursor_col, if backward { 0 } else { 11 });
+                    for r in 0..3 {
+                        let cell = host.vt.screen.grid.get(r, if backward { 0 } else { 11 });
+                        assert_eq!(cell.character, ' ');
+                        assert_eq!(
+                            (cell.foreground, cell.background),
+                            (crate::Color::Red, crate::Color::Blue)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_rendition_stack_selection_at_every_split() {
         let packet = b"\x1b[1;31;44m\x1b[#{\x1b[0;32m\x1b[1:2#{\x1b[?#{\x1b[1#}\x1b[#}\x1b[30#{\x1b[33;42m\x1b[#}";
         let alias_packet = packet
@@ -1867,6 +1961,58 @@ mod tests {
                         format!("{:?}", actual.parser.snapshot()),
                         format!("{:?}", expected.parser.snapshot())
                     );
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_dec_special_control_pictures_survive_all_feed_partitions() {
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for packet in [
+                b"\x1b(0bcdehi\x1b(Bbci".as_slice(),
+                b"\x1b)0\x0ebcdehi\x0fbci",
+                b"\x1b*0\x1bNb\x1bNc\x1bNd\x1bNe\x1bNh\x1bNibci",
+                b"\x1b+0\x1bOb\x1bOc\x1bOd\x1bOe\x1bOh\x1bOibci",
+            ] {
+                for split in 0..=packet.len() {
+                    let mut host = Host::new(profile);
+                    let ids = host.vt.screen.grid.row_ids().to_vec();
+                    feed(&mut host, &packet[..split], None);
+                    feed(&mut host, &packet[split..], None);
+                    let text: String = host
+                        .vt
+                        .screen
+                        .grid
+                        .row_slice(0)
+                        .unwrap()
+                        .iter()
+                        .map(|cell| cell.character)
+                        .collect();
+                    assert!(
+                        text.starts_with("␉␌␍␊␤␋bci"),
+                        "{profile:?} split {split}: {text:?}"
+                    );
+                    assert_eq!(
+                        (
+                            host.vt.screen.cursor_row,
+                            host.vt.screen.cursor_col,
+                            host.vt.screen.pending_wrap
+                        ),
+                        (0, 9, false)
+                    );
+                    assert_eq!(host.vt.screen.grid.row_ids(), ids);
+                    assert!(host.replies.is_empty());
+                    assert!(!host
+                        .vt
+                        .screen
+                        .grid
+                        .row_wrapped
+                        .iter()
+                        .any(|wrapped| *wrapped));
                 }
             }
         }

@@ -909,6 +909,27 @@ fn primary_history_captures_scroll_and_snapshot_is_immutable() {
 }
 
 #[test]
+fn inline_transcript_scrolls_into_history_above_a_fixed_composer() {
+    let mut terminal = Terminal::new(5, 12).unwrap();
+    terminal
+        .feed(b"\x1b[4;1Hcomposer\x1b[5;1Hstatus\x1b[?2026h\x1b[1;3r\x1b[1;1H")
+        .unwrap();
+    terminal
+        .feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\x1b[r\x1b[?2026l")
+        .unwrap();
+
+    assert_eq!(terminal.history_page(0, 128).unwrap().text, "one\ntwo");
+    let screen = terminal.visible_text();
+    assert_eq!(
+        screen.lines().map(str::trim_end).collect::<Vec<_>>(),
+        ["three", "four", "five", "composer", "status"]
+    );
+
+    terminal.feed(b"\x1b[1;3r\x1b[S").unwrap();
+    assert_eq!(terminal.history_rows(), 2);
+}
+
+#[test]
 fn early_wide_wrap_keeps_copy_provenance_through_scrolling() {
     let mut terminal = Terminal::new(3, 6).unwrap();
     terminal.feed("abcde界Z".as_bytes()).unwrap();
@@ -1036,7 +1057,7 @@ fn exceptionally_narrow_history_projection_retains_access_to_raw_rows() {
 }
 
 #[test]
-fn alternate_and_partial_margins_never_archive_or_expose_primary_history() {
+fn alternate_and_interior_margins_never_archive_or_expose_primary_history() {
     let mut t = Terminal::new(3, 8).unwrap();
     t.feed(b"a\r\nb\r\nc\r\n").unwrap();
     assert_eq!(t.history_rows(), 1);

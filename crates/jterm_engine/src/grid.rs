@@ -155,6 +155,17 @@ impl TerminalGrid {
             .is_none_or(|changed_at| *changed_at > revision)
     }
 
+    // Wrap bits remain independently observable through the public legacy
+    // vector; this certificate covers cells and row-owned paint metadata only.
+    #[inline]
+    pub(crate) fn captured_rows_unchanged_after(&self, revision: u64) -> bool {
+        self.row_changes.len() == self.rows
+            && self
+                .row_changes
+                .iter()
+                .all(|&changed_at| changed_at <= revision)
+    }
+
     #[inline]
     fn mark_row_changed(&mut self, row: usize) {
         if self.capture_revision != 0 {

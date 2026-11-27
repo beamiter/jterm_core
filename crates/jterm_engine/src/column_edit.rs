@@ -67,6 +67,47 @@ pub(crate) fn prepare_column_edit(
     Some(edit)
 }
 
+/// XTerm DECBI/DECFI: move inside the page, otherwise shift the scroll
+/// region at the edge. Raw column shifts preserve the Last Column Flag.
+pub(crate) fn prepare_column_index(
+    screen: &mut ScreenState,
+    backward: bool,
+    protocol: &crate::protocol_state::ProtocolState,
+) -> Option<ColumnEdit> {
+    let cols = screen.grid.cols();
+    if cols == 0 || screen.cursor_col >= cols {
+        return None;
+    }
+    if backward && screen.cursor_col > 0 {
+        screen.move_cursor_backward_with_wrap(1, protocol);
+        return None;
+    }
+    if !backward && screen.cursor_col + 1 < cols {
+        screen.move_cursor_forward(1);
+        return None;
+    }
+    let (top, bottom) = (screen.scroll_region_top, screen.scroll_region_bottom);
+    if top > bottom
+        || bottom >= screen.grid.rows()
+        || screen.cursor_row < top
+        || screen.cursor_row > bottom
+    {
+        return None;
+    }
+    Some(ColumnEdit {
+        next_row: top,
+        end_row: bottom + 1,
+        column: 0,
+        count: 1,
+        insert: backward,
+        blank: TerminalCell {
+            foreground: screen.current_fg,
+            background: screen.current_bg,
+            ..TerminalCell::default()
+        },
+    })
+}
+
 impl ColumnEdit {
     /// The caller applies each row's provenance/dirty notification before
     /// requesting another step. Geometry remains fixed during this command.
@@ -126,6 +167,94 @@ mod tests {
         }
         mutations
     }
+    #[test]
+    fn index_matches_snapshot_reference_and_bce_without_cursor_or_identity_changes() {
+        for backward in [false, true] {
+            for cursor_row in 0..4 {
+                for cursor_col in 0..5 {
+                    let mut screen = ScreenState::new(4, 5);
+                    for r in 0..4 {
+                        for c in 0..5 {
+                            screen.grid.get_mut(r, c).character =
+                                char::from(b'A' + (r * 5 + c) as u8);
+                        }
+                    }
+                    screen.scroll_region_top = 1;
+                    screen.scroll_region_bottom = 2;
+                    screen.cursor_row = cursor_row;
+                    screen.cursor_col = cursor_col;
+                    screen.pending_wrap = true;
+                    screen.current_fg = Color::Red;
+                    screen.current_bg = Color::Blue;
+                    screen.current_flags.set_bold(true);
+                    screen.current_flags.set_protected(true);
+                    let ids = screen.grid.row_ids().to_vec();
+                    let mut rows = Vec::new();
+                    if let Some(mut edit) = prepare_column_index(
+                        &mut screen,
+                        backward,
+                        &crate::protocol_state::ProtocolState::default(),
+                    ) {
+                        while let Some(effect) = edit.step(&mut screen) {
+                            rows.push(effect.row);
+                        }
+                    }
+                    let edge = if backward {
+                        cursor_col == 0
+                    } else {
+                        cursor_col == 4
+                    };
+                    let shifts = edge && (1..=2).contains(&cursor_row);
+                    assert_eq!(rows, if shifts { vec![1, 2] } else { vec![] });
+                    assert_eq!(
+                        screen.cursor_col,
+                        if edge {
+                            cursor_col
+                        } else if backward {
+                            cursor_col - 1
+                        } else {
+                            cursor_col + 1
+                        }
+                    );
+                    assert_eq!(screen.pending_wrap, edge);
+                    assert_eq!(screen.grid.row_ids(), ids.as_slice());
+                    for r in 0..4 {
+                        for c in 0..5 {
+                            let shifted = shifts && (1..=2).contains(&r);
+                            let blank = shifted && if backward { c == 0 } else { c == 4 };
+                            let cell = screen.grid.get(r, c);
+                            let source = if shifted && !blank {
+                                if backward {
+                                    c - 1
+                                } else {
+                                    c + 1
+                                }
+                            } else {
+                                c
+                            };
+                            assert_eq!(
+                                cell.character,
+                                if blank {
+                                    ' '
+                                } else {
+                                    char::from(b'A' + (r * 5 + source) as u8)
+                                }
+                            );
+                            if blank {
+                                assert_eq!(
+                                    (cell.foreground, cell.background),
+                                    (Color::Red, Color::Blue)
+                                );
+                                assert_eq!(cell.flags, StyleFlags::default());
+                                assert_eq!(cell.hyperlink_id, HyperlinkId::NONE);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn columns_match_independent_snapshot_shift_reference_across_counts_and_regions() {
         for insert in [false, true] {

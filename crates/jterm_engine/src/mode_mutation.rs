@@ -307,6 +307,19 @@ pub fn apply_native_mode_parameter(
     enabled: bool,
     focused: bool,
 ) -> NativeModeEffect {
+    if namespace == ModeNamespace::DecPrivate && mode == 1004 {
+        let newly = !protocol.modes().contains(&1004);
+        if enabled {
+            protocol.modes_mut().insert(1004);
+        } else {
+            protocol.modes_mut().remove(&1004);
+        }
+        return if enabled && newly && focused {
+            NativeModeEffect::Reply(b"\x1b[I")
+        } else {
+            NativeModeEffect::None
+        };
+    }
     if profile == NativeModeProfile::FrostLegacy {
         return match apply_frost_mode(screen, protocol, namespace, mode, enabled) {
             FrostModeEffect::None => NativeModeEffect::None,
@@ -319,19 +332,6 @@ pub fn apply_native_mode_parameter(
         return NativeModeEffect::None;
     }
     match mode {
-        1004 => {
-            let newly = !protocol.modes().contains(&1004);
-            if enabled {
-                protocol.modes_mut().insert(1004);
-            } else {
-                protocol.modes_mut().remove(&1004);
-            }
-            if enabled && newly && focused {
-                NativeModeEffect::Reply(b"\x1b[I")
-            } else {
-                NativeModeEffect::None
-            }
-        }
         5522 => {
             if enabled {
                 protocol.modes_mut().insert(5522);

@@ -1230,7 +1230,6 @@ impl Terminal {
             if !self.vt.screen.use_alt_buffer
                 && effect.direction == RegionDirection::Up
                 && effect.top == 0
-                && effect.bottom + 1 == self.vt.screen.grid.rows()
             {
                 for removed in effect.removed {
                     if let Some(line) = removed.captured {
@@ -1261,10 +1260,11 @@ impl Terminal {
             .expect("terminal history row identity exhausted");
     }
     fn history_admitted(&self) -> bool {
+        // Inline TUIs can reserve bottom rows for their editor while committed
+        // output scrolls off the top of the primary screen.
         self.history_row_limit != 0
             && !self.vt.screen.use_alt_buffer
             && self.vt.screen.scroll_region_top == 0
-            && self.vt.screen.scroll_region_bottom + 1 == self.vt.screen.grid.rows()
     }
     fn motion(&mut self, m: VerticalMotion) {
         let capture = self.history_admitted();
@@ -1870,6 +1870,15 @@ impl Terminal {
                     self.vt.screen.begin_next_line();
                     self.motion(VerticalMotion::LineFeed);
                 }
+                b'6' | b'9' => {
+                    if let Some(mut columns) = crate::column_edit::prepare_column_index(
+                        &mut self.vt.screen,
+                        *final_byte == b'6',
+                        &self.vt.protocol,
+                    ) {
+                        while columns.step(&mut self.vt.screen).is_some() {}
+                    }
+                }
                 b'M' => self.motion(VerticalMotion::ReverseIndex),
                 b'c' => self.reset_terminal(),
                 _ => return false,
@@ -2064,8 +2073,9 @@ impl Terminal {
                             RegionDirection::Down
                         };
                         for _ in 0..count.min(bottom - top + 1) {
-                            let capture =
-                                self.history_admitted() && direction == RegionDirection::Up;
+                            let capture = self.history_admitted()
+                                && bottom + 1 == self.vt.screen.grid.rows()
+                                && direction == RegionDirection::Up;
                             let effect = self.vt.screen.scroll_region_one(
                                 direction,
                                 top,
@@ -2499,14 +2509,24 @@ impl Terminal {
         let last_observation = *observed_revision;
         let may_have_changed =
             |row| previous.is_none() || grid.row_changed_after(row, last_observation);
-        if let Some(previous) = previous.filter(|frame| {
+        let unchanged_paint = previous.filter(|frame| {
+            *history_extent == extent
+                && *row_identity_revision == identity
+                && frame.cols() == grid.cols()
+                && frame.rows().len() == grid.rows()
+                && !grid.row_changed_after(cursor.row, last_observation)
+                && grid.captured_rows_unchanged_after(last_observation)
+                && frame
+                    .rows()
+                    .iter()
+                    .enumerate()
+                    .all(|(row, old)| old.wrapped == grid.row_wrapped[row])
+        });
+        if let Some(previous) = unchanged_paint.filter(|frame| {
             frame.cursor() == cursor
                 && *color_revision == self.color_revision
                 && *history_extent == extent
                 && *row_identity_revision == identity
-                && frame.rows().iter().enumerate().all(|(row, old)| {
-                    !may_have_changed(row) && old.wrapped == grid.row_wrapped[row]
-                })
         }) {
             // Parser carry, queries, and input modes may advance independently
             // of paint. Keep the acknowledgement base when the view is unchanged.
@@ -2520,7 +2540,9 @@ impl Terminal {
             *observed_revision = self.revision;
             return Ok(previous.clone());
         }
-        let rows = if let Some(previous) = previous {
+        let rows = if let Some(previous) = unchanged_paint {
+            previous.shared_rows()
+        } else if let Some(previous) = previous {
             let mut changed = None;
             for (index, row) in previous.rows().iter().enumerate() {
                 let cells_changed = if may_have_changed(index) {
@@ -2546,52 +2568,60 @@ impl Terminal {
             (0..grid.rows()).map(capture_row).collect::<Vec<_>>().into()
         };
         let underline_colors = if self.underline_pen.is_some() {
-            let mut changed = None;
-            for row in 0..grid.rows() {
-                let before = previous.map_or(&[][..], |frame| frame.underline_color_runs(row));
-                if !may_have_changed(row) {
-                    debug_assert!(grid.underline_color_runs(row).eq(before.iter().copied()));
-                    continue;
+            if let Some(previous) = unchanged_paint {
+                previous.shared_underline_rows()
+            } else {
+                let mut changed = None;
+                for row in 0..grid.rows() {
+                    let before = previous.map_or(&[][..], |frame| frame.underline_color_runs(row));
+                    if !may_have_changed(row) {
+                        debug_assert!(grid.underline_color_runs(row).eq(before.iter().copied()));
+                        continue;
+                    }
+                    if grid.underline_color_runs(row).eq(before.iter().copied()) {
+                        continue;
+                    }
+                    let table = changed.get_or_insert_with(|| {
+                        previous
+                            .and_then(CellFrame::shared_underline_rows)
+                            .map_or_else(|| vec![None; grid.rows()], |colors| colors.to_vec())
+                    });
+                    let runs: Vec<_> = grid.underline_color_runs(row).collect();
+                    table[row] = (!runs.is_empty()).then(|| runs.into());
                 }
-                if grid.underline_color_runs(row).eq(before.iter().copied()) {
-                    continue;
+                match changed {
+                    Some(colors) => colors.iter().any(Option::is_some).then(|| colors.into()),
+                    None => previous.and_then(CellFrame::shared_underline_rows),
                 }
-                let table = changed.get_or_insert_with(|| {
-                    previous
-                        .and_then(CellFrame::shared_underline_rows)
-                        .map_or_else(|| vec![None; grid.rows()], |colors| colors.to_vec())
-                });
-                let runs: Vec<_> = grid.underline_color_runs(row).collect();
-                table[row] = (!runs.is_empty()).then(|| runs.into());
-            }
-            match changed {
-                Some(colors) => colors.iter().any(Option::is_some).then(|| colors.into()),
-                None => previous.and_then(CellFrame::shared_underline_rows),
             }
         } else {
             None
         };
         let annotations = if self.graphemes.is_some() || self.next_inline_image_id != 0 {
-            let mut changed = None;
-            for row in 0..grid.rows() {
-                let current = grid.row_annotations(row);
-                let before = previous.and_then(|frame| frame.row_annotations(row));
-                if !may_have_changed(row) {
-                    debug_assert_eq!(current, before);
-                    continue;
+            if let Some(previous) = unchanged_paint {
+                previous.shared_annotations()
+            } else {
+                let mut changed = None;
+                for row in 0..grid.rows() {
+                    let current = grid.row_annotations(row);
+                    let before = previous.and_then(|frame| frame.row_annotations(row));
+                    if !may_have_changed(row) {
+                        debug_assert_eq!(current, before);
+                        continue;
+                    }
+                    if current != before {
+                        let rows = changed.get_or_insert_with(|| {
+                            previous
+                                .and_then(CellFrame::shared_annotations)
+                                .map_or_else(|| vec![None; grid.rows()], |rows| rows.to_vec())
+                        });
+                        rows[row] = current.cloned();
+                    }
                 }
-                if current != before {
-                    let rows = changed.get_or_insert_with(|| {
-                        previous
-                            .and_then(CellFrame::shared_annotations)
-                            .map_or_else(|| vec![None; grid.rows()], |rows| rows.to_vec())
-                    });
-                    rows[row] = current.cloned();
+                match changed {
+                    Some(rows) => rows.iter().any(Option::is_some).then(|| rows.into()),
+                    None => previous.and_then(CellFrame::shared_annotations),
                 }
-            }
-            match changed {
-                Some(rows) => rows.iter().any(Option::is_some).then(|| rows.into()),
-                None => previous.and_then(CellFrame::shared_annotations),
             }
         } else {
             None
@@ -2741,5 +2771,92 @@ mod offset_specialization_tests {
             assert_eq!(expected.as_ref().map(|_| ()), actual.as_ref().map(|_| ()));
             assert_eq!(actual.is_ok(), count == MAX_COPY_BYTES / 4);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_certificate_regressions {
+    use super::*;
+    use crate::Color;
+    fn advance(terminal: &mut Terminal) {
+        terminal.revision += 1;
+        terminal
+            .vt
+            .screen
+            .grid
+            .begin_capture_revision(terminal.revision);
+        terminal
+            .vt
+            .screen
+            .alt_grid
+            .begin_capture_revision(terminal.revision);
+    }
+    #[test]
+    fn legacy_wrap_row_flat_and_metadata_mutations_keep_exact_frames() {
+        let mut t = Terminal::new(3, 8).unwrap();
+        t.set_color_defaults(TerminalDefaultColors::default());
+        t.enable_underline_colors();
+        t.enable_grapheme_clusters();
+        t.enable_hyperlinks(|_, _| true);
+        t.feed(
+            "\x1b]8;;https://example.test/a\x1b\\X\u{301}\x1b]8;;\x1b\\\x1b[3;1HX\x1b[1;1H"
+                .as_bytes(),
+        )
+        .unwrap();
+        let initial = t.frame().unwrap();
+        t.feed(b"\x1b[2;2H").unwrap();
+        let cursor = t.frame().unwrap();
+        assert!(Arc::ptr_eq(&initial.shared_rows(), &cursor.shared_rows()));
+        advance(&mut t);
+        t.vt.screen.grid.row_wrapped[1] = true;
+        assert!(t.frame().unwrap().rows()[1].wrapped);
+        advance(&mut t);
+        t.vt.screen.grid.get_mut(2, 0).character = 'Y';
+        assert_eq!(t.frame().unwrap().rows()[2].cells[0].character, 'Y');
+        advance(&mut t);
+        t.vt.screen.grid[2][1].character = 'Z';
+        assert_eq!(t.frame().unwrap().rows()[2].cells[1].character, 'Z');
+        let before = t.frame().unwrap();
+        advance(&mut t);
+        t.vt.screen
+            .grid
+            .set_underline_color(2, 0..1, Color::Rgb(1, 2, 3));
+        let underline = t.frame().unwrap();
+        assert_eq!(before.rows(), underline.rows());
+        assert_eq!(underline.underline_color(2, 0), Some(Color::Rgb(1, 2, 3)));
+        advance(&mut t);
+        let _ = t.vt.screen.grid.set_cluster_text(2, 0, "Y\u{302}");
+        let annotated = t.frame().unwrap();
+        assert_eq!(annotated.cluster_text(2, 0), Some("Y\u{302}"));
+        let colors = TerminalDefaultColors {
+            foreground: (11, 22, 33),
+            ..TerminalDefaultColors::default()
+        };
+        t.set_color_defaults(colors);
+        let recolored = t.frame().unwrap();
+        assert!(Arc::ptr_eq(
+            &annotated.shared_rows(),
+            &recolored.shared_rows()
+        ));
+        assert_eq!(
+            recolored.paint_colors().unwrap().effective_foreground(),
+            (11, 22, 33)
+        );
+        assert_eq!(recolored.cluster_text(2, 0), Some("Y\u{302}"));
+        assert_eq!(recolored.underline_color(2, 0), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(
+            recolored.hyperlink_target(HyperlinkId::from_raw(1)),
+            Some("https://example.test/a")
+        );
+        advance(&mut t);
+        t.vt.screen.grid.cells_mut()[7].character = 'W';
+        let flat = t.frame().unwrap();
+        assert_eq!(flat.rows()[0].cells[7].character, 'W');
+        assert_eq!(flat.cluster_text(0, 0), None);
+        assert_eq!(flat.cluster_text(2, 0), None);
+        assert!(flat.underline_color_runs(2).is_empty());
+        advance(&mut t);
+        t.vt.screen.grid.row_wrapped[1] = false;
+        assert!(!t.frame().unwrap().rows()[1].wrapped);
     }
 }

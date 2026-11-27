@@ -43,6 +43,11 @@ pub enum FrostCsiEffect<'a> {
 pub trait FrostCsiHost {
     fn csi_state(&mut self) -> (&mut ScreenState, &mut ProtocolState);
     fn csi_effect(&mut self, effect: FrostCsiEffect<'_>);
+    /// Whether this PTY currently owns keyboard focus in the frontend.
+    fn focused(&self) -> bool {
+        false
+    }
+
     /// Exact content effects for legacy ED0/ED1, separate from metadata-only
     /// DirtyRows. Default preserves the original whole-operation callbacks.
     fn track_legacy_erase_mutations(&self) -> bool {
@@ -130,7 +135,7 @@ pub fn execute<H: FrostCsiHost>(
                 params,
             );
             for (mode, enabled) in operations {
-                let focused = false;
+                let focused = host.focused();
                 let (screen, protocol) = host.csi_state();
                 let effect = apply_native_mode_parameter(
                     NativeModeProfile::FrostLegacy,
@@ -258,11 +263,12 @@ pub fn execute<H: FrostCsiHost>(
 fn execute_transaction<H: FrostCsiHost>(host: &mut H, mut transaction: CsiTransaction<'_>) {
     loop {
         let allow = host.allow_alt_archive();
+        let focused = host.focused();
         let (screen, protocol) = host.csi_state();
         let Some(effect) = transaction.step(
             screen,
             protocol,
-            false,
+            focused,
             allow,
             H::graphic_width,
             RawRowId::allocate_process_unique,
@@ -290,6 +296,7 @@ mod tests {
         trace: Vec<String>,
         replies: Vec<u8>,
         dark: bool,
+        focused: bool,
         wheel_retires: usize,
     }
     impl Host {
@@ -300,6 +307,7 @@ mod tests {
                 trace: vec![],
                 replies: vec![],
                 dark: true,
+                focused: false,
                 wheel_retires: 0,
             }
         }
@@ -310,6 +318,9 @@ mod tests {
         }
         fn allow_alt_archive(&self) -> bool {
             false
+        }
+        fn focused(&self) -> bool {
+            self.focused
         }
         fn background_is_dark(&self) -> bool {
             self.dark
@@ -346,6 +357,9 @@ mod tests {
                 FrostCsiEffect::Region(_) => self.trace.push("region".into()),
                 FrostCsiEffect::Mode(effect) => {
                     self.trace.push("mode".into());
+                    if let NativeModeEffect::Reply(bytes) = effect {
+                        self.replies.extend_from_slice(bytes);
+                    }
                     if matches!(effect, NativeModeEffect::MouseReportingChanged) {
                         self.wheel_retires += 1;
                     }
@@ -370,6 +384,28 @@ mod tests {
                 FrostCsiEffect::VersionReply => self.trace.push("version".into()),
             }
         }
+    }
+    #[test]
+    fn focus_negotiation_reports_only_new_enables_on_the_selected_pty() {
+        let mut h = Host::new();
+        execute(&mut h, &[1004], b"1004", 'h', Some(b'?'), b"");
+        assert!(h.protocol.modes().contains(&1004));
+        assert!(h.replies.is_empty());
+
+        h.focused = true;
+        execute(&mut h, &[1004], b"1004", 'h', Some(b'?'), b"");
+        assert!(h.replies.is_empty());
+        execute(&mut h, &[1004], b"1004", 'l', Some(b'?'), b"");
+        execute(&mut h, &[1004], b"1004", 'h', None, b"");
+        assert!(!h.protocol.modes().contains(&1004));
+        execute(&mut h, &[1004, 1004], b"1004;1004", 'h', Some(b'?'), b"");
+        assert_eq!(h.replies, b"\x1b[I");
+
+        execute(&mut h, &[1004], b"1004", 's', Some(b'?'), b"");
+        execute(&mut h, &[1004], b"1004", 'l', Some(b'?'), b"");
+        execute(&mut h, &[1004, 1004], b"1004;1004", 'r', Some(b'?'), b"");
+        assert!(h.protocol.modes().contains(&1004));
+        assert_eq!(h.replies, b"\x1b[I\x1b[I");
     }
     #[test]
     fn actual_row_mutations_and_rep_steps_are_executed_before_each_callback() {

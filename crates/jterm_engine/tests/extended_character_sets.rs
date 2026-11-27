@@ -49,3 +49,45 @@ fn saved_single_shift_is_consumed_by_one_graphic_space_after_cursor_restore() {
         b"\x1bP1$u1;3;1;@;@;@;0;2;@;BBB0\x1b\\"
     );
 }
+
+#[test]
+fn dec_special_control_pictures_survive_all_feed_partitions() {
+    for packet in [
+        b"\x1b(0bcdehi\x1b(Bbci".as_slice(),
+        b"\x1b)0\x0ebcdehi\x0fbci",
+        b"\x1b*0\x1bNb\x1bNc\x1bNd\x1bNe\x1bNh\x1bNibci",
+        b"\x1b+0\x1bOb\x1bOc\x1bOd\x1bOe\x1bOh\x1bOibci",
+    ] {
+        for split in 0..=packet.len() {
+            let mut terminal = Terminal::new(3, 12).unwrap();
+            terminal.feed(&packet[..split]).unwrap();
+            terminal.feed(&packet[split..]).unwrap();
+            assert!(
+                terminal.visible_text().starts_with("␉␌␍␊␤␋bci"),
+                "split {split}"
+            );
+            let frame = terminal.frame().unwrap();
+            assert_eq!((frame.cursor().row, frame.cursor().col), (0, 9));
+            assert_eq!(terminal.unsupported_count(), 0);
+        }
+    }
+}
+
+#[test]
+fn dec_special_control_pictures_are_single_column_graphics() {
+    use unicode_width::UnicodeWidthChar;
+    for (input, expected) in "bcdehi".chars().zip("␉␌␍␊␤␋".chars()) {
+        let translated = jterm_engine::screen::Charset::DecSpecialGraphics.translate(input);
+        assert_eq!(translated, expected);
+        assert_eq!(translated.width(), Some(1));
+        let mut terminal = Terminal::new(2, 12).unwrap();
+        terminal
+            .feed(format!("\x1b(0{input}\x1b[2b").as_bytes())
+            .unwrap();
+        assert!(terminal
+            .visible_text()
+            .starts_with(&expected.to_string().repeat(3)));
+        let frame = terminal.frame().unwrap();
+        assert_eq!((frame.cursor().row, frame.cursor().col), (0, 3));
+    }
+}
