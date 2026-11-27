@@ -2187,13 +2187,35 @@ impl ScrollbackLine {
         // space is printed and all remaining cells have default attributes.
         let plain_printed_spaces =
             row_flags.0 == PRINTED_SPACE_BIT && cells.len() <= usize::from(u16::MAX);
-        let (data, archive_flags) = if (!needs_encoded_flags(row_flags) || plain_printed_spaces)
-            && active.iter().all(|cell| {
-                default_colors_and_no_link(cell)
-                    && (!plain_printed_spaces
-                        || (cell.character == ' ') == cell.flags.printed_space())
-            }) {
-            let text: String = active.iter().map(|cell| cell.character).collect();
+        let matches_plain = |cell: &TerminalCell| {
+            default_colors_and_no_link(cell)
+                && (!plain_printed_spaces || (cell.character == ' ') == cell.flags.printed_space())
+        };
+        let mut ascii_only = false;
+        let stores_plain = (!needs_encoded_flags(row_flags) || plain_printed_spaces)
+            && if active
+                .first()
+                .is_some_and(|cell| !cell.character.is_ascii())
+            {
+                active.iter().all(matches_plain)
+            } else {
+                // Detect ASCII in the same pass as plain-row eligibility.
+                let mut character_bits = 0;
+                let eligible = active.iter().all(|cell| {
+                    character_bits |= cell.character as u32;
+                    matches_plain(cell)
+                });
+                ascii_only = character_bits <= 0x7f;
+                eligible
+            };
+        let (data, archive_flags) = if stores_plain {
+            let text = if ascii_only {
+                let mut bytes = Vec::new();
+                bytes.extend(active.iter().map(|cell| cell.character as u8));
+                String::from_utf8(bytes).expect("plain ASCII history contains valid UTF-8")
+            } else {
+                active.iter().map(|cell| cell.character).collect()
+            };
             (
                 CompressedLineData::Plain(text, (cells.len() - active_len) as u16),
                 (u8::from(cells.len() > usize::from(u16::MAX)) << 2)
@@ -3957,6 +3979,44 @@ mod retained_drawn_space_tests {
             let line = ScrollbackLine::compress(&cells, false);
             assert!(matches!(line.content(), ScrollbackContent::Encoded(_)));
             assert_eq!(line.decompress(), cells);
+        }
+    }
+
+    #[test]
+    fn plain_archive_packing_preserves_short_row_charges_and_unicode_suffixes() {
+        for text in [
+            "",
+            "x",
+            "\0\u{7f}  ",
+            "short  row",
+            "abc\u{80}",
+            "abcé  ",
+            "界 abc",
+        ] {
+            let mut cells: Vec<_> = text
+                .chars()
+                .map(|character| {
+                    let mut cell = TerminalCell {
+                        character,
+                        ..TerminalCell::default()
+                    };
+                    cell.flags.set_printed_space(character == ' ');
+                    cell
+                })
+                .collect();
+            let reference: String = cells.iter().map(|cell| cell.character).collect();
+            cells.extend([TerminalCell::default(); 2]);
+
+            let line = ScrollbackLine::compress(&cells, false);
+            assert!(matches!(
+                line.content(),
+                ScrollbackContent::Plain(stored, 2) if stored == text
+            ));
+            assert_eq!(line.decompress(), cells);
+            assert_eq!(
+                line.retained_bytes(),
+                size_of::<ScrollbackLine>() + reference.capacity()
+            );
         }
     }
 
