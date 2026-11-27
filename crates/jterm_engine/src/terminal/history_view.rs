@@ -505,7 +505,7 @@ impl Terminal {
         } else {
             ((first..end).map(materialize).collect(), false)
         };
-        self.make_history_page(
+        self.make_history_page::<false>(
             layout.len() - end,
             layout.len(),
             rows,

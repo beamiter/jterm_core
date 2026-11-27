@@ -131,6 +131,7 @@ pub struct HistoryPage {
     pub row_count: usize,
     pub text: String,
     rows: Arc<[HistoryCopyRow]>,
+    raw_rows: bool,
     paint_colors: Option<Arc<ColorState>>,
     hyperlinks: Option<HyperlinkResources>,
 }
@@ -210,17 +211,32 @@ impl HistoryPage {
     /// One UTF-16 offset per physical cell boundary in the page's copy text.
     /// Blank padding and wide continuation cells can share an offset.
     pub fn copy_offsets_utf16(&self) -> Result<Vec<Vec<u32>>, String> {
+        if !cfg!(debug_assertions) && self.row_count == self.rows.len() {
+            if let Some(offsets) = scalar_copy_offsets(&self.rows) {
+                return Ok(offsets);
+            }
+        }
+        if self.raw_rows {
+            self.copy_offsets_for_rows::<true>()
+        } else {
+            self.copy_offsets_for_rows::<false>()
+        }
+    }
+
+    fn copy_offsets_for_rows<const TRIM_PADDING: bool>(&self) -> Result<Vec<Vec<u32>>, String> {
         let mut offsets = Vec::with_capacity(self.row_count);
         // Page construction already checks the text byte limit. Release
         // delivery needs only UTF-16 lengths and trimming boundaries.
         // Debug builds also materialize text for the consistency check.
-        let text = extract_selection::<{ cfg!(debug_assertions) }, false>(
+        let text = extract_selection_bounded::<{ cfg!(debug_assertions) }, false, TRIM_PADDING>(
             &self.rows,
             (0, 0),
             (self.row_count, 0),
             false,
             Some(&mut offsets),
-        )?;
+            None,
+        )?
+        .expect("unbounded copy returns text");
         debug_assert_eq!(text, self.text);
         Ok(offsets)
     }
@@ -255,6 +271,48 @@ impl HistoryPage {
     }
 }
 
+#[inline(never)]
+fn scalar_copy_offsets(rows: &[HistoryCopyRow]) -> Option<Vec<Vec<u32>>> {
+    if rows
+        .iter()
+        .any(|row| row.row.wrapped || row.synthetic_gap.is_some() || row.annotations.is_some())
+    {
+        return None;
+    }
+    // Validate the entire page before allocating the boundary vectors.
+    let mut content_ends = [0; MAX_ROWS];
+    let content_ends = content_ends.get_mut(..rows.len())?;
+    for (source, end) in rows.iter().zip(content_ends.iter_mut()) {
+        let cells = &source.row.cells;
+        *end = copy_content_end(cells, 0);
+        if !cells[..*end]
+            .iter()
+            .all(|cell| !cell.flags.wide_continuation() && cell.character.len_utf16() == 1)
+        {
+            return None;
+        }
+    }
+    let mut result = Vec::with_capacity(rows.len());
+    let mut units = 0u32;
+    for (source, &content_end) in rows.iter().zip(content_ends.iter()) {
+        let end = units + content_end as u32;
+        let width = source.row.cells.len();
+        let mut boundaries = Vec::with_capacity(width + 1);
+        boundaries.extend(units..=end);
+        boundaries.resize(width + 1, end);
+        result.push(boundaries);
+        units = end + 1;
+    }
+    Some(result)
+}
+
+fn copy_content_end(cells: &[crate::TerminalCell], first: usize) -> usize {
+    cells[first..]
+        .iter()
+        .rposition(|cell| cell.character != ' ' || cell.flags.printed_space())
+        .map_or(first, |column| first + column + 1)
+}
+
 fn selection_text(
     rows: &[HistoryCopyRow],
     start: (usize, usize),
@@ -284,7 +342,7 @@ fn extract_selection<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
     require_literal: bool,
     offsets: Option<&mut Vec<Vec<u32>>>,
 ) -> Result<String, String> {
-    extract_selection_bounded::<MATERIALIZE, CHECK_COPY_BYTES>(
+    extract_selection_bounded::<MATERIALIZE, CHECK_COPY_BYTES, false>(
         rows,
         start,
         end,
@@ -295,7 +353,11 @@ fn extract_selection<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
     .map(|text| text.expect("unbounded copy returns text"))
 }
 
-fn extract_selection_bounded<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
+fn extract_selection_bounded<
+    const MATERIALIZE: bool,
+    const CHECK_COPY_BYTES: bool,
+    const TRIM_PADDING: bool,
+>(
     rows: &[HistoryCopyRow],
     start: (usize, usize),
     end: (usize, usize),
@@ -325,10 +387,24 @@ fn extract_selection_bounded<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bo
         let cells = &source.row.cells;
         let first_col = if index == start.0 { start.1 } else { 0 };
         let last_col = if index == end.0 { end.1 } else { cells.len() };
+        let copy_end = if TRIM_PADDING && index < end.0 && !source.row.wrapped && !require_literal {
+            // The hard break trims these spaces anyway. Keep annotations
+            // and explicit spaces in the prefix, and fill the discarded
+            // columns' copy boundaries together.
+            let annotated_end = source
+                .annotations
+                .as_ref()
+                .map_or(first_col, |annotations| {
+                    annotations.end().clamp(first_col, last_col)
+                });
+            copy_content_end(&cells[..last_col], annotated_end)
+        } else {
+            last_col
+        };
         let mut boundaries = offsets
             .as_ref()
             .map(|_| Vec::with_capacity(last_col - first_col + 1));
-        for (offset, cell) in cells[first_col..last_col].iter().enumerate() {
+        for (offset, cell) in cells[first_col..copy_end].iter().enumerate() {
             if let Some(boundaries) = &mut boundaries {
                 boundaries.push(units);
             }
@@ -384,7 +460,11 @@ fn extract_selection_bounded<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bo
             }
         }
         if let (Some(offsets), Some(mut boundaries)) = (offsets.as_deref_mut(), boundaries) {
-            boundaries.push(units);
+            if TRIM_PADDING && copy_end < last_col {
+                boundaries.resize(last_col - first_col + 1, units);
+            } else {
+                boundaries.push(units);
+            }
             offsets.push(boundaries);
         }
         let hard_line_end = index < end.0 && !source.row.wrapped;
@@ -1641,10 +1721,10 @@ impl Terminal {
             .take(end - start)
             .map(HistoryCopyRow::from_line)
             .collect();
-        self.make_history_page(offset, total_rows, rows, false, text_limit)
+        self.make_history_page::<true>(offset, total_rows, rows, false, text_limit)
     }
 
-    fn make_history_page(
+    fn make_history_page<const RAW_ROWS: bool>(
         &self,
         offset: usize,
         total_rows: usize,
@@ -1652,7 +1732,7 @@ impl Terminal {
         cached_links: bool,
         text_limit: Option<usize>,
     ) -> Result<Option<HistoryPage>, String> {
-        let Some(text) = extract_selection_bounded::<true, true>(
+        let Some(text) = extract_selection_bounded::<true, true, RAW_ROWS>(
             &rows,
             (0, 0),
             (rows.len(), 0),
@@ -1684,6 +1764,7 @@ impl Terminal {
             total_rows,
             row_count: rows.len(),
             text,
+            raw_rows: RAW_ROWS,
             hyperlinks,
             paint_colors: self.colors.clone(),
             rows,

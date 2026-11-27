@@ -2634,7 +2634,7 @@ fn bounded_history_text_counts_committed_bytes_and_defers_soft_wrap_padding() {
         synthetic_gap: None,
     };
     let copy = |rows: &[HistoryCopyRow], limit| {
-        extract_selection_bounded::<true, true>(
+        let reference = extract_selection_bounded::<true, true, false>(
             rows,
             (0, 0),
             (rows.len(), 0),
@@ -2642,7 +2642,18 @@ fn bounded_history_text_counts_committed_bytes_and_defers_soft_wrap_padding() {
             None,
             Some(limit),
         )
-        .unwrap()
+        .unwrap();
+        let trimmed = extract_selection_bounded::<true, true, true>(
+            rows,
+            (0, 0),
+            (rows.len(), 0),
+            false,
+            None,
+            Some(limit),
+        )
+        .unwrap();
+        assert_eq!(trimmed, reference);
+        trimmed
     };
     let mut padded = [row("🐍   ", true), row("   ", false)];
     assert_eq!(copy(&padded, 4).as_deref(), Some("🐍"));
@@ -2659,6 +2670,27 @@ fn bounded_history_text_counts_committed_bytes_and_defers_soft_wrap_padding() {
     let separated = [row("🐍", false), row("", false)];
     assert_eq!(copy(&separated, 4), None);
     assert_eq!(copy(&separated, 5).as_deref(), Some("🐍\n"));
+}
+
+#[test]
+fn scalar_history_offsets_match_literal_spaces_tabs_and_empty_rows() {
+    let mut terminal = Terminal::new(2, 16).unwrap();
+    terminal.track_printed_spaces();
+    terminal.feed(b"key\tv  \r\n\r\nnext\r\nlast\r\n").unwrap();
+    let page = terminal.history_page(0, 8).unwrap();
+    assert_eq!(page.text, "key     v  \n\nnext");
+    let reference = page.copy_offsets_for_rows::<false>().unwrap();
+    assert_eq!(scalar_copy_offsets(&page.rows).as_ref(), Some(&reference));
+    assert_eq!(page.copy_offsets_utf16().unwrap(), reference);
+    terminal
+        .feed("wide 界X\r\nafter\r\nend\r\n".as_bytes())
+        .unwrap();
+    let mixed = terminal.history_page(0, 8).unwrap();
+    assert!(scalar_copy_offsets(&mixed.rows).is_none());
+    assert_eq!(
+        mixed.copy_offsets_utf16(),
+        mixed.copy_offsets_for_rows::<false>()
+    );
 }
 
 #[test]
