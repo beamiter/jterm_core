@@ -17,6 +17,7 @@ jterm_runtime = { version = "0.1.0", path = "../jterm_runtime", features = ["ter
 [target.'cfg(target_os = "linux")'.dependencies]
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false }
+gdk4-wayland = { version = "0.11.4", features = ["wayland_crate"] }
 jterm_runtime = { version = "0.1.0", path = "../jterm_runtime", features = ["linux-pty"] }
 
 [workspace]

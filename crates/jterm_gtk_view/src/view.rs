@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use gdk4_wayland::{wayland_client::Proxy, WaylandDisplay};
 use gtk4::{gdk, glib, graphene, pango, prelude::*, subclass::prelude::*};
 use jterm_engine::{
     colors::ColorState,
@@ -102,6 +104,8 @@ pub(crate) struct TerminalView {
     background: Cell<Option<gdk::RGBA>>,
     line_height_scale: Cell<f64>,
     font_geometry: RefCell<Option<CachedFontGeometry>>,
+    #[cfg(target_os = "linux")]
+    display_scale: RefCell<Option<DisplayScale>>,
     appearance_changed: Cell<bool>,
     palette_revision: Cell<u64>,
 }
@@ -124,6 +128,33 @@ struct CachedFontGeometry {
     context: pango::Context,
     serial: u32,
     dimensions: FontGeometry,
+}
+
+#[cfg(target_os = "linux")]
+struct DisplayScale {
+    display: gdk::Display,
+    use_output_scale: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl DisplayScale {
+    fn new(display: gdk::Display) -> Self {
+        // wl_surface gained preferred_buffer_scale in version 6. On older
+        // compositors without fractional-scale, GTK may keep its initial
+        // surface scale even after the window enters a different output.
+        let use_output_scale = display
+            .downcast_ref::<WaylandDisplay>()
+            .is_some_and(|wayland| {
+                !wayland.query_registry("wp_fractional_scale_manager_v1")
+                    && wayland
+                        .wl_compositor()
+                        .is_some_and(|compositor| compositor.version() < 6)
+            });
+        Self {
+            display,
+            use_output_scale,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -481,6 +512,8 @@ impl TerminalView {
             background: Cell::new(None),
             line_height_scale: Cell::new(1.0),
             font_geometry: RefCell::new(None),
+            #[cfg(target_os = "linux")]
+            display_scale: RefCell::new(None),
             appearance_changed: Cell::new(false),
             palette_revision: Cell::new(0),
         };
@@ -578,10 +611,39 @@ impl TerminalView {
     }
 
     fn physical_viewport(&self, width: f64, height: f64) -> Option<PixelViewport> {
-        // GDK also exposes an integer scale factor for buffers. Use the
-        // surface's actual scale for fractional-scale output.
-        let scale = self.widget.native()?.surface()?.scale();
+        let surface = self.widget.native()?.surface()?;
+        #[cfg(target_os = "linux")]
+        let scale = self.surface_scale(&surface)?;
+        #[cfg(not(target_os = "linux"))]
+        let scale = surface.scale();
         PixelViewport::measure((width, height), scale)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn surface_scale(&self, surface: &gdk::Surface) -> Option<f64> {
+        let display = surface.display();
+        let mut policy = self.display_scale.borrow_mut();
+        if policy
+            .as_ref()
+            .is_none_or(|cached| cached.display != display)
+        {
+            *policy = Some(DisplayScale::new(display.clone()));
+        }
+        let use_output_scale = policy
+            .as_ref()
+            .is_some_and(|cached| cached.use_output_scale);
+        drop(policy);
+        if !use_output_scale {
+            return Some(surface.scale());
+        }
+        // Wait for the current output if the surface is between enter
+        // events. GTK 4.12 only exposes its integer monitor factor.
+        let output = display.monitor_at_surface(surface)?;
+        Some(if output.find_property("scale").is_some() {
+            output.property::<f64>("scale")
+        } else {
+            f64::from(output.scale_factor())
+        })
     }
 
     fn cell_geometry(&self) -> (i32, i32, i32) {
