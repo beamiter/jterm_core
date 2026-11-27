@@ -137,7 +137,7 @@ impl ViewportRequest {
             palette_revision,
         };
         let page = (self.painted_history != Some(window))
-            .then(|| terminal.projected_history_page(&layout, first, window.history_rows))
+            .then(|| terminal.projected_history_viewport_page(&layout, first, window.history_rows))
             .transpose()?;
         Ok(Some(HistoryViewport {
             layout,
@@ -165,7 +165,7 @@ fn a_palette_change_invalidates_a_pinned_historical_page() {
         .unwrap()
         .history
         .unwrap();
-    assert!(first.page.is_some());
+    let first_page = first.page.as_ref().unwrap();
     let request = ViewportRequest {
         top: Some(ScrollTarget::Source(first.anchor)),
         painted_history: Some(first.window),
@@ -180,12 +180,20 @@ fn a_palette_change_invalidates_a_pinned_historical_page() {
         .page
         .is_none());
     terminal.feed(b"\x1b]11;#102030\x07").unwrap();
-    assert!(request
+    let recolored = request
         .capture(&terminal, false)
         .unwrap()
         .unwrap()
         .history
         .unwrap()
         .page
-        .is_some());
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &first_page.row(0).unwrap().cells,
+        &recolored.row(0).unwrap().cells,
+    ));
+    assert_eq!(
+        recolored.paint_colors().unwrap().background_override(),
+        Some((0x10, 0x20, 0x30)),
+    );
 }

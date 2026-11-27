@@ -1,7 +1,17 @@
-use crate::{ScrollbackLine, TerminalCell};
-use std::{collections::VecDeque, ops::Range};
+use crate::{
+    frame::Row,
+    retained_bytes::{RetainedBytes, RetainedBytesBudget},
+    row_annotations::RowAnnotations,
+    ScrollbackLine, TerminalCell, UnderlineColorRun,
+};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 const MAX_PROJECTED_ROWS: usize = 65_536;
+const PROCESS_HISTORY_VIEWPORT_BYTES: usize = 8 * 1024 * 1024;
 
 /// An original, immutable history row and physical column within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,6 +34,7 @@ pub struct HistoryLayout {
     pub(crate) extent: Range<u64>,
     pub(crate) columns: usize,
     pub(crate) projected: Option<Vec<ProjectedHistoryRow>>,
+    pub(crate) viewport: Mutex<HistoryViewportCache>,
 }
 
 impl HistoryLayout {
@@ -42,6 +53,7 @@ impl HistoryLayout {
             extent,
             columns,
             projected,
+            viewport: Mutex::default(),
         }
     }
 
@@ -145,6 +157,152 @@ impl HistoryLayout {
         }
         Some(rows)
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct HistoryCopyRow {
+    pub(crate) row: Row,
+    pub(crate) underline_colors: Option<Arc<[UnderlineColorRun]>>,
+    pub(crate) annotations: Option<Arc<RowAnnotations>>,
+    // Physical addressing retains this slot. Only text extraction omits it.
+    pub(crate) synthetic_gap: Option<usize>,
+}
+
+impl HistoryCopyRow {
+    pub(crate) fn from_line(line: &ScrollbackLine) -> Self {
+        Self {
+            row: Row {
+                cells: Arc::from(line.decompress()),
+                wrapped: line.is_wrapped,
+            },
+            underline_colors: (!line.underline_color_runs().is_empty())
+                .then(|| Arc::from(line.underline_color_runs())),
+            annotations: line.row_annotations().cloned(),
+            synthetic_gap: line.synthetic_margin_gap(),
+        }
+    }
+}
+
+pub(crate) fn history_rows_retained_bytes(rows: &[HistoryCopyRow]) -> usize {
+    let header = 2 * size_of::<usize>();
+    header
+        + std::mem::size_of_val(rows)
+        + rows
+            .iter()
+            .map(|row| {
+                header
+                    + std::mem::size_of_val(row.row.cells.as_ref())
+                    + row
+                        .underline_colors
+                        .as_ref()
+                        .map_or(0, |runs| header + std::mem::size_of_val(runs.as_ref()))
+                    + row
+                        .annotations
+                        .as_ref()
+                        .map_or(0, |data| data.retained_bytes())
+            })
+            .sum::<usize>()
+}
+
+pub(crate) fn process_history_viewport_budget() -> &'static Arc<RetainedBytesBudget> {
+    static BUDGET: OnceLock<Arc<RetainedBytesBudget>> = OnceLock::new();
+    BUDGET.get_or_init(|| Arc::new(RetainedBytesBudget::new(PROCESS_HISTORY_VIEWPORT_BYTES)))
+}
+
+#[derive(Default)]
+pub(crate) struct HistoryViewportCache(Option<CachedViewport>);
+
+struct CachedViewport {
+    first: usize,
+    rows: Arc<[HistoryCopyRow]>,
+    lease: RetainedBytes,
+}
+
+impl HistoryViewportCache {
+    pub(crate) fn read(
+        &mut self,
+        range: Range<usize>,
+        mut materialize: impl FnMut(usize) -> HistoryCopyRow,
+        budget: &Arc<RetainedBytesBudget>,
+    ) -> Arc<[HistoryCopyRow]> {
+        let first = range.start;
+        let cached = self.0.as_ref();
+        if let Some(window) =
+            cached.filter(|window| window.first == first && window.rows.len() == range.len())
+        {
+            return Arc::clone(&window.rows);
+        }
+        let rows: Arc<[HistoryCopyRow]> = range
+            .map(|index| {
+                let retained = cached.and_then(|window| {
+                    index
+                        .checked_sub(window.first)
+                        .and_then(|row| window.rows.get(row))
+                });
+                retained.cloned().unwrap_or_else(|| materialize(index))
+            })
+            .collect();
+        if rows.is_empty() {
+            return rows;
+        }
+        let bytes = history_rows_retained_bytes(&rows);
+        // A cache miss or a full budget leaves delivery available. The layout
+        // owns at most one decoded window and releases it with its lease.
+        if let Some(window) = &mut self.0 {
+            if window.lease.try_resize(bytes) {
+                window.first = first;
+                window.rows = Arc::clone(&rows);
+            }
+        } else if let Some(lease) = budget.reserve(bytes) {
+            self.0 = Some(CachedViewport {
+                first,
+                rows: Arc::clone(&rows),
+                lease,
+            });
+        }
+        rows
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn viewport_cache_serves_larger_windows_when_the_retention_budget_is_full() {
+    fn row(index: usize) -> HistoryCopyRow {
+        HistoryCopyRow {
+            row: Row {
+                cells: Arc::from([TerminalCell {
+                    character: char::from(b'a' + index as u8),
+                    ..TerminalCell::default()
+                }]),
+                wrapped: false,
+            },
+            underline_colors: None,
+            annotations: None,
+            synthetic_gap: None,
+        }
+    }
+
+    let capacity = history_rows_retained_bytes(&[row(0)]);
+    let budget = Arc::new(RetainedBytesBudget::new(capacity));
+    let mut cache = HistoryViewportCache::default();
+    let first = cache.read(0..1, row, &budget);
+    assert_eq!(budget.usage().retained_bytes, capacity);
+
+    let larger = cache.read(0..2, row, &budget);
+    assert!(Arc::ptr_eq(&first[0].row.cells, &larger[0].row.cells));
+    assert_eq!(larger[1].row.cells[0].character, 'b');
+    assert_eq!(budget.usage().retained_bytes, capacity);
+    let first_again = cache.read(0..1, |_| panic!("original cached row"), &budget);
+    assert!(Arc::ptr_eq(&first, &first_again));
+
+    let replacement = cache.read(1..2, row, &budget);
+    assert!(!Arc::ptr_eq(
+        &larger[1].row.cells,
+        &replacement[0].row.cells
+    ));
+    assert_eq!(replacement[0].row.cells[0].character, 'b');
+    drop(cache);
+    assert_eq!(budget.usage().retained_bytes, 0);
 }
 
 fn push_projected(

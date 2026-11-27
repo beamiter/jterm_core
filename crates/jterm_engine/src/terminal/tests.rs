@@ -1002,7 +1002,9 @@ fn projected_history_keeps_clusters_styles_links_and_raw_anchors_across_widths()
     terminal.resize(2, 4).unwrap();
     let narrow = terminal.history_layout().unwrap();
     assert_eq!(narrow.row_at(wide), 1);
-    let page = terminal.projected_history_page(&narrow, 0, 2).unwrap();
+    let page = terminal
+        .projected_history_viewport_page(&narrow, 0, 2)
+        .unwrap();
     assert_eq!(page.text, "ae\u{301}cde界Z");
     assert_eq!(page.cluster_text(0, 1), Some("e\u{301}"));
     assert_eq!(page.underline_color(0, 1), Some(Color::Rgb(9, 8, 7)));
@@ -1013,13 +1015,27 @@ fn projected_history_keeps_clusters_styles_links_and_raw_anchors_across_widths()
         page.hyperlink_target(cells[1].hyperlink_id),
         Some("https://example.test/history")
     );
+    let overlap = terminal
+        .projected_history_viewport_page(&narrow, 1, 1)
+        .unwrap();
+    assert!(Arc::ptr_eq(cells, &overlap.row(0).unwrap().cells));
+    assert_eq!(overlap.text, "e界Z");
+    assert_eq!(
+        overlap.hyperlink_target(cells[1].hyperlink_id),
+        page.hyperlink_target(cells[1].hyperlink_id)
+    );
     assert!(terminal.projected_history_page(&original, 0, 2).is_err());
 
     terminal.resize(2, 8).unwrap();
     let wider = terminal.history_layout().unwrap();
     assert_eq!(wider.len(), 1);
     assert_eq!(wider.row_at(wide), 0);
-    let widened = terminal.projected_history_page(&wider, 0, 1).unwrap();
+    let widened = terminal
+        .projected_history_viewport_page(&wider, 0, 1)
+        .unwrap();
+    assert!(terminal
+        .projected_history_viewport_page(&narrow, 1, 1)
+        .is_err());
     assert_eq!(widened.text, page.text);
     assert_eq!(widened.row(0).unwrap().cells.len(), 8);
     terminal.feed(b"\x1b[?1049h").unwrap();
@@ -1104,7 +1120,16 @@ fn exceptionally_narrow_history_projection_retains_access_to_raw_rows() {
             .len(),
         256
     );
-    let tail = terminal.projected_history_page(&history, 299, 8).unwrap();
+    let previous = terminal
+        .projected_history_viewport_page(&history, 298, 8)
+        .unwrap();
+    let tail = terminal
+        .projected_history_viewport_page(&history, 299, 8)
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &previous.row(1).unwrap().cells,
+        &tail.row(0).unwrap().cells
+    ));
     assert_eq!(tail.text, "ésecond");
     assert_eq!((tail.row_count, tail.total_rows, tail.offset), (1, 300, 0));
     assert_eq!(tail.row(0).unwrap().cells[0].foreground, Color::Red);

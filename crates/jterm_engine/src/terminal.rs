@@ -6,7 +6,7 @@ use crate::{
     frame::{underline_color_at, CellFrame, Cursor, Limits, Row, Screen, Stamp, UnderlineRows},
     graphemes::{self, MAX_CLUSTER_BYTES},
     grid::{PrintCheckpoint, TerminalGrid, WrapCheckpoint},
-    history_reflow::HistoryLayout,
+    history_reflow::{history_rows_retained_bytes, HistoryCopyRow, HistoryLayout},
     hyperlink::{resolve_resource, HyperlinkPolicy, HyperlinkResources, HyperlinkTable},
     kitty_graphics::{self, inline::InlineGraphics},
     mouse::MouseInput,
@@ -124,16 +124,9 @@ pub struct HistoryPage {
     pub total_rows: usize,
     pub row_count: usize,
     pub text: String,
-    rows: Vec<HistoryCopyRow>,
+    rows: Arc<[HistoryCopyRow]>,
     paint_colors: Option<Arc<ColorState>>,
     hyperlinks: Option<HyperlinkResources>,
-}
-struct HistoryCopyRow {
-    // Physical addressing is unchanged. Only extraction may omit this slot.
-    row: Row,
-    underline_colors: Option<Arc<[UnderlineColorRun]>>,
-    annotations: Option<Arc<RowAnnotations>>,
-    synthetic_gap: Option<usize>,
 }
 impl HistoryPage {
     /// Current colors captured when this history page was requested.
@@ -145,19 +138,6 @@ impl HistoryPage {
     /// The image store accounts for referenced rasters.
     pub fn retained_delivery_bytes(&self) -> usize {
         let header = 2 * size_of::<usize>();
-        let rows = self.rows.capacity() * size_of::<HistoryCopyRow>();
-        let contents = self.rows.iter().map(|row| {
-            header
-                + row.row.cells.len() * size_of::<crate::TerminalCell>()
-                + row
-                    .underline_colors
-                    .as_ref()
-                    .map_or(0, |runs| header + std::mem::size_of_val(runs.as_ref()))
-                + row
-                    .annotations
-                    .as_ref()
-                    .map_or(0, |data| data.retained_bytes())
-        });
         let links = self.hyperlinks.as_ref().map_or(0, |table| {
             header
                 + std::mem::size_of_val(table.as_ref())
@@ -168,8 +148,7 @@ impl HistoryPage {
         });
         size_of::<Self>()
             + self.text.capacity()
-            + rows
-            + contents.sum::<usize>()
+            + history_rows_retained_bytes(&self.rows)
             + links
             + self
                 .paint_colors
@@ -1459,21 +1438,12 @@ impl Terminal {
         let offset = offset.min(total_rows);
         let end = total_rows - offset;
         let start = end.saturating_sub(limit);
-        let rows: Vec<HistoryCopyRow> = self
+        let rows = self
             .history
             .iter()
             .skip(start)
             .take(end - start)
-            .map(|line| HistoryCopyRow {
-                row: Row {
-                    cells: Arc::from(line.decompress()),
-                    wrapped: line.is_wrapped,
-                },
-                underline_colors: (!line.underline_color_runs().is_empty())
-                    .then(|| Arc::from(line.underline_color_runs())),
-                annotations: line.row_annotations().cloned(),
-                synthetic_gap: line.synthetic_margin_gap(),
-            })
+            .map(HistoryCopyRow::from_line)
             .collect();
         self.make_history_page(offset, total_rows, rows)
     }
@@ -1482,7 +1452,7 @@ impl Terminal {
         &self,
         offset: usize,
         total_rows: usize,
-        rows: Vec<HistoryCopyRow>,
+        rows: Arc<[HistoryCopyRow]>,
     ) -> Result<HistoryPage, String> {
         let mut page = HistoryPage {
             revision: self.revision,

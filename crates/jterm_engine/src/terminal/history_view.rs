@@ -4,7 +4,9 @@ use super::{
 };
 use crate::{
     grid::ScrollbackContent,
-    history_reflow::{source_columns, HistoryAnchor, ProjectedHistoryRow},
+    history_reflow::{
+        process_history_viewport_budget, source_columns, HistoryAnchor, ProjectedHistoryRow,
+    },
     TerminalCell,
 };
 use std::{collections::VecDeque, io, ops::Range};
@@ -394,6 +396,27 @@ impl Terminal {
         first: usize,
         limit: usize,
     ) -> Result<HistoryPage, String> {
+        self.read_projected_history_page(layout, first, limit, false)
+    }
+
+    /// Capture a scrolling viewport, sharing decoded rows with the previous
+    /// viewport from the same layout when the cache has room.
+    pub fn projected_history_viewport_page(
+        &self,
+        layout: &HistoryLayout,
+        first: usize,
+        limit: usize,
+    ) -> Result<HistoryPage, String> {
+        self.read_projected_history_page(layout, first, limit, true)
+    }
+
+    fn read_projected_history_page(
+        &self,
+        layout: &HistoryLayout,
+        first: usize,
+        limit: usize,
+        use_cache: bool,
+    ) -> Result<HistoryPage, String> {
         if limit == 0 || limit > MAX_ROWS || first > layout.len() {
             return Err("history page out of bounds".into());
         }
@@ -404,20 +427,18 @@ impl Terminal {
             return Err("history layout is stale".into());
         }
         let end = (first + limit).min(layout.len());
-        let offset = layout.len() - end;
-        let Some(projected) = &layout.projected else {
-            let count = end - first;
-            if count == 0 {
-                return self.make_history_page(offset, layout.len(), Vec::new());
-            }
-            return self.history_page(offset, count);
-        };
         let mut reader = HistoryReader::new(&self.history, layout);
-        let rows = projected[first..end]
-            .iter()
-            .map(|row| reader.read(*row))
-            .collect();
-        self.make_history_page(offset, layout.len(), rows)
+        let materialize = |index: usize| match &layout.projected {
+            Some(projected) => reader.read(projected[index]),
+            None => HistoryCopyRow::from_line(&self.history[index]),
+        };
+        let cache = use_cache.then(|| layout.viewport.lock().ok()).flatten();
+        let rows = if let Some(mut cache) = cache {
+            cache.read(first..end, materialize, process_history_viewport_budget())
+        } else {
+            (first..end).map(materialize).collect()
+        };
+        self.make_history_page(layout.len() - end, layout.len(), rows)
     }
 }
 
