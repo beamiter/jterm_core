@@ -1418,7 +1418,7 @@ pub enum UnderlineStyle {
 ///   bit 12: a printed space, distinct from erase padding
 ///   bits 12–13 together distinguish printed spaces, tab padding, and drawn
 ///   spaces that do not change history trimming
-///   bits 14-15: overline and conceal in legacy document projections
+///   bits 14-15: overline and conceal
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct StyleFlags(u16);
@@ -1561,7 +1561,9 @@ impl StyleFlags {
                     | INVERSE_BIT
                     | DIM_BIT
                     | BLINK_BIT
-                    | STRIKETHROUGH_BIT),
+                    | STRIKETHROUGH_BIT
+                    | OVERLINE_BIT
+                    | CONCEALED_BIT),
         )
     }
 
@@ -1822,6 +1824,11 @@ pub struct ScrollbackLine {
     raw_row_id: RawRowId,
 }
 
+const ARCHIVE_PRINTED_SPACES: u8 = 1 << 1;
+const ARCHIVE_EXTENDED_RENDITION: u8 = 1 << 3;
+const ARCHIVE_CELL_OVERLINE: u8 = 1 << 5;
+const ARCHIVE_CELL_CONCEALED: u8 = 1 << 6;
+
 #[derive(Clone, Debug)]
 enum CompressedLineData {
     Plain(String, u16),
@@ -1919,7 +1926,9 @@ impl ScrollbackLine {
     fn compress_with_style(cells: &[TerminalCell], is_wrapped: bool, preserve_blink: bool) -> Self {
         let needs_encoded_flags = |flags: StyleFlags| {
             !flags.is_default_style()
-                || flags.0 & (WIDE_BIT | WIDE_CONT_BIT | PRINTED_SPACE_BIT) != 0
+                || flags.0
+                    & (WIDE_BIT | WIDE_CONT_BIT | PRINTED_SPACE_BIT | OVERLINE_BIT | CONCEALED_BIT)
+                    != 0
         };
         let default_colors_and_no_link = |cell: &TerminalCell| {
             cell.foreground == Color::Default
@@ -1987,7 +1996,9 @@ impl ScrollbackLine {
             } else {
                 (
                     CompressedLineData::Encoded(Self::encode_cells(active, preserve_blink)),
-                    u8::from(row_flags.printed_space()) << 1,
+                    (u8::from(row_flags.printed_space()) * ARCHIVE_PRINTED_SPACES)
+                        | (u8::from(row_flags.0 & (OVERLINE_BIT | CONCEALED_BIT) != 0)
+                            * ARCHIVE_EXTENDED_RENDITION),
                 )
             };
         ScrollbackLine {
@@ -2099,7 +2110,7 @@ impl ScrollbackLine {
                 cells
             }
             ScrollbackContent::Encoded(data) => {
-                Self::decode_cells(data, self.cols as usize, self.archive_flags & 2 != 0)
+                Self::decode_cells(data, self.cols as usize, self.archive_flags)
             }
         };
         self.restore_drawn_spaces(&mut cells);
@@ -2141,12 +2152,7 @@ impl ScrollbackLine {
                 cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
             }
             ScrollbackContent::Encoded(data) => {
-                Self::decode_cells_into(
-                    data,
-                    self.cols as usize,
-                    self.archive_flags & 2 != 0,
-                    cells,
-                );
+                Self::decode_cells_into(data, self.cols as usize, self.archive_flags, cells);
             }
         }
         self.restore_drawn_spaces(cells);
@@ -2168,7 +2174,7 @@ impl ScrollbackLine {
                 }
             }
             ScrollbackContent::Encoded(data) => {
-                Self::visit_encoded_cells(data, self.columns(), self.archive_flags & 2 != 0, visit);
+                Self::visit_encoded_cells(data, self.columns(), self.archive_flags, visit);
             }
         }
     }
@@ -2176,13 +2182,13 @@ impl ScrollbackLine {
     fn visit_encoded_cells(
         data: &[u8],
         cols: usize,
-        printed_spaces: bool,
+        archive_flags: u8,
         mut visit: impl FnMut(usize, TerminalCell),
     ) {
         let mut column = 0;
         let mut pos = 0;
         while column < cols {
-            let Some((cell, run)) = Self::decode_run(data, &mut pos, printed_spaces) else {
+            let Some((cell, run)) = Self::decode_run(data, &mut pos, archive_flags) else {
                 break;
             };
             for _ in 0..run.min(cols - column) {
@@ -2259,15 +2265,11 @@ impl ScrollbackLine {
                     pos += ch_len;
                     let foreground = Self::decode_color(data, &mut pos);
                     let background = Self::decode_color(data, &mut pos);
-                    let mut flags = Self::decode_flags(*data.get(pos)?);
+                    let style = *data.get(pos)?;
                     pos += 1;
-                    let wide = *data.get(pos)?;
+                    let extra = *data.get(pos)?;
                     pos += 1;
-                    flags.set_wide(wide & 1 != 0);
-                    flags.set_wide_continuation(wide & 2 != 0);
-                    flags.set_blink(wide & 4 != 0);
-                    flags.set_printed_space((self.archive_flags & 2 != 0) && wide & 8 != 0);
-                    flags.set_tab_padding((self.archive_flags & 2 != 0) && wide & 16 != 0);
+                    let flags = Self::decode_cell_flags(style, extra, self.archive_flags);
                     let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
                         *data.get(pos)?,
                         *data.get(pos + 1)?,
@@ -2475,7 +2477,17 @@ impl ScrollbackLine {
                     0
                 }
                 | if cell.flags.printed_space() { 8 } else { 0 }
-                | if cell.flags.tab_padding() { 16 } else { 0 };
+                | if cell.flags.tab_padding() { 16 } else { 0 }
+                | if cell.flags.overline() {
+                    ARCHIVE_CELL_OVERLINE
+                } else {
+                    0
+                }
+                | if cell.flags.concealed() {
+                    ARCHIVE_CELL_CONCEALED
+                } else {
+                    0
+                };
             let [link_low, link_high] = cell.hyperlink_id.as_raw().to_le_bytes();
             record[end..end + 5].copy_from_slice(&[f, extra_flags, link_low, link_high, run]);
             buf.extend_from_slice(&record[..end + 5]);
@@ -2485,9 +2497,9 @@ impl ScrollbackLine {
         buf
     }
 
-    fn decode_cells(data: &[u8], cols: usize, printed_spaces: bool) -> Vec<TerminalCell> {
+    fn decode_cells(data: &[u8], cols: usize, archive_flags: u8) -> Vec<TerminalCell> {
         let mut cells = Vec::with_capacity(cols);
-        Self::decode_cells_into(data, cols, printed_spaces, &mut cells);
+        Self::decode_cells_into(data, cols, archive_flags, &mut cells);
         cells
     }
 
@@ -2495,12 +2507,12 @@ impl ScrollbackLine {
     fn decode_cells_into(
         data: &[u8],
         cols: usize,
-        printed_spaces: bool,
+        archive_flags: u8,
         cells: &mut Vec<TerminalCell>,
     ) {
         let mut pos = 0;
         while cells.len() < cols {
-            let Some((cell, run)) = Self::decode_run(data, &mut pos, printed_spaces) else {
+            let Some((cell, run)) = Self::decode_run(data, &mut pos, archive_flags) else {
                 break;
             };
             if run == 1 {
@@ -2536,10 +2548,26 @@ impl ScrollbackLine {
             .unwrap_or(' ')
     }
 
+    fn decode_cell_flags(style: u8, extra: u8, archive_flags: u8) -> StyleFlags {
+        let mut flags = Self::decode_flags(style);
+        flags.set_wide(extra & 1 != 0);
+        flags.set_wide_continuation(extra & 2 != 0);
+        flags.set_blink(extra & 4 != 0);
+        if archive_flags & ARCHIVE_PRINTED_SPACES != 0 {
+            flags.set_printed_space(extra & 8 != 0);
+            flags.set_tab_padding(extra & 16 != 0);
+        }
+        if archive_flags & ARCHIVE_EXTENDED_RENDITION != 0 {
+            flags.set_overline(extra & ARCHIVE_CELL_OVERLINE != 0);
+            flags.set_concealed(extra & ARCHIVE_CELL_CONCEALED != 0);
+        }
+        flags
+    }
+
     fn decode_run(
         data: &[u8],
         pos: &mut usize,
-        printed_spaces: bool,
+        archive_flags: u8,
     ) -> Option<(TerminalCell, usize)> {
         let ch_len = usize::from(*data.get(*pos)?);
         *pos += 1;
@@ -2563,15 +2591,11 @@ impl ScrollbackLine {
 
         let foreground = Self::decode_color(data, pos);
         let background = Self::decode_color(data, pos);
-        let mut flags = Self::decode_flags(data.get(*pos).copied().unwrap_or(0));
+        let style = data.get(*pos).copied().unwrap_or(0);
         *pos += 1;
         let extra_flags = data.get(*pos).copied().unwrap_or(0);
         *pos += 1;
-        flags.set_wide(extra_flags & 1 != 0);
-        flags.set_wide_continuation(extra_flags & 2 != 0);
-        flags.set_blink(extra_flags & 4 != 0);
-        flags.set_printed_space(printed_spaces && extra_flags & 8 != 0);
-        flags.set_tab_padding(printed_spaces && extra_flags & 16 != 0);
+        let flags = Self::decode_cell_flags(style, extra_flags, archive_flags);
         let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
             data.get(*pos).copied().unwrap_or(0),
             data.get(*pos + 1).copied().unwrap_or(0),
@@ -2645,9 +2669,8 @@ impl Default for TerminalCell {
 }
 
 impl TerminalCell {
-    /// Match the historical reflow rule exactly.  Foreground-only styling on
-    /// a space has never kept that space in a joined logical line; changing
-    /// that here would move existing search/selection coordinates.
+    /// Omit trailing padding from a joined logical line. An overline marks
+    /// even a space visibly, giving the projected row a cell to paint.
     #[inline]
     pub fn is_reflow_trimmable_blank(&self) -> bool {
         self.character == ' '
@@ -2655,6 +2678,7 @@ impl TerminalCell {
             && !self.flags.wide()
             && !self.flags.wide_continuation()
             && !self.flags.printed_space()
+            && !self.flags.overline()
             && self.hyperlink_id.is_none()
     }
 }
@@ -3194,19 +3218,16 @@ mod decoder_parity {
             for cols in [0, 1, 17, 254, 255, 256, 511, 601] {
                 for length in 0..=bytes.len() {
                     let mut streamed = Vec::new();
-                    ScrollbackLine::visit_encoded_cells(
-                        &bytes[..length],
-                        cols,
-                        false,
-                        |_, cell| streamed.push(cell),
-                    );
+                    ScrollbackLine::visit_encoded_cells(&bytes[..length], cols, 0, |_, cell| {
+                        streamed.push(cell)
+                    });
                     streamed.resize(cols, TerminalCell::default());
                     assert_eq!(
                         streamed,
                         ScrollbackLine::pinned_decode_cells(&bytes[..length], cols)
                     );
                     assert_eq!(
-                        ScrollbackLine::decode_cells(&bytes[..length], cols, false),
+                        ScrollbackLine::decode_cells(&bytes[..length], cols, 0),
                         streamed
                     );
                 }
@@ -3272,7 +3293,7 @@ mod decoder_parity {
             modified.extend_from_slice(&encoded[4..]);
             let expected = [TerminalCell { character, ..cell }; 2];
             assert_eq!(
-                ScrollbackLine::decode_cells(&modified, 2, false),
+                ScrollbackLine::decode_cells(&modified, 2, 0),
                 expected,
                 "{bytes:02x?}"
             );
@@ -3293,12 +3314,12 @@ mod decoder_parity {
                 }
                 for cols in [0, 1, 2, 17, 255, 512] {
                     let mut streamed = Vec::new();
-                    ScrollbackLine::visit_encoded_cells(&bytes, cols, false, |_, cell| {
+                    ScrollbackLine::visit_encoded_cells(&bytes, cols, 0, |_, cell| {
                         streamed.push(cell)
                     });
                     streamed.resize(cols, TerminalCell::default());
                     assert_eq!(streamed, ScrollbackLine::pinned_decode_cells(&bytes, cols));
-                    assert_eq!(ScrollbackLine::decode_cells(&bytes, cols, false), streamed);
+                    assert_eq!(ScrollbackLine::decode_cells(&bytes, cols, 0), streamed);
                 }
             }
         }

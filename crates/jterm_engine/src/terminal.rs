@@ -2487,7 +2487,7 @@ impl Terminal {
             .or_else(|| self.color_event(osc?))
             .map_or_else(
                 || {
-                    semantics::dispatch_local_with_underline(
+                    semantics::dispatch_hosted(
                         &mut self.vt.screen,
                         &mut self.vt.protocol,
                         &event,

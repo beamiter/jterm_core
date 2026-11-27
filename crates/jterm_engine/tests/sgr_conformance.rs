@@ -1,11 +1,57 @@
-//! Hand-written SGR state and DECRQSS wire expectations (Ember policy only).
+//! Hand-written SGR state and DECRQSS wire expectations.
 use jterm_engine::{
     parser::{Event, Parser, ParserLimits, ParserProfile, PendingKind},
     protocol_state::ProtocolState,
     screen::ScreenState,
     semantics::{dispatch_local, Dispatch, Effect},
+    terminal::Terminal,
     Color, TerminalGrid, UnderlineStyle,
 };
+
+#[test]
+fn hosted_conceal_and_overline_survive_archive_and_fragmented_sgr() {
+    let input = "\x1b[8;53;4;9m🧪\x1bP$qm\x1b\\\x1b[28m界\x1b[55mV\x1b[0mD\x1b[53m \x1b[0m";
+    for split in 0..=input.len() {
+        let mut terminal = Terminal::new(2, 12).unwrap();
+        terminal.enable_grapheme_clusters();
+        let (left, right) = input.as_bytes().split_at(split);
+        let mut replies = terminal.feed(left).unwrap();
+        replies.extend(terminal.feed(right).unwrap());
+        assert_eq!(replies, b"\x1bP1$r0;4;8;9;53m\x1b\\", "split {split}");
+        let frame = terminal.frame().unwrap();
+        let cells = &frame.rows()[0].cells;
+        assert_eq!(cells[0].character, '🧪');
+        assert!(cells[0].flags.concealed() && cells[0].flags.overline());
+        assert!(cells[1].flags.wide_continuation());
+        assert!(!cells[2].flags.concealed() && cells[2].flags.overline());
+        assert!(!cells[4].flags.overline() && cells[4].flags.strikethrough());
+        assert!(cells[5].flags.is_plain_text());
+        assert_eq!(cells[6].character, ' ');
+        assert!(cells[6].flags.overline());
+
+        terminal.feed(b"\r\nsecond\r\nthird").unwrap();
+        let physical = terminal.history_page(0, 1).unwrap();
+        assert_eq!(&physical.row(0).unwrap().cells[..7], &cells[..7]);
+        let layout = terminal.history_layout().unwrap();
+        let projected = terminal.projected_history_page(&layout, 0, 1).unwrap();
+        assert_eq!(projected.row(0).unwrap().cells.as_ref(), &cells[..7]);
+        assert_eq!(projected.text, "🧪界VD");
+        assert_eq!(terminal.unsupported_count(), 0);
+    }
+}
+
+#[test]
+fn hosted_sgr_stack_restores_both_attributes_and_reset_clears_them() {
+    let mut terminal = Terminal::new(2, 8).unwrap();
+    terminal
+        .feed(b"\x1b[8;53m\x1b[#{\x1b[28;55mA\x1b[#}B\x1b[mC")
+        .unwrap();
+    let frame = terminal.frame().unwrap();
+    let cells = &frame.rows()[0].cells;
+    assert!(cells[0].flags.is_plain_text());
+    assert!(cells[1].flags.concealed() && cells[1].flags.overline());
+    assert!(cells[2].flags.is_plain_text());
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rendition {

@@ -534,14 +534,24 @@ pub fn dispatch_local(
     protocol: &mut ProtocolState,
     event: &Event<'_>,
 ) -> Dispatch {
-    dispatch_local_with_underline(screen, protocol, event, None)
+    dispatch_local_with_rendition(screen, protocol, event, None, false)
 }
 
-pub(crate) fn dispatch_local_with_underline(
+pub(crate) fn dispatch_hosted(
+    screen: &mut ScreenState,
+    protocol: &mut ProtocolState,
+    event: &Event<'_>,
+    underline: Option<&mut UnderlinePen>,
+) -> Dispatch {
+    dispatch_local_with_rendition(screen, protocol, event, underline, true)
+}
+
+fn dispatch_local_with_rendition(
     screen: &mut ScreenState,
     protocol: &mut ProtocolState,
     event: &Event<'_>,
     mut underline: Option<&mut UnderlinePen>,
+    extended_sgr: bool,
 ) -> Dispatch {
     let mut effects = Effects::new();
     if let Event::Csi {
@@ -963,6 +973,7 @@ pub(crate) fn dispatch_local_with_underline(
                             colon_flags,
                             &mut effects,
                             underline.as_deref_mut().map(|pen| &mut pen.current),
+                            extended_sgr,
                         );
                     }
                 }
@@ -1314,7 +1325,7 @@ impl Rendition<'_> {
         None
     }
 
-    fn apply(&mut self, param: u16) -> Option<Color> {
+    fn apply(&mut self, param: u16, extended: bool) -> Option<Color> {
         match param {
             0 => self.reset(),
             1 => self.flags.set_bold(true),
@@ -1322,6 +1333,7 @@ impl Rendition<'_> {
             3 => self.flags.set_italic(true),
             5 => self.flags.set_blink(true),
             7 => self.flags.set_inverse(true),
+            8 | 28 if extended => self.flags.set_concealed(param == 8),
             9 => self.flags.set_strikethrough(true),
             21 => self.underline(2),
             22 => {
@@ -1337,6 +1349,7 @@ impl Rendition<'_> {
             39 => *self.foreground = Color::Default,
             40..=47 => return self.color(48, ANSI_COLORS[usize::from(param - 40)]),
             49 => *self.background = Color::Default,
+            53 | 55 if extended => self.flags.set_overline(param == 53),
             59 => self.set_underline_color(Color::Default),
             90..=97 => *self.foreground = ANSI_BRIGHT_COLORS[usize::from(param - 90)],
             100..=107 => return self.color(48, ANSI_BRIGHT_COLORS[usize::from(param - 100)]),
@@ -1352,6 +1365,7 @@ fn handle_sgr(
     colon_flags: &[bool],
     effects: &mut Effects,
     underline_color: Option<&mut Color>,
+    extended: bool,
 ) {
     // DECSCA is independent of Ember's visual rendition reset by SGR 0.
     let preserve_protection = screen.current_flags.protected();
@@ -1397,7 +1411,7 @@ fn handle_sgr(
                 next = last + 1;
                 rendition.color(param, color)
             }),
-            _ => rendition.apply(param),
+            _ => rendition.apply(param, extended),
         };
         if let Some(color) = background {
             effects.push(Effect::GlobalBackground(color));
@@ -1512,7 +1526,7 @@ pub fn frost_legacy_sgr(
             rendition.underline(1);
             return None;
         }
-        return rendition.apply(param);
+        return rendition.apply(param, false);
     }
     let groups = frost_sgr_groups(raw_params);
     let mut global_background = None;
@@ -1527,7 +1541,7 @@ pub fn frost_legacy_sgr(
             38 | 48 | 58 => {
                 frost_sgr_color(&groups, &mut i).and_then(|color| rendition.color(param, color))
             }
-            _ => rendition.apply(param),
+            _ => rendition.apply(param, false),
         };
         if changed.is_some() {
             global_background = changed;
@@ -1700,11 +1714,17 @@ fn decrqss_sgr_payload(screen: &ScreenState, underline_color: Option<Color>) -> 
     if screen.current_flags.inverse() {
         params.push("7".into());
     }
+    if screen.current_flags.concealed() {
+        params.push("8".into());
+    }
     if screen.current_flags.strikethrough() {
         params.push("9".into());
     }
     params.extend(sgr_color_params(screen.current_fg, true));
     params.extend(sgr_color_params(screen.current_bg, false));
+    if screen.current_flags.overline() {
+        params.push("53".into());
+    }
     match underline_color {
         Some(Color::Indexed(index)) => params.extend(["58".into(), "5".into(), index.to_string()]),
         Some(Color::Rgb(red, green, blue)) => params.extend([

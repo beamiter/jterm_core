@@ -9,6 +9,9 @@ pub const VERSION: u8 = 4;
 pub const IMAGE_VERSION: u8 = 5;
 pub const ROW_MOVE_VERSION: u8 = 6;
 pub const PACKED_VERSION: u8 = 7;
+pub const RENDITION_VERSION: u8 = 8;
+pub const STYLE_CONCEALED: u8 = 1 << 2;
+pub const STYLE_OVERLINE: u8 = 1 << 7;
 pub const MAX_IMAGES: usize = 32;
 pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_IMAGE_DIMENSION: u32 = 4096;
@@ -27,6 +30,7 @@ pub enum SnapshotFormat {
     ChannelImages,
     ChannelRowMoves,
     ChannelPacked,
+    ChannelRendition,
 }
 
 impl SnapshotFormat {
@@ -37,6 +41,7 @@ impl SnapshotFormat {
             Some(IMAGE_VERSION) => Ok(Self::ChannelImages),
             Some(ROW_MOVE_VERSION) => Ok(Self::ChannelRowMoves),
             Some(PACKED_VERSION) => Ok(Self::ChannelPacked),
+            Some(RENDITION_VERSION) => Ok(Self::ChannelRendition),
             Some(_) => Err("unsupported terminal snapshot version"),
         }
     }
@@ -48,23 +53,35 @@ impl SnapshotFormat {
             Self::ChannelImages => Some(IMAGE_VERSION),
             Self::ChannelRowMoves => Some(ROW_MOVE_VERSION),
             Self::ChannelPacked => Some(PACKED_VERSION),
+            Self::ChannelRendition => Some(RENDITION_VERSION),
         }
     }
 
     pub fn supports_images(self) -> bool {
         matches!(
             self,
-            Self::ChannelImages | Self::ChannelRowMoves | Self::ChannelPacked
+            Self::ChannelImages
+                | Self::ChannelRowMoves
+                | Self::ChannelPacked
+                | Self::ChannelRendition
         )
     }
 
     pub fn history_version(self) -> Option<u8> {
         match self {
-            Self::ChannelPacked => Some(PACKED_VERSION),
+            Self::ChannelPacked | Self::ChannelRendition => self.channel_version(),
             Self::ChannelImages | Self::ChannelRowMoves => Some(IMAGE_VERSION),
             _ => None,
         }
     }
+}
+
+pub fn supports_packed_rows(version: u8) -> bool {
+    matches!(version, PACKED_VERSION | RENDITION_VERSION)
+}
+
+pub fn supports_row_moves(version: u8) -> bool {
+    version == ROW_MOVE_VERSION || supports_packed_rows(version)
 }
 
 pub const MAX_PROJECTED_HISTORY_ROWS: usize = 65_536;
@@ -226,6 +243,7 @@ pub struct CellData<Text, Paint> {
     /// 0 = wide continuation, 1 = single cell, 2 = wide lead.
     pub width: u8,
     /// bold=1, italic=2, strike=8, dim=16, blink=32, protected=64.
+    /// Version 8 additionally uses bits 2 and 7 for conceal and overline.
     pub style: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underline: Option<Underline>,
@@ -247,7 +265,7 @@ pub struct RowData<C> {
     pub image_slices: Vec<ImageSlice>,
 }
 
-/// Version 7 can use a row-local style table and runs or the ordinary row data.
+/// Versions 7 and 8 can use a row-local style table and runs or ordinary rows.
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackedRow<Text, Paint> {
@@ -442,7 +460,12 @@ mod tests {
         assert_eq!(packed, SnapshotFormat::ChannelPacked);
         assert_eq!(packed.channel_version(), Some(PACKED_VERSION));
         assert!(packed.supports_images());
-        assert!(SnapshotFormat::negotiate(Some(PACKED_VERSION + 1)).is_err());
+        let rendition = SnapshotFormat::negotiate(Some(RENDITION_VERSION)).unwrap();
+        assert_eq!(rendition, SnapshotFormat::ChannelRendition);
+        assert_eq!(rendition.history_version(), Some(RENDITION_VERSION));
+        assert!(rendition.supports_images() && supports_packed_rows(RENDITION_VERSION));
+        assert!(supports_row_moves(RENDITION_VERSION));
+        assert!(SnapshotFormat::negotiate(Some(RENDITION_VERSION + 1)).is_err());
     }
 
     #[test]

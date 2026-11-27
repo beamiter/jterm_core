@@ -7,6 +7,12 @@ pub const MAX_ROWS: usize = 128;
 pub const MAX_COLUMNS: usize = 256;
 pub const MAX_CELLS: usize = 32_768;
 pub const MAX_HISTORY_SNAPSHOT_BYTES: usize = 131_200;
+pub const RENDITION_CONCEALED: u8 = 1;
+pub const RENDITION_OVERLINE: u8 = 2;
+
+fn default_rendition(value: &u8) -> bool {
+    *value == 0
+}
 
 /// The session ID names a PTY during its lifetime. The generation names
 /// the receiver's current attachment to that PTY.
@@ -90,6 +96,9 @@ pub struct WireCell {
     pub width: u8,
     /// bold=1, italic=2, underline=4, strike=8, dim=16.
     pub style: u8,
+    /// Optional display attributes for compatible version-3 readers.
+    #[serde(default, skip_serializing_if = "default_rendition")]
+    pub rendition: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

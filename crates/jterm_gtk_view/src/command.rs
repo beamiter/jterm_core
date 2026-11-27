@@ -14,7 +14,10 @@ use std::{
 
 use crate::{
     text_link::connect_links,
-    view::{faint_palette_color, link_for_offset, terminal_color, text_at_point, PresentedLink},
+    view::{
+        concealed_ink, faint_palette_color, link_for_offset, terminal_color, text_at_point,
+        PresentedLink,
+    },
     LinkActions, PlainLinkFinder,
 };
 
@@ -589,9 +592,9 @@ fn set_span_paint(
         foreground = Some(ink);
     }
     let hidden = style.flags.concealed() || (style.flags.blink() && blink_hidden);
-    let transparent = gdk::RGBA::new(0., 0., 0., 0.);
+    let concealed = concealed_ink();
     tag.set_foreground_rgba(if hidden {
-        Some(&transparent)
+        Some(&concealed)
     } else {
         foreground.as_ref()
     });
@@ -928,7 +931,7 @@ mod tests {
         let blinking = view.styles.tags.borrow()[0].0.clone();
         let concealed = view.styles.tags.borrow()[1].0.clone();
         assert_eq!(blinking.overline(), pango::Overline::Single);
-        assert_eq!(concealed.foreground_rgba().unwrap().alpha(), 0.0);
+        assert_eq!(concealed.foreground_rgba(), Some(concealed_ink()));
         assert!(view.styles.blink_timer.borrow().is_none());
         let window = gtk4::Window::builder().child(view.widget()).build();
         window.present();
@@ -939,7 +942,7 @@ mod tests {
             context.iteration(false);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(blinking.foreground_rgba().unwrap().alpha(), 0.0);
+        assert_eq!(blinking.foreground_rgba(), Some(concealed_ink()));
         assert_eq!(blinking.overline(), pango::Overline::None);
         assert!(select_finished_text_bytes(view.widget(), 0..2));
         let buffer = view.widget().buffer();

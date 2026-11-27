@@ -78,6 +78,9 @@ impl SgrStack {
         if has(9) {
             flags.set_strikethrough(saved.flags.strikethrough());
         }
+        if saved.mask == u32::MAX {
+            flags.set_overline(saved.flags.overline());
+        }
         if has(30) {
             screen.current_fg = saved.foreground;
         }

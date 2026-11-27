@@ -65,6 +65,8 @@ fn wire_row(row: &Row, cols: usize, colors: Option<&ColorState>) -> Vec<WireCell
                     | (u8::from(c.flags.underline() != jterm_engine::UnderlineStyle::None) << 2)
                     | (u8::from(c.flags.strikethrough()) << 3)
                     | (u8::from(c.flags.dim()) << 4),
+                rendition: (u8::from(c.flags.concealed()) * protocol::RENDITION_CONCEALED)
+                    | (u8::from(c.flags.overline()) * protocol::RENDITION_OVERLINE),
             }
         })
         .collect()

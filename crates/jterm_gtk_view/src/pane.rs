@@ -368,6 +368,7 @@ impl<P: Pty> EmbeddedTerminal<P> {
                     && !cell.flags.inverse()
                     && cell.flags.underline() == UnderlineStyle::None
                     && !cell.flags.strikethrough()
+                    && !cell.flags.overline()
                     && frame
                         .cluster_text(row, col)
                         .is_none_or(|cluster| cluster.chars().all(char::is_whitespace))

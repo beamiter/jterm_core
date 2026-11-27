@@ -313,6 +313,7 @@ struct Style {
     underline: pango::Underline,
     underline_color: Option<gdk::RGBA>,
     strikethrough: bool,
+    overline: bool,
 }
 
 struct StyleTag {
@@ -825,10 +826,14 @@ impl TerminalView {
                 background = cursor_color;
             }
         }
-        let underline = match cell.flags.underline() {
-            UnderlineStyle::Double => pango::Underline::Double,
-            UnderlineStyle::Curly => pango::Underline::Error,
-            UnderlineStyle::None => pango::Underline::None,
+        let concealed = cell.flags.concealed();
+        if concealed {
+            foreground = concealed_ink();
+        }
+        let underline = match (concealed, cell.flags.underline()) {
+            (true, _) | (_, UnderlineStyle::None) => pango::Underline::None,
+            (false, UnderlineStyle::Double) => pango::Underline::Double,
+            (false, UnderlineStyle::Curly) => pango::Underline::Error,
             _ => pango::Underline::Single,
         };
         Style {
@@ -840,7 +845,8 @@ impl TerminalView {
             underline_color: underline_color
                 .filter(|_| underline != pango::Underline::None)
                 .map(|color| theme.color(color, foreground)),
-            strikethrough: cell.flags.strikethrough(),
+            strikethrough: !concealed && cell.flags.strikethrough(),
+            overline: !concealed && cell.flags.overline(),
         }
     }
 }
@@ -1472,6 +1478,83 @@ fn capture_scrollback(
     .capture(terminal, false)
     .unwrap()
     .unwrap()
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires a GTK display"]
+fn conceal_keeps_terminal_text_and_suppresses_glyphs_and_decorations() {
+    gtk4::init().expect("GTK display");
+    let mut terminal = jterm_engine::terminal::Terminal::new(2, 12).unwrap();
+    let view = TerminalView::new(Theme {
+        font: pango::FontDescription::from_string("Monospace 12"),
+        foreground: gdk::RGBA::WHITE,
+        background: gdk::RGBA::BLACK,
+        palette: default_ansi_palette(),
+        cursor: None,
+    });
+    let window = gtk4::Window::builder()
+        .default_width(320)
+        .default_height(130)
+        .child(&view.widget)
+        .build();
+    window.present();
+    let context = glib::MainContext::default();
+    let present = |terminal: &jterm_engine::terminal::Terminal| {
+        view.present(
+            &terminal.frame().unwrap(),
+            terminal.live_margin_gaps(),
+            None,
+            None,
+        );
+        while context.iteration(false) {}
+    };
+    let ink_pixels = || {
+        let snapshot = gtk4::Snapshot::new();
+        window.snapshot_child(&view.widget, &snapshot);
+        let node = snapshot.to_node().expect("painted terminal");
+        let mut surface = gtk4::cairo::ImageSurface::create(
+            gtk4::cairo::Format::ARgb32,
+            window.width(),
+            window.height(),
+        )
+        .unwrap();
+        {
+            let context = gtk4::cairo::Context::new(&surface).unwrap();
+            node.draw(&context);
+        }
+        let pixels = surface.data().unwrap();
+        pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3].iter().any(|&value| value != 0))
+            .count()
+    };
+
+    terminal.feed(b"\x1b[?25l").unwrap();
+    present(&terminal);
+    let blank_ink = ink_pixels();
+    terminal.feed("\x1b[8;53;4;9mM🧪".as_bytes()).unwrap();
+    present(&terminal);
+    let buffer = view.widget.buffer();
+    let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+    assert!(text.starts_with("M🧪"));
+    assert!(buffer.start_iter().tags().iter().any(|tag| {
+        tag.foreground_rgba() == Some(concealed_ink())
+            && tag.underline() == pango::Underline::None
+            && tag.overline() == pango::Overline::None
+            && !tag.is_strikethrough()
+    }));
+    assert_eq!(ink_pixels(), blank_ink);
+
+    terminal.feed("\x1b[H\x1b[28mM🧪".as_bytes()).unwrap();
+    present(&terminal);
+    assert!(ink_pixels() > blank_ink);
+    assert!(buffer
+        .start_iter()
+        .tags()
+        .iter()
+        .any(|tag| tag.overline() == pango::Overline::Single));
+    window.close();
 }
 
 #[cfg(test)]
@@ -2235,6 +2318,12 @@ fn rgba(r: u8, g: u8, b: u8) -> gdk::RGBA {
     )
 }
 
+pub(crate) fn concealed_ink() -> gdk::RGBA {
+    // Pango reserves alpha zero to unset the override. Its smallest nonzero
+    // 16-bit alpha preserves shaping and rounds away in 8-bit output.
+    gdk::RGBA::new(0., 0., 0., 1. / f32::from(u16::MAX))
+}
+
 impl PaintTags {
     fn insert_run(
         &mut self,
@@ -2261,6 +2350,11 @@ impl PaintTags {
                 })
                 .underline(style.underline)
                 .strikethrough(style.strikethrough)
+                .overline(if style.overline {
+                    pango::Overline::Single
+                } else {
+                    pango::Overline::None
+                })
                 .build();
             if let Some(color) = style.underline_color {
                 tag.set_underline_rgba(Some(&color));
