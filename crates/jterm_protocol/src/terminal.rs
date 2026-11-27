@@ -38,6 +38,22 @@ pub enum CursorShape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RgbColor(pub u8, pub u8, pub u8);
 
+impl RgbColor {
+    pub(crate) const fn hex_bytes(self) -> [u8; 7] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let Self(red, green, blue) = self;
+        [
+            b'#',
+            HEX[(red >> 4) as usize],
+            HEX[(red & 15) as usize],
+            HEX[(green >> 4) as usize],
+            HEX[(green & 15) as usize],
+            HEX[(blue >> 4) as usize],
+            HEX[(blue & 15) as usize],
+        ]
+    }
+}
+
 impl From<(u8, u8, u8)> for RgbColor {
     fn from((red, green, blue): (u8, u8, u8)) -> Self {
         Self(red, green, blue)
@@ -46,8 +62,8 @@ impl From<(u8, u8, u8)> for RgbColor {
 
 impl Serialize for RgbColor {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let Self(red, green, blue) = *self;
-        serializer.collect_str(&format_args!("#{red:02x}{green:02x}{blue:02x}"))
+        let bytes = self.hex_bytes();
+        serializer.serialize_str(std::str::from_utf8(&bytes).expect("hex colors are ASCII"))
     }
 }
 

@@ -62,19 +62,23 @@ pub struct HistorySource {
     pub column: u16,
 }
 
+pub type HistoryRow = HistoryRowData<Cell>;
+
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HistoryRow {
+#[serde(rename = "HistoryRow", deny_unknown_fields)]
+pub struct HistoryRowData<C> {
     pub source: HistorySource,
-    pub paint: Row,
+    pub paint: RowData<C>,
     /// Physical cell boundaries in the selectable snapshot, measured in UTF-16.
     pub text_offsets: Vec<u32>,
 }
 
+pub type HistoryView = HistoryViewData<Cell>;
+
 /// An immutable primary-history window. It does not participate in live ACKs.
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HistoryView {
+#[serde(rename = "HistoryView", deny_unknown_fields)]
+pub struct HistoryViewData<C> {
     pub version: u8,
     pub owner: Attachment,
     pub revision: Counter,
@@ -84,7 +88,7 @@ pub struct HistoryView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_background: Option<RgbColor>,
     pub text: String,
-    pub rows: Vec<HistoryRow>,
+    pub rows: Vec<HistoryRowData<C>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hyperlinks: Vec<Hyperlink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -192,13 +196,16 @@ pub enum Underline {
     Dashed,
 }
 
+pub type Cell = CellData<String, String>;
+
+/// The Channel cell shape shared by decoded frames and compact encoders.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Cell {
+#[serde(rename = "Cell", deny_unknown_fields)]
+pub struct CellData<Text, Paint> {
     /// UTF-8 cluster in the lead cell. A continuation uses one ASCII blank.
-    pub text: String,
-    pub foreground: String,
-    pub background: String,
+    pub text: Text,
+    pub foreground: Paint,
+    pub background: Paint,
     /// 0 = wide continuation, 1 = single cell, 2 = wide lead.
     pub width: u8,
     /// bold=1, italic=2, strike=8, dim=16, blink=32, protected=64.
@@ -206,17 +213,19 @@ pub struct Cell {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underline: Option<Underline>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub underline_color: Option<String>,
+    pub underline_color: Option<Paint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink_id: Option<u16>,
 }
 
+pub type Row = RowData<Cell>;
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Row {
+#[serde(rename = "Row", deny_unknown_fields)]
+pub struct RowData<C> {
     /// The row continues on the next physical row.
     pub wrapped: bool,
-    pub cells: Vec<Cell>,
+    pub cells: Vec<C>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_slices: Vec<ImageSlice>,
 }
@@ -242,11 +251,13 @@ pub struct ImageResource {
     pub rgba: String,
 }
 
+pub type ChangedRow = ChangedRowData<Cell>;
+
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChangedRow {
+#[serde(rename = "ChangedRow", deny_unknown_fields)]
+pub struct ChangedRowData<C> {
     pub index: u16,
-    pub row: Row,
+    pub row: RowData<C>,
 }
 
 /// Copy consecutive rows from the acknowledged base into the new frame.
@@ -286,13 +297,20 @@ pub struct Hyperlink {
     pub target: String,
 }
 
+pub type Update = UpdateData<Cell>;
+
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Update {
+#[serde(
+    rename = "Update",
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum UpdateData<C> {
     Snapshot {
         stamp: Stamp,
         cols: u16,
-        rows: Vec<Row>,
+        rows: Vec<RowData<C>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hyperlinks: Vec<Hyperlink>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -301,7 +319,7 @@ pub enum Update {
     Delta {
         stamp: Stamp,
         base_revision: Counter,
-        rows: Vec<ChangedRow>,
+        rows: Vec<ChangedRowData<C>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         moves: Vec<RowMove>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -311,7 +329,7 @@ pub enum Update {
     },
 }
 
-impl Update {
+impl<C> UpdateData<C> {
     pub fn revision(&self) -> Counter {
         match self {
             Self::Snapshot { stamp, .. } | Self::Delta { stamp, .. } => stamp.revision,

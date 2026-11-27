@@ -1,8 +1,8 @@
 //! Paint-only projection for terminal wire version 3.
 
 use crate::terminal::{
-    self as protocol, ChangedRow, CursorShape as WireCursorShape, Update, WireCell, WireDelta,
-    WireFrame,
+    self as protocol, ChangedRow, CursorShape as WireCursorShape, RgbColor, Update, WireCell,
+    WireDelta, WireFrame,
 };
 use jterm_engine::{
     colors::{ColorState, Rgb, TerminalDefaultColors},
@@ -80,19 +80,6 @@ pub fn cell_width(flags: jterm_engine::StyleFlags, column: usize, cols: usize) -
     }
 }
 
-const fn rgb_hex(red: u8, green: u8, blue: u8) -> [u8; 7] {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    [
-        b'#',
-        HEX[(red >> 4) as usize],
-        HEX[(red & 15) as usize],
-        HEX[(green >> 4) as usize],
-        HEX[(green & 15) as usize],
-        HEX[(blue >> 4) as usize],
-        HEX[(blue & 15) as usize],
-    ]
-}
-
 /// The compatibility renderer's initial colors, also used for OSC resets.
 pub const WIRE_COLOR_DEFAULTS: TerminalDefaultColors = TerminalDefaultColors {
     foreground: (0xd9, 0xe5, 0xef),
@@ -125,13 +112,13 @@ const fn wire_palette() -> [[u8; 7]; 256] {
     while index < 256 {
         palette[index] = if index < 16 {
             let (red, green, blue) = WIRE_COLOR_DEFAULTS.ansi[index];
-            rgb_hex(red, green, blue)
+            RgbColor(red, green, blue).hex_bytes()
         } else if index >= 232 {
             let gray = (8 + (index - 232) * 10) as u8;
-            rgb_hex(gray, gray, gray)
+            RgbColor(gray, gray, gray).hex_bytes()
         } else {
             let cube = index - 16;
-            rgb_hex(levels[cube / 36], levels[(cube / 6) % 6], levels[cube % 6])
+            RgbColor(levels[cube / 36], levels[(cube / 6) % 6], levels[cube % 6]).hex_bytes()
         };
         index += 1;
     }
@@ -182,7 +169,7 @@ fn rgb_color((red, green, blue): Rgb) -> String {
             let mut pairs = [[0; 2]; 256];
             let mut index = 0;
             while index < 256 {
-                let hex = rgb_hex(index as u8, 0, 0);
+                let hex = RgbColor(index as u8, 0, 0).hex_bytes();
                 pairs[index] = [hex[1], hex[2]];
                 index += 1;
             }
@@ -209,6 +196,41 @@ fn rgb_color((red, green, blue): Rgb) -> String {
 
 pub fn color(c: Color, foreground: bool) -> String {
     paint_color(c, foreground, None)
+}
+
+/// Resolve the same captured paint as [`paint_color`] without allocating a CSS string.
+pub fn paint_rgb(c: Color, foreground: bool, colors: Option<&ColorState>) -> RgbColor {
+    match c {
+        Color::Rgb(red, green, blue) => RgbColor(red, green, blue),
+        Color::Default => {
+            let rgb = if foreground {
+                colors.map_or(
+                    WIRE_COLOR_DEFAULTS.foreground,
+                    ColorState::effective_foreground,
+                )
+            } else {
+                colors.map_or(
+                    WIRE_COLOR_DEFAULTS.background,
+                    ColorState::effective_background,
+                )
+            };
+            rgb.into()
+        }
+        _ => {
+            let index = palette_index(c);
+            let rgb = colors.map_or_else(
+                || {
+                    WIRE_COLOR_DEFAULTS
+                        .ansi
+                        .get(usize::from(index))
+                        .copied()
+                        .unwrap_or_else(|| ColorState::default_256_color(index))
+                },
+                |colors| colors.palette_color(index),
+            );
+            rgb.into()
+        }
+    }
 }
 
 /// Resolve paint using the palette captured with the frame or history page.
@@ -439,7 +461,10 @@ mod tests {
         ];
         for foreground in [false, true] {
             for entry in named.into_iter().chain((0..=255).map(Indexed)) {
-                assert_eq!(color(entry, foreground), original_color(entry, foreground));
+                let expected = original_color(entry, foreground);
+                assert_eq!(color(entry, foreground), expected);
+                let bytes = paint_rgb(entry, foreground, None).hex_bytes();
+                assert_eq!(std::str::from_utf8(&bytes).unwrap(), expected);
             }
             for red in 0..=255 {
                 for green in [0, 1, 15, 16, 127, 128, 254, 255] {
@@ -485,15 +510,27 @@ mod tests {
                         paint_color(Color::Default, foreground, Some(&state)),
                         rgb_color(expected)
                     );
+                    assert_eq!(
+                        paint_rgb(Color::Default, foreground, Some(&state)),
+                        expected.into()
+                    );
                     for index in 0..=255u8 {
                         assert_eq!(
                             paint_color(Color::Indexed(index), foreground, Some(&state)),
                             rgb_color(state.palette_color(index))
                         );
+                        assert_eq!(
+                            paint_rgb(Color::Indexed(index), foreground, Some(&state)),
+                            state.palette_color(index).into()
+                        );
                     }
                     assert_eq!(
                         paint_color(Color::Rgb(12, 34, 56), foreground, Some(&state)),
                         "#0c2238"
+                    );
+                    assert_eq!(
+                        paint_rgb(Color::Rgb(12, 34, 56), foreground, Some(&state)),
+                        RgbColor(12, 34, 56)
                     );
                 }
             }
