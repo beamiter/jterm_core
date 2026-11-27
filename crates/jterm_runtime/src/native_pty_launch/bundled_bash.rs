@@ -78,6 +78,7 @@ pub(crate) fn launch_bundled_bash(spec: BundledBash<'_>) -> Result<PendingPty, P
         },
         None,
         None,
+        (0, 0),
     )?;
     drop(script_file);
     drop(token_reader);

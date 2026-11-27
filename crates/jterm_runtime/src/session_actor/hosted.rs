@@ -2,7 +2,7 @@
 
 use super::{ReadOutcome, SessionActor, SessionTransport, SplitWriteLimits, WriteOutcome};
 use crate::{
-    pty_io::{resize_master, write_master},
+    pty_io::{resize_master_with_pixels, write_master},
     pty_reader::read_master,
     runtime_wake::WakeSink,
     supervised::SupervisedChild,
@@ -117,9 +117,19 @@ impl SessionTransport for HostedPty {
     }
 
     fn resize(&mut self, cols: usize, rows: usize) -> Result<(), String> {
+        self.resize_with_pixels(cols, rows, (0, 0))
+    }
+
+    fn resize_with_pixels(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        pixels: (u16, u16),
+    ) -> Result<(), String> {
         let cols = u16::try_from(cols).map_err(|_| "PTY column count out of bounds")?;
         let rows = u16::try_from(rows).map_err(|_| "PTY row count out of bounds")?;
-        resize_master(self.as_fd(), cols, rows).map_err(|error| error.to_string())
+        resize_master_with_pixels(self.as_fd(), cols, rows, pixels)
+            .map_err(|error| error.to_string())
     }
 
     fn is_alive(&mut self) -> bool {

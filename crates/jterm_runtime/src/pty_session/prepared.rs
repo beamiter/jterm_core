@@ -1,7 +1,7 @@
 //! A session whose native host prepared the child and PTY master.
 
 use crate::child_lifecycle::{observe_child_exit, ChildLifecycle, EscalationPolicy};
-use crate::pty_io::{resize_master, write_master};
+use crate::pty_io::{resize_master, resize_master_with_pixels, write_master};
 use crate::pty_reader::read_master;
 use crate::runtime_wake::WakeSink;
 use crate::session_actor::{
@@ -132,7 +132,17 @@ impl SessionTransport for Transport {
     }
 
     fn resize(&mut self, cols: usize, rows: usize) -> Result<(), String> {
-        resize_master(self.as_fd(), cols as u16, rows as u16).map_err(|error| error.to_string())
+        self.resize_with_pixels(cols, rows, (0, 0))
+    }
+
+    fn resize_with_pixels(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        pixels: (u16, u16),
+    ) -> Result<(), String> {
+        resize_master_with_pixels(self.as_fd(), cols as u16, rows as u16, pixels)
+            .map_err(|error| error.to_string())
     }
 
     fn is_alive(&mut self) -> bool {

@@ -82,12 +82,16 @@ pub fn write_native_master<'a>(
 
 /// Install a cell size after the caller applies its profile's dimension policy.
 pub fn resize_master(fd: BorrowedFd<'_>, cols: u16, rows: u16) -> io::Result<()> {
-    let size = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
+    resize_master_with_pixels(fd, cols, rows, (0, 0))
+}
+
+pub(crate) fn resize_master_with_pixels(
+    fd: BorrowedFd<'_>,
+    cols: u16,
+    rows: u16,
+    pixels: (u16, u16),
+) -> io::Result<()> {
+    let size = crate::native_pty_launch::pty_window_size(rows, cols, pixels);
     // SAFETY: the borrow pins the master and size is initialized.
     if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
         return Err(io::Error::last_os_error());

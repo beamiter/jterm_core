@@ -573,6 +573,23 @@ pub struct Session {
     write_error: Option<String>,
     dropped_reply_bytes: usize,
 }
+fn kernel_window_pixels(
+    rows: usize,
+    cols: usize,
+    pixels: jterm_engine::native_window_ops::NativeWindowPixels,
+) -> (u16, u16) {
+    let geometry = jterm_engine::native_window_ops::NativeWindowGeometry {
+        rows,
+        columns: cols,
+        pixels,
+    };
+    let (height, width) = geometry.text_pixels();
+    match (u16::try_from(width), u16::try_from(height)) {
+        (Ok(width), Ok(height)) => (width, height),
+        _ => (0, 0),
+    }
+}
+
 impl Session {
     pub fn spawn(rows: usize, cols: usize) -> Result<Self, String> {
         Self::spawn_with_epoch(rows, cols, NonZeroU64::MIN)
@@ -607,8 +624,22 @@ impl Session {
         epoch: NonZeroU64,
         integrated: bool,
     ) -> Result<Self, String> {
+        Self::spawn_family_with_window_pixels(rows, cols, epoch, integrated, None)
+    }
+
+    /// Start a family shell with the renderer's initial text-area measurement.
+    pub fn spawn_family_with_window_pixels(
+        rows: usize,
+        cols: usize,
+        epoch: NonZeroU64,
+        integrated: bool,
+        pixels: Option<jterm_engine::native_window_ops::NativeWindowPixels>,
+    ) -> Result<Self, String> {
         let mut terminal = Terminal::with_epoch(rows, cols, epoch)?;
         terminal.enable_device_answers();
+        if let Some(pixels) = pixels {
+            terminal.set_window_pixels(rows, cols, pixels)?;
+        }
         let mut environment = crate::terminal_profile::environment().to_vec();
         let program = if integrated {
             terminal.observe_command_blocks();
@@ -738,7 +769,10 @@ impl Session {
     ) -> Result<Self, String> {
         require_waitable_sigchld().map_err(|error| error.to_string())?;
         let lease = reaper::global()?.reserve()?;
-        let pending = launch_standalone_pty(spec, forwarded).map_err(launch_error)?;
+        let pixels = terminal.window_geometry().map_or((0, 0), |geometry| {
+            kernel_window_pixels(geometry.rows, geometry.columns, geometry.pixels)
+        });
+        let pending = launch_standalone_pty(spec, forwarded, pixels).map_err(launch_error)?;
         Self::register_program(pending, lease, terminal)
     }
 
@@ -878,7 +912,12 @@ impl Session {
         if self.closed {
             return Err("session is closed".into());
         }
-        self.terminal.engine.set_window_pixels(rows, cols, pixels)
+        let actor = &self.io.as_ref().ok_or("master closed")?.actor;
+        self.terminal
+            .engine
+            .set_window_pixels_with(rows, cols, pixels, || {
+                actor.resize_with_pixels(cols, rows, kernel_window_pixels(rows, cols, pixels))
+            })
     }
 
     pub fn enable_window_updates(&mut self) {
@@ -1388,9 +1427,17 @@ impl Session {
             return Err("session is closed".into());
         }
         let actor = &self.io.as_ref().ok_or("master closed")?.actor;
+        let kernel_pixels = pixels
+            .or_else(|| {
+                let current = self.terminal.engine.window_geometry()?;
+                (current.rows == rows && current.columns == cols).then_some(current.pixels)
+            })
+            .map_or((0, 0), |pixels| kernel_window_pixels(rows, cols, pixels));
         self.terminal
             .engine
-            .resize_with_window_pixels(rows, cols, pixels, || actor.resize(cols, rows))
+            .resize_with_window_pixels(rows, cols, pixels, || {
+                actor.resize_with_pixels(cols, rows, kernel_pixels)
+            })
     }
     /// Drop PTY handles and transfer owned child to the fixed-capacity reaper.
     /// Success means accepted for asynchronous cleanup, not confirmed exit.
@@ -2429,6 +2476,63 @@ mod tests {
         s.close().unwrap();
         await_cleanup(&s);
     }
+    #[test]
+    fn real_kernel_pixels_follow_measurements_and_grid_resizes() {
+        use jterm_engine::native_window_ops::NativeWindowPixels;
+
+        let initial = NativeWindowPixels::Viewport {
+            width: 504,
+            height: 384,
+        };
+        let mut session =
+            Session::spawn_family_with_window_pixels(8, 21, NonZeroU64::MIN, false, Some(initial))
+                .unwrap();
+        let kernel = |session: &Session| {
+            let size = session.kernel_size();
+            (size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel)
+        };
+        assert_eq!(kernel(&session), (8, 21, 504, 384));
+        session
+            .set_window_pixels(
+                8,
+                21,
+                NativeWindowPixels::Viewport {
+                    width: 252,
+                    height: 192,
+                },
+            )
+            .unwrap();
+        assert_eq!(kernel(&session), (8, 21, 252, 192));
+        session.resize(8, 21).unwrap();
+        assert_eq!(kernel(&session), (8, 21, 252, 192));
+
+        session
+            .resize_with_window_pixels(
+                11,
+                95,
+                Some(NativeWindowPixels::Cell {
+                    width: 24,
+                    height: 48,
+                }),
+            )
+            .unwrap();
+        assert_eq!(kernel(&session), (11, 95, 2280, 528));
+        assert!(session
+            .set_window_pixels(
+                8,
+                21,
+                NativeWindowPixels::Cell {
+                    width: 12,
+                    height: 24,
+                }
+            )
+            .is_err());
+        assert_eq!(kernel(&session), (11, 95, 2280, 528));
+        session.resize(12, 96).unwrap();
+        assert_eq!(kernel(&session), (12, 96, 0, 0));
+        session.close().unwrap();
+    }
+
     #[test]
     fn real_pty_resize_limits_match_kernel_and_reject_without_mutation() {
         let mut s = Session::spawn(4, 8).unwrap();

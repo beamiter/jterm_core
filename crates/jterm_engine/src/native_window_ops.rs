@@ -29,7 +29,8 @@ pub struct NativeWindowGeometry {
 }
 
 impl NativeWindowGeometry {
-    fn text_pixels(&self) -> (u32, u32) {
+    /// Text-area pixel height and width, in window-query reply order.
+    pub fn text_pixels(&self) -> (u32, u32) {
         match self.pixels {
             NativeWindowPixels::Cell { width, height } => (
                 height.saturating_mul(self.rows as u32),

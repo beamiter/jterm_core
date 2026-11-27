@@ -166,7 +166,7 @@ impl Drop for PendingChild {
 }
 
 pub fn launch_pty(spec: PtyLaunch<'_>) -> Result<PendingPty, PtyLaunchError> {
-    launch_with_inherited_fds(spec, ChildDescriptors::default(), None, None)
+    launch_with_inherited_fds(spec, ChildDescriptors::default(), None, None, (0, 0))
 }
 
 /// Preserve the standalone runtime's isolated descriptor and signal policy.
@@ -174,6 +174,7 @@ pub fn launch_pty(spec: PtyLaunch<'_>) -> Result<PendingPty, PtyLaunchError> {
 pub(crate) fn launch_standalone_pty(
     spec: PtyLaunch<'_>,
     forwarded: Option<ForwardedFd<'_>>,
+    pixels: (u16, u16),
 ) -> Result<PendingPty, PtyLaunchError> {
     // Preserve execvp's executable-text fallback in the same child.
     let executable = spec.executable.to_owned();
@@ -185,6 +186,7 @@ pub(crate) fn launch_standalone_pty(
         },
         Some(descriptor_ceiling()?),
         Some(std::slice::from_ref(&executable)),
+        pixels,
     )
 }
 
@@ -193,6 +195,7 @@ fn launch_with_inherited_fds(
     descriptors: ChildDescriptors<'_>,
     isolated_fd_ceiling: Option<RawFd>,
     search: Option<&[CString]>,
+    pixels: (u16, u16),
 ) -> Result<PendingPty, PtyLaunchError> {
     if spec.argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "PTY argv is empty").into());
@@ -222,7 +225,7 @@ fn launch_with_inherited_fds(
     // Serializing through close also keeps concurrent launches from inheriting
     // one another's status writers before they are closed in the parent.
     let registration = lock_registration();
-    let (master, slave) = pty_pair(spec.rows, spec.columns)?;
+    let (master, slave) = pty_pair(pty_window_size(spec.rows, spec.columns, pixels))?;
     let (status_reader, mut status_writer) = startup_status::channel()?;
     if forwarded.is_some_and(|fd| fd.child_fd == status_writer.as_raw_fd()) {
         // Keep the CLOEXEC startup pipe private even when its original slot
@@ -353,17 +356,17 @@ fn exec_pointers(entries: &[CString]) -> Vec<*const libc::c_char> {
         .collect()
 }
 
-fn initial_geometry(rows: u16, columns: u16) -> libc::winsize {
+pub(crate) fn pty_window_size(rows: u16, columns: u16, pixels: (u16, u16)) -> libc::winsize {
     libc::winsize {
         ws_row: rows,
         ws_col: columns,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
+        ws_xpixel: pixels.0,
+        ws_ypixel: pixels.1,
     }
 }
 
 #[cfg(target_os = "linux")]
-fn pty_pair(rows: u16, columns: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+fn pty_pair(winsize: libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
     let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
     // SAFETY: successful open calls return fresh descriptors for this process.
     let master = unsafe { libc::posix_openpt(flags | libc::O_NONBLOCK) };
@@ -386,7 +389,6 @@ fn pty_pair(rows: u16, columns: u16) -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(io::Error::last_os_error());
     }
     let slave = move_above_stdio(unsafe { OwnedFd::from_raw_fd(slave) })?;
-    let winsize = initial_geometry(rows, columns);
     if unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &winsize) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -394,10 +396,9 @@ fn pty_pair(rows: u16, columns: u16) -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pty_pair(rows: u16, columns: u16) -> io::Result<(OwnedFd, OwnedFd)> {
+fn pty_pair(winsize: libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
     let mut master = -1;
     let mut slave = -1;
-    let winsize = initial_geometry(rows, columns);
     // SAFETY: openpty receives writable descriptor storage and a valid winsize.
     if unsafe {
         libc::openpty(

@@ -46,9 +46,9 @@ fn shared_master_write_and_resize_reach_the_real_pty_slave() {
     };
     use std::io::Read;
 
-    let (master, slave) = pty_pair(24, 80).unwrap();
+    let (master, slave) = pty_pair(pty_window_size(24, 80, (0, 0))).unwrap();
     resize_master(master.as_fd(), 101, 37).unwrap();
-    let mut size = initial_geometry(0, 0);
+    let mut size = pty_window_size(0, 0, (0, 0));
     // SAFETY: the slave is owned and size is writable.
     assert_eq!(
         unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
@@ -75,6 +75,73 @@ fn shared_master_write_and_resize_reach_the_real_pty_slave() {
     assert_eq!(&received[..count], input);
 }
 
+#[cfg(all(target_os = "linux", feature = "linux-pty"))]
+#[test]
+fn child_reads_pixels_at_its_first_kernel_size_query() {
+    use std::os::unix::ffi::OsStrExt;
+
+    if std::env::var_os("JTERM_TEST_INITIAL_PTY_PIXELS").is_some() {
+        let mut size = pty_window_size(0, 0, (0, 0));
+        // SAFETY: launch attaches the slave to stdin and size is writable.
+        assert_eq!(
+            unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut size) },
+            0
+        );
+        assert_eq!(
+            (size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel),
+            (8, 21, 504, 384)
+        );
+        return;
+    }
+    let executable = std::env::current_exe().unwrap();
+    let executable = CString::new(executable.as_os_str().as_bytes()).unwrap();
+    let argv = [
+        executable.clone(),
+        c"--exact".to_owned(),
+        c"native_pty_launch::tests::child_reads_pixels_at_its_first_kernel_size_query".to_owned(),
+    ];
+    let pending = launch_standalone_pty(
+        PtyLaunch {
+            executable: &executable,
+            argv: &argv,
+            environment: &[c"JTERM_TEST_INITIAL_PTY_PIXELS=1".to_owned()],
+            directory: WorkingDirectory::Inherit,
+            rows: 8,
+            columns: 21,
+            parent_death_signal: true,
+        },
+        None,
+        (504, 384),
+    )
+    .unwrap();
+    let (master, pid) = pending
+        .adopt(|master, pid| Ok::<_, Infallible>((master, pid)))
+        .unwrap();
+    let mut cleanup = PendingChild(Some(pid));
+    let started = Instant::now();
+    let mut output = Vec::new();
+    let mut buffer = [0; 256];
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match read_master(master.as_fd(), &mut buffer).unwrap() {
+            ReadOutcome::Data(count) => output.extend_from_slice(&buffer[..count]),
+            ReadOutcome::WouldBlock => std::thread::sleep(Duration::from_millis(1)),
+            ReadOutcome::Eof | ReadOutcome::Hangup => break,
+        }
+    }
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("1 passed"), "{output}");
+    assert_eq!(
+        observe_child_exit(pid, false).unwrap(),
+        Some(ChildExitOutcome::Exited(0)),
+        "{output}"
+    );
+    let mut status = 0;
+    // SAFETY: adoption gave this test the exact wait for pid.
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    cleanup.0 = None;
+}
+
 #[test]
 fn launches_controlling_tty_with_exact_settings_and_preserves_exit_127() {
     let cwd = File::open("/tmp").unwrap();
@@ -89,7 +156,7 @@ fn launches_controlling_tty_with_exact_settings_and_preserves_exit_127() {
         .unwrap();
     let mut cleanup = PendingChild(Some(pid));
 
-    let mut size = initial_geometry(0, 0);
+    let mut size = pty_window_size(0, 0, (0, 0));
     // SAFETY: the master is owned and size is writable.
     assert_eq!(
         unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
@@ -203,7 +270,7 @@ fn real_launch_closes_the_registered_flock_even_without_cloexec() {
 #[test]
 fn partial_status_failure_and_timeout_both_reap_the_startup_child() {
     for pause in [false, true] {
-        let (master, slave) = pty_pair(24, 80).unwrap();
+        let (master, slave) = pty_pair(pty_window_size(24, 80, (0, 0))).unwrap();
         let (reader, writer) = startup_status::channel().unwrap();
         let status_fd = writer.as_raw_fd();
         // SAFETY: the child uses only raw syscalls after fork.

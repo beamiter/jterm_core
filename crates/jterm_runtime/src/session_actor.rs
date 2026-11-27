@@ -57,6 +57,17 @@ pub trait SessionTransport: AsFd + Send + 'static {
     fn read(&mut self, buffer: &mut [u8]) -> Result<ReadOutcome, String>;
     fn write(&mut self, bytes: &[u8]) -> Result<WriteOutcome, String>;
     fn resize(&mut self, cols: usize, rows: usize) -> Result<(), String>;
+    fn resize_with_pixels(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        pixels: (u16, u16),
+    ) -> Result<(), String> {
+        if pixels != (0, 0) {
+            return Err("transport does not report PTY pixel geometry".into());
+        }
+        self.resize(cols, rows)
+    }
     fn is_alive(&mut self) -> bool;
     fn try_reap(&mut self) -> Option<i32>;
     fn wait_timeout(&mut self, timeout_ms: u64) -> Result<i32, String>;
@@ -1560,11 +1571,20 @@ impl<T: SessionTransport, Output> SessionActor<T, Output> {
     }
 
     pub fn resize(&self, cols: usize, rows: usize) -> std::result::Result<(), String> {
+        self.resize_with_pixels(cols, rows, (0, 0))
+    }
+
+    pub(crate) fn resize_with_pixels(
+        &self,
+        cols: usize,
+        rows: usize,
+        pixels: (u16, u16),
+    ) -> Result<(), String> {
         let mut pty = self.pty.lock();
         if self.shutdown.load(Ordering::Acquire) {
             return Err("PTY session has stopped".into());
         }
-        pty.resize(cols, rows)
+        pty.resize_with_pixels(cols, rows, pixels)
             .map_err(|e| format!("Resize error: {}", e))
     }
 

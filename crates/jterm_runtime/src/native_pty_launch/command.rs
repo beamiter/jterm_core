@@ -104,6 +104,7 @@ pub fn launch_hosted_pty(
         },
         Some(descriptor_ceiling()?),
         Some(&candidates),
+        (0, 0),
     )?;
     pending.adopt(|master, pid| {
         let child = SupervisedChild::adopt_pty(pid).map_err(PtyLaunchError::ExecConfirmed)?;

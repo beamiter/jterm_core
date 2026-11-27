@@ -841,23 +841,38 @@ impl Terminal {
         cols: usize,
         pixels: NativeWindowPixels,
     ) -> Result<(), String> {
+        self.set_window_pixels_with(rows, cols, pixels, || Ok(()))
+    }
+
+    /// Publish a measurement after the host applies it to the current PTY.
+    pub fn set_window_pixels_with(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        pixels: NativeWindowPixels,
+        update_pty: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
         let grid = &self.vt.screen.grid;
         if (rows, cols) != (grid.rows(), grid.cols()) {
             return Err("pixel measurement is for a different grid".into());
         }
         pixels.validate()?;
+        update_pty()?;
         self.window_pixels = Some(pixels);
         Ok(())
     }
 
-    pub(crate) fn measured_cell_pixels(&self) -> Option<(u16, u16)> {
+    pub fn window_geometry(&self) -> Option<NativeWindowGeometry> {
         let grid = &self.vt.screen.grid;
-        let geometry = NativeWindowGeometry {
+        Some(NativeWindowGeometry {
             rows: grid.rows(),
             columns: grid.cols(),
             pixels: self.window_pixels?,
-        };
-        let (height, width) = geometry.cell_pixels();
+        })
+    }
+
+    pub(crate) fn measured_cell_pixels(&self) -> Option<(u16, u16)> {
+        let (height, width) = self.window_geometry()?.cell_pixels();
         let width = u16::try_from(width).ok()?;
         let height = u16::try_from(height).ok()?;
         (width != 0 && height != 0).then_some((width, height))
