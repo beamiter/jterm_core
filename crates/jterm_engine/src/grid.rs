@@ -102,13 +102,18 @@ impl GridCells {
         let end = self.storage.len();
         let next_end = end + dropped_cells;
         if next_end > self.storage.capacity() {
-            // Reserve spare cells lazily for scrolling grids.
+            // Start with a small reserve and grow it once scrolling fills it.
             const MAX_SPARE_BYTES: usize = 64 * 1024;
             let visible = end - self.start;
-            let spare = (visible / 4).min(MAX_SPARE_BYTES / std::mem::size_of::<TerminalCell>());
-            if self.start != 0
-                || dropped_cells > spare
-                || self.storage.try_reserve_exact(spare).is_err()
+            let headroom = if self.start == 0 {
+                visible / 4
+            } else {
+                visible
+            };
+            let reserved_end =
+                visible + headroom.min(MAX_SPARE_BYTES / std::mem::size_of::<TerminalCell>());
+            if next_end > reserved_end
+                || self.storage.try_reserve_exact(reserved_end - end).is_err()
             {
                 // Reclaim the prefix and preserve the surviving cells in one copy.
                 self.storage.copy_within(self.start + dropped_cells..end, 0);
@@ -1917,7 +1922,7 @@ fn scroll_storage_preserves_flat_access_through_compaction_and_resize() {
         ..TerminalCell::default()
     };
     let mut reclaimed = false;
-    for step in 0..rows {
+    for step in 0..rows * 2 {
         let before = grid.cells.start;
         grid.scroll_up_by(1, blank);
         reclaimed |= grid.cells.start < before;
@@ -1955,6 +1960,30 @@ fn scroll_storage_preserves_flat_access_through_compaction_and_resize() {
     assert_eq!(grid.cells.start, 0);
     assert_eq!(&grid[0], &expected[..cols - 1]);
     assert_eq!(&grid[1], &expected[cols..2 * cols - 1]);
+}
+
+#[cfg(test)]
+#[test]
+fn full_screen_scroll_storage_grows_after_the_initial_reserve_fills() {
+    let (rows, cols) = (40, 120);
+    let visible = rows * cols;
+    let blank = TerminalCell::default();
+    let mut grid = TerminalGrid::new(rows, cols);
+
+    assert_eq!(grid.cells.storage.capacity(), visible);
+    grid.scroll_up_by(rows / 4 + 1, blank);
+    assert_eq!(grid.cells.storage.capacity(), visible);
+
+    for _ in 0..rows / 4 {
+        grid.scroll_up_by(1, blank);
+        assert_eq!(grid.cells.storage.capacity(), visible + visible / 4);
+    }
+
+    let capped_spare = visible.min(64 * 1024 / std::mem::size_of::<TerminalCell>());
+    for _ in 0..rows * 2 {
+        grid.scroll_up_by(1, blank);
+        assert_eq!(grid.cells.storage.capacity(), visible + capped_spare);
+    }
 }
 
 #[derive(Clone, Debug)]
