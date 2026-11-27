@@ -556,7 +556,7 @@ impl TerminalGrid {
         let track_spaces = self.track_printed_spaces;
         debug_assert!(bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)));
         let target = self.narrow_overwrite_cells(row, col..col + bytes.len(), blank, policy);
-        Self::write_ascii_cells(target, bytes, rendition, track_spaces, char::from);
+        Self::write_ascii_cells::<false>(target, bytes, rendition, track_spaces, char::from);
     }
 
     /// Write printable bytes mapped to single-column graphics. The supported
@@ -577,7 +577,7 @@ impl TerminalGrid {
             blank,
             AsciiOverwritePolicy::SharedScreen,
         );
-        Self::write_ascii_cells(target, bytes, rendition, track_spaces, map);
+        Self::write_ascii_cells::<true>(target, bytes, rendition, track_spaces, map);
     }
 
     #[inline]
@@ -608,7 +608,7 @@ impl TerminalGrid {
     }
 
     #[inline]
-    fn write_ascii_cells(
+    fn write_ascii_cells<const MAPPED: bool>(
         target: &mut [TerminalCell],
         bytes: &[u8],
         mut rendition: TerminalCell,
@@ -622,20 +622,41 @@ impl TerminalGrid {
             space.character = ' ';
             if track_spaces {
                 space.flags.set_printed_space(true);
-                rendition.flags.set_printed_space(false);
             } else if !space.flags.printed_space() {
                 space.flags.mark_untracked_drawn_space();
             }
-            if bytes.iter().all(|&byte| byte == b' ') {
-                target.fill(space);
-                return;
+            if bytes.first() == Some(&b' ') {
+                let mut chunks = bytes.chunks_exact(8);
+                if chunks.by_ref().all(|chunk| chunk == b"        ")
+                    && chunks.remainder().iter().all(|&byte| byte == b' ')
+                {
+                    target.fill(space);
+                    return;
+                }
             }
-            for (cell, &byte) in target.iter_mut().zip(bytes) {
-                if byte == b' ' {
-                    *cell = space;
-                } else {
-                    rendition.character = map(byte);
-                    *cell = rendition;
+            if track_spaces {
+                rendition.flags.set_printed_space(false);
+            }
+            if MAPPED {
+                for (cell, &byte) in target.iter_mut().zip(bytes) {
+                    if byte == b' ' {
+                        *cell = space;
+                    } else {
+                        rendition.character = map(byte);
+                        *cell = rendition;
+                    }
+                }
+            } else {
+                // Apply the space flags in the same write as the character.
+                let space_flags = rendition.flags.0 ^ space.flags.0;
+                for (cell, &byte) in target.iter_mut().zip(bytes) {
+                    *cell = TerminalCell {
+                        character: map(byte),
+                        flags: StyleFlags(
+                            rendition.flags.0 ^ (space_flags * u16::from(byte == b' ')),
+                        ),
+                        ..rendition
+                    };
                 }
             }
         } else {
@@ -3055,25 +3076,60 @@ fn ascii_overwrite_changes_only_the_expected_space_and_width_flags() {
         AsciiOverwritePolicy::SharedScreen,
         AsciiOverwritePolicy::FrostLegacy,
     ] {
-        for tracked in [false, true] {
-            let mut grid = TerminalGrid::new(1, 4);
+        for (tracked, printed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let input = b"         a b";
+            let mut grid = TerminalGrid::new(1, input.len());
             grid.track_printed_spaces = tracked;
             let mut style = TerminalCell::default();
             style.flags.set_bold(true);
             style.flags.set_protected(true);
             style.flags.set_wide(true);
             style.flags.set_wide_continuation(true);
-            style.flags.set_printed_space(true);
-            let input = b" a b";
+            style.flags.set_printed_space(printed);
             grid.overwrite_ascii(0, 0, input, style, TerminalCell::default(), policy);
             for (cell, byte) in grid[0].iter().zip(input.iter().copied()) {
                 assert_eq!(cell.character, char::from(byte));
-                assert_eq!(cell.flags.printed_space(), !tracked || byte == b' ');
+                assert_eq!(
+                    cell.flags.printed_space(),
+                    if tracked { byte == b' ' } else { printed }
+                );
+                assert_eq!(
+                    cell.flags.untracked_drawn_space(),
+                    !tracked && !printed && byte == b' '
+                );
                 assert!(cell.flags.bold() && cell.flags.protected());
                 assert!(!cell.flags.wide() && !cell.flags.wide_continuation());
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn mapped_ascii_keeps_literal_spaces_out_of_the_character_map() {
+    let mut grid = TerminalGrid::new(1, 3);
+    grid.track_printed_spaces = true;
+    grid.overwrite_mapped_ascii(
+        0,
+        0,
+        b"x x",
+        TerminalCell::default(),
+        TerminalCell::default(),
+        |byte| {
+            assert_eq!(byte, b'x');
+            '│'
+        },
+    );
+    assert_eq!(
+        grid[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>(),
+        "│ │"
+    );
+    assert!(!grid[0][0].flags.printed_space());
+    assert!(grid[0][1].flags.printed_space());
+    assert!(!grid[0][2].flags.printed_space());
 }
 
 #[cfg(test)]
