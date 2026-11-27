@@ -858,8 +858,16 @@ impl Terminal {
         }
         pixels.validate()?;
         update_pty()?;
-        self.window_pixels = Some(pixels);
+        self.commit_window_pixels(pixels);
         Ok(())
+    }
+
+    fn commit_window_pixels(&mut self, pixels: NativeWindowPixels) {
+        let previous = self.mouse_pixel_extent();
+        self.window_pixels = Some(pixels);
+        if self.mouse_pixel_extent() != previous {
+            self.retire_mouse_reports();
+        }
     }
 
     pub fn window_geometry(&self) -> Option<NativeWindowGeometry> {
@@ -1159,6 +1167,21 @@ impl Terminal {
         self.vt.protocol.modes().mouse_report_profile()
     }
 
+    /// Let a frontend opt in before its first feed if it reports physical pixels.
+    pub fn enable_pixel_mouse(&mut self) {
+        self.vt.protocol.modes_mut().enable_pixel_mouse();
+    }
+
+    /// Physical width and height of the text area for the active pixel mode.
+    pub fn mouse_pixel_extent(&self) -> Option<(u32, u32)> {
+        let modes = self.vt.protocol.modes();
+        if !modes.contains(&1016) || !modes.is_mouse_enabled() {
+            return None;
+        }
+        let (height, width) = self.window_geometry()?.text_pixels();
+        Some((width, height))
+    }
+
     /// Wheel input is routed to unmodified cursor keys on the alternate
     /// screen only when tracking is off and the active keyboard encoder can
     /// admit those keys. Unsupported keyboard profiles never claim this route.
@@ -1196,10 +1219,34 @@ impl Terminal {
         row: usize,
         modifiers: u8,
     ) -> Option<Vec<u8>> {
+        self.encode_mouse_with_pixels(input, column, row, modifiers, None)
+    }
+
+    /// Encode a pointer report from zero-based cell and optional pixel positions.
+    /// Pixel mode requires an actual position in the measured text area.
+    #[inline]
+    pub fn encode_mouse_with_pixels(
+        &self,
+        input: MouseInput,
+        column: usize,
+        row: usize,
+        modifiers: u8,
+        pixels: Option<(u32, u32)>,
+    ) -> Option<Vec<u8>> {
         if column >= self.vt.screen.grid.cols() || row >= self.vt.screen.grid.rows() {
             return None;
         }
         let modes = self.vt.protocol.modes();
+        let (column, row) = if modes.contains(&1016) && modes.is_mouse_enabled() {
+            let (x, y) = pixels?;
+            let (width, height) = self.mouse_pixel_extent()?;
+            if x >= width || y >= height {
+                return None;
+            }
+            (x as usize, y as usize)
+        } else {
+            (column, row)
+        };
         let modifiers = modifiers & 0x1c;
         match input {
             MouseInput::Press(button) => modes.get_mouse_report(button | modifiers, column, row),
@@ -2061,19 +2108,31 @@ impl Terminal {
             }
             42 => self.vt.screen.national_replacement_mode = set,
             1 | 9 | 25 | 45 | 66 | 1000 | 1002..=1007 | 1015 | 2004 => (),
+            1016 if self.vt.protocol.modes().supports_pixel_mouse() => (),
             _ => {
                 self.unsupported();
                 return;
             }
         }
-        let previous_mouse = matches!(mode, 9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015)
+        let previous_mouse = matches!(mode, 9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015 | 1016)
             .then(|| self.mouse_report_profile());
         let previous_alternate_scroll = matches!(mode, 1 | 1007 | 9 | 1000 | 1002 | 1003)
             .then(|| self.alternate_scroll_profile());
+        let modes = self.vt.protocol.modes_mut();
         if set {
-            self.vt.protocol.modes_mut().insert(mode);
+            // Pixel and cell coordinate formats cannot be active together.
+            match mode {
+                1016 => {
+                    for encoding in [1005, 1006, 1015] {
+                        modes.remove(&encoding);
+                    }
+                }
+                1005 | 1006 | 1015 => modes.remove(&1016),
+                _ => {}
+            }
+            modes.insert(mode);
         } else {
-            self.vt.protocol.modes_mut().remove(&mode);
+            modes.remove(&mode);
         }
         if previous_mouse.is_some_and(|old| self.mouse_report_profile() != old)
             || previous_alternate_scroll.is_some_and(|old| self.alternate_scroll_profile() != old)
@@ -2094,6 +2153,9 @@ impl Terminal {
         self.begin_revision(self.revision);
         let keyboard_limit = self.vt.protocol.keyboard_enhancement_limit();
         let mut protocol = initial_protocol();
+        if self.vt.protocol.modes().supports_pixel_mouse() {
+            protocol.modes_mut().enable_pixel_mouse();
+        }
         protocol.take_rendition_stack_from(&mut self.vt.protocol);
         self.vt.protocol = protocol;
         if let Some(limit) = keyboard_limit {
@@ -2763,8 +2825,8 @@ impl Terminal {
             // The PTY may still need notification, but the screen has no
             // geometry change to commit.
             resize_pty()?;
-            if pixels.is_some() {
-                self.window_pixels = pixels;
+            if let Some(pixels) = pixels {
+                self.commit_window_pixels(pixels);
             }
             return Ok(());
         }

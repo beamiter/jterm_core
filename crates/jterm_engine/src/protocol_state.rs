@@ -8,6 +8,17 @@ pub struct TerminalModes {
 }
 
 impl TerminalModes {
+    // Pixel reporting requires a frontend that can supply measured positions.
+    const PIXEL_MOUSE_CAPABILITY: u32 = 1 << 31;
+
+    pub(crate) fn enable_pixel_mouse(&mut self) {
+        self.bits |= Self::PIXEL_MOUSE_CAPABILITY;
+    }
+
+    pub(crate) fn supports_pixel_mouse(&self) -> bool {
+        self.bits & Self::PIXEL_MOUSE_CAPABILITY != 0
+    }
+
     const fn bit_index(mode: u16) -> Option<u32> {
         match mode {
             // DECCKM — application cursor keys. Keep this independent from
@@ -49,6 +60,7 @@ impl TerminalModes {
             9 => Some(24),
             45 => Some(25),
             42 => Some(26),
+            1016 => Some(27),
             _ => None,
         }
     }
@@ -64,7 +76,9 @@ impl TerminalModes {
     #[inline]
     pub fn insert(&mut self, mode: u16) {
         if let Some(bit) = Self::bit_index(mode) {
-            self.bits |= 1 << bit;
+            if mode != 1016 || self.supports_pixel_mouse() {
+                self.bits |= 1 << bit;
+            }
         }
     }
 

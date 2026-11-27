@@ -11,7 +11,12 @@ pub(crate) enum SavedDecModeProfile {
 }
 const TRACKING_MODES: &[u16] = &[9, 1000, 1002, 1003];
 const ENCODING_MODES: &[u16] = &[1005, 1006, 1015];
-fn saved_mode_slot(profile: SavedDecModeProfile, mode: u16) -> Option<(usize, &'static [u16])> {
+const PIXEL_ENCODING_MODES: &[u16] = &[1005, 1006, 1015, 1016];
+fn saved_mode_slot(
+    profile: SavedDecModeProfile,
+    mode: u16,
+    pixel_mouse: bool,
+) -> Option<(usize, &'static [u16])> {
     let result = match mode {
         1 => (0, &[1][..]),
         6 => (1, &[6][..]),
@@ -26,6 +31,7 @@ fn saved_mode_slot(profile: SavedDecModeProfile, mode: u16) -> Option<(usize, &'
         2004 => (10, &[2004][..]),
         9 => (11, TRACKING_MODES),
         1000 | 1002 | 1003 => (12, TRACKING_MODES),
+        1005 | 1006 | 1015 | 1016 if pixel_mouse => (13, PIXEL_ENCODING_MODES),
         1005 | 1006 | 1015 => (13, ENCODING_MODES),
         47 | 1047 | 1049 => (14, &[47][..]),
         45 => (15, &[45][..]),
@@ -45,7 +51,9 @@ pub(crate) fn save_dec_private_modes(
     params: &[u16],
 ) {
     for &mode in params {
-        let Some((slot, modes)) = saved_mode_slot(profile, mode) else {
+        let Some((slot, modes)) =
+            saved_mode_slot(profile, mode, protocol.modes().supports_pixel_mouse())
+        else {
             continue;
         };
         let mut bits = 0;
@@ -68,7 +76,9 @@ pub(crate) fn restore_dec_private_modes(
 ) -> smallvec::SmallVec<[(u16, bool); 16]> {
     let mut result = smallvec::SmallVec::new();
     for &mode in params {
-        let Some((slot, modes)) = saved_mode_slot(profile, mode) else {
+        let Some((slot, modes)) =
+            saved_mode_slot(profile, mode, protocol.modes().supports_pixel_mouse())
+        else {
             continue;
         };
         let Some(bits) = protocol.saved_dec_private_modes[slot] else {

@@ -1,4 +1,8 @@
-use jterm_engine::terminal::Terminal;
+use jterm_engine::{
+    mouse::{MouseEncoding, MouseInput},
+    native_window_ops::NativeWindowPixels,
+    terminal::Terminal,
+};
 
 #[test]
 fn geometry_changes_retire_pointer_generation_only_after_success() {
@@ -77,4 +81,142 @@ fn pointer_generation_retires_gestures_when_the_screen_switches_back_inside_one_
         before.stamp().screen
     );
     assert_eq!(terminal.mouse_report_generation(), generation + 2);
+}
+
+#[test]
+fn pixel_mouse_requires_opt_in_and_encodes_measured_coordinates_at_every_split() {
+    let mut default_terminal = Terminal::new(4, 6).unwrap();
+    let enable = b"\x1b[?1003;1006;1016h\x1b[?1016$p\x1b[?1006$p";
+    assert_eq!(
+        default_terminal.feed(enable).unwrap(),
+        b"\x1b[?1016;0$y\x1b[?1006;1$y"
+    );
+    assert_eq!(
+        default_terminal.mouse_report_profile().unwrap().encoding,
+        MouseEncoding::Sgr
+    );
+    for split in 0..=enable.len() {
+        let mut terminal = Terminal::new(4, 6).unwrap();
+        terminal.enable_pixel_mouse();
+        terminal
+            .set_window_pixels(
+                4,
+                6,
+                NativeWindowPixels::Viewport {
+                    width: 144,
+                    height: 192,
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal.feed(b"\x1b[?1016$p").unwrap(), b"\x1b[?1016;2$y");
+        let mut replies = terminal.feed(&enable[..split]).unwrap();
+        replies.extend(terminal.feed(&enable[split..]).unwrap());
+        assert_eq!(replies, b"\x1b[?1016;1$y\x1b[?1006;2$y");
+        assert_eq!(
+            terminal.mouse_report_profile().unwrap().encoding,
+            MouseEncoding::SgrPixels
+        );
+        assert_eq!(terminal.mouse_pixel_extent(), Some((144, 192)));
+        for (input, pixel, modifiers, expected) in [
+            (MouseInput::Press(0), (0, 0), 0, &b"\x1b[<0;1;1M"[..]),
+            (MouseInput::Motion(None), (1, 2), 0, &b"\x1b[<35;2;3M"[..]),
+            (
+                MouseInput::Motion(Some(1)),
+                (11, 23),
+                16,
+                &b"\x1b[<49;12;24M"[..],
+            ),
+            (
+                MouseInput::Release(2),
+                (143, 191),
+                8,
+                &b"\x1b[<10;144;192m"[..],
+            ),
+            (MouseInput::WheelDown, (12, 36), 0, &b"\x1b[<65;13;37M"[..]),
+        ] {
+            assert_eq!(
+                terminal
+                    .encode_mouse_with_pixels(input, 0, 0, modifiers, Some(pixel))
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(terminal
+            .encode_mouse(MouseInput::Press(0), 0, 0, 0)
+            .is_none());
+        for outside in [(144, 0), (0, 192)] {
+            assert!(terminal
+                .encode_mouse_with_pixels(MouseInput::Press(0), 0, 0, 0, Some(outside))
+                .is_none());
+        }
+    }
+}
+
+#[test]
+fn pixel_negotiation_and_baseline_reset_preserve_distinct_coordinate_formats() {
+    let mut terminal = Terminal::new(4, 6).unwrap();
+    terminal.enable_pixel_mouse();
+    terminal.feed(b"\x1b[?1002;1016h\x1b[?1016s").unwrap();
+    let generation = terminal.mouse_report_generation();
+    assert_eq!(
+        terminal.feed(b"\x1b[?1006h\x1b[?1016$p").unwrap(),
+        b"\x1b[?1016;2$y"
+    );
+    assert_eq!(
+        terminal.encode_mouse(MouseInput::Press(0), 1, 2, 0),
+        Some(b"\x1b[<0;2;3M".to_vec())
+    );
+    assert_eq!(terminal.mouse_report_generation(), generation + 1);
+    assert_eq!(
+        terminal.feed(b"\x1b[?1006r\x1b[?1016$p").unwrap(),
+        b"\x1b[?1016;1$y"
+    );
+    assert_eq!(terminal.mouse_report_generation(), generation + 3);
+    assert!(terminal
+        .encode_mouse_with_pixels(MouseInput::Press(0), 1, 2, 0, Some((50, 75)))
+        .is_none());
+    terminal.feed(b"\x1b[?1049;1007h\x1b[?1002l").unwrap();
+    assert_eq!(
+        terminal.encode_mouse(MouseInput::WheelUp, 1, 2, 0),
+        Some(b"\x1b[A".to_vec())
+    );
+    assert_eq!(
+        terminal.feed(b"\x1bc\x1b[?1016$p").unwrap(),
+        b"\x1b[?1016;2$y"
+    );
+}
+
+#[test]
+fn pixel_only_resize_retires_pointer_generation_after_the_pty_accepts_it() {
+    let mut terminal = Terminal::new(4, 6).unwrap();
+    terminal.enable_pixel_mouse();
+    terminal.feed(b"\x1b[?1003;1016h").unwrap();
+    let pixels = NativeWindowPixels::Viewport {
+        width: 144,
+        height: 192,
+    };
+    let before = terminal.mouse_report_generation();
+    terminal.set_window_pixels(4, 6, pixels).unwrap();
+    let layout = terminal.frame().unwrap().stamp().layout;
+    assert_eq!(terminal.mouse_report_generation(), before + 1);
+    terminal.set_window_pixels(4, 6, pixels).unwrap();
+    assert_eq!(terminal.mouse_report_generation(), before + 1);
+    let resized = NativeWindowPixels::Cell {
+        width: 12,
+        height: 24,
+    };
+    assert!(terminal
+        .set_window_pixels_with(4, 6, resized, || Err("resize refused".into()))
+        .is_err());
+    assert_eq!(terminal.mouse_report_generation(), before + 1);
+    assert_eq!(terminal.mouse_pixel_extent(), Some((144, 192)));
+    terminal
+        .resize_with_window_pixels(4, 6, Some(resized), || Ok(()))
+        .unwrap();
+    assert_eq!(terminal.frame().unwrap().stamp().layout, layout);
+    assert_eq!(terminal.mouse_pixel_extent(), Some((72, 96)));
+    assert_eq!(terminal.mouse_report_generation(), before + 2);
+    terminal.resize(5, 7).unwrap();
+    assert_eq!(terminal.mouse_pixel_extent(), None);
+    assert_eq!(terminal.mouse_report_generation(), before + 3);
 }

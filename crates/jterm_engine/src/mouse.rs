@@ -1,7 +1,7 @@
 //! Mouse reporting encoders extracted from Ember, including legacy limits.
 use crate::protocol_state::TerminalModes;
 
-/// Pointer input addressed to a terminal cell, before encoding for the PTY.
+/// Pointer action before encoding for the PTY.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MouseInput {
     Press(u8),
@@ -27,6 +27,7 @@ pub enum MouseEncoding {
     Utf8,
     Urxvt,
     Sgr,
+    SgrPixels,
 }
 
 /// Immutable view of the modes that determine pointer reporting.
@@ -95,7 +96,9 @@ impl TerminalModes {
     }
 
     fn mouse_encoding(&self) -> MouseEncoding {
-        if self.contains(&1006) {
+        if self.contains(&1016) {
+            MouseEncoding::SgrPixels
+        } else if self.contains(&1006) {
             MouseEncoding::Sgr
         } else if self.contains(&1015) {
             MouseEncoding::Urxvt
@@ -118,7 +121,7 @@ impl TerminalModes {
             button
         };
         Some(match self.mouse_encoding() {
-            MouseEncoding::Sgr => {
+            MouseEncoding::Sgr | MouseEncoding::SgrPixels => {
                 decimal_mouse_report(b"\x1b[<", usize::from(button), col, row, b'M')
             }
             MouseEncoding::Urxvt => Self::urxvt_mouse_report(button, col, row),
@@ -173,7 +176,7 @@ impl TerminalModes {
         }
         let legacy_release = 3 | (button & 0x1c);
         Some(match self.mouse_encoding() {
-            MouseEncoding::Sgr => {
+            MouseEncoding::Sgr | MouseEncoding::SgrPixels => {
                 decimal_mouse_report(b"\x1b[<", usize::from(button), col, row, b'm')
             }
             MouseEncoding::Urxvt => Self::urxvt_mouse_report(legacy_release, col, row),

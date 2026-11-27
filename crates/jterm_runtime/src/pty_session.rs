@@ -899,6 +899,10 @@ impl Session {
         self.terminal.engine.enable_grapheme_clusters();
     }
 
+    pub fn enable_pixel_mouse(&mut self) {
+        self.terminal.engine.enable_pixel_mouse();
+    }
+
     pub fn enable_hyperlinks(&mut self, policy: jterm_engine::hyperlink::HyperlinkPolicy) {
         self.terminal.engine.enable_hyperlinks(policy);
     }

@@ -1840,6 +1840,7 @@ fn decrqm_private_mode_state(
         | 2031
         | 5522 => protocol.modes().contains(&mode),
         12 | 1034 | 1036 if ember_extensions => protocol.modes().contains(&mode),
+        1016 if protocol.modes().supports_pixel_mouse() => protocol.modes().contains(&mode),
         _ => return 0,
     };
     if set {
