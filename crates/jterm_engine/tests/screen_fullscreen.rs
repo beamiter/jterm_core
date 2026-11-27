@@ -199,7 +199,8 @@ fn assert_saved(actual: &Option<SavedCursorState>, expected: &Option<SavedCursor
 }
 
 fn assert_screen(a: &ScreenState, b: &ScreenState) {
-    // No `..`: adding a ScreenState field requires updating this comparison.
+    // Compare the legacy public fields. Private GL identity is covered by
+    // the cursor_information protocol tests.
     let ScreenState {
         grid,
         alt_grid,
@@ -228,6 +229,7 @@ fn assert_screen(a: &ScreenState, b: &ScreenState) {
         g0_charset,
         g1_charset,
         active_charset,
+        ..
     } = a;
     for (actual, expected) in [(grid, &b.grid), (alt_grid, &b.alt_grid)] {
         assert_eq!(

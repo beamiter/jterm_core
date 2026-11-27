@@ -118,6 +118,12 @@ impl OutputBuffer {
         self.bytes
     }
     pub fn extend(&mut self, mut other: Self) {
+        // The first reader batch can retain its allocation. Multiple spans
+        // still pass through append, which may need to coalesce provenance.
+        if self.bytes.is_empty() && self.spans.is_empty() && other.spans.len() == 1 {
+            *self = other;
+            return;
+        }
         self.append(&mut other);
     }
     pub fn append(&mut self, other: &mut Self) {
@@ -291,5 +297,60 @@ mod tests {
         let next = source.batch(vec![2], Instant::now());
         assert_eq!(next.as_bytes(), [2]);
         assert!(next.spans[0].origin.is_none());
+    }
+    #[test]
+    fn owned_single_span_transfer_keeps_storage_and_capture_metadata() {
+        for quarantined in [false, true] {
+            let mut source = OutputSource::default();
+            let at = Instant::now();
+            let mut batch = source.batch(b"prefix-payload".to_vec(), at);
+            let mut tail = batch.split_off(7);
+            if quarantined {
+                tail.quarantine();
+            }
+            let bytes = tail.bytes.as_ptr();
+            let spans = tail.spans.as_ptr();
+            let expected = tail.spans.clone();
+            let mut delivered = OutputBuffer::default();
+            delivered.extend(tail);
+            assert_eq!(delivered.as_bytes(), b"payload");
+            assert_eq!(delivered.bytes.as_ptr(), bytes);
+            assert_eq!(delivered.spans.as_ptr(), spans);
+            assert_eq!(delivered.spans, expected);
+            assert_eq!(
+                delivered
+                    .fragments()
+                    .next()
+                    .unwrap()
+                    .origin
+                    .unwrap()
+                    .read_at,
+                at
+            );
+        }
+    }
+
+    #[test]
+    fn owned_multi_span_transfer_recoalesces_after_quarantine() {
+        let mut source = OutputSource::default();
+        let mut left = source.batch(b"abcdef".to_vec(), Instant::now());
+        let mut right = left.split_off(3);
+        left.quarantine();
+        left.append(&mut right);
+        assert_eq!(left.spans.len(), 2);
+        left.quarantine();
+        let origin = left.spans[0].origin;
+        let mut delivered = OutputBuffer::default();
+        delivered.extend(left);
+        assert_eq!(delivered.as_bytes(), b"abcdef");
+        assert_eq!(
+            delivered.spans,
+            [OriginSpan {
+                len: 6,
+                origin,
+                offset: 0,
+                quarantined: true
+            }]
+        );
     }
 }

@@ -2,6 +2,131 @@ use super::*;
 use crate::history_reflow::HistoryAnchor;
 
 #[test]
+fn decst8c_restores_tabs_after_custom_stops_at_every_split() {
+    let command = b"\x1b[?005W";
+    for cut in 0..=command.len() {
+        let mut terminal = Terminal::new(3, 25).unwrap();
+        terminal.feed(b"\x1b[3g\x1b[4G\x1bH\x1b[2;25H").unwrap();
+        terminal.feed(b"x").unwrap();
+        let before = terminal.frame().unwrap();
+        assert!(before.cursor().pending_wrap);
+        terminal.feed(&command[..cut]).unwrap();
+        terminal.feed(&command[cut..]).unwrap();
+        assert_eq!(terminal.frame().unwrap(), before);
+        terminal.feed(b"\r\t").unwrap();
+        assert_eq!(terminal.frame().unwrap().cursor().col, 8);
+        terminal.feed(b"\x1b[2I").unwrap();
+        assert_eq!(terminal.frame().unwrap().cursor().col, 24);
+        terminal.feed(b"\x1b[2Z").unwrap();
+        assert_eq!(terminal.frame().unwrap().cursor().col, 8);
+        assert_eq!(terminal.unsupported_count(), 0);
+    }
+}
+
+#[test]
+fn saved_cursor_queries_follow_the_retained_slot_and_reset() {
+    const QUERY: &[u8] = b"\x1b[?1048$p";
+    for save in [b"\x1b7".as_slice(), b"\x1b[s", b"\x1b[?1048h"] {
+        for restore in [b"\x1b8".as_slice(), b"\x1b[u", b"\x1b[?1048l"] {
+            for chunk in 1..=QUERY.len() {
+                let mut terminal = Terminal::new(4, 8).unwrap();
+                assert_eq!(terminal.feed(QUERY).unwrap(), b"\x1b[?1048;2$y");
+                terminal.feed(b"\x1b[2;3H").unwrap();
+                let saved = terminal.frame().unwrap().cursor();
+                let stream = [save, QUERY, b"\x1b[4;7H", restore, QUERY].concat();
+                let mut replies = Vec::new();
+                for bytes in stream.chunks(chunk) {
+                    replies.extend(terminal.feed(bytes).unwrap());
+                }
+                assert_eq!(replies, b"\x1b[?1048;1$y\x1b[?1048;1$y");
+                assert_eq!(terminal.frame().unwrap().cursor(), saved);
+                assert_eq!(
+                    terminal
+                        .feed(&[b"\x1bc".as_slice(), QUERY].concat())
+                        .unwrap(),
+                    b"\x1b[?1048;2$y"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn alternate_mode_queries_follow_the_live_screen_across_aliases() {
+    for enter in [47, 1047, 1049] {
+        for leave in [47, 1047, 1049] {
+            for chunk in 1..=8 {
+                let mut terminal = Terminal::new(3, 12).unwrap();
+                let query = b"\x1b[?47$p\x1b[?1047$p\x1b[?1049$p";
+                assert_eq!(
+                    terminal.feed(query).unwrap(),
+                    b"\x1b[?47;2$y\x1b[?1047;2$y\x1b[?1049;2$y"
+                );
+                let stream = format!("\x1b[?{enter}h");
+                for bytes in stream.as_bytes().chunks(chunk) {
+                    terminal.feed(bytes).unwrap();
+                }
+                assert!(terminal.alternate_screen_active());
+                assert_eq!(
+                    terminal.feed(query).unwrap(),
+                    b"\x1b[?47;1$y\x1b[?1047;1$y\x1b[?1049;1$y"
+                );
+                let stream = format!("\x1b[?{leave}l");
+                for bytes in stream.as_bytes().chunks(chunk) {
+                    terminal.feed(bytes).unwrap();
+                }
+                assert!(!terminal.alternate_screen_active());
+                assert_eq!(
+                    terminal.feed(query).unwrap(),
+                    b"\x1b[?47;2$y\x1b[?1047;2$y\x1b[?1049;2$y"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_scroll_margins_preserve_cursor_wrap_and_existing_region() {
+    for sequence in [b"\x1b[4;2r".as_slice(), b"\x1b[3;3r", b"\x1b[6;99r"] {
+        for cut in 0..=sequence.len() {
+            let mut terminal = Terminal::new(5, 4).unwrap();
+            terminal.feed(b"\x1b[2;4r\x1b[3;1HABCD").unwrap();
+            let before = terminal.frame().unwrap();
+            assert!(before.cursor().pending_wrap);
+            terminal.feed(&sequence[..cut]).unwrap();
+            terminal.feed(&sequence[cut..]).unwrap();
+            assert_eq!(terminal.frame().unwrap(), before);
+            assert_eq!(
+                (
+                    terminal.vt.screen.scroll_region_top,
+                    terminal.vt.screen.scroll_region_bottom
+                ),
+                (1, 3)
+            );
+        }
+    }
+    let mut terminal = Terminal::new(5, 4).unwrap();
+    terminal.feed(b"\x1b[2;4r\x1b[?6h\x1b[2;99r").unwrap();
+    assert_eq!(
+        (
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
+        ),
+        (1, 4)
+    );
+    assert_eq!(terminal.frame().unwrap().cursor().paint_position(), (1, 0));
+    terminal.feed(b"\x1b[r").unwrap();
+    assert_eq!(
+        (
+            terminal.vt.screen.scroll_region_top,
+            terminal.vt.screen.scroll_region_bottom
+        ),
+        (0, 4)
+    );
+    assert_eq!(terminal.frame().unwrap().cursor().paint_position(), (0, 0));
+}
+
+#[test]
 fn key_format_queries_report_encoding_and_preserve_tabs() {
     for chunk in 1..=8 {
         let mut terminal = Terminal::new(2, 16).unwrap();
@@ -441,6 +566,38 @@ fn keyboard_mode_modifiers_and_unicode_are_rust_owned() {
 }
 
 #[test]
+fn paste_normalization_matches_literal_crlf_rules_for_mixed_utf8() {
+    let mut terminal = Terminal::new(2, 8).unwrap();
+    let pieces = ["", "界", "\r", "\n", "\t"];
+    for bracketed in [false, true] {
+        terminal
+            .feed(if bracketed {
+                b"\x1b[?2004h"
+            } else {
+                b"\x1b[?2004l"
+            })
+            .unwrap();
+        for first in pieces {
+            for second in pieces {
+                for third in pieces {
+                    let input = format!("{first}{second}{third}");
+                    let normalized = input
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .replace('\n', "\r");
+                    let expected = if bracketed {
+                        format!("\x1b[200~{normalized}\x1b[201~").into_bytes()
+                    } else {
+                        normalized.into_bytes()
+                    };
+                    assert_eq!(terminal.encode_paste(&input).unwrap(), expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn paste_controls_markers_normalization_and_wire_bound() {
     let mut t = Terminal::new(3, 10).unwrap();
     assert_eq!(
@@ -640,6 +797,34 @@ fn committed_text_rejects_controls_and_enforces_utf8_bytes_not_scalars() {
 }
 
 #[test]
+fn xtgettcap_colors_report_live_capabilities_across_feed_splits() {
+    let query = b"\x1bP+q436f;636F6C6F7273;524742\x1b\\";
+    let reply = b"\x1bP1+r436f=323536;636F6C6F7273=323536;524742=38\x1b\\";
+    for cut in 0..=query.len() {
+        let mut terminal = Terminal::new(2, 4).unwrap();
+        terminal.feed(b"\x1b[31mABCD").unwrap();
+        let before = terminal.frame().unwrap();
+        assert!(before.cursor().pending_wrap);
+        let mut bytes = terminal.feed(&query[..cut]).unwrap();
+        bytes.extend(terminal.feed(&query[cut..]).unwrap());
+        assert_eq!(bytes, reply, "cut {cut}");
+        assert_eq!(terminal.frame().unwrap(), before);
+        assert_eq!(terminal.negative_query_replies(), 0);
+        assert_eq!(terminal.unsupported_count(), 0);
+        assert_eq!(
+            terminal.feed(b"\x1bP+q524742;544e;436f\x1b\\").unwrap(),
+            b"\x1bP1+r524742=38\x1b\\"
+        );
+        assert_eq!(
+            terminal.feed(b"\x1bP+q544e\x1b\\").unwrap(),
+            b"\x1bP0+r\x1b\\"
+        );
+        assert_eq!(terminal.negative_query_replies(), 1);
+        assert_eq!(terminal.unsupported_events(), &["DCS XTGETTCAP"]);
+    }
+}
+
+#[test]
 fn xtgettcap_negative_reply_does_not_claim_or_reflect_capabilities() {
     let mut t = Terminal::new(3, 10).unwrap();
     assert_eq!(
@@ -783,6 +968,30 @@ fn projected_history_keeps_clusters_styles_links_and_raw_anchors_across_widths()
     assert!(terminal.history_layout().unwrap().is_empty());
     assert!(terminal.projected_history_page(&wider, 0, 1).is_err());
     assert_eq!(page.text, "ae\u{301}cde界Z");
+}
+
+#[test]
+fn plain_projected_history_copies_clipped_fragments_and_link_ids() {
+    let mut terminal = Terminal::new(2, 6).unwrap();
+    terminal.enable_hyperlinks(|_, target| target == "https://example.test/plain");
+    terminal
+        .feed(b"\x1b]8;;https://example.test/plain\x07abcdefghij\x1b]8;;\x07\r\nnext\r\n")
+        .unwrap();
+    for (width, expected_rows) in [(4, 3), (8, 2)] {
+        terminal.resize(2, width).unwrap();
+        let layout = terminal.history_layout().unwrap();
+        let page = terminal.projected_history_page(&layout, 0, 8).unwrap();
+        assert_eq!(page.text, "abcdefghij");
+        assert_eq!(page.row_count, expected_rows);
+        for row in 0..page.row_count {
+            for cell in page.row(row).unwrap().cells.iter() {
+                assert_eq!(
+                    page.hyperlink_target(cell.hyperlink_id),
+                    Some("https://example.test/plain")
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1295,9 +1504,29 @@ fn visible_hyperlink_resources_follow_cells_across_row_edits_and_screens() {
         Some("https://example.com/two")
     );
 
+    terminal.feed(b"\x1b[1;3Htext").unwrap();
+    let edited = terminal.frame().unwrap();
+    assert_eq!(edited.rows()[0].cells[2].character, 't');
+    assert!(Arc::ptr_eq(
+        &initial.shared_hyperlinks().unwrap(),
+        &edited.shared_hyperlinks().unwrap()
+    ));
+
+    terminal
+        .feed(b"\x1b[1;2H\x1b]8;;https://example.com/three\x07C\x1b]8;;\x07")
+        .unwrap();
+    let added = terminal.frame().unwrap();
+    let three = added.rows()[0].cells[1].hyperlink_id;
+    assert_eq!(
+        added.hyperlink_target(three),
+        Some("https://example.com/three")
+    );
+    assert_eq!(edited.hyperlink_target(three), None);
+
     terminal.feed(b"\x1b[H\x1b[2K").unwrap();
     let erased = terminal.frame().unwrap();
     assert_eq!(erased.hyperlink_target(one), None);
+    assert_eq!(erased.hyperlink_target(three), None);
     assert_eq!(
         erased.hyperlink_target(two),
         Some("https://example.com/two")
@@ -1316,6 +1545,42 @@ fn visible_hyperlink_resources_follow_cells_across_row_edits_and_screens() {
         initial.hyperlink_target(one),
         Some("https://example.com/one")
     );
+}
+
+#[test]
+fn repeated_resize_preserves_grapheme_composition_and_frame() {
+    for (base, suffix, cluster) in [("e", "\u{301}", "e\u{301}"), ("❤", "\u{fe0f}", "❤\u{fe0f}")]
+    {
+        for fail in [false, true] {
+            let mut terminal = Terminal::new(4, 8).unwrap();
+            terminal.enable_grapheme_clusters();
+            terminal.feed(base.as_bytes()).unwrap();
+            let before = terminal.frame().unwrap();
+            let mut calls = 0;
+            let result = terminal.resize_with(4, 8, || {
+                calls += 1;
+                if fail {
+                    Err("resize refused".into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(terminal.frame().unwrap(), before);
+            terminal.feed(suffix.as_bytes()).unwrap();
+            let frame = terminal.frame().unwrap();
+            assert_eq!(frame.cluster_text(0, 0), Some(cluster));
+            assert_eq!(terminal.unsupported_count(), 0);
+        }
+    }
+    let mut terminal = Terminal::new(4, 8).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal.feed(b"e").unwrap();
+    terminal.resize(4, 7).unwrap();
+    terminal.feed("\u{301}".as_bytes()).unwrap();
+    assert_eq!(terminal.frame().unwrap().cluster_text(0, 0), None);
+    assert_eq!(terminal.unsupported_count(), 1);
 }
 
 #[test]
@@ -1523,6 +1788,40 @@ fn primary_reflow_preserves_virtual_cursor_space_and_deferred_wrap() {
             .unwrap(),
         "1234  !"
     );
+}
+
+#[test]
+fn retained_text_keeps_blank_base_clusters_below_the_cursor() {
+    let mut terminal = Terminal::new(4, 8).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal.feed("\x1b[3;1H \u{301}\x1b[H".as_bytes()).unwrap();
+    assert_eq!(
+        terminal.frame().unwrap().cluster_text(2, 0),
+        Some(" \u{301}")
+    );
+    let mut output = Vec::new();
+    terminal.write_retained_text(&mut output).unwrap();
+    assert_eq!(String::from_utf8(output).unwrap(), "\n\n \u{301}");
+}
+
+#[test]
+fn retained_text_joins_plain_archive_padding_to_encoded_and_live_rows() {
+    let mut terminal = Terminal::new(2, 6).unwrap();
+    terminal
+        .feed("ab    \x1b[31mc\x1b[0m\r\né\r\nlast".as_bytes())
+        .unwrap();
+    assert!(matches!(
+        terminal.history[0].content(),
+        crate::grid::ScrollbackContent::Plain(_, _)
+    ));
+    assert!(terminal.history[0].is_wrapped);
+    assert!(matches!(
+        terminal.history[1].content(),
+        crate::grid::ScrollbackContent::Encoded(_)
+    ));
+    let mut output = Vec::new();
+    terminal.write_retained_text(&mut output).unwrap();
+    assert_eq!(String::from_utf8(output).unwrap(), "ab    c\né\nlast");
 }
 
 #[test]
@@ -1889,4 +2188,51 @@ fn hosted_and_native_hold_the_identical_vt_owner_type() {
         std::any::type_name_of_val(&terminal.vt),
         std::any::type_name::<crate::vt_state::VtState>()
     );
+}
+
+#[test]
+fn fragmented_private_cursor_sequences_preserve_the_last_column_and_origin() {
+    for sequence in [b"\x1b[?2;2H".as_slice(), b"\x1b[2$A", b"\x1b[>2C"] {
+        for cut in 0..=sequence.len() {
+            let mut terminal = Terminal::new(5, 4).unwrap();
+            terminal.feed(b"\x1b[2;4r\x1b[?6h\x1b[2;1HABCD").unwrap();
+            let before = terminal.frame().unwrap();
+            terminal.feed(&sequence[..cut]).unwrap();
+            terminal.feed(&sequence[cut..]).unwrap();
+            assert_eq!(terminal.frame().unwrap(), before);
+            assert!(before.cursor().pending_wrap);
+            terminal.feed(b"X").unwrap();
+            let after = terminal.frame().unwrap();
+            assert_eq!(after.rows()[2].cells[3].character, 'D');
+            assert_eq!(after.rows()[3].cells[0].character, 'X');
+        }
+    }
+}
+
+#[test]
+fn malformed_sgr_preserves_the_next_printed_cells_rendition() {
+    for sequence in [
+        b"\x1b[?31m".as_slice(),
+        b"\x1b[31$m",
+        b"\x1b[31%m",
+        b"\x1b[=41m",
+    ] {
+        for cut in 0..=sequence.len() {
+            let mut terminal = Terminal::new(2, 8).unwrap();
+            terminal.feed(b"\x1b[32;44;1mA").unwrap();
+            terminal.feed(&sequence[..cut]).unwrap();
+            terminal.feed(&sequence[cut..]).unwrap();
+            terminal.feed(b"B\x1b[31;41mC").unwrap();
+            let frame = terminal.frame().unwrap();
+            let cells = &frame.rows()[0].cells;
+            assert_eq!(
+                (cells[1].foreground, cells[1].background, cells[1].flags),
+                (cells[0].foreground, cells[0].background, cells[0].flags)
+            );
+            assert_eq!(
+                (cells[2].foreground, cells[2].background),
+                (Color::Red, Color::Red)
+            );
+        }
+    }
 }

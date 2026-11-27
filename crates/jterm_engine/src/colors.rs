@@ -207,21 +207,28 @@ impl<D> ProfiledColorState<D> {
         profile: OscColorProfile,
         effects: &mut Effects,
     ) {
-        let (slot, fallback) = match command {
-            "10" => (&mut self.dynamic_fg, defaults.foreground),
-            "11" => (&mut self.dynamic_bg, defaults.background),
-            "12" => (&mut self.dynamic_cursor_color, defaults.cursor),
+        let start = match command {
+            "10" => 10,
+            "11" => 11,
+            "12" => 12,
             _ => return,
         };
-        if value == "?" {
-            color_reply(
-                format_args!("{command}"),
-                slot.unwrap_or(fallback),
-                terminator,
-                effects,
-            );
-        } else if let Some(rgb) = profile.parse(value) {
-            *slot = Some(rgb);
+        for (command, value) in (start..=12).zip(value.split(';')) {
+            let (slot, fallback) = match command {
+                10 => (&mut self.dynamic_fg, defaults.foreground),
+                11 => (&mut self.dynamic_bg, defaults.background),
+                _ => (&mut self.dynamic_cursor_color, defaults.cursor),
+            };
+            if value == "?" {
+                color_reply(
+                    format_args!("{command}"),
+                    slot.unwrap_or(fallback),
+                    terminator,
+                    effects,
+                );
+            } else if let Some(rgb) = profile.parse(value) {
+                *slot = Some(rgb);
+            }
         }
     }
 
@@ -308,6 +315,58 @@ impl ColorState {
         }
         effects
     }
+    /// Answer query-only packets without making a mutable palette snapshot.
+    /// Mixed queries and writes keep their ordered mutation path.
+    pub(crate) fn query_ember_osc(
+        &self,
+        command: &str,
+        value: &str,
+        terminator: &[u8],
+    ) -> Option<Effects> {
+        let mut effects = Effects::new();
+        match command {
+            "10" | "11" | "12" => {
+                let start = match command {
+                    "10" => 10,
+                    "11" => 11,
+                    _ => 12,
+                };
+                if !value.split(';').take(13 - start).all(|spec| spec == "?") {
+                    return None;
+                }
+                for (command, _) in (start..=12).zip(value.split(';')) {
+                    let color = match command {
+                        10 => self.effective_foreground(),
+                        11 => self.effective_background(),
+                        _ => self.effective_cursor(),
+                    };
+                    color_reply(format_args!("{command}"), color, terminator, &mut effects);
+                }
+            }
+            "4" => {
+                let mut parts = value.split(';');
+                while let (Some(_), Some(spec)) = (parts.next(), parts.next()) {
+                    if spec != "?" {
+                        return None;
+                    }
+                }
+                let mut parts = value.split(';');
+                while let (Some(index), Some(_)) = (parts.next(), parts.next()) {
+                    if let Ok(index) = index.parse::<u8>() {
+                        color_reply(
+                            format_args!("4;{index}"),
+                            self.palette_color(index),
+                            terminator,
+                            &mut effects,
+                        );
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(effects)
+    }
+
     /// The terminator is supplied by the current OSC.
     pub fn apply_ember_osc(&mut self, command: &str, value: &str, terminator: &[u8]) -> Effects {
         self.apply_color_osc(
@@ -409,5 +468,44 @@ impl DynamicColorState {
 
     pub fn parse_frost_color_spec(spec: &str) -> Option<Rgb> {
         OscColorProfile::Frost.parse(spec)
+    }
+}
+
+#[cfg(test)]
+mod immutable_query_tests {
+    use super::*;
+
+    #[test]
+    fn immutable_queries_match_the_ordered_color_owner() {
+        let mut colors = ColorState::default();
+        colors.apply_ember_osc("4", "3;#123456", b"\x07");
+        colors.apply_ember_osc("10", "#102030;#405060;#708090", b"\x07");
+        for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
+            for (command, value) in [
+                ("10", "?"),
+                ("10", "?;?;?"),
+                ("11", "?;?"),
+                ("12", "?;ignored"),
+                ("4", "3;?;255;?"),
+                ("4", "invalid;?;3;?;5"),
+                ("4", ""),
+            ] {
+                let mut reference = colors.clone();
+                let expected = reference.apply_ember_osc(command, value, terminator);
+                assert_eq!(
+                    colors.query_ember_osc(command, value, terminator),
+                    Some(expected)
+                );
+                assert_eq!(reference, colors);
+            }
+        }
+        for (command, value) in [
+            ("10", "?;#ff00ff"),
+            ("11", "#000000"),
+            ("4", "3;?;4;#000000"),
+            ("104", ""),
+        ] {
+            assert_eq!(colors.query_ember_osc(command, value, b"\x07"), None);
+        }
     }
 }

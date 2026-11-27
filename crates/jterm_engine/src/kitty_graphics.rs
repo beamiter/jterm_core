@@ -519,8 +519,10 @@ pub fn png_dimensions(bytes: &[u8], caps: &Caps) -> Result<(u32, u32), Error> {
 pub fn decode_base64(input: &[u8], max_decoded: usize) -> Result<Vec<u8>, Error> {
     let mut significant = 0usize;
     let mut padded = false;
+    let mut whitespace = false;
     for &byte in input {
         if byte.is_ascii_whitespace() {
+            whitespace = true;
             continue;
         }
         if byte == b'=' {
@@ -548,6 +550,31 @@ pub fn decode_base64(input: &[u8], max_decoded: usize) -> Result<Vec<u8>, Error>
     let mut out = Vec::new();
     out.try_reserve_exact(decoded_len)
         .map_err(|_| Error::TooLarge)?;
+    // Validation above preserves the permissive padding and error policy.
+    // Ordinary wire payloads can now decode complete groups without per-byte
+    // bit accounting; wrapped payloads retain the tolerant scalar path.
+    if !whitespace {
+        let mut quartets = input[..significant].chunks_exact(4);
+        for quartet in &mut quartets {
+            let word = (base64_index(quartet[0]).unwrap() << 18)
+                | (base64_index(quartet[1]).unwrap() << 12)
+                | (base64_index(quartet[2]).unwrap() << 6)
+                | base64_index(quartet[3]).unwrap();
+            out.extend_from_slice(&[(word >> 16) as u8, (word >> 8) as u8, word as u8]);
+        }
+        match quartets.remainder() {
+            [a, b] => out
+                .push(((base64_index(*a).unwrap() << 2) | (base64_index(*b).unwrap() >> 4)) as u8),
+            [a, b, c] => {
+                let a = base64_index(*a).unwrap();
+                let b = base64_index(*b).unwrap();
+                let c = base64_index(*c).unwrap();
+                out.extend_from_slice(&[((a << 2) | (b >> 4)) as u8, ((b << 4) | (c >> 2)) as u8]);
+            }
+            _ => {}
+        }
+        return Ok(out);
+    }
     let mut buffer = 0u32;
     let mut bits = 0u32;
     for &byte in input {
@@ -873,7 +900,11 @@ impl Assembler {
             .encoded
             .try_reserve(chunk_len)
             .map_err(|_| Error::TooLarge)?;
-        entry.encoded.extend(chunk);
+        if chunk_len == body.len() {
+            entry.encoded.extend_from_slice(body.as_bytes());
+        } else {
+            entry.encoded.extend(chunk);
+        }
         Ok(())
     }
 
@@ -1828,5 +1859,70 @@ mod tests {
             Error::TooLarge.to_string(),
             "kitty graphics command exceeds the configured limits"
         );
+    }
+}
+
+#[cfg(test)]
+mod quartet_compatibility_tests {
+    use super::*;
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    #[test]
+    fn quartet_and_tail_decoding_match_tolerant_scalar_path() {
+        for &a in ALPHABET {
+            for &b in ALPHABET {
+                assert_eq!(decode_base64(&[a, b], 2), decode_base64(&[a, b'\n', b], 2));
+                for &c in ALPHABET {
+                    assert_eq!(
+                        decode_base64(&[a, b, c], 3),
+                        decode_base64(&[a, b'\t', b, c], 3)
+                    );
+                }
+                let c = ALPHABET[(usize::from(a) * 7 + usize::from(b)) % 64];
+                let d = ALPHABET[(usize::from(a) + usize::from(b) * 13) % 64];
+                assert_eq!(
+                    decode_base64(&[a, b, c, d], 3),
+                    decode_base64(&[a, b'\r', b, c, b' ', d], 3)
+                );
+            }
+        }
+        for input in [b"AB".as_slice(), b"ABC", b"ABCD"] {
+            for padding in 0..=5 {
+                let mut plain = input.to_vec();
+                plain.extend(std::iter::repeat_n(b'=', padding));
+                let mut wrapped = vec![b'\n'];
+                wrapped.extend_from_slice(&plain);
+                wrapped.push(b'\t');
+                for cap in 0..=4 {
+                    assert_eq!(decode_base64(&plain, cap), decode_base64(&wrapped, cap));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validation_precedence_and_permissive_padding_are_unchanged() {
+        for input in [b"=".as_slice(), b"====", b"= \t=\n"] {
+            assert_eq!(decode_base64(input, 0), Ok(Vec::new()));
+        }
+        assert_eq!(decode_base64(b"AB", 1), Ok(vec![0]));
+        assert_eq!(decode_base64(b"ABC", 2), Ok(vec![0, 16]));
+        assert_eq!(
+            decode_base64(b"A===", 0),
+            Err(Error::Invalid("base64 length"))
+        );
+        assert_eq!(
+            decode_base64(b"AA=A", 0),
+            Err(Error::Invalid("base64 padding is not at the end"))
+        );
+        assert_eq!(
+            decode_base64(b"AA=!", 0),
+            Err(Error::Invalid("base64 padding is not at the end"))
+        );
+        assert_eq!(
+            decode_base64(b"!AAA", 0),
+            Err(Error::Invalid("base64 alphabet"))
+        );
+        assert_eq!(decode_base64(b"AAAA", 2), Err(Error::TooLarge));
     }
 }

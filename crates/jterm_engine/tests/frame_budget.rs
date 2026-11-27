@@ -97,9 +97,14 @@ fn tightened_budgets_reject_without_allocating_or_advancing_receiver() {
             },
             rows,
         );
-        // Positive control: the allocation observer sees a successful copy.
+        // Cursor-only updates reuse the rows; content updates still exercise
+        // the allocation observer's successful-copy positive control.
         let (accepted, allocations) = measured(|| base.apply(&delta, LIMITS));
-        assert!(allocations > 0);
+        if delta.rows.is_empty() {
+            assert_eq!(allocations, 0);
+        } else {
+            assert!(allocations > 0);
+        }
         assert_eq!(accepted.unwrap().stamp(), delta.next);
         for limits in [
             Limits {

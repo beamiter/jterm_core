@@ -58,8 +58,8 @@ fn opt_in_retains_fragmented_rgb_indexed_and_reset_semantics() {
     assert_eq!(frame.underline_color(0, usize::MAX), None);
 
     let query = b"\x1b[4;58;5;9m\x1bP$qm\x1b\\";
-    assert_eq!(styled.feed(query).unwrap(), b"\x1bP1$r4;58;5;9m\x1b\\");
-    assert_eq!(legacy.feed(query).unwrap(), b"\x1bP1$r4m\x1b\\");
+    assert_eq!(styled.feed(query).unwrap(), b"\x1bP1$r0;4;58;5;9m\x1b\\");
+    assert_eq!(legacy.feed(query).unwrap(), b"\x1bP1$r0;4m\x1b\\");
     styled.feed(b"\x1b[!pF").unwrap();
     assert_eq!(styled.frame().unwrap().underline_color(0, 5), None);
 }

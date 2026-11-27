@@ -1,6 +1,6 @@
 //! Terminal wire version 3 as used by the native bridge and browser receiver.
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 pub const VERSION: u8 = 3;
 pub const MAX_ROWS: usize = 128;
@@ -34,6 +34,38 @@ pub enum CursorShape {
     Beam,
 }
 
+/// Compact RGB paint value serialized as a CSS `#RRGGBB` string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RgbColor(pub u8, pub u8, pub u8);
+
+impl From<(u8, u8, u8)> for RgbColor {
+    fn from((red, green, blue): (u8, u8, u8)) -> Self {
+        Self(red, green, blue)
+    }
+}
+
+impl Serialize for RgbColor {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Self(red, green, blue) = *self;
+        serializer.collect_str(&format_args!("#{red:02x}{green:02x}{blue:02x}"))
+    }
+}
+
+impl<'de> Deserialize<'de> for RgbColor {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.len() != 7
+            || !value.starts_with('#')
+            || !value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(de::Error::custom("expected a six-digit RGB color"));
+        }
+        let channel =
+            |start| u8::from_str_radix(&value[start..start + 2], 16).map_err(de::Error::custom);
+        Ok(Self(channel(1)?, channel(3)?, channel(5)?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WireCell {
     pub text: String,
@@ -57,6 +89,8 @@ pub struct WireFrame {
     pub cursor_col: usize,
     pub cursor_visible: bool,
     pub cursor_shape: CursorShape,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_color: Option<RgbColor>,
     pub pending_wrap: bool,
 }
 
@@ -94,6 +128,8 @@ pub struct WireDelta {
     pub cursor_col: usize,
     pub cursor_visible: bool,
     pub cursor_shape: CursorShape,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_color: Option<RgbColor>,
     pub pending_wrap: bool,
     pub rows: Vec<ChangedRow>,
 }

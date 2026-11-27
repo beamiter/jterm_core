@@ -103,7 +103,7 @@ fn capture_top(screen: &mut ScreenState, bottom: usize) -> ScrollbackLine {
 }
 
 #[test]
-fn equal_physical_rows_keep_distinct_margin_origins_in_both_compression_lanes() {
+fn visually_equal_rows_keep_distinct_margin_origins_and_drawn_spaces() {
     for style in [Color::Default, Color::Red] {
         let mut virgin = printed_prefix(2, style);
         let mut explicit = printed_prefix(2, style);
@@ -113,14 +113,24 @@ fn equal_physical_rows_keep_distinct_margin_origins_in_both_compression_lanes() 
         explicit.write_char_in_row('界', 2, true);
         early_wrap(&mut virgin);
 
-        assert_eq!(virgin.grid.to_vec(), explicit.grid.to_vec());
+        let mut explicit_cells = explicit.grid.to_vec();
+        let drawn_space = explicit_cells[0][3];
+        assert_eq!(drawn_space.character, ' ');
+        assert_eq!(drawn_space.foreground, Color::Default);
+        assert_eq!(drawn_space.background, Color::Default);
+        assert_ne!(drawn_space.flags, TerminalCell::default().flags);
+        explicit_cells[0][3] = TerminalCell::default();
+        assert_eq!(virgin.grid.to_vec(), explicit_cells);
         assert_eq!(virgin.grid.row_wrapped, explicit.grid.row_wrapped);
         assert_eq!(virgin.grid[0][3], TerminalCell::default());
         assert_eq!(virgin.grid[1][0].character, '界');
         assert!(virgin.grid[1][1].flags.wide_continuation());
         let proof = capture_top(&mut virgin, 1);
         let literal = capture_top(&mut explicit, 1);
-        assert_eq!(proof.decompress(), literal.decompress());
+        let mut literal_cells = literal.decompress();
+        assert_eq!(literal_cells[3], drawn_space);
+        literal_cells[3] = TerminalCell::default();
+        assert_eq!(proof.decompress(), literal_cells);
         assert_eq!(proof.reflow_content_len(), literal.reflow_content_len());
         assert_eq!(
             proof.reflow_wide_continuations(),
@@ -129,7 +139,7 @@ fn equal_physical_rows_keep_distinct_margin_origins_in_both_compression_lanes() 
         assert!(proof.is_wrapped && literal.is_wrapped);
         assert_eq!(proof.synthetic_margin_gap(), Some(3));
         assert_eq!(literal.synthetic_margin_gap(), None);
-        // Ordinary storage callers do not infer proof from identical row bytes.
+        // Retaining a row outside grid archival leaves the gap uncertified.
         assert_eq!(
             ScrollbackLine::compress(&proof.decompress(), true).synthetic_margin_gap(),
             None

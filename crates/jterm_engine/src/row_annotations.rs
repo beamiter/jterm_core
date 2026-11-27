@@ -91,6 +91,10 @@ impl RowAnnotations {
         self.cells.is_empty()
     }
 
+    pub(crate) fn has_text(&self) -> bool {
+        self.text_bytes != 0
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         let arc_header = 2 * size_of::<usize>();
         size_of::<Self>()
@@ -106,12 +110,7 @@ impl RowAnnotations {
     }
 
     pub(crate) fn can_store_after_displacing(&self, columns: Range<usize>, bytes: usize) -> bool {
-        let range = self.position(columns.start)..self.position(columns.end);
-        let removed = self.cells[range]
-            .iter()
-            .map(|cell| cell.value.text_bytes())
-            .sum::<usize>();
-        self.text_bytes - removed + bytes <= MAX_ROW_CLUSTER_BYTES
+        self.text_bytes - self.text_bytes_in(columns) + bytes <= MAX_ROW_CLUSTER_BYTES
     }
 
     pub(crate) fn set(&mut self, column: usize, text: Arc<str>) {
@@ -148,6 +147,41 @@ impl RowAnnotations {
             .drain(range)
             .map(|cell| cell.value.text_bytes())
             .sum::<usize>();
+    }
+
+    pub(crate) fn text_bytes_in(&self, columns: Range<usize>) -> usize {
+        self.cells[self.position(columns.start)..self.position(columns.end)]
+            .iter()
+            .map(|cell| cell.value.text_bytes())
+            .sum()
+    }
+
+    /// Copy text into an already-cleared, preflighted target span. Raster
+    /// placements remain owned by their original screen coordinates.
+    pub(crate) fn copy_text_from(
+        &mut self,
+        source: &Self,
+        source_columns: Range<usize>,
+        target_start: usize,
+    ) {
+        let target = self.position(target_start);
+        let text_bytes = &mut self.text_bytes;
+        let copied = source.cells
+            [source.position(source_columns.start)..source.position(source_columns.end)]
+            .iter()
+            .filter_map(|cell| {
+                let Value::Text(text) = &cell.value else {
+                    return None;
+                };
+                let offset = usize::from(cell.column) - source_columns.start;
+                *text_bytes += text.len();
+                Some(Annotation {
+                    column: (target_start + offset) as u16,
+                    value: Value::Text(Arc::clone(text)),
+                })
+            });
+        drop(self.cells.splice(target..target, copied));
+        debug_assert!(self.text_bytes <= MAX_ROW_CLUSTER_BYTES);
     }
 
     pub(crate) fn insert_columns(&mut self, column: usize, count: usize, cols: usize) {

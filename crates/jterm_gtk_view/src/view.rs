@@ -1,4 +1,4 @@
-use gtk4::{gdk, pango, prelude::*};
+use gtk4::{gdk, glib, graphene, pango, prelude::*, subclass::prelude::*};
 use jterm_engine::{
     colors::ColorState,
     frame::{CellFrame, Cursor, Row},
@@ -18,10 +18,78 @@ use crate::pane::{PlainLinkFinder, Theme};
 
 const MARGIN: i32 = 6;
 
+#[derive(Clone, Copy, PartialEq)]
+struct CursorStroke {
+    offset: i32,
+    shape: CursorShape,
+    color: gdk::RGBA,
+}
+
+mod imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct CursorTextView {
+        pub(super) stroke: Cell<Option<CursorStroke>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for CursorTextView {
+        const NAME: &'static str = "JtermCursorTextView";
+        type Type = super::CursorTextView;
+        type ParentType = gtk4::TextView;
+    }
+
+    impl ObjectImpl for CursorTextView {}
+    impl WidgetImpl for CursorTextView {}
+
+    impl TextViewImpl for CursorTextView {
+        fn snapshot_layer(&self, layer: gtk4::TextViewLayer, snapshot: gtk4::Snapshot) {
+            let Some(stroke) = self
+                .stroke
+                .get()
+                .filter(|_| layer == gtk4::TextViewLayer::AboveText)
+            else {
+                self.parent_snapshot_layer(layer, snapshot);
+                return;
+            };
+            self.parent_snapshot_layer(layer, snapshot.clone());
+            let view = self.obj();
+            let iter = view.buffer().iter_at_offset(stroke.offset);
+            let area = view.iter_location(&iter);
+            let (x, y) = (area.x() as f32, area.y() as f32);
+            let (width, height) = (area.width().max(1) as f32, area.height().max(1) as f32);
+            let bounds = match stroke.shape {
+                CursorShape::Beam => graphene::Rect::new(x, y, width.min(2.0), height),
+                CursorShape::Underline => {
+                    let thickness = height.min(2.0);
+                    graphene::Rect::new(x, y + height - thickness, width, thickness)
+                }
+                CursorShape::Block => return,
+            };
+            snapshot.append_color(&stroke.color, &bounds);
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct CursorTextView(ObjectSubclass<imp::CursorTextView>)
+        @extends gtk4::TextView, gtk4::Widget,
+        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Scrollable;
+}
+
+impl CursorTextView {
+    fn set_cursor_stroke(&self, stroke: Option<CursorStroke>) {
+        if self.imp().stroke.replace(stroke) != stroke {
+            self.queue_draw();
+        }
+    }
+}
+
 /// GTK presentation of an immutable live or historical viewport. The widget owns selection
 /// and clipboard state; the session owns the grid and every terminal mode.
 pub(crate) struct TerminalView {
-    pub(crate) widget: gtk4::TextView,
+    pub(crate) widget: CursorTextView,
     preedit: gtk4::Label,
     cursor_offset: Cell<Option<i32>>,
     presentation: Rc<RefCell<Option<Presentation>>>,
@@ -86,7 +154,9 @@ pub fn terminal_view_selection(widget: &gtk4::Widget) -> Option<String> {
 impl Drop for TerminalView {
     fn drop(&mut self) {
         let _ = LIVE_SELECTIONS.try_with(|entries| {
-            entries.borrow_mut().remove(&self.widget.as_ptr());
+            entries
+                .borrow_mut()
+                .remove(&self.widget.upcast_ref::<gtk4::TextView>().as_ptr());
         });
     }
 }
@@ -241,18 +311,18 @@ impl PresentedLink {
 impl TerminalView {
     pub(crate) fn new(theme: Theme) -> Self {
         let buffer = gtk4::TextBuffer::builder().enable_undo(false).build();
-        let widget = gtk4::TextView::builder()
-            .buffer(&buffer)
-            .editable(false)
-            .cursor_visible(false)
-            .monospace(true)
-            .wrap_mode(gtk4::WrapMode::None)
-            .left_margin(MARGIN)
-            .right_margin(MARGIN)
-            .top_margin(MARGIN)
-            .bottom_margin(MARGIN)
-            .hexpand(true)
-            .vexpand(true)
+        let widget = glib::Object::builder::<CursorTextView>()
+            .property("buffer", &buffer)
+            .property("editable", false)
+            .property("cursor-visible", false)
+            .property("monospace", true)
+            .property("wrap-mode", gtk4::WrapMode::None)
+            .property("left-margin", MARGIN)
+            .property("right-margin", MARGIN)
+            .property("top-margin", MARGIN)
+            .property("bottom-margin", MARGIN)
+            .property("hexpand", true)
+            .property("vexpand", true)
             .build();
         widget.set_widget_name("shared-terminal-screen");
         let background_style = gtk4::CssProvider::new();
@@ -285,9 +355,10 @@ impl TerminalView {
             palette_revision: Cell::new(0),
         };
         LIVE_SELECTIONS.with(|entries| {
-            entries
-                .borrow_mut()
-                .insert(view.widget.as_ptr(), Rc::downgrade(&view.presentation));
+            entries.borrow_mut().insert(
+                view.widget.upcast_ref::<gtk4::TextView>().as_ptr(),
+                Rc::downgrade(&view.presentation),
+            );
         });
         view.paint_background(background);
         view
@@ -305,6 +376,8 @@ impl TerminalView {
 
     pub(crate) fn clear(&self) {
         self.presentation.take();
+        self.cursor_offset.set(None);
+        self.widget.set_cursor_stroke(None);
         self.widget.buffer().set_text("");
     }
 
@@ -492,6 +565,25 @@ impl TerminalView {
         });
         self.cursor_offset
             .set(caret.as_ref().map(gtk4::TextIter::offset));
+        let cursor = frame.cursor();
+        let stroke = caret.as_ref().and_then(|iter| {
+            if history.is_some() || !cursor.visible || cursor.shape == CursorShape::Block {
+                return None;
+            }
+            let (row, column) = cursor.paint_position();
+            let cells = &frame.rows()[row].cells;
+            // The text iterator and cursor both anchor at the lead of a wide glyph.
+            let column = column - usize::from(cells[column].flags.wide_continuation());
+            let color = theme
+                .cursor()
+                .unwrap_or_else(|| Self::style(&theme, &cells[column], None, false).foreground);
+            Some(CursorStroke {
+                offset: iter.offset(),
+                shape: cursor.shape,
+                color,
+            })
+        });
+        self.widget.set_cursor_stroke(stroke);
         if let Some(caret) = caret {
             if current.buffer.iter_at_mark(&current.buffer.get_insert()) != caret {
                 current.buffer.place_cursor(&caret);
@@ -512,12 +604,13 @@ impl TerminalView {
         y: f64,
         find_plain: Option<PlainLinkFinder>,
     ) -> Option<PresentedLink> {
-        let iter = text_at_point(&self.widget, x, y)?;
+        let widget = self.widget.upcast_ref();
+        let iter = text_at_point(widget, x, y)?;
         let shown = self.presentation.borrow();
         let shown = shown.as_ref()?;
         let row = shown.rows.get(iter.line() as usize)?;
         link_for_offset(&row.links, iter.line_offset()).or_else(|| {
-            plain_link_at(&self.widget, &iter, find_plain?, |line| {
+            plain_link_at(widget, &iter, find_plain?, |line| {
                 shown
                     .rows
                     .get(line)
@@ -586,7 +679,10 @@ impl TerminalView {
     }
 
     pub(crate) fn selected_text(&self) -> Option<String> {
-        selected_text(&self.widget, self.presentation.borrow().as_ref())
+        selected_text(
+            self.widget.upcast_ref(),
+            self.presentation.borrow().as_ref(),
+        )
     }
 
     pub(crate) fn show_preedit(&self, text: &str, attributes: pango::AttrList) {
@@ -641,7 +737,7 @@ impl TerminalView {
         theme: &PaintTheme<'_>,
         cell: &TerminalCell,
         underline_color: Option<Color>,
-        cursor: Option<CursorShape>,
+        block_cursor: bool,
     ) -> Style {
         let mut foreground = theme.color(cell.foreground, theme.foreground());
         let mut background = theme.color(cell.background, theme.background());
@@ -652,7 +748,7 @@ impl TerminalView {
             std::mem::swap(&mut foreground, &mut background);
             foreground.set_alpha(1.0);
         }
-        if matches!(cursor, Some(CursorShape::Block | CursorShape::Beam)) {
+        if block_cursor {
             std::mem::swap(&mut foreground, &mut background);
             if let Some(cursor) = theme.configured.cursor {
                 foreground = cursor.foreground;
@@ -663,11 +759,10 @@ impl TerminalView {
                 background = cursor_color;
             }
         }
-        let underline = match (cell.flags.underline(), cursor) {
-            (UnderlineStyle::Double, _) => pango::Underline::Double,
-            (UnderlineStyle::Curly, _) => pango::Underline::Error,
-            (UnderlineStyle::None, Some(CursorShape::Underline)) => pango::Underline::Single,
-            (UnderlineStyle::None, _) => pango::Underline::None,
+        let underline = match cell.flags.underline() {
+            UnderlineStyle::Double => pango::Underline::Double,
+            UnderlineStyle::Curly => pango::Underline::Error,
+            UnderlineStyle::None => pango::Underline::None,
             _ => pango::Underline::Single,
         };
         Style {
@@ -676,13 +771,9 @@ impl TerminalView {
             bold: cell.flags.bold(),
             italic: cell.flags.italic(),
             underline,
-            underline_color: if cell.flags.underline() != UnderlineStyle::None {
-                underline_color.map(|color| theme.color(color, foreground))
-            } else if cursor == Some(CursorShape::Underline) {
-                theme.cursor()
-            } else {
-                None
-            },
+            underline_color: underline_color
+                .filter(|_| underline != pango::Underline::None)
+                .map(|color| theme.color(color, foreground)),
             strikethrough: cell.flags.strikethrough(),
         }
     }
@@ -934,6 +1025,81 @@ fn live_update_preserves_unchanged_buffer_rows_and_moves_the_caret() {
 #[cfg(test)]
 #[test]
 #[ignore = "requires a GTK display"]
+fn cursor_strokes_use_text_geometry_and_leave_the_caret_available() {
+    gtk4::init().expect("GTK display");
+    let mut terminal = jterm_engine::terminal::Terminal::new(3, 8).unwrap();
+    let color = gdk::RGBA::new(0.1, 0.9, 0.4, 1.0);
+    let view = TerminalView::new(Theme {
+        font: pango::FontDescription::from_string("Monospace 12"),
+        foreground: gdk::RGBA::WHITE,
+        background: gdk::RGBA::BLACK,
+        palette: default_ansi_palette(),
+        cursor: Some(crate::pane::CursorColors {
+            foreground: gdk::RGBA::BLACK,
+            background: color,
+        }),
+    });
+    let window = gtk4::Window::builder().child(&view.widget).build();
+    window.present();
+    let context = glib::MainContext::default();
+    let present = |terminal: &jterm_engine::terminal::Terminal, history: Option<&HistoryPage>| {
+        view.present(
+            &terminal.frame().unwrap(),
+            terminal.live_margin_gaps(),
+            history,
+            None,
+        );
+        while context.iteration(false) {}
+    };
+    let stroke = || {
+        let snapshot = gtk4::Snapshot::new();
+        view.widget
+            .imp()
+            .snapshot_layer(gtk4::TextViewLayer::AboveText, snapshot.clone());
+        snapshot
+            .to_node()
+            .map(|node| node.downcast::<gtk4::gsk::ColorNode>().unwrap())
+    };
+
+    terminal
+        .feed("\x1b[4:3m界\x1b[1;2H\x1b[6 q".as_bytes())
+        .unwrap();
+    present(&terminal, None);
+    let buffer = view.widget.buffer();
+    let area = view.widget.iter_location(&buffer.start_iter());
+    assert_eq!(view.cursor_offset.get(), Some(0));
+    let beam = stroke().unwrap();
+    assert_eq!(beam.color(), color);
+    assert_eq!(beam.bounds().x(), area.x() as f32);
+    assert_eq!(beam.bounds().width(), 2.0);
+    assert_eq!(beam.bounds().height(), area.height() as f32);
+
+    terminal.feed(b"\x1b[4 q").unwrap();
+    present(&terminal, None);
+    let underline = stroke().unwrap();
+    assert_eq!(underline.color(), color);
+    assert_eq!(underline.bounds().width(), area.width() as f32);
+    assert_eq!(underline.bounds().height(), 2.0);
+    assert_eq!(
+        underline.bounds().y() + 2.0,
+        (area.y() + area.height()) as f32
+    );
+
+    terminal.feed(b"\x1b[?25l").unwrap();
+    present(&terminal, None);
+    assert!(stroke().is_none());
+    assert_eq!(view.cursor_offset.get(), Some(0));
+    terminal.feed(b"\x1b[?25h\r\nX\r\nX\r\nX").unwrap();
+    let history = terminal.history_page(0, 1).unwrap();
+    present(&terminal, Some(&history));
+    assert!(stroke().is_none());
+    assert_eq!(view.cursor_offset.get(), None);
+    window.close();
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "requires a GTK display"]
 fn selection_joins_wide_wraps_in_live_and_archived_rows() {
     gtk4::init().expect("GTK display");
     let mut terminal = jterm_engine::terminal::Terminal::new(3, 6).unwrap();
@@ -1007,13 +1173,10 @@ fn live_updates(before: &CellFrame, after: &CellFrame, changed_gaps: u128) -> Op
     if before.stamp() == after.stamp() {
         return Some(Vec::new());
     }
-    let delta = before.delta_to(after).ok()?;
-    let mut rows = delta
-        .rows
-        .into_iter()
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    rows.extend((0..after.rows().len()).filter(|row| changed_gaps & (1 << row) != 0));
+    let mut rows = before.changed_row_indices(after).ok()?;
+    if changed_gaps != 0 {
+        rows.extend((0..after.rows().len()).filter(|row| changed_gaps & (1 << row) != 0));
+    }
     if before.cursor() != after.cursor() {
         rows.push(before.cursor().paint_position().0);
         rows.push(after.cursor().paint_position().0);
@@ -1158,6 +1321,17 @@ fn paint_row(
     let mut offset = 0;
     let mut run = String::new();
     let mut previous = None;
+    // Repeated styles are common in text rows. Diverse rows retain the
+    // ordinary resolver, including rows whose first cells only happen to match.
+    let mut cache_styles = row
+        .cells
+        .first()
+        .zip(row.cells.get(1))
+        .is_some_and(|(a, b)| {
+            a.foreground == b.foreground && a.background == b.background && a.flags == b.flags
+        });
+    let mut style_cache = None;
+    let mut style_misses = 0u8;
     let mut underline_colors = source.underline_colors().iter().peekable();
     let margin_gap = source.margin_gap();
     for (column, cell) in row.cells.iter().enumerate() {
@@ -1184,14 +1358,35 @@ fn paint_row(
             .peek()
             .filter(|color| usize::from(color.start) <= column)
             .map(|color| color.color);
-        let style = TerminalView::style(
-            theme,
-            cell,
-            underline_color,
-            caret
-                .filter(|cursor| cursor.visible)
-                .map(|cursor| cursor.shape),
-        );
+        let block_cursor =
+            caret.is_some_and(|cursor| cursor.visible && cursor.shape == CursorShape::Block);
+        let style = if cache_styles {
+            let key = (
+                cell.foreground,
+                cell.background,
+                cell.flags,
+                underline_color,
+                block_cursor,
+            );
+            if let Some((_, style)) = style_cache.filter(|(previous, _)| *previous == key) {
+                style_misses = 0;
+                style
+            } else {
+                if style_cache.is_some() {
+                    style_misses += 1;
+                    // Two misses can surround an isolated cursor or underline
+                    // change. Three indicate that caching is no longer useful.
+                    cache_styles = style_misses < 3;
+                }
+                let style = TerminalView::style(theme, cell, underline_color, block_cursor);
+                if cache_styles {
+                    style_cache = Some((key, style));
+                }
+                style
+            }
+        } else {
+            TerminalView::style(theme, cell, underline_color, block_cursor)
+        };
         if let Some(old_style) = previous.filter(|old| *old != style) {
             result
                 .tags

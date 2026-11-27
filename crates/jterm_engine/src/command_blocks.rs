@@ -255,9 +255,9 @@ impl CommandBlocks {
         &self.completed
     }
 
-    pub(crate) fn resized(&mut self, dimensions_changed: bool) {
+    pub(crate) fn resized(&mut self) {
         if let Some(active) = &mut self.active {
-            active.resized |= dimensions_changed;
+            active.resized = true;
             active.unavailable();
         }
     }

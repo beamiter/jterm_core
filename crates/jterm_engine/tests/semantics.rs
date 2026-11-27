@@ -5,7 +5,7 @@ use jterm_engine::{
     protocol_state::ProtocolState,
     screen::ScreenState,
     semantics::{dispatch_local, frost_legacy_sgr, Dispatch, Effect},
-    Color, TerminalGrid, UnderlineStyle,
+    Color, StyleFlags, TerminalGrid, UnderlineStyle,
 };
 
 fn screen() -> ScreenState {
@@ -114,9 +114,44 @@ fn sgr_profiles_keep_group_consumption_and_protection_distinct() {
     assert_eq!(standard.current_bg, Color::Default);
     assert_eq!(standard.current_flags.underline(), UnderlineStyle::Single);
     assert!(standard.current_flags.protected());
-    assert!(standard.current_flags.inverse());
+    // The unknown underline substyle is consumed atomically, not SGR7.
+    assert!(!standard.current_flags.inverse());
     assert!(standard.current_flags.bold());
     assert!(standard.current_flags.dim());
+}
+
+#[test]
+fn frost_single_group_sgr_matches_grouped_rendition() {
+    for raw in [
+        b"".as_slice(),
+        b"0",
+        b"1",
+        b"4",
+        b"21",
+        b"31",
+        b"44",
+        b"49",
+        b"38",
+        b"48",
+        b"58",
+        b"42x",
+        b"00?31",
+        b"65535999",
+    ] {
+        let apply = |parameters| {
+            let mut fg = Color::Green;
+            let mut bg = Color::Blue;
+            let mut flags = StyleFlags::default();
+            flags.set_protected(true);
+            flags.set_bold(true);
+            let effect = frost_legacy_sgr(parameters, &mut fg, &mut bg, &mut flags);
+            (fg, bg, flags, effect)
+        };
+        // An ignored second group keeps the first group's behavior while
+        // exercising the original grouped reducer.
+        let grouped = [raw, b";65535"].concat();
+        assert_eq!(apply(raw), apply(&grouped), "raw={raw:?}");
+    }
 }
 
 #[test]
@@ -145,6 +180,21 @@ fn sgr_matches_frozen_original_on_adversarial_sequences() {
     ];
     for params in fixtures {
         for colons in [false, true] {
+            // Atomic colon ownership deliberately replaces the old flattened
+            // argument behavior; those changed cases have independent wire
+            // and paint expectations in sgr_colon_groups.rs.
+            if colons
+                && matches!(
+                    params.as_slice(),
+                    [41, 0, 49]
+                        | [38, 2, 0, 255, 256, 65535]
+                        | [48, 5, 65535]
+                        | [38, 2, 1]
+                        | [48, 2, 0, 1, 2, 3, 49]
+                )
+            {
+                continue;
+            }
             let flags: Vec<_> = (0..params.len()).map(|i| i > 0 && colons).collect();
             original.handle_sgr(&params, &flags);
             let event = Event::Csi {
@@ -180,10 +230,12 @@ fn sgr_matches_frozen_original_on_adversarial_sequences() {
     for _ in 0..4000 {
         let mut params = Vec::new();
         let mut flags = Vec::new();
-        for i in 0..12 {
+        for _ in 0..12 {
             random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
             params.push(alphabet[random as usize % alphabet.len()]);
-            flags.push(i > 0 && (random >> 32) & 1 == 1);
+            // Preserve all4000 legacy semicolon oracles. Colon groups are
+            // checked against independent semantics rather than old leakage.
+            flags.push(false);
         }
         original.handle_sgr(&params, &flags);
         let event = Event::Csi {
@@ -315,4 +367,92 @@ fn keyboard_query_replies_and_saved_cursor_are_ordered() {
         handled(&mut s, &mut p, &csi(b'u', &[], Some(b'?'), &[])),
         [Effect::Reply(b"\x1b[?17u".to_vec())]
     );
+}
+
+#[test]
+fn cursor_namespaces_are_transactionally_rejected_in_both_profiles() {
+    use jterm_engine::semantics::dispatch_frost_legacy_csi;
+    for command in b"ABCDEFGHIZadefjk`" {
+        for (prefix, intermediates) in [
+            (Some(b'?'), b"".as_slice()),
+            (Some(b'>'), b""),
+            (None, b"$"),
+            (None, b" "),
+        ] {
+            // XTFMTKEYS is a separately admitted protocol command.
+            if *command == b'f' && prefix == Some(b'>') {
+                continue;
+            }
+            let mut s = screen();
+            let mut p = ProtocolState::default();
+            s.cursor_row = 2;
+            s.cursor_col = 7;
+            s.pending_wrap = true;
+            s.origin_mode = true;
+            s.scroll_region_top = 1;
+            s.scroll_region_bottom = 3;
+            let before = snapshot(&s, &p);
+            let event = csi(*command, &[2], prefix, intermediates);
+            assert_eq!(dispatch_local(&mut s, &mut p, &event), Dispatch::Unhandled);
+            assert_eq!(snapshot(&s, &p), before);
+            assert_eq!(
+                dispatch_frost_legacy_csi(
+                    &mut s,
+                    &mut p,
+                    b"2",
+                    &[2],
+                    *command,
+                    prefix,
+                    intermediates
+                ),
+                Dispatch::Unhandled
+            );
+            assert_eq!(snapshot(&s, &p), before);
+        }
+    }
+}
+
+#[test]
+fn sgr_requires_the_rendition_namespace_in_both_profiles() {
+    use jterm_engine::semantics::dispatch_frost_legacy_csi;
+    let mut s = screen();
+    let mut p = ProtocolState::default();
+    handled(&mut s, &mut p, &csi(b'm', &[32, 44, 1], None, b""));
+    let before = snapshot(&s, &p);
+    for (prefix, intermediate) in [
+        (Some(b'?'), b"".as_slice()),
+        (Some(b'='), b""),
+        (Some(b'<'), b""),
+        (None, b"$"),
+        (None, b"%"),
+        (Some(b'>'), b"$"),
+    ] {
+        assert_eq!(
+            dispatch_local(
+                &mut s,
+                &mut p,
+                &csi(b'm', &[31, 41, 0], prefix, intermediate)
+            ),
+            Dispatch::Unhandled
+        );
+        assert_eq!(snapshot(&s, &p), before);
+        assert_eq!(
+            dispatch_frost_legacy_csi(
+                &mut s,
+                &mut p,
+                b"31;41;0",
+                &[31, 41, 0],
+                b'm',
+                prefix,
+                intermediate
+            ),
+            Dispatch::Unhandled
+        );
+        assert_eq!(snapshot(&s, &p), before);
+    }
+    assert_eq!(
+        handled(&mut s, &mut p, &csi(b'm', &[31, 41], None, b"")),
+        [Effect::GlobalBackground(Color::Red)]
+    );
+    assert_eq!((s.current_fg, s.current_bg), (Color::Red, Color::Red));
 }

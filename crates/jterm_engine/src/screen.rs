@@ -86,6 +86,26 @@ impl Charset {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CharsetBanks {
+    upper: [Charset; 2],
+    invoked: u8,
+    invoked_gr: u8,
+    latin1: u8,
+    single_shift: Option<u8>,
+}
+impl Default for CharsetBanks {
+    fn default() -> Self {
+        Self {
+            upper: [Charset::Ascii; 2],
+            invoked: 0,
+            invoked_gr: 2,
+            latin1: 0,
+            single_shift: None,
+        }
+    }
+}
+
 /// DECSC/DECRC 保存的完整光标状态(含 SGR 属性、字符集、模式),
 /// 与备用屏幕缓冲使用的 saved_cursor_row/col 解耦。
 #[derive(Clone, Debug)]
@@ -157,8 +177,17 @@ impl CursorDrawing<'_> {
             self.restore_pen(saved);
             *self.pending_wrap = saved.pending_wrap;
         } else {
+            // DEC DECRC defines a normal home drawing state when DECSC has
+            // never populated this slot. This is not a screen or mode reset.
             *self.position.0 = 0;
             *self.position.1 = 0;
+            *self.fg = Color::Default;
+            *self.bg = Color::Default;
+            *self.flags = StyleFlags::default();
+            *self.g0 = Charset::Ascii;
+            *self.g1 = Charset::Ascii;
+            *self.active = Charset::Ascii;
+            *self.origin_mode = false;
             *self.pending_wrap = false;
         }
     }
@@ -300,6 +329,8 @@ pub struct AlternateScreenControls<'a, Grid> {
     pub primary_position: (&'a mut usize, &'a mut usize),
     pub alternate_position: (&'a mut usize, &'a mut usize),
     pub saved_primary: &'a mut Option<SavedCursorState>,
+    charset_banks: &'a mut CharsetBanks,
+    saved_primary_banks: &'a mut CharsetBanks,
     pub margins: (&'a mut usize, &'a mut usize),
     pub rows: usize,
 }
@@ -320,6 +351,7 @@ impl<Grid> AlternateScreenControls<'_, Grid> {
             *self.primary_position.0 = *self.cursor.position.0;
             *self.primary_position.1 = *self.cursor.position.1;
             *self.saved_primary = Some(self.cursor.snapshot(autowrap));
+            *self.saved_primary_banks = *self.charset_banks;
         }
         std::mem::swap(self.grid, self.alt_grid);
         *self.alternate_position.0 = *self.cursor.position.0;
@@ -355,6 +387,7 @@ impl<Grid> AlternateScreenControls<'_, Grid> {
         *self.cursor.pending_wrap = false;
         let restore_autowrap = if let Some(saved) = self.saved_primary.take() {
             self.cursor.restore_pen(&saved);
+            *self.charset_banks = *self.saved_primary_banks;
             *self.cursor.pending_wrap = frost && saved.pending_wrap;
             (!frost).then_some(saved.autowrap)
         } else {
@@ -559,6 +592,9 @@ pub struct ScreenState<Grid = TerminalGrid> {
     pub g0_charset: Charset,
     pub g1_charset: Charset,
     pub active_charset: Charset,
+    charset_banks: CharsetBanks,
+    saved_cursor_banks: CharsetBanks,
+    saved_primary_banks: CharsetBanks,
 }
 
 impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
@@ -601,10 +637,14 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: Charset::Ascii,
+            charset_banks: CharsetBanks::default(),
+            saved_cursor_banks: CharsetBanks::default(),
+            saved_primary_banks: CharsetBanks::default(),
         }
     }
 
     pub fn alternate_screen_controls(&mut self) -> AlternateScreenControls<'_, Grid> {
+        self.charset_banks.invoked = self.invoked_charset_bank();
         let rows = self.grid.as_ref().rows();
         AlternateScreenControls {
             grid: &mut self.grid,
@@ -624,6 +664,8 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
             primary_position: (&mut self.saved_cursor_row, &mut self.saved_cursor_col),
             alternate_position: (&mut self.alt_cursor_row, &mut self.alt_cursor_col),
             saved_primary: &mut self.saved_primary_screen_state,
+            charset_banks: &mut self.charset_banks,
+            saved_primary_banks: &mut self.saved_primary_banks,
             margins: (&mut self.scroll_region_top, &mut self.scroll_region_bottom),
             rows,
         }
@@ -644,6 +686,8 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
     }
 
     pub fn save_cursor(&mut self, autowrap: bool) {
+        self.charset_banks.invoked = self.invoked_charset_bank();
+        self.saved_cursor_banks = self.charset_banks;
         self.saved_state = Some(self.alternate_screen_controls().cursor.snapshot(autowrap));
     }
 
@@ -655,7 +699,144 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
         self.alternate_screen_controls()
             .cursor
             .restore(saved.as_ref(), rows, cols);
+        if saved.is_some() {
+            self.charset_banks = self.saved_cursor_banks;
+        } else {
+            // Reset supported bank designations/invocation, including pending
+            // single shifts. Default GR remains the engine's Latin-1 fallback.
+            self.reset_charset_banks();
+        }
         saved.map(|state| state.autowrap)
+    }
+
+    pub(crate) fn charset_bank(&self, index: u8) -> Charset {
+        match index {
+            0 => self.g0_charset,
+            1 => self.g1_charset,
+            2 | 3 => self.charset_banks.upper[usize::from(index - 2)],
+            _ => Charset::Ascii,
+        }
+    }
+    pub(crate) fn invoked_charset_bank(&self) -> u8 {
+        let current = self.charset_banks.invoked;
+        if self.charset_bank(current) == self.active_charset {
+            return current;
+        }
+        // Public legacy drawing state may be set directly by a native host.
+        (0..4)
+            .find(|&index| self.charset_bank(index) == self.active_charset)
+            .unwrap_or(0)
+    }
+    pub(crate) fn invoked_g1(&self) -> bool {
+        self.invoked_charset_bank() == 1
+    }
+    pub(crate) fn invoke_charset(&mut self, g1: bool) {
+        self.invoke_charset_bank(u8::from(g1));
+    }
+    pub(crate) fn invoke_charset_bank(&mut self, index: u8) {
+        if index < 4 {
+            self.charset_banks.invoked = index;
+            self.active_charset = self.charset_bank(index);
+        }
+    }
+    pub(crate) fn invoked_gr_charset_bank(&self) -> u8 {
+        self.charset_banks.invoked_gr
+    }
+    pub(crate) fn invoke_gr_charset_bank(&mut self, index: u8) {
+        if index < 4 {
+            self.charset_banks.invoked_gr = index;
+        }
+    }
+    /// Numeric DECFRA uses the selected GL/GR table without consuming SS2/SS3.
+    /// Ordinary Unicode text uses take_graphic_charset and never this mapping.
+    pub(crate) fn translate_fill_character(&self, value: u8) -> char {
+        if value < 128 {
+            let charset = self
+                .single_shift_bank()
+                .map_or(self.active_charset, |index| self.charset_bank(index));
+            return charset.translate(char::from(value));
+        }
+        if self.charset_bank(self.invoked_gr_charset_bank()) == Charset::Ascii {
+            return char::from(value);
+        }
+        if matches!(value, 0xa0 | 0xff) {
+            return ' ';
+        }
+        let base = char::from(value & 0x7f);
+        let mapped = Charset::DecSpecialGraphics.translate(base);
+        if mapped == base {
+            char::from(value)
+        } else {
+            mapped
+        }
+    }
+    /// ISO Latin-1 is identity on this UTF-8 terminal, as in XTerm's ISO
+    /// Latin-1 output path. Private designation bits preserve the 96-set wire
+    /// identity without adding a variant to the public legacy Charset enum.
+    pub(crate) fn designate_latin1(&mut self, index: u8) {
+        if index < 4 {
+            self.designate_charset_bank(index, Charset::Ascii);
+            self.charset_banks.latin1 |= 1 << index;
+        }
+    }
+    pub(crate) fn charset_is_latin1(&self, index: u8) -> bool {
+        index < 4
+            && self.charset_bank(index) == Charset::Ascii
+            && self.charset_banks.latin1 & (1 << index) != 0
+    }
+    pub(crate) fn designate_charset_bank(&mut self, index: u8, charset: Charset) {
+        if index >= 4 {
+            return;
+        }
+        self.charset_banks.latin1 &= !(1 << index);
+        let invoked = self.invoked_charset_bank();
+        match index {
+            0 => self.g0_charset = charset,
+            1 => self.g1_charset = charset,
+            _ => self.charset_banks.upper[usize::from(index - 2)] = charset,
+        }
+        if invoked == index {
+            self.invoke_charset_bank(index);
+        }
+    }
+    pub(crate) fn single_shift(&mut self, index: u8) {
+        if matches!(index, 2 | 3) {
+            self.charset_banks.single_shift = Some(index);
+        }
+    }
+    pub(crate) fn single_shift_bank(&self) -> Option<u8> {
+        self.charset_banks.single_shift
+    }
+    pub(crate) fn single_shift_pending(&self) -> bool {
+        self.charset_banks.single_shift.is_some()
+    }
+    pub(crate) fn take_graphic_charset(&mut self, ch: char) -> Charset {
+        if (' '..='~').contains(&ch) {
+            if let Some(index) = self.charset_banks.single_shift.take() {
+                return self.charset_bank(index);
+            }
+        }
+        self.active_charset
+    }
+    pub(crate) fn reset_charset_banks(&mut self) {
+        self.g0_charset = Charset::Ascii;
+        self.g1_charset = Charset::Ascii;
+        self.active_charset = Charset::Ascii;
+        self.charset_banks = CharsetBanks::default();
+    }
+
+    pub(crate) fn designate_charset(&mut self, g1: bool, charset: Charset) {
+        self.charset_banks.latin1 &= !(1 << u8::from(g1));
+        if g1 {
+            let active = self.invoked_g1();
+            self.g1_charset = charset;
+            if active {
+                self.invoke_charset(true);
+            }
+        } else {
+            self.g0_charset = charset;
+            self.invoke_charset(false);
+        }
     }
 }
 
@@ -1575,6 +1756,26 @@ impl ScreenState {
         )
     }
 
+    fn selective_erase_protected(&self, row: usize, col: usize) -> bool {
+        let flags = self.grid.get(row, col).flags;
+        if flags.protected() {
+            return true;
+        }
+        if flags.wide() && !flags.wide_continuation() && col + 1 < self.grid.cols() {
+            let next = self.grid.get(row, col + 1).flags;
+            if next.wide_continuation() && !next.wide() {
+                return next.protected();
+            }
+        }
+        if flags.wide_continuation() && !flags.wide() && col > 0 {
+            let previous = self.grid.get(row, col - 1).flags;
+            if previous.wide() && !previous.wide_continuation() {
+                return previous.protected();
+            }
+        }
+        false
+    }
+
     /// At most one effect per eligible run, bounded by the width of this row.
     /// Protected-only selective erasure leaves the Last Column Flag untouched.
     pub fn erase_span(
@@ -1591,13 +1792,13 @@ impl ScreenState {
         let end = end.min(self.grid.cols());
         let mut col = start.min(end);
         while col < end {
-            if selective && self.grid.get(row, col).flags.protected() {
+            if selective && self.selective_erase_protected(row, col) {
                 col += 1;
                 continue;
             }
             let start = col;
             col += 1;
-            while col < end && !(selective && self.grid.get(row, col).flags.protected()) {
+            while col < end && !(selective && self.selective_erase_protected(row, col)) {
                 col += 1;
             }
             effects.push(self.row_mutation(row, start, col, None));
@@ -1617,6 +1818,36 @@ impl ScreenState {
     pub fn move_cursor_forward(&mut self, count: usize) {
         self.cursor_controls().move_forward(count);
     }
+    /// XTerm mode45 reverses only across physical rows joined by autowrap.
+    /// The pending last-column position consumes one backward step before
+    /// physical motion. Never enter retained history or alter row metadata.
+    pub(crate) fn move_cursor_backward_with_wrap(
+        &mut self,
+        count: usize,
+        protocol: &ProtocolState,
+    ) {
+        if !protocol.modes().contains(&45) || !protocol.modes().contains(&7) {
+            self.move_cursor_backward(count);
+            return;
+        }
+        let mut remaining = count.saturating_sub(usize::from(self.pending_wrap));
+        self.pending_wrap = false;
+        let (mut row, mut col) = (self.cursor_row, self.cursor_col);
+        while remaining != 0 {
+            let within_row = remaining.min(col);
+            col -= within_row;
+            remaining -= within_row;
+            if remaining == 0 || row == 0 || !self.grid.row_wrapped[row - 1] {
+                break;
+            }
+            row -= 1;
+            col = self.grid.cols() - 1;
+            remaining -= 1;
+        }
+        self.cursor_row = row;
+        self.cursor_col = col;
+    }
+
     pub fn move_cursor_backward(&mut self, count: usize) {
         self.cursor_controls().move_backward(count);
     }
@@ -1640,6 +1871,11 @@ impl ScreenState {
     }
     pub fn clear_all_tab_stops(&mut self) {
         self.cursor_controls().clear_all_tab_stops();
+    }
+    pub fn reset_eight_column_tab_stops(&mut self) {
+        for (column, stop) in self.tab_stops.iter_mut().enumerate() {
+            *stop = column != 0 && column % 8 == 0;
+        }
     }
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
         self.cursor_controls().set_scroll_region(top, bottom);
@@ -1702,6 +1938,352 @@ mod composition_tests {
                 assert_eq!(screen.cursor_col, 2);
                 assert!(!screen.pending_wrap);
                 assert_eq!(screen.last_printed_char, Some('e'));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod charset_bank_tests {
+    use super::*;
+    #[test]
+    fn single_shift_consumes_only_gl_graphics_and_locking_preserves_it() {
+        let mut screen = ScreenState::new(2, 8);
+        screen.designate_charset_bank(2, Charset::DecSpecialGraphics);
+        screen.designate_charset_bank(3, Charset::Ascii);
+        screen.single_shift(2);
+        screen.invoke_charset_bank(3);
+        for ch in ['\n', '\u{7f}', 'é', '界', '\u{301}'] {
+            assert_eq!(screen.take_graphic_charset(ch), Charset::Ascii);
+            assert!(screen.single_shift_pending());
+        }
+        assert_eq!(screen.take_graphic_charset('q').translate('q'), '─');
+        assert!(!screen.single_shift_pending());
+        assert_eq!(screen.invoked_charset_bank(), 3);
+        assert_eq!(screen.take_graphic_charset('q').translate('q'), 'q');
+        screen.single_shift(2);
+        assert_eq!(
+            screen.take_graphic_charset(' '),
+            Charset::DecSpecialGraphics
+        );
+        assert!(!screen.single_shift_pending());
+        screen.invoke_charset_bank(2);
+        screen.designate_charset_bank(3, Charset::DecSpecialGraphics);
+        assert_eq!(screen.invoked_charset_bank(), 2);
+        screen.designate_charset_bank(2, Charset::Ascii);
+        assert_eq!(screen.active_charset, Charset::Ascii);
+        assert_eq!(screen.invoked_charset_bank(), 2);
+    }
+    #[test]
+    fn cursor_and_alternate_snapshots_restore_all_banks_and_pending_shift() {
+        let mut screen = ScreenState::new(2, 8);
+        screen.designate_charset_bank(2, Charset::DecSpecialGraphics);
+        screen.designate_charset_bank(3, Charset::DecSpecialGraphics);
+        screen.invoke_charset_bank(3);
+        screen.single_shift(2);
+        screen.save_cursor(true);
+        screen.reset_charset_banks();
+        assert_eq!(screen.restore_cursor(), Some(true));
+        assert_eq!(screen.invoked_charset_bank(), 3);
+        assert_eq!(screen.single_shift_bank(), Some(2));
+        assert_eq!(screen.charset_bank(2), Charset::DecSpecialGraphics);
+        assert_eq!(screen.charset_bank(3), Charset::DecSpecialGraphics);
+        let protocol = ProtocolState::default();
+        assert!(screen
+            .enter_alternate_screen(true, false, &protocol)
+            .is_some());
+        screen.reset_charset_banks();
+        assert!(screen.leave_alternate_screen(true).is_some());
+        assert_eq!(screen.invoked_charset_bank(), 3);
+        assert_eq!(screen.single_shift_bank(), Some(2));
+        assert_eq!(screen.charset_bank(2), Charset::DecSpecialGraphics);
+        screen.reset_charset_banks();
+        assert_eq!(screen.invoked_charset_bank(), 0);
+        assert!(!screen.single_shift_pending());
+        assert_eq!(screen.charset_bank(2), Charset::Ascii);
+        assert_eq!(screen.charset_bank(3), Charset::Ascii);
+    }
+    #[test]
+    fn gr_fill_mapping_is_separate_from_unicode_gl_and_single_shift() {
+        let mut screen = ScreenState::new(2, 8);
+        assert_eq!(screen.invoked_gr_charset_bank(), 2);
+        for value in 160..=255 {
+            assert_eq!(screen.translate_fill_character(value), char::from(value));
+        }
+        screen.designate_charset_bank(1, Charset::DecSpecialGraphics);
+        screen.invoke_gr_charset_bank(1);
+        assert_eq!(screen.invoked_charset_bank(), 0);
+        assert_eq!(screen.translate_fill_character(0xf1), '─');
+        assert_eq!(screen.translate_fill_character(0xa0), ' ');
+        assert_eq!(screen.translate_fill_character(0xff), ' ');
+        assert_eq!(screen.translate_fill_character(0xdf), 'ß');
+        assert_eq!(screen.translate_fill_character(0xa3), '£');
+        assert_eq!(screen.take_graphic_charset('ñ').translate('ñ'), 'ñ');
+        assert_eq!(screen.translate_fill_character(b'q'), 'q');
+        screen.single_shift(2); // ASCII single shift does not suppress GR mapping.
+        assert_eq!(screen.translate_fill_character(0xf1), '─');
+        assert_eq!(screen.single_shift_bank(), Some(2));
+        screen.designate_charset_bank(2, Charset::DecSpecialGraphics);
+        assert_eq!(screen.translate_fill_character(b'q'), '─');
+        assert_eq!(screen.single_shift_bank(), Some(2));
+        assert_eq!(screen.take_graphic_charset('q').translate('q'), '─');
+        assert!(!screen.single_shift_pending());
+        assert_eq!(screen.take_graphic_charset('q').translate('q'), 'q');
+        screen.invoke_gr_charset_bank(4);
+        assert_eq!(screen.invoked_gr_charset_bank(), 1);
+    }
+    #[test]
+    fn gr_invocation_survives_cursor_and_alternate_snapshots_and_resets() {
+        let mut screen = ScreenState::new(2, 8);
+        for gr in 0..4 {
+            screen.invoke_gr_charset_bank(gr);
+            screen.save_cursor(true);
+            screen.invoke_gr_charset_bank((gr + 1) % 4);
+            screen.restore_cursor();
+            assert_eq!(screen.invoked_gr_charset_bank(), gr);
+            assert!(screen
+                .enter_alternate_screen(true, false, &ProtocolState::default())
+                .is_some());
+            screen.invoke_gr_charset_bank((gr + 1) % 4);
+            assert!(screen.leave_alternate_screen(true).is_some());
+            assert_eq!(screen.invoked_gr_charset_bank(), gr);
+        }
+        screen.reset_charset_banks();
+        assert_eq!(screen.invoked_gr_charset_bank(), 2);
+    }
+    #[test]
+    fn latin1_designation_preserves_identity_and_retires_on_94_redesignation() {
+        let mut screen = ScreenState::new(2, 8);
+        for index in 0..4 {
+            screen.designate_latin1(index);
+            assert!(screen.charset_is_latin1(index));
+            assert_eq!(screen.charset_bank(index), Charset::Ascii);
+            screen.invoke_charset_bank(index);
+            assert_eq!(screen.take_graphic_charset('q').translate('q'), 'q');
+            screen.invoke_gr_charset_bank(index);
+            for value in [0xa0, 0xa3, 0xf1, 0xff] {
+                assert_eq!(screen.translate_fill_character(value), char::from(value));
+            }
+            screen.designate_charset_bank(index, Charset::DecSpecialGraphics);
+            assert!(!screen.charset_is_latin1(index));
+            screen.designate_latin1(index);
+        }
+        screen.designate_charset(false, Charset::Ascii);
+        screen.designate_charset(true, Charset::Ascii);
+        assert!(!screen.charset_is_latin1(0));
+        assert!(!screen.charset_is_latin1(1));
+        screen.designate_latin1(0);
+        screen.g0_charset = Charset::DecSpecialGraphics;
+        assert!(!screen.charset_is_latin1(0));
+        screen.designate_latin1(9);
+        assert!(!screen.charset_is_latin1(9));
+    }
+    #[test]
+    fn latin1_designation_snapshots_and_reset_preserve_private_wire_state() {
+        let mut screen = ScreenState::new(2, 8);
+        for index in 0..4 {
+            screen.designate_latin1(index);
+        }
+        screen.invoke_charset_bank(1);
+        screen.invoke_gr_charset_bank(3);
+        screen.single_shift(2);
+        screen.save_cursor(true);
+        screen.reset_charset_banks();
+        screen.restore_cursor();
+        for index in 0..4 {
+            assert!(screen.charset_is_latin1(index));
+        }
+        assert_eq!(screen.invoked_charset_bank(), 1);
+        assert_eq!(screen.invoked_gr_charset_bank(), 3);
+        assert_eq!(screen.single_shift_bank(), Some(2));
+        screen.enter_alternate_screen(true, false, &ProtocolState::default());
+        screen.reset_charset_banks();
+        screen.leave_alternate_screen(true);
+        for index in 0..4 {
+            assert!(screen.charset_is_latin1(index));
+        }
+        screen.reset_charset_banks();
+        for index in 0..4 {
+            assert!(!screen.charset_is_latin1(index));
+        }
+    }
+    #[test]
+    fn unsaved_cursor_restore_resets_only_drawing_state_and_keeps_decawm() {
+        for autowrap in [false, true] {
+            let mut screen = ScreenState::new(3, 8);
+            let mut protocol = ProtocolState::default();
+            if autowrap {
+                protocol.modes_mut().insert(7);
+            }
+            protocol.modes_mut().insert(25);
+            screen.cursor_row = 2;
+            screen.cursor_col = 7;
+            screen.pending_wrap = true;
+            screen.current_fg = Color::Red;
+            screen.current_bg = Color::Blue;
+            screen.current_flags.set_bold(true);
+            screen.current_flags.set_protected(true);
+            screen.current_hyperlink = HyperlinkId::from_raw(4);
+            screen.origin_mode = true;
+            screen.insert_mode = true;
+            screen.scroll_region_top = 1;
+            screen.scroll_region_bottom = 2;
+            screen.tab_stops[3] = true;
+            screen.designate_charset_bank(0, Charset::DecSpecialGraphics);
+            screen.designate_latin1(1);
+            screen.designate_latin1(2);
+            screen.designate_charset_bank(3, Charset::DecSpecialGraphics);
+            screen.invoke_charset_bank(3);
+            screen.invoke_gr_charset_bank(1);
+            screen.single_shift(2);
+            screen.grid.get_mut(1, 2).character = 'X';
+            screen.grid.row_wrapped[1] = true;
+            let cells = screen.grid.to_vec();
+            let tabs = screen.tab_stops.clone();
+            let ids: Vec<_> = (0..3).map(|r| screen.grid.row_id(r)).collect();
+            screen.restore_cursor_state(&mut protocol);
+            assert_eq!(
+                (
+                    screen.cursor_row,
+                    screen.cursor_col,
+                    screen.origin_mode,
+                    screen.pending_wrap
+                ),
+                (0, 0, false, false)
+            );
+            assert_eq!(
+                (screen.current_fg, screen.current_bg, screen.current_flags),
+                (Color::Default, Color::Default, StyleFlags::default())
+            );
+            for index in 0..4 {
+                assert_eq!(screen.charset_bank(index), Charset::Ascii);
+                assert!(!screen.charset_is_latin1(index));
+            }
+            assert_eq!(screen.invoked_charset_bank(), 0);
+            assert_eq!(screen.invoked_gr_charset_bank(), 2);
+            assert!(!screen.single_shift_pending());
+            assert_eq!(screen.grid.to_vec(), cells);
+            assert_eq!(screen.tab_stops, tabs);
+            assert_eq!(
+                (0..3).map(|r| screen.grid.row_id(r)).collect::<Vec<_>>(),
+                ids
+            );
+            assert!(
+                screen.grid.row_wrapped[1] && screen.insert_mode && protocol.modes().contains(&25)
+            );
+            assert_eq!(protocol.modes().contains(&7), autowrap);
+            assert_eq!(
+                (screen.scroll_region_top, screen.scroll_region_bottom),
+                (1, 2)
+            );
+            assert_eq!(screen.current_hyperlink, HyperlinkId::from_raw(4));
+            assert!(screen.saved_state.is_none());
+        }
+    }
+    #[test]
+    fn reverse_wrap_matches_independent_physical_step_reference() {
+        let mut protocol = ProtocolState::default();
+        protocol.modes_mut().insert(7);
+        protocol.modes_mut().insert(45);
+        for wrapped in 0..8 {
+            for start_row in 0..3 {
+                for start_col in 0..4 {
+                    for pending in [false, true] {
+                        for count in 1..=20 {
+                            let mut screen = ScreenState::new(3, 4);
+                            for row in 0..3 {
+                                screen.grid.row_wrapped[row] = wrapped & (1 << row) != 0;
+                            }
+                            screen.cursor_row = start_row;
+                            screen.cursor_col = start_col;
+                            screen.pending_wrap = pending;
+                            screen.scroll_region_top = 1;
+                            screen.scroll_region_bottom = 2;
+                            let (mut row, mut col) = (start_row, start_col);
+                            let mut pending = pending;
+                            for _ in 0..count {
+                                if pending {
+                                    pending = false;
+                                } else if col > 0 {
+                                    col -= 1;
+                                } else if row > 0 && wrapped & (1 << (row - 1)) != 0 {
+                                    row -= 1;
+                                    col = 3;
+                                }
+                            }
+                            screen.move_cursor_backward_with_wrap(count, &protocol);
+                            assert_eq!(
+                                (screen.cursor_row, screen.cursor_col, screen.pending_wrap),
+                                (row, col, false)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn reverse_wrap_preserves_legacy_off_policy_and_never_changes_row_contents() {
+        let mut protocol = ProtocolState::default();
+        let mut screen = ScreenState::new(3, 4);
+        screen.grid.row_wrapped[0] = true;
+        screen.grid.get_mut(0, 1).flags.set_wide(true);
+        screen.grid.get_mut(0, 2).flags.set_wide_continuation(true);
+        screen.cursor_row = 1;
+        screen.cursor_col = 0;
+        screen.move_cursor_backward_with_wrap(1, &protocol);
+        assert_eq!((screen.cursor_row, screen.cursor_col), (1, 0));
+        protocol.modes_mut().insert(45);
+        screen.move_cursor_backward_with_wrap(1, &protocol);
+        assert_eq!((screen.cursor_row, screen.cursor_col), (1, 0));
+        protocol.modes_mut().insert(7);
+        screen.scroll_region_top = 1;
+        screen.scroll_region_bottom = 2;
+        let cells = screen.grid.to_vec();
+        let ids: Vec<_> = (0..3).map(|r| screen.grid.row_id(r)).collect();
+        screen.move_cursor_backward_with_wrap(1, &protocol);
+        assert_eq!((screen.cursor_row, screen.cursor_col), (0, 3)); // Soft wrap crosses vertical margin.
+        screen.move_cursor_backward_with_wrap(1, &protocol);
+        assert_eq!(screen.cursor_col, 2); // Physical continuation column is not normalized.
+        screen.move_cursor_backward_with_wrap(usize::MAX, &protocol);
+        assert_eq!((screen.cursor_row, screen.cursor_col), (0, 0));
+        assert_eq!(screen.grid.to_vec(), cells);
+        assert!(screen.grid.row_wrapped[0]);
+        assert_eq!(
+            (0..3).map(|r| screen.grid.row_id(r)).collect::<Vec<_>>(),
+            ids
+        );
+        protocol.modes_mut().remove(&45);
+        screen.cursor_col = 3;
+        screen.pending_wrap = true;
+        screen.move_cursor_backward_with_wrap(1, &protocol);
+        assert_eq!((screen.cursor_col, screen.pending_wrap), (2, false));
+    }
+    #[test]
+    fn selective_erasure_protects_valid_wide_pairs_from_either_half() {
+        for protected_continuation in [false, true] {
+            for requested in [0..1, 1..2, 0..2] {
+                let mut screen = ScreenState::new(1, 5);
+                screen.current_flags.set_protected(true);
+                screen.write_frost_legacy_char_in_row('界', 2, true);
+                assert!(screen.grid.get(0, 0).flags.protected());
+                assert!(!screen.grid.get(0, 1).flags.protected());
+                if protected_continuation {
+                    screen.grid.get_mut(0, 0).flags.set_protected(false);
+                    screen.grid.get_mut(0, 1).flags.set_protected(true);
+                }
+                screen.current_flags.set_protected(false);
+                screen.pending_wrap = true;
+                let before = screen.grid.to_vec();
+                assert!(screen
+                    .erase_span(0, requested.start, requested.end, true)
+                    .is_empty());
+                assert_eq!(screen.grid.to_vec(), before);
+                assert!(screen.pending_wrap);
+                let mutations = screen.erase_span(0, requested.start, requested.end, false);
+                assert_eq!(mutations.len(), 1);
+                assert_eq!(screen.grid.get(0, 0).character, ' ');
+                assert_eq!(screen.grid.get(0, 1).character, ' ');
             }
         }
     }

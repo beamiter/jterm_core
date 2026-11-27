@@ -3,6 +3,7 @@ use super::{
     HistoryPage, Row, RowAnnotations, ScrollbackLine, Terminal, UnderlineColorRun, MAX_ROWS,
 };
 use crate::{
+    grid::ScrollbackContent,
     history_reflow::{source_columns, HistoryAnchor, ProjectedHistoryRow},
     TerminalCell,
 };
@@ -127,26 +128,28 @@ impl Terminal {
         let mut row_text = String::new();
         let mut padding = 0;
         let mut separate = false;
-        let mut write_row = |cells: &[TerminalCell],
-                             annotations: Option<&RowAnnotations>,
-                             margin_gap: Option<usize>,
-                             wrapped: bool| {
-            if separate {
-                output.write_all(b"\n")?;
-            }
-            row_text.clear();
+        let format_row = |text: &mut String,
+                          cells: &[TerminalCell],
+                          annotations: Option<&RowAnnotations>,
+                          margin_gap: Option<usize>| {
+            text.clear();
             let mut written_space_end = 0;
             for (column, cell) in cells.iter().enumerate() {
                 if cell.flags.wide_continuation() || margin_gap == Some(column) {
                     continue;
                 }
-                append_copy_cell(&mut row_text, cell, annotations, column);
+                append_copy_cell(text, cell, annotations, column);
                 if cell.flags.printed_space() {
-                    written_space_end = row_text.len();
+                    written_space_end = text.len();
                 }
             }
-            let end = row_text.trim_end_matches(' ').len().max(written_space_end);
-            if end != 0 {
+            text.trim_end_matches(' ').len().max(written_space_end)
+        };
+        let mut finish_row = |text: &str, trailing: usize, wrapped: bool| {
+            if separate {
+                output.write_all(b"\n")?;
+            }
+            if !text.is_empty() {
                 // Padding at an earlier wrap is internal when this row
                 // contains text. Only padding at a hard line end is dropped.
                 while padding > 0 {
@@ -154,24 +157,34 @@ impl Terminal {
                     output.write_all(&SPACES[..count])?;
                     padding -= count;
                 }
-                output.write_all(&row_text.as_bytes()[..end])?;
+                output.write_all(text.as_bytes())?;
             }
-            padding = if wrapped {
-                padding + row_text.len() - end
-            } else {
-                0
-            };
+            padding = if wrapped { padding + trailing } else { 0 };
             separate = !wrapped;
             Ok::<(), io::Error>(())
         };
         if !self.alternate_screen_active() {
+            let mut decoded = Vec::new();
             for line in self.history.iter() {
-                write_row(
-                    &line.decompress(),
+                if let ScrollbackContent::Plain(text, trailing) = line.content() {
+                    if line.row_annotations().is_none() && line.synthetic_margin_gap().is_none() {
+                        let trimmed = text.trim_end_matches(' ');
+                        finish_row(
+                            trimmed,
+                            text.len() - trimmed.len() + usize::from(trailing),
+                            line.is_wrapped,
+                        )?;
+                        continue;
+                    }
+                }
+                line.decompress_into(&mut decoded);
+                let end = format_row(
+                    &mut row_text,
+                    &decoded,
                     line.row_annotations().map(Arc::as_ref),
                     line.synthetic_margin_gap(),
-                    line.is_wrapped,
-                )?;
+                );
+                finish_row(&row_text[..end], row_text.len() - end, line.is_wrapped)?;
             }
         }
         let last_drawn = (self.vt.screen.cursor_row..grid.rows())
@@ -179,13 +192,21 @@ impl Terminal {
                 grid[row]
                     .iter()
                     .any(|cell| !cell.is_reflow_trimmable_blank())
+                    || grid
+                        .row_annotations(row)
+                        .is_some_and(|line| line.has_text())
             })
             .unwrap_or(self.vt.screen.cursor_row);
         for row in 0..=last_drawn {
-            write_row(
+            let end = format_row(
+                &mut row_text,
                 &grid[row],
                 grid.row_annotations(row).map(Arc::as_ref),
                 grid.synthetic_margin_gap(row),
+            );
+            finish_row(
+                &row_text[..end],
+                row_text.len() - end,
                 grid.row_wrapped[row],
             )?;
         }
@@ -319,7 +340,8 @@ impl Terminal {
 
 pub(super) struct HistoryReader<'a> {
     raw: &'a VecDeque<ScrollbackLine>,
-    cached: Option<(usize, Vec<TerminalCell>)>,
+    cached: Option<usize>,
+    decoded: Vec<TerminalCell>,
     first: u64,
     single_column: bool,
 }
@@ -329,6 +351,7 @@ impl<'a> HistoryReader<'a> {
         Self {
             raw,
             cached: None,
+            decoded: Vec::new(),
             first: layout.extent.start,
             single_column: layout.columns == 1,
         }
@@ -343,15 +366,50 @@ impl<'a> HistoryReader<'a> {
         let mut column = usize::from(row.anchor.column);
         while cells.len() < width {
             let line = &self.raw[index];
-            if self.cached.as_ref().is_none_or(|(row, _)| *row != index) {
-                self.cached = Some((index, line.decompress()));
+            if self.cached != Some(index) {
+                line.decompress_into(&mut self.decoded);
+                self.cached = Some(index);
             }
-            let source = &self.cached.as_ref().expect("decoded history row").1;
+            let source = &self.decoded;
+            let source_end = source_columns(line).min(source.len());
+            let source_start = column.min(source_end);
+            let source_annotations = line.row_annotations();
+            let source_underline = line.underline_color_runs();
+            if !self.single_column && source_annotations.is_none() {
+                let count = (width - cells.len()).min(source_end - source_start);
+                let target_start = cells.len();
+                let end = source_start + count;
+                cells.extend_from_slice(&source[source_start..end]);
+                let first =
+                    source_underline.partition_point(|run| usize::from(run.end) <= source_start);
+                for run in source_underline[first..]
+                    .iter()
+                    .take_while(|run| usize::from(run.start) < end)
+                {
+                    let start =
+                        target_start + usize::from(run.start).max(source_start) - source_start;
+                    let end = target_start + usize::from(run.end).min(end) - source_start;
+                    if let Some(previous) = underline.last_mut().filter(|previous| {
+                        usize::from(previous.end) == start && previous.color == run.color
+                    }) {
+                        previous.end = end as u16;
+                    } else {
+                        underline.push(UnderlineColorRun {
+                            start: start as u16,
+                            end: end as u16,
+                            color: run.color,
+                        });
+                    }
+                }
+                column = 0;
+                index += 1;
+                continue;
+            }
             for (raw_column, &cell) in source
                 .iter()
                 .enumerate()
-                .take(source_columns(line))
-                .skip(column)
+                .take(source_end)
+                .skip(source_start)
             {
                 let mut cell = cell;
                 if self.single_column && cell.flags.wide_continuation() {
@@ -361,7 +419,7 @@ impl<'a> HistoryReader<'a> {
                     cell.flags.set_wide(false);
                 }
                 let column = cells.len();
-                if let Some(source) = line.row_annotations() {
+                if let Some(source) = source_annotations {
                     if let Some(text) = source.shared_text(raw_column) {
                         annotations.set(column, Arc::clone(text));
                     }
@@ -369,7 +427,7 @@ impl<'a> HistoryReader<'a> {
                         annotations.set_image(column, slice.clone());
                     }
                 }
-                if let Some(color) = underline_color_at(line.underline_color_runs(), raw_column) {
+                if let Some(color) = underline_color_at(source_underline, raw_column) {
                     let column = column as u16;
                     if let Some(run) = underline
                         .last_mut()
@@ -401,5 +459,101 @@ impl<'a> HistoryReader<'a> {
             annotations: (!annotations.is_empty()).then(|| Arc::new(annotations)),
             synthetic_gap: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod underline_projection_tests {
+    use super::*;
+    use crate::{Color, TerminalCell};
+
+    fn history(force_scalar: bool) -> VecDeque<ScrollbackLine> {
+        ["ABCD", "EFGH"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let cells: Vec<_> = text
+                    .chars()
+                    .map(|character| TerminalCell {
+                        character,
+                        ..TerminalCell::default()
+                    })
+                    .collect();
+                let mut line = ScrollbackLine::compress(&cells, index == 0);
+                let colors = if index == 0 {
+                    vec![UnderlineColorRun {
+                        start: 1,
+                        end: 4,
+                        color: Color::Red,
+                    }]
+                } else {
+                    vec![
+                        UnderlineColorRun {
+                            start: 0,
+                            end: 2,
+                            color: Color::Red,
+                        },
+                        UnderlineColorRun {
+                            start: 2,
+                            end: 4,
+                            color: Color::Blue,
+                        },
+                    ]
+                };
+                // An empty annotation owner selects the existing scalar fallback
+                // without changing any projected text or decoration.
+                line.attach_decorations(
+                    colors,
+                    force_scalar.then(|| Arc::new(RowAnnotations::default())),
+                );
+                line
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bulk_underline_projection_clips_and_joins_like_scalar_projection() {
+        let bulk = history(false);
+        let scalar = history(true);
+        let layout = HistoryLayout::new(&bulk, 0..2, 5);
+        let mut bulk_reader = HistoryReader::new(&bulk, &layout);
+        let mut scalar_reader = HistoryReader::new(&scalar, &layout);
+        for (anchor, cells) in [
+            (HistoryAnchor { row: 0, column: 2 }, 5),
+            (HistoryAnchor { row: 1, column: 1 }, 3),
+        ] {
+            let row = ProjectedHistoryRow {
+                anchor,
+                cells,
+                wrapped: false,
+            };
+            let actual = bulk_reader.read(row);
+            let expected = scalar_reader.read(row);
+            assert_eq!(actual.row, expected.row);
+            assert_eq!(actual.underline_colors, expected.underline_colors);
+            assert_eq!(actual.annotations, expected.annotations);
+        }
+        let combined = bulk_reader.read(ProjectedHistoryRow {
+            anchor: HistoryAnchor { row: 0, column: 2 },
+            cells: 5,
+            wrapped: false,
+        });
+        assert_eq!(
+            combined.underline_colors.as_deref(),
+            Some(
+                &[
+                    UnderlineColorRun {
+                        start: 0,
+                        end: 4,
+                        color: Color::Red
+                    },
+                    UnderlineColorRun {
+                        start: 4,
+                        end: 5,
+                        color: Color::Blue
+                    },
+                ][..]
+            )
+        );
     }
 }

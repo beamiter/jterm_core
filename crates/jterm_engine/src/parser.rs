@@ -28,6 +28,39 @@ fn printable_ascii_prefix(input: &[u8]) -> usize {
     input.len() - tail.len() + accepted
 }
 
+#[inline]
+fn zero_byte_high_bits(word: u64) -> u64 {
+    const LOW_BITS: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    // The add cannot carry across bytes. A zero lane is the only one
+    // whose high bit is unset in both the sum and the original word.
+    !((word & LOW_BITS).wrapping_add(LOW_BITS) | word | LOW_BITS)
+}
+
+fn string_boundary_position(input: &[u8], osc: bool) -> Option<usize> {
+    let is_boundary = |byte: u8| matches!(byte, 0x1b | 0x18 | 0x1a) || (osc && byte == 7);
+    if input.len() < 32 {
+        return input.iter().copied().position(is_boundary);
+    }
+    let mut words = input.chunks_exact(8);
+    for (index, bytes) in words.by_ref().enumerate() {
+        let word = u64::from_le_bytes(bytes.try_into().unwrap());
+        let esc_or_sub = (word & 0xfefe_fefe_fefe_fefe) ^ 0x1a1a_1a1a_1a1a_1a1a;
+        let cancel = word ^ 0x1818_1818_1818_1818;
+        let mut boundary = zero_byte_high_bits(esc_or_sub) | zero_byte_high_bits(cancel);
+        if osc {
+            boundary |= zero_byte_high_bits(word ^ 0x0707_0707_0707_0707);
+        }
+        if boundary != 0 {
+            return Some(index * 8 + boundary.trailing_zeros() as usize / 8);
+        }
+    }
+    let tail = words.remainder();
+    tail.iter()
+        .copied()
+        .position(is_boundary)
+        .map(|index| input.len() - tail.len() + index)
+}
+
 /// Versioned scanner compatibility, not terminal semantic dispatch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ParserProfile {
@@ -670,6 +703,13 @@ impl Parser {
                                 4
                             };
                             self.utf8_expected = expected;
+                            if !self.frost() && at - 1 + expected as usize <= input.len() {
+                                let bytes = &input[at - 1..at - 1 + expected as usize];
+                                if let Some(ch) = complete_utf8_scalar(bytes) {
+                                    at += expected as usize - 1;
+                                    emit!(Event::Print(ch));
+                                }
+                            }
                             if self.frost() {
                                 if at - 1 + expected as usize <= input.len() {
                                     let bytes = &input[at - 1..at - 1 + expected as usize];
@@ -709,10 +749,13 @@ impl Parser {
                             } else {
                                 256
                             };
-                            if params.len() < limit {
-                                params.push(byte);
-                            }
-                            at += 1;
+                            let length = input[at..]
+                                .iter()
+                                .take_while(|&&byte| (0x30..=0x3f).contains(&byte))
+                                .count();
+                            let retained = length.min(limit - params.len());
+                            params.extend_from_slice(&input[at..at + retained]);
+                            at += length;
                             continue;
                         }
                         if (0x20..=0x2f).contains(&byte) {
@@ -754,14 +797,10 @@ impl Parser {
                     };
                     let available = limit.saturating_sub(data.len());
                     let remaining = &input[at..];
-                    let ordinary = remaining
-                        .iter()
-                        .take(available)
-                        .position(|byte| {
-                            matches!(byte, 0x1b | 0x18 | 0x1a)
-                                || (*kind == StringKind::Osc && *byte == 7)
-                        })
-                        .unwrap_or(remaining.len().min(available));
+                    let scan_len = remaining.len().min(available);
+                    let ordinary =
+                        string_boundary_position(&remaining[..scan_len], *kind == StringKind::Osc)
+                            .unwrap_or(scan_len);
                     if ordinary > 0 {
                         data.extend_from_slice(&remaining[..ordinary]);
                         at += ordinary;
@@ -821,11 +860,12 @@ impl Parser {
                     // short OSC titles without accepting any unchecked tail.
                     if data.is_empty() {
                         let remaining = &input[at..];
-                        let scan_len = remaining.len().min(self.string_limit(kind) + 1);
-                        if let Some(end) = remaining[..scan_len].iter().position(|&byte| {
-                            matches!(byte, 0x1b | 0x18 | 0x1a)
-                                || (kind == StringKind::Osc && byte == 7)
-                        }) {
+                        let limit = self.string_limit(kind);
+                        let scan_len = remaining.len().min(limit + 1);
+                        if let Some(end) = string_boundary_position(
+                            &remaining[..scan_len],
+                            kind == StringKind::Osc,
+                        ) {
                             let bel = kind == StringKind::Osc && remaining[end] == 7;
                             let st =
                                 remaining[end] == 0x1b && remaining.get(end + 1) == Some(&b'\\');
@@ -840,6 +880,13 @@ impl Parser {
                                     bel_terminated: bel
                                 });
                             }
+                        } else if scan_len >= 32 {
+                            // Reuse the completed scan for a long partial
+                            // payload. Leave the first excess byte to the
+                            // scalar path.
+                            let ordinary = scan_len.min(limit);
+                            data.extend_from_slice(&remaining[..ordinary]);
+                            at += ordinary;
                         }
                     }
                     let Some(&byte) = input.get(at) else {
@@ -1178,8 +1225,10 @@ impl Parser {
                                 .first()
                                 .copied()
                                 .filter(|b| matches!(b, b'<' | b'=' | b'>' | b'?'));
-                            let raw_params =
-                                params[usize::from(private_prefix.is_some())..].to_vec();
+                            if private_prefix.is_some() {
+                                params.remove(0);
+                            }
+                            let raw_params = params;
                             let (params, colon_flags) =
                                 parse_profiled_csi_params(&raw_params, self.profile);
                             emit!(Event::Csi {
@@ -1231,6 +1280,12 @@ impl Parser {
     }
 }
 
+// Keep whole-scalar validation out of the scanner's ASCII hot loop.
+#[inline(never)]
+fn complete_utf8_scalar(bytes: &[u8]) -> Option<char> {
+    std::str::from_utf8(bytes).ok()?.chars().next()
+}
+
 /// A single ordered scan replaces the legacy abort scan followed by a
 /// separate terminator scan. In particular, a fresh ESC aborts before any
 /// later BEL, while a real terminator ends scanning before later cancellation.
@@ -1275,8 +1330,20 @@ fn parse_profiled_csi_params(bytes: &[u8], profile: ParserProfile) -> (Vec<u16>,
     if bytes.is_empty() {
         return (Vec::new(), Vec::new());
     }
+    // Long lists can otherwise grow both output buffers several times. Keep
+    // the common short sequences single-pass.
     let mut params = Vec::new();
     let mut flags = Vec::new();
+    // Five-field RGB lists can fit in 16 bytes but exceed Vec's initial
+    // four-parameter allocation; reserve before the first growth there too.
+    if bytes.len() > 8 {
+        let capacity = 1 + bytes
+            .iter()
+            .filter(|&&byte| matches!(byte, b';' | b':'))
+            .count();
+        params.reserve_exact(capacity);
+        flags.reserve_exact(capacity);
+    }
     let mut current: u16 = 0;
     let mut colon = false;
     let mut has_digits = false;
@@ -1320,6 +1387,34 @@ mod frozen_f243_framing;
 #[cfg(test)]
 mod hot_path_parity {
     use super::*;
+
+    #[test]
+    fn string_boundary_scan_matches_scalar_across_words_and_tails() {
+        for osc in [false, true] {
+            for len in [0, 1, 7, 8, 31, 32, 33, 47, 64] {
+                let mut data = vec![0xe1; len];
+                assert_eq!(string_boundary_position(&data, osc), None);
+                for index in 0..len {
+                    for byte in u8::MIN..=u8::MAX {
+                        data[index] = byte;
+                        let expected = data
+                            .iter()
+                            .position(|&b| matches!(b, 0x1b | 0x18 | 0x1a) || (osc && b == 7));
+                        assert_eq!(string_boundary_position(&data, osc), expected);
+                    }
+                    data[index] = 0xe1;
+                }
+            }
+            let mut data = [b'a'; 40];
+            data[8] = 7;
+            data[14] = 0x1b;
+            data[30] = 0x18;
+            assert_eq!(
+                string_boundary_position(&data, osc),
+                Some(if osc { 8 } else { 14 })
+            );
+        }
+    }
 
     #[test]
     fn printable_prefix_matches_a_byte_scan_at_every_word_and_tail_offset() {
@@ -1408,6 +1503,18 @@ mod hot_path_parity {
                 ),
                 "offset={at} input={input:?}"
             );
+            if let (
+                Some(Event::Csi {
+                    raw_params: actual, ..
+                }),
+                Some(frozen_f243::Event::Csi {
+                    raw_params: expected,
+                    ..
+                }),
+            ) = (&a.event, &e.event)
+            {
+                assert_eq!(actual, expected, "CSI wire params at offset={at}");
+            }
             // Preserve zero-copy complete packet admission as well as the
             // visible event bytes; ordinary carried spans must stay owned.
             assert_eq!(
@@ -1447,6 +1554,7 @@ mod hot_path_parity {
         let mut inputs = vec![
             b"printable ABC xyz\r\n\t\x07\x0e\x0f".to_vec(),
             b"\x1b[;:12:;65536mX\x1b[2\n;4H".to_vec(),
+            b"\x1b[?25h\x1b[>4;1f\x1b[?u".to_vec(),
             b"\x1b]0;title\x07x\x1bP$qm\x1b\\Z".to_vec(),
             b"\x1b_Gi=4,m=1;x\x1b\\\x1b_Gi=4;\x18A".to_vec(),
             b"\x1b(0q\x1b(Bz\x1b( % 5\x1bcX".to_vec(),

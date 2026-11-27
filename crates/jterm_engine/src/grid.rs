@@ -5,6 +5,13 @@ use std::ops::{Range, RangeInclusive};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Reusable snapshot of one source row for overlap-safe rectangular copies.
+#[derive(Default)]
+pub(crate) struct RectangularCopyScratch {
+    cells: Vec<TerminalCell>,
+    colors: Vec<Color>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionDirection {
     Up,
@@ -478,12 +485,32 @@ impl TerminalGrid {
         };
         rendition.flags.set_wide(false);
         rendition.flags.set_wide_continuation(false);
-        for (cell, &byte) in target.iter_mut().zip(bytes) {
-            rendition.character = char::from(byte);
+        if track_spaces || bytes.contains(&b' ') {
+            let mut space = rendition;
+            space.character = ' ';
             if track_spaces {
-                rendition.flags.set_printed_space(byte == b' ');
+                space.flags.set_printed_space(true);
+                rendition.flags.set_printed_space(false);
+            } else if !space.flags.printed_space() {
+                space.flags.mark_untracked_drawn_space();
             }
-            *cell = rendition;
+            if bytes.iter().all(|&byte| byte == b' ') {
+                target.fill(space);
+                return;
+            }
+            for (cell, &byte) in target.iter_mut().zip(bytes) {
+                if byte == b' ' {
+                    *cell = space;
+                } else {
+                    rendition.character = char::from(byte);
+                    *cell = rendition;
+                }
+            }
+        } else {
+            for (cell, &byte) in target.iter_mut().zip(bytes) {
+                rendition.character = char::from(byte);
+                *cell = rendition;
+            }
         }
     }
 
@@ -508,6 +535,8 @@ impl TerminalGrid {
             rendition
                 .flags
                 .set_printed_space(rendition.character == ' ');
+        } else if rendition.character == ' ' && !rendition.flags.printed_space() {
+            rendition.flags.mark_untracked_drawn_space();
         }
         rendition.flags.set_wide(width == 2);
         rendition.flags.set_wide_continuation(false);
@@ -534,7 +563,7 @@ impl TerminalGrid {
         );
         line.set_raw_row_id(self.row_id(row));
         if allow_margin && self.synthetic_margin_gap(row).is_some() {
-            line.synthetic_margin_gap = true;
+            line.set_synthetic_margin_gap(true);
         }
         line
     }
@@ -571,6 +600,182 @@ impl TerminalGrid {
             self.annotations.resize_with(self.rows, || None);
             self.annotations[row] = Some(annotations);
         }
+    }
+
+    /// Fill a control-command span without cursor movement or output ownership.
+    /// Repair clipped wide partners with default blanks, never the fill glyph.
+    pub(crate) fn fill_rectangular_span(
+        &mut self,
+        row: usize,
+        columns: Range<usize>,
+        mut cell: TerminalCell,
+        underline: Color,
+    ) {
+        cell.flags.clear_cell_contents();
+        if cell.character == ' ' {
+            if self.track_printed_spaces {
+                cell.flags.set_printed_space(true);
+            } else {
+                cell.flags.mark_untracked_drawn_space();
+            }
+        }
+        self.repair_wide_edges(row, columns.clone(), TerminalCell::default());
+        self.row_cells_mut(row, columns.clone()).fill(cell);
+        self.erase_annotations(row, columns.clone());
+        self.set_underline_color(row, columns, underline);
+    }
+
+    pub(crate) fn apply_rectangular_rendition(
+        &mut self,
+        row: usize,
+        columns: Range<usize>,
+        rectangle_extent: bool,
+        rendition: RectangularRendition,
+    ) -> Option<Range<usize>> {
+        let base = row * self.cols;
+        let mut changed: Option<Range<usize>> = None;
+        for column in columns {
+            let drawn = self.cell_drawn(row, column);
+            if !rectangle_extent && !drawn {
+                continue;
+            }
+            let cell = &mut self.cells[base + column];
+            let mut flags = rendition.apply(cell.flags);
+            if !drawn {
+                flags.mark_untracked_drawn_space();
+            }
+            if flags != cell.flags {
+                cell.flags = flags;
+                if let Some(span) = &mut changed {
+                    span.end = column + 1;
+                } else {
+                    changed = Some(column..column + 1);
+                }
+            }
+        }
+        if changed.is_some() {
+            self.mark_row_changed(row);
+        }
+        changed
+    }
+
+    pub(crate) fn cell_drawn(&self, row: usize, column: usize) -> bool {
+        let cell = self.get(row, column);
+        cell.character != ' '
+            || cell.flags.wide_continuation()
+            || cell.flags.untracked_drawn_space()
+            || (cell.flags.printed_space() && !cell.flags.tab_padding())
+    }
+
+    fn rectangular_text_columns(&self, row: usize, columns: Range<usize>) -> Range<usize> {
+        let mut retained = columns;
+        if self.get(row, retained.start).flags.wide_continuation() {
+            retained.start += 1;
+        }
+        if retained.start < retained.end && self.get(row, retained.end - 1).flags.wide() {
+            retained.end -= 1;
+        }
+        retained
+    }
+
+    pub(crate) fn rectangular_copy_fits(
+        &self,
+        source_row: usize,
+        source: Range<usize>,
+        target_row: usize,
+        target_col: usize,
+    ) -> bool {
+        if source_row >= self.rows
+            || target_row >= self.rows
+            || source.start >= source.end
+            || source.end > self.cols
+        {
+            return false;
+        }
+        let Some(end) = target_col
+            .checked_add(source.len())
+            .filter(|end| *end <= self.cols)
+        else {
+            return false;
+        };
+        let columns = self.rectangular_text_columns(source_row, source);
+        let bytes = self
+            .row_annotations(source_row)
+            .map_or(0, |line| line.text_bytes_in(columns));
+        self.row_annotations(target_row).is_none_or(|line| {
+            line.can_store_after_displacing(
+                self.expanded_wide_span(target_row, target_col..end),
+                bytes,
+            )
+        })
+    }
+
+    /// Snapshot before repairing the destination, including same-row overlaps.
+    pub(crate) fn copy_rectangular_row(
+        &mut self,
+        source_row: usize,
+        source: Range<usize>,
+        target_row: usize,
+        target_col: usize,
+        scratch: &mut RectangularCopyScratch,
+    ) -> Range<usize> {
+        debug_assert!(self.rectangular_copy_fits(
+            source_row,
+            source.clone(),
+            target_row,
+            target_col
+        ));
+        let target = target_col..target_col + source.len();
+        let affected = self.expanded_wide_span(target_row, target.clone());
+        let text_columns = self.rectangular_text_columns(source_row, source.clone());
+        let source_annotations = self.row_annotations(source_row).cloned();
+        scratch.cells.clear();
+        let base = source_row * self.cols;
+        scratch
+            .cells
+            .extend_from_slice(&self.cells[base + source.start..base + source.end]);
+        for column in [source.start, source.end - 1] {
+            if !text_columns.contains(&column) {
+                let cell = &mut scratch.cells[column - source.start];
+                cell.character = ' ';
+                cell.hyperlink_id = HyperlinkId::NONE;
+                cell.flags.clear_cell_contents();
+            }
+        }
+        scratch.colors.clear();
+        let colors = self.underline_colors(source_row);
+        if !colors.is_empty() {
+            scratch.colors.extend_from_slice(&colors[source.clone()]);
+        }
+        self.repair_wide_edges(target_row, target.clone(), TerminalCell::default());
+        self.row_cells_mut(target_row, target.clone())
+            .copy_from_slice(&scratch.cells);
+        self.erase_annotations(target_row, target.clone());
+        self.set_underline_color(target_row, target.clone(), Color::Default);
+        let mut offset = 0;
+        for run in scratch.colors.chunk_by(|a, b| a == b) {
+            if run[0] != Color::Default {
+                self.set_underline_color(
+                    target_row,
+                    target_col + offset..target_col + offset + run.len(),
+                    run[0],
+                );
+            }
+            offset += run.len();
+        }
+        if let Some(line) =
+            source_annotations.filter(|line| line.text_bytes_in(text_columns.clone()) != 0)
+        {
+            self.annotations.resize_with(self.rows, || None);
+            let destination = self.annotations[target_row]
+                .get_or_insert_with(|| Arc::new(RowAnnotations::default()));
+            Arc::make_mut(destination).copy_text_from(
+                &line,
+                text_columns.clone(),
+                target_col + text_columns.start - source.start,
+            );
+        }
+        affected
     }
 
     pub(crate) fn mark_tab_spaces(&mut self, row: usize, columns: std::ops::Range<usize>) {
@@ -1103,7 +1308,8 @@ pub enum UnderlineStyle {
 ///   bit 10: wide_continuation
 ///   bit 11: protected (DECSCA)
 ///   bit 12: a printed space, distinct from erase padding
-///   bit 13: padding produced by a tab
+///   bits 12–13 together distinguish printed spaces, tab padding, and drawn
+///   spaces that do not change history trimming
 ///   bits 14-15: overline and conceal in legacy document projections
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
@@ -1140,7 +1346,103 @@ const TAB_PADDING_BIT: u16 = 1 << 13;
 const OVERLINE_BIT: u16 = 1 << 14;
 const CONCEALED_BIT: u16 = 1 << 15;
 
+/// A command's DEC rendition edits, compiled once for all affected cells.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RectangularRendition {
+    keep: u16,
+    xor: u16,
+    underline: RectangularUnderline,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RectangularUnderline {
+    Preserve { toggle: bool },
+    Constant { enabled: bool },
+}
+
+impl RectangularRendition {
+    pub(crate) fn compile(params: &[u16], reverse: bool) -> Self {
+        let mut result = Self {
+            keep: u16::MAX,
+            xor: 0,
+            underline: RectangularUnderline::Preserve { toggle: false },
+        };
+        for &parameter in if params.is_empty() { &[0][..] } else { params } {
+            let (bits, underline) = match parameter {
+                0 => (BOLD_BIT | BLINK_BIT | INVERSE_BIT, true),
+                1 | 22 if !reverse || parameter == 1 => (BOLD_BIT, false),
+                4 | 24 if !reverse || parameter == 4 => (0, true),
+                5 | 25 if !reverse || parameter == 5 => (BLINK_BIT, false),
+                7 | 27 if !reverse || parameter == 7 => (INVERSE_BIT, false),
+                _ => continue,
+            };
+            if reverse {
+                result.xor ^= bits;
+                if underline {
+                    result.underline = match result.underline {
+                        RectangularUnderline::Preserve { toggle } => {
+                            RectangularUnderline::Preserve { toggle: !toggle }
+                        }
+                        RectangularUnderline::Constant { enabled } => {
+                            RectangularUnderline::Constant { enabled: !enabled }
+                        }
+                    };
+                }
+            } else {
+                let enabled = matches!(parameter, 1 | 4 | 5 | 7);
+                result.keep &= !bits;
+                if enabled {
+                    result.xor |= bits;
+                } else {
+                    result.xor &= !bits;
+                }
+                if underline {
+                    result.underline = RectangularUnderline::Constant { enabled };
+                }
+            }
+        }
+        result
+    }
+
+    pub(crate) fn apply(self, flags: StyleFlags) -> StyleFlags {
+        let mut result = StyleFlags((flags.0 & self.keep) ^ self.xor);
+        let enabled = match self.underline {
+            RectangularUnderline::Preserve { toggle: false } => return result,
+            RectangularUnderline::Preserve { toggle: true } => {
+                flags.underline() == UnderlineStyle::None
+            }
+            RectangularUnderline::Constant { enabled } => enabled,
+        };
+        result.set_underline(if enabled {
+            UnderlineStyle::Single
+        } else {
+            UnderlineStyle::None
+        });
+        result
+    }
+}
+
 impl StyleFlags {
+    pub(crate) fn common_sgr(self, other: Self) -> Self {
+        let mut mask = BOLD_BIT
+            | ITALIC_BIT
+            | INVERSE_BIT
+            | DIM_BIT
+            | BLINK_BIT
+            | STRIKETHROUGH_BIT
+            | OVERLINE_BIT
+            | CONCEALED_BIT;
+        if (self.0 ^ other.0) & UNDERLINE_MASK == 0 {
+            mask |= UNDERLINE_MASK;
+        }
+        Self(self.0 & other.0 & mask)
+    }
+
+    /// Remove attributes that describe the contents of one cell.
+    pub(crate) fn clear_cell_contents(&mut self) {
+        self.0 &= !(WIDE_BIT | WIDE_CONT_BIT | PRINTED_SPACE_BIT | TAB_PADDING_BIT);
+    }
+
     /// Renderable attributes without live cell geometry or protection.
     pub(crate) fn archive_rendition(self) -> Self {
         Self(
@@ -1158,6 +1460,13 @@ impl StyleFlags {
     #[inline(always)]
     pub fn new() -> Self {
         Self(0)
+    }
+
+    /// Whether this cell has only ordinary text occupancy flags. Rendition,
+    /// protection, and wide-cell geometry all disqualify plain text.
+    #[inline]
+    pub fn is_plain_text(&self) -> bool {
+        self.0 & !(PRINTED_SPACE_BIT | TAB_PADDING_BIT) == 0
     }
 
     #[inline(always)]
@@ -1225,7 +1534,15 @@ impl StyleFlags {
     }
 
     pub(crate) fn tab_padding(&self) -> bool {
-        self.0 & TAB_PADDING_BIT != 0
+        self.0 & (PRINTED_SPACE_BIT | TAB_PADDING_BIT) == (PRINTED_SPACE_BIT | TAB_PADDING_BIT)
+    }
+
+    pub(crate) fn untracked_drawn_space(&self) -> bool {
+        self.0 & (PRINTED_SPACE_BIT | TAB_PADDING_BIT) == TAB_PADDING_BIT
+    }
+
+    pub(crate) fn mark_untracked_drawn_space(&mut self) {
+        self.0 = (self.0 & !PRINTED_SPACE_BIT) | TAB_PADDING_BIT;
     }
 
     fn set_printed_space(&mut self, printed: bool) {
@@ -1380,8 +1697,7 @@ fn structural_grid_revision_stays_nonzero_after_wrap() {
 pub struct ScrollbackLine {
     data: CompressedLineData,
     pub is_wrapped: bool,
-    synthetic_margin_gap: bool,
-    printed_spaces: bool,
+    archive_flags: u8,
     cols: u16,
     /// Number of cells retained when historical soft-wrapped rows are joined
     /// before being split at the current terminal width.  Computing this when
@@ -1393,6 +1709,8 @@ pub struct ScrollbackLine {
     /// geometry beside the compressed row lets the projection planner avoid
     /// decoding historical cells merely to preserve wide glyph boundaries.
     reflow_wide_continuations: SmallVec<[u16; 2]>,
+    // Geometry occupies the prefix; packed drawn-space occupancy follows it.
+    reflow_wide_count: u16,
     raw_row_id: RawRowId,
 }
 
@@ -1496,7 +1814,7 @@ impl ScrollbackLine {
             .iter()
             .rposition(|cell| !cell.is_reflow_trimmable_blank())
             .map_or(0, |index| index + 1);
-        let reflow_wide_continuations = cells[..reflow_content_len]
+        let mut reflow_wide_continuations: SmallVec<[u16; 2]> = cells[..reflow_content_len]
             .iter()
             .enumerate()
             .filter_map(|(column, cell)| {
@@ -1507,6 +1825,19 @@ impl ScrollbackLine {
                 }
             })
             .collect();
+        let reflow_wide_count = reflow_wide_continuations.len() as u16;
+        if let Some(last) = cells
+            .iter()
+            .rposition(|cell| cell.flags.untracked_drawn_space())
+        {
+            let start = reflow_wide_continuations.len();
+            reflow_wide_continuations.resize(start + last / 16 + 1, 0);
+            for (column, cell) in cells[..=last].iter().enumerate() {
+                if cell.flags.untracked_drawn_space() {
+                    reflow_wide_continuations[start + column / 16] |= 1 << (column % 16);
+                }
+            }
+        }
         let reflow_content_len = u16::try_from(reflow_content_len).unwrap_or(u16::MAX);
         let trailing_blanks = cells
             .iter()
@@ -1524,29 +1855,37 @@ impl ScrollbackLine {
             .count();
 
         let active_len = cells.len() - trailing_blanks;
-        let printed_spaces = cells[..active_len]
-            .iter()
-            .any(|cell| cell.flags.printed_space());
-        let all_default_attrs = !printed_spaces
-            && cells[..active_len].iter().all(|c| {
-                c.foreground == Color::Default
-                    && c.background == Color::Default
-                    && c.flags.is_default_style()
-                    && !c.flags.wide()
-                    && !c.flags.wide_continuation()
-                    && c.hyperlink_id.is_none()
-            });
+        // Plain rows need only one admission pass. If styled contents end
+        // that pass early, retain the codec's row-wide printed-space flag.
+        let mut printed_spaces = false;
+        let all_default_attrs = cells[..active_len].iter().all(|c| {
+            if c.flags.printed_space() {
+                printed_spaces = true;
+                return false;
+            }
+            c.foreground == Color::Default
+                && c.background == Color::Default
+                && c.flags.is_default_style()
+                && !c.flags.wide()
+                && !c.flags.wide_continuation()
+                && c.hyperlink_id.is_none()
+        });
+        if !all_default_attrs && !printed_spaces {
+            printed_spaces = cells[..active_len]
+                .iter()
+                .any(|cell| cell.flags.printed_space());
+        }
 
         if all_default_attrs {
             let text: String = cells[..active_len].iter().map(|c| c.character).collect();
             ScrollbackLine {
                 data: CompressedLineData::Plain(text, trailing_blanks as u16),
                 is_wrapped,
-                synthetic_margin_gap: false,
-                printed_spaces: false,
+                archive_flags: 0,
                 cols,
                 reflow_content_len,
                 reflow_wide_continuations,
+                reflow_wide_count,
                 raw_row_id: RawRowId::UNTRACKED,
             }
         } else {
@@ -1554,11 +1893,11 @@ impl ScrollbackLine {
             ScrollbackLine {
                 data: CompressedLineData::Encoded(encoded),
                 is_wrapped,
-                synthetic_margin_gap: false,
-                printed_spaces,
+                archive_flags: u8::from(printed_spaces) << 1,
                 cols,
                 reflow_content_len,
                 reflow_wide_continuations,
+                reflow_wide_count,
                 raw_row_id: RawRowId::UNTRACKED,
             }
         }
@@ -1567,7 +1906,7 @@ impl ScrollbackLine {
     /// Physical column certified as a synthetic early-wide-wrap gap.
     /// Unlike the projection reflow estimate, no visible-cell heuristic is used.
     pub fn synthetic_margin_gap(&self) -> Option<usize> {
-        if self.synthetic_margin_gap && self.is_wrapped {
+        if self.archive_flags & 1 != 0 && self.is_wrapped {
             self.columns().checked_sub(1)
         } else {
             None
@@ -1581,7 +1920,7 @@ impl ScrollbackLine {
 
     #[inline]
     pub fn reflow_wide_continuations(&self) -> &[u16] {
-        &self.reflow_wide_continuations
+        &self.reflow_wide_continuations[..usize::from(self.reflow_wide_count)]
     }
 
     #[inline]
@@ -1620,7 +1959,7 @@ impl ScrollbackLine {
     }
 
     pub(crate) fn set_synthetic_margin_gap(&mut self, present: bool) {
-        self.synthetic_margin_gap = present;
+        self.archive_flags = (self.archive_flags & !1) | u8::from(present);
     }
 
     pub(crate) fn underline_color_runs(&self) -> &[UnderlineColorRun] {
@@ -1642,7 +1981,7 @@ impl ScrollbackLine {
     }
 
     pub fn decompress(&self) -> Vec<TerminalCell> {
-        match self.content() {
+        let mut cells = match self.content() {
             ScrollbackContent::Plain(text, trailing) => {
                 let cell = |character| TerminalCell {
                     character,
@@ -1659,9 +1998,57 @@ impl ScrollbackLine {
                 cells
             }
             ScrollbackContent::Encoded(data) => {
-                Self::decode_cells(data, self.cols as usize, self.printed_spaces)
+                Self::decode_cells(data, self.cols as usize, self.archive_flags & 2 != 0)
+            }
+        };
+        self.restore_drawn_spaces(&mut cells);
+        cells
+    }
+
+    fn restore_drawn_spaces(&self, cells: &mut [TerminalCell]) {
+        for (word_index, &word) in self.reflow_wide_continuations
+            [usize::from(self.reflow_wide_count)..]
+            .iter()
+            .enumerate()
+        {
+            let mut occupied = word;
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                if let Some(cell) = cells.get_mut(word_index * 16 + bit) {
+                    cell.flags.mark_untracked_drawn_space();
+                }
+                occupied &= occupied - 1;
             }
         }
+    }
+
+    /// Replace scratch cells with this row while retaining reusable capacity.
+    pub(crate) fn decompress_into(&self, cells: &mut Vec<TerminalCell>) {
+        cells.clear();
+        cells.reserve(self.columns());
+        match self.content() {
+            ScrollbackContent::Plain(text, trailing) => {
+                let cell = |character| TerminalCell {
+                    character,
+                    ..TerminalCell::default()
+                };
+                if text.is_ascii() {
+                    cells.extend(text.bytes().map(char::from).map(cell));
+                } else {
+                    cells.extend(text.chars().map(cell));
+                }
+                cells.resize(cells.len() + usize::from(trailing), TerminalCell::default());
+            }
+            ScrollbackContent::Encoded(data) => {
+                Self::decode_cells_into(
+                    data,
+                    self.cols as usize,
+                    self.archive_flags & 2 != 0,
+                    cells,
+                );
+            }
+        }
+        self.restore_drawn_spaces(cells);
     }
 
     /// Visit retained cells in column order without materializing the row.
@@ -1680,7 +2067,7 @@ impl ScrollbackLine {
                 }
             }
             ScrollbackContent::Encoded(data) => {
-                Self::visit_encoded_cells(data, self.columns(), self.printed_spaces, visit);
+                Self::visit_encoded_cells(data, self.columns(), self.archive_flags & 2 != 0, visit);
             }
         }
     }
@@ -1778,8 +2165,8 @@ impl ScrollbackLine {
                     flags.set_wide(wide & 1 != 0);
                     flags.set_wide_continuation(wide & 2 != 0);
                     flags.set_blink(wide & 4 != 0);
-                    flags.set_printed_space(self.printed_spaces && wide & 8 != 0);
-                    flags.set_tab_padding(self.printed_spaces && wide & 16 != 0);
+                    flags.set_printed_space((self.archive_flags & 2 != 0) && wide & 8 != 0);
+                    flags.set_tab_padding((self.archive_flags & 2 != 0) && wide & 16 != 0);
                     let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
                         *data.get(pos)?,
                         *data.get(pos + 1)?,
@@ -1998,15 +2385,31 @@ impl ScrollbackLine {
 
     fn decode_cells(data: &[u8], cols: usize, printed_spaces: bool) -> Vec<TerminalCell> {
         let mut cells = Vec::with_capacity(cols);
+        Self::decode_cells_into(data, cols, printed_spaces, &mut cells);
+        cells
+    }
+
+    #[inline]
+    fn decode_cells_into(
+        data: &[u8],
+        cols: usize,
+        printed_spaces: bool,
+        cells: &mut Vec<TerminalCell>,
+    ) {
         let mut pos = 0;
-        while let Some((cell, run)) = Self::decode_run(data, &mut pos, printed_spaces) {
-            for _ in 0..run {
+        while cells.len() < cols {
+            let Some((cell, run)) = Self::decode_run(data, &mut pos, printed_spaces) else {
+                break;
+            };
+            if run == 1 {
                 cells.push(cell);
+            } else {
+                let end = cells.len() + run.min(cols - cells.len());
+                cells.resize(end, cell);
             }
         }
         // Pad to cols
         cells.resize(cols, TerminalCell::default());
-        cells
     }
 
     fn decode_run(
@@ -2204,6 +2607,34 @@ mod search_chunk_decode_tests {
         assert_eq!(line.columns(), 1024);
         assert!(line.decode_search_row(1000, 4096).is_none());
         assert_eq!(line.decode_search_row(1024, 4096).unwrap().len(), 1024);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ascii_overwrite_changes_only_the_expected_space_and_width_flags() {
+    for policy in [
+        AsciiOverwritePolicy::SharedScreen,
+        AsciiOverwritePolicy::FrostLegacy,
+    ] {
+        for tracked in [false, true] {
+            let mut grid = TerminalGrid::new(1, 4);
+            grid.track_printed_spaces = tracked;
+            let mut style = TerminalCell::default();
+            style.flags.set_bold(true);
+            style.flags.set_protected(true);
+            style.flags.set_wide(true);
+            style.flags.set_wide_continuation(true);
+            style.flags.set_printed_space(true);
+            let input = b" a b";
+            grid.overwrite_ascii(0, 0, input, style, TerminalCell::default(), policy);
+            for (cell, byte) in grid[0].iter().zip(input.iter().copied()) {
+                assert_eq!(cell.character, char::from(byte));
+                assert_eq!(cell.flags.printed_space(), !tracked || byte == b' ');
+                assert!(cell.flags.bold() && cell.flags.protected());
+                assert!(!cell.flags.wide() && !cell.flags.wide_continuation());
+            }
+        }
     }
 }
 
@@ -2525,6 +2956,32 @@ impl ScrollbackLine {
 mod decoder_parity {
     use super::*;
     #[test]
+    fn reused_decode_scratch_replaces_prior_rows_and_keeps_capacity() {
+        let mut scratch = Vec::with_capacity(600);
+        let capacity = scratch.capacity();
+        for (width, character, colored) in [
+            (400, 'x', false),
+            (3, 'é', false),
+            (256, '界', true),
+            (0, ' ', false),
+            (120, 'z', true),
+        ] {
+            let row = vec![
+                TerminalCell {
+                    character,
+                    foreground: if colored { Color::Red } else { Color::Default },
+                    ..TerminalCell::default()
+                };
+                width
+            ];
+            let retained = ScrollbackLine::compress(&row, false);
+            retained.decompress_into(&mut scratch);
+            assert_eq!(scratch, row);
+            assert_eq!(scratch.capacity(), capacity);
+        }
+    }
+
+    #[test]
     fn stored_decoder_rle_boundary_clipping_parity() {
         let cell = TerminalCell {
             character: 'İ',
@@ -2547,6 +3004,10 @@ mod decoder_parity {
                     assert_eq!(
                         streamed,
                         ScrollbackLine::pinned_decode_cells(&bytes[..length], cols)
+                    );
+                    assert_eq!(
+                        ScrollbackLine::decode_cells(&bytes[..length], cols, false),
+                        streamed
                     );
                 }
             }
@@ -2571,8 +3032,217 @@ mod decoder_parity {
                     });
                     streamed.resize(cols, TerminalCell::default());
                     assert_eq!(streamed, ScrollbackLine::pinned_decode_cells(&bytes, cols));
+                    assert_eq!(ScrollbackLine::decode_cells(&bytes, cols, false), streamed);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rectangular_copy_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_row_copy_snapshots_text_and_decoration() {
+        let mut grid = TerminalGrid::new(1, 8);
+        for (column, character) in "abcdefgh".chars().enumerate() {
+            grid.get_mut(0, column).character = character;
+        }
+        grid.set_cluster_text(0, 1, "b\u{301}");
+        grid.set_cluster_text(0, 7, "h\u{301}");
+        grid.set_underline_color(0, 1..3, Color::Rgb(1, 2, 3));
+        let original = grid
+            .row_annotations(0)
+            .unwrap()
+            .shared_text(1)
+            .unwrap()
+            .clone();
+        let mut scratch = RectangularCopyScratch::default();
+        assert!(grid.rectangular_copy_fits(0, 0..5, 0, 2));
+        assert_eq!(grid.copy_rectangular_row(0, 0..5, 0, 2, &mut scratch), 2..7);
+        assert_eq!(
+            grid.cells
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>(),
+            "ababcdeh"
+        );
+        assert!(Arc::ptr_eq(
+            grid.row_annotations(0).unwrap().shared_text(3).unwrap(),
+            &original
+        ));
+        assert_eq!(grid.cluster_text(0, 7), Some("h\u{301}"));
+        assert_eq!(grid.underline_colors(0)[3..5], [Color::Rgb(1, 2, 3); 2]);
+        assert_eq!(grid.underline_colors(0)[2], Color::Default);
+    }
+
+    #[test]
+    fn clipped_halves_preserve_style_and_clear_target_partners() {
+        let mut grid = TerminalGrid::new(2, 8);
+        grid.get_mut(0, 1).flags.set_wide(true);
+        grid.get_mut(0, 2).flags.set_wide_continuation(true);
+        grid.get_mut(0, 4).flags.set_wide(true);
+        grid.get_mut(0, 5).flags.set_wide_continuation(true);
+        grid.get_mut(0, 2).foreground = Color::Rgb(1, 2, 3);
+        grid.set_cluster_text(0, 2, "excluded");
+        grid.set_cluster_text(0, 4, "excluded");
+        grid.set_underline_color(0, 2..5, Color::Rgb(4, 5, 6));
+        grid.get_mut(1, 0).flags.set_wide(true);
+        grid.get_mut(1, 1).flags.set_wide_continuation(true);
+        grid.get_mut(1, 3).flags.set_wide(true);
+        grid.get_mut(1, 4).flags.set_wide_continuation(true);
+        let mut scratch = RectangularCopyScratch::default();
+        assert_eq!(grid.copy_rectangular_row(0, 2..5, 1, 1, &mut scratch), 0..5);
+        for column in [1, 3] {
+            assert_eq!(grid.get(1, column).character, ' ');
+            assert!(!grid.get(1, column).flags.wide());
+            assert!(!grid.get(1, column).flags.wide_continuation());
+            assert_eq!(grid.cluster_text(1, column), None);
+        }
+        assert_eq!(*grid.get(1, 0), TerminalCell::default());
+        assert_eq!(*grid.get(1, 4), TerminalCell::default());
+        assert_eq!(grid.get(1, 1).foreground, Color::Rgb(1, 2, 3));
+        assert_eq!(grid.underline_colors(1)[1..4], [Color::Rgb(4, 5, 6); 3]);
+        assert!(!grid.rectangular_copy_fits(0, 2..5, 1, usize::MAX));
+        assert!(!grid.rectangular_copy_fits(0, 5..5, 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod rectangular_rendition_tests {
+    use super::*;
+
+    #[test]
+    fn compiled_dec_edits_preserve_unrelated_bits_and_compose_in_order() {
+        let affected = BOLD_BIT | BLINK_BIT | INVERSE_BIT | UNDERLINE_MASK;
+        for bits in 0..=u16::MAX {
+            let original = StyleFlags(bits);
+            for parameter in [0, 1, 4, 5, 7, 22, 24, 25, 27, 8, 65535] {
+                let changed = RectangularRendition::compile(&[parameter], false).apply(original);
+                assert_eq!(changed.0 & !affected, bits & !affected);
+                let mut expected = original;
+                match parameter {
+                    0 => {
+                        expected.set_bold(false);
+                        expected.set_underline(UnderlineStyle::None);
+                        expected.set_blink(false);
+                        expected.set_inverse(false);
+                    }
+                    1 => expected.set_bold(true),
+                    4 => expected.set_underline(UnderlineStyle::Single),
+                    5 => expected.set_blink(true),
+                    7 => expected.set_inverse(true),
+                    22 => expected.set_bold(false),
+                    24 => expected.set_underline(UnderlineStyle::None),
+                    25 => expected.set_blink(false),
+                    27 => expected.set_inverse(false),
+                    _ => {}
+                }
+                assert_eq!(changed, expected);
+                let doubled =
+                    RectangularRendition::compile(&[parameter, parameter], true).apply(original);
+                assert_eq!(doubled, original);
+            }
+            assert_eq!(
+                RectangularRendition::compile(&[1, 22, 4, 24, 5, 25, 7, 27], false).apply(original),
+                RectangularRendition::compile(&[0], false).apply(original)
+            );
+            assert_eq!(
+                RectangularRendition::compile(&[], false).apply(original),
+                RectangularRendition::compile(&[0], false).apply(original)
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_underline_keeps_all_authored_styles_under_even_parity() {
+        for style in [
+            UnderlineStyle::None,
+            UnderlineStyle::Single,
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ] {
+            let mut original = StyleFlags::default();
+            original.set_underline(style);
+            assert_eq!(
+                RectangularRendition::compile(&[4, 0, 4, 0], true).apply(original),
+                original
+            );
+            assert_eq!(
+                RectangularRendition::compile(&[4], true)
+                    .apply(original)
+                    .underline(),
+                if style == UnderlineStyle::None {
+                    UnderlineStyle::Single
+                } else {
+                    UnderlineStyle::None
+                }
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_drawn_space_tests {
+    use super::*;
+
+    #[test]
+    fn plain_and_encoded_rows_restore_untracked_drawn_spaces_including_trimmed_tail() {
+        for encoded in [false, true] {
+            let mut cells = vec![TerminalCell::default(); 49];
+            cells[0].character = 'X';
+            for column in [1, 15, 16, 32, 48] {
+                cells[column].flags.mark_untracked_drawn_space();
+            }
+            if encoded {
+                cells[0].foreground = Color::Red;
+                cells[2].character = '界';
+                cells[2].flags.set_wide(true);
+                cells[3].flags.set_wide_continuation(true);
+            }
+            let line = ScrollbackLine::compress(&cells, false);
+            assert_eq!(
+                matches!(line.content(), ScrollbackContent::Encoded(_)),
+                encoded
+            );
+            assert_eq!(
+                line.reflow_wide_continuations(),
+                if encoded { &[3][..] } else { &[][..] }
+            );
+            assert_eq!(line.decompress(), cells);
+            let mut scratch = Vec::new();
+            line.decompress_into(&mut scratch);
+            assert_eq!(scratch, cells);
+            let cloned = line.clone();
+            assert_eq!(cloned.decompress(), cells);
+            assert!(
+                line.retained_bytes()
+                    >= size_of::<ScrollbackLine>()
+                        + line.reflow_wide_continuations.capacity() * size_of::<u16>()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn styled_history_admission_still_preserves_later_printed_tab_spaces() {
+    let mut cells = vec![TerminalCell::default(); 8];
+    cells[0].character = 'X';
+    cells[0].foreground = Color::Red;
+    cells[5].flags.set_printed_space(true);
+    cells[5].flags.set_tab_padding(true);
+    for line in [
+        ScrollbackLine::compress(&cells, false),
+        ScrollbackLine::compress_preserving_blink(&cells, false),
+    ] {
+        assert!(matches!(line.content(), ScrollbackContent::Encoded(_)));
+        assert_eq!(line.decompress(), cells);
+        let mut scratch = Vec::new();
+        line.decompress_into(&mut scratch);
+        assert_eq!(scratch, cells);
     }
 }

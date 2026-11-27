@@ -253,7 +253,7 @@ fn frost_csi_retains_absolute_cursor_and_ordered_mode_replies() {
     assert_eq!(
         reply.as_slice(),
         [Effect::Reply(
-            b"\x1b[?6;1$y\x1b[?1007;0$y\x1b[?7;1$y".to_vec()
+            b"\x1b[?6;1$y\x1b[?1007;1$y\x1b[?7;1$y".to_vec()
         )]
     );
 
@@ -294,10 +294,14 @@ fn decstr_matches_frozen_host_and_retains_all_unrelated_state() {
             let mut actual = seeded(seed);
             let mut expected = seeded(seed);
             expected.frozen_soft_reset();
+            // Reverse-wrap45 is newly supported and DECSTR restores its
+            // default off setting; the frozen pre-support oracle has no rule.
+            expected.protocol.modes_mut().remove(&45);
             assert_eq!(
                 run(&mut actual, &csi(None, b"!", &params)),
                 [Effect::GlobalBackground(Color::Default)]
             );
+            assert!(!actual.protocol.modes().contains(&45));
             assert_eq!(snapshot(&actual), snapshot(&expected));
             for mode in 0..=u16::MAX {
                 assert_eq!(

@@ -27,7 +27,7 @@ pub enum DisplayErase {
 )]
 pub enum DisplayEraseStep {
     ScreenErased,
-    /// One Ember row, including all eligible selective-erasure runs. Apply
+    /// One row, including all eligible selective-erasure runs. Apply
     /// every returned mutation before proceeding to the next physical row.
     Mutations(SmallVec<[RowMutation; 4]>),
     /// Frost dirties the whole affected range after its cell transaction.
@@ -48,10 +48,11 @@ pub struct DisplayEraseRows {
     notify_erased: bool,
     reset_wrap: bool,
     complete: bool,
+    track_legacy_mutations: bool,
 }
 
-/// Decode the original profile's admission without mutating any state. Frost
-/// intentionally retains its permissive namespace/intermediate handling.
+/// Decode the profile's admission without mutating any state. Frost retains
+/// its permissive legacy ED handling outside the DECSED namespace.
 pub fn prepare_display_erase(
     profile: DisplayEraseProfile,
     screen: &ScreenState,
@@ -66,7 +67,7 @@ pub fn prepare_display_erase(
     {
         return None;
     }
-    let selective = profile == DisplayEraseProfile::Ember && private_prefix == Some(b'?');
+    let selective = private_prefix == Some(b'?') && intermediates.is_empty();
     let mode = params.first().copied().unwrap_or(0);
     match mode {
         0 | 1 => {}
@@ -91,7 +92,17 @@ pub fn prepare_display_erase(
         notify_erased: mode == 0 && !selective && screen.cursor_row == 0 && screen.cursor_col == 0,
         reset_wrap: profile == DisplayEraseProfile::Ember && mode == 0,
         complete: false,
+        track_legacy_mutations: false,
     }))
+}
+
+impl DisplayErase {
+    /// Opt in to exact ordered content effects for Frost legacy ED0/ED1.
+    pub(crate) fn track_legacy_erase_mutations(&mut self) {
+        if let Self::Rows(rows) = self {
+            rows.track_legacy_mutations = true;
+        }
+    }
 }
 
 impl DisplayEraseRows {
@@ -107,7 +118,10 @@ impl DisplayEraseRows {
             screen.pending_wrap = false;
             self.reset_wrap = false;
         }
-        if self.profile == DisplayEraseProfile::FrostLegacy {
+        if self.profile == DisplayEraseProfile::FrostLegacy
+            && !self.selective
+            && !self.track_legacy_mutations
+        {
             self.complete = true;
             return screen
                 .erase_frost_legacy_display(self.mode)
@@ -129,12 +143,18 @@ impl DisplayEraseRows {
         } else {
             self.columns
         };
-        Some(DisplayEraseStep::Mutations(screen.erase_span(
-            row,
-            start,
-            end,
-            self.selective,
-        )))
+        let legacy_damage = (self.profile == DisplayEraseProfile::FrostLegacy && !self.selective)
+            .then(|| crate::semantics::frost_legacy_erase_damage_span(screen, row, start, end));
+        let pending_wrap = screen.pending_wrap;
+        let mut mutations = screen.erase_span(row, start, end, self.selective);
+        if let Some(damage) = legacy_damage {
+            screen.pending_wrap = pending_wrap;
+            if let Some(mutation) = mutations.first_mut() {
+                mutation.changed.start = mutation.changed.start.min(damage.start);
+                mutation.changed.end = mutation.changed.end.max(damage.end);
+            }
+        }
+        Some(DisplayEraseStep::Mutations(mutations))
     }
 }
 

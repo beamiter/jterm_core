@@ -1,10 +1,16 @@
 //! Ember's post-local-dispatch CSI fallback. Admission stays explicitly Ember;
 //! physical transaction execution is shared with the FrostLegacyV1 consumer.
+use crate::column_edit::prepare_column_edit;
 use crate::csi_transaction::{CsiTransaction, CsiTransactionEffect};
-use crate::display_erase::{prepare_display_erase, DisplayEraseProfile};
+use crate::display_erase::{prepare_display_erase, DisplayEraseProfile, DisplayEraseStep};
 use crate::graphic_write::{GraphicProfile, RepeatGraphics};
+use crate::mode_mutation::{
+    apply_native_mode_parameter, native_alternate_scroll_profile, restore_dec_private_modes,
+    save_dec_private_modes, ModeNamespace, NativeModeEffect, SavedDecModeProfile,
+};
 use crate::mode_mutation::{prepare_native_mode_command, NativeModeProfile};
 use crate::protocol_state::ProtocolState;
+use crate::rectangular_edit::{prepare_rectangular_attributes, prepare_rectangular_edit};
 use crate::region_ops::{prepare_region_operation, RegionOpsProfile};
 use crate::screen::ScreenState;
 use crate::RawRowId;
@@ -25,6 +31,11 @@ pub enum EmberCsiEffect<'a> {
 pub trait EmberCsiHost {
     fn csi_state(&mut self) -> (&mut ScreenState, &mut ProtocolState, &mut u64);
     fn csi_effect(&mut self, effect: EmberCsiEffect<'_>);
+    /// Opt in to wheel-route retirement effects. The default preserves legacy
+    /// hosts that have no native alternate-scroll input lease.
+    fn track_alternate_scroll_changes(&self) -> bool {
+        false
+    }
     fn focused(&self) -> bool;
     fn allow_alt_archive(&self) -> bool;
     fn color_scheme_report(&self) -> u8;
@@ -48,6 +59,82 @@ fn execute_inner<H: EmberCsiHost>(
     prefix: Option<u8>,
     intermediates: &[u8],
 ) {
+    if prefix.is_none() && intermediates == b"$" && matches!(command, 'r' | 't') {
+        let (screen, protocol, _) = host.csi_state();
+        if let Some(mut rectangle) = prepare_rectangular_attributes(
+            screen,
+            params,
+            command,
+            prefix,
+            intermediates,
+            protocol.rectangular_attribute_extent,
+        ) {
+            while let Some(mutations) = rectangle.step(host.csi_state().0) {
+                if let Some(change) = mutations.first() {
+                    host.csi_effect(EmberCsiEffect::Transaction(CsiTransactionEffect::Erase(
+                        DisplayEraseStep::DirtyRows(change.row..=change.row),
+                    )));
+                }
+            }
+        }
+        return;
+    }
+    if let Some(mut rectangle) =
+        prepare_rectangular_edit(host.csi_state().0, params, command, prefix, intermediates)
+    {
+        while let Some(mutations) = rectangle.step(host.csi_state().0) {
+            if !mutations.is_empty() {
+                host.csi_effect(EmberCsiEffect::Transaction(CsiTransactionEffect::Erase(
+                    DisplayEraseStep::Mutations(mutations),
+                )));
+            }
+        }
+        return;
+    }
+    if let Some(mut columns) =
+        prepare_column_edit(host.csi_state().0, params, command, prefix, intermediates)
+    {
+        while let Some(mutation) = columns.step(host.csi_state().0) {
+            host.csi_effect(EmberCsiEffect::Transaction(CsiTransactionEffect::Erase(
+                DisplayEraseStep::Mutations(smallvec::smallvec![mutation]),
+            )));
+        }
+        return;
+    }
+    if prefix == Some(b'?') && intermediates.is_empty() && matches!(command, 's' | 'r') {
+        if command == 's' {
+            let (screen, protocol, _) = host.csi_state();
+            save_dec_private_modes(screen, protocol, SavedDecModeProfile::Ember, params);
+        } else {
+            let operations =
+                restore_dec_private_modes(host.csi_state().1, SavedDecModeProfile::Ember, params);
+            for (mode, enabled) in operations {
+                let focused = host.focused();
+                let track = host.track_alternate_scroll_changes();
+                let (screen, protocol, _) = host.csi_state();
+                let previous = track.then(|| native_alternate_scroll_profile(screen, protocol));
+                let mut effect = apply_native_mode_parameter(
+                    NativeModeProfile::Ember,
+                    screen,
+                    protocol,
+                    ModeNamespace::DecPrivate,
+                    mode,
+                    enabled,
+                    focused,
+                );
+                if matches!(effect, NativeModeEffect::None)
+                    && previous
+                        .is_some_and(|old| native_alternate_scroll_profile(screen, protocol) != old)
+                {
+                    effect = NativeModeEffect::MouseReportingChanged;
+                }
+                host.csi_effect(EmberCsiEffect::Transaction(CsiTransactionEffect::Mode(
+                    effect,
+                )));
+            }
+        }
+        return;
+    }
     let transaction = if let Some(op) = prepare_display_erase(
         DisplayEraseProfile::Ember,
         host.csi_state().0,
@@ -61,9 +148,12 @@ fn execute_inner<H: EmberCsiHost>(
         prepare_region_operation(RegionOpsProfile::Ember, host.csi_state().0, params, command)
     {
         Some(CsiTransaction::Region(op))
-    } else if let Some(op) =
+    } else if let Some(mut op) =
         prepare_native_mode_command(NativeModeProfile::Ember, params, command, prefix)
     {
+        if host.track_alternate_scroll_changes() {
+            op.track_alternate_scroll_changes();
+        }
         Some(CsiTransaction::Mode(op))
     } else {
         RepeatGraphics::prepare(host.csi_state().0, params, command).map(|repeat| {

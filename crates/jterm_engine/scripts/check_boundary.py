@@ -182,7 +182,9 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn('decrqm_private_mode_state(screen, protocol, mode, true)', engine)
         self.assertIn('decrqm_ansi_mode_state(screen, mode)', engine)
         self.assertNotIn('[DECRQM]', host)
-        self.assertRegex(engine, r'Effect::Reply\(decrqss_reply\(\s*screen,\s*&payload\[2\.\.\]')
+        self.assertRegex(engine, r'Effect::Reply\(decrqss_reply\(\s*screen,\s*protocol,\s*&payload\[2\.\.\]')
+        for path in ('src/terminal.rs', 'src/vt_state.rs'):
+            self.assertIn('semantics::restorable_decrqss_reply(', (ENGINE / path).read_text())
         frost = (FAMILY / 'frost/src/terminal.rs').read_text()
         for name in ('soft_reset', 'report_private_mode_status',
                      'decrqm_private_mode_state', 'decrqm_ansi_mode_state'):
@@ -571,7 +573,7 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn('fn parse_sgr_groups(', frost)
         graphic = frost.split('    fn put_char(', 1)[1].split('    fn put_ascii_run(', 1)[0]
         self.assertIn('NativeTerminal::write_frost(', graphic)
-        self.assertIn('GraphicWrite::new(', (ENGINE / 'src/vt_state.rs').read_text())
+        self.assertIn('GraphicWrite::new_with_charset(', (ENGINE / 'src/vt_state.rs').read_text())
         shared = (ENGINE / 'src/graphic_write.rs').read_text().split('#[cfg(test)]', 1)[0]
         self.assertIn('screen.take_pending_wrap(self.autowrap)', shared)
         self.assertIn('screen.prepare_character_width(self.width, self.autowrap)', shared)
@@ -669,7 +671,9 @@ class BoundaryTests(unittest.TestCase):
 
     def test_native_graphic_and_rep_transactions_have_one_owner(self):
         shared = (ENGINE / 'src/graphic_write.rs').read_text().split('#[cfg(test)]', 1)[0]
-        self.assertIn('screen.translate_char(original)', shared)
+        self.assertIn('charset.translate(original)', shared)
+        self.assertIn('screen.active_charset', shared)
+        self.assertIn('take_graphic_charset(ch)', (ENGINE / 'src/vt_state.rs').read_text())
         self.assertIn('screen.compose_combining_mark(self.translated)', shared)
         self.assertIn('screen.compose_frost_legacy_mark(self.translated)', shared)
         self.assertIn('screen.last_printed_char = Some(self.original)', shared)
@@ -679,7 +683,7 @@ class BoundaryTests(unittest.TestCase):
             host = (FAMILY / app / path).read_text()
             body = host.split('fn put_char(', 1)[1].split('fn put_ascii_run(', 1)[0]
             self.assertIn(f'NativeTerminal::write_{app}(', body)
-            self.assertIn('GraphicWrite::new(', (ENGINE / 'src/vt_state.rs').read_text())
+            self.assertIn('GraphicWrite::new_with_charset(', (ENGINE / 'src/vt_state.rs').read_text())
             self.assertNotIn('prepare_character_width(', body)
             self.assertNotIn('last_printed_char =', body)
             dispatch = (ENGINE / f'src/{app}_csi.rs').read_text().split('#[cfg(test)]', 1)[0]
@@ -762,11 +766,12 @@ class BoundaryTests(unittest.TestCase):
 
     def test_frost_c0_escape_state_mutations_have_engine_authority(self):
         shared = (ENGINE / 'src/frost_controls.rs').read_text().split('#[cfg(test)]', 1)[0]
-        for operation in ('screen.cursor_controls().move_backward(1)',
+        for operation in ('screen.move_cursor_backward_with_wrap(1, protocol)',
                           'screen.cursor_controls().tab_forward(1)',
                           'screen.save_cursor(protocol.modes().contains(&7))',
                           'screen.restore_cursor()', 'screen.begin_next_line()',
-                          'screen.active_charset = screen.g1_charset',
+                          'screen.invoke_charset(true)', 'screen.invoke_charset(false)',
+                          "screen.designate_charset(bank != b'(', charset)",
                           'protocol.modes_mut().insert(66)', 'protocol.modes_mut().remove(&66)'):
             self.assertIn(operation, shared)
         self.assertIn('Operation::CommitDesignation', shared)

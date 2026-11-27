@@ -11,33 +11,120 @@ pub enum MouseInput {
     WheelDown,
 }
 
+/// Enabled pointer tracking policy, independent of its wire encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseTracking {
+    PressOnly,
+    Button,
+    Drag,
+    Any,
+}
+
+/// The effective encoding selected by the negotiated mouse modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseEncoding {
+    Legacy,
+    Utf8,
+    Urxvt,
+    Sgr,
+}
+
+/// Immutable view of the modes that determine pointer reporting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MouseReportProfile {
+    pub tracking: MouseTracking,
+    pub encoding: MouseEncoding,
+}
+
+fn append_decimal(output: &mut Vec<u8>, mut value: usize) {
+    // Every supported usize fits in at most this many decimal digits.
+    let mut digits = [0; usize::BITS as usize];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    output.extend_from_slice(&digits[start..]);
+}
+
+fn decimal_mouse_report(
+    prefix: &[u8],
+    button: usize,
+    col: usize,
+    row: usize,
+    final_byte: u8,
+) -> Vec<u8> {
+    // CSI prefix, three decimal fields, two separators, and final byte.
+    let coordinate_digits = usize::MAX.ilog10() as usize + 1;
+    let mut output = Vec::with_capacity(prefix.len() + 3 + 2 * coordinate_digits + 3);
+    output.extend_from_slice(prefix);
+    append_decimal(&mut output, button);
+    output.push(b';');
+    append_decimal(&mut output, col.saturating_add(1));
+    output.push(b';');
+    append_decimal(&mut output, row.saturating_add(1));
+    output.push(final_byte);
+    output
+}
+
 impl TerminalModes {
-    pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
-        // Check if any mouse reporting mode is enabled
-        if !self.contains(&1000) && !self.contains(&1002) && !self.contains(&1003) {
-            return None;
-        }
+    /// Read effective pointer negotiation without encoding a speculative event.
+    pub fn mouse_report_profile(&self) -> Option<MouseReportProfile> {
+        Some(MouseReportProfile {
+            tracking: self.mouse_tracking()?,
+            encoding: self.mouse_encoding(),
+        })
+    }
 
-        // SGR format (mode 1006) is preferred: CSI < button ; col ; row M/m
-        // urxvt format (mode 1015): CSI button+32 ; col ; row M (decimal)
-        // UTF-8 format (mode 1005): X10 frame with UTF-8 encoded coordinates
-        // Standard format (mode 1000/1002): CSI M button col row (3 bytes)
-
-        if self.contains(&1006) {
-            // SGR format: CSI < button ; x ; y M (button press) or m (button release)
-            // Releases use get_mouse_release_report instead.
-            // Decimal SGR coordinates are not subject to the one-byte legacy
-            // protocol limit. Keep them 1-indexed without truncating at 255.
-            let x = col.saturating_add(1);
-            let y = row.saturating_add(1);
-            Some(format!("\x1b[<{};{};{}M", button, x, y).into_bytes())
-        } else if self.contains(&1015) {
-            Some(Self::urxvt_mouse_report(button, col, row))
-        } else if self.contains(&1005) {
-            Some(Self::utf8_mouse_report(button, col, row))
+    fn mouse_tracking(&self) -> Option<MouseTracking> {
+        if self.contains(&1003) {
+            Some(MouseTracking::Any)
+        } else if self.contains(&1002) {
+            Some(MouseTracking::Drag)
+        } else if self.contains(&1000) {
+            Some(MouseTracking::Button)
+        } else if self.contains(&9) {
+            Some(MouseTracking::PressOnly)
         } else {
-            Some(Self::x10_mouse_report(button, col, row))
+            None
         }
+    }
+
+    fn mouse_encoding(&self) -> MouseEncoding {
+        if self.contains(&1006) {
+            MouseEncoding::Sgr
+        } else if self.contains(&1015) {
+            MouseEncoding::Urxvt
+        } else if self.contains(&1005) {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Legacy
+        }
+    }
+
+    pub fn get_mouse_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
+        let tracking = self.mouse_tracking()?;
+        let button = if tracking == MouseTracking::PressOnly {
+            let base = button & !0x1c;
+            if base > 2 {
+                return None;
+            }
+            base
+        } else {
+            button
+        };
+        Some(match self.mouse_encoding() {
+            MouseEncoding::Sgr => {
+                decimal_mouse_report(b"\x1b[<", usize::from(button), col, row, b'M')
+            }
+            MouseEncoding::Urxvt => Self::urxvt_mouse_report(button, col, row),
+            MouseEncoding::Utf8 => Self::utf8_mouse_report(button, col, row),
+            MouseEncoding::Legacy => Self::x10_mouse_report(button, col, row),
+        })
     }
 
     /// Standard xterm format: CSI M button col row (raw bytes).
@@ -75,40 +162,28 @@ impl TerminalModes {
 
     /// Mode 1015 (urxvt): decimal fields, button still offset by 32.
     fn urxvt_mouse_report(button: u8, col: usize, row: usize) -> Vec<u8> {
-        format!(
-            "\x1b[{};{};{}M",
-            u16::from(button) + 32,
-            col.saturating_add(1),
-            row.saturating_add(1)
-        )
-        .into_bytes()
+        decimal_mouse_report(b"\x1b[", usize::from(button) + 32, col, row, b'M')
     }
 
     /// `button` is the encoded Cb value, including Shift/Meta/Control bits.
     /// Legacy releases discard button/motion/extension bits, retaining modifiers.
     pub fn get_mouse_release_report(&self, button: u8, col: usize, row: usize) -> Option<Vec<u8>> {
-        if !self.contains(&1000) && !self.contains(&1002) && !self.contains(&1003) {
+        if self.mouse_tracking()? == MouseTracking::PressOnly {
             return None;
         }
-
         let legacy_release = 3 | (button & 0x1c);
-        if self.contains(&1006) {
-            // SGR format: lowercase 'm' for release
-            let x = col.saturating_add(1);
-            let y = row.saturating_add(1);
-            Some(format!("\x1b[<{};{};{}m", button, x, y).into_bytes())
-        } else if self.contains(&1015) {
-            // Legacy Cb: release=3 in the low bits, Shift/Meta/Control above.
-            Some(Self::urxvt_mouse_report(legacy_release, col, row))
-        } else if self.contains(&1005) {
-            Some(Self::utf8_mouse_report(legacy_release, col, row))
-        } else {
-            Some(Self::x10_mouse_report(legacy_release, col, row))
-        }
+        Some(match self.mouse_encoding() {
+            MouseEncoding::Sgr => {
+                decimal_mouse_report(b"\x1b[<", usize::from(button), col, row, b'm')
+            }
+            MouseEncoding::Urxvt => Self::urxvt_mouse_report(legacy_release, col, row),
+            MouseEncoding::Utf8 => Self::utf8_mouse_report(legacy_release, col, row),
+            MouseEncoding::Legacy => Self::x10_mouse_report(legacy_release, col, row),
+        })
     }
 
     pub fn is_mouse_enabled(&self) -> bool {
-        self.contains(&1000) || self.contains(&1002) || self.contains(&1003)
+        self.mouse_tracking().is_some()
     }
 
     /// 1002 reports motion only while a button is held; 1003 reports all
@@ -121,6 +196,124 @@ impl TerminalModes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn press_only_profile_strips_modifiers_and_suppresses_non_press_events() {
+        for encoding in [0, 1005, 1015, 1006] {
+            let mut modes = TerminalModes::default();
+            modes.insert(9);
+            modes.insert(encoding);
+            assert_eq!(
+                modes.mouse_report_profile().unwrap().tracking,
+                MouseTracking::PressOnly
+            );
+            for button in 0..=255 {
+                let base = button & !0x1c;
+                let report = modes.get_mouse_report(button, 2, 1);
+                if base <= 2 {
+                    let mut reference = modes.clone();
+                    reference.remove(&9);
+                    reference.insert(1000);
+                    assert_eq!(report, reference.get_mouse_report(base, 2, 1));
+                } else {
+                    assert!(report.is_none());
+                }
+                assert!(modes.get_mouse_release_report(button, 2, 1).is_none());
+            }
+            assert!(!modes.should_report_mouse_motion(false));
+            assert!(!modes.should_report_mouse_motion(true));
+            for stronger in [1000, 1002, 1003] {
+                modes.insert(stronger);
+                assert_ne!(
+                    modes.mouse_report_profile().unwrap().tracking,
+                    MouseTracking::PressOnly
+                );
+                assert!(modes.get_mouse_release_report(1, 2, 1).is_some());
+                assert!(modes.get_mouse_report(64, 2, 1).is_some());
+                modes.remove(&stronger);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_profile_matches_independent_reporting_and_encoding_negotiation() {
+        for reporting in 0..8 {
+            for encoding in 0..8 {
+                let mut modes = TerminalModes::default();
+                for (bit, mode) in [1000, 1002, 1003].into_iter().enumerate() {
+                    if reporting & (1 << bit) != 0 {
+                        modes.insert(mode);
+                    }
+                }
+                for (bit, mode) in [1005, 1015, 1006].into_iter().enumerate() {
+                    if encoding & (1 << bit) != 0 {
+                        modes.insert(mode);
+                    }
+                }
+                let actual = modes.mouse_report_profile();
+                assert_eq!(actual.is_some(), modes.is_mouse_enabled());
+                let Some(profile) = actual else { continue };
+                assert_eq!(
+                    profile.tracking,
+                    if modes.should_report_mouse_motion(false) {
+                        MouseTracking::Any
+                    } else if modes.should_report_mouse_motion(true) {
+                        MouseTracking::Drag
+                    } else {
+                        MouseTracking::Button
+                    }
+                );
+                let probe = modes.get_mouse_report(96, 0, 0).unwrap();
+                let expected = if probe.starts_with(b"\x1b[<") {
+                    MouseEncoding::Sgr
+                } else if probe.starts_with(b"\x1b[M") {
+                    if probe[3] == 0xc2 {
+                        MouseEncoding::Utf8
+                    } else {
+                        MouseEncoding::Legacy
+                    }
+                } else {
+                    MouseEncoding::Urxvt
+                };
+                assert_eq!(profile.encoding, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_reports_match_wire_formulas_at_all_button_and_coordinate_boundaries() {
+        for encoding in [1006, 1015] {
+            let mut modes = TerminalModes::default();
+            modes.insert(1003);
+            modes.insert(encoding);
+            for button in u8::MIN..=u8::MAX {
+                for col in [0, 8, 9, 98, 99, 998, 999, 9999, usize::MAX - 1, usize::MAX] {
+                    for row in [0, 99, 999, usize::MAX] {
+                        let x = col.saturating_add(1);
+                        let y = row.saturating_add(1);
+                        let press = if encoding == 1006 {
+                            format!("\x1b[<{button};{x};{y}M")
+                        } else {
+                            format!("\x1b[{};{x};{y}M", u16::from(button) + 32)
+                        };
+                        let release = if encoding == 1006 {
+                            format!("\x1b[<{button};{x};{y}m")
+                        } else {
+                            format!("\x1b[{};{x};{y}M", u16::from(3 | (button & 0x1c)) + 32)
+                        };
+                        assert_eq!(
+                            modes.get_mouse_report(button, col, row).unwrap(),
+                            press.as_bytes()
+                        );
+                        assert_eq!(
+                            modes.get_mouse_release_report(button, col, row).unwrap(),
+                            release.as_bytes()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn reporting_enablement_and_motion_are_independent_of_encoding() {

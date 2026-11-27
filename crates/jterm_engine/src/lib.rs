@@ -8,7 +8,9 @@ pub mod grid;
 pub mod history_reflow;
 pub mod history_search;
 pub mod hyperlink;
+mod rectangular_edit;
 mod row_annotations;
+mod sgr_stack;
 pub use grid::*;
 pub use hyperlink::{
     FrostHyperlinkTable, HyperlinkId, MAX_FROST_OSC8_ID_BYTES, MAX_OSC8_URI_BYTES,
@@ -22,10 +24,13 @@ pub mod protocol_state;
 pub mod retained_bytes;
 pub mod retained_history;
 
+mod column_edit;
+mod cursor_report;
 pub mod display_erase;
 pub mod region_ops;
 pub mod screen;
 pub mod selection;
+mod termcap_query;
 
 pub mod parser;
 

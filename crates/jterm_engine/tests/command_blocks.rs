@@ -150,6 +150,18 @@ fn fullscreen_cursor_rewrites_and_large_outputs_leave_bounded_status_records() {
 }
 
 #[test]
+fn repeated_size_preserves_the_active_command_output() {
+    let mut terminal = Terminal::new(3, 8).unwrap();
+    terminal.observe_command_blocks();
+    terminal.feed(&[START, b"first\r\n"].concat()).unwrap();
+    terminal.resize(3, 8).unwrap();
+    terminal.feed(&[b"second\r\n", END].concat()).unwrap();
+    let record = &terminal.completed_command_blocks().unwrap()[0];
+    assert_eq!(record.output, Ok("first\nsecond\n".into()));
+    assert!(!record.output_source.as_ref().unwrap().resized);
+}
+
+#[test]
 fn sanctioned_alternate_excursion_preserves_only_main_output_across_every_feed_split() {
     let bytes = [
         START,

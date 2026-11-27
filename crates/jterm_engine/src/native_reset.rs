@@ -3,7 +3,7 @@
 use crate::grid::{Color, CursorShape, StyleFlags};
 use crate::hyperlink::HyperlinkId;
 use crate::protocol_state::{ProtocolState, TerminalModes};
-use crate::screen::{default_tab_stops, Charset, ScreenState, TabStopOrigin};
+use crate::screen::{default_tab_stops, ScreenState, TabStopOrigin};
 
 /// Ember RIS reconstructs both screens and all protocol state. Row identity
 /// allocation belongs to the host and must run before publishing either grid.
@@ -31,14 +31,14 @@ pub fn reset_frost_attributes(screen: &mut ScreenState, protocol: &mut ProtocolS
     screen.current_fg = Color::Default;
     screen.current_bg = Color::Default;
     screen.current_flags = StyleFlags::default();
-    screen.g0_charset = Charset::Ascii;
-    screen.g1_charset = Charset::Ascii;
-    screen.active_charset = Charset::Ascii;
+    screen.reset_charset_banks();
     screen.scroll_region_top = 0;
     screen.scroll_region_bottom = screen.grid.rows().saturating_sub(1);
     screen.tab_stops = default_tab_stops(screen.grid.row_len(), TabStopOrigin::Clear);
     screen.saved_state = None;
     *protocol.modes_mut() = frost_initial_modes();
+    protocol.clear_saved_dec_modes();
+    protocol.rectangular_attribute_extent = false;
     screen.insert_mode = false;
     screen.origin_mode = false;
     screen.pending_wrap = false;

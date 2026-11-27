@@ -155,12 +155,39 @@ impl HyperlinkTable {
         if self.is_empty() {
             return None;
         }
-        let ids: BTreeSet<_> = ids.filter(|id| !id.is_none()).collect();
-        let targets: Vec<_> = ids
-            .into_iter()
-            .filter_map(|id| self.target(id).map(|target| (id, target.clone())))
-            .collect();
-        (!targets.is_empty()).then(|| targets.into())
+        let mut ids = ids.filter_map(|id| {
+            usize::from(id.as_raw())
+                .checked_sub(1)
+                .filter(|&index| index < self.targets.len())
+        });
+        // Skip scratch initialization when no visible ID resolves. IDs are
+        // bounded by this interner, so a fixed bitmap replaces duplicate
+        // staging/sorting while retaining ascending resource order.
+        let first = ids.next()?;
+        let mut seen = [0u64; MAX_HYPERLINKS.div_ceil(64)];
+        seen[first / 64] |= 1 << (first % 64);
+        let mut last_word = first / 64;
+        for index in ids {
+            seen[index / 64] |= 1 << (index % 64);
+            last_word = last_word.max(index / 64);
+        }
+        let count = seen[..=last_word]
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+        let mut targets = Vec::with_capacity(count);
+        for (word_index, &word) in seen[..=last_word].iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let index = word_index * 64 + bits.trailing_zeros() as usize;
+                targets.push((
+                    HyperlinkId::from_raw((index + 1) as u16),
+                    self.targets[index].clone(),
+                ));
+                bits &= bits - 1;
+            }
+        }
+        Some(targets.into())
     }
 }
 
@@ -336,5 +363,51 @@ mod frost_tests {
         links.clear();
         assert_eq!(links.retained_count(), 0);
         assert_eq!(links.resolve(screen.current_hyperlink), None);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_snapshots_order_unique_installed_ids_across_bitmap_words() {
+        let mut table = HyperlinkTable::default();
+        assert!(table
+            .snapshot(std::iter::from_fn(|| panic!(
+                "empty table must not inspect IDs"
+            )))
+            .is_none());
+        for index in 1..=MAX_HYPERLINKS {
+            assert_eq!(
+                table
+                    .intern("", &format!("https://example.test/{index}"), |_, _| true)
+                    .unwrap()
+                    .as_raw(),
+                index as u16
+            );
+        }
+        assert!(table
+            .intern("", "https://example.test/overflow", |_, _| true)
+            .is_none());
+        let ids = [4096, 65, 0, 64, 65, 65535, 1, 4096, 64].map(HyperlinkId::from_raw);
+        let snapshot = table.snapshot(ids.into_iter()).unwrap();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|(id, _)| id.as_raw())
+                .collect::<Vec<_>>(),
+            [1, 64, 65, 4096]
+        );
+        for (id, target) in snapshot.iter() {
+            assert_eq!(
+                target.as_ref(),
+                format!("https://example.test/{}", id.as_raw())
+            );
+            assert!(Arc::ptr_eq(target, table.target(*id).unwrap()));
+        }
+        assert!(table
+            .snapshot([HyperlinkId::NONE, HyperlinkId::from_raw(65535)].into_iter())
+            .is_none());
     }
 }

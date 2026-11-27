@@ -8,7 +8,7 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::fmt::Write;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -25,14 +25,78 @@ pub enum Dispatch {
     Handled(Effects),
 }
 
-fn modify_other_keys_reply(protocol: &ProtocolState) -> Vec<u8> {
+fn modify_other_keys_status(protocol: &ProtocolState) -> u16 {
     // The encoder treats all nonzero levels above one as level two.
-    format!("\x1b[>4;{}m", protocol.xterm_modify_other_keys().min(2)).into_bytes()
+    protocol.xterm_modify_other_keys().min(2)
+}
+
+fn format_other_keys_status(protocol: &ProtocolState) -> u8 {
+    u8::from(protocol.xterm_format_other_keys() == 1)
+}
+
+fn modify_other_keys_reply(protocol: &ProtocolState) -> Vec<u8> {
+    format!("\x1b[>4;{}m", modify_other_keys_status(protocol)).into_bytes()
 }
 
 fn format_other_keys_reply(protocol: &ProtocolState) -> Vec<u8> {
-    let format = u8::from(protocol.xterm_format_other_keys() == 1);
-    format!("\x1b[>4;{format}f").into_bytes()
+    format!("\x1b[>4;{}f", format_other_keys_status(protocol)).into_bytes()
+}
+
+fn tab_stop_report(screen: &ScreenState) -> Vec<u8> {
+    let mut reply = String::from("\x1bP2$u");
+    let mut separator = "";
+    for (column, set) in screen.tab_stops.iter().enumerate().take(screen.grid.cols()) {
+        if *set {
+            write!(reply, "{separator}{}", column + 1).expect("write to String");
+            separator = "/";
+        }
+    }
+    reply.push_str("\x1b\\");
+    reply.into_bytes()
+}
+
+fn displayed_extent_reply(screen: &ScreenState) -> Vec<u8> {
+    format!(
+        "\x1b[{};{};1;1;1\"w",
+        screen.grid.rows(),
+        screen.grid.cols()
+    )
+    .into_bytes()
+}
+
+/// A malformed restore cannot partially clear the existing tab settings.
+pub(crate) fn restore_tab_stops(screen: &mut ScreenState, payload: &[u8]) {
+    let Some(data) = payload.strip_prefix(b"2$t") else {
+        return;
+    };
+    let mut stops = vec![false; screen.grid.cols()];
+    if !data.is_empty() {
+        for field in data.split(|byte| *byte == b'/') {
+            if field.is_empty() {
+                return;
+            }
+            let mut column = 0usize;
+            for byte in field {
+                if !byte.is_ascii_digit() {
+                    return;
+                }
+                let Some(next) = column
+                    .checked_mul(10)
+                    .and_then(|n| n.checked_add(usize::from(byte - b'0')))
+                else {
+                    return;
+                };
+                column = next;
+            }
+            if column == 0 {
+                return;
+            }
+            if let Some(stop) = stops.get_mut(column - 1) {
+                *stop = true;
+            }
+        }
+    }
+    screen.tab_stops = stops;
 }
 
 pub(crate) struct UnderlinePen {
@@ -67,9 +131,12 @@ pub(crate) fn restore_cursor_state(
     protocol: &mut ProtocolState,
     underline: Option<&mut UnderlinePen>,
 ) {
+    let had_saved_cursor = screen.saved_state.is_some();
     screen.restore_cursor_state(protocol);
     if let Some(underline) = underline {
-        if let Some(color) = underline.saved_cursor {
+        if !had_saved_cursor {
+            underline.current = Color::Default;
+        } else if let Some(color) = underline.saved_cursor {
             underline.current = color;
         }
     }
@@ -93,18 +160,22 @@ pub fn legacy_device_attributes_reply(
 
 fn dispatch_cursor_csi(
     screen: &mut ScreenState,
+    protocol: &ProtocolState,
     params: &[u16],
     cmd: u8,
     private_prefix: Option<u8>,
     intermediates: &[u8],
 ) -> bool {
+    if private_prefix.is_some() || !intermediates.is_empty() {
+        return false;
+    }
     let first = params.first().copied();
     let count = first.unwrap_or(1).max(1) as usize;
     match cmd {
         b'A' | b'k' => screen.move_cursor_up(count),
         b'B' | b'e' => screen.move_cursor_down(count),
         b'C' | b'a' => screen.move_cursor_forward(count),
-        b'D' | b'j' => screen.move_cursor_backward(count),
+        b'D' | b'j' => screen.move_cursor_backward_with_wrap(count, protocol),
         b'E' => {
             screen.move_cursor_down(count);
             screen.set_cursor_column(1);
@@ -121,19 +192,21 @@ fn dispatch_cursor_csi(
         ),
         b'I' => screen.tab_forward(count),
         b'Z' => screen.tab_backward(count),
-        b'g' if private_prefix.is_none() && intermediates.is_empty() => match first.unwrap_or(0) {
+        b'g' => match first.unwrap_or(0) {
             0 => screen.clear_tab_stop(),
             3 => screen.clear_all_tab_stops(),
             _ => {}
         },
-        // XTRESTORE and DECCARA also end in r. They must never set margins.
-        b'r' if private_prefix.is_none() && intermediates.is_empty() => {
+        b'r' => {
+            let rows = screen.grid.rows();
             let top = first.unwrap_or(1).max(1) as usize;
-            let bottom = match params.get(1).copied().unwrap_or(screen.grid.rows() as u16) {
-                0 => screen.grid.rows(),
-                value => value as usize,
+            let bottom = match params.get(1).copied() {
+                None | Some(0) => rows,
+                Some(value) => usize::from(value).min(rows),
             };
-            screen.set_scroll_region(top, bottom);
+            if bottom > top {
+                screen.set_scroll_region(top, bottom);
+            }
         }
         _ => return false,
     }
@@ -152,6 +225,74 @@ pub fn dispatch_frost_legacy_csi(
     private_prefix: Option<u8>,
     intermediates: &[u8],
 ) -> Dispatch {
+    if private_prefix.is_none() && intermediates == b"#" && matches!(cmd, b'{' | b'}' | b'p' | b'q')
+    {
+        let mut effects = Effects::new();
+        if !raw_params.contains(&b':') {
+            if matches!(cmd, b'{' | b'p') {
+                protocol.sgr_stack.push(screen, params);
+            } else if params.is_empty() {
+                if let Some(color) = protocol.sgr_stack.pop(screen) {
+                    effects.push(Effect::GlobalBackground(color));
+                }
+            }
+        }
+        return Dispatch::Handled(effects);
+    }
+    if cmd == b'x'
+        && private_prefix.is_none()
+        && intermediates == b"*"
+        && params.len() <= 1
+        && !raw_params.contains(&b':')
+    {
+        select_attribute_extent(protocol, params);
+        return Dispatch::Handled(Effects::new());
+    }
+    if cmd == b'|' && !raw_params.contains(&b':') {
+        if let Some(reply) = crate::rectangular_edit::report_rectangular_sgr(
+            screen,
+            params,
+            '|',
+            private_prefix,
+            intermediates,
+        ) {
+            return Dispatch::Handled([Effect::Reply(reply)].into_iter().collect());
+        }
+    }
+    if cmd == b'v'
+        && private_prefix.is_none()
+        && intermediates == b"\""
+        && raw_params.is_empty()
+        && params.is_empty()
+    {
+        return Dispatch::Handled(
+            [Effect::Reply(displayed_extent_reply(screen))]
+                .into_iter()
+                .collect(),
+        );
+    }
+    if cmd == b'w'
+        && private_prefix.is_none()
+        && intermediates == b"$"
+        && matches!(params, [1] | [2])
+        && raw_params.iter().all(u8::is_ascii_digit)
+    {
+        let reply = if params == [1] {
+            crate::cursor_report::cursor_information_report(screen)
+        } else {
+            tab_stop_report(screen)
+        };
+        return Dispatch::Handled([Effect::Reply(reply)].into_iter().collect());
+    }
+    if cmd == b'W'
+        && private_prefix == Some(b'?')
+        && intermediates.is_empty()
+        && params == [5]
+        && raw_params.iter().all(u8::is_ascii_digit)
+    {
+        screen.reset_eight_column_tab_stops();
+        return Dispatch::Handled(Effects::new());
+    }
     if cmd == b'g' && private_prefix == Some(b'?') && intermediates.is_empty() {
         let effects = if params == [4] && raw_params.iter().all(u8::is_ascii_digit) {
             [Effect::Reply(format_other_keys_reply(protocol))]
@@ -168,11 +309,29 @@ pub fn dispatch_frost_legacy_csi(
     }
     // The older profile omits the four cursor-movement aliases.
     if !matches!(cmd, b'a' | b'e' | b'j' | b'k')
-        && dispatch_cursor_csi(screen, params, cmd, private_prefix, intermediates)
+        && dispatch_cursor_csi(screen, protocol, params, cmd, private_prefix, intermediates)
     {
         return Dispatch::Handled(Effects::new());
     }
 
+    if cmd == b'K' && private_prefix == Some(b'?') && intermediates.is_empty() {
+        let mode = params.first().copied().unwrap_or(0);
+        let effects = erase_line_span(mode, screen.cursor_col, screen.grid.row_len()).map_or_else(
+            Effects::new,
+            |span| {
+                screen
+                    .erase_span(screen.cursor_row, span.start, span.end, true)
+                    .into_iter()
+                    .map(Effect::Row)
+                    .collect()
+            },
+        );
+        return Dispatch::Handled(effects);
+    }
+    // SL/SR belongs to the ordered column dispatcher, never legacy ICH/CUU.
+    if intermediates.starts_with(b" ") && matches!(cmd, b'@' | b'A') {
+        return Dispatch::Unhandled;
+    }
     if matches!(cmd, b'K' | b'@' | b'P' | b'X') {
         let mutation = edit_frost_legacy_line(screen, params, cmd);
         return Dispatch::Handled(mutation.into_iter().map(Effect::Row).collect());
@@ -197,6 +356,8 @@ pub fn dispatch_frost_legacy_csi(
         }
         (b'p', None, b"!", _) => {
             reset_local_attributes(screen, protocol);
+            // Frost's native alternateScroll resource default is off.
+            protocol.modes_mut().remove(&1007);
             effects.push(Effect::GlobalBackground(Color::Default));
             None
         }
@@ -222,7 +383,7 @@ pub fn dispatch_frost_legacy_csi(
             set_xterm_modify_other_keys(protocol, params);
             None
         }
-        (b'm', _, _, _) => {
+        (b'm', None, b"", _) => {
             if let Some(color) = frost_legacy_sgr(
                 raw_params,
                 &mut screen.current_fg,
@@ -246,6 +407,10 @@ pub fn dispatch_frost_legacy_csi(
         (b'q', None, b" ", _) => {
             // Frost historically truncates the argument to one byte.
             screen.cursor_shape = cursor_shape(u16::from(first.unwrap_or(0) as u8));
+            None
+        }
+        (b'q', None, b"\"", _) if params.len() <= 1 && !raw_params.contains(&b':') => {
+            set_character_protection(screen, first.unwrap_or(0));
             None
         }
         _ => return Dispatch::Unhandled,
@@ -276,6 +441,22 @@ fn cursor_shape(param: u16) -> CursorShape {
     }
 }
 
+fn set_character_protection(screen: &mut ScreenState, parameter: u16) {
+    match parameter {
+        0 | 2 => screen.current_flags.set_protected(false),
+        1 => screen.current_flags.set_protected(true),
+        _ => {}
+    }
+}
+
+fn select_attribute_extent(protocol: &mut ProtocolState, params: &[u16]) {
+    match params.first().copied().unwrap_or(0) {
+        0 | 1 => protocol.rectangular_attribute_extent = false,
+        2 => protocol.rectangular_attribute_extent = true,
+        _ => {}
+    }
+}
+
 /// Ember-compatible semantics, including its DECSTR policy (not Frost soft reset).
 /// Frost parser profiles do not select or authorize this semantic policy.
 /// Dispatch exactly one event. Apply returned effects before the next event.
@@ -296,6 +477,122 @@ pub(crate) fn dispatch_local_with_underline(
 ) -> Dispatch {
     let mut effects = Effects::new();
     match event {
+        Event::Csi {
+            params,
+            colon_flags,
+            private_prefix: None,
+            intermediates,
+            final_byte,
+            ..
+        } if intermediates == b"#" && matches!(final_byte, b'{' | b'}' | b'p' | b'q') => {
+            if !colon_flags.iter().any(|flag| *flag) {
+                if matches!(final_byte, b'{' | b'p') {
+                    protocol.sgr_stack.push(screen, params);
+                } else if params.is_empty() {
+                    if let Some(color) = protocol.sgr_stack.pop(screen) {
+                        effects.push(Effect::GlobalBackground(color));
+                    }
+                }
+            }
+        }
+        Event::Csi {
+            params,
+            colon_flags,
+            private_prefix: None,
+            intermediates,
+            final_byte: b'x',
+            ..
+        } if intermediates == b"*"
+            && params.len() <= 1
+            && !colon_flags.iter().any(|flag| *flag) =>
+        {
+            select_attribute_extent(protocol, params);
+        }
+        Event::Csi {
+            params,
+            colon_flags,
+            private_prefix: None,
+            intermediates,
+            final_byte: b'|',
+            ..
+        } if intermediates == b"#" && !colon_flags.iter().any(|flag| *flag) => {
+            let Some(reply) = crate::rectangular_edit::report_rectangular_sgr(
+                screen,
+                params,
+                '|',
+                None,
+                intermediates,
+            ) else {
+                return Dispatch::Unhandled;
+            };
+            effects.push(Effect::Reply(reply));
+        }
+        Event::Csi {
+            raw_params,
+            params,
+            private_prefix: None,
+            intermediates,
+            final_byte: b'v',
+            ..
+        } if intermediates == b"\"" && raw_params.is_empty() && params.is_empty() => {
+            effects.push(Effect::Reply(displayed_extent_reply(screen)));
+        }
+        Event::Csi {
+            raw_params,
+            params,
+            private_prefix: None,
+            intermediates,
+            final_byte: b'w',
+            ..
+        } if intermediates == b"$"
+            && matches!(params.as_slice(), [1] | [2])
+            && raw_params.iter().all(u8::is_ascii_digit) =>
+        {
+            let reply = if params.as_slice() == [1] {
+                crate::cursor_report::cursor_information_report(screen)
+            } else {
+                tab_stop_report(screen)
+            };
+            effects.push(Effect::Reply(reply));
+        }
+        Event::String {
+            kind: StringKind::Dcs,
+            payload,
+            ..
+        } if payload.starts_with(b"1$t") => {
+            if crate::cursor_report::restore_cursor_information(screen, &payload[3..]) {
+                effects.push(Effect::CursorReposition { non_linear: true });
+            }
+        }
+        Event::String {
+            kind: StringKind::Dcs,
+            payload,
+            ..
+        } if payload.starts_with(b"2$t") => {
+            restore_tab_stops(screen, payload);
+        }
+        Event::String {
+            kind: StringKind::Dcs,
+            payload,
+            ..
+        } if payload.starts_with(b"+q") => {
+            if let Some(reply) = crate::termcap_query::termcap_query(payload, protocol) {
+                effects.push(Effect::Reply(reply.into_owned()));
+            }
+        }
+        Event::Csi {
+            raw_params,
+            params,
+            private_prefix: Some(b'?'),
+            intermediates,
+            final_byte: b'W',
+            ..
+        } if intermediates.is_empty()
+            && params.as_slice() == [5]
+            && raw_params.iter().all(u8::is_ascii_digit) =>
+        {
+            screen.reset_eight_column_tab_stops();
+        }
         Event::Csi {
             params,
             colon_flags,
@@ -371,6 +668,7 @@ pub(crate) fn dispatch_local_with_underline(
         } if payload.starts_with(b"$q") => {
             effects.push(Effect::Reply(decrqss_reply(
                 screen,
+                protocol,
                 &payload[2..],
                 underline.as_deref().map(|pen| pen.current),
             )));
@@ -378,9 +676,11 @@ pub(crate) fn dispatch_local_with_underline(
         Event::Control(byte) if matches!(byte, 7 | 8 | 9 | 13 | 14 | 15) => match byte {
             7 => effects.push(Effect::Bell),
             8 => {
-                screen.pending_wrap = false;
-                screen.cursor_col = screen.cursor_col.saturating_sub(1);
-                effects.push(Effect::CursorReposition { non_linear: false });
+                let previous_row = screen.cursor_row;
+                screen.move_cursor_backward_with_wrap(1, protocol);
+                effects.push(Effect::CursorReposition {
+                    non_linear: screen.cursor_row != previous_row,
+                });
             }
             9 => {
                 screen.pending_wrap = false;
@@ -396,8 +696,8 @@ pub(crate) fn dispatch_local_with_underline(
                 screen.cursor_col = 0;
                 effects.push(Effect::CursorReposition { non_linear: false });
             }
-            14 => screen.active_charset = screen.g1_charset,
-            15 => screen.active_charset = screen.g0_charset,
+            14 => screen.invoke_charset(true),
+            15 => screen.invoke_charset(false),
             _ => unreachable!(),
         },
         Event::Charset { bank, designator } => {
@@ -406,11 +706,41 @@ pub(crate) fn dispatch_local_with_underline(
             } else {
                 Charset::Ascii
             };
-            if *bank == b'(' {
-                screen.g0_charset = charset;
-                screen.active_charset = charset;
+            screen.designate_charset(*bank != b'(', charset);
+        }
+        Event::Escape {
+            intermediates,
+            final_byte,
+        } if matches!(intermediates.as_slice(), b"*" | b"+")
+            && matches!(final_byte, b'B' | b'0') =>
+        {
+            let bank = if intermediates == b"*" { 2 } else { 3 };
+            let charset = if *final_byte == b'0' {
+                Charset::DecSpecialGraphics
             } else {
-                screen.g1_charset = charset;
+                Charset::Ascii
+            };
+            screen.designate_charset_bank(bank, charset);
+        }
+        Event::Escape {
+            intermediates,
+            final_byte: b'A',
+        } if matches!(intermediates.as_slice(), b"-" | b"." | b"/") => {
+            screen.designate_latin1(1 + intermediates[0] - b'-');
+        }
+        Event::Escape {
+            intermediates,
+            final_byte,
+        } if intermediates.is_empty()
+            && matches!(final_byte, b'n' | b'o' | b'N' | b'O' | b'~' | b'}' | b'|') =>
+        {
+            match final_byte {
+                b'n' => screen.invoke_charset_bank(2),
+                b'o' => screen.invoke_charset_bank(3),
+                b'N' => screen.single_shift(2),
+                b'O' => screen.single_shift(3),
+                b'~' | b'}' | b'|' => screen.invoke_gr_charset_bank(1 + b'~' - *final_byte),
+                _ => unreachable!(),
             }
         }
         Event::Escape {
@@ -457,10 +787,18 @@ pub(crate) fn dispatch_local_with_underline(
             // Classify BEFORE changing wrap/cursor or generating effects.
             let local = match cmd {
                 b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'H' | b'I' | b'Z' | b'a'
-                | b'd' | b'e' | b'f' | b'j' | b'k' | b'`' | b'm' | b's' | b'u' => true,
-                b'g' => plain,
+                | b'd' | b'e' | b'f' | b'j' | b'k' | b'`' | b'g' | b'@' | b'P' | b'X' | b'r' => {
+                    plain
+                }
+                b'm' => intermediates.is_empty() && matches!(private_prefix, None | Some(b'>')),
+                b's' if *private_prefix == Some(b'?')
+                    && intermediates.is_empty()
+                    && !colon_flags.iter().any(|flag| *flag) =>
+                {
+                    false
+                }
+                b's' | b'u' => true,
                 b'K' => intermediates.is_empty() && matches!(private_prefix, None | Some(b'?')),
-                b'@' | b'P' | b'X' | b'r' => plain,
                 b'q' => {
                     private_prefix.is_none() && (intermediates == b" " || intermediates == b"\"")
                 }
@@ -486,7 +824,20 @@ pub(crate) fn dispatch_local_with_underline(
             } else if matches!(cmd, b'C' | b'D' | b'G' | b'`' | b'I' | b'Z' | b'a' | b'j') {
                 effects.push(Effect::CursorReposition { non_linear: false });
             }
-            if dispatch_cursor_csi(screen, params, cmd, *private_prefix, intermediates) {
+            let previous_row = screen.cursor_row;
+            if dispatch_cursor_csi(
+                screen,
+                protocol,
+                params,
+                cmd,
+                *private_prefix,
+                intermediates,
+            ) {
+                if screen.cursor_row != previous_row {
+                    if let Some(Effect::CursorReposition { non_linear }) = effects.last_mut() {
+                        *non_linear = true;
+                    }
+                }
                 return Dispatch::Handled(effects);
             }
             let first = params.first().copied();
@@ -523,22 +874,19 @@ pub(crate) fn dispatch_local_with_underline(
                     }
                 }
                 b'K' => {
-                    let span = match first.unwrap_or(0) {
-                        0 => {
-                            screen.pending_wrap = false;
-                            Some((screen.cursor_col, screen.grid.row_len()))
-                        }
-                        1 => Some((0, screen.cursor_col + 1)),
-                        2 => Some((0, screen.grid.row_len())),
-                        _ => None,
-                    };
-                    if let Some((start, end)) = span {
+                    let mode = first.unwrap_or(0);
+                    if mode == 0 {
+                        screen.pending_wrap = false;
+                    }
+                    if let Some(span) =
+                        erase_line_span(mode, screen.cursor_col, screen.grid.row_len())
+                    {
                         effects.extend(
                             screen
                                 .erase_span(
                                     screen.cursor_row,
-                                    start,
-                                    end,
+                                    span.start,
+                                    span.end,
                                     *private_prefix == Some(b'?'),
                                 )
                                 .into_iter()
@@ -572,11 +920,7 @@ pub(crate) fn dispatch_local_with_underline(
                     if intermediates == b" " {
                         screen.cursor_shape = cursor_shape(first.unwrap_or(0));
                     } else {
-                        match first.unwrap_or(0) {
-                            0 | 2 => screen.current_flags.set_protected(false),
-                            1 => screen.current_flags.set_protected(true),
-                            _ => {}
-                        }
+                        set_character_protection(screen, first.unwrap_or(0));
                     }
                 }
                 b'n' => {
@@ -625,6 +969,39 @@ pub fn frost_legacy_splice_lines(
     cursor..=bottom
 }
 
+fn erase_line_span(mode: u16, column: usize, width: usize) -> Option<Range<usize>> {
+    match mode {
+        0 => Some(column..width),
+        1 => Some(0..column + 1),
+        2 => Some(0..width),
+        _ => None,
+    }
+}
+
+/// Frost's inherited eraser admits orphan wide flags. Retain the shared
+/// glyph-span contract while also covering the eraser's physical edge repairs.
+pub(crate) fn frost_legacy_erase_damage_span(
+    screen: &ScreenState,
+    row: usize,
+    start: usize,
+    end: usize,
+) -> Range<usize> {
+    let width = screen.grid.cols();
+    let start = start.min(width);
+    let end = end.min(width);
+    let (left, right) = screen.expanded_cell_mutation_span(row, start, end);
+    let mut changed = left..right;
+    if row < screen.grid.rows() && start < end {
+        if start > 0 && screen.grid.get(row, start).flags.wide_continuation() {
+            changed.start = changed.start.min(start - 1);
+        }
+        if end < width && screen.grid.get(row, end - 1).flags.wide() {
+            changed.end = changed.end.max(end + 1);
+        }
+    }
+    changed
+}
+
 fn edit_frost_legacy_line(
     screen: &mut ScreenState,
     params: &[u16],
@@ -636,14 +1013,34 @@ fn edit_frost_legacy_line(
     let first = params.first().copied();
     let count = first.unwrap_or(1).max(1) as usize;
     let blank = screen.create_blank_cell();
+    let span = match cmd {
+        b'K' => erase_line_span(first.unwrap_or(0), col, width)?,
+        b'X' => col..col.saturating_add(count).min(width),
+        b'@' | b'P' => col..width,
+        _ => unreachable!("Frost line editing selector"),
+    };
+    let mut changed = span.clone();
+    if changed.start < changed.end {
+        if matches!(cmd, b'K' | b'X') {
+            changed = frost_legacy_erase_damage_span(screen, row, span.start, span.end);
+        } else if col > 0 {
+            // Mirror erase_wide_pair_touching's ordered branches. A live lead
+            // wins over an unrelated preceding lead in a malformed row.
+            let current = screen.grid.get(row, col).flags;
+            let clears_previous = if current.wide_continuation() {
+                true
+            } else if col + 1 < width && current.wide() {
+                false
+            } else {
+                screen.grid.get(row, col - 1).flags.wide()
+            };
+            if clears_previous {
+                changed.start -= 1;
+            }
+        }
+    }
     match cmd {
         b'K' => {
-            let span = match first.unwrap_or(0) {
-                0 => col..width,
-                1 => 0..col + 1,
-                2 => 0..width,
-                _ => return None,
-            };
             screen.grid.erase_cells(row, span, blank);
         }
         b'@' => {
@@ -670,7 +1067,7 @@ fn edit_frost_legacy_line(
     Some(RowMutation {
         row,
         row_id: screen.grid.row_id(row),
-        changed: 0..width,
+        changed,
         printed: None,
     })
 }
@@ -692,34 +1089,48 @@ fn kitty_keyboard_csi(protocol: &mut ProtocolState, params: &[u16], prefix: u8) 
     None
 }
 
-fn parse_sgr_extended_color(
-    params: &[u16],
-    colon_flags: &[bool],
-    i: usize,
-) -> Option<(Color, usize)> {
-    match params.get(i + 1).copied()? {
-        5 => {
-            let idx = params.get(i + 2).copied()? as u8;
-            Some((Color::Indexed(idx), i + 2))
-        }
+fn sgr_group_end(params: &[u16], colon_flags: &[bool], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < params.len() && colon_flags.get(end).copied().unwrap_or(false) {
+        end += 1;
+    }
+    end
+}
+
+/// A colon-owned color cannot read components across the next semicolon.
+/// XTerm permits both mode:r:g:b and mode:colorspace:r:g:b; additional
+/// subgroup fields are ignored without becoming independent SGR commands.
+fn sgr_colon_color(values: &[u16]) -> Option<Color> {
+    match values.first()? {
+        5 => Some(Color::Indexed(u8::try_from(*values.get(1)?).ok()?)),
         2 => {
-            // 计算从 i 起的冒号连续子参数组长度(组内各参数 colon_flag 为 true)。
-            let mut end = i + 1;
-            while end < params.len() && colon_flags.get(end).copied().unwrap_or(false) {
-                end += 1;
-            }
-            let colon_form = colon_flags.get(i + 1).copied().unwrap_or(false);
-            // 冒号形式且组长 >=6 表示存在颜色空间字段(38,2,cs,r,g,b),r 偏移为 3;
-            // 否则(传统分号形式或无 cs 的冒号形式)r 偏移为 2。
-            let r_off = if colon_form && (end - i) >= 6 { 3 } else { 2 };
-            let r = params.get(i + r_off).copied()?;
-            let g = params.get(i + r_off + 1).copied()?;
-            let b = params.get(i + r_off + 2).copied()?;
-            Some((Color::Rgb(r as u8, g as u8, b as u8), i + r_off + 2))
+            let offset = if values.len() >= 5 { 2 } else { 1 };
+            Some(Color::Rgb(
+                u8::try_from(*values.get(offset)?).ok()?,
+                u8::try_from(*values.get(offset + 1)?).ok()?,
+                u8::try_from(*values.get(offset + 2)?).ok()?,
+            ))
         }
         _ => None,
     }
 }
+
+/// Preserve the historical semicolon component conversion and consumption.
+fn parse_sgr_semicolon_color(params: &[u16], i: usize) -> Option<(Color, usize)> {
+    match params.get(i + 1).copied()? {
+        5 => Some((Color::Indexed(*params.get(i + 2)? as u8), i + 2)),
+        2 => Some((
+            Color::Rgb(
+                *params.get(i + 2)? as u8,
+                *params.get(i + 3)? as u8,
+                *params.get(i + 4)? as u8,
+            ),
+            i + 4,
+        )),
+        _ => None,
+    }
+}
+
 const ANSI_COLORS: [Color; 8] = [
     Color::Black,
     Color::Red,
@@ -847,34 +1258,39 @@ fn handle_sgr(
     let mut i = 0;
     while i < params.len() {
         let param = params[i];
+        let group_end = sgr_group_end(params, colon_flags, i);
+        let mut next = group_end;
         let background = match param {
             4 => {
-                // Only a recognized colon subparameter selects a style. A
-                // semicolon or unknown value remains a separate parameter.
-                let next_is_substyle = i + 1 < params.len()
-                    && colon_flags.get(i + 1).copied().unwrap_or(false)
-                    && params[i + 1] <= 5;
-                let style = if next_is_substyle {
-                    i += 1;
-                    params[i]
-                } else {
-                    1
-                };
+                let style = params
+                    .get(i + 1)
+                    .copied()
+                    .filter(|style| group_end > i + 1 && *style <= 5)
+                    .unwrap_or(1);
                 rendition.underline(style);
                 None
             }
-            38 | 48 | 58 => {
-                parse_sgr_extended_color(params, colon_flags, i).and_then(|(color, last)| {
-                    i = last;
-                    rendition.color(param, color)
-                })
+            38 | 48 | 58 if group_end > i + 1 => sgr_colon_color(&params[i + 1..group_end])
+                .and_then(|color| rendition.color(param, color)),
+            38 | 48 | 58
+                if i + 1 < params.len() && colon_flags.get(i + 2).copied().unwrap_or(false) =>
+            {
+                // Legacy mixed spelling: the mode following ';' owns a colon
+                // group, as in38;2:r:g:b or38;5:index.
+                next = sgr_group_end(params, colon_flags, i + 1);
+                sgr_colon_color(&params[i + 1..next])
+                    .and_then(|color| rendition.color(param, color))
             }
+            38 | 48 | 58 => parse_sgr_semicolon_color(params, i).and_then(|(color, last)| {
+                next = last + 1;
+                rendition.color(param, color)
+            }),
             _ => rendition.apply(param),
         };
         if let Some(color) = background {
             effects.push(Effect::GlobalBackground(color));
         }
-        i += 1;
+        i = next;
     }
 }
 
@@ -963,7 +1379,6 @@ pub fn frost_legacy_sgr(
     background: &mut Color,
     flags: &mut StyleFlags,
 ) -> Option<Color> {
-    let groups = frost_sgr_groups(raw_params);
     let mut rendition = Rendition {
         foreground,
         background,
@@ -971,6 +1386,23 @@ pub fn frost_legacy_sgr(
         underline_color: None,
         preserve_protection: false,
     };
+    if !raw_params.iter().any(|byte| matches!(byte, b';' | b':')) {
+        let param = raw_params.iter().fold(0u16, |value, byte| {
+            if byte.is_ascii_digit() {
+                value
+                    .saturating_mul(10)
+                    .saturating_add(u16::from(byte - b'0'))
+            } else {
+                value
+            }
+        });
+        if param == 4 {
+            rendition.underline(1);
+            return None;
+        }
+        return rendition.apply(param);
+    }
+    let groups = frost_sgr_groups(raw_params);
     let mut global_background = None;
     let mut i = 0;
     while let Some(group) = groups.get(i) {
@@ -1052,9 +1484,7 @@ fn reset_local_attributes(screen: &mut ScreenState, protocol: &mut ProtocolState
     screen.current_fg = Color::Default;
     screen.current_bg = Color::Default;
     screen.current_flags = StyleFlags::default();
-    screen.g0_charset = Charset::Ascii;
-    screen.g1_charset = Charset::Ascii;
-    screen.active_charset = Charset::Ascii;
+    screen.reset_charset_banks();
     screen.scroll_region_top = 0;
     screen.scroll_region_bottom = screen.grid.rows().saturating_sub(1);
     screen.saved_state = None;
@@ -1062,11 +1492,27 @@ fn reset_local_attributes(screen: &mut ScreenState, protocol: &mut ProtocolState
     screen.insert_mode = false;
     protocol.modes_mut().insert(25);
     protocol.modes_mut().insert(7);
+    protocol.modes_mut().remove(&45);
     screen.pending_wrap = false;
 }
 
-fn decrqss_reply(screen: &ScreenState, pt: &[u8], underline_color: Option<Color>) -> Vec<u8> {
+fn decrqss_reply(
+    screen: &ScreenState,
+    protocol: &ProtocolState,
+    pt: &[u8],
+    underline_color: Option<Color>,
+) -> Vec<u8> {
     let reply = match pt {
+        [b'>', zeros @ .., b'4', final_byte @ (b'm' | b'f')]
+            if zeros.iter().all(|byte| *byte == b'0') =>
+        {
+            let status = if *final_byte == b'm' {
+                modify_other_keys_status(protocol)
+            } else {
+                u16::from(format_other_keys_status(protocol))
+            };
+            format!("\x1bP1$r>4;{status}{}\x1b\\", char::from(*final_byte))
+        }
         b" q" => {
             let n = match screen.cursor_shape {
                 CursorShape::Underline => 4,
@@ -1096,6 +1542,23 @@ fn decrqss_reply(screen: &ScreenState, pt: &[u8], underline_color: Option<Color>
         _ => "\x1bP0$r\x1b\\".to_string(),
     };
     reply.into_bytes()
+}
+
+/// Hosted and newly supported profiles report a replayable SGR state.
+pub(crate) fn restorable_decrqss_reply(
+    screen: &ScreenState,
+    protocol: &ProtocolState,
+    pt: &[u8],
+    underline_color: Option<Color>,
+) -> Vec<u8> {
+    if pt != b"m" {
+        return decrqss_reply(screen, protocol, pt, underline_color);
+    }
+    let sgr = decrqss_sgr_payload(screen, underline_color);
+    if sgr == "0m" {
+        return b"\x1bP1$r0m\x1b\\".to_vec();
+    }
+    format!("\x1bP1$r0;{sgr}\x1b\\").into_bytes()
 }
 
 fn decrqss_sgr_payload(screen: &ScreenState, underline_color: Option<Color>) -> String {
@@ -1195,10 +1658,21 @@ fn decrqm_private_mode_state(
 ) -> u8 {
     let set = match mode {
         6 => screen.origin_mode,
-        1 | 7 | 25 | 47 | 66 | 1000..=1006 | 1015 | 1047..=1049 | 2004 | 2026 | 2031 | 5522 => {
-            protocol.modes().contains(&mode)
-        }
-        12 | 1007 | 1034 | 1036 if ember_extensions => protocol.modes().contains(&mode),
+        1
+        | 7
+        | 9
+        | 25
+        | 45
+        | 47
+        | 66
+        | 1000..=1007
+        | 1015
+        | 1047..=1049
+        | 2004
+        | 2026
+        | 2031
+        | 5522 => protocol.modes().contains(&mode),
+        12 | 1034 | 1036 if ember_extensions => protocol.modes().contains(&mode),
         _ => return 0,
     };
     if set {
@@ -1214,5 +1688,30 @@ fn decrqm_ansi_mode_state(screen: &ScreenState, mode: u16) -> u8 {
         4 => 2,
         20 => 4,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod unsaved_cursor_tests {
+    use super::*;
+    #[test]
+    fn missing_cursor_slot_resets_optional_underline_pen_without_consuming_saved_slots() {
+        let mut screen = ScreenState::new(3, 6);
+        let mut protocol = ProtocolState::default();
+        let mut underline = UnderlinePen {
+            current: Color::Rgb(1, 2, 3),
+            primary: Some(Color::Blue),
+            saved_cursor: Some(Color::Red),
+        };
+        restore_cursor_state(&mut screen, &mut protocol, Some(&mut underline));
+        assert_eq!(underline.current, Color::Default);
+        assert_eq!(underline.primary, Some(Color::Blue));
+        assert_eq!(underline.saved_cursor, Some(Color::Red));
+        underline.current = Color::Green;
+        save_cursor_state(&mut screen, &protocol, Some(&mut underline));
+        underline.current = Color::Blue;
+        restore_cursor_state(&mut screen, &mut protocol, Some(&mut underline));
+        assert_eq!(underline.current, Color::Green);
+        assert!(screen.saved_state.is_some());
     }
 }

@@ -21,6 +21,7 @@ enum Operation {
     Control(u8),
     Escape(u8),
     Designate { bank: u8, designator: u8 },
+    DesignateLatin1(u8),
     CommitDesignation { bank: u8, charset: Charset },
     AlignmentTest,
     Done,
@@ -43,7 +44,12 @@ impl FrostStateCommand {
                 bank: intermediates[0],
                 designator,
             },
-            // G2/G3 and multi-byte designators stay consumed without mutation.
+            (b"*" | b"+", designator @ (b'B' | b'0')) => Operation::Designate {
+                bank: intermediates[0],
+                designator,
+            },
+            (b"-" | b"." | b"/", b'A') => Operation::DesignateLatin1(1 + intermediates[0] - b'-'),
+            // Unsupported and multi-byte designators stay consumed.
             _ => Operation::Done,
         };
         Self { operation }
@@ -56,7 +62,7 @@ impl FrostStateCommand {
         match std::mem::replace(&mut self.operation, Operation::Done) {
             Operation::Control(byte) => match byte {
                 8 => {
-                    screen.cursor_controls().move_backward(1);
+                    screen.move_cursor_backward_with_wrap(1, protocol);
                     None
                 }
                 9 => {
@@ -69,11 +75,11 @@ impl FrostStateCommand {
                     None
                 }
                 14 => {
-                    screen.active_charset = screen.g1_charset;
+                    screen.invoke_charset(true);
                     None
                 }
                 15 => {
-                    screen.active_charset = screen.g0_charset;
+                    screen.invoke_charset(false);
                     None
                 }
                 // In particular, BEL does not produce Ember's bell effect.
@@ -99,6 +105,26 @@ impl FrostStateCommand {
                     None
                 }
                 b'c' => Some(FrostStateEffect::HardReset),
+                b'n' => {
+                    screen.invoke_charset_bank(2);
+                    None
+                }
+                b'o' => {
+                    screen.invoke_charset_bank(3);
+                    None
+                }
+                b'~' | b'}' | b'|' => {
+                    screen.invoke_gr_charset_bank(1 + b'~' - byte);
+                    None
+                }
+                b'N' => {
+                    screen.single_shift(2);
+                    None
+                }
+                b'O' => {
+                    screen.single_shift(3);
+                    None
+                }
                 b'>' => {
                     protocol.modes_mut().remove(&66);
                     None
@@ -117,6 +143,10 @@ impl FrostStateCommand {
                 } else {
                     Charset::Ascii
                 };
+                if matches!(bank, b'*' | b'+') {
+                    screen.designate_charset_bank(if bank == b'*' { 2 } else { 3 }, charset);
+                    return None;
+                }
                 self.operation = Operation::CommitDesignation { bank, charset };
                 Some(FrostStateEffect::CharsetNotice {
                     bank,
@@ -125,12 +155,11 @@ impl FrostStateCommand {
                 })
             }
             Operation::CommitDesignation { bank, charset } => {
-                if bank == b'(' {
-                    screen.g0_charset = charset;
-                    screen.active_charset = charset;
-                } else {
-                    screen.g1_charset = charset;
-                }
+                screen.designate_charset(bank != b'(', charset);
+                None
+            }
+            Operation::DesignateLatin1(bank) => {
+                screen.designate_latin1(bank);
                 None
             }
             Operation::Done => None,
@@ -284,6 +313,7 @@ mod tests {
     #[test]
     fn all_control_and_escape_bytes_match_frozen_frost_state_and_hook_order() {
         let mut cases = 0;
+        let mut new_shift_cases = 0;
         for bits in 0..16 {
             for byte in 0..=255 {
                 let (mut a, mut ap) = seed(bits);
@@ -306,6 +336,23 @@ mod tests {
                     b"%",
                     b"##",
                 ] {
+                    // LS2/LS3 now invoke supported G2/G3 instead of the frozen
+                    // legacy no-op. Actual scanners cover these transitions.
+                    if intermediates.is_empty() && matches!(byte, b'n' | b'o') {
+                        let (mut a, mut ap) = seed(bits);
+                        let (mut expected, ep) = seed(bits);
+                        assert!(actual(
+                            &mut a,
+                            &mut ap,
+                            FrostStateCommand::escape(intermediates, byte)
+                        )
+                        .is_empty());
+                        expected.active_charset = Charset::Ascii;
+                        assert_eq!(snapshot(&a, &ap), snapshot(&expected, &ep));
+                        assert_eq!(a.invoked_charset_bank(), if byte == b'n' { 2 } else { 3 });
+                        new_shift_cases += 1;
+                        continue;
+                    }
                     let (mut a, mut ap) = seed(bits);
                     let (mut e, mut ep) = seed(bits);
                     assert_eq!(
@@ -321,7 +368,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cases, 45056);
+        assert_eq!(cases, 45024);
+        assert_eq!(new_shift_cases, 32);
     }
     #[test]
     fn designation_notice_precedes_commit_and_unknown_sequences_leave_pending_wrap() {

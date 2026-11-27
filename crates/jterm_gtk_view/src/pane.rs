@@ -8,7 +8,7 @@ use jterm_engine::{
     history_reflow::HistoryAnchor,
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
-    mouse::MouseInput,
+    mouse::{MouseInput, MouseTracking},
     terminal::{Terminal, TranscriptAnchor, WindowUpdates},
 };
 use jterm_runtime::exit_status::PtyExit;
@@ -286,7 +286,7 @@ impl<P: Pty> EmbeddedTerminal<P> {
         rect: graphene::Rect,
     ) -> bool {
         let view = &self.pane.view;
-        let screen = &view.widget;
+        let screen = self.pane.screen();
         let Some(origin) = source.compute_point(screen, &graphene::Point::new(rect.x(), rect.y()))
         else {
             return false;
@@ -719,6 +719,43 @@ struct PointerMotion {
     modifiers: u8,
 }
 
+#[derive(Clone, Copy, Default)]
+struct PointerState {
+    generation: u64,
+    owned_buttons: u8,
+    active_buttons: u8,
+    last_motion: Option<PointerMotion>,
+    last_point: Option<(f64, f64)>,
+}
+
+impl PointerState {
+    fn follow_generation(&mut self, generation: u64) -> bool {
+        if self.generation == generation {
+            return false;
+        }
+        self.generation = generation;
+        self.active_buttons = 0;
+        self.last_motion = None;
+        true
+    }
+
+    fn first_button(buttons: u8) -> Option<u8> {
+        (0..3).find(|button| buttons & (1 << button) != 0)
+    }
+
+    fn release(&mut self, button: u8) -> Option<bool> {
+        let mask = 1 << button;
+        if self.owned_buttons & mask == 0 {
+            return None;
+        }
+        let was_active = self.active_buttons & mask != 0;
+        self.owned_buttons &= !mask;
+        self.active_buttons &= !mask;
+        self.last_motion = None;
+        Some(was_active)
+    }
+}
+
 /// Coordinates for the same primary rows installed in the GTK text buffer.
 pub(crate) struct PaintedTranscript<'a> {
     pub(crate) top: usize,
@@ -771,9 +808,7 @@ pub struct TerminalPane<P: Pty> {
     terminal_find: RefCell<Weak<crate::terminal_find::TerminalFind<P>>>,
     scroll_update: Cell<bool>,
     wheel_rows: Cell<f64>,
-    reported_buttons: Cell<u8>,
-    last_pointer_motion: Cell<Option<PointerMotion>>,
-    last_pointer_cell: Cell<Option<(usize, usize)>>,
+    pointer: Cell<PointerState>,
     pointer_wheel: Cell<f64>,
     painted_history: Cell<Option<HistoricalWindow>>,
     dirty: Cell<bool>,
@@ -993,9 +1028,7 @@ impl<P: Pty> TerminalPane<P> {
             terminal_find: RefCell::new(Weak::new()),
             scroll_update: Cell::new(false),
             wheel_rows: Cell::new(0.0),
-            reported_buttons: Cell::new(0),
-            last_pointer_motion: Cell::new(None),
-            last_pointer_cell: Cell::new(None),
+            pointer: Cell::new(PointerState::default()),
             pointer_wheel: Cell::new(0.0),
             painted_history: Cell::new(None),
             dirty: Cell::new(true),
@@ -1022,7 +1055,7 @@ impl<P: Pty> TerminalPane<P> {
         let open_link = (links.attach_opener)(session.view.widget.upcast_ref());
         let weak = Rc::downgrade(&session);
         connect_links(
-            &session.view.widget,
+            session.screen(),
             move |x, y| {
                 let pane = weak.upgrade()?;
                 pane.view.link_at(x, y, pane.plain_links)
@@ -1261,7 +1294,7 @@ impl<P: Pty> TerminalPane<P> {
     }
 
     pub fn screen(&self) -> &gtk4::TextView {
-        &self.view.widget
+        self.view.widget.upcast_ref()
     }
 
     pub fn window_title(&self) -> Option<String> {
@@ -2094,41 +2127,35 @@ impl<P: Pty> TerminalPane<P> {
                 .contains(&event.button())
                 .then(|| event.button() as u8 - 1)
         };
-        let (input, released) = match event.event_type() {
+        let mut pointer = self.pointer.get();
+        let (input, release_was_active) = match event.event_type() {
             gdk::EventType::ButtonPress => {
                 let Some(button) = button() else { return false };
                 (MouseInput::Press(button), false)
             }
             gdk::EventType::ButtonRelease => {
                 let Some(button) = button() else { return false };
-                let mask = 1 << button;
-                let previous = self.reported_buttons.get();
-                self.reported_buttons.set(previous & !mask);
-                if previous & mask == 0 {
+                let Some(active) = pointer.release(button) else {
                     return false;
-                }
-                (MouseInput::Release(button), true)
+                };
+                self.pointer.set(pointer);
+                (MouseInput::Release(button), active)
             }
-            gdk::EventType::MotionNotify => {
-                let buttons = self.reported_buttons.get();
-                (
-                    MouseInput::Motion((0..3).find(|button| buttons & (1 << button) != 0)),
-                    false,
-                )
-            }
+            gdk::EventType::MotionNotify => (MouseInput::Motion(None), false),
             gdk::EventType::GrabBroken => {
-                self.reported_buttons.set(0);
-                self.last_pointer_motion.set(None);
-                self.last_pointer_cell.set(None);
+                self.pointer.set(PointerState::default());
+                self.pointer_wheel.set(0.0);
                 return false;
             }
             gdk::EventType::LeaveNotify => {
-                self.last_pointer_motion.set(None);
-                self.last_pointer_cell.set(None);
+                pointer.last_motion = None;
+                pointer.last_point = None;
+                self.pointer.set(pointer);
                 return false;
             }
             _ => return false,
         };
+        let released = matches!(input, MouseInput::Release(_));
         if self.exited.get()
             || (!released
                 && (self.scroll_top.get().is_some()
@@ -2136,62 +2163,108 @@ impl<P: Pty> TerminalPane<P> {
         {
             return released;
         }
-        let Some(point) = self.view.event_point(event) else {
-            return released;
-        };
+        let point = self.view.event_point(event);
         if input == MouseInput::Press(0)
             && link_modifier(state)
-            && self
-                .view
-                .link_at(point.0, point.1, self.plain_links)
-                .is_some()
+            && point.is_some_and(|point| {
+                self.view
+                    .link_at(point.0, point.1, self.plain_links)
+                    .is_some()
+            })
         {
             return false;
         }
-        let Some((column, row)) = self.view.cell_at(point, self.dimensions.get(), released) else {
-            self.last_pointer_cell.set(None);
-            return released;
-        };
-        self.last_pointer_cell.set(Some((column, row)));
-        let motion = if let MouseInput::Motion(button) = input {
-            Some(PointerMotion {
-                column,
-                row,
-                button,
-                modifiers,
-            })
-        } else {
-            self.last_pointer_motion.set(None);
-            None
-        };
-        let already_sent = motion.is_some() && self.last_pointer_motion.get() == motion;
+        let cell =
+            point.and_then(|point| self.view.cell_at(point, self.dimensions.get(), released));
         let mut reporting = false;
+        let mut admitted = None;
         let sent = self
             .queue_input(|terminal| {
+                let new_generation = pointer.follow_generation(terminal.mouse_report_generation());
+                if new_generation {
+                    self.pointer_wheel.set(0.0);
+                }
+                if point.is_some() {
+                    pointer.last_point = point.filter(|_| cell.is_some());
+                }
+                let cell = cell.or_else(|| {
+                    if released && !new_generation {
+                        pointer
+                            .last_point
+                            .and_then(|point| self.view.cell_at(point, self.dimensions.get(), true))
+                    } else {
+                        None
+                    }
+                });
+                let Some((column, row)) = cell else {
+                    return Ok(Vec::new());
+                };
+                let (input, motion) = match input {
+                    MouseInput::Release(_) if new_generation || !release_was_active => {
+                        return Ok(Vec::new());
+                    }
+                    MouseInput::Motion(_) => {
+                        let physical = pointer_buttons(state);
+                        let button = PointerState::first_button(pointer.active_buttons & physical);
+                        if physical != 0 && button.is_none() {
+                            pointer.last_motion = None;
+                            return Ok(Vec::new());
+                        }
+                        let motion = PointerMotion {
+                            column,
+                            row,
+                            button,
+                            modifiers,
+                        };
+                        if pointer.last_motion == Some(motion) {
+                            // This cell was sent in the current mouse and grid generation.
+                            reporting = true;
+                            return Ok(Vec::new());
+                        }
+                        (MouseInput::Motion(button), Some(motion))
+                    }
+                    _ => (input, None),
+                };
                 let Some(bytes) = terminal.encode_mouse(input, column, row, modifiers) else {
+                    pointer.last_motion = None;
                     return Ok(Vec::new());
                 };
                 reporting = true;
-                Ok(if already_sent { Vec::new() } else { bytes })
+                let press = match input {
+                    MouseInput::Press(button) => terminal
+                        .mouse_report_profile()
+                        .map(|profile| (button, profile.tracking)),
+                    _ => None,
+                };
+                admitted = Some((motion, press, column, row));
+                Ok(bytes)
             })
             .unwrap_or(false);
-        if sent {
-            self.last_pointer_motion.set(motion);
-            if let MouseInput::Press(button) = input {
-                let buttons = self.reported_buttons.get() | (1 << button);
-                self.reported_buttons.set(buttons);
-                // The press has already reported this cell. GTK can deliver
-                // motion from the same cell when the button grab starts.
-                self.last_pointer_motion.set(Some(PointerMotion {
-                    column,
-                    row,
-                    button: (0..3).find(|button| buttons & (1 << button) != 0),
-                    modifiers,
-                }));
-                self.view.widget.grab_focus();
+        let mut focus = false;
+        if let Some((motion, press, column, row)) = admitted.filter(|_| sent) {
+            pointer.last_motion = motion;
+            if let Some((button, tracking)) = press {
+                pointer.owned_buttons |= 1 << button;
+                if tracking != MouseTracking::PressOnly {
+                    pointer.active_buttons |= 1 << button;
+                }
+                if matches!(tracking, MouseTracking::Drag | MouseTracking::Any) {
+                    // GTK can deliver motion from the press cell as its grab starts.
+                    pointer.last_motion = Some(PointerMotion {
+                        column,
+                        row,
+                        button: PointerState::first_button(pointer.active_buttons),
+                        modifiers,
+                    });
+                }
+                focus = true;
             }
         } else if !reporting {
-            self.last_pointer_motion.set(None);
+            pointer.last_motion = None;
+        }
+        self.pointer.set(pointer);
+        if focus {
+            self.view.widget.grab_focus();
         }
         reporting || released
     }
@@ -2207,14 +2280,10 @@ impl<P: Pty> TerminalPane<P> {
             self.pointer_wheel.set(0.0);
             return false;
         }
-        let Some((column, row)) = self
+        let cell = self
             .view
             .event_point(event)
-            .and_then(|point| self.view.cell_at(point, self.dimensions.get(), false))
-            .or_else(|| self.last_pointer_cell.get())
-        else {
-            return false;
-        };
+            .and_then(|point| self.view.cell_at(point, self.dimensions.get(), false));
         let delta = match event
             .downcast_ref::<gdk::ScrollEvent>()
             .map(|scroll| scroll.direction())
@@ -2224,25 +2293,47 @@ impl<P: Pty> TerminalPane<P> {
             _ if unit == gdk::ScrollUnit::Surface => dy / self.view.row_height(),
             _ => dy,
         };
-        let pending = self.pointer_wheel.get() + delta;
-        let count = pending.trunc().abs().min(8.0) as usize;
-        let input = if pending < 0.0 {
-            MouseInput::WheelUp
-        } else {
-            MouseInput::WheelDown
-        };
+        let mut pointer = self.pointer.get();
+        let mut remainder = 0.0;
         let mut reporting = false;
         let result = self.queue_input(|terminal| {
+            let new_generation = pointer.follow_generation(terminal.mouse_report_generation());
+            // Scroll events can omit their position. Re-hit-test the last
+            // widget point against today's cell geometry.
+            let cell = cell.or_else(|| {
+                pointer
+                    .last_point
+                    .and_then(|point| self.view.cell_at(point, self.dimensions.get(), false))
+            });
+            let Some((column, row)) = cell else {
+                return Ok(Vec::new());
+            };
+            let pending = if new_generation {
+                delta
+            } else {
+                self.pointer_wheel.get() + delta
+            };
+            let input = if pending < 0.0 {
+                MouseInput::WheelUp
+            } else {
+                MouseInput::WheelDown
+            };
             let Some(bytes) =
                 terminal.encode_mouse(input, column, row, mouse_modifiers(event.modifier_state()))
             else {
                 return Ok(Vec::new());
             };
             reporting = true;
-            Ok(bytes.repeat(count))
+            remainder = pending.fract();
+            let count = pending.trunc().abs().min(8.0) as usize;
+            Ok(if count == 1 {
+                bytes
+            } else {
+                bytes.repeat(count)
+            })
         });
-        self.pointer_wheel
-            .set(if reporting { pending.fract() } else { 0.0 });
+        self.pointer.set(pointer);
+        self.pointer_wheel.set(remainder);
         reporting && result.is_ok()
     }
 
@@ -2471,6 +2562,12 @@ async fn read_native_clipboard(clipboard: &gdk::Clipboard) -> Result<Option<Stri
         .map_err(|_| "clipboard text is not UTF-8".into())
 }
 
+fn pointer_buttons(modifiers: gdk::ModifierType) -> u8 {
+    u8::from(modifiers.contains(gdk::ModifierType::BUTTON1_MASK))
+        | (u8::from(modifiers.contains(gdk::ModifierType::BUTTON2_MASK)) << 1)
+        | (u8::from(modifiers.contains(gdk::ModifierType::BUTTON3_MASK)) << 2)
+}
+
 fn mouse_modifiers(modifiers: gdk::ModifierType) -> u8 {
     (u8::from(modifiers.contains(gdk::ModifierType::SHIFT_MASK)) << 2)
         | (u8::from(modifiers.contains(gdk::ModifierType::ALT_MASK)) << 3)
@@ -2522,6 +2619,30 @@ fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {
 mod transcript_tests {
     use super::*;
     use crate::{TranscriptView, TranscriptZoneOrigin};
+
+    #[test]
+    fn pointer_generation_expires_reports_but_consumes_the_old_physical_release() {
+        let mut pointer = PointerState {
+            generation: 3,
+            owned_buttons: 1,
+            active_buttons: 1,
+            last_point: Some((20.0, 10.0)),
+            last_motion: Some(PointerMotion {
+                column: 2,
+                row: 1,
+                button: Some(0),
+                modifiers: 0,
+            }),
+        };
+        assert!(!pointer.follow_generation(3));
+        assert!(pointer.last_motion.is_some());
+        assert!(pointer.follow_generation(4));
+        assert_eq!(pointer.active_buttons, 0);
+        assert!(pointer.last_motion.is_none());
+        assert_eq!(pointer.last_point, Some((20.0, 10.0)));
+        assert_eq!(pointer.release(0), Some(false));
+        assert_eq!(pointer.release(0), None);
+    }
 
     struct TestPty;
 

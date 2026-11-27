@@ -1,6 +1,6 @@
 //! Terminal Channel frames. Version 5 adds inline raster resources to version 4.
 
-use crate::terminal::{self, Attachment, CursorShape, SessionStatus, WireFrame};
+use crate::terminal::{self, Attachment, CursorShape, RgbColor, SessionStatus, WireFrame};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, num::NonZeroU64};
 
@@ -73,6 +73,8 @@ pub struct HistoryView {
     pub offset: u32,
     pub total_rows: u32,
     pub cols: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_background: Option<RgbColor>,
     pub text: String,
     pub rows: Vec<HistoryRow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -254,6 +256,8 @@ pub struct Stamp {
     pub cursor_col: u16,
     pub cursor_visible: bool,
     pub cursor_shape: CursorShape,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_color: Option<RgbColor>,
     pub pending_wrap: bool,
 }
 

@@ -125,6 +125,7 @@ pub struct HistoryPage {
     pub row_count: usize,
     pub text: String,
     rows: Vec<HistoryCopyRow>,
+    paint_colors: Option<Arc<ColorState>>,
     hyperlinks: Option<HyperlinkResources>,
 }
 struct HistoryCopyRow {
@@ -135,6 +136,11 @@ struct HistoryCopyRow {
     synthetic_gap: Option<usize>,
 }
 impl HistoryPage {
+    /// Current colors captured when this history page was requested.
+    pub fn paint_colors(&self) -> Option<&ColorState> {
+        self.paint_colors.as_deref()
+    }
+
     /// Decoded page backing, including copy text and row annotations.
     /// The image store accounts for referenced rasters.
     pub fn retained_delivery_bytes(&self) -> usize {
@@ -160,7 +166,15 @@ impl HistoryPage {
                     .map(|(_, uri)| header + uri.len())
                     .sum::<usize>()
         });
-        size_of::<Self>() + self.text.capacity() + rows + contents.sum::<usize>() + links
+        size_of::<Self>()
+            + self.text.capacity()
+            + rows
+            + contents.sum::<usize>()
+            + links
+            + self
+                .paint_colors
+                .as_ref()
+                .map_or(0, |_| header + size_of::<ColorState>())
     }
 
     /// Physical row and style snapshot for a viewport. Width can differ
@@ -212,7 +226,9 @@ impl HistoryPage {
     /// Blank padding and wide continuation cells can share an offset.
     pub fn copy_offsets_utf16(&self) -> Result<Vec<Vec<u32>>, String> {
         let mut offsets = Vec::with_capacity(self.row_count);
-        let text = extract_selection(
+        // Release offset delivery needs only lengths and trimming boundaries.
+        // Debug builds retain the original single text pass and consistency check.
+        let text = extract_selection::<{ cfg!(debug_assertions) }>(
             &self.rows,
             (0, 0),
             (self.row_count, 0),
@@ -259,7 +275,7 @@ fn selection_text(
     end: (usize, usize),
     require_literal: bool,
 ) -> Result<String, String> {
-    extract_selection(rows, start, end, require_literal, None)
+    extract_selection::<true>(rows, start, end, require_literal, None)
 }
 
 fn append_copy_cell(
@@ -275,7 +291,7 @@ fn append_copy_cell(
     }
 }
 
-fn extract_selection(
+fn extract_selection<const MATERIALIZE: bool>(
     rows: &[HistoryCopyRow],
     start: (usize, usize),
     end: (usize, usize),
@@ -289,6 +305,8 @@ fn extract_selection(
         return Err("selection out of bounds".into());
     }
     let mut text = String::new();
+    let mut text_bytes = 0usize;
+    let mut trailing_spaces = 0usize;
     let mut printed_space_end = 0;
     let mut units = 0u32;
     for (index, source) in rows
@@ -314,13 +332,38 @@ fn extract_selection(
             if require_literal && cell.flags.tab_padding() {
                 return Err("terminal range has tab expansion".into());
             }
-            let start = text.len();
-            append_copy_cell(&mut text, cell, source.annotations.as_deref(), col);
-            if boundaries.is_some() {
-                units += text[start..].encode_utf16().count() as u32;
+            if let Some(cluster) = source.annotations.as_ref().and_then(|row| row.text(col)) {
+                if MATERIALIZE {
+                    text.push_str(cluster);
+                } else {
+                    text_bytes += cluster.len();
+                    let trailing = cluster.len() - cluster.trim_end_matches(' ').len();
+                    trailing_spaces = if trailing == cluster.len() {
+                        trailing_spaces + trailing
+                    } else {
+                        trailing
+                    };
+                }
+                if boundaries.is_some() {
+                    units += cluster.encode_utf16().count() as u32;
+                }
+            } else {
+                if MATERIALIZE {
+                    text.push(cell.character);
+                } else {
+                    text_bytes += cell.character.len_utf8();
+                    trailing_spaces = if cell.character == ' ' {
+                        trailing_spaces + 1
+                    } else {
+                        0
+                    };
+                }
+                if boundaries.is_some() {
+                    units += cell.character.len_utf16() as u32;
+                }
             }
             if cell.flags.printed_space() {
-                printed_space_end = text.len();
+                printed_space_end = if MATERIALIZE { text.len() } else { text_bytes };
             }
         }
         if let (Some(offsets), Some(mut boundaries)) = (offsets.as_deref_mut(), boundaries) {
@@ -329,9 +372,15 @@ fn extract_selection(
         }
         if index < end.0 && !source.row.wrapped {
             // Physical trailing blank padding is not copied across a hard line.
-            let end = text.trim_end_matches(' ').len().max(printed_space_end);
+            let length = if MATERIALIZE { text.len() } else { text_bytes };
+            let trimmed = if MATERIALIZE {
+                text.trim_end_matches(' ').len()
+            } else {
+                text_bytes - trailing_spaces
+            };
+            let end = trimmed.max(printed_space_end);
             if let Some(offsets) = offsets.as_deref_mut() {
-                units -= (text.len() - end) as u32;
+                units -= (length - end) as u32;
                 for boundary in offsets
                     .iter_mut()
                     .rev()
@@ -343,13 +392,23 @@ fn extract_selection(
                     *boundary = units;
                 }
             }
-            text.truncate(end);
+            if MATERIALIZE {
+                text.truncate(end);
+            } else {
+                trailing_spaces = trailing_spaces.saturating_sub(length - end);
+                text_bytes = end;
+            }
             if index + 1 < rows.len() {
-                text.push('\n');
+                if MATERIALIZE {
+                    text.push('\n');
+                } else {
+                    text_bytes += 1;
+                    trailing_spaces = 0;
+                }
                 units += 1;
             }
         }
-        if text.len() > MAX_COPY_BYTES {
+        if (if MATERIALIZE { text.len() } else { text_bytes }) > MAX_COPY_BYTES {
             return Err("selection byte limit".into());
         }
     }
@@ -363,6 +422,7 @@ fn extract_selection(
 /// reply bytes to the caller. PTY I/O and effects with external side effects
 /// belong to the owning session.
 pub struct Terminal {
+    mouse_report_generation: u64,
     epoch: NonZeroU64,
     max_cols: usize,
     vt: crate::vt_state::VtState,
@@ -401,34 +461,45 @@ struct FrameCache {
     history_extent: std::ops::Range<u64>,
     row_identity_revision: u64,
     row_links: Vec<Vec<HyperlinkId>>,
+    row_link_scratch: Vec<HyperlinkId>,
 }
 
 fn visible_hyperlinks(
     table: &HyperlinkTable,
     row_links: &mut Vec<Vec<HyperlinkId>>,
+    scratch: &mut Vec<HyperlinkId>,
     previous: Option<&CellFrame>,
     rows: &[Row],
 ) -> Option<HyperlinkResources> {
-    let reuse = !row_links.is_empty();
+    let reuse = previous.is_some() && row_links.len() == rows.len();
     if let Some(frame) = previous.filter(|frame| reuse && std::ptr::eq(frame.rows(), rows)) {
         return frame.shared_hyperlinks();
     }
     row_links.resize_with(rows.len(), Vec::new);
+    let mut links_changed = !reuse;
     for (index, (row, ids)) in rows.iter().zip(row_links.iter_mut()).enumerate() {
         if reuse
             && previous.is_some_and(|frame| Arc::ptr_eq(&frame.rows()[index].cells, &row.cells))
         {
             continue;
         }
-        ids.clear();
+        scratch.clear();
         for cell in row.cells.iter() {
             let id = cell.hyperlink_id;
-            if !id.is_none() && ids.last() != Some(&id) {
-                ids.push(id);
+            if !id.is_none() && scratch.last() != Some(&id) {
+                scratch.push(id);
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
+        scratch.sort_unstable();
+        scratch.dedup();
+        if *ids != *scratch {
+            std::mem::swap(ids, scratch);
+            links_changed = true;
+        }
+    }
+    if !links_changed {
+        // IDs belong to this append-only table and keep their targets.
+        return previous.and_then(CellFrame::shared_hyperlinks);
     }
     table.snapshot(row_links.iter().flatten().copied())
 }
@@ -566,6 +637,7 @@ impl Terminal {
         screen.grid.begin_capture_revision(revision);
         screen.alt_grid.begin_capture_revision(revision);
         Ok(Self {
+            mouse_report_generation: 1,
             epoch,
             max_cols,
             vt: crate::vt_state::VtState::adopt_hosted(
@@ -658,9 +730,13 @@ impl Terminal {
     /// Native key controllers supply the base key in the active layout and
     /// deliver committed IME text separately from physical key presses.
     pub fn enable_keyboard_disambiguation(&mut self) {
+        let before = self.alternate_scroll_profile();
         self.vt
             .protocol
             .limit_keyboard_enhancements(u16::from(crate::input::KITTY_DISAMBIGUATE));
+        if self.alternate_scroll_profile() != before {
+            self.retire_mouse_reports();
+        }
     }
 
     pub fn take_window_updates(&mut self) -> WindowUpdates {
@@ -671,12 +747,23 @@ impl Terminal {
 
     /// Supply the native theme and admit OSC palette and default-color operations.
     pub fn set_color_defaults(&mut self, defaults: TerminalDefaultColors) {
+        if self
+            .colors
+            .as_ref()
+            .is_some_and(|colors| colors.default_colors == defaults)
+        {
+            return;
+        }
+        let Some(revision) = self.revision.checked_add(1) else {
+            return;
+        };
         let mut next = self
             .colors
             .as_deref()
             .cloned()
             .unwrap_or_else(|| ColorState::new(defaults));
         next.default_colors = defaults;
+        self.begin_revision(revision);
         self.publish_colors(next);
     }
 
@@ -701,6 +788,9 @@ impl Terminal {
         let value = packet.text()?;
         if packet.payload_len() > 4096 {
             return Some(Effects::new());
+        }
+        if let Some(effects) = colors.query_ember_osc(command, value, packet.terminator()) {
+            return Some(effects);
         }
         let mut next = colors.clone();
         let effects = next.apply_ember_osc(command, value, packet.terminator());
@@ -915,6 +1005,41 @@ impl Terminal {
             .then_some(if focused { b"\x1b[I" } else { b"\x1b[O" })
     }
 
+    /// Effective pointer tracking and encoding from the current live modes.
+    pub fn mouse_report_profile(&self) -> Option<crate::mouse::MouseReportProfile> {
+        self.vt.protocol.modes().mouse_report_profile()
+    }
+
+    /// Wheel input is routed to unmodified cursor keys on the alternate
+    /// screen only when tracking is off and the active keyboard encoder can
+    /// admit those keys. Unsupported keyboard profiles never claim this route.
+    pub fn alternate_scroll_active(&self) -> bool {
+        self.vt.screen.use_alt_buffer
+            && self.vt.protocol.modes().contains(&1007)
+            && !self.vt.protocol.modes().is_mouse_enabled()
+            && (self.vt.protocol.keyboard_enhancement_flags() == 0
+                || self.vt.protocol.keyboard_enhancement_limit().is_some())
+    }
+
+    fn alternate_scroll_profile(&self) -> Option<(bool, u16)> {
+        self.alternate_scroll_active().then(|| {
+            (
+                self.vt.protocol.modes().contains(&1),
+                self.vt.protocol.keyboard_enhancement_flags(),
+            )
+        })
+    }
+
+    /// Identity of the current pointer negotiation and active screen.
+    /// A round trip inside one output batch still retires old gestures.
+    pub fn mouse_report_generation(&self) -> u64 {
+        self.mouse_report_generation
+    }
+
+    fn retire_mouse_reports(&mut self) {
+        self.mouse_report_generation = self.mouse_report_generation.saturating_add(1);
+    }
+
     pub fn encode_mouse(
         &self,
         input: MouseInput,
@@ -941,10 +1066,7 @@ impl Terminal {
             }
             MouseInput::WheelUp | MouseInput::WheelDown => {
                 let up = input == MouseInput::WheelUp;
-                if !modes.is_mouse_enabled()
-                    && self.vt.screen.use_alt_buffer
-                    && modes.contains(&1007)
-                {
+                if self.alternate_scroll_active() {
                     return self
                         .encode_key(
                             if up { "ArrowUp" } else { "ArrowDown" },
@@ -1012,21 +1134,27 @@ impl Terminal {
         if text.len() > byte_limit {
             return Err("paste byte limit".into());
         }
-        if text
-            .chars()
-            .any(|c| c.is_control() && !matches!(c, '\r' | '\n' | '\t'))
-        {
-            return Err("paste contains control characters".into());
+        let mut bytes = Vec::with_capacity(text.len() + if bracketed { 12 } else { 0 });
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
         }
-        let normalized = text
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .replace('\n', "\r");
-        let bytes = if bracketed {
-            format!("\x1b[200~{normalized}\x1b[201~").into_bytes()
-        } else {
-            normalized.into_bytes()
-        };
+        let input = text.as_bytes();
+        let mut start = 0;
+        for (position, character) in text.char_indices() {
+            if matches!(character, '\r' | '\n') {
+                bytes.extend_from_slice(&input[start..position]);
+                if character == '\r' || position == 0 || input[position - 1] != b'\r' {
+                    bytes.push(b'\r');
+                }
+                start = position + 1;
+            } else if character != '\t' && character.is_control() {
+                return Err("paste contains control characters".into());
+            }
+        }
+        bytes.extend_from_slice(&input[start..]);
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
         if bytes.len() > byte_limit {
             return Err("encoded paste byte limit".into());
         }
@@ -1240,6 +1368,7 @@ impl Terminal {
             row_count: rows.len(),
             text: String::new(),
             hyperlinks: self.hyperlink_snapshot(rows.iter().map(|row| &row.row)),
+            paint_colors: self.colors.clone(),
             rows,
         };
         page.text = page.selection_text(0, 0, page.row_count, 0)?;
@@ -1296,7 +1425,7 @@ impl Terminal {
         }
     }
 
-    fn extend_grapheme(&mut self, ch: char) -> bool {
+    fn extend_grapheme(&mut self, ch: char, translated: char) -> bool {
         let Some(input) = &self.graphemes else {
             return false;
         };
@@ -1317,9 +1446,7 @@ impl Terminal {
             .cluster_text(anchor.row, anchor.col)
             .unwrap_or_else(|| base.encode_utf8(&mut scalar));
         let mut buf = [0; MAX_CLUSTER_BYTES + 4];
-        let Some(cluster) =
-            graphemes::extension(preceding, self.vt.screen.translate_char(ch), &mut buf)
-        else {
+        let Some(cluster) = graphemes::extension(preceding, translated, &mut buf) else {
             return false;
         };
         if cluster.len() > MAX_CLUSTER_BYTES {
@@ -1420,8 +1547,9 @@ impl Terminal {
     }
 
     fn print(&mut self, ch: char) {
-        if !self.extend_grapheme(ch) {
-            self.print_cell(ch, self.vt.screen.translate_char(ch));
+        let translated = self.vt.screen.take_graphic_charset(ch).translate(ch);
+        if !self.extend_grapheme(ch, translated) {
+            self.print_cell(ch, translated);
         }
     }
 
@@ -1588,8 +1716,117 @@ impl Terminal {
         }
     }
 
+    fn apply_dec_private_mode(&mut self, mode: u16, set: bool, now: Instant) {
+        match mode {
+            47 | 1047 | 1049 => {
+                let was_alternate = self.vt.screen.use_alt_buffer;
+                if set != was_alternate {
+                    self.cancel_inline_upload();
+                }
+                if set {
+                    if let Some(entry) = self.vt.screen.enter_alternate_screen(
+                        mode == 1049,
+                        mode != 47,
+                        &self.vt.protocol,
+                    ) {
+                        if let Some(rows) = entry.cleared_rows {
+                            self.vt.screen.grid.row_wrapped[rows].fill(false);
+                        }
+                        if mode == 1049 {
+                            if let Some(underline) = &mut self.underline_pen {
+                                underline.primary = Some(underline.current);
+                            }
+                        }
+                        self.vt.protocol.switch_screen();
+                    }
+                } else if let Some(effect) = self.vt.screen.leave_alternate_screen(mode == 1049) {
+                    if self.vt.protocol.keyboard_enhancement_limit().is_some() {
+                        self.vt.protocol.reset_keyboard_enhancement();
+                    }
+                    self.vt.protocol.switch_screen();
+                    if let Some(underline) = &mut self.underline_pen {
+                        underline.current = underline.primary.take().unwrap_or(Color::Default);
+                    }
+                    if let Some(wrap) = effect.restore_autowrap {
+                        if wrap {
+                            self.vt.protocol.modes_mut().insert(7);
+                        } else {
+                            self.vt.protocol.modes_mut().remove(&7);
+                        }
+                    }
+                }
+                // These DEC modes report the same active buffer.
+                let alternate = self.vt.screen.use_alt_buffer;
+                if alternate != was_alternate {
+                    self.retire_mouse_reports();
+                }
+                let modes = self.vt.protocol.modes_mut();
+                for alias in [47, 1047, 1049] {
+                    if alternate {
+                        modes.insert(alias);
+                    } else {
+                        modes.remove(&alias);
+                    }
+                }
+                return;
+            }
+            1048 => {
+                if set {
+                    semantics::save_cursor_state(
+                        &mut self.vt.screen,
+                        &self.vt.protocol,
+                        self.underline_pen.as_mut(),
+                    );
+                } else {
+                    semantics::restore_cursor_state(
+                        &mut self.vt.screen,
+                        &mut self.vt.protocol,
+                        self.underline_pen.as_mut(),
+                    );
+                }
+            }
+            6 => {
+                self.vt.screen.origin_mode = set;
+                self.vt.screen.set_cursor_position(1, 1);
+            }
+            7 => {
+                if !set {
+                    self.vt.screen.pending_wrap = false;
+                }
+            }
+            2026 => {
+                if set {
+                    self.vt.sync_output.begin_hosted(now);
+                } else {
+                    self.vt.sync_output.end_hosted();
+                }
+                return;
+            }
+            1 | 9 | 25 | 45 | 66 | 1000 | 1002..=1007 | 1015 | 2004 => (),
+            _ => {
+                self.unsupported();
+                return;
+            }
+        }
+        let previous_mouse = matches!(mode, 9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015)
+            .then(|| self.mouse_report_profile());
+        let previous_alternate_scroll = matches!(mode, 1 | 1007 | 9 | 1000 | 1002 | 1003)
+            .then(|| self.alternate_scroll_profile());
+        if set {
+            self.vt.protocol.modes_mut().insert(mode);
+        } else {
+            self.vt.protocol.modes_mut().remove(&mode);
+        }
+        if previous_mouse.is_some_and(|old| self.mouse_report_profile() != old)
+            || previous_alternate_scroll.is_some_and(|old| self.alternate_scroll_profile() != old)
+        {
+            self.retire_mouse_reports();
+        }
+    }
+
     // Apply profile-specific screen operations after shared local dispatch.
     fn reset_terminal(&mut self) {
+        self.retire_mouse_reports();
         self.cancel_inline_upload();
         let track_printed_spaces = self.vt.screen.grid.track_printed_spaces;
         self.vt.screen = ScreenState::new(self.vt.screen.grid.rows(), self.vt.screen.grid.cols());
@@ -1598,7 +1835,9 @@ impl Terminal {
         }
         self.begin_revision(self.revision);
         let keyboard_limit = self.vt.protocol.keyboard_enhancement_limit();
-        self.vt.protocol = initial_protocol();
+        let mut protocol = initial_protocol();
+        protocol.take_rendition_stack_from(&mut self.vt.protocol);
+        self.vt.protocol = protocol;
         if let Some(limit) = keyboard_limit {
             self.vt.protocol.limit_keyboard_enhancements(limit);
         }
@@ -1644,6 +1883,68 @@ impl Terminal {
             }
             Event::Csi {
                 params,
+                colon_flags,
+                private_prefix: None,
+                intermediates,
+                final_byte: final_byte @ (b'r' | b't'),
+                ..
+            } if intermediates == b"$" && !colon_flags.iter().any(|flag| *flag) => {
+                if let Some(mut rectangle) = crate::rectangular_edit::prepare_rectangular_attributes(
+                    &self.vt.screen,
+                    params,
+                    *final_byte as char,
+                    None,
+                    intermediates,
+                    self.vt.protocol.rectangular_attribute_extent,
+                ) {
+                    while rectangle.step(&mut self.vt.screen).is_some() {}
+                }
+            }
+            Event::Csi {
+                params,
+                colon_flags,
+                private_prefix: None,
+                intermediates,
+                final_byte: final_byte @ (b'z' | b'{' | b'x' | b'v'),
+                ..
+            } if intermediates == b"$" && !colon_flags.iter().any(|flag| *flag) => {
+                if let Some(mut rectangle) = crate::rectangular_edit::prepare_rectangular_edit(
+                    &self.vt.screen,
+                    params,
+                    *final_byte as char,
+                    None,
+                    intermediates,
+                ) {
+                    if let Some(pen) = &self.underline_pen {
+                        rectangle.set_fill_underline_color(pen.current);
+                    }
+                    while rectangle.step(&mut self.vt.screen).is_some() {}
+                }
+            }
+            Event::Csi {
+                params,
+                colon_flags,
+                private_prefix: None,
+                intermediates,
+                final_byte: final_byte @ (b'}' | b'~' | b'@' | b'A'),
+                ..
+            } if ((intermediates == b"'" && matches!(final_byte, b'}' | b'~'))
+                || (intermediates == b" " && matches!(final_byte, b'@' | b'A')))
+                && !colon_flags.iter().any(|flag| *flag) =>
+            {
+                if let Some(mut columns) = crate::column_edit::prepare_column_edit(
+                    &self.vt.screen,
+                    params,
+                    *final_byte as char,
+                    None,
+                    intermediates,
+                ) {
+                    while columns.step(&mut self.vt.screen).is_some() {}
+                }
+            }
+            Event::Csi {
+                params,
+                colon_flags,
                 private_prefix,
                 intermediates,
                 final_byte,
@@ -1653,92 +1954,26 @@ impl Terminal {
                 let count = usize::from(first.max(1));
                 match (*private_prefix, *final_byte) {
                     (Some(b'?'), b'h' | b'l') => {
-                        let set = *final_byte == b'h';
                         for &mode in params.iter() {
-                            match mode {
-                                47 | 1047 | 1049 => {
-                                    if set != self.vt.screen.use_alt_buffer {
-                                        self.cancel_inline_upload();
-                                    }
-                                    if set {
-                                        if let Some(entry) = self.vt.screen.enter_alternate_screen(
-                                            mode == 1049,
-                                            mode != 47,
-                                            &self.vt.protocol,
-                                        ) {
-                                            if let Some(rows) = entry.cleared_rows {
-                                                self.vt.screen.grid.row_wrapped[rows].fill(false);
-                                            }
-                                            if mode == 1049 {
-                                                if let Some(underline) = &mut self.underline_pen {
-                                                    underline.primary = Some(underline.current);
-                                                }
-                                            }
-                                            self.vt.protocol.switch_screen();
-                                        }
-                                    } else if let Some(effect) =
-                                        self.vt.screen.leave_alternate_screen(mode == 1049)
-                                    {
-                                        if self.vt.protocol.keyboard_enhancement_limit().is_some() {
-                                            self.vt.protocol.reset_keyboard_enhancement();
-                                        }
-                                        self.vt.protocol.switch_screen();
-                                        if let Some(underline) = &mut self.underline_pen {
-                                            underline.current =
-                                                underline.primary.take().unwrap_or(Color::Default);
-                                        }
-                                        if let Some(wrap) = effect.restore_autowrap {
-                                            if wrap {
-                                                self.vt.protocol.modes_mut().insert(7);
-                                            } else {
-                                                self.vt.protocol.modes_mut().remove(&7);
-                                            }
-                                        }
-                                    }
-                                }
-                                1048 => {
-                                    if set {
-                                        semantics::save_cursor_state(
-                                            &mut self.vt.screen,
-                                            &self.vt.protocol,
-                                            self.underline_pen.as_mut(),
-                                        );
-                                    } else {
-                                        semantics::restore_cursor_state(
-                                            &mut self.vt.screen,
-                                            &mut self.vt.protocol,
-                                            self.underline_pen.as_mut(),
-                                        );
-                                    }
-                                }
-                                6 => {
-                                    self.vt.screen.origin_mode = set;
-                                    self.vt.screen.set_cursor_position(1, 1);
-                                }
-                                7 => {
-                                    if !set {
-                                        self.vt.screen.pending_wrap = false;
-                                    }
-                                }
-                                2026 => {
-                                    if set {
-                                        self.vt.sync_output.begin_hosted(now);
-                                    } else {
-                                        self.vt.sync_output.end_hosted();
-                                    }
-                                    continue;
-                                }
-                                1 | 25 | 1000 | 1002..=1007 | 1015 | 2004 => (),
-                                _ => {
-                                    self.unsupported();
-                                    continue;
-                                }
-                            }
-                            if set {
-                                self.vt.protocol.modes_mut().insert(mode);
-                            } else {
-                                self.vt.protocol.modes_mut().remove(&mode);
-                            }
+                            self.apply_dec_private_mode(mode, *final_byte == b'h', now);
+                        }
+                    }
+                    (Some(b'?'), b's') if !colon_flags.iter().any(|flag| *flag) => {
+                        crate::mode_mutation::save_dec_private_modes(
+                            &self.vt.screen,
+                            &mut self.vt.protocol,
+                            crate::mode_mutation::SavedDecModeProfile::Hosted,
+                            params,
+                        );
+                    }
+                    (Some(b'?'), b'r') if !colon_flags.iter().any(|flag| *flag) => {
+                        let modes = crate::mode_mutation::restore_dec_private_modes(
+                            &self.vt.protocol,
+                            crate::mode_mutation::SavedDecModeProfile::Hosted,
+                            params,
+                        );
+                        for (mode, enabled) in modes {
+                            self.apply_dec_private_mode(mode, enabled, now);
                         }
                     }
                     (None, b'h' | b'l') => {
@@ -1990,6 +2225,34 @@ impl Terminal {
                 return Ok(());
             }
         }
+        if let Event::String {
+            kind: StringKind::Dcs,
+            payload,
+            ..
+        } = &event
+        {
+            if let Some(selector) = payload.strip_prefix(b"$q") {
+                let reply = semantics::restorable_decrqss_reply(
+                    &self.vt.screen,
+                    &self.vt.protocol,
+                    selector,
+                    self.underline_pen.as_ref().map(|pen| pen.current),
+                );
+                replies.push(&reply, "reply limit");
+                return Ok(());
+            }
+            if let Some(reply) = crate::termcap_query::termcap_query(payload, &self.vt.protocol) {
+                replies.push(&reply, "reply limit");
+                if reply.as_ref() == crate::termcap_query::NEGATIVE_TERMCAP_REPLY {
+                    if replies.limit_error.is_none() {
+                        self.negative_query_replies = self.negative_query_replies.saturating_add(1);
+                    }
+                    self.unsupported();
+                    self.record_unsupported_event(&event);
+                }
+                return Ok(());
+            }
+        }
         // Aether has no DA identity contract. A newer shared legacy
         // dispatcher answers DA1/DA2 as Ember; do not inherit that identity.
         // Count unsupported CSI c separately from ESC c (RIS).
@@ -2015,6 +2278,23 @@ impl Terminal {
             self.record_unsupported_event(&event);
             return Ok(());
         }
+        if matches!(&event, Event::Csi {
+            params,
+            private_prefix: Some(b'?'),
+            intermediates,
+            final_byte: b'p',
+            ..
+        } if intermediates == b"$" && params.first() == Some(&1048))
+        {
+            // DECSC/DECRC share a retained slot across all save aliases.
+            let reply = if self.vt.screen.saved_state.is_some() {
+                b"\x1b[?1048;1$y"
+            } else {
+                b"\x1b[?1048;2$y"
+            };
+            replies.push(reply, "reply limit");
+            return Ok(());
+        }
         // Reflect the effective hold only for the shared mode-query reducer;
         // do not sample the clock or touch the mode set on ordinary output.
         let sync_query = matches!(&event, Event::Csi {
@@ -2033,6 +2313,12 @@ impl Terminal {
             && self.vt.sync_output.started.is_some()
             && matches!(&event, Event::Csi { private_prefix: Some(b'?'), intermediates, final_byte: b'l', params, .. }
                 if intermediates.is_empty() && params.contains(&2026));
+        // Only admitted keyboard-stack edits and DECSTR can change the
+        // alternate wheel route outside the ordered DEC mode executor.
+        let watch_alternate_keyboard = matches!(&event, Event::Csi { private_prefix: Some(b'=' | b'>' | b'<'), final_byte: b'u', intermediates, .. } if intermediates.is_empty())
+            || matches!(&event, Event::Csi { private_prefix: None, final_byte: b'p', intermediates, .. } if intermediates == b"!");
+        let previous_alternate_keyboard =
+            watch_alternate_keyboard.then(|| self.alternate_scroll_profile());
         let dispatch = self
             .window
             .as_mut()
@@ -2077,19 +2363,7 @@ impl Terminal {
                 Event::Control(0) | Event::Boundary => (),
                 _ => {
                     let before = self.unsupported;
-                    if matches!(&event, Event::String { kind: StringKind::Dcs, payload, .. } if payload.starts_with(b"+q") && payload.len() <= 4096)
-                    {
-                        // XTerm ctlseqs XTGETTCAP: an unknown first name
-                        // ends the list with DCS 0+r ST. No capability table
-                        // is advertised here, and no payload is reflected.
-                        const NEGATIVE: &[u8] = b"\x1bP0+r\x1b\\";
-                        replies.push(NEGATIVE, "reply limit");
-                        if replies.limit_error.is_none() {
-                            self.negative_query_replies =
-                                self.negative_query_replies.saturating_add(1);
-                        }
-                        self.unsupported();
-                    } else if !self.apply_profile_event(&event, now) {
+                    if !self.apply_profile_event(&event, now) {
                         self.unsupported();
                     }
                     if self.unsupported != before {
@@ -2097,6 +2371,9 @@ impl Terminal {
                     }
                 }
             },
+        }
+        if previous_alternate_keyboard.is_some_and(|old| self.alternate_scroll_profile() != old) {
+            self.retire_mouse_reports();
         }
         if capture_end {
             // Exactly one bounded immutable frame per opted-in PTY poll.
@@ -2126,8 +2403,8 @@ impl Terminal {
         self.track_printed_spaces();
     }
 
-    /// Validate geometry and frame counters before invoking the session's resize.
-    /// Commit screen geometry only after that operation succeeds.
+    /// Validate geometry and any new frame counters before invoking the PTY
+    /// resize. Commit screen geometry only after that operation succeeds.
     pub fn resize_with(
         &mut self,
         rows: usize,
@@ -2135,17 +2412,22 @@ impl Terminal {
         resize_pty: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         dimensions(rows, cols, self.max_cols)?;
+        if (rows, cols) == (self.vt.screen.grid.rows(), self.vt.screen.grid.cols()) {
+            // The PTY may still need notification, but the screen has no
+            // geometry change to commit.
+            return resize_pty();
+        }
         let layout = self.layout.checked_add(1).ok_or("layout exhausted")?;
         let revision = self.revision.checked_add(1).ok_or("revision exhausted")?;
         resize_pty()?;
         self.finish_grapheme();
         if let Some(blocks) = &mut self.command_blocks {
-            blocks
-                .resized((rows, cols) != (self.vt.screen.grid.rows(), self.vt.screen.grid.cols()));
+            blocks.resized();
         }
         self.begin_revision(revision);
         if self.reflow_primary_on_resize && self.reflow_primary(rows, cols) {
             self.layout = layout;
+            self.retire_mouse_reports();
             return Ok(());
         }
         let transferred = if self.preserve_primary_on_resize && !self.vt.screen.use_alt_buffer {
@@ -2169,6 +2451,7 @@ impl Terminal {
             }
         }
         self.layout = layout;
+        self.retire_mouse_reports();
         Ok(())
     }
     pub fn frame(&self) -> Result<CellFrame, String> {
@@ -2180,6 +2463,7 @@ impl Terminal {
             history_extent,
             row_identity_revision,
             row_links,
+            row_link_scratch,
         } = &mut *cache;
         if let Some(frame) = last
             .as_ref()
@@ -2336,8 +2620,12 @@ impl Terminal {
             .hyperlinks
             .as_ref()
             .filter(|(_, table)| !table.is_empty())
-            .and_then(|(_, table)| visible_hyperlinks(table, row_links, previous, frame.rows()));
-        let frame = frame.with_hyperlinks(hyperlinks);
+            .and_then(|(_, table)| {
+                visible_hyperlinks(table, row_links, row_link_scratch, previous, frame.rows())
+            });
+        let frame = frame
+            .with_hyperlinks(hyperlinks)
+            .with_paint_colors(self.colors.clone());
         *last = Some(frame.clone());
         *observed_revision = self.revision;
         *color_revision = self.color_revision;
@@ -2367,3 +2655,91 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod offset_specialization_tests {
+    use super::*;
+    use crate::grid::{TerminalCell, TerminalGrid};
+
+    #[test]
+    fn offset_only_matches_materialized_boundaries_across_copy_metadata() {
+        for seed in 0..24 {
+            let mut grid = TerminalGrid::new(4, 12);
+            grid.track_printed_spaces = true;
+            for row in 0..4 {
+                for col in 0..12 {
+                    let cell = grid.get_mut(row, col);
+                    cell.character = ['a', ' ', '界', '🦀'][(seed + row + col) % 4];
+                    cell.flags.set_wide(col == 4);
+                    cell.flags.set_wide_continuation(col == 5);
+                }
+                grid.mark_tab_spaces(row, 0..12);
+            }
+            let rows: Vec<_> = (0..4)
+                .map(|row| {
+                    let mut annotations = RowAnnotations::default();
+                    annotations.set(7, Arc::from("e\u{301}"));
+                    annotations.set(11, Arc::from(if seed % 2 == 0 { "x  " } else { " " }));
+                    HistoryCopyRow {
+                        row: Row {
+                            cells: Arc::from(&grid[row][..]),
+                            wrapped: (seed + row) % 2 == 0,
+                        },
+                        underline_colors: None,
+                        annotations: Some(Arc::new(annotations)),
+                        synthetic_gap: (row % 2 == 0).then_some(10),
+                    }
+                })
+                .collect();
+            for require_literal in [false, true] {
+                let mut expected = Vec::new();
+                let mut actual = Vec::new();
+                let materialized = extract_selection::<true>(
+                    &rows,
+                    (0, 0),
+                    (4, 0),
+                    require_literal,
+                    Some(&mut expected),
+                );
+                let counted = extract_selection::<false>(
+                    &rows,
+                    (0, 0),
+                    (4, 0),
+                    require_literal,
+                    Some(&mut actual),
+                );
+                assert_eq!(
+                    materialized.as_ref().map(|_| ()),
+                    counted.as_ref().map(|_| ())
+                );
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn offset_only_preserves_exact_copy_byte_limit() {
+        for count in [MAX_COPY_BYTES / 4, MAX_COPY_BYTES / 4 + 1] {
+            let rows = [HistoryCopyRow {
+                row: Row {
+                    cells: vec![
+                        TerminalCell {
+                            character: '🦀',
+                            ..TerminalCell::default()
+                        };
+                        count
+                    ]
+                    .into(),
+                    wrapped: true,
+                },
+                underline_colors: None,
+                annotations: None,
+                synthetic_gap: None,
+            }];
+            let expected = extract_selection::<true>(&rows, (0, 0), (1, 0), false, None);
+            let actual = extract_selection::<false>(&rows, (0, 0), (1, 0), false, None);
+            assert_eq!(expected.as_ref().map(|_| ()), actual.as_ref().map(|_| ()));
+            assert_eq!(actual.is_ok(), count == MAX_COPY_BYTES / 4);
+        }
+    }
+}

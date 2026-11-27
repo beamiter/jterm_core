@@ -9,6 +9,85 @@ use jterm_engine::{
 };
 
 #[test]
+fn frost_decst8c_replaces_custom_stops_without_moving_cursor() {
+    let mut screen = ScreenState::new(3, 25);
+    screen.tab_stops.fill(true);
+    screen.cursor_row = 1;
+    screen.cursor_col = 24;
+    screen.pending_wrap = true;
+    let mut protocol = ProtocolState::default();
+    assert_eq!(
+        dispatch_frost_legacy_csi(
+            &mut screen,
+            &mut protocol,
+            b"005",
+            &[5],
+            b'W',
+            Some(b'?'),
+            b""
+        ),
+        Dispatch::Handled(Default::default())
+    );
+    assert_eq!(
+        screen
+            .tab_stops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &set)| set.then_some(i))
+            .collect::<Vec<_>>(),
+        [8, 16, 24]
+    );
+    assert_eq!(
+        (screen.cursor_row, screen.cursor_col, screen.pending_wrap),
+        (1, 24, true)
+    );
+    for (raw, params, prefix, intermediate) in [
+        (b"5".as_slice(), vec![5], None, b"".as_slice()),
+        (b"0", vec![0], Some(b'?'), b""),
+        (b"5;0", vec![5, 0], Some(b'?'), b""),
+        (b"5:0", vec![5], Some(b'?'), b""),
+        (b"5", vec![5], Some(b'?'), b"$"),
+    ] {
+        let before = screen.tab_stops.clone();
+        assert_eq!(
+            dispatch_frost_legacy_csi(
+                &mut screen,
+                &mut protocol,
+                raw,
+                &params,
+                b'W',
+                prefix,
+                intermediate
+            ),
+            Dispatch::Unhandled
+        );
+        assert_eq!(screen.tab_stops, before);
+    }
+}
+
+#[test]
+fn frost_invalid_scroll_margins_keep_the_current_region_and_cursor() {
+    let mut screen = ScreenState::new(5, 8);
+    screen.set_scroll_region(2, 4);
+    screen.cursor_row = 2;
+    screen.cursor_col = 7;
+    screen.pending_wrap = true;
+    let mut protocol = ProtocolState::default();
+    for params in [[4, 2], [3, 3], [6, 99]] {
+        assert_eq!(
+            dispatch_frost_legacy_csi(&mut screen, &mut protocol, b"", &params, b'r', None, b""),
+            Dispatch::Handled(Default::default())
+        );
+        assert_eq!(
+            (screen.scroll_region_top, screen.scroll_region_bottom),
+            (1, 3)
+        );
+        assert_eq!((screen.cursor_row, screen.cursor_col), (2, 7));
+        assert!(screen.pending_wrap);
+    }
+}
+
+#[test]
 fn frost_format_queries_preserve_tabs_and_report_active_format() {
     let mut screen = ScreenState::new(2, 16);
     let tabs = screen.tab_stops.clone();

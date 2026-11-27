@@ -229,7 +229,11 @@ fn exhaustive_decrqm_matches_frozen_ember() {
                 };
                 // Query only current mode, independent of unrelated accumulated mode bits.
                 check(&mut t, &[mode], None, false);
-                check(&mut t, &[mode], Some(b'?'), false);
+                // Newly supported X10 and reverse-wrap have independent wire
+                // tests rather than expectations from the frozen old oracle.
+                if !matches!(mode, 9 | 45) {
+                    check(&mut t, &[mode], Some(b'?'), false);
+                }
             }
         }
     }

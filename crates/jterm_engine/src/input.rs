@@ -105,11 +105,31 @@ pub fn encode_kitty_disambiguated_key(
         _ => return None,
     };
     let parameter = kitty_modifier_value(modifiers);
-    Some(if parameter == 1 {
-        format!("\x1b[{code}u").into_bytes()
-    } else {
-        format!("\x1b[{code};{parameter}u").into_bytes()
-    })
+    // Maximum wire length: CSI, seven Unicode decimal digits, semicolon,
+    // two modifier digits and the final byte.
+    let mut output = Vec::with_capacity(13);
+    output.extend_from_slice(b"\x1b[");
+    append_key_decimal(&mut output, code);
+    if parameter != 1 {
+        output.push(b';');
+        append_key_decimal(&mut output, u32::from(parameter));
+    }
+    output.push(b'u');
+    Some(output)
+}
+
+fn append_key_decimal(output: &mut Vec<u8>, mut value: u32) {
+    let mut digits = [0; 10];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    output.extend_from_slice(&digits[start..]);
 }
 
 // Preserve Ember's existing logical-key repertoire. Arbitrary OS-produced
@@ -259,5 +279,77 @@ pub fn xterm_encode_modify_other_keys(
         Some(format!("\x1b[{};{}u", codepoint, modifier_value))
     } else {
         Some(format!("\x1b[27;{};{}~", modifier_value, codepoint))
+    }
+}
+
+#[cfg(test)]
+mod decimal_key_tests {
+    use super::*;
+
+    #[test]
+    fn disambiguated_wire_matches_formatted_reference() {
+        let keys = [
+            KittyKey::Escape,
+            KittyKey::Enter,
+            KittyKey::Tab,
+            KittyKey::Backspace,
+            KittyKey::Space,
+            KittyKey::Functional,
+        ];
+        let unicode = [
+            '\0',
+            '9',
+            'a',
+            '\u{7f}',
+            '\u{ff}',
+            '\u{3e8}',
+            '界',
+            '\u{ffff}',
+            '\u{10000}',
+            '\u{10ffff}',
+        ];
+        for bits in 0..16 {
+            let mods = Modifiers {
+                shift: bits & 1 != 0,
+                alt: bits & 2 != 0,
+                ctrl: bits & 4 != 0,
+                super_key: bits & 8 != 0,
+            };
+            for flags in [0, 1, 2, 3, 255] {
+                for key in keys.into_iter().chain(unicode.into_iter().flat_map(|ch| {
+                    [
+                        KittyKey::Unicode(ch),
+                        KittyKey::UnicodeWithText {
+                            base: ch,
+                            text: 'Z',
+                        },
+                    ]
+                })) {
+                    let non_shift = mods.alt || mods.ctrl || mods.super_key;
+                    let modified = mods.shift || non_shift;
+                    let code = match key {
+                        KittyKey::Escape => Some(27),
+                        KittyKey::Enter if modified => Some(13),
+                        KittyKey::Tab if modified => Some(9),
+                        KittyKey::Backspace if modified => Some(127),
+                        KittyKey::Space if non_shift => Some(32),
+                        KittyKey::Unicode(ch) if non_shift => Some(u32::from(ch)),
+                        KittyKey::UnicodeWithText { base, .. } if non_shift => {
+                            Some(u32::from(base))
+                        }
+                        _ => None,
+                    };
+                    let expected = code.filter(|_| flags & 1 != 0).map(|code| {
+                        let parameter = kitty_modifier_value(mods);
+                        if parameter == 1 {
+                            format!("\x1b[{code}u").into_bytes()
+                        } else {
+                            format!("\x1b[{code};{parameter}u").into_bytes()
+                        }
+                    });
+                    assert_eq!(encode_kitty_disambiguated_key(key, mods, flags), expected);
+                }
+            }
+        }
     }
 }

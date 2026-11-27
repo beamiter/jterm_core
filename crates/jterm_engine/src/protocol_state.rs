@@ -46,6 +46,8 @@ impl TerminalModes {
             1036 => Some(22),
             // 1034 eightBitInput: we stay UTF-8 7-bit C1, but DECRQM must answer.
             1034 => Some(23),
+            9 => Some(24),
+            45 => Some(25),
             _ => None,
         }
     }
@@ -78,6 +80,9 @@ impl TerminalModes {
 #[derive(Clone, Default)]
 pub struct ProtocolState {
     modes: TerminalModes,
+    pub(crate) sgr_stack: crate::sgr_stack::SgrStack,
+    pub(crate) rectangular_attribute_extent: bool,
+    pub(crate) saved_dec_private_modes: [Option<u8>; 16],
     keyboard_enhancement_flags: u16,
     keyboard_enhancement_stack: Vec<u16>,
     alt_keyboard_enhancement_flags: u16,
@@ -120,11 +125,21 @@ impl std::fmt::Debug for ProtocolState {
 }
 
 impl ProtocolState {
+    /// Transfer the widget-global XTerm rendition stack when RIS replaces mode
+    /// state. DECSTR and primary/alternate screen switches leave it untouched.
+    pub fn take_rendition_stack_from(&mut self, previous: &mut Self) {
+        self.sgr_stack = std::mem::take(&mut previous.sgr_stack);
+    }
+
     pub fn with_modes(modes: TerminalModes) -> Self {
         Self {
             modes,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn clear_saved_dec_modes(&mut self) {
+        self.saved_dec_private_modes.fill(None);
     }
 
     pub fn modes(&self) -> &TerminalModes {
@@ -233,7 +248,7 @@ mod tests {
     fn exact_mode_mapping_and_unknown_modes() {
         let mapping = [
             7, 25, 1000, 1001, 1002, 1003, 1004, 1006, 1049, 2004, 2026, 2031, 5522, 1, 47, 1047,
-            1048, 1005, 1015, 66, 1007, 12, 1036, 1034,
+            1048, 1005, 1015, 66, 1007, 12, 1036, 1034, 9, 45,
         ];
         let mut modes = TerminalModes::default();
         for (bit, mode) in mapping.into_iter().enumerate() {
@@ -241,7 +256,7 @@ mod tests {
             assert!(modes.contains(&mode));
             assert_eq!(modes.bits, (1u32 << (bit + 1)) - 1);
         }
-        for unknown in [0, 6, 9, 1016, u16::MAX] {
+        for unknown in [0, 6, 1016, u16::MAX] {
             let before = modes.bits;
             modes.insert(unknown);
             modes.remove(&unknown);

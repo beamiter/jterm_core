@@ -2,7 +2,7 @@
 //! consume it before the next step, including wrap/history/provenance effects.
 //! Width policy stays an injected native cache. ASCII parser chunks keep their
 //! existing separate transaction boundary.
-use crate::screen::{RowMutation, ScreenState};
+use crate::screen::{Charset, RowMutation, ScreenState};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,9 +45,27 @@ impl GraphicWrite {
         original: char,
         autowrap: bool,
         track_idle: bool,
+        width: impl FnMut(char) -> usize,
+    ) -> Self {
+        Self::new_with_charset(
+            profile,
+            original,
+            screen.active_charset,
+            autowrap,
+            track_idle,
+            width,
+        )
+    }
+
+    pub(crate) fn new_with_charset(
+        profile: GraphicProfile,
+        original: char,
+        charset: Charset,
+        autowrap: bool,
+        track_idle: bool,
         mut width: impl FnMut(char) -> usize,
     ) -> Self {
-        let translated = screen.translate_char(original);
+        let translated = charset.translate(original);
         Self {
             profile,
             original,
@@ -160,6 +178,30 @@ mod tests {
     use super::*;
     use crate::grid::{Color, RawRowId};
     use crate::screen::{Charset, VerticalMotion};
+
+    #[test]
+    fn explicit_charset_changes_translation_without_mutating_active_bank() {
+        let mut screen = ScreenState::new(2, 8);
+        screen.active_charset = Charset::Ascii;
+        let mut observed = None;
+        let write = GraphicWrite::new_with_charset(
+            GraphicProfile::Ember,
+            'q',
+            Charset::DecSpecialGraphics,
+            true,
+            false,
+            |character| {
+                observed = Some(character);
+                1
+            },
+        );
+        assert_eq!(observed, Some('─'));
+        assert_eq!(write.original, 'q');
+        assert_eq!(write.translated, '─');
+        assert_eq!(screen.active_charset, Charset::Ascii);
+        let ordinary = GraphicWrite::new(GraphicProfile::Ember, &screen, 'q', true, false, |_| 1);
+        assert_eq!(ordinary.translated, 'q');
+    }
 
     fn width(ch: char) -> usize {
         match ch {

@@ -159,8 +159,12 @@ impl Paste {
 /// A lone CR is an executable Enter in a canonical-mode shell, so leaving it
 /// alone would let a payload bypass both the newline check a frontend does for
 /// confirmation and the first-line truncation below.
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    if !text.as_bytes().contains(&b'\r') {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    }
 }
 
 /// Remove paste-bracket markers, then optionally C0/C1, recording what was
@@ -177,12 +181,29 @@ fn normalize_newlines(text: &str) -> String {
 /// splice creates, in one pass, because a marker can only ever be completed by
 /// the character just appended.
 fn defang(text: &str, strip_controls: bool) -> (String, bool, bool) {
+    // Keep short pastes on the original sanitizer entry. For longer valid
+    // UTF-8 text, ASCII controls/DEL and a C2 lead cover every possible marker
+    // prefix and C1 control. C2 may conservatively stop at harmless Latin text.
+    // Each matching byte is a character boundary, so the prefix is safe to copy.
+    let first_control = if text.len() < 128 {
+        0
+    } else {
+        let Some(first) = text
+            .as_bytes()
+            .iter()
+            .position(|&byte| matches!(byte, 0..=8 | 11..=31 | 127 | 0xc2))
+        else {
+            return (text.to_owned(), false, false);
+        };
+        first
+    };
     // Pass 1 — markers. Must run before control stripping: removing the ESC
     // first would leave a literal `[201~` behind, which is inert but wrong to
     // echo into an editor model.
     let mut stripped = String::with_capacity(text.len());
+    stripped.push_str(&text[..first_control]);
     let mut had_marker = false;
-    for ch in text.chars() {
+    for ch in text[first_control..].chars() {
         stripped.push(ch);
         // A marker ends in `~`, so only that character can complete one; every
         // other byte skips the check.
@@ -1259,5 +1280,56 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    #[test]
+    fn paste_shortcut_boundary_preserves_controls_and_c2_text() {
+        for size in [127usize, 128, 129] {
+            for (tail, expected_tail, marker, control) in [
+                ("\x00", "", false, true),
+                ("\u{9b}", "", false, true),
+                ("©", "©", false, false),
+                ("\x1b[201~", "", true, false),
+            ] {
+                let prefix = "x".repeat(size - tail.len());
+                let text = format!("{prefix}{tail}");
+                assert_eq!(text.len(), size);
+                let paste = encode_paste(
+                    &text,
+                    PasteModes { bracketed: true },
+                    PastePolicy::clipboard(UnbracketedMultiline::SendVerbatim),
+                );
+                let expected = format!("{prefix}{expected_tail}");
+                assert_eq!(paste.echo_text, expected);
+                assert_eq!(
+                    paste.bytes,
+                    [PASTE_START, expected.as_bytes(), PASTE_END].concat()
+                );
+                assert_eq!(paste.risk.had_embedded_paste_marker, marker);
+                assert_eq!(paste.risk.had_controls, control);
+            }
+        }
+    }
+
+    #[test]
+    fn long_unicode_prefix_keeps_splice_safe_marker_removal() {
+        for prefix in ["x".repeat(128), "界".repeat(43), "© prefix ".repeat(20)] {
+            let text = format!("{prefix}\x1b[\x1b[201~201~tail\u{9b}200~\u{9b}201~\x00");
+            for strip_controls in [false, true] {
+                let policy = PastePolicy {
+                    strip_controls,
+                    submit: false,
+                    unbracketed_multiline: UnbracketedMultiline::SendVerbatim,
+                };
+                let paste = encode_paste(&text, PasteModes { bracketed: true }, policy);
+                let expected = format!("{prefix}tail{}", if strip_controls { "" } else { "\x00" });
+                assert_eq!(paste.echo_text, expected);
+                assert_eq!(
+                    paste.bytes,
+                    [PASTE_START, expected.as_bytes(), PASTE_END].concat()
+                );
+                assert!(paste.risk.had_embedded_paste_marker);
+                assert!(paste.risk.had_controls);
+            }
+        }
     }
 }

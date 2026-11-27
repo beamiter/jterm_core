@@ -2,6 +2,84 @@
 //! in wire order; hosts consume ordered window, archive and sync effects.
 use crate::{protocol_state::ProtocolState, screen::ScreenState};
 
+/// Profiles admit only Boolean modes their ordinary DECSET path supports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SavedDecModeProfile {
+    Hosted,
+    Ember,
+    FrostLegacy,
+}
+const TRACKING_MODES: &[u16] = &[9, 1000, 1002, 1003];
+const ENCODING_MODES: &[u16] = &[1005, 1006, 1015];
+fn saved_mode_slot(profile: SavedDecModeProfile, mode: u16) -> Option<(usize, &'static [u16])> {
+    let result = match mode {
+        1 => (0, &[1][..]),
+        6 => (1, &[6][..]),
+        7 => (2, &[7][..]),
+        12 => (3, &[12][..]),
+        25 => (4, &[25][..]),
+        66 => (5, &[66][..]),
+        1004 => (6, &[1004][..]),
+        1007 => (7, &[1007][..]),
+        1034 => (8, &[1034][..]),
+        1036 => (9, &[1036][..]),
+        2004 => (10, &[2004][..]),
+        9 => (11, TRACKING_MODES),
+        1000 | 1002 | 1003 => (12, TRACKING_MODES),
+        1005 | 1006 | 1015 => (13, ENCODING_MODES),
+        47 | 1047 | 1049 => (14, &[47][..]),
+        45 => (15, &[45][..]),
+        _ => return None,
+    };
+    if profile != SavedDecModeProfile::Ember && matches!(mode, 12 | 1034 | 1036) {
+        return None;
+    }
+    Some(result)
+}
+/// Save requested one-level slots, preserving independent mouse bits.
+pub(crate) fn save_dec_private_modes(
+    screen: &ScreenState,
+    protocol: &mut ProtocolState,
+    profile: SavedDecModeProfile,
+    params: &[u16],
+) {
+    for &mode in params {
+        let Some((slot, modes)) = saved_mode_slot(profile, mode) else {
+            continue;
+        };
+        let mut bits = 0;
+        for (index, &mode) in modes.iter().enumerate() {
+            let enabled = match mode {
+                6 => screen.origin_mode,
+                47 => screen.use_alt_buffer,
+                _ => protocol.modes().contains(&mode),
+            };
+            bits |= u8::from(enabled) << index;
+        }
+        protocol.saved_dec_private_modes[slot] = Some(bits);
+    }
+}
+/// Ordinary ordered DECSET/DECRST operations, preserving caller host effects.
+pub(crate) fn restore_dec_private_modes(
+    protocol: &ProtocolState,
+    profile: SavedDecModeProfile,
+    params: &[u16],
+) -> smallvec::SmallVec<[(u16, bool); 16]> {
+    let mut result = smallvec::SmallVec::new();
+    for &mode in params {
+        let Some((slot, modes)) = saved_mode_slot(profile, mode) else {
+            continue;
+        };
+        let Some(bits) = protocol.saved_dec_private_modes[slot] else {
+            continue;
+        };
+        for (index, &mode) in modes.iter().enumerate() {
+            result.push((mode, bits & (1 << index) != 0));
+        }
+    }
+    result
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeNamespace {
     Ansi,
@@ -53,7 +131,22 @@ pub enum FrostModeEffect {
     SynchronizedOutput,
 }
 
-/// Apply one FrostLegacyV1 mode parameter. A mouse change requires the host
+pub(crate) fn native_alternate_scroll_profile(
+    screen: &ScreenState,
+    protocol: &ProtocolState,
+) -> Option<(bool, u16)> {
+    (screen.use_alt_buffer
+        && protocol.modes().contains(&1007)
+        && !protocol.modes().is_mouse_enabled())
+    .then(|| {
+        (
+            protocol.modes().contains(&1),
+            protocol.keyboard_enhancement_flags(),
+        )
+    })
+}
+
+/// Apply one FrostLegacyV1 mode parameter. A mouse or alternate-scroll change requires the host
 /// to revoke queued scroll input before proceeding to the next parameter.
 /// Alternate screen and sync leave screen and protocol state to the host
 /// until it can take the required snapshots and apply the transition.
@@ -74,6 +167,11 @@ pub fn apply_frost_mode(
     }
 
     let effect = match mode {
+        1 if protocol.modes().contains(&1) != enabled
+            && native_alternate_scroll_profile(screen, protocol).is_some() =>
+        {
+            MouseReportingChanged
+        }
         47 | 1047 | 1049 => return AlternateScreen,
         2026 => return SynchronizedOutput,
         6 => {
@@ -89,10 +187,12 @@ pub fn apply_frost_mode(
             }
             None
         }
-        1000..=1003 | 1005 | 1006 | 1015 if protocol.modes().contains(&mode) != enabled => {
+        9 | 1000..=1003 | 1005 | 1006 | 1007 | 1015
+            if protocol.modes().contains(&mode) != enabled =>
+        {
             MouseReportingChanged
         }
-        1 | 7 | 25 | 66 | 1004 | 2004 | 2031 | 5522 => None,
+        1 | 7 | 25 | 45 | 66 | 1004 | 1007 | 2004 | 2031 | 5522 => None,
         _ => return None,
     };
 
@@ -127,6 +227,7 @@ pub struct NativeModeCommand<'a> {
     namespace: ModeNamespace,
     params: std::slice::Iter<'a, u16>,
     enabled: bool,
+    track_alternate_scroll_changes: bool,
 }
 
 /// Both legacy profiles ignore intermediates for h/l. Ember admits ANSI and
@@ -153,10 +254,14 @@ pub fn prepare_native_mode_command<'a>(
         namespace,
         params: params.iter(),
         enabled,
+        track_alternate_scroll_changes: false,
     })
 }
 
 impl NativeModeCommand<'_> {
+    pub(crate) fn track_alternate_scroll_changes(&mut self) {
+        self.track_alternate_scroll_changes = self.profile == NativeModeProfile::Ember;
+    }
     pub fn step(
         &mut self,
         screen: &mut ScreenState,
@@ -164,7 +269,11 @@ impl NativeModeCommand<'_> {
         focused: bool,
     ) -> Option<NativeModeEffect> {
         let mode = *self.params.next()?;
-        Some(apply_native_mode_parameter(
+        let previous = (self.track_alternate_scroll_changes
+            && self.namespace == ModeNamespace::DecPrivate
+            && matches!(mode, 1 | 1007 | 9 | 1000 | 1002 | 1003))
+        .then(|| native_alternate_scroll_profile(screen, protocol));
+        let effect = apply_native_mode_parameter(
             self.profile,
             screen,
             protocol,
@@ -172,7 +281,17 @@ impl NativeModeCommand<'_> {
             mode,
             self.enabled,
             focused,
-        ))
+        );
+        Some(
+            if matches!(effect, NativeModeEffect::None)
+                && previous
+                    .is_some_and(|old| native_alternate_scroll_profile(screen, protocol) != old)
+            {
+                NativeModeEffect::MouseReportingChanged
+            } else {
+                effect
+            },
+        )
     }
 }
 
@@ -311,5 +430,86 @@ mod command_tests {
             false,
         );
         assert_eq!((screen.cursor_row, screen.cursor_col), (1, 2));
+    }
+}
+
+#[cfg(test)]
+mod saved_mode_tests {
+    use super::*;
+    #[test]
+    fn saved_slots_are_independent_grouped_and_exclude_actions() {
+        let mut screen = ScreenState::new(3, 4);
+        let mut protocol = ProtocolState::default();
+        protocol.modes_mut().insert(1);
+        protocol.modes_mut().insert(9);
+        protocol.modes_mut().insert(1002);
+        protocol.modes_mut().insert(1006);
+        screen.origin_mode = true;
+        screen.use_alt_buffer = true;
+        save_dec_private_modes(
+            &screen,
+            &mut protocol,
+            SavedDecModeProfile::Ember,
+            &[1, 6, 1000, 1015, 1049, 1048, 2026, 2031, 5522],
+        );
+        protocol.modes_mut().remove(&1);
+        screen.origin_mode = false;
+        save_dec_private_modes(&screen, &mut protocol, SavedDecModeProfile::Ember, &[6]);
+        assert_eq!(
+            &restore_dec_private_modes(
+                &protocol,
+                SavedDecModeProfile::Ember,
+                &[1, 6, 1003, 1005, 47, 1048, 2026, 2031, 5522]
+            )[..],
+            &[
+                (1, true),
+                (6, false),
+                (9, true),
+                (1000, false),
+                (1002, true),
+                (1003, false),
+                (1005, false),
+                (1006, true),
+                (1015, false),
+                (47, true)
+            ]
+        );
+        assert!(restore_dec_private_modes(
+            &ProtocolState::default(),
+            SavedDecModeProfile::Ember,
+            &[1, 47, 1000]
+        )
+        .is_empty());
+        assert!(restore_dec_private_modes(
+            &protocol,
+            SavedDecModeProfile::FrostLegacy,
+            &[12, 1034, 1036]
+        )
+        .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod saved_reset_tests {
+    use super::*;
+    #[test]
+    fn frost_ris_discards_saved_slots() {
+        let mut screen = ScreenState::new(2, 3);
+        let mut protocol = ProtocolState::default();
+        protocol.modes_mut().insert(1);
+        save_dec_private_modes(
+            &screen,
+            &mut protocol,
+            SavedDecModeProfile::FrostLegacy,
+            &[1],
+        );
+        assert_eq!(
+            &restore_dec_private_modes(&protocol, SavedDecModeProfile::FrostLegacy, &[1])[..],
+            &[(1, true)]
+        );
+        crate::native_reset::reset_frost_attributes(&mut screen, &mut protocol);
+        assert!(
+            restore_dec_private_modes(&protocol, SavedDecModeProfile::FrostLegacy, &[1]).is_empty()
+        );
     }
 }

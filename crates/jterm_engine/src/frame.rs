@@ -1,5 +1,6 @@
 //! Immutable raw-cell paint values and their referenced style metadata.
 use crate::{
+    colors::ColorState,
     grid::{Color, CursorShape, TerminalCell, UnderlineColorRun},
     hyperlink::{resolve_resource, retain_resources, HyperlinkResources},
     row_annotations::RowAnnotations,
@@ -100,6 +101,7 @@ pub struct CellFrame {
     underline_colors: Option<UnderlineRows>,
     hyperlinks: Option<HyperlinkResources>,
     annotations: Option<AnnotationRows>,
+    paint_colors: Option<Arc<ColorState>>,
 }
 
 impl fmt::Debug for CellFrame {
@@ -281,6 +283,7 @@ pub struct Delta {
     pub rows: Vec<(usize, Row)>,
     underline_colors: Vec<(usize, Arc<[UnderlineColorRun]>)>,
     hyperlinks: HyperlinkDelta,
+    paint_colors: Option<Option<Arc<ColorState>>>,
     annotations: Vec<(usize, Arc<RowAnnotations>)>,
 }
 
@@ -300,6 +303,7 @@ impl Delta {
             rows,
             underline_colors: Vec::new(),
             hyperlinks: HyperlinkDelta::Inherit,
+            paint_colors: None,
             annotations: Vec::new(),
         }
     }
@@ -365,6 +369,7 @@ impl CellFrame {
             cursor,
             underline_colors,
             hyperlinks: None,
+            paint_colors: None,
             annotations: None,
         })
     }
@@ -385,6 +390,16 @@ impl CellFrame {
     }
     pub fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// Colors captured with this immutable publication.
+    pub fn paint_colors(&self) -> Option<&ColorState> {
+        self.paint_colors.as_deref()
+    }
+
+    pub(crate) fn with_paint_colors(mut self, colors: Option<Arc<ColorState>>) -> Self {
+        self.paint_colors = colors;
+        self
     }
 
     /// Conservative application-storage charge for decoded rows and metadata.
@@ -420,7 +435,15 @@ impl CellFrame {
                     .map(|row| row.retained_bytes())
                     .sum::<usize>()
         });
-        rows + underlines + links + annotations + header + size_of::<Self>()
+        rows + underlines
+            + links
+            + annotations
+            + header
+            + size_of::<Self>()
+            + self
+                .paint_colors
+                .as_ref()
+                .map_or(0, |_| header + size_of::<ColorState>())
     }
 
     pub(crate) fn with_hyperlinks(mut self, hyperlinks: Option<HyperlinkResources>) -> Self {
@@ -502,35 +525,69 @@ impl CellFrame {
     /// Fresh publication in the same stream. Screen/layout changes require a full frame.
     pub fn delta_to(&self, next: &Self) -> Result<Delta, Error> {
         let next_stamp = next.stamp();
-        self.admit_delta_stamp(next_stamp)?;
-        if self.cols != next.cols || self.rows.len() != next.rows.len() {
-            return Err(Error::Layout);
-        }
+        self.validate_delta_frame(next)?;
         let mut delta = Delta::new(self.stamp(), next_stamp, next.cursor, Vec::new());
         delta.hyperlinks = HyperlinkDelta::Snapshot(next.shared_hyperlinks());
-        let same_underlines = same_shared_table(&self.underline_colors, &next.underline_colors);
-        let same_annotations = same_shared_table(&self.annotations, &next.annotations);
-        // Cursor-only publications keep all three immutable paint tables.
-        // The snapshot of hyperlink targets and the new cursor still travel.
-        if Arc::ptr_eq(&self.rows, &next.rows) && same_underlines && same_annotations {
+        delta.paint_colors = Some(next.paint_colors.clone());
+        if self.shares_paint_rows(next) {
             return Ok(delta);
         }
-        for (index, (before, after)) in self.rows.iter().zip(next.rows.iter()).enumerate() {
-            if before != after
-                || (!same_underlines
-                    && !same_underline_runs(self.underline_row(index), next.underline_row(index)))
-                || (!same_annotations && self.row_annotations(index) != next.row_annotations(index))
-            {
-                delta.rows.push((index, after.clone()));
-                if let Some(runs) = next.underline_row(index) {
-                    delta.underline_colors.push((index, runs.clone()));
-                }
-                if let Some(line) = next.row_annotations(index) {
-                    delta.annotations.push((index, line.clone()));
-                }
+        for (index, after) in self.changed_rows(next) {
+            delta.rows.push((index, after.clone()));
+            if let Some(runs) = next.underline_row(index) {
+                delta.underline_colors.push((index, runs.clone()));
+            }
+            if let Some(line) = next.row_annotations(index) {
+                delta.annotations.push((index, line.clone()));
             }
         }
         Ok(delta)
+    }
+
+    /// Indices of rows whose cells, wrapping, underline colors, or annotations
+    /// changed. Uses the same stream/revision/layout checks as `delta_to`,
+    /// without constructing a delta or cloning row/resource metadata.
+    #[inline]
+    pub fn changed_row_indices(&self, next: &Self) -> Result<Vec<usize>, Error> {
+        self.validate_delta_frame(next)?;
+        if self.shares_paint_rows(next) {
+            return Ok(Vec::new());
+        }
+        Ok(self.changed_rows(next).map(|(index, _)| index).collect())
+    }
+
+    fn validate_delta_frame(&self, next: &Self) -> Result<(), Error> {
+        self.admit_delta_stamp(next.stamp())?;
+        if self.cols != next.cols || self.rows.len() != next.rows.len() {
+            return Err(Error::Layout);
+        }
+        Ok(())
+    }
+
+    fn shares_paint_rows(&self, next: &Self) -> bool {
+        Arc::ptr_eq(&self.rows, &next.rows)
+            && same_shared_table(&self.underline_colors, &next.underline_colors)
+            && same_shared_table(&self.annotations, &next.annotations)
+    }
+
+    fn changed_rows<'a>(&'a self, next: &'a Self) -> impl Iterator<Item = (usize, &'a Row)> + 'a {
+        let same_underlines = same_shared_table(&self.underline_colors, &next.underline_colors);
+        let same_annotations = same_shared_table(&self.annotations, &next.annotations);
+        self.rows
+            .iter()
+            .zip(next.rows.iter())
+            .enumerate()
+            .filter(move |(index, (before, after))| {
+                before != after
+                    || (!same_underlines
+                        && !same_underline_runs(
+                            self.underline_row(*index),
+                            next.underline_row(*index),
+                        ))
+                    || (!same_annotations
+                        && self.row_annotations(*index) != next.row_annotations(*index))
+            })
+            .map(|(index, (_, after))| (index, after))
     }
     fn admit_delta_stamp(&self, next: Stamp) -> Result<AdmittedStamp, Error> {
         // Keep malformed raw-delta error precedence: a mismatched stream or
@@ -567,7 +624,11 @@ impl CellFrame {
         {
             return Err(Error::Bounds);
         }
-        let mut seen = vec![false; self.rows.len()];
+        let mut seen = if delta.rows.is_empty() {
+            Vec::new()
+        } else {
+            vec![false; self.rows.len()]
+        };
         for (index, row) in &delta.rows {
             if *index >= self.rows.len() || row.cells.len() != self.cols {
                 return Err(Error::Bounds);
@@ -593,10 +654,15 @@ impl CellFrame {
         }) {
             return Err(Error::Bounds);
         }
-        let mut rows = self.rows.to_vec();
-        for (index, row) in &delta.rows {
-            rows[*index] = row.clone();
-        }
+        let rows = if delta.rows.is_empty() {
+            self.rows.clone()
+        } else {
+            let mut rows = self.rows.to_vec();
+            for (index, row) in &delta.rows {
+                rows[*index] = row.clone();
+            }
+            Arc::from(rows)
+        };
         let underline_colors = if delta.rows.is_empty() {
             self.shared_underline_rows()
         } else if self.underline_colors.is_some() || !delta.underline_colors.is_empty() {
@@ -650,8 +716,13 @@ impl CellFrame {
         Ok(Self {
             stamp: next,
             cols: self.cols,
-            rows: rows.into(),
+            rows,
             cursor: delta.cursor,
+            paint_colors: delta
+                .paint_colors
+                .as_ref()
+                .unwrap_or(&self.paint_colors)
+                .clone(),
             underline_colors,
             hyperlinks,
             annotations,
@@ -701,4 +772,66 @@ impl Receiver {
         self.frame = Some(next);
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn applying_cursor_only_delta_reuses_rows_and_preserves_paint_metadata() {
+    let mut terminal = crate::terminal::Terminal::new(3, 8).unwrap();
+    terminal.enable_underline_colors();
+    terminal.feed(b"\x1b[4;58;2;12;34;56mX\x1b[0m").unwrap();
+    let base = terminal.frame().unwrap();
+    terminal.feed(b"\x1b[2;3H").unwrap();
+    let next = terminal.frame().unwrap();
+    let delta = base.delta_to(&next).unwrap();
+    assert!(delta.rows.is_empty());
+    let applied = base
+        .apply(
+            &delta,
+            Limits {
+                max_rows: 3,
+                max_cols: 8,
+                max_cells: 24,
+            },
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&base.shared_rows(), &applied.shared_rows()));
+    assert_eq!(applied, next);
+    assert_eq!(
+        applied.underline_color_runs(0),
+        base.underline_color_runs(0)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn changed_row_indices_match_delta_rows_and_admission_errors() {
+    let mut terminal = crate::terminal::Terminal::new(3, 8).unwrap();
+    terminal.enable_underline_colors();
+    terminal.feed(b"\x1b[4;58;2;12;34;56mX\x1b[1;1H").unwrap();
+    let base = terminal.frame().unwrap();
+    let check = |next: &CellFrame| {
+        assert_eq!(
+            base.changed_row_indices(next),
+            base.delta_to(next).map(|delta| delta
+                .rows
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect())
+        );
+    };
+    check(&base);
+    terminal.feed(b"\x1b[2;3H").unwrap();
+    check(&terminal.frame().unwrap());
+    terminal
+        .feed(b"\x1b[1;1H\x1b[58;2;99;88;77mX\x1b[1;1H")
+        .unwrap();
+    let decorated = terminal.frame().unwrap();
+    assert_eq!(base.rows(), decorated.rows());
+    assert_eq!(base.changed_row_indices(&decorated), Ok(vec![0]));
+    check(&decorated);
+    terminal.feed(b"\x1b[3;1HY").unwrap();
+    check(&terminal.frame().unwrap());
+    terminal.resize(3, 7).unwrap();
+    check(&terminal.frame().unwrap());
 }
