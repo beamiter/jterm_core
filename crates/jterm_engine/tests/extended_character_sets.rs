@@ -63,6 +63,85 @@ fn repeat_preserves_the_pending_single_shift_for_the_next_input_graphic() {
 }
 
 #[test]
+fn mapped_ascii_runs_match_bytewise_prints_across_wrap_and_charset_shifts() {
+    let setups: [&[u8]; 6] = [
+        b"\x1b)0\x0e\x1b[3;4H",
+        b"\x1b(A\x1b[?42h\x1b[3;4H",
+        b"\x1b*0\x1b[3;4H\x1bN",
+        b"\x1b)0\x0e\x1b*B\x1b[3;4H\x1bN",
+        b"\x1b(0\x1b[?7l\x1b[2;4H",
+        b"\x1b(0\x1b[4h\x1b[2;4H",
+    ];
+    let text = "q lqwxntuvmjk xyz #  lqk# \u{301}";
+    for setup in setups {
+        let seed = || {
+            let mut terminal = Terminal::new(3, 9).unwrap();
+            terminal.enable_grapheme_clusters();
+            terminal.enable_underline_colors();
+            terminal.enable_hyperlinks(|_, _| true);
+            terminal.track_printed_spaces();
+            terminal
+                .feed("old\r\nxx界e\u{301} tail".as_bytes())
+                .unwrap();
+            terminal
+                .feed(b"\x1b[31;44;4:3;58;5;33m\x1b]8;;https://example.test/mapped\x07")
+                .unwrap();
+            terminal.feed(setup).unwrap();
+            terminal
+        };
+        let mut scalar = seed();
+        for byte in text.as_bytes() {
+            scalar.feed(std::slice::from_ref(byte)).unwrap();
+        }
+        let baseline = scalar.frame().unwrap();
+        let expected_history = scalar.history_page(0, 8).unwrap();
+        for split in 0..=text.len() {
+            let mut batched = seed();
+            batched.feed(&text.as_bytes()[..split]).unwrap();
+            batched.feed(&text.as_bytes()[split..]).unwrap();
+            let frame = batched.frame().unwrap();
+            assert_eq!(frame.rows(), baseline.rows(), "{setup:?}, split {split}");
+            assert_eq!(frame.cursor(), baseline.cursor());
+            assert_eq!(batched.visible_text(), scalar.visible_text());
+            assert_eq!(batched.unsupported_count(), scalar.unsupported_count());
+            for row in 0..3 {
+                assert_eq!(
+                    frame.underline_color_runs(row),
+                    baseline.underline_color_runs(row)
+                );
+                for column in 0..9 {
+                    assert_eq!(
+                        frame.cluster_text(row, column),
+                        baseline.cluster_text(row, column)
+                    );
+                }
+            }
+            assert_eq!(batched.history_extent(), scalar.history_extent());
+            let history = batched.history_page(0, 8).unwrap();
+            assert_eq!(history.text, expected_history.text);
+            for row in 0..history.row_count {
+                assert_eq!(history.row(row), expected_history.row(row));
+                assert_eq!(
+                    history.underline_color_runs(row),
+                    expected_history.underline_color_runs(row)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mapped_run_accepts_a_leading_grapheme_extension() {
+    let mut terminal = Terminal::new(2, 12).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal.feed("\x1b(0\u{0600}qxlmk".as_bytes()).unwrap();
+    let frame = terminal.frame().unwrap();
+    assert_eq!(frame.cluster_text(0, 0), Some("\u{0600}─"));
+    assert!(terminal.visible_text().starts_with("\u{0600}─│┌└┐"));
+    assert_eq!(frame.cursor().col, 5);
+}
+
+#[test]
 fn dec_special_control_pictures_survive_all_feed_partitions() {
     for packet in [
         b"\x1b(0bcdehi\x1b(Bbci".as_slice(),

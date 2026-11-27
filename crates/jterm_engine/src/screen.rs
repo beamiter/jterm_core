@@ -854,9 +854,10 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
             && self.charset_banks.british & (1 << index) != 0
     }
     pub(crate) fn ascii_graphics(&self) -> bool {
-        self.active_charset == Charset::Ascii
-            && !(self.national_replacement_mode
-                && self.charset_is_british(self.invoked_charset_bank()))
+        self.active_charset == Charset::Ascii && !self.uses_british_charset()
+    }
+    fn uses_british_charset(&self) -> bool {
+        self.national_replacement_mode && self.charset_is_british(self.invoked_charset_bank())
     }
     fn translate_bank(&self, bank: u8, ch: char) -> char {
         if self.national_replacement_mode && self.charset_is_british(bank) && ch == '#' {
@@ -1518,10 +1519,7 @@ impl ScreenState {
     }
 
     pub fn translate_char(&self, ch: char) -> char {
-        if self.national_replacement_mode
-            && self.charset_is_british(self.invoked_charset_bank())
-            && ch == '#'
-        {
+        if self.uses_british_charset() && ch == '#' {
             '£'
         } else {
             self.active_charset.translate(ch)
@@ -1665,13 +1663,34 @@ impl ScreenState {
     /// Empty input leaves the latch alone; nonempty input clears it even when
     /// autowrap is disabled. Cursor bounds/no-progress retain the row contract.
     pub fn step_ascii_write(&mut self, bytes: &[u8], autowrap: bool) -> AsciiWriteStep {
+        self.step_narrow_write(bytes, autowrap, Self::write_ascii_in_row)
+    }
+
+    /// The caller has consumed any one-shot character-set shift on the first
+    /// scalar. Map the remaining printable bytes with the active character set.
+    pub(crate) fn step_mapped_ascii_write(
+        &mut self,
+        bytes: &[u8],
+        autowrap: bool,
+    ) -> AsciiWriteStep {
+        debug_assert!(!self.single_shift_pending());
+        self.step_narrow_write(bytes, autowrap, Self::write_mapped_ascii_in_row)
+    }
+
+    #[inline]
+    fn step_narrow_write(
+        &mut self,
+        bytes: &[u8],
+        autowrap: bool,
+        write: impl FnOnce(&mut Self, &[u8], bool) -> Option<(usize, RowMutation)>,
+    ) -> AsciiWriteStep {
         if bytes.is_empty() {
             return AsciiWriteStep::Stopped;
         }
         if self.take_pending_wrap(autowrap) {
             return AsciiWriteStep::NeedsWrap;
         }
-        match self.write_ascii_in_row(bytes, autowrap) {
+        match write(self, bytes, autowrap) {
             Some((consumed, mutation)) => AsciiWriteStep::Written { consumed, mutation },
             None => AsciiWriteStep::Stopped,
         }
@@ -1723,6 +1742,38 @@ impl ScreenState {
         if profile == WriteProfile::Ember {
             self.last_printed_char = Some(char::from(bytes[written.0 - 1]));
         }
+        Some(written)
+    }
+
+    fn write_mapped_ascii_in_row(
+        &mut self,
+        bytes: &[u8],
+        autowrap: bool,
+    ) -> Option<(usize, RowMutation)> {
+        let charset = self.active_charset;
+        let british = self.uses_british_charset();
+        let map = |byte| {
+            if british && byte == b'#' {
+                '£'
+            } else {
+                charset.translate(char::from(byte))
+            }
+        };
+        let written = self.write_narrow_in_row(
+            bytes.len(),
+            autowrap,
+            |grid, row, columns, rendition, blank| {
+                grid.overwrite_mapped_ascii(
+                    row,
+                    columns.start,
+                    &bytes[..columns.len()],
+                    rendition,
+                    blank,
+                    map,
+                );
+            },
+        )?;
+        self.last_printed_char = Some(map(bytes[written.0 - 1]));
         Some(written)
     }
 

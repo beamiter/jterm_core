@@ -488,7 +488,7 @@ impl TerminalGrid {
         row: usize,
         col: usize,
         bytes: &[u8],
-        mut rendition: TerminalCell,
+        rendition: TerminalCell,
         blank: TerminalCell,
         policy: AsciiOverwritePolicy,
     ) {
@@ -496,16 +496,49 @@ impl TerminalGrid {
             return;
         }
         assert!(row < self.rows && bytes.len() <= self.cols.saturating_sub(col));
-        let end = col + bytes.len();
         let track_spaces = self.track_printed_spaces;
         debug_assert!(bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)));
-        let target = match policy {
+        let target = self.narrow_overwrite_cells(row, col..col + bytes.len(), blank, policy);
+        Self::write_ascii_cells(target, bytes, rendition, track_spaces, char::from);
+    }
+
+    /// Write printable bytes mapped to single-column graphics. The supported
+    /// character sets preserve spaces as well as the number of columns.
+    pub(crate) fn overwrite_mapped_ascii(
+        &mut self,
+        row: usize,
+        col: usize,
+        bytes: &[u8],
+        rendition: TerminalCell,
+        blank: TerminalCell,
+        map: impl Fn(u8) -> char,
+    ) {
+        let track_spaces = self.track_printed_spaces;
+        let target = self.narrow_overwrite_cells(
+            row,
+            col..col + bytes.len(),
+            blank,
+            AsciiOverwritePolicy::SharedScreen,
+        );
+        Self::write_ascii_cells(target, bytes, rendition, track_spaces, map);
+    }
+
+    #[inline]
+    fn narrow_overwrite_cells(
+        &mut self,
+        row: usize,
+        columns: Range<usize>,
+        blank: TerminalCell,
+        policy: AsciiOverwritePolicy,
+    ) -> &mut [TerminalCell] {
+        match policy {
             AsciiOverwritePolicy::SharedScreen => {
-                self.repair_wide_edges(row, col..end, blank);
-                self.erase_annotations(row, col..end);
-                self.row_cells_mut(row, col..end)
+                self.repair_wide_edges(row, columns.clone(), blank);
+                self.erase_annotations(row, columns.clone());
+                self.row_cells_mut(row, columns)
             }
             AsciiOverwritePolicy::FrostLegacy => {
+                let (col, end) = (columns.start, columns.end);
                 if col > 0 && self.get(row, col).flags.wide_continuation() {
                     *self.get_mut(row, col - 1) = blank;
                 }
@@ -514,7 +547,17 @@ impl TerminalGrid {
                 }
                 &mut self[row][col..end]
             }
-        };
+        }
+    }
+
+    #[inline]
+    fn write_ascii_cells(
+        target: &mut [TerminalCell],
+        bytes: &[u8],
+        mut rendition: TerminalCell,
+        track_spaces: bool,
+        map: impl Fn(u8) -> char,
+    ) {
         rendition.flags.set_wide(false);
         rendition.flags.set_wide_continuation(false);
         if track_spaces || bytes.contains(&b' ') {
@@ -534,13 +577,13 @@ impl TerminalGrid {
                 if byte == b' ' {
                     *cell = space;
                 } else {
-                    rendition.character = char::from(byte);
+                    rendition.character = map(byte);
                     *cell = rendition;
                 }
             }
         } else {
             for (cell, &byte) in target.iter_mut().zip(bytes) {
-                rendition.character = char::from(byte);
+                rendition.character = map(byte);
                 *cell = rendition;
             }
         }
@@ -554,12 +597,11 @@ impl TerminalGrid {
         mut rendition: TerminalCell,
         blank: TerminalCell,
     ) {
-        self.repair_wide_edges(row, columns.clone(), blank);
-        self.erase_annotations(row, columns.clone());
         self.mark_drawn_space(&mut rendition);
         rendition.flags.set_wide(false);
         rendition.flags.set_wide_continuation(false);
-        self.row_cells_mut(row, columns).fill(rendition);
+        self.narrow_overwrite_cells(row, columns, blank, AsciiOverwritePolicy::SharedScreen)
+            .fill(rendition);
     }
 
     #[inline]

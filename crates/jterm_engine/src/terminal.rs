@@ -1639,15 +1639,17 @@ impl Terminal {
         Some(placed)
     }
 
-    fn print(&mut self, ch: char) {
+    // Report whether this scalar started a new graphic.
+    fn print(&mut self, ch: char) -> bool {
         let translated = self.vt.screen.translate_graphic(ch);
-        if !self.extend_grapheme(ch, translated) {
-            self.print_cell(ch, translated);
+        if self.extend_grapheme(ch, translated) {
+            return false;
         }
+        self.print_cell(ch, translated)
     }
 
     fn print_ascii(&mut self, bytes: &[u8]) {
-        if bytes.len() < 4 || self.vt.screen.insert_mode || !self.vt.screen.ascii_graphics() {
+        if bytes.len() < 4 || self.vt.screen.insert_mode {
             for &byte in bytes {
                 self.print(char::from(byte));
             }
@@ -1655,25 +1657,26 @@ impl Terminal {
         }
 
         let (&first, tail) = bytes.split_first().expect("nonempty ASCII run");
-        self.print(char::from(first));
-        if !self
-            .vt
-            .screen
-            .last_printed_char
-            .is_some_and(|ch| ch.is_ascii())
-        {
+        if !self.print(char::from(first)) {
             for &byte in tail {
                 self.print(char::from(byte));
             }
             return;
         }
 
-        // Keep both boundaries in the scalar path. The leading byte can join
-        // a previous grapheme and the trailing byte owns any later extension.
+        // Supported printable-byte mappings produce separate single-column
+        // graphics. The first scalar consumes a pending single shift, and
+        // the last scalar owns any following grapheme extension.
         let (&last, mut middle) = tail.split_last().expect("ASCII run has a tail");
         let autowrap = self.vt.protocol.modes().contains(&7);
+        let mapped = !self.vt.screen.ascii_graphics();
         while !middle.is_empty() {
-            match self.vt.screen.step_ascii_write(middle, autowrap) {
+            let step = if mapped {
+                self.vt.screen.step_mapped_ascii_write(middle, autowrap)
+            } else {
+                self.vt.screen.step_ascii_write(middle, autowrap)
+            };
+            match step {
                 AsciiWriteStep::NeedsWrap => self.motion(VerticalMotion::Wrap),
                 AsciiWriteStep::Written { consumed, mutation } => {
                     self.apply_written_underline(mutation);
@@ -1689,15 +1692,16 @@ impl Terminal {
         self.print(char::from(last));
     }
 
-    fn print_cell(&mut self, ch: char, translated: char) {
+    fn print_cell(&mut self, ch: char, translated: char) -> bool {
         let width = ch.width().unwrap_or(0);
         if width == 0 || width > 2 {
             self.finish_grapheme();
             self.record_unsupported_event(&Event::Print(ch));
             self.unsupported();
-            return;
+            return false;
         }
         self.write_graphic(translated, width);
+        true
     }
 
     fn write_graphic(&mut self, translated: char, width: usize) {
@@ -2502,7 +2506,9 @@ impl Terminal {
                 }
             }
             Dispatch::Unhandled => match event {
-                Event::Print(ch) => self.print(ch),
+                Event::Print(ch) => {
+                    self.print(ch);
+                }
                 Event::Ascii(bytes) => self.print_ascii(bytes),
                 Event::Control(10..=12) => self.motion(VerticalMotion::LineFeed),
                 Event::Control(0) | Event::Boundary => (),
