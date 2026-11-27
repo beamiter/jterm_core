@@ -120,6 +120,32 @@ mod tests {
         assert_eq!((frame.cursor().row, frame.cursor().col), (2, 1));
         assert!(repeated.visible_text().starts_with("XXXXXXXX\nXXXXXXXX\nX"));
 
+        let mut graphics = Terminal::new(2, 80).unwrap();
+        let mapped = cap(&["acsc"]);
+        assert_eq!(mapped.len() % 2, 0);
+        let codes: Vec<_> = mapped.chunks_exact(2).map(|pair| pair[1]).collect();
+        graphics.feed(&cap(&["enacs"])).unwrap();
+        graphics.feed(&cap(&["smacs"])).unwrap();
+        graphics.feed(&codes).unwrap();
+        graphics.feed(&cap(&["rmacs"])).unwrap();
+        graphics.feed(b"qxm").unwrap();
+        assert!(graphics
+            .visible_text()
+            .starts_with("◆▒°±␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·qxm"));
+        graphics.feed(&cap(&["smacs"])).unwrap();
+        graphics.feed(&cap(&["bold"])).unwrap();
+        graphics.feed(&cap(&["rep", "113", "8"])).unwrap();
+        graphics.feed(&cap(&["sgr0"])).unwrap();
+        graphics.feed(b"q").unwrap();
+        let frame = graphics.frame().unwrap();
+        let pen = codes.len() + 3;
+        let cells = &frame.rows()[0].cells;
+        assert!(cells[pen..pen + 8]
+            .iter()
+            .all(|cell| cell.character == '─' && cell.flags.bold()));
+        assert_eq!(cells[pen + 8].character, 'q');
+        assert!(!cells[pen + 8].flags.bold());
+
         let mut terminal = Terminal::new(24, 80).unwrap();
         terminal.enable_device_answers();
         terminal.feed(&cap(&["smkx"])).unwrap();

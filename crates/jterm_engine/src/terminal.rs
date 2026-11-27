@@ -16,7 +16,7 @@ use crate::{
     row_annotations::RowAnnotations,
     screen::{
         rows_to_archive_on_height_shrink, AsciiWriteStep, RegionDirection, RegionMutation,
-        ScreenState, VerticalMotion,
+        RowMutation, ScreenState, VerticalMotion,
     },
     semantics::{self, Dispatch, Effect, Effects, UnderlinePen},
     titles::TitleState,
@@ -1670,34 +1670,23 @@ impl Terminal {
 
         // Keep both boundaries in the scalar path. The leading byte can join
         // a previous grapheme and the trailing byte owns any later extension.
-        let (&last, middle) = tail.split_last().expect("ASCII run has a tail");
+        let (&last, mut middle) = tail.split_last().expect("ASCII run has a tail");
         let autowrap = self.vt.protocol.modes().contains(&7);
-        let consumed = self.write_ascii_rows(middle, autowrap);
-        self.finish_grapheme();
-        for &byte in &middle[consumed..] {
-            self.print(char::from(byte));
-        }
-        self.print(char::from(last));
-    }
-
-    fn write_ascii_rows(&mut self, mut bytes: &[u8], autowrap: bool) -> usize {
-        let length = bytes.len();
-        while !bytes.is_empty() {
-            match self.vt.screen.step_ascii_write(bytes, autowrap) {
+        while !middle.is_empty() {
+            match self.vt.screen.step_ascii_write(middle, autowrap) {
                 AsciiWriteStep::NeedsWrap => self.motion(VerticalMotion::Wrap),
                 AsciiWriteStep::Written { consumed, mutation } => {
-                    if let (Some(pen), Some(columns)) = (&self.underline_pen, mutation.printed) {
-                        self.vt
-                            .screen
-                            .grid
-                            .set_underline_color(mutation.row, columns, pen.current);
-                    }
-                    bytes = &bytes[consumed..];
+                    self.apply_written_underline(mutation);
+                    middle = &middle[consumed..];
                 }
                 AsciiWriteStep::Stopped => break,
             }
         }
-        length - bytes.len()
+        self.finish_grapheme();
+        for &byte in middle {
+            self.print(char::from(byte));
+        }
+        self.print(char::from(last));
     }
 
     fn print_cell(&mut self, ch: char, translated: char) {
@@ -1766,13 +1755,18 @@ impl Terminal {
             input.provisional = provisional;
             input.last_cluster = None;
         }
+        self.apply_written_underline(written);
+        self.vt.screen.last_printed_char = Some(translated);
+    }
+
+    #[inline]
+    fn apply_written_underline(&mut self, written: RowMutation) {
         if let (Some(underline), Some(cols)) = (&self.underline_pen, written.printed) {
             self.vt
                 .screen
                 .grid
                 .set_underline_color(written.row, cols, underline.current);
         }
-        self.vt.screen.last_printed_char = Some(translated);
     }
 
     fn repeat_print(&mut self, mut count: usize) {
@@ -1806,11 +1800,7 @@ impl Terminal {
             }
         } else {
             let translated = self.vt.screen.translate_char(ch);
-            if count >= 4
-                && (' '..='~').contains(&ch)
-                && translated == ch
-                && !self.vt.screen.insert_mode
-            {
+            if count >= 4 && ch.width() == Some(1) && !self.vt.screen.insert_mode {
                 let autowrap = self.vt.protocol.modes().contains(&7);
                 if !autowrap {
                     // Further writes at the right margin overwrite the same glyph.
@@ -1823,15 +1813,20 @@ impl Terminal {
                         .max(1);
                     count = count.min(remaining);
                 }
-                let repeated = [ch as u8; HOST_MAX_COLS];
                 // The last scalar can still receive a combining mark or widen.
                 while count > 1 {
-                    let length = (count - 1).min(repeated.len());
-                    let written = self.write_ascii_rows(&repeated[..length], autowrap);
-                    count -= written;
-                    if written < length {
-                        break;
+                    if self.vt.screen.take_pending_wrap(autowrap) {
+                        self.motion(VerticalMotion::Wrap);
                     }
+                    let Some((written, mutation)) = self.vt.screen.write_repeated_narrow_in_row(
+                        translated,
+                        count - 1,
+                        autowrap,
+                    ) else {
+                        break;
+                    };
+                    self.apply_written_underline(mutation);
+                    count -= written;
                 }
             }
             for _ in 0..count {

@@ -546,6 +546,33 @@ impl TerminalGrid {
         }
     }
 
+    /// Fill a valid span with the same single-column graphic and rendition.
+    pub(crate) fn overwrite_repeated_narrow(
+        &mut self,
+        row: usize,
+        columns: Range<usize>,
+        mut rendition: TerminalCell,
+        blank: TerminalCell,
+    ) {
+        self.repair_wide_edges(row, columns.clone(), blank);
+        self.erase_annotations(row, columns.clone());
+        self.mark_drawn_space(&mut rendition);
+        rendition.flags.set_wide(false);
+        rendition.flags.set_wide_continuation(false);
+        self.row_cells_mut(row, columns).fill(rendition);
+    }
+
+    #[inline]
+    fn mark_drawn_space(&self, rendition: &mut TerminalCell) {
+        if self.track_printed_spaces {
+            rendition
+                .flags
+                .set_printed_space(rendition.character == ' ');
+        } else if rendition.character == ' ' && !rendition.flags.printed_space() {
+            rendition.flags.mark_untracked_drawn_space();
+        }
+    }
+
     /// Replace a glyph at a valid row and column. The caller has already
     /// resolved wrapping and any insert-mode shift.
     ///
@@ -563,13 +590,7 @@ impl TerminalGrid {
     ) {
         assert!(row < self.rows && col < self.cols && width > 0);
         self.repair_wide_edges(row, col..col.saturating_add(width), blank);
-        if self.track_printed_spaces {
-            rendition
-                .flags
-                .set_printed_space(rendition.character == ' ');
-        } else if rendition.character == ' ' && !rendition.flags.printed_space() {
-            rendition.flags.mark_untracked_drawn_space();
-        }
+        self.mark_drawn_space(&mut rendition);
         rendition.flags.set_wide(width == 2);
         rendition.flags.set_wide_continuation(false);
         *self.get_mut(row, col) = rendition;

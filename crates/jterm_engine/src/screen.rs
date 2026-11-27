@@ -1703,20 +1703,67 @@ impl ScreenState {
         autowrap: bool,
         profile: WriteProfile,
     ) -> Option<(usize, RowMutation)> {
+        let written = self.write_narrow_in_row(
+            bytes.len(),
+            autowrap,
+            |grid, row, columns, rendition, blank| {
+                grid.overwrite_ascii(
+                    row,
+                    columns.start,
+                    &bytes[..columns.len()],
+                    rendition,
+                    blank,
+                    match profile {
+                        WriteProfile::Ember => AsciiOverwritePolicy::SharedScreen,
+                        WriteProfile::FrostLegacy => AsciiOverwritePolicy::FrostLegacy,
+                    },
+                );
+            },
+        )?;
+        if profile == WriteProfile::Ember {
+            self.last_printed_char = Some(char::from(bytes[written.0 - 1]));
+        }
+        Some(written)
+    }
+
+    pub(crate) fn write_repeated_narrow_in_row(
+        &mut self,
+        character: char,
+        requested: usize,
+        autowrap: bool,
+    ) -> Option<(usize, RowMutation)> {
+        let written = self.write_narrow_in_row(
+            requested,
+            autowrap,
+            |grid, row, columns, mut rendition, blank| {
+                rendition.character = character;
+                grid.overwrite_repeated_narrow(row, columns, rendition, blank);
+            },
+        )?;
+        self.last_printed_char = Some(character);
+        Some(written)
+    }
+
+    fn write_narrow_in_row(
+        &mut self,
+        requested: usize,
+        autowrap: bool,
+        overwrite: impl FnOnce(&mut TerminalGrid, usize, Range<usize>, TerminalCell, TerminalCell),
+    ) -> Option<(usize, RowMutation)> {
         assert!(!self.insert_mode);
         let cols = self.grid.cols();
         let col = self.cursor_col;
         let row = self.cursor_row;
-        let count = bytes.len().min(cols.saturating_sub(col));
+        let count = requested.min(cols.saturating_sub(col));
         if count == 0 {
             return None;
         }
         let effect = self.row_mutation(row, col, col + count, Some(col..col + count));
         let blank = self.create_blank_cell();
-        self.grid.overwrite_ascii(
+        overwrite(
+            &mut self.grid,
             row,
-            col,
-            &bytes[..count],
+            col..col + count,
             TerminalCell {
                 character: ' ',
                 foreground: self.current_fg,
@@ -1725,10 +1772,6 @@ impl ScreenState {
                 hyperlink_id: self.current_hyperlink,
             },
             blank,
-            match profile {
-                WriteProfile::Ember => AsciiOverwritePolicy::SharedScreen,
-                WriteProfile::FrostLegacy => AsciiOverwritePolicy::FrostLegacy,
-            },
         );
         self.cursor_col += count;
         if self.cursor_col >= cols {
@@ -1736,9 +1779,6 @@ impl ScreenState {
             if autowrap {
                 self.pending_wrap = true;
             }
-        }
-        if profile == WriteProfile::Ember {
-            self.last_printed_char = Some(bytes[count - 1] as char);
         }
         Some((count, effect))
     }

@@ -150,12 +150,14 @@ fn off_at_last_column_keeps_one_byte_batches_and_rep_source() {
 }
 
 #[test]
-fn ascii_rep_matches_scalar_output_in_live_and_retained_rows() {
-    let cases: [(&[u8], u8, &str); 4] = [
+fn single_column_rep_matches_scalar_output_in_live_and_retained_rows() {
+    let cases: [(&[u8], u8, &str); 6] = [
         (b"\x1b[3;4H", b'#', "\u{fe0f}\u{20e3}"),
         (b"\x1b[?7l\x1b[2;4H", b' ', ""),
         (b"\x1b[?1049h\x1b[2;3r\x1b[3;4H", b'X', ""),
         (b"\x1b[4h\x1b[2;4H", b'X', ""),
+        (b"\x1b(0\x1b[3;4H", b'q', ""),
+        (b"\x1b(0\x1b[?7l\x1b[2;4H", b'x', ""),
     ];
     for (setup, byte, suffix) in cases {
         let seed = || {
