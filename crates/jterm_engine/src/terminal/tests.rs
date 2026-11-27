@@ -303,6 +303,24 @@ fn csi_bell_and_utf8_recovery_survive_every_feed_split() {
 }
 
 #[test]
+fn discarded_escape_releases_a_new_query_at_every_feed_split() {
+    let bytes = b"AB\x1b%%%%%%%%%\x07\r\x1b[6nZ";
+    for cut in 0..=bytes.len() {
+        let mut terminal = Terminal::new(2, 8).unwrap();
+        terminal.enable_window_updates();
+        let mut replies = terminal.feed(&bytes[..cut]).unwrap();
+        let bell = terminal.take_window_updates().bell;
+        replies.extend(terminal.feed(&bytes[cut..]).unwrap());
+        assert_ne!(bell, terminal.take_window_updates().bell, "cut {cut}");
+        assert_eq!(replies, b"\x1b[1;1R", "cut {cut}");
+        assert_eq!(
+            terminal.visible_text().lines().next().unwrap().trim_end(),
+            "ZB"
+        );
+    }
+}
+
+#[test]
 fn focus_and_pointer_encoding_follows_negotiated_modes() {
     let mut terminal = Terminal::new(4, 10).unwrap();
     assert_eq!(terminal.encode_focus(true), None);

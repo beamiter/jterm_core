@@ -107,6 +107,7 @@ pub struct TerminalGrid {
     underline_colors: Vec<Option<Vec<Color>>>,
     annotations: Vec<Option<Arc<RowAnnotations>>>,
     capture_revision: u64,
+    last_row_change: u64,
     row_changes: Vec<u64>,
     pub(crate) track_printed_spaces: bool,
 }
@@ -124,6 +125,7 @@ impl TerminalGrid {
             underline_colors: Vec::new(),
             annotations: Vec::new(),
             capture_revision: 0,
+            last_row_change: 0,
             row_changes: Vec::new(),
             track_printed_spaces: false,
         }
@@ -143,8 +145,12 @@ impl TerminalGrid {
     }
 
     pub(crate) fn begin_capture_revision(&mut self, revision: u64) {
+        debug_assert!(revision >= self.capture_revision);
         self.capture_revision = revision;
-        self.row_changes.resize(self.rows, revision);
+        if self.row_changes.len() != self.rows {
+            self.row_changes.resize(self.rows, revision);
+            self.last_row_change = revision;
+        }
     }
 
     /// Grid users that do not start capture revisions have no change certificate.
@@ -159,23 +165,21 @@ impl TerminalGrid {
     // vector; this certificate covers cells and row-owned paint metadata only.
     #[inline]
     pub(crate) fn captured_rows_unchanged_after(&self, revision: u64) -> bool {
-        self.row_changes.len() == self.rows
-            && self
-                .row_changes
-                .iter()
-                .all(|&changed_at| changed_at <= revision)
+        self.row_changes.len() == self.rows && self.last_row_change <= revision
     }
 
     #[inline]
     fn mark_row_changed(&mut self, row: usize) {
         if self.capture_revision != 0 {
             self.row_changes[row] = self.capture_revision;
+            self.last_row_change = self.capture_revision;
         }
     }
 
     /// Flat cells with a fixed length. Hosts must preserve wide-cell invariants.
     pub fn cells_mut(&mut self) -> &mut [TerminalCell] {
         self.row_changes.fill(self.capture_revision);
+        self.last_row_change = self.capture_revision;
         self.margin_origin.fill(MarginOrigin::Unknown);
         self.underline_colors = Vec::new();
         self.annotations = Vec::new();
@@ -859,6 +863,7 @@ impl TerminalGrid {
         let end = bottom + 1;
         if self.capture_revision != 0 {
             self.row_changes[top..end].fill(self.capture_revision);
+            self.last_row_change = self.capture_revision;
         }
         let height = end - top;
         let count = count.min(height);
@@ -1133,6 +1138,7 @@ impl TerminalGrid {
         if self.capture_revision != 0 {
             self.row_changes.resize(new_rows, self.capture_revision);
             self.row_changes.fill(self.capture_revision);
+            self.last_row_change = self.capture_revision;
         }
         let mut new_cells = vec![default_cell; new_rows * new_cols];
         let copy_rows = self.rows.min(new_rows);
@@ -2657,6 +2663,32 @@ mod search_chunk_decode_tests {
         assert!(line.decode_search_row(1000, 4096).is_none());
         assert_eq!(line.decode_search_row(1024, 4096).unwrap().len(), 1024);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn latest_capture_change_tracks_cell_region_and_geometry_edits() {
+    let mut grid = TerminalGrid::new(4, 8);
+    assert!(!grid.captured_rows_unchanged_after(0));
+    grid.begin_capture_revision(1);
+    grid.begin_capture_revision(2);
+    assert!(grid.captured_rows_unchanged_after(1));
+    grid.get_mut(3, 0).character = 'X';
+    assert!(!grid.captured_rows_unchanged_after(1));
+    assert!(grid.captured_rows_unchanged_after(2));
+
+    grid.begin_capture_revision(3);
+    grid.scroll_up_by(1, TerminalCell::default());
+    assert!(!grid.captured_rows_unchanged_after(2));
+    assert!(grid.captured_rows_unchanged_after(3));
+
+    grid.begin_capture_revision(4);
+    grid.cells_mut()[0].character = 'Y';
+    assert!(!grid.captured_rows_unchanged_after(3));
+    grid.begin_capture_revision(5);
+    grid.resize(3, 8, TerminalCell::default());
+    assert!(!grid.captured_rows_unchanged_after(4));
+    assert!(grid.captured_rows_unchanged_after(5));
 }
 
 #[cfg(test)]

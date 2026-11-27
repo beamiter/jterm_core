@@ -6,6 +6,7 @@ use crate::{
     row_annotations::RowAnnotations,
     HyperlinkId,
 };
+use smallvec::SmallVec;
 use std::{fmt, num::NonZeroU64, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +398,21 @@ impl CellFrame {
     pub fn shared_rows(&self) -> Arc<[Row]> {
         Arc::clone(&self.rows)
     }
+    pub(crate) fn update_rows(
+        &self,
+        mut updates: impl Iterator<Item = (usize, Row)>,
+    ) -> Arc<[Row]> {
+        let Some((index, row)) = updates.next() else {
+            return self.shared_rows();
+        };
+        let mut rows: Arc<[Row]> = Arc::from(self.rows.as_ref());
+        let target = Arc::get_mut(&mut rows).expect("new row table is unique");
+        target[index] = row;
+        for (index, row) in updates {
+            target[index] = row;
+        }
+        rows
+    }
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -636,44 +652,44 @@ impl CellFrame {
         {
             return Err(Error::Bounds);
         }
-        let mut seen = if delta.rows.is_empty() {
-            Vec::new()
-        } else {
-            vec![false; self.rows.len()]
-        };
+        // Index replacements once for validation and direct shared-row construction.
+        let mut edited = SmallVec::<[Option<&Row>; 128]>::new();
+        if !delta.rows.is_empty() {
+            edited.resize(self.rows.len(), None);
+        }
         for (index, row) in &delta.rows {
             if *index >= self.rows.len() || row.cells.len() != self.cols {
                 return Err(Error::Bounds);
             }
-            if seen[*index] {
+            if edited[*index].replace(row).is_some() {
                 return Err(Error::Duplicate);
             }
-            seen[*index] = true;
         }
         if delta.cursor.row >= self.rows.len() || delta.cursor.col >= self.cols {
             return Err(Error::Cursor);
         }
         if delta.underline_colors.iter().any(|(index, runs)| {
-            !seen.get(*index).copied().unwrap_or(false) || !valid_underline_colors(runs, self.cols)
+            edited.get(*index).is_none_or(Option::is_none)
+                || !valid_underline_colors(runs, self.cols)
         }) {
             return Err(Error::Bounds);
         }
         if delta.annotations.iter().any(|(index, line)| {
-            !delta
-                .rows
-                .iter()
-                .any(|(row, cells)| row == index && line.valid_for(&cells.cells))
+            edited
+                .get(*index)
+                .and_then(|row| *row)
+                .is_none_or(|row| !line.valid_for(&row.cells))
         }) {
             return Err(Error::Bounds);
         }
-        let rows = if delta.rows.is_empty() {
-            self.rows.clone()
+        let rows: Arc<[Row]> = if edited.is_empty() {
+            self.shared_rows()
         } else {
-            let mut rows = self.rows.to_vec();
-            for (index, row) in &delta.rows {
-                rows[*index] = row.clone();
-            }
-            Arc::from(rows)
+            self.rows
+                .iter()
+                .zip(edited.iter())
+                .map(|(before, patch)| patch.unwrap_or(before).clone())
+                .collect()
         };
         let underline_colors = if delta.rows.is_empty() {
             self.shared_underline_rows()
@@ -716,15 +732,24 @@ impl CellFrame {
             HyperlinkDelta::Inherit => &self.hyperlinks,
             HyperlinkDelta::Snapshot(resources) => resources,
         };
-        let hyperlinks = if delta.rows.is_empty() && same_shared_table(resources, &self.hyperlinks)
-        {
-            // The validated base already retains exactly the targets used by these rows.
-            self.hyperlinks.clone()
-        } else {
-            resources
+        let hyperlinks = resources.as_ref().and_then(|resources| {
+            if self
+                .hyperlinks
                 .as_ref()
-                .and_then(|resources| retain_delta_hyperlinks(resources, &rows))
-        };
+                .is_some_and(|old| Arc::ptr_eq(old, resources))
+                && delta.rows.iter().all(|(index, _)| {
+                    self.rows[*index]
+                        .cells
+                        .iter()
+                        .all(|cell| cell.hyperlink_id.is_none())
+                })
+            {
+                // Every target in the base is still referenced by an unchanged row.
+                Some(resources.clone())
+            } else {
+                retain_delta_hyperlinks(resources, &rows)
+            }
+        });
         // The admitted base and validated edit set already establish all
         // invariants, including row widths. Do not rescan cloned rows.
         Ok(Self {
@@ -901,4 +926,38 @@ fn cursor_only_delta_admits_resource_replacement_and_inherited_targets() {
         base.hyperlinks.as_ref().unwrap(),
         replaced.hyperlinks.as_ref().unwrap()
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn delta_reuses_links_outside_edited_rows_and_releases_the_last_reference() {
+    let mut terminal = crate::terminal::Terminal::new(3, 8).unwrap();
+    terminal.enable_hyperlinks(|_, _| true);
+    terminal
+        .feed(b"\x1b]8;;https://example.test/link\x07X\x1b]8;;\x07")
+        .unwrap();
+    let before = terminal.frame().unwrap();
+    terminal.feed(b"\x1b[2;1HY").unwrap();
+    let after = terminal.frame().unwrap();
+    let limits = Limits {
+        max_rows: 3,
+        max_cols: 8,
+        max_cells: 24,
+    };
+    let delta = before.delta_to(&after).unwrap();
+    let applied = before.apply(&delta, limits).unwrap();
+    assert_eq!(applied, after);
+    assert!(Arc::ptr_eq(
+        before.hyperlinks.as_ref().unwrap(),
+        applied.hyperlinks.as_ref().unwrap()
+    ));
+
+    terminal.feed(b"\x1b[1;1H\x1b[2K").unwrap();
+    let erased = terminal.frame().unwrap();
+    let mut delta = after.delta_to(&erased).unwrap();
+    delta.hyperlinks = HyperlinkDelta::Inherit;
+    let applied = after.apply(&delta, limits).unwrap();
+    let id = before.rows()[0].cells[0].hyperlink_id;
+    assert_eq!(applied, erased);
+    assert_eq!(applied.hyperlink_target(id), None);
 }

@@ -212,6 +212,21 @@ fn bounded_csi_returns_invalid_non_ascii_to_ground() {
     );
 }
 #[test]
+fn bounded_discarded_escape_keeps_c0_and_restarts_on_a_new_escape() {
+    check(
+        b"\x1b%%%%%%%%%\x07\r\x1b[6nZ",
+        vec![
+            Token::Control(7),
+            Token::Control(13),
+            csi(b"6", &[6], None, b"", b'n'),
+            Token::Print('Z'),
+        ],
+        128,
+        1,
+        0,
+    );
+}
+#[test]
 fn empty_fields_and_colon_syntax_preserve_raw_bytes() {
     let input = b"\x1b[;5H\x1b[38:2::1:2:3m\x1b[;;g\x1b[12;999999P";
     for (profile, cup, sgr, tbc) in [

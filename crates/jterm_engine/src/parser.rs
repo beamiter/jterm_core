@@ -850,7 +850,12 @@ impl Parser {
                     }
                     abandon!(Some(Event::Boundary));
                 }
-                State::DiscardCsi => {
+                discarded @ (State::DiscardCsi | State::DiscardEscape) => {
+                    let first_final = if matches!(discarded, State::DiscardCsi) {
+                        0x40
+                    } else {
+                        0x30
+                    };
                     while let Some(&byte) = input.get(at) {
                         at += 1;
                         match byte {
@@ -858,33 +863,21 @@ impl Parser {
                                 self.state = State::Escape(Vec::new());
                                 abandon!(Some(Event::Boundary));
                             }
-                            0x40..=0x7e | 0x18 | 0x1a => {
+                            0x18 | 0x1a => {
                                 abandon!(Some(Event::Boundary));
                             }
                             0x00..=0x1f => {
-                                self.state = State::DiscardCsi;
+                                self.state = discarded;
                                 emit_open!(Event::Control(byte));
+                            }
+                            final_byte if (first_final..=0x7e).contains(&final_byte) => {
+                                abandon!(Some(Event::Boundary));
                             }
                             _ => {}
                         }
                     }
-                    self.state = State::DiscardCsi;
+                    self.state = discarded;
                     abandon!(None);
-                }
-                State::DiscardEscape => {
-                    let mut ended = false;
-                    while let Some(&byte) = input.get(at) {
-                        at += 1;
-                        if matches!(byte, 0x30..=0x7e | 0x18 | 0x1a) {
-                            ended = true;
-                            break;
-                        }
-                    }
-                    if !ended {
-                        self.state = State::DiscardEscape;
-                        abandon!(None);
-                    }
-                    abandon!(Some(Event::Boundary));
                 }
                 State::String { kind, mut data } if self.bounded => {
                     // Borrow a complete fresh payload only after scanning its

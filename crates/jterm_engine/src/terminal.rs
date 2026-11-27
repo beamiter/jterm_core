@@ -2557,7 +2557,6 @@ impl Terminal {
                 && *row_identity_revision == identity
                 && frame.cols() == grid.cols()
                 && frame.rows().len() == grid.rows()
-                && !grid.row_changed_after(cursor.row, last_observation)
                 && grid.captured_rows_unchanged_after(last_observation)
                 && frame
                     .rows()
@@ -2586,29 +2585,30 @@ impl Terminal {
         let rows = if let Some(previous) = unchanged_paint {
             previous.shared_rows()
         } else if let Some(previous) = previous {
-            let mut changed = None;
-            for (index, row) in previous.rows().iter().enumerate() {
-                let cells_changed = if may_have_changed(index) {
-                    row.cells.as_ref() != &grid[index][..]
-                } else {
-                    debug_assert_eq!(row.cells.as_ref(), &grid[index][..]);
-                    false
-                };
-                let wrapped = grid.row_wrapped[index];
-                if row.wrapped != wrapped || cells_changed {
-                    changed.get_or_insert_with(|| previous.rows().to_vec())[index] = Row {
-                        cells: if cells_changed {
+            let changes = previous
+                .rows()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    let cells_changed = if may_have_changed(index) {
+                        row.cells.as_ref() != &grid[index][..]
+                    } else {
+                        debug_assert_eq!(row.cells.as_ref(), &grid[index][..]);
+                        false
+                    };
+                    let wrapped = grid.row_wrapped[index];
+                    (row.wrapped != wrapped || cells_changed).then(|| {
+                        let cells = if cells_changed {
                             Arc::from(&grid[index][..])
                         } else {
                             row.cells.clone()
-                        },
-                        wrapped,
-                    };
-                }
-            }
-            changed.map_or_else(|| previous.shared_rows(), Arc::from)
+                        };
+                        (index, Row { cells, wrapped })
+                    })
+                });
+            previous.update_rows(changes)
         } else {
-            (0..grid.rows()).map(capture_row).collect::<Vec<_>>().into()
+            (0..grid.rows()).map(capture_row).collect()
         };
         let underline_colors = if self.underline_pen.is_some() {
             if let Some(previous) = unchanged_paint {

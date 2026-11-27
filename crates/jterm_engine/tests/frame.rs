@@ -67,6 +67,54 @@ fn full_and_delta_equal_with_shared_unchanged_rows() {
     ));
 }
 #[test]
+fn applies_out_of_order_edits_to_frames_taller_than_a_live_viewport() {
+    let sample = frame(1);
+    let count = 129;
+    let cols = sample.cols();
+    let limits = Limits {
+        max_rows: count,
+        max_cols: cols,
+        max_cells: count * cols,
+    };
+    let base = CellFrame::new(
+        sample.stamp(),
+        cols,
+        vec![sample.rows()[0].clone(); count].into(),
+        sample.cursor(),
+        limits,
+    )
+    .unwrap();
+    let replacement = |character| Row {
+        cells: vec![
+            TerminalCell {
+                character,
+                ..TerminalCell::default()
+            };
+            cols
+        ]
+        .into(),
+        wrapped: false,
+    };
+    let updates = Delta::new(
+        base.stamp(),
+        Stamp {
+            revision: 2,
+            ..base.stamp()
+        },
+        base.cursor(),
+        vec![(count - 1, replacement('Z')), (0, replacement('A'))],
+    );
+    let updated = base.apply(&updates, limits).unwrap();
+    assert_eq!(updated.rows()[0].cells[0].character, 'A');
+    assert_eq!(updated.rows()[count - 1].cells[0].character, 'Z');
+    assert!(std::sync::Arc::ptr_eq(
+        &base.rows()[1].cells,
+        &updated.rows()[1].cells
+    ));
+    assert_eq!(base.rows()[0].cells[0].character, ' ');
+}
+
+#[test]
 fn cursor_only_and_pending_wrap_preserved() {
     let a = frame(1);
     let cursor = Cursor {
