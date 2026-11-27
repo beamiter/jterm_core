@@ -29,50 +29,58 @@ fn format_cell_text(
     text.trim_end_matches(' ').len().max(written_space_end)
 }
 
-// Keep the encoded formatter out of the plain-text export path.
+// Keep cell streaming out of the plain-text export path.
 #[inline(never)]
-fn format_encoded_archive_row(line: &ScrollbackLine, text: &mut String) -> (usize, usize) {
+fn format_streamed_archive_row<'a>(
+    line: &ScrollbackLine,
+    text: &mut String,
+    annotations: impl Iterator<Item = (usize, &'a str)>,
+) -> (usize, usize) {
     text.clear();
     let mut physical_end = 0;
     let mut written_space_end = 0;
     let gap = line.synthetic_margin_gap();
+    let mut annotations = annotations.peekable();
     line.visit_search_cells(|column, cell| {
         physical_end = column + 1;
+        let cluster = annotations.next_if(|&(at, _)| at == column);
         if cell.flags.wide_continuation() || gap == Some(column) {
             return;
         }
-        text.push(cell.character);
+        if let Some((_, cluster)) = cluster {
+            text.push_str(cluster);
+        } else {
+            text.push(cell.character);
+        }
         if cell.flags.printed_space() {
             written_space_end = text.len();
         }
     });
-    let end = text.trim_end_matches(' ').len().max(written_space_end);
     let content_columns = line.columns() - usize::from(gap.is_some());
+    // Compression may omit a trailing blank cell with a combining mark.
+    for (column, cluster) in annotations.take_while(|&(at, _)| at < content_columns) {
+        text.extend(std::iter::repeat_n(' ', column - physical_end));
+        text.push_str(cluster);
+        physical_end = column + 1;
+    }
+    let end = text.trim_end_matches(' ').len().max(written_space_end);
     let implicit_padding = content_columns.saturating_sub(physical_end);
     (end, text.len() - end + implicit_padding)
 }
 
-fn format_archive_row<'a>(
-    line: &'a ScrollbackLine,
-    text: &'a mut String,
-    decoded: &mut Vec<TerminalCell>,
-) -> (&'a str, usize) {
-    let annotations = line.row_annotations().map(Arc::as_ref);
-    let gap = line.synthetic_margin_gap();
-    match line.content() {
-        ScrollbackContent::Plain(text, trailing) if annotations.is_none() && gap.is_none() => {
+fn format_archive_row<'a>(line: &'a ScrollbackLine, text: &'a mut String) -> (&'a str, usize) {
+    let annotations = line.row_annotations().filter(|row| row.has_text());
+    let (end, trailing) = match (line.content(), annotations) {
+        (ScrollbackContent::Plain(text, trailing), None)
+            if line.synthetic_margin_gap().is_none() =>
+        {
             let trimmed = text.trim_end_matches(' ');
             return (trimmed, text.len() - trimmed.len() + usize::from(trailing));
         }
-        ScrollbackContent::Encoded(_) if annotations.is_none() => {
-            let (end, trailing) = format_encoded_archive_row(line, text);
-            return (&text[..end], trailing);
-        }
-        _ => {}
-    }
-    line.decompress_into(decoded);
-    let end = format_cell_text(text, decoded, annotations, gap);
-    (&text[..end], text.len() - end)
+        (_, Some(row)) => format_streamed_archive_row(line, text, row.texts()),
+        _ => format_streamed_archive_row(line, text, std::iter::empty()),
+    };
+    (&text[..end], trailing)
 }
 
 impl Terminal {
@@ -213,9 +221,8 @@ impl Terminal {
             Ok::<(), io::Error>(())
         };
         if !self.alternate_screen_active() {
-            let mut decoded = Vec::new();
             for line in self.history.iter() {
-                let (text, trailing) = format_archive_row(line, &mut row_text, &mut decoded);
+                let (text, trailing) = format_archive_row(line, &mut row_text);
                 finish_row(text, trailing, line.is_wrapped)?;
             }
         }
@@ -257,17 +264,18 @@ impl Terminal {
         let row_count = rows.len();
         let mut text = String::new();
         let mut row_text = String::new();
-        let mut decoded = Vec::new();
         let mut padding = 0;
         for (index, line) in self.history.range(rows).enumerate() {
-            let (row, trailing) = format_archive_row(line, &mut row_text, &mut decoded);
+            let (row, trailing) = format_archive_row(line, &mut row_text);
             if !row.is_empty() {
                 if text.len() + padding + row.len() > max_bytes {
                     return None;
                 }
-                text.extend(std::iter::repeat_n(' ', padding));
+                if padding != 0 {
+                    text.extend(std::iter::repeat_n(' ', padding));
+                    padding = 0;
+                }
                 text.push_str(row);
-                padding = 0;
             }
             if line.is_wrapped {
                 padding += trailing;
@@ -442,7 +450,18 @@ impl<'a> HistoryReader<'a> {
 
     pub(super) fn read(&mut self, row: ProjectedHistoryRow) -> HistoryCopyRow {
         let width = usize::from(row.cells);
-        let mut cells = std::mem::take(&mut self.projected);
+        if width == 0 {
+            return HistoryCopyRow {
+                row: Row {
+                    cells: empty_projected_cells(),
+                    wrapped: row.wrapped,
+                },
+                underline_colors: None,
+                annotations: None,
+                synthetic_gap: None,
+            };
+        }
+        let cells = &mut self.projected;
         cells.clear();
         cells.reserve(width);
         let mut underline: Vec<UnderlineColorRun> = Vec::new();
@@ -460,11 +479,14 @@ impl<'a> HistoryReader<'a> {
             let source_start = column.min(source_end);
             let source_annotations = line.row_annotations();
             let source_underline = line.underline_color_runs();
-            if !self.single_column && source_annotations.is_none() {
+            if !self.single_column {
                 let count = (width - cells.len()).min(source_end - source_start);
                 let target_start = cells.len();
                 let end = source_start + count;
                 cells.extend_from_slice(&source[source_start..end]);
+                if let Some(source) = source_annotations {
+                    annotations.append_columns_from(source, source_start..end, target_start);
+                }
                 let first =
                     source_underline.partition_point(|run| usize::from(run.end) <= source_start);
                 for run in source_underline[first..]
@@ -535,15 +557,9 @@ impl<'a> HistoryReader<'a> {
             column = 0;
             index += 1;
         }
-        let shared = if cells.is_empty() {
-            empty_projected_cells()
-        } else {
-            Arc::from(cells.as_slice())
-        };
-        self.projected = cells;
         HistoryCopyRow {
             row: Row {
-                cells: shared,
+                cells: Arc::from(cells.as_slice()),
                 wrapped: row.wrapped,
             },
             underline_colors: (!underline.is_empty()).then(|| underline.into()),
@@ -558,7 +574,7 @@ mod underline_projection_tests {
     use super::*;
     use crate::{Color, TerminalCell};
 
-    fn history(force_scalar: bool) -> VecDeque<ScrollbackLine> {
+    fn history() -> VecDeque<ScrollbackLine> {
         ["ABCD", "EFGH"]
             .into_iter()
             .enumerate()
@@ -591,12 +607,13 @@ mod underline_projection_tests {
                         },
                     ]
                 };
-                // An empty annotation owner selects the existing scalar fallback
-                // without changing any projected text or decoration.
-                line.attach_decorations(
-                    colors,
-                    force_scalar.then(|| Arc::new(RowAnnotations::default())),
-                );
+                let mut annotations = RowAnnotations::default();
+                if index == 0 {
+                    annotations.set(2, Arc::from("C\u{301}"));
+                } else {
+                    annotations.set(1, Arc::from("F\u{301}"));
+                }
+                line.attach_decorations(colors, Some(Arc::new(annotations)));
                 line
             })
             .collect()
@@ -604,7 +621,7 @@ mod underline_projection_tests {
 
     #[test]
     fn projected_rows_remain_immutable_when_the_reader_reuses_its_cell_buffer() {
-        let raw = history(false);
+        let raw = history();
         let layout = HistoryLayout::new(&raw, 0..2, 3);
         let rows = layout.projected.as_ref().unwrap();
         let mut reader = HistoryReader::new(&raw, &layout);
@@ -628,12 +645,13 @@ mod underline_projection_tests {
     }
 
     #[test]
-    fn bulk_underline_projection_clips_and_joins_like_scalar_projection() {
-        let bulk = history(false);
-        let scalar = history(true);
-        let layout = HistoryLayout::new(&bulk, 0..2, 5);
-        let mut bulk_reader = HistoryReader::new(&bulk, &layout);
-        let mut scalar_reader = HistoryReader::new(&scalar, &layout);
+    fn bulk_projection_clips_and_joins_like_scalar_projection() {
+        let raw = history();
+        let layout = HistoryLayout::new(&raw, 0..2, 5);
+        let mut bulk_reader = HistoryReader::new(&raw, &layout);
+        let mut scalar_reader = HistoryReader::new(&raw, &layout);
+        // With no wide cells, both paths preserve the same physical columns.
+        scalar_reader.single_column = true;
         for (anchor, cells) in [
             (HistoryAnchor { row: 0, column: 2 }, 5),
             (HistoryAnchor { row: 1, column: 1 }, 3),

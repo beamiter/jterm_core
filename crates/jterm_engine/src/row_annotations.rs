@@ -57,6 +57,13 @@ impl RowAnnotations {
         }
     }
 
+    pub(crate) fn texts(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
+        self.cells.iter().filter_map(|cell| match &cell.value {
+            Value::Text(text) => Some((usize::from(cell.column), text.as_ref())),
+            Value::Image(_) => None,
+        })
+    }
+
     pub(crate) fn image_at(&self, column: usize) -> Option<&ImageAnnotation> {
         match self.get(column)? {
             Value::Image(row) => Some(row),
@@ -150,10 +157,35 @@ impl RowAnnotations {
     }
 
     pub(crate) fn text_bytes_in(&self, columns: Range<usize>) -> usize {
-        self.cells[self.position(columns.start)..self.position(columns.end)]
+        self.in_columns(columns)
             .iter()
             .map(|cell| cell.value.text_bytes())
             .sum()
+    }
+
+    fn in_columns(&self, columns: Range<usize>) -> &[Annotation] {
+        &self.cells[self.position(columns.start)..self.position(columns.end)]
+    }
+
+    /// Append metadata for a consecutive run of physical cells in a projected row.
+    pub(crate) fn append_columns_from(
+        &mut self,
+        source: &Self,
+        columns: Range<usize>,
+        target_start: usize,
+    ) {
+        debug_assert!(self.end() <= target_start);
+        let start = columns.start;
+        let text_bytes = &mut self.text_bytes;
+        self.cells
+            .extend(source.in_columns(columns).iter().map(|cell| {
+                let offset = usize::from(cell.column) - start;
+                *text_bytes += cell.value.text_bytes();
+                Annotation {
+                    column: (target_start + offset) as u16,
+                    value: cell.value.clone(),
+                }
+            }));
     }
 
     /// Copy text into an already-cleared, preflighted target span. Raster
@@ -166,20 +198,18 @@ impl RowAnnotations {
     ) {
         let target = self.position(target_start);
         let text_bytes = &mut self.text_bytes;
-        let copied = source.cells
-            [source.position(source_columns.start)..source.position(source_columns.end)]
-            .iter()
-            .filter_map(|cell| {
-                let Value::Text(text) = &cell.value else {
-                    return None;
-                };
-                let offset = usize::from(cell.column) - source_columns.start;
-                *text_bytes += text.len();
-                Some(Annotation {
-                    column: (target_start + offset) as u16,
-                    value: Value::Text(Arc::clone(text)),
-                })
-            });
+        let source_start = source_columns.start;
+        let copied = source.in_columns(source_columns).iter().filter_map(|cell| {
+            let Value::Text(text) = &cell.value else {
+                return None;
+            };
+            let offset = usize::from(cell.column) - source_start;
+            *text_bytes += text.len();
+            Some(Annotation {
+                column: (target_start + offset) as u16,
+                value: Value::Text(Arc::clone(text)),
+            })
+        });
         drop(self.cells.splice(target..target, copied));
         debug_assert!(self.text_bytes <= MAX_ROW_CLUSTER_BYTES);
     }

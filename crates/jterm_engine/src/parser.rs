@@ -659,13 +659,21 @@ impl Parser {
                             if let Some(capture) = self.capture.as_mut() {
                                 capture.escape = true;
                             }
-                            // A present two-byte string introducer has no
+                            // A present two-byte introducer has no
                             // intermediate public event. Enter its active state
                             // directly instead of moving an empty Escape state
                             // through another reducer iteration. Split prefixes
                             // retain the ordinary Escape path below.
                             let kind = if self.bounded {
                                 match input.get(at) {
+                                    Some(b'[') => {
+                                        at += 1;
+                                        self.state = State::Csi {
+                                            params: Vec::new(),
+                                            intermediates: Vec::new(),
+                                        };
+                                        continue;
+                                    }
                                     Some(b']') => Some(StringKind::Osc),
                                     Some(b'P') => Some(StringKind::Dcs),
                                     Some(b'X') => Some(StringKind::Sos),
@@ -1337,8 +1345,21 @@ impl Parser {
                             }
                             continue;
                         }
-                        0..=31 => {}
+                        0..=31 => {
+                            if byte == 7 && self.bounded {
+                                self.state = State::Csi {
+                                    params,
+                                    intermediates,
+                                };
+                                emit_open!(Event::Control(byte));
+                            }
+                        }
                         _ => {
+                            if self.bounded {
+                                // End the incomplete CSI and let ground handle UTF-8.
+                                at -= 1;
+                                abandon!(Some(Event::Boundary));
+                            }
                             self.state = State::Csi {
                                 params,
                                 intermediates,

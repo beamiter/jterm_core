@@ -284,6 +284,25 @@ fn window_updates_share_bounded_title_state_and_keep_bell_out_of_osc() {
 }
 
 #[test]
+fn csi_bell_and_utf8_recovery_survive_every_feed_split() {
+    let bytes = "XY\x1b[2;\x073H!\x1b[9;界\x1b[6n".as_bytes();
+    for cut in 0..=bytes.len() {
+        let mut terminal = Terminal::new(4, 10).unwrap();
+        terminal.enable_window_updates();
+        let mut replies = terminal.feed(&bytes[..cut]).unwrap();
+        let bell = terminal.take_window_updates().bell;
+        replies.extend(terminal.feed(&bytes[cut..]).unwrap());
+        assert_ne!(bell, terminal.take_window_updates().bell, "cut {cut}");
+        assert_eq!(replies, b"\x1b[2;6R", "cut {cut}");
+        assert_eq!(
+            terminal.visible_text().lines().nth(1).unwrap().trim_end(),
+            "  !界"
+        );
+        assert_eq!(terminal.unsupported_count(), 0, "cut {cut}");
+    }
+}
+
+#[test]
 fn focus_and_pointer_encoding_follows_negotiated_modes() {
     let mut terminal = Terminal::new(4, 10).unwrap();
     assert_eq!(terminal.encode_focus(true), None);
@@ -1923,6 +1942,34 @@ fn history_search_text_matches_selection_at_every_archive_boundary() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn archive_text_keeps_clusters_on_blanks_omitted_by_both_codecs() {
+    for (styled, start) in [(false, "a"), (true, "\x1b[31ma\x1b[0m")] {
+        let mut terminal = Terminal::new(2, 8).unwrap();
+        terminal.enable_grapheme_clusters();
+        terminal
+            .feed(format!("{start}\x1b[6G \u{301}\r\nnext\r\n").as_bytes())
+            .unwrap();
+        let archived = &terminal.history[0];
+        assert_eq!(
+            matches!(
+                archived.content(),
+                crate::grid::ScrollbackContent::Encoded(_)
+            ),
+            styled
+        );
+        let mut visited = 0;
+        archived.visit_search_cells(|_, _| visited += 1);
+        assert_eq!(visited, 1);
+        assert_eq!(terminal.history_page(0, 1).unwrap().text, "a     \u{301}");
+        let (_, search) = terminal.history_search_text(0..1, false, 16).unwrap();
+        assert_eq!(search, "a     \u{301}");
+        let mut export = Vec::new();
+        terminal.write_retained_text(&mut export).unwrap();
+        assert_eq!(String::from_utf8(export).unwrap(), "a     \u{301}\nnext\n");
     }
 }
 

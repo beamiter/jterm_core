@@ -179,6 +179,39 @@ fn csi_standard_syntax_and_xterm_extensions() {
     );
 }
 #[test]
+fn bounded_csi_executes_bel_without_losing_its_parameters() {
+    check(
+        b"\x1b[\x07?2\x075l\x1b[2 \x07qX",
+        vec![
+            Token::Control(7),
+            Token::Control(7),
+            csi(b"25", &[25], Some(b'?'), b"", b'l'),
+            Token::Control(7),
+            csi(b"2", &[2], None, b" ", b'q'),
+            Token::Print('X'),
+        ],
+        128,
+        0,
+        0,
+    );
+}
+#[test]
+fn bounded_csi_returns_invalid_non_ascii_to_ground() {
+    check(
+        b"\x1b[12;\xe7\x95\x8cZ\x1b[3;\xffX\x1b[6n",
+        vec![
+            Token::Print('界'),
+            Token::Print('Z'),
+            Token::Print('\u{fffd}'),
+            Token::Print('X'),
+            csi(b"6", &[6], None, b"", b'n'),
+        ],
+        128,
+        0,
+        0,
+    );
+}
+#[test]
 fn empty_fields_and_colon_syntax_preserve_raw_bytes() {
     let input = b"\x1b[;5H\x1b[38:2::1:2:3m\x1b[;;g\x1b[12;999999P";
     for (profile, cup, sgr, tbc) in [
