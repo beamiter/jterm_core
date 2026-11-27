@@ -44,19 +44,40 @@ fn format_streamed_archive_row<'a>(
     let mut written_space_end = 0;
     let gap = line.synthetic_margin_gap();
     let mut annotations = annotations.peekable();
-    line.visit_search_cells(|column, cell| {
-        physical_end = column + 1;
-        let cluster = annotations.next_if(|&(at, _)| at == column);
-        if cell.flags.wide_continuation() || gap == Some(column) {
-            return;
-        }
-        if let Some((_, cluster)) = cluster {
-            text.push_str(cluster);
+    line.visit_text_runs(|run| {
+        let columns = run.column..run.column + run.count;
+        physical_end = columns.end;
+        if annotations
+            .peek()
+            .is_none_or(|&(column, _)| column >= columns.end)
+        {
+            let count =
+                run.count - usize::from(gap.is_some_and(|column| columns.contains(&column)));
+            if !run.wide_continuation && count > 0 {
+                if count == 1 {
+                    text.push(run.character);
+                } else {
+                    text.extend(std::iter::repeat_n(run.character, count));
+                }
+                if run.printed_space {
+                    written_space_end = text.len();
+                }
+            }
         } else {
-            text.push(cell.character);
-        }
-        if cell.flags.printed_space() {
-            written_space_end = text.len();
+            for column in columns {
+                let cluster = annotations.next_if(|&(at, _)| at == column);
+                if run.wide_continuation || gap == Some(column) {
+                    continue;
+                }
+                if let Some((_, cluster)) = cluster {
+                    text.push_str(cluster);
+                } else {
+                    text.push(run.character);
+                }
+                if run.printed_space {
+                    written_space_end = text.len();
+                }
+            }
         }
     });
     let content_columns = line.columns() - usize::from(gap.is_some());

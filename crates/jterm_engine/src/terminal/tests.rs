@@ -2156,6 +2156,25 @@ fn archive_text_keeps_clusters_on_blanks_omitted_by_both_codecs() {
 }
 
 #[test]
+fn streamed_archive_runs_keep_combining_marks_and_written_spaces() {
+    let mut terminal = Terminal::new(2, 8).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal.track_printed_spaces();
+    terminal
+        .feed("\x1b[31meee\u{301}e  \x1b[m\r\nnext\r\nlive".as_bytes())
+        .unwrap();
+    let archived = "eee\u{301}e  ";
+    assert_eq!(terminal.history_page(0, 1).unwrap().text, archived);
+    let (_, search) = terminal
+        .history_search_text(0..1, false, archived.len())
+        .unwrap();
+    assert_eq!(search, archived);
+    let mut output = Vec::new();
+    terminal.write_retained_text(&mut output).unwrap();
+    assert_eq!(output, format!("{archived}\nnext\nlive").as_bytes());
+}
+
+#[test]
 fn compact_history_exports_trailing_written_spaces() {
     let mut terminal = Terminal::new(2, 8).unwrap();
     terminal.track_printed_spaces();

@@ -1995,6 +1995,14 @@ pub enum ScrollbackContent<'a> {
     Encoded(&'a [u8]),
 }
 
+pub(crate) struct ArchiveTextRun {
+    pub column: usize,
+    pub count: usize,
+    pub character: char,
+    pub wide_continuation: bool,
+    pub printed_space: bool,
+}
+
 /// A row's text or cells before matching. Plain history has identity columns.
 /// Encoded history can stream through the codec without building a cell vector.
 pub enum SearchLine<'a> {
@@ -2306,6 +2314,44 @@ impl ScrollbackLine {
         }
     }
 
+    /// Visit the stored text and its copy boundaries in physical column order.
+    pub(crate) fn visit_text_runs(&self, mut visit: impl FnMut(ArchiveTextRun)) {
+        let printed_spaces = self.has_printed_spaces();
+        match self.content() {
+            ScrollbackContent::Plain(text, _) => {
+                for (column, character) in text.chars().enumerate() {
+                    visit(ArchiveTextRun {
+                        column,
+                        count: 1,
+                        character,
+                        wide_continuation: false,
+                        printed_space: printed_spaces && character == ' ',
+                    });
+                }
+            }
+            ScrollbackContent::Encoded(data) => {
+                let cols = self.columns();
+                let mut column = 0;
+                let mut pos = 0;
+                while column < cols {
+                    let Some(character) = Self::decode_run_character(data, &mut pos) else {
+                        break;
+                    };
+                    let (extra, run) = Self::read_text_run_tail(data, &mut pos);
+                    let count = usize::from(run.max(1)).min(cols - column);
+                    visit(ArchiveTextRun {
+                        column,
+                        count,
+                        character,
+                        wide_continuation: extra & 2 != 0,
+                        printed_space: printed_spaces && extra & 8 != 0,
+                    });
+                    column += count;
+                }
+            }
+        }
+    }
+
     fn visit_encoded_cells(
         data: &[u8],
         cols: usize,
@@ -2479,12 +2525,27 @@ impl ScrollbackLine {
         1
     }
 
-    fn decode_color(data: &[u8], pos: &mut usize) -> Color {
-        if *pos >= data.len() {
-            return Color::Default;
+    #[inline]
+    fn color_payload_len(tag: u8) -> usize {
+        match tag {
+            17 => 1,
+            18 => 3,
+            _ => 0,
         }
-        let tag = data[*pos];
-        *pos += 1;
+    }
+
+    #[inline]
+    fn read_color_tag(data: &[u8], pos: &mut usize) -> (u8, usize) {
+        let Some(&tag) = data.get(*pos) else {
+            return (0, *pos);
+        };
+        let payload = *pos + 1;
+        *pos = payload + Self::color_payload_len(tag);
+        (tag, payload)
+    }
+
+    fn decode_color(data: &[u8], pos: &mut usize) -> Color {
+        let (tag, payload) = Self::read_color_tag(data, pos);
         match tag {
             0 => Color::Default,
             1 => Color::Black,
@@ -2504,15 +2565,13 @@ impl ScrollbackLine {
             15 => Color::BrightCyan,
             16 => Color::BrightWhite,
             17 => {
-                let i = data.get(*pos).copied().unwrap_or(0);
-                *pos += 1;
+                let i = data.get(payload).copied().unwrap_or(0);
                 Color::Indexed(i)
             }
             18 => {
-                let r = data.get(*pos).copied().unwrap_or(0);
-                let g = data.get(*pos + 1).copied().unwrap_or(0);
-                let b = data.get(*pos + 2).copied().unwrap_or(0);
-                *pos += 3;
+                let r = data.get(payload).copied().unwrap_or(0);
+                let g = data.get(payload + 1).copied().unwrap_or(0);
+                let b = data.get(payload + 2).copied().unwrap_or(0);
                 Color::Rgb(r, g, b)
             }
             _ => Color::Default,
@@ -2689,11 +2748,8 @@ impl ScrollbackLine {
         flags
     }
 
-    fn decode_run(
-        data: &[u8],
-        pos: &mut usize,
-        archive_flags: u8,
-    ) -> Option<(TerminalCell, usize)> {
+    #[inline]
+    fn decode_run_character(data: &[u8], pos: &mut usize) -> Option<char> {
         let ch_len = usize::from(*data.get(*pos)?);
         *pos += 1;
         let bytes = data.get(*pos..*pos + ch_len)?;
@@ -2713,31 +2769,61 @@ impl ScrollbackLine {
             _ => Self::decode_uncommon_run_char(bytes),
         };
         *pos += ch_len;
+        Some(ch)
+    }
 
+    #[inline]
+    fn read_run_tail(data: &[u8], pos: &mut usize) -> [u8; 5] {
+        let bytes = data.get(*pos..).unwrap_or_default();
+        *pos += 5;
+        if let Some(tail) = bytes.first_chunk::<5>() {
+            *tail
+        } else {
+            let mut tail = [0; 5];
+            tail[..bytes.len()].copy_from_slice(bytes);
+            tail
+        }
+    }
+
+    #[inline]
+    fn read_text_run_tail(data: &[u8], pos: &mut usize) -> (u8, u8) {
+        // Two single-byte palette codes and the regular five-byte tail fit
+        // in one checked read.
+        if let Some([foreground, background, _, extra, _, _, run]) =
+            data.get(*pos..).and_then(<[u8]>::first_chunk::<7>)
+        {
+            if Self::color_payload_len(*foreground) | Self::color_payload_len(*background) == 0 {
+                *pos += 7;
+                return (*extra, *run);
+            }
+        }
+        Self::read_color_tag(data, pos);
+        Self::read_color_tag(data, pos);
+        let [_, extra, _, _, run] = Self::read_run_tail(data, pos);
+        (extra, run)
+    }
+
+    fn decode_run(
+        data: &[u8],
+        pos: &mut usize,
+        archive_flags: u8,
+    ) -> Option<(TerminalCell, usize)> {
+        let character = Self::decode_run_character(data, pos)?;
         let foreground = Self::decode_color(data, pos);
         let background = Self::decode_color(data, pos);
-        let style = data.get(*pos).copied().unwrap_or(0);
-        *pos += 1;
-        let extra_flags = data.get(*pos).copied().unwrap_or(0);
-        *pos += 1;
+        let [style, extra_flags, link_low, link_high, run] = Self::read_run_tail(data, pos);
         let flags = Self::decode_cell_flags(style, extra_flags, archive_flags);
-        let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([
-            data.get(*pos).copied().unwrap_or(0),
-            data.get(*pos + 1).copied().unwrap_or(0),
-        ]));
-        *pos += 2;
-        let run = usize::from(data.get(*pos).copied().unwrap_or(1).max(1));
-        *pos += 1;
+        let hyperlink_id = HyperlinkId::from_raw(u16::from_le_bytes([link_low, link_high]));
 
         Some((
             TerminalCell {
-                character: ch,
+                character,
                 foreground,
                 background,
                 flags,
                 hyperlink_id,
             },
-            run,
+            usize::from(run.max(1)),
         ))
     }
 }
@@ -3266,6 +3352,57 @@ impl ScrollbackLine {
 #[cfg(test)]
 mod decoder_parity {
     use super::*;
+
+    #[test]
+    fn archive_text_runs_match_stored_cells_across_truncation_and_width_limits() {
+        let glyph = TerminalCell {
+            character: '𐐀',
+            foreground: Color::Rgb(1, 2, 3),
+            background: Color::Indexed(47),
+            hyperlink_id: HyperlinkId::from_raw(9),
+            ..TerminalCell::default()
+        };
+        let mut printed = glyph;
+        printed.character = ' ';
+        printed.flags.set_printed_space(true);
+        let mut continuation = glyph;
+        continuation.character = ' ';
+        continuation.flags.set_wide_continuation(true);
+        let mut cells = vec![glyph; 256];
+        cells.extend([continuation, printed, printed]);
+        let encoded = ScrollbackLine::compress(&cells, false);
+        let ScrollbackContent::Encoded(bytes) = encoded.content() else {
+            panic!("the mixed-rendition fixture needs encoded storage");
+        };
+        for length in 0..=bytes.len() {
+            let mut line = encoded.clone();
+            line.data = CompressedLineData::Encoded(bytes[..length].to_vec());
+            for width in [0, 1, 17, 255, 256, 257, 259, 260] {
+                line.cols = width;
+                let mut expected = Vec::new();
+                line.visit_search_cells(|column, cell| {
+                    expected.push((
+                        column,
+                        cell.character,
+                        cell.flags.wide_continuation(),
+                        cell.flags.printed_space(),
+                    ));
+                });
+                let mut actual = Vec::new();
+                line.visit_text_runs(|run| {
+                    actual.extend((run.column..run.column + run.count).map(|column| {
+                        (
+                            column,
+                            run.character,
+                            run.wide_continuation,
+                            run.printed_space,
+                        )
+                    }));
+                });
+                assert_eq!(actual, expected, "length {length}, width {width}");
+            }
+        }
+    }
 
     #[test]
     fn packed_archive_flags_match_scalar_reference_for_all_bytes() {
