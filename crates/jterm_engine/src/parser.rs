@@ -1476,17 +1476,36 @@ pub fn parse_csi_params(bytes: &[u8]) -> (Vec<u16>, Vec<bool>) {
     parse_profiled_csi_params(bytes, ParserProfile::EmberV1)
 }
 
-fn parse_profiled_csi_params(bytes: &[u8], profile: ParserProfile) -> (Vec<u16>, Vec<bool>) {
+#[inline]
+fn short_csi_number(bytes: &[u8]) -> Option<u16> {
     match bytes {
-        [] => return (Vec::new(), Vec::new()),
-        [digit @ b'0'..=b'9'] => return (vec![u16::from(*digit - b'0')], vec![false]),
+        [digit @ b'0'..=b'9'] => Some(u16::from(*digit - b'0')),
         [tens @ b'0'..=b'9', ones @ b'0'..=b'9'] => {
-            return (
-                vec![u16::from(*tens - b'0') * 10 + u16::from(*ones - b'0')],
-                vec![false],
-            );
+            Some(u16::from(*tens - b'0') * 10 + u16::from(*ones - b'0'))
         }
-        _ => {}
+        _ => None,
+    }
+}
+
+fn parse_profiled_csi_params(bytes: &[u8], profile: ParserProfile) -> (Vec<u16>, Vec<bool>) {
+    if bytes.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    if let Some(number) = short_csi_number(bytes) {
+        return (vec![number], vec![false]);
+    }
+    let separator = match bytes {
+        [_, b';', _, ..] if bytes.len() <= 4 => Some(1),
+        [_, _, b';', _, ..] if bytes.len() <= 5 => Some(2),
+        _ => None,
+    };
+    if let Some(index) = separator {
+        if let (Some(left), Some(right)) = (
+            short_csi_number(&bytes[..index]),
+            short_csi_number(&bytes[index + 1..]),
+        ) {
+            return (vec![left, right], vec![false, false]);
+        }
     }
     // Long lists can otherwise grow both output buffers several times. Keep
     // the common short sequences single-pass.
