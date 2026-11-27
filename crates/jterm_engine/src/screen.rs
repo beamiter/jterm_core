@@ -591,6 +591,7 @@ impl CursorControls<'_> {
 pub struct ScreenState<Grid = TerminalGrid> {
     pub grid: Grid,
     pub alt_grid: Grid,
+    archive_scratch: Vec<u8>,
     pub use_alt_buffer: bool,
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -640,6 +641,7 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
         Self {
             grid,
             alt_grid,
+            archive_scratch: Vec::new(),
             use_alt_buffer: false,
             cursor_row: 0,
             cursor_col: 0,
@@ -934,6 +936,12 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
 }
 
 impl ScreenState {
+    /// Archive a Frost legacy row with its identity and blink bit.
+    pub fn archive_frost_legacy_row(&mut self, row: usize) -> ScrollbackLine {
+        self.grid
+            .archive_frost_legacy_row_with(row, Some(&mut self.archive_scratch))
+    }
+
     /// NEL's first stage. The host must notify cursor reposition immediately
     /// after this call, BEFORE running LineFeed. Pending wrap is deliberately
     /// retained until that second stage; no action can span protocol events.
@@ -1223,7 +1231,10 @@ impl ScreenState {
         let preserve_margin =
             self.scroll_region_top == 0 && self.scroll_region_bottom == old_rows - 1;
         let transferred = (0..transfer_top)
-            .map(|row| self.grid.archive_row(row, preserve_margin))
+            .map(|row| {
+                self.grid
+                    .archive_row(row, preserve_margin, &mut self.archive_scratch)
+            })
             .collect();
         self.grid.scroll_up_by(transfer_top, blank);
         self.cursor_row -= transfer_top;
@@ -1284,8 +1295,7 @@ impl ScreenState {
                         .all(TerminalCell::is_reflow_trimmable_blank)
                 });
             if transfer_top > 0 {
-                transferred
-                    .extend((0..transfer_top).map(|row| self.grid.archive_frost_legacy_row(row)));
+                transferred.extend((0..transfer_top).map(|row| self.archive_frost_legacy_row(row)));
                 self.grid.scroll_up_by(transfer_top, blank);
                 self.cursor_row -= transfer_top;
                 self.saved_cursor_row = self.saved_cursor_row.saturating_sub(transfer_top);
@@ -1437,8 +1447,10 @@ impl ScreenState {
         let removed = removed_rows
             .map(|row| {
                 let row_id = self.grid.row_id(row);
-                let captured =
-                    capture_outgoing.then(|| self.grid.archive_row(row, preserve_margin));
+                let captured = capture_outgoing.then(|| {
+                    self.grid
+                        .archive_row(row, preserve_margin, &mut self.archive_scratch)
+                });
                 RemovedRow {
                     original_row: row,
                     row_id,

@@ -706,9 +706,15 @@ impl TerminalGrid {
         }
     }
 
-    pub(crate) fn archive_row(&self, row: usize, allow_margin: bool) -> ScrollbackLine {
+    pub(crate) fn archive_row(
+        &self,
+        row: usize,
+        allow_margin: bool,
+        scratch: &mut Vec<u8>,
+    ) -> ScrollbackLine {
         let wrapped = self.row_wrapped[row];
-        let mut line = ScrollbackLine::compress(&self[row], wrapped);
+        let mut line =
+            ScrollbackLine::compress_with_style(&self[row], wrapped, false, Some(scratch));
         line.attach_decorations(
             self.underline_color_runs(row).collect(),
             self.row_annotations(row).cloned(),
@@ -722,7 +728,16 @@ impl TerminalGrid {
 
     /// Transfer a FrostLegacyV1 row with its original identity and blink bit.
     pub fn archive_frost_legacy_row(&self, row: usize) -> ScrollbackLine {
-        let mut line = ScrollbackLine::compress_preserving_blink(&self[row], self.row_wrapped[row]);
+        self.archive_frost_legacy_row_with(row, None)
+    }
+
+    pub(crate) fn archive_frost_legacy_row_with(
+        &self,
+        row: usize,
+        scratch: Option<&mut Vec<u8>>,
+    ) -> ScrollbackLine {
+        let mut line =
+            ScrollbackLine::compress_with_style(&self[row], self.row_wrapped[row], true, scratch);
         line.set_raw_row_id(self.row_id(row));
         line
     }
@@ -1946,11 +1961,12 @@ const ARCHIVE_PRINTED_SPACES: u8 = 1 << 1;
 const ARCHIVE_EXTENDED_RENDITION: u8 = 1 << 3;
 const ARCHIVE_CELL_OVERLINE: u8 = 1 << 5;
 const ARCHIVE_CELL_CONCEALED: u8 = 1 << 6;
+const ARCHIVE_SCRATCH_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug)]
 enum CompressedLineData {
     Plain(String, u16),
-    Encoded(Vec<u8>),
+    Encoded(Box<[u8]>),
     Decorated(Box<DecoratedLineData>),
 }
 
@@ -1973,7 +1989,7 @@ impl CompressedLineData {
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Plain(text, _) => text.capacity(),
-            Self::Encoded(bytes) => bytes.capacity(),
+            Self::Encoded(bytes) => bytes.len(),
             Self::Decorated(data) => {
                 size_of::<DecoratedLineData>()
                     + data.base.heap_bytes()
@@ -2031,13 +2047,13 @@ impl ScrollbackLine {
     }
 
     pub fn compress(cells: &[TerminalCell], is_wrapped: bool) -> Self {
-        Self::compress_with_style(cells, is_wrapped, false)
+        Self::compress_with_style(cells, is_wrapped, false, None)
     }
 
     /// Preserve blink for history profiles that already retain it. The legacy
     /// default codec drops blink while preserving all its other encoded flags.
     pub fn compress_preserving_blink(cells: &[TerminalCell], is_wrapped: bool) -> Self {
-        Self::compress_with_style(cells, is_wrapped, true)
+        Self::compress_with_style(cells, is_wrapped, true, None)
     }
 
     /// Archive an independent Frost row, preserving blink and assigning a fresh
@@ -2049,7 +2065,12 @@ impl ScrollbackLine {
         line
     }
 
-    fn compress_with_style(cells: &[TerminalCell], is_wrapped: bool, preserve_blink: bool) -> Self {
+    fn compress_with_style(
+        cells: &[TerminalCell],
+        is_wrapped: bool,
+        preserve_blink: bool,
+        scratch: Option<&mut Vec<u8>>,
+    ) -> Self {
         let needs_encoded_flags = |flags: StyleFlags| {
             !flags.is_default_style()
                 || flags.0
@@ -2129,8 +2150,21 @@ impl ScrollbackLine {
                     | (u8::from(plain_printed_spaces) * ARCHIVE_PRINTED_SPACES),
             )
         } else {
+            let bytes = if let Some(scratch) = scratch {
+                Self::encode_cells_into(active, preserve_blink, scratch);
+                if scratch.capacity() > ARCHIVE_SCRATCH_LIMIT {
+                    // Keep this allocation with the row and release the large scratch.
+                    std::mem::take(scratch).into_boxed_slice()
+                } else {
+                    let retained = Box::from(scratch.as_slice());
+                    scratch.clear();
+                    retained
+                }
+            } else {
+                Self::encode_cells(active, preserve_blink).into_boxed_slice()
+            };
             (
-                CompressedLineData::Encoded(Self::encode_cells(active, preserve_blink)),
+                CompressedLineData::Encoded(bytes),
                 (u8::from(row_flags.printed_space()) * ARCHIVE_PRINTED_SPACES)
                     | (u8::from(row_flags.0 & (OVERLINE_BIT | CONCEALED_BIT) != 0)
                         * ARCHIVE_EXTENDED_RENDITION),
@@ -2187,7 +2221,8 @@ impl ScrollbackLine {
             if let Some(annotations) = &annotations {
                 self.reflow_content_len = self.reflow_content_len.max(annotations.end() as u16);
             }
-            let base = std::mem::replace(&mut self.data, CompressedLineData::Encoded(Vec::new()));
+            let base =
+                std::mem::replace(&mut self.data, CompressedLineData::Encoded(Box::default()));
             self.data = CompressedLineData::Decorated(Box::new(DecoratedLineData {
                 base,
                 underline_colors: colors.into_boxed_slice(),
@@ -2622,7 +2657,14 @@ impl ScrollbackLine {
     }
 
     fn encode_cells(cells: &[TerminalCell], preserve_blink: bool) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(cells.len() * 3);
+        let mut buf = Vec::new();
+        Self::encode_cells_into(cells, preserve_blink, &mut buf);
+        buf
+    }
+
+    fn encode_cells_into(cells: &[TerminalCell], preserve_blink: bool, buf: &mut Vec<u8>) {
+        buf.clear();
+        buf.reserve_exact(cells.len() * 3);
         let mut i = 0;
         while i < cells.len() {
             let cell = &cells[i];
@@ -2678,7 +2720,6 @@ impl ScrollbackLine {
 
             i += run as usize;
         }
-        buf
     }
 
     fn decode_cells(data: &[u8], cols: usize, archive_flags: u8) -> Vec<TerminalCell> {
@@ -3049,7 +3090,7 @@ fn ascii_overwrite_preserves_each_profiles_margin_and_decoration_invalidation() 
         grid.overwrite_ascii(0, 2, b"AB", blank, blank, policy);
         grid.row_wrapped[0] = true;
         grid.record_wrap_margin(0, 5, true);
-        let archived = grid.archive_row(0, true);
+        let archived = grid.archive_row(0, true, &mut Vec::new());
         assert_eq!(archived.synthetic_margin_gap(), retained.then_some(5));
         assert_eq!(archived.row_annotations().is_some(), retained);
         assert_eq!(!archived.underline_color_runs().is_empty(), retained);
@@ -3104,7 +3145,7 @@ fn graphic_overwrite_repairs_both_partners_with_bce_and_preserves_archive_proven
             .set_protected(protects_continuation);
         assert_eq!(*grid.get(0, 3), expected_continuation);
         assert_eq!(*grid.get(0, 4), blank);
-        let archived = grid.archive_row(0, true);
+        let archived = grid.archive_row(0, true, &mut Vec::new());
         assert_eq!(archived.raw_row_id(), row_id);
         assert_eq!(archived.synthetic_margin_gap(), Some(6));
         let archived_clusters = archived.row_annotations().unwrap();
@@ -3240,9 +3281,9 @@ fn archived_underline_colors_keep_the_original_row_payload_and_size() {
         let mut grid = TerminalGrid::new(2, 6);
         grid[0][1].character = 'é';
         grid[0][1].flags.set_underline(style);
-        let original = grid.archive_row(0, false);
+        let original = grid.archive_row(0, false, &mut Vec::new());
         grid.set_underline_color(0, 1..3, Color::Rgb(1, 2, 3));
-        let decorated = grid.archive_row(0, false);
+        let decorated = grid.archive_row(0, false, &mut Vec::new());
         assert_eq!(
             format!("{:?}", original.content()),
             format!("{:?}", decorated.content())
@@ -3268,10 +3309,10 @@ fn archived_underline_colors_keep_the_original_row_payload_and_size() {
 fn archived_cluster_preserves_the_codec_and_counts_decorated_space_as_content() {
     let mut grid = TerminalGrid::new(1, 6);
     grid[0][1].character = 'a';
-    let original = grid.archive_row(0, false);
+    let original = grid.archive_row(0, false, &mut Vec::new());
     grid.set_cluster_text(0, 1, "a\u{301}").unwrap();
     grid.set_cluster_text(0, 5, " \u{300}").unwrap();
-    let decorated = grid.archive_row(0, false);
+    let decorated = grid.archive_row(0, false, &mut Vec::new());
     assert!(matches!(
         original.content(),
         ScrollbackContent::Plain(" a", 4)
@@ -3354,6 +3395,44 @@ mod decoder_parity {
     use super::*;
 
     #[test]
+    fn archived_bytes_leave_the_reusable_encoder_buffer() {
+        let mut grid = TerminalGrid::new(1, 120);
+        let mut scratch = Vec::new();
+        for (column, cell) in grid[0].iter_mut().enumerate() {
+            cell.character = char::from(b'a' + (column % 26) as u8);
+            cell.foreground = Color::Indexed(47);
+        }
+        let first = grid.archive_row(0, false, &mut scratch);
+        let before = grid[0].to_vec();
+        let ScrollbackContent::Encoded(bytes) = first.content() else {
+            panic!("indexed cells require encoded storage");
+        };
+        assert_eq!(
+            first.retained_bytes(),
+            size_of::<ScrollbackLine>() + bytes.len()
+        );
+        let capacity = scratch.capacity();
+        assert!((1..=ARCHIVE_SCRATCH_LIMIT).contains(&capacity));
+        assert!(scratch.is_empty());
+
+        grid[0][0].character = 'Z';
+        let second = grid.archive_row(0, false, &mut scratch);
+        assert_eq!(first.decompress(), before);
+        assert_eq!(second.decompress(), grid[0]);
+        assert_eq!(scratch.capacity(), capacity);
+
+        let mut wide = TerminalGrid::new(1, 1024);
+        for (column, cell) in wide[0].iter_mut().enumerate() {
+            cell.character = char::from(b'a' + (column % 26) as u8);
+            cell.foreground = Color::Rgb(1, 2, 3);
+            cell.background = Color::Rgb(4, 5, 6);
+        }
+        let large = wide.archive_row(0, false, &mut scratch);
+        assert_eq!(large.decompress(), wide[0]);
+        assert_eq!(scratch.capacity(), 0);
+    }
+
+    #[test]
     fn archive_text_runs_match_stored_cells_across_truncation_and_width_limits() {
         let glyph = TerminalCell {
             character: '𐐀',
@@ -3376,7 +3455,7 @@ mod decoder_parity {
         };
         for length in 0..=bytes.len() {
             let mut line = encoded.clone();
-            line.data = CompressedLineData::Encoded(bytes[..length].to_vec());
+            line.data = CompressedLineData::Encoded(bytes[..length].into());
             for width in [0, 1, 17, 255, 256, 257, 259, 260] {
                 line.cols = width;
                 let mut expected = Vec::new();

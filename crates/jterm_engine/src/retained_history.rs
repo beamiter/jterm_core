@@ -397,14 +397,24 @@ mod tests {
             character: 'a',
             ..blank
         };
-        let large = TerminalCell {
-            character: '界',
-            background: crate::Color::Red,
+        let oldest = TerminalCell {
+            character: 'b',
             ..blank
         };
+        // The middle row needs an encoded payload larger than the byte
+        // limit. Alternating backgrounds keep its cell runs distinct.
+        let large = std::array::from_fn(|column| TerminalCell {
+            character: '界',
+            background: if column % 2 == 0 {
+                crate::Color::Red
+            } else {
+                crate::Color::Green
+            },
+            ..blank
+        });
         let row_bytes = ScrollbackLine::compress_frost_legacy(&[small; 80], false).retained_bytes();
         let mut history = RetainedHistory::with_byte_limit(row_bytes * 2);
-        for row in [[small; 80], [large; 80], [small; 80]] {
+        for row in [[oldest; 80], large, [small; 80]] {
             history.push_back(ScrollbackLine::compress_frost_legacy(&row, false));
         }
         assert!(history[1].retained_bytes() > row_bytes * 2);

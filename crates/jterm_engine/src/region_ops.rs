@@ -123,7 +123,7 @@ impl RegionOperation {
             && top == 0
             && (!screen.use_alt_buffer || allow_alt_scrollback);
         let frost_capture = (self.profile == RegionOpsProfile::FrostLegacy && transfer_outgoing)
-            .then(|| screen.grid.archive_frost_legacy_row(top));
+            .then(|| screen.archive_frost_legacy_row(top));
         let mutation = screen.scroll_region_one(
             self.direction,
             top,
