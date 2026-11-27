@@ -1477,8 +1477,16 @@ pub fn parse_csi_params(bytes: &[u8]) -> (Vec<u16>, Vec<bool>) {
 }
 
 fn parse_profiled_csi_params(bytes: &[u8], profile: ParserProfile) -> (Vec<u16>, Vec<bool>) {
-    if bytes.is_empty() {
-        return (Vec::new(), Vec::new());
+    match bytes {
+        [] => return (Vec::new(), Vec::new()),
+        [digit @ b'0'..=b'9'] => return (vec![u16::from(*digit - b'0')], vec![false]),
+        [tens @ b'0'..=b'9', ones @ b'0'..=b'9'] => {
+            return (
+                vec![u16::from(*tens - b'0') * 10 + u16::from(*ones - b'0')],
+                vec![false],
+            );
+        }
+        _ => {}
     }
     // Long lists can otherwise grow both output buffers several times. Keep
     // the common short sequences single-pass.
