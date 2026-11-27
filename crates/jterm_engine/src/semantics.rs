@@ -454,11 +454,12 @@ pub fn dispatch_frost_legacy_csi(
             None
         }
         (b'm', None, b"", _) => {
-            if let Some(color) = frost_legacy_sgr(
+            if let Some(color) = frost_sgr_with_rendition(
                 raw_params,
                 &mut screen.current_fg,
                 &mut screen.current_bg,
                 &mut screen.current_flags,
+                screen.extended_rendition,
             ) {
                 effects.push(Effect::GlobalBackground(color));
             }
@@ -534,7 +535,8 @@ pub fn dispatch_local(
     protocol: &mut ProtocolState,
     event: &Event<'_>,
 ) -> Dispatch {
-    dispatch_local_with_rendition(screen, protocol, event, None, false)
+    let extended = screen.extended_rendition;
+    dispatch_local_with_rendition(screen, protocol, event, None, extended)
 }
 
 pub(crate) fn dispatch_hosted(
@@ -1505,6 +1507,16 @@ pub fn frost_legacy_sgr(
     background: &mut Color,
     flags: &mut StyleFlags,
 ) -> Option<Color> {
+    frost_sgr_with_rendition(raw_params, foreground, background, flags, false)
+}
+
+fn frost_sgr_with_rendition(
+    raw_params: &[u8],
+    foreground: &mut Color,
+    background: &mut Color,
+    flags: &mut StyleFlags,
+    extended: bool,
+) -> Option<Color> {
     let mut rendition = Rendition {
         foreground,
         background,
@@ -1526,7 +1538,7 @@ pub fn frost_legacy_sgr(
             rendition.underline(1);
             return None;
         }
-        return rendition.apply(param, false);
+        return rendition.apply(param, extended);
     }
     let groups = frost_sgr_groups(raw_params);
     let mut global_background = None;
@@ -1541,7 +1553,7 @@ pub fn frost_legacy_sgr(
             38 | 48 | 58 => {
                 frost_sgr_color(&groups, &mut i).and_then(|color| rendition.color(param, color))
             }
-            _ => rendition.apply(param, false),
+            _ => rendition.apply(param, extended),
         };
         if changed.is_some() {
             global_background = changed;

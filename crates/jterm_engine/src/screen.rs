@@ -610,6 +610,7 @@ pub struct ScreenState<Grid = TerminalGrid> {
     pub current_fg: Color,
     pub current_bg: Color,
     pub current_flags: StyleFlags,
+    pub(crate) extended_rendition: bool,
     pub current_hyperlink: HyperlinkId,
     pub scroll_region_top: usize,
     pub scroll_region_bottom: usize,
@@ -658,6 +659,7 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
             current_fg: Color::Default,
             current_bg: Color::Default,
             current_flags: StyleFlags::default(),
+            extended_rendition: false,
             current_hyperlink: HyperlinkId::NONE,
             scroll_region_top: 0,
             scroll_region_bottom: rows - 1,
@@ -669,6 +671,11 @@ impl<Grid: AsRef<TerminalGrid>> ScreenState<Grid> {
             saved_cursor_banks: CharsetBanks::default(),
             saved_primary_banks: CharsetBanks::default(),
         }
+    }
+
+    /// Admit conceal and overline when the native consumer can draw them.
+    pub fn enable_extended_rendition(&mut self) {
+        self.extended_rendition = true;
     }
 
     pub fn alternate_screen_controls(&mut self) -> AlternateScreenControls<'_, Grid> {

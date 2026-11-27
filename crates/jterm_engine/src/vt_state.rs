@@ -594,6 +594,43 @@ mod tests {
         frost_csi::{FrostCsiEffect, FrostCsiHost},
         RawRowId,
     };
+
+    #[test]
+    fn native_rendition_opt_in_preserves_attributes_across_scanner_boundaries() {
+        let input = b"\x1b[8;53mAB\x1bP$qm\x1b\\\x1b[28mC\x1b[55mD";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for enabled in [false, true] {
+                for split in 0..=input.len() {
+                    let mut host = Host::new(profile);
+                    if enabled {
+                        host.vt.screen.enable_extended_rendition();
+                    }
+                    feed(&mut host, &input[..split], None);
+                    feed(&mut host, &input[split..], None);
+                    let row = &host.vt.screen.grid[0];
+                    assert_eq!(
+                        row[..4].iter().map(|c| c.character).collect::<String>(),
+                        "ABCD"
+                    );
+                    for (index, cell) in row[..4].iter().enumerate() {
+                        assert_eq!(cell.flags.concealed(), enabled && index < 2);
+                        assert_eq!(cell.flags.overline(), enabled && index < 3);
+                    }
+                    let reply: &[u8] = match (profile, enabled) {
+                        (_, false) => b"\x1bP1$r0m\x1b\\",
+                        (NativeProfile::Ember, true) => b"\x1bP1$r8;53m\x1b\\",
+                        (NativeProfile::FrostLegacy, true) => b"\x1bP1$r0;8;53m\x1b\\",
+                    };
+                    assert_eq!(host.replies, reply, "{profile:?} at {split}");
+                }
+            }
+        }
+    }
+
     struct Host {
         vt: VtState,
         next: u64,
