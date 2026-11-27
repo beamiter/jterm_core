@@ -1574,7 +1574,8 @@ impl<T: SessionTransport, Output> SessionActor<T, Output> {
         self.resize_with_pixels(cols, rows, (0, 0))
     }
 
-    pub(crate) fn resize_with_pixels(
+    /// Apply the measured dimensions to the owned transport in one resize.
+    pub fn resize_with_pixels(
         &self,
         cols: usize,
         rows: usize,

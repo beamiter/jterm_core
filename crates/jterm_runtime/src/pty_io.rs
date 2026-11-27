@@ -85,7 +85,8 @@ pub fn resize_master(fd: BorrowedFd<'_>, cols: u16, rows: u16) -> io::Result<()>
     resize_master_with_pixels(fd, cols, rows, (0, 0))
 }
 
-pub(crate) fn resize_master_with_pixels(
+/// Install the grid size and measured text-area width and height in pixels.
+pub fn resize_master_with_pixels(
     fd: BorrowedFd<'_>,
     cols: u16,
     rows: u16,
