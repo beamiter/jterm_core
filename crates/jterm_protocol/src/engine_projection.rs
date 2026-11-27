@@ -304,33 +304,38 @@ pub fn update(
 ) -> Result<Update, String> {
     validate_grid(frame)?;
     let colors = frame.paint_colors();
-    if let Some(delta) = previous
+    if let Some((base, changed)) = previous
         .filter(|previous| same_cell_colors(previous.paint_colors(), colors))
-        .and_then(|previous| previous.delta_to(frame).ok())
+        .and_then(|base| {
+            base.changed_row_indices(frame)
+                .ok()
+                .map(|changed| (base, changed))
+        })
     {
         // If the complete grid changed, the snapshot is no larger and retains
         // its independence from previously accepted state.
-        if delta.rows.len() < frame.rows().len() {
+        if changed.len() < frame.rows().len() {
+            let next = frame.stamp();
+            let cursor = frame.cursor();
             return Ok(Update::Delta {
                 frame: WireDelta {
                     version: protocol::VERSION,
                     session: id.to_owned(),
                     epoch,
-                    base_revision: revision(delta.base.revision)?,
-                    revision: revision(delta.next.revision)?,
-                    layout: u32::try_from(delta.next.layout).map_err(|_| "layout exhausted")?,
-                    cursor_row: delta.cursor.row,
-                    cursor_col: delta.cursor.col,
-                    cursor_visible: delta.cursor.visible,
-                    cursor_shape: cursor_shape(delta.cursor.shape),
+                    base_revision: revision(base.stamp().revision)?,
+                    revision: revision(next.revision)?,
+                    layout: u32::try_from(next.layout).map_err(|_| "layout exhausted")?,
+                    cursor_row: cursor.row,
+                    cursor_col: cursor.col,
+                    cursor_visible: cursor.visible,
+                    cursor_shape: cursor_shape(cursor.shape),
                     cursor_color: colors.map(|colors| colors.effective_cursor().into()),
-                    pending_wrap: delta.cursor.pending_wrap,
-                    rows: delta
-                        .rows
+                    pending_wrap: cursor.pending_wrap,
+                    rows: changed
                         .into_iter()
-                        .map(|(index, row)| ChangedRow {
+                        .map(|index| ChangedRow {
                             index,
-                            cells: wire_row(&row, frame.cols(), colors),
+                            cells: wire_row(&frame.rows()[index], frame.cols(), colors),
                         })
                         .collect(),
                 },

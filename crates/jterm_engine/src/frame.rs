@@ -320,6 +320,17 @@ impl Delta {
             annotations: Vec::new(),
         }
     }
+
+    #[cold]
+    fn reserve_following_rows(&mut self, remaining: usize) {
+        let prefix = self.rows.len();
+        self.rows.reserve_exact(remaining);
+        // The same prefix provides a density estimate for row metadata.
+        self.underline_colors
+            .reserve_exact(remaining * self.underline_colors.len() / prefix);
+        self.annotations
+            .reserve_exact(remaining * self.annotations.len() / prefix);
+    }
 }
 impl CellFrame {
     pub fn new(
@@ -585,7 +596,16 @@ impl CellFrame {
         if self.shares_paint_rows(next) {
             return Ok(delta);
         }
+        const DENSE_ROW_PREFIX: usize = 8;
         for (index, after) in self.changed_rows(next) {
+            if delta.rows.len() == DENSE_ROW_PREFIX
+                && next.rows.len() <= 128
+                && index == delta.rows[0].0 + DENSE_ROW_PREFIX
+            {
+                // A contiguous run often continues through a redraw or a scroll.
+                // Bound speculative allocation to the hosted terminal's grid.
+                delta.reserve_following_rows(next.rows.len() - index);
+            }
             delta.rows.push((index, after.clone()));
             if let Some(runs) = next.underline_row(index) {
                 delta.underline_colors.push((index, runs.clone()));
@@ -1035,4 +1055,38 @@ fn delta_reuses_links_outside_edited_rows_and_releases_the_last_reference() {
     let id = before.rows()[0].cells[0].hyperlink_id;
     assert_eq!(applied, erased);
     assert_eq!(applied.hyperlink_target(id), None);
+}
+
+#[cfg(test)]
+#[test]
+fn dense_delta_prefix_keeps_later_gaps_and_mixed_row_metadata() {
+    let mut terminal = crate::terminal::Terminal::new(24, 16).unwrap();
+    terminal.enable_underline_colors();
+    terminal.enable_grapheme_clusters();
+    terminal.feed(b"\x1b[16;1Hkeep").unwrap();
+    let before = terminal.frame().unwrap();
+    for row in 1..=9 {
+        terminal.feed(format!("\x1b[{row};1H").as_bytes()).unwrap();
+        let text = if row % 2 == 0 {
+            "\x1b[4;58;5;33mX\u{301}\x1b[m"
+        } else {
+            "Y"
+        };
+        terminal.feed(text.as_bytes()).unwrap();
+    }
+    terminal.feed(b"\x1b[24;1HZ").unwrap();
+    let after = terminal.frame().unwrap();
+    let delta = before.delta_to(&after).unwrap();
+    assert_eq!(
+        delta.rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 23]
+    );
+    assert_eq!(delta.underline_colors.len(), 4);
+    assert_eq!(delta.annotations.len(), 4);
+    let limits = Limits {
+        max_rows: 24,
+        max_cols: 16,
+        max_cells: 384,
+    };
+    assert_eq!(before.apply(&delta, limits).unwrap(), after);
 }
