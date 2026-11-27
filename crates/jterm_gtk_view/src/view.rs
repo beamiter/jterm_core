@@ -101,8 +101,25 @@ pub(crate) struct TerminalView {
     background_style: gtk4::CssProvider,
     background: Cell<Option<gdk::RGBA>>,
     line_height_scale: Cell<f64>,
+    font_geometry: RefCell<Option<CachedFontGeometry>>,
     appearance_changed: Cell<bool>,
     palette_revision: Cell<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct FontGeometry {
+    cell_width: i32,
+    cell_height: i32,
+    #[cfg(target_os = "linux")]
+    space_advance: f64,
+    #[cfg(target_os = "linux")]
+    text_height: i32,
+}
+
+struct CachedFontGeometry {
+    context: pango::Context,
+    serial: u32,
+    dimensions: FontGeometry,
 }
 
 struct Presentation {
@@ -410,6 +427,7 @@ impl TerminalView {
             background_style,
             background: Cell::new(None),
             line_height_scale: Cell::new(1.0),
+            font_geometry: RefCell::new(None),
             appearance_changed: Cell::new(false),
             palette_revision: Cell::new(0),
         };
@@ -449,6 +467,9 @@ impl TerminalView {
     }
 
     pub(crate) fn set_theme(&self, theme: Theme) {
+        if self.theme.borrow().font != theme.font {
+            self.font_geometry.take();
+        }
         self.theme.replace(theme);
         self.appearance_changed.set(true);
         self.update_line_spacing();
@@ -456,6 +477,7 @@ impl TerminalView {
 
     pub(crate) fn set_font(&self, font: &pango::FontDescription) {
         self.theme.borrow_mut().font = font.clone();
+        self.font_geometry.take();
         self.appearance_changed.set(true);
         self.update_line_spacing();
     }
@@ -475,19 +497,102 @@ impl TerminalView {
 
     pub(crate) fn dimensions(&self, width: i32, height: i32) -> (usize, usize) {
         let (cell_width, cell_height, _) = self.cell_geometry();
-        let rows = ((height - MARGIN * 2) / cell_height).clamp(1, 128);
-        let columns = ((width - MARGIN * 2) / cell_width).clamp(1, 256);
-        (rows as usize, columns as usize)
+        fitted_grid(width, height, f64::from(cell_width), cell_height)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn measured_allocation(
+        &self,
+        width: i32,
+        height: i32,
+    ) -> ((usize, usize), Option<(u16, u16)>) {
+        let font = self.font_geometry();
+        let cell_height = self.scaled_cell_height(font.cell_height);
+        let text_height = font.text_height.saturating_add(cell_height - font.cell_height);
+        let (rows, columns) = fitted_grid(
+            width,
+            height,
+            font.space_advance.max(f64::from(font.cell_width)),
+            text_height.max(cell_height),
+        );
+        let pixels = self.physical_viewport_pixels(
+            columns as f64 * font.space_advance,
+            rows as f64 * f64::from(text_height),
+        );
+        ((rows, columns), pixels)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn physical_viewport_pixels(&self, width: f64, height: f64) -> Option<(u16, u16)> {
+        // GDK also exposes an integer scale factor for buffers. Use the
+        // surface's actual scale for fractional-scale output.
+        let scale = self.widget.native()?.surface()?.scale();
+        let physical = |points: f64| {
+            let pixels = (points * scale).round();
+            (1.0..=f64::from(u16::MAX))
+                .contains(&pixels)
+                .then_some(pixels as u16)
+        };
+        Some((physical(width)?, physical(height)?))
     }
 
     fn cell_geometry(&self) -> (i32, i32, i32) {
+        let font = self.font_geometry();
+        let cell_height = self.scaled_cell_height(font.cell_height);
+        (font.cell_width, cell_height, cell_height - font.cell_height)
+    }
+
+    fn scaled_cell_height(&self, height: i32) -> i32 {
+        (f64::from(height) * self.line_height_scale.get()).round() as i32
+    }
+
+    fn font_geometry(&self) -> FontGeometry {
         let context = self.widget.pango_context();
-        let metrics = context.metrics(Some(&self.theme.borrow().font), None);
-        let cell_width =
-            ((metrics.approximate_digit_width() + pango::SCALE - 1) / pango::SCALE).max(1);
-        let unscaled = font_row_height(metrics.height());
-        let cell_height = (f64::from(unscaled) * self.line_height_scale.get()).round() as i32;
-        (cell_width, cell_height, cell_height - unscaled)
+        let serial = context.serial();
+        if let Some(cached) = self
+            .font_geometry
+            .borrow()
+            .as_ref()
+            .filter(|cached| cached.context == context && cached.serial == serial)
+        {
+            return cached.dimensions;
+        }
+        let theme = self.theme.borrow();
+        let metrics = context.metrics(Some(&theme.font), None);
+        let cell_width = font_row_height(metrics.approximate_digit_width());
+        let cell_height = font_row_height(metrics.height());
+        // GTK draws blank cells with the configured font's space advance
+        // and rounds each line's height. The integer grid estimates can
+        // differ from those measurements, especially for fractional advances.
+        #[cfg(target_os = "linux")]
+        let (space_advance, text_height) = {
+            let layout = pango::Layout::new(&context);
+            layout.set_font_description(Some(&theme.font));
+            layout.set_text(" ");
+            let (advance, height) = layout.size();
+            (
+                if advance > 0 {
+                    f64::from(advance) / f64::from(pango::SCALE)
+                } else {
+                    f64::from(cell_width)
+                },
+                (f64::from(height) / f64::from(pango::SCALE)).round().max(1.0) as i32,
+            )
+        };
+        let dimensions = FontGeometry {
+            cell_width,
+            cell_height,
+            #[cfg(target_os = "linux")]
+            space_advance,
+            #[cfg(target_os = "linux")]
+            text_height,
+        };
+        self.font_geometry.replace(Some(CachedFontGeometry {
+            serial: context.serial(),
+            context,
+            dimensions,
+        }));
+        dimensions
     }
 
     pub(crate) fn cell_metrics(&self) -> (i32, i32, i32, i32) {
@@ -2236,6 +2341,13 @@ fn push_painted_character(
     } else {
         run.push(character);
     }
+}
+
+fn fitted_grid(width: i32, height: i32, cell_width: f64, cell_height: i32) -> (usize, usize) {
+    let rows = (height.saturating_sub(MARGIN * 2) / cell_height).clamp(1, 128) as usize;
+    let columns =
+        (f64::from(width.saturating_sub(MARGIN * 2)) / cell_width).clamp(1.0, 256.0) as usize;
+    (rows, columns)
 }
 
 fn font_row_height(pango_height: i32) -> i32 {

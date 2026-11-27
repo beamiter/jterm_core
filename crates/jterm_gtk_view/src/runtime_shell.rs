@@ -600,7 +600,12 @@ impl RuntimeShell {
         Ok(accepted)
     }
 
-    pub(crate) fn resize(&self, rows: usize, columns: usize) -> Result<(), String> {
+    pub(crate) fn resize(
+        &self,
+        rows: usize,
+        columns: usize,
+        pixels: Option<(u16, u16)>,
+    ) -> Result<(), String> {
         let mut state = self.lock()?;
         if !state
             .attachment
@@ -609,10 +614,22 @@ impl RuntimeShell {
         {
             return Err("terminal view is detached".into());
         }
-        state.session.resize(rows, columns)?;
-        state.view_revision = state.view_revision.wrapping_add(1);
-        state.captured_viewport = None;
-        self.observers.request_refresh();
+        let pixels = pixels.map(|(width, height)| {
+            jterm_engine::native_window_ops::NativeWindowPixels::Viewport {
+                width: u32::from(width),
+                height: u32::from(height),
+            }
+        });
+        let grid_changed = pixels.is_none()
+            || state.session.terminal().window_geometry().is_none_or(|old| {
+                (old.rows, old.columns) != (rows, columns)
+            });
+        state.session.resize_with_window_pixels(rows, columns, pixels)?;
+        if grid_changed {
+            state.view_revision = state.view_revision.wrapping_add(1);
+            state.captured_viewport = None;
+            self.observers.request_refresh();
+        }
         if let Some(worker) = self.worker.get() {
             worker.unpark();
         }
@@ -886,6 +903,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn updating_pixels_keeps_the_current_grid_snapshot() {
+        let owner = RuntimeShell::spawn_pane_command(
+            &["/bin/sh".into(), "-c".into(), "read line".into()],
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        owner.resize(12, 40, Some((379, 204))).unwrap();
+        let revision = owner.lock().unwrap().view_revision;
+        owner.resize(12, 40, Some((758, 408))).unwrap();
+        let state = owner.lock().unwrap();
+        assert_eq!(state.view_revision, revision);
+        let geometry = state.session.terminal().window_geometry().unwrap();
+        assert_eq!((geometry.rows, geometry.columns), (12, 40));
+        assert_eq!(geometry.text_pixels(), (408, 758));
+        drop(state);
+        owner.resize(12, 41, Some((778, 408))).unwrap();
+        assert_ne!(owner.lock().unwrap().view_revision, revision);
+    }
+
+    #[test]
     fn two_detached_views_keep_real_actors_drain_replies_and_reject_stale_input() {
         use std::os::unix::fs::DirBuilderExt;
         let root = std::env::temp_dir().join(format!(
@@ -975,7 +1014,7 @@ exit 17"#;
             assert!(owner.input_for(ticket, b"stale".to_vec()).is_err());
             assert!(owner.input(|_| Ok(b"detached".to_vec())).is_err());
             assert!(owner.paste("detached").is_err());
-            assert!(owner.resize(10, 10).is_err());
+            assert!(owner.resize(10, 10, None).is_err());
         }
         std::fs::write(root.join("advance"), b"go").unwrap();
         for role in ["A", "B"] {

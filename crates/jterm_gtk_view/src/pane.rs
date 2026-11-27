@@ -398,7 +398,8 @@ impl<P: Pty> EmbeddedTerminal<P> {
         if self.pane.exited.get() {
             return Err("terminal session is closed".into());
         }
-        self.pane.resize_grid(usize::from(rows), usize::from(cols))
+        self.pane
+            .resize_grid(usize::from(rows), usize::from(cols), None)
     }
 
     pub fn enable_transcript_sources(&self) {
@@ -799,6 +800,7 @@ pub struct TerminalPane<P: Pty> {
     event_handler: OnceCell<OnEvent>,
     viewport: glib::WeakRef<gtk4::ScrolledWindow>,
     dimensions: Cell<(usize, usize)>,
+    window_pixels: Cell<Option<(u16, u16)>>,
     scrollback: gtk4::Adjustment,
     scroll_top: Cell<Option<ScrollTarget>>,
     history_rail: RefCell<HistoryRail>,
@@ -1019,6 +1021,7 @@ impl<P: Pty> TerminalPane<P> {
             event_handler: OnceCell::new(),
             viewport: scroll.downgrade(),
             dimensions: Cell::new((rows, columns)),
+            window_pixels: Cell::new(None),
             scrollback,
             scroll_top: Cell::new(None),
             history_rail: RefCell::default(),
@@ -1050,7 +1053,7 @@ impl<P: Pty> TerminalPane<P> {
             interactive_paint_frame: Cell::new(None),
         });
         if automatic_grid && session.pty().is_some() {
-            session.resize(rows, columns);
+            session.resize(rows, columns, None);
         }
         session.connect_input();
         let open_link = (links.attach_opener)(session.view.widget.upcast_ref());
@@ -1096,9 +1099,11 @@ impl<P: Pty> TerminalPane<P> {
                 && scroll.width() > 0
                 && scroll.height() > 0
             {
-                let (rows, columns) = session.view.dimensions(scroll.width(), scroll.height());
-                if session.dimensions.get() != (rows, columns) {
-                    session.resize(rows, columns);
+                let (grid, pixels) = session.allocated_grid(scroll.width(), scroll.height());
+                if session.dimensions.get() != grid
+                    || pixels.is_some_and(|size| session.window_pixels.get() != Some(size))
+                {
+                    session.resize(grid.0, grid.1, pixels);
                 }
             }
             session.paint();
@@ -1363,7 +1368,7 @@ impl<P: Pty> TerminalPane<P> {
                 && viewport.width() > 0
                 && viewport.height() > 0
                 && self.dimensions.get()
-                    == self.view.dimensions(viewport.width(), viewport.height())
+                    == self.allocated_grid(viewport.width(), viewport.height()).0
         })
     }
 
@@ -1703,23 +1708,42 @@ impl<P: Pty> TerminalPane<P> {
         revision
     }
 
-    fn resize(&self, rows: usize, columns: usize) {
-        if let Err(error) = self.resize_grid(rows, columns) {
+    fn allocated_grid(
+        &self,
+        width: i32,
+        height: i32,
+    ) -> ((usize, usize), Option<(u16, u16)>) {
+        match &self.backend {
+            Backend::Host { .. } => (self.view.dimensions(width, height), None),
+            #[cfg(target_os = "linux")]
+            Backend::Runtime(_) => self.view.measured_allocation(width, height),
+        }
+    }
+
+    fn resize(&self, rows: usize, columns: usize, pixels: Option<(u16, u16)>) {
+        if let Err(error) = self.resize_grid(rows, columns, pixels) {
             self.report(&format!("Cannot resize terminal: {error}"));
         }
     }
 
-    fn resize_grid(&self, rows: usize, columns: usize) -> Result<(), String> {
+    fn resize_grid(
+        &self,
+        rows: usize,
+        columns: usize,
+        pixels: Option<(u16, u16)>,
+    ) -> Result<(), String> {
         if !self.view_attached.get() {
             return Err("terminal view is detached".into());
         }
         match &self.backend {
             Backend::Host { terminal, .. } => terminal.resize(rows, columns),
             #[cfg(target_os = "linux")]
-            Backend::Runtime(owner) => owner.resize(rows, columns),
+            Backend::Runtime(owner) => owner.resize(rows, columns, pixels),
         }?;
-        self.dimensions.set((rows, columns));
-        self.dirty.set(true);
+        if self.dimensions.replace((rows, columns)) != (rows, columns) || pixels.is_none() {
+            self.dirty.set(true);
+        }
+        self.window_pixels.set(pixels);
         Ok(())
     }
 
