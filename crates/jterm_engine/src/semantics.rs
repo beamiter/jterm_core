@@ -1422,12 +1422,32 @@ fn handle_sgr(
     }
 }
 
+#[derive(Default)]
+struct FrostSgrGroup {
+    values: [u16; 6],
+    len: u8,
+}
+
+impl FrostSgrGroup {
+    fn push(&mut self, value: u16) {
+        // Frost reads at most six fields, including the optional color space.
+        if let Some(slot) = self.values.get_mut(usize::from(self.len)) {
+            *slot = value;
+            self.len += 1;
+        }
+    }
+
+    fn params(&self) -> &[u16] {
+        &self.values[..usize::from(self.len)]
+    }
+}
+
 /// Parse SGR parameters into groups. Top-level parameters are separated by ';';
 /// within a group, ':' introduces sub-parameters (ISO 8613-6 / curly underline,
 /// e.g. `4:3` or `38:2:r:g:b`). Empty fields parse as 0 so positions are preserved.
-fn frost_sgr_groups(param_bytes: &[u8]) -> SmallVec<[SmallVec<[u16; 6]>; 8]> {
-    let mut groups: SmallVec<[SmallVec<[u16; 6]>; 8]> = SmallVec::new();
-    let mut group: SmallVec<[u16; 6]> = SmallVec::new();
+fn frost_sgr_groups(param_bytes: &[u8]) -> SmallVec<[FrostSgrGroup; 8]> {
+    let mut groups = SmallVec::new();
+    let mut group = FrostSgrGroup::default();
     let mut current: u16 = 0;
 
     for &byte in param_bytes {
@@ -1457,8 +1477,8 @@ fn frost_sgr_groups(param_bytes: &[u8]) -> SmallVec<[SmallVec<[u16; 6]>; 8]> {
 /// Resolve an extended color (SGR 38/48/58) from either the colon sub-parameter
 /// form (within a single group, e.g. `38:2:r:g:b` or `38:2:cs:r:g:b`) or the
 /// legacy semicolon form (`38;2;r;g;b`), advancing `gi` past consumed groups.
-fn frost_sgr_color(groups: &[SmallVec<[u16; 6]>], gi: &mut usize) -> Option<Color> {
-    let g = &groups[*gi];
+fn frost_sgr_color(groups: &[FrostSgrGroup], gi: &mut usize) -> Option<Color> {
+    let g = groups[*gi].params();
     if g.len() >= 2 {
         // Colon sub-parameter form: everything lives in this group.
         match g[1] {
@@ -1477,7 +1497,7 @@ fn frost_sgr_color(groups: &[SmallVec<[u16; 6]>], gi: &mut usize) -> Option<Colo
         }
     } else {
         // Legacy semicolon form: the kind and components are separate groups.
-        let first = |idx: usize| groups.get(idx).and_then(|x| x.first().copied());
+        let first = |idx: usize| groups.get(idx).map(|group| group.values[0]);
         match first(*gi + 1) {
             Some(5) => {
                 let n = first(*gi + 2);
@@ -1544,10 +1564,10 @@ fn frost_sgr_with_rendition(
     let mut global_background = None;
     let mut i = 0;
     while let Some(group) = groups.get(i) {
-        let param = group.first().copied().unwrap_or(0);
+        let param = group.values[0];
         let changed = match param {
             4 => {
-                rendition.underline(group.get(1).copied().unwrap_or(1));
+                rendition.underline(group.params().get(1).copied().unwrap_or(1));
                 None
             }
             38 | 48 | 58 => {
