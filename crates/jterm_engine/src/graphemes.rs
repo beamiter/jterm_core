@@ -1,4 +1,4 @@
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::GraphemeCursor;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) const MAX_CLUSTER_BYTES: usize = 64;
@@ -43,8 +43,9 @@ pub(crate) fn has_wide_emoji_presentation(cluster: &str) -> bool {
         && cluster.width() == 2
 }
 
-/// Candidate includes one scalar beyond the accepted size so overflow
-/// rejects only a true continuation, leaving ordinary adjacent glyphs intact.
+/// The base is one retained grapheme (or one scalar). Test its boundary
+/// with the incoming scalar using the full left context for emoji and Indic
+/// rules. A genuine continuation may exceed the caller's retained size cap.
 pub(crate) fn extension<'a>(
     base: &str,
     next: char,
@@ -53,5 +54,8 @@ pub(crate) fn extension<'a>(
     buf[..base.len()].copy_from_slice(base.as_bytes());
     let len = base.len() + next.encode_utf8(&mut buf[base.len()..]).len();
     let candidate = std::str::from_utf8(&buf[..len]).expect("UTF-8 cluster and scalar");
-    (candidate.graphemes(true).nth(1).is_none()).then_some(candidate)
+    let boundary = GraphemeCursor::new(base.len(), len, true)
+        .is_boundary(candidate, 0)
+        .expect("complete UTF-8 candidate");
+    (!boundary).then_some(candidate)
 }

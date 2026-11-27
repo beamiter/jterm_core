@@ -39,6 +39,28 @@ fn fragmented_combining_marks_and_emoji_join_their_physical_heads() {
 }
 
 #[test]
+fn contextual_graphemes_retain_left_context_and_break_before_the_next_glyph() {
+    for cluster in ["한", "क्\u{200d}ष", "🇨🇳", "👩🏽\u{200d}💻", "禰\u{e0100}"]
+    {
+        let text = format!("{cluster}界");
+        for split in 0..=text.len() {
+            let mut terminal = terminal(2, 8);
+            let (before, after) = text.as_bytes().split_at(split);
+            terminal.feed(before).unwrap();
+            terminal.feed(after).unwrap();
+            let frame = terminal.frame().unwrap();
+            let context = format!("{text:?} with a split at {split}");
+            assert_eq!(frame.cluster_text(0, 0), Some(cluster), "{context}");
+            let cells = &frame.rows()[0].cells;
+            let next = 1 + usize::from(cells[0].flags.wide());
+            assert_eq!(cells[next].character, '界', "{context}");
+            assert_eq!(frame.cluster_text(0, next), None, "{context}");
+            assert_eq!(terminal.unsupported_count(), 0, "{context}");
+        }
+    }
+}
+
+#[test]
 fn wide_emoji_sequences_use_pairs_and_keep_deferred_wrap() {
     let mut terminal = terminal(2, 6);
     terminal.feed("❤️#️⃣🇺🇸".as_bytes()).unwrap();

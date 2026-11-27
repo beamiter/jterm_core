@@ -2331,6 +2331,19 @@ impl Terminal {
         }) {
             return Ok(());
         }
+        // Printable events still reach command-output observers first. They
+        // cannot produce control replies, window events or mode changes.
+        match event {
+            Event::Print(ch) => {
+                self.print(ch);
+                return Ok(());
+            }
+            Event::Ascii(bytes) => {
+                self.print_ascii(bytes);
+                return Ok(());
+            }
+            _ => {}
+        }
         let osc = match &event {
             Event::String {
                 kind: StringKind::Osc,
@@ -2505,10 +2518,6 @@ impl Terminal {
                 }
             }
             Dispatch::Unhandled => match event {
-                Event::Print(ch) => {
-                    self.print(ch);
-                }
-                Event::Ascii(bytes) => self.print_ascii(bytes),
                 Event::Control(10..=12) => self.motion(VerticalMotion::LineFeed),
                 Event::Control(0) | Event::Boundary => (),
                 _ => {
