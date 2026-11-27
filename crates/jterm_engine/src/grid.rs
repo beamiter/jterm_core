@@ -1917,97 +1917,88 @@ impl ScrollbackLine {
     }
 
     fn compress_with_style(cells: &[TerminalCell], is_wrapped: bool, preserve_blink: bool) -> Self {
-        let cols = cells.len() as u16;
-        let reflow_content_len = cells
+        let needs_encoded_flags = |flags: StyleFlags| {
+            !flags.is_default_style()
+                || flags.0 & (WIDE_BIT | WIDE_CONT_BIT | PRINTED_SPACE_BIT) != 0
+        };
+        let default_colors_and_no_link = |cell: &TerminalCell| {
+            cell.foreground == Color::Default
+                && cell.background == Color::Default
+                && cell.hyperlink_id.is_none()
+        };
+        let active_len = cells
+            .iter()
+            .rposition(|cell| {
+                cell.character != ' '
+                    || needs_encoded_flags(cell.flags)
+                    || !default_colors_and_no_link(cell)
+            })
+            .map_or(0, |column| column + 1);
+        let active = &cells[..active_len];
+        // Storage can keep styled trailing cells that reflow omits.
+        let reflow_content_len = active
             .iter()
             .rposition(|cell| !cell.is_reflow_trimmable_blank())
             .map_or(0, |index| index + 1);
-        let mut reflow_wide_continuations: SmallVec<[u16; 2]> = cells[..reflow_content_len]
-            .iter()
-            .enumerate()
-            .filter_map(|(column, cell)| {
-                if cell.flags.wide_continuation() {
-                    u16::try_from(column).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Include trimmed cells so their drawn spaces can still be restored.
+        let row_flags = StyleFlags(cells.iter().fold(0, |bits, cell| bits | cell.flags.0));
+        let mut reflow_wide_continuations: SmallVec<[u16; 2]> = if row_flags.wide_continuation() {
+            cells[..reflow_content_len]
+                .iter()
+                .enumerate()
+                .filter_map(|(column, cell)| {
+                    if cell.flags.wide_continuation() {
+                        u16::try_from(column).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            SmallVec::new()
+        };
         let reflow_wide_count = reflow_wide_continuations.len() as u16;
-        if let Some(last) = cells
-            .iter()
-            .rposition(|cell| cell.flags.untracked_drawn_space())
-        {
+        let last_drawn = if row_flags.0 & TAB_PADDING_BIT != 0 {
+            cells
+                .iter()
+                .rposition(|cell| cell.flags.untracked_drawn_space())
+        } else {
+            None
+        };
+        if let Some(last) = last_drawn {
             let start = reflow_wide_continuations.len();
             reflow_wide_continuations.resize(start + last / 16 + 1, 0);
-            for (column, cell) in cells[..=last].iter().enumerate() {
-                if cell.flags.untracked_drawn_space() {
-                    reflow_wide_continuations[start + column / 16] |= 1 << (column % 16);
-                }
+            for (word, block) in reflow_wide_continuations[start..]
+                .iter_mut()
+                .zip(cells[..=last].chunks(16))
+            {
+                *word = block.iter().rev().fold(0, |bits, cell| {
+                    (bits << 1) | u16::from(cell.flags.untracked_drawn_space())
+                });
             }
         }
-        let reflow_content_len = u16::try_from(reflow_content_len).unwrap_or(u16::MAX);
-        let trailing_blanks = cells
-            .iter()
-            .rev()
-            .take_while(|c| {
-                c.character == ' '
-                    && c.foreground == Color::Default
-                    && c.background == Color::Default
-                    && c.flags.is_default_style()
-                    && !c.flags.wide()
-                    && !c.flags.wide_continuation()
-                    && !c.flags.printed_space()
-                    && c.hyperlink_id.is_none()
-            })
-            .count();
-
-        let active_len = cells.len() - trailing_blanks;
-        // Plain rows need only one admission pass. If styled contents end
-        // that pass early, retain the codec's row-wide printed-space flag.
-        let mut printed_spaces = false;
-        let all_default_attrs = cells[..active_len].iter().all(|c| {
-            if c.flags.printed_space() {
-                printed_spaces = true;
-                return false;
-            }
-            c.foreground == Color::Default
-                && c.background == Color::Default
-                && c.flags.is_default_style()
-                && !c.flags.wide()
-                && !c.flags.wide_continuation()
-                && c.hyperlink_id.is_none()
-        });
-        if !all_default_attrs && !printed_spaces {
-            printed_spaces = cells[..active_len]
-                .iter()
-                .any(|cell| cell.flags.printed_space());
-        }
-
-        if all_default_attrs {
-            let text: String = cells[..active_len].iter().map(|c| c.character).collect();
-            ScrollbackLine {
-                data: CompressedLineData::Plain(text, trailing_blanks as u16),
-                is_wrapped,
-                archive_flags: u8::from(cells.len() > usize::from(u16::MAX)) << 2,
-                cols,
-                reflow_content_len,
-                reflow_wide_continuations,
-                reflow_wide_count,
-                raw_row_id: RawRowId::UNTRACKED,
-            }
-        } else {
-            let encoded = Self::encode_cells(&cells[..active_len], preserve_blink);
-            ScrollbackLine {
-                data: CompressedLineData::Encoded(encoded),
-                is_wrapped,
-                archive_flags: u8::from(printed_spaces) << 1,
-                cols,
-                reflow_content_len,
-                reflow_wide_continuations,
-                reflow_wide_count,
-                raw_row_id: RawRowId::UNTRACKED,
-            }
+        let (data, archive_flags) =
+            if !needs_encoded_flags(row_flags) && active.iter().all(default_colors_and_no_link) {
+                let text: String = active.iter().map(|cell| cell.character).collect();
+                (
+                    CompressedLineData::Plain(text, (cells.len() - active_len) as u16),
+                    u8::from(cells.len() > usize::from(u16::MAX)) << 2,
+                )
+            } else {
+                (
+                    CompressedLineData::Encoded(Self::encode_cells(active, preserve_blink)),
+                    u8::from(row_flags.printed_space()) << 1,
+                )
+            };
+        ScrollbackLine {
+            data,
+            is_wrapped,
+            archive_flags,
+            cols: cells.len() as u16,
+            reflow_content_len: u16::try_from(reflow_content_len).unwrap_or(u16::MAX),
+            reflow_wide_continuations,
+            reflow_wide_count,
+            raw_row_id: RawRowId::UNTRACKED,
         }
     }
 
@@ -2330,36 +2321,35 @@ impl ScrollbackLine {
         }
     }
 
-    fn encode_color(color: &Color, buf: &mut Vec<u8>) {
-        match color {
-            Color::Default => buf.push(0),
-            Color::Black => buf.push(1),
-            Color::Red => buf.push(2),
-            Color::Green => buf.push(3),
-            Color::Yellow => buf.push(4),
-            Color::Blue => buf.push(5),
-            Color::Magenta => buf.push(6),
-            Color::Cyan => buf.push(7),
-            Color::White => buf.push(8),
-            Color::BrightBlack => buf.push(9),
-            Color::BrightRed => buf.push(10),
-            Color::BrightGreen => buf.push(11),
-            Color::BrightYellow => buf.push(12),
-            Color::BrightBlue => buf.push(13),
-            Color::BrightMagenta => buf.push(14),
-            Color::BrightCyan => buf.push(15),
-            Color::BrightWhite => buf.push(16),
+    fn encode_color(color: Color, bytes: &mut [u8]) -> usize {
+        bytes[0] = match color {
+            Color::Default => 0,
+            Color::Black => 1,
+            Color::Red => 2,
+            Color::Green => 3,
+            Color::Yellow => 4,
+            Color::Blue => 5,
+            Color::Magenta => 6,
+            Color::Cyan => 7,
+            Color::White => 8,
+            Color::BrightBlack => 9,
+            Color::BrightRed => 10,
+            Color::BrightGreen => 11,
+            Color::BrightYellow => 12,
+            Color::BrightBlue => 13,
+            Color::BrightMagenta => 14,
+            Color::BrightCyan => 15,
+            Color::BrightWhite => 16,
             Color::Indexed(i) => {
-                buf.push(17);
-                buf.push(*i);
+                bytes[..2].copy_from_slice(&[17, i]);
+                return 2;
             }
             Color::Rgb(r, g, b) => {
-                buf.push(18);
-                buf.push(*r);
-                buf.push(*g);
-                buf.push(*b);
+                bytes[..4].copy_from_slice(&[18, r, g, b]);
+                return 4;
             }
-        }
+        };
+        1
     }
 
     fn decode_color(data: &[u8], pos: &mut usize) -> Color {
@@ -2450,8 +2440,6 @@ impl ScrollbackLine {
         let mut i = 0;
         while i < cells.len() {
             let cell = &cells[i];
-            let mut character = [0; 4];
-            let ch_bytes = cell.character.encode_utf8(&mut character).as_bytes();
 
             // RLE: count consecutive identical cells (packed flags comparison is a single u16 ==)
             let mut run = 1u8;
@@ -2471,12 +2459,14 @@ impl ScrollbackLine {
 
             // Format: [char_len:1][char_bytes][fg][bg][flags:1]
             //         [extra_flags:1][hyperlink_id:2][run:1]
-            buf.push(ch_bytes.len() as u8);
-            buf.extend_from_slice(ch_bytes);
-            Self::encode_color(&cell.foreground, &mut buf);
-            Self::encode_color(&cell.background, &mut buf);
+            // Assemble one record before appending it to the archive.
+            let mut record = [0; 1 + 4 + 4 + 4 + 5];
+            let glyph_len = cell.character.encode_utf8(&mut record[1..5]).len();
+            record[0] = glyph_len as u8;
+            let mut end = 1 + glyph_len;
+            end += Self::encode_color(cell.foreground, &mut record[end..]);
+            end += Self::encode_color(cell.background, &mut record[end..]);
             let f = Self::encode_flags(&cell.flags);
-            buf.push(f);
             let extra_flags = if cell.flags.wide() { 1u8 } else { 0 }
                 | if cell.flags.wide_continuation() { 2 } else { 0 }
                 | if preserve_blink && cell.flags.blink() {
@@ -2486,9 +2476,9 @@ impl ScrollbackLine {
                 }
                 | if cell.flags.printed_space() { 8 } else { 0 }
                 | if cell.flags.tab_padding() { 16 } else { 0 };
-            buf.push(extra_flags);
-            buf.extend_from_slice(&cell.hyperlink_id.as_raw().to_le_bytes());
-            buf.push(run);
+            let [link_low, link_high] = cell.hyperlink_id.as_raw().to_le_bytes();
+            record[end..end + 5].copy_from_slice(&[f, extra_flags, link_low, link_high, run]);
+            buf.extend_from_slice(&record[..end + 5]);
 
             i += run as usize;
         }
@@ -3223,6 +3213,32 @@ mod decoder_parity {
             }
         }
     }
+
+    #[test]
+    fn longest_archive_record_keeps_both_rgb_colors_and_the_run_boundary() {
+        let mut cell = TerminalCell {
+            character: '𐐀',
+            foreground: Color::Rgb(1, 2, 3),
+            background: Color::Rgb(4, 5, 6),
+            hyperlink_id: HyperlinkId::from_raw(0x1234),
+            ..TerminalCell::default()
+        };
+        cell.flags.set_bold(true);
+        cell.flags.set_blink(true);
+        cell.flags.set_underline(UnderlineStyle::Dashed);
+        let cells = vec![cell; 256];
+        let run = [
+            4, 0xf0, 0x90, 0x90, 0x80, 18, 1, 2, 3, 18, 4, 5, 6, 21, 4, 0x34, 0x12, 255,
+        ];
+        let mut expected = run.repeat(2);
+        *expected.last_mut().unwrap() = 1;
+        let line = ScrollbackLine::compress_preserving_blink(&cells, true);
+        assert!(
+            matches!(line.content(), ScrollbackContent::Encoded(bytes) if bytes == expected.as_slice())
+        );
+        assert_eq!(line.decompress(), cells);
+    }
+
     #[test]
     fn encoded_runs_preserve_valid_scalars_and_replace_invalid_utf8() {
         let cell = TerminalCell {
@@ -3474,6 +3490,31 @@ mod retained_drawn_space_tests {
                         + line.reflow_wide_continuations.capacity() * size_of::<u16>()
             );
         }
+    }
+
+    #[test]
+    fn stored_and_reflowed_tails_keep_their_distinct_boundaries() {
+        let mut cells = vec![TerminalCell::default(); 33];
+        cells[0].character = 'x';
+        cells[4].character = '界';
+        cells[4].flags.set_wide(true);
+        cells[5].flags.set_wide_continuation(true);
+        cells[8].flags.set_printed_space(true);
+        cells[8].flags.set_tab_padding(true);
+        cells[11].foreground = Color::Yellow;
+        cells[16].flags.mark_untracked_drawn_space();
+        cells[32].flags.mark_untracked_drawn_space();
+
+        let line = ScrollbackLine::compress(&cells, false);
+        assert_eq!(line.reflow_content_len(), 9);
+        assert_eq!(line.reflow_wide_continuations(), &[5]);
+        let mut stored = Vec::new();
+        line.visit_search_cells(|column, cell| {
+            assert_eq!(column, stored.len());
+            stored.push(cell);
+        });
+        assert_eq!(stored, cells[..12]);
+        assert_eq!(line.decompress(), cells);
     }
 }
 
