@@ -1,7 +1,7 @@
 use super::hyperlink::HyperlinkId;
 use crate::{graphemes::MAX_CLUSTER_BYTES, row_annotations::RowAnnotations};
 use smallvec::SmallVec;
-use std::ops::{Range, RangeInclusive};
+use std::ops::{Deref, DerefMut, Range, RangeInclusive};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -87,11 +87,68 @@ impl PrintCheckpoint {
     }
 }
 
-/// 连续内存网格存储 - 优化内存局部性和缓存命中率
-/// 内存布局：`cells[row * cols + col]` 对应 `grid[row][col]`。
+/// The visible cells form a contiguous window in the backing allocation.
+struct GridCells {
+    storage: Vec<TerminalCell>,
+    start: usize,
+}
+
+impl GridCells {
+    fn new(storage: Vec<TerminalCell>) -> Self {
+        Self { storage, start: 0 }
+    }
+
+    fn shift_full_up(&mut self, dropped_cells: usize, blank: TerminalCell) {
+        let end = self.storage.len();
+        let next_end = end + dropped_cells;
+        if next_end > self.storage.capacity() {
+            // Reserve spare cells lazily for scrolling grids.
+            const MAX_SPARE_BYTES: usize = 64 * 1024;
+            let visible = end - self.start;
+            let spare = (visible / 4).min(MAX_SPARE_BYTES / std::mem::size_of::<TerminalCell>());
+            if self.start != 0
+                || dropped_cells > spare
+                || self.storage.try_reserve_exact(spare).is_err()
+            {
+                // Reclaim the prefix and preserve the surviving cells in one copy.
+                self.storage.copy_within(self.start + dropped_cells..end, 0);
+                self.storage.truncate(visible - dropped_cells);
+                self.storage.resize(visible, blank);
+                self.start = 0;
+                return;
+            }
+        }
+        self.storage.resize(next_end, blank);
+        self.start += dropped_cells;
+    }
+}
+
+impl Clone for GridCells {
+    fn clone(&self) -> Self {
+        Self::new(self.to_vec())
+    }
+}
+
+impl Deref for GridCells {
+    type Target = [TerminalCell];
+
+    #[inline]
+    fn deref(&self) -> &[TerminalCell] {
+        &self.storage[self.start..]
+    }
+}
+
+impl DerefMut for GridCells {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [TerminalCell] {
+        &mut self.storage[self.start..]
+    }
+}
+
+/// A row-major grid with a contiguous view of its visible cells.
 #[derive(Clone)]
 pub struct TerminalGrid {
-    cells: Vec<TerminalCell>,
+    cells: GridCells,
     rows: usize,
     cols: usize,
     /// Legacy wrap bits. Hosts opting into certified archive gaps must use
@@ -118,7 +175,7 @@ pub struct TerminalGrid {
 impl TerminalGrid {
     pub fn new(rows: usize, cols: usize) -> Self {
         TerminalGrid {
-            cells: vec![TerminalCell::default(); rows * cols],
+            cells: GridCells::new(vec![TerminalCell::default(); rows * cols]),
             rows,
             cols,
             row_wrapped: vec![false; rows],
@@ -885,18 +942,7 @@ impl TerminalGrid {
         }
     }
 
-    fn copy_region_rows(&mut self, source: Range<usize>, target: usize, preserve_margin: bool) {
-        self.cells.copy_within(
-            source.start * self.cols..source.end * self.cols,
-            target * self.cols,
-        );
-        if preserve_margin {
-            self.margin_origin.copy_within(source, target);
-        }
-    }
-
-    fn fill_region_rows(&mut self, rows: Range<usize>, blank: TerminalCell) {
-        self.cells[rows.start * self.cols..rows.end * self.cols].fill(blank);
+    fn reset_blank_row_metadata(&mut self, rows: Range<usize>, blank: TerminalCell) {
         if !self.underline_colors.is_empty() {
             self.underline_colors[rows.clone()].fill(None);
         }
@@ -977,14 +1023,29 @@ impl TerminalGrid {
                 RegionDirection::Down => rows.rotate_right(count),
             }
         }
+        let full_up =
+            count < height && direction == RegionDirection::Up && top == 0 && end == self.rows;
         if count < height {
-            self.copy_region_rows(source.clone(), target, preserve_margin);
+            if full_up {
+                self.cells.shift_full_up(count * self.cols, blank);
+            } else {
+                self.cells.copy_within(
+                    source.start * self.cols..source.end * self.cols,
+                    target * self.cols,
+                );
+            }
+            if preserve_margin {
+                self.margin_origin.copy_within(source.clone(), target);
+            }
             if move_wraps {
                 self.row_wrapped.copy_within(source.clone(), target);
             }
             self.row_ids.copy_within(source, target);
         }
-        self.fill_region_rows(blank_rows.clone(), blank);
+        if !full_up {
+            self.cells[blank_rows.start * self.cols..blank_rows.end * self.cols].fill(blank);
+        }
+        self.reset_blank_row_metadata(blank_rows.clone(), blank);
         if !preserve_margin {
             self.forget_region_margins(top.saturating_sub(1)..end);
         }
@@ -1240,7 +1301,7 @@ impl TerminalGrid {
             new_cells[dst_start..dst_start + copy_cols]
                 .copy_from_slice(&self.cells[src_start..src_start + copy_cols]);
         }
-        self.cells = new_cells;
+        self.cells = GridCells::new(new_cells);
         let mut new_wrapped = vec![false; new_rows];
         new_wrapped[..copy_rows].copy_from_slice(&self.row_wrapped[..copy_rows]);
         self.row_wrapped = new_wrapped;
@@ -1801,6 +1862,63 @@ fn structural_grid_revision_stays_nonzero_after_wrap() {
     assert_eq!(grid.identity_revision(), 1);
     grid.resize(2, 3, TerminalCell::default());
     assert_eq!(grid.identity_revision(), 2);
+}
+
+#[cfg(test)]
+#[test]
+fn scroll_storage_preserves_flat_access_through_compaction_and_resize() {
+    let (rows, cols) = (12, 8);
+    let mut grid = TerminalGrid::new(rows, cols);
+    let mut expected: Vec<TerminalCell> = (0..rows * cols)
+        .map(|cell| TerminalCell {
+            character: char::from(b'a' + (cell % 26) as u8),
+            ..TerminalCell::default()
+        })
+        .collect();
+    grid.cells_mut().copy_from_slice(&expected);
+    let blank = TerminalCell {
+        background: Color::Rgb(1, 2, 3),
+        ..TerminalCell::default()
+    };
+    let mut reclaimed = false;
+    for step in 0..rows {
+        let before = grid.cells.start;
+        grid.scroll_up_by(1, blank);
+        reclaimed |= grid.cells.start < before;
+        expected.rotate_left(cols);
+        expected[(rows - 1) * cols..].fill(blank);
+        assert_eq!(grid.cells_mut(), expected.as_slice());
+
+        if step == 0 {
+            assert_ne!(grid.cells.start, 0);
+            let cloned = grid.clone();
+            assert_eq!(cloned.cells.start, 0);
+            assert_eq!(cloned.cells.storage.len(), expected.len());
+            assert_eq!(&*cloned.cells, expected.as_slice());
+
+            grid.shift_rows(
+                RegionDirection::Down,
+                1..=2,
+                1,
+                blank,
+                RegionWrapPolicy::KeepPhysicalIndices,
+                || RawRowId::UNTRACKED,
+            );
+            expected[cols..3 * cols].rotate_right(cols);
+            expected[cols..2 * cols].fill(blank);
+        }
+        grid.iter_mut().next_back().unwrap()[cols - 1].character = 'z';
+        expected[rows * cols - 1].character = 'z';
+        assert!(grid.iter().flatten().eq(&expected));
+    }
+    assert!(reclaimed);
+
+    grid.scroll_up_by(1, blank);
+    expected.rotate_left(cols);
+    grid.resize(2, cols - 1, blank);
+    assert_eq!(grid.cells.start, 0);
+    assert_eq!(&grid[0], &expected[..cols - 1]);
+    assert_eq!(&grid[1], &expected[cols..2 * cols - 1]);
 }
 
 #[derive(Clone, Debug)]
@@ -3008,7 +3126,7 @@ fn middle_erase_matches_scalar_order_for_all_small_wide_flag_patterns() {
                     actual.erase_cells(0, start..end, blank);
                     scalar(&mut expected, start..end, blank);
                     assert_eq!(
-                        actual.cells, expected.cells,
+                        &*actual.cells, &*expected.cells,
                         "bits={bits} span={start}..{end} blank={blank_bits}"
                     );
                     assert_eq!(actual.underline_colors, expected.underline_colors);
