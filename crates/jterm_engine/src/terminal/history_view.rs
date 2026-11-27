@@ -7,6 +7,7 @@ use crate::{
     history_reflow::{
         process_history_viewport_budget, source_columns, HistoryAnchor, ProjectedHistoryRow,
     },
+    retained_bytes::RetainedBytesBudget,
     TerminalCell,
 };
 use std::{collections::VecDeque, io, ops::Range};
@@ -303,21 +304,36 @@ impl Terminal {
     /// Index the retained archive at the current width. The caller owns the
     /// index while reading history, and repeated captures can reuse it.
     pub fn history_layout(&self) -> Result<Arc<HistoryLayout>, String> {
-        let extent = self.history_extent();
-        let columns = self.vt.screen.grid.cols();
+        self.read_history_layout(None)
+    }
+
+    /// Use the process viewport budget to keep the index and its decoded
+    /// window available between independent reads for this terminal.
+    pub fn history_layout_for_viewport(&self) -> Result<Arc<HistoryLayout>, String> {
+        self.read_history_layout(Some(process_history_viewport_budget()))
+    }
+
+    fn read_history_layout(
+        &self,
+        retention: Option<&Arc<RetainedBytesBudget>>,
+    ) -> Result<Arc<HistoryLayout>, String> {
         let mut cache = self
             .retained_layout
             .lock()
             .map_err(|_| "history layout cache poisoned")?;
-        if let Some(layout) = cache
-            .upgrade()
-            .filter(|layout| layout.extent == extent && layout.columns == columns)
-        {
-            return Ok(layout);
+        Ok(cache.read(
+            &self.history,
+            self.history_extent(),
+            self.vt.screen.grid.cols(),
+            retention,
+        ))
+    }
+
+    /// Release the terminal's retained viewport when the reader leaves.
+    pub fn release_history_viewport(&self) {
+        if let Ok(mut cache) = self.retained_layout.lock() {
+            cache.release_retained();
         }
-        let layout = Arc::new(HistoryLayout::new(&self.history, extent, columns));
-        *cache = Arc::downgrade(&layout);
-        Ok(layout)
     }
 
     /// Validate a stable physical cell before resolving it in any history layout.

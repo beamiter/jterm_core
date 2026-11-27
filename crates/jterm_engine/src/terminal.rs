@@ -6,7 +6,9 @@ use crate::{
     frame::{underline_color_at, CellFrame, Cursor, Limits, Row, Screen, Stamp, UnderlineRows},
     graphemes::{self, MAX_CLUSTER_BYTES},
     grid::{PrintCheckpoint, TerminalGrid, WrapCheckpoint},
-    history_reflow::{history_rows_retained_bytes, HistoryCopyRow, HistoryLayout},
+    history_reflow::{
+        history_rows_retained_bytes, HistoryCopyRow, HistoryLayout, HistoryLayoutCache,
+    },
     hyperlink::{
         capture_row_hyperlinks, resolve_resource, HyperlinkPolicy, HyperlinkResources,
         HyperlinkTable,
@@ -30,7 +32,7 @@ use std::time::Duration;
 use std::{
     collections::VecDeque,
     num::NonZeroU64,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use unicode_width::UnicodeWidthChar;
@@ -448,7 +450,7 @@ pub struct Terminal {
     row_sources: Option<RowSources>,
     next_inline_image_id: u64,
     inline_graphics: Option<InlineGraphics>,
-    retained_layout: Mutex<Weak<HistoryLayout>>,
+    retained_layout: Mutex<HistoryLayoutCache>,
     preserve_primary_on_resize: bool,
     reflow_primary_on_resize: bool,
     command_blocks: Option<CommandBlocks>,
@@ -738,7 +740,7 @@ impl Terminal {
             row_sources: None,
             next_inline_image_id: 0,
             inline_graphics: None,
-            retained_layout: Mutex::new(Weak::new()),
+            retained_layout: Mutex::default(),
             preserve_primary_on_resize: false,
             reflow_primary_on_resize: false,
             command_blocks: None,
@@ -1305,6 +1307,7 @@ impl Terminal {
         if self.history_row_limit == 0 {
             return;
         }
+        self.discard_history_viewport();
         let row_id = line.raw_row_id();
         let retained = self
             .history
@@ -1381,10 +1384,25 @@ impl Terminal {
     }
 
     fn trim_history(&mut self) {
+        if self.history.len() > self.history_row_limit {
+            self.discard_history_viewport();
+        }
         self.history.trim_oldest(self.history_row_limit);
         if let Some(sources) = &mut self.row_sources {
             sources.trim_to(self.history.len());
         }
+    }
+
+    fn discard_history_viewport(&mut self) {
+        if let Ok(cache) = self.retained_layout.get_mut() {
+            cache.release_retained();
+        }
+    }
+
+    fn clear_history(&mut self) {
+        self.discard_history_viewport();
+        self.history.clear();
+        self.clear_transcript_archive();
     }
 
     /// Approximate bytes charged by retained primary history, including when
@@ -1973,8 +1991,7 @@ impl Terminal {
         if let Some(colors) = &self.colors {
             self.publish_colors(ColorState::new(colors.defaults()));
         }
-        self.history.clear();
-        self.clear_transcript_archive();
+        self.clear_history();
         self.renew_live_source_rows();
         self.vt.sync_output.end_hosted();
         if let Some(blocks) = &mut self.command_blocks {
@@ -2170,8 +2187,7 @@ impl Terminal {
                             // Alternate applications cannot erase primary history.
                             3 => {
                                 if !self.vt.screen.use_alt_buffer {
-                                    self.history.clear();
-                                    self.clear_transcript_archive();
+                                    self.clear_history();
                                 }
                             }
                             _ => self.unsupported(),
@@ -2579,6 +2595,9 @@ impl Terminal {
         let layout = self.layout.checked_add(1).ok_or("layout exhausted")?;
         let revision = self.revision.checked_add(1).ok_or("revision exhausted")?;
         resize_pty()?;
+        if cols != self.vt.screen.grid.cols() {
+            self.discard_history_viewport();
+        }
         self.finish_grapheme();
         if let Some(blocks) = &mut self.command_blocks {
             blocks.resized();

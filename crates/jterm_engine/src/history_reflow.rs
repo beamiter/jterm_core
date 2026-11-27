@@ -8,7 +8,7 @@ use crate::{
 use std::{
     collections::VecDeque,
     ops::Range,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 const MAX_PROJECTED_ROWS: usize = 65_536;
@@ -36,6 +36,43 @@ pub struct HistoryLayout {
     pub(crate) columns: usize,
     pub(crate) projected: Option<Vec<ProjectedHistoryRow>>,
     pub(crate) viewport: Mutex<HistoryViewportCache>,
+}
+
+#[derive(Default)]
+pub(crate) struct HistoryLayoutCache {
+    current: Weak<HistoryLayout>,
+    retained: Option<(Arc<HistoryLayout>, RetainedBytes)>,
+}
+
+impl HistoryLayoutCache {
+    pub(crate) fn read(
+        &mut self,
+        history: &VecDeque<ScrollbackLine>,
+        extent: Range<u64>,
+        columns: usize,
+        retention: Option<&Arc<RetainedBytesBudget>>,
+    ) -> Arc<HistoryLayout> {
+        let layout = self
+            .current
+            .upgrade()
+            .filter(|layout| layout.extent == extent && layout.columns == columns)
+            .unwrap_or_else(|| {
+                self.release_retained();
+                let layout = Arc::new(HistoryLayout::new(history, extent, columns));
+                self.current = Arc::downgrade(&layout);
+                layout
+            });
+        if self.retained.is_none() && !layout.is_empty() {
+            self.retained = retention
+                .and_then(|budget| budget.reserve(layout.index_bytes()))
+                .map(|lease| (Arc::clone(&layout), lease));
+        }
+        layout
+    }
+
+    pub(crate) fn release_retained(&mut self) {
+        self.retained = None;
+    }
 }
 
 impl HistoryLayout {
@@ -70,6 +107,15 @@ impl HistoryLayout {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    fn index_bytes(&self) -> usize {
+        size_of::<Self>()
+            + 2 * size_of::<usize>()
+            + self
+                .projected
+                .as_ref()
+                .map_or(0, |rows| rows.capacity() * size_of::<ProjectedHistoryRow>())
     }
 
     pub fn anchor_at(&self, visual_row: usize) -> Option<HistoryAnchor> {
@@ -294,6 +340,37 @@ impl HistoryViewportCache {
         }
         (rows, cache_links)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn index_retention_is_bounded_and_a_new_width_releases_its_predecessor() {
+    let cells = [TerminalCell {
+        character: 'A',
+        ..TerminalCell::default()
+    }; 8];
+    let history = VecDeque::from([ScrollbackLine::compress(&cells, false)]);
+    let extent = 0..1;
+    let mut cache = HistoryLayoutCache::default();
+    let initial = cache.read(&history, extent.clone(), 8, None);
+    let bytes = initial.index_bytes();
+    let budget = Arc::new(RetainedBytesBudget::new(bytes));
+    let retained = cache.read(&history, extent.clone(), 8, Some(&budget));
+    assert!(Arc::ptr_eq(&initial, &retained));
+    let weak = Arc::downgrade(&retained);
+    drop(initial);
+    drop(retained);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(budget.usage().retained_bytes, bytes);
+
+    let narrow = cache.read(&history, extent, 1, Some(&budget));
+    assert!(weak.upgrade().is_none());
+    assert_eq!(narrow.len(), 8);
+    assert!(narrow.index_bytes() > bytes);
+    let narrow_weak = Arc::downgrade(&narrow);
+    drop(narrow);
+    assert!(narrow_weak.upgrade().is_none());
+    assert_eq!(budget.usage().retained_bytes, 0);
 }
 
 #[cfg(test)]
