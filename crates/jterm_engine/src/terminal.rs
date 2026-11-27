@@ -15,6 +15,7 @@ use crate::{
     },
     kitty_graphics::{self, inline::InlineGraphics},
     mouse::MouseInput,
+    native_window_ops::{self, NativeWindowGeometry, NativeWindowPixels},
     parser::{Event, Parser, ParserLimits, ParserProfile, StringKind},
     protocol_state::ProtocolState,
     retained_history::RetainedHistory,
@@ -475,6 +476,7 @@ pub struct Terminal {
     hyperlinks: Option<(HyperlinkPolicy, HyperlinkTable)>,
     graphemes: Option<GraphemeInput>,
     window: Option<WindowState>,
+    window_pixels: Option<NativeWindowPixels>,
     device_answers: bool,
     colors: Option<Arc<ColorState>>,
     color_revision: u64,
@@ -765,6 +767,7 @@ impl Terminal {
             hyperlinks: None,
             graphemes: None,
             window: None,
+            window_pixels: None,
             device_answers: false,
             colors: None,
             color_revision: 0,
@@ -829,6 +832,22 @@ impl Terminal {
     /// Enable bounded bell and title notifications and text-area size reports.
     pub fn enable_window_updates(&mut self) {
         self.window.get_or_insert_with(WindowState::default);
+    }
+
+    /// Record the frontend's pixel measurement of the current text area.
+    pub fn set_window_pixels(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        pixels: NativeWindowPixels,
+    ) -> Result<(), String> {
+        let grid = &self.vt.screen.grid;
+        if (rows, cols) != (grid.rows(), grid.cols()) {
+            return Err("pixel measurement is for a different grid".into());
+        }
+        pixels.validate()?;
+        self.window_pixels = Some(pixels);
+        Ok(())
     }
 
     /// Enable terminal identification and size reports for interactive
@@ -2464,23 +2483,46 @@ impl Terminal {
                 return Ok(());
             }
         }
-        if matches!(&event, Event::Csi {
+        if let Event::Csi {
             params,
             raw_params,
             private_prefix: None,
             intermediates,
             final_byte: b't',
             ..
-        } if (self.device_answers || self.window.is_some())
-            && intermediates.is_empty()
-            && params.as_slice() == [18]
-            && raw_params.iter().all(u8::is_ascii_digit))
+        } = &event
         {
-            let grid = &self.vt.screen.grid;
-            let mut reply = Vec::new();
-            crate::native_window_ops::write_text_area_chars(grid.rows(), grid.cols(), &mut reply);
-            replies.push(&reply, "reply byte limit");
-            return Ok(());
+            if (self.device_answers || self.window.is_some())
+                && intermediates.is_empty()
+                && raw_params.iter().all(u8::is_ascii_digit)
+            {
+                let grid = &self.vt.screen.grid;
+                let mut reply = Vec::new();
+                match (params.as_slice(), self.window_pixels) {
+                    ([18], _) => native_window_ops::write_text_area_chars(
+                        grid.rows(),
+                        grid.cols(),
+                        &mut reply,
+                    ),
+                    ([selector @ (14 | 16)], Some(pixels)) => {
+                        let geometry = NativeWindowGeometry {
+                            rows: grid.rows(),
+                            columns: grid.cols(),
+                            pixels,
+                        };
+                        if *selector == 14 {
+                            native_window_ops::write_text_area_pixels(&geometry, &mut reply);
+                        } else {
+                            native_window_ops::write_cell_pixels(&geometry, &mut reply);
+                        }
+                    }
+                    _ => {}
+                }
+                if !reply.is_empty() {
+                    replies.push(&reply, "reply byte limit");
+                    return Ok(());
+                }
+            }
         }
         if let Event::String {
             kind: StringKind::Dcs,
@@ -2674,15 +2716,34 @@ impl Terminal {
         cols: usize,
         resize_pty: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
+        self.resize_with_window_pixels(rows, cols, None, resize_pty)
+    }
+
+    /// Commit the new text area and its pixels after the PTY accepts the resize.
+    pub fn resize_with_window_pixels(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        pixels: Option<NativeWindowPixels>,
+        resize_pty: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
         dimensions(rows, cols, self.max_cols)?;
+        if let Some(pixels) = pixels {
+            pixels.validate()?;
+        }
         if (rows, cols) == (self.vt.screen.grid.rows(), self.vt.screen.grid.cols()) {
             // The PTY may still need notification, but the screen has no
             // geometry change to commit.
-            return resize_pty();
+            resize_pty()?;
+            if pixels.is_some() {
+                self.window_pixels = pixels;
+            }
+            return Ok(());
         }
         let layout = self.layout.checked_add(1).ok_or("layout exhausted")?;
         let revision = self.revision.checked_add(1).ok_or("revision exhausted")?;
         resize_pty()?;
+        self.window_pixels = pixels;
         if cols != self.vt.screen.grid.cols() {
             self.discard_history_viewport();
         }

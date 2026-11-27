@@ -9,6 +9,19 @@ pub enum NativeWindowPixels {
     Viewport { width: u32, height: u32 },
 }
 
+impl NativeWindowPixels {
+    /// A renderer must supply positive dimensions in physical pixels.
+    pub fn validate(self) -> Result<(), String> {
+        let (width, height) = match self {
+            Self::Cell { width, height } | Self::Viewport { width, height } => (width, height),
+        };
+        if width == 0 || height == 0 {
+            return Err("empty pixel measurement".into());
+        }
+        Ok(())
+    }
+}
+
 pub struct NativeWindowGeometry {
     pub columns: usize,
     pub rows: usize,
@@ -47,6 +60,16 @@ pub(crate) fn write_text_area_chars(rows: usize, columns: usize, replies: &mut V
     write!(replies, "\x1b[8;{rows};{columns}t").unwrap();
 }
 
+pub(crate) fn write_text_area_pixels(geometry: &NativeWindowGeometry, replies: &mut Vec<u8>) {
+    let (height, width) = geometry.text_pixels();
+    write!(replies, "\x1b[4;{height};{width}t").unwrap();
+}
+
+pub(crate) fn write_cell_pixels(geometry: &NativeWindowGeometry, replies: &mut Vec<u8>) {
+    let (height, width) = geometry.cell_pixels();
+    write!(replies, "\x1b[6;{height};{width}t").unwrap();
+}
+
 /// Apply one already-admitted CSI `t` in place so queries stay in parser order.
 /// Without compositor coordinates, state is normal and position is origin.
 /// Monitor geometry mirrors the grid. Move, resize and iconify are ignored.
@@ -61,14 +84,8 @@ pub fn apply_native_window_op<const LIMIT: usize>(
     match params.first().copied().unwrap_or(0) {
         11 => replies.extend_from_slice(b"\x1b[1t"),
         13 => replies.extend_from_slice(b"\x1b[3;0;0t"),
-        14 => {
-            let (height, width) = geometry.text_pixels();
-            write!(replies, "\x1b[4;{height};{width}t").unwrap();
-        }
-        16 => {
-            let (height, width) = geometry.cell_pixels();
-            write!(replies, "\x1b[6;{height};{width}t").unwrap();
-        }
+        14 => write_text_area_pixels(&geometry, replies),
+        16 => write_cell_pixels(&geometry, replies),
         18 => write_text_area_chars(rows, columns, replies),
         19 => write!(replies, "\x1b[9;{rows};{columns}t").unwrap(),
         _ => {

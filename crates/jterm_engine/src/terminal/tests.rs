@@ -1721,6 +1721,67 @@ fn hosted_character_size_queries_follow_the_current_grid() {
 }
 
 #[test]
+fn hosted_pixel_queries_use_current_frontend_measurements() {
+    let mut terminal = Terminal::new(24, 80).unwrap();
+    terminal.enable_device_answers();
+    let query = b"\x1b[14t\x1b[16t";
+    assert!(terminal.feed(query).unwrap().is_empty());
+
+    let before = terminal.frame().unwrap().stamp();
+    let viewport = NativeWindowPixels::Viewport {
+        width: 1920,
+        height: 1152,
+    };
+    terminal.set_window_pixels(24, 80, viewport).unwrap();
+    let expected = b"\x1b[4;1152;1920t\x1b[6;48;24t";
+    assert_eq!(terminal.feed(query).unwrap(), expected);
+    assert_eq!(terminal.frame().unwrap().stamp(), before);
+    assert!(terminal
+        .resize_with_window_pixels(12, 84, Some(viewport), || Err("pty error".into()))
+        .is_err());
+    assert_eq!(terminal.feed(query).unwrap(), expected);
+    let empty = NativeWindowPixels::Viewport {
+        width: 0,
+        height: 576,
+    };
+    assert!(terminal
+        .resize_with_window_pixels(12, 84, Some(empty), || panic!(
+            "invalid pixels reached the PTY"
+        ))
+        .is_err());
+    assert_eq!(terminal.feed(query).unwrap(), expected);
+
+    let scale_one = NativeWindowPixels::Viewport {
+        width: 960,
+        height: 576,
+    };
+    terminal
+        .resize_with_window_pixels(24, 80, Some(scale_one), || Ok(()))
+        .unwrap();
+    assert_eq!(
+        terminal.feed(query).unwrap(),
+        b"\x1b[4;576;960t\x1b[6;24;12t"
+    );
+    assert_eq!(terminal.frame().unwrap().stamp(), before);
+
+    terminal.resize(12, 84).unwrap();
+    assert!(terminal.feed(query).unwrap().is_empty());
+    assert!(terminal.set_window_pixels(24, 80, viewport).is_err());
+    let resized = NativeWindowPixels::Viewport {
+        width: 1008,
+        height: 288,
+    };
+    terminal
+        .resize_with_window_pixels(12, 84, Some(resized), || Ok(()))
+        .unwrap();
+    terminal.feed(b"\x1b[?1049h").unwrap();
+    assert_eq!(
+        terminal.feed(query).unwrap(),
+        b"\x1b[4;288;1008t\x1b[6;24;12t",
+    );
+}
+
+#[test]
 fn nonpaint_output_keeps_the_frame_revision_and_the_next_delta_base() {
     let mut terminal = Terminal::new(3, 20).unwrap();
     terminal.enable_device_answers();

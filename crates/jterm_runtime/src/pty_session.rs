@@ -869,6 +869,18 @@ impl Session {
         self.terminal.engine.enable_hyperlinks(policy);
     }
 
+    pub fn set_window_pixels(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        pixels: jterm_engine::native_window_ops::NativeWindowPixels,
+    ) -> Result<(), String> {
+        if self.closed {
+            return Err("session is closed".into());
+        }
+        self.terminal.engine.set_window_pixels(rows, cols, pixels)
+    }
+
     pub fn enable_window_updates(&mut self) {
         self.terminal.engine.enable_window_updates();
     }
@@ -1363,13 +1375,22 @@ impl Session {
         Ok(total)
     }
     pub fn resize(&mut self, rows: usize, cols: usize) -> Result<(), String> {
+        self.resize_with_window_pixels(rows, cols, None)
+    }
+
+    pub fn resize_with_window_pixels(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        pixels: Option<jterm_engine::native_window_ops::NativeWindowPixels>,
+    ) -> Result<(), String> {
         if self.closed {
             return Err("session is closed".into());
         }
         let actor = &self.io.as_ref().ok_or("master closed")?.actor;
         self.terminal
             .engine
-            .resize_with(rows, cols, || actor.resize(cols, rows))
+            .resize_with_window_pixels(rows, cols, pixels, || actor.resize(cols, rows))
     }
     /// Drop PTY handles and transfer owned child to the fixed-capacity reaper.
     /// Success means accepted for asynchronous cleanup, not confirmed exit.
@@ -2100,19 +2121,35 @@ mod tests {
     }
 
     #[test]
-    fn real_pty_text_area_query_follows_the_family_session_after_resize() {
+    fn real_pty_text_area_queries_follow_the_family_session_after_resize() {
+        use jterm_engine::native_window_ops::NativeWindowPixels;
+
         let script = concat!(
             "stty raw -echo || exit 30; ",
+            "check_reply() { printf '\\033[%st' \"$1\"; ",
+            "actual=$(dd bs=1 count=\"${#2}\" 2>/dev/null); ",
+            "[ \"$actual\" = \"$2\" ]; }; ",
             "check_size() { set -- $(stty size); ",
-            "expected=$(printf '\\033[8;%s;%st' \"$1\" \"$2\"); ",
-            "printf '\\033[18t'; actual=$(dd bs=1 count=\"${#expected}\" 2>/dev/null); ",
-            "[ \"$actual\" = \"$expected\" ]; }; ",
-            "check_size || exit 31; printf 'SIZE_%s\\r\\n' INITIAL; ",
-            "IFS= read -r resume || exit 32; check_size || exit 33; ",
+            "check_reply 18 \"$(printf '\\033[8;%s;%st' \"$1\" \"$2\")\"; }; ",
+            "check_size && check_reply 14 \"$(printf '\\033[4;192;252t')\" ",
+            "&& check_reply 16 \"$(printf '\\033[6;24;12t')\" || exit 31; ",
+            "printf 'SIZE_%s\\r\\n' INITIAL; IFS= read -r resume || exit 32; ",
+            "check_size && check_reply 14 \"$(printf '\\033[4;528;2280t')\" ",
+            "&& check_reply 16 \"$(printf '\\033[6;48;24t')\" || exit 33; ",
             "printf 'SIZE_%s\\r\\n' RESIZED; exit\n",
         );
         let mut session = Session::spawn_family_with_epoch(8, 21, NonZeroU64::MIN, false).unwrap();
         session.enable_ordered_input();
+        session
+            .set_window_pixels(
+                8,
+                21,
+                NativeWindowPixels::Viewport {
+                    width: 252,
+                    height: 192,
+                },
+            )
+            .unwrap();
         session.submit_input(script.as_bytes().to_vec()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut resized = false;
@@ -2124,7 +2161,16 @@ mod tests {
             );
             session.drive().unwrap();
             if !resized && session.terminal().visible_text().contains("SIZE_INITIAL") {
-                session.resize(11, 95).unwrap();
+                session
+                    .resize_with_window_pixels(
+                        11,
+                        95,
+                        Some(NativeWindowPixels::Viewport {
+                            width: 2280,
+                            height: 528,
+                        }),
+                    )
+                    .unwrap();
                 session.submit_input(b"resume\n".to_vec()).unwrap();
                 resized = true;
             }
@@ -2133,7 +2179,7 @@ mod tests {
         assert_eq!(
             session.exit_code(),
             Some(0),
-            "child checks both reply sizes"
+            "child checks all three reply sizes"
         );
         assert!(resized);
         assert!(session.terminal().visible_text().contains("SIZE_RESIZED"));
