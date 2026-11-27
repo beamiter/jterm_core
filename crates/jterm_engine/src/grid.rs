@@ -2736,10 +2736,70 @@ impl ScrollbackLine {
         buf
     }
 
+    fn encode_ascii_color_prefix(
+        cells: &[TerminalCell],
+        preserve_blink: bool,
+        buf: &mut Vec<u8>,
+    ) -> usize {
+        let mut index = 0;
+        while let Some([first, second]) = cells[index..].first_chunk::<2>() {
+            if first.character == second.character
+                || !first.character.is_ascii()
+                || !second.character.is_ascii()
+                || first.foreground != second.foreground
+                || first.background != second.background
+            {
+                break;
+            }
+            let mut record = [0; 1 + 4 + 4 + 4 + 5];
+            record[0] = 1;
+            let mut tail = 2;
+            tail += Self::encode_color(first.foreground, &mut record[tail..]);
+            tail += Self::encode_color(first.background, &mut record[tail..]);
+            while let Some(cell) = cells.get(index) {
+                if !cell.character.is_ascii()
+                    || cell.foreground != first.foreground
+                    || cell.background != first.background
+                {
+                    break;
+                }
+                let mut run = 1u8;
+                while run < u8::MAX && index + usize::from(run) < cells.len() {
+                    if cells[index + usize::from(run)] != *cell {
+                        break;
+                    }
+                    run += 1;
+                }
+                record[1] = cell.character as u8;
+                let flags = Self::encode_flags(&cell.flags);
+                let extra_flags = ((cell.flags.0
+                    & (WIDE_BIT
+                        | WIDE_CONT_BIT
+                        | PRINTED_SPACE_BIT
+                        | OVERLINE_BIT
+                        | CONCEALED_BIT))
+                    >> 9) as u8
+                    | (u8::from(preserve_blink && cell.flags.blink()) * 4)
+                    | (u8::from(cell.flags.tab_padding()) * 16);
+                let [link_low, link_high] = cell.hyperlink_id.as_raw().to_le_bytes();
+                record[tail..tail + 5].copy_from_slice(&[
+                    flags,
+                    extra_flags,
+                    link_low,
+                    link_high,
+                    run,
+                ]);
+                buf.extend_from_slice(&record[..tail + 5]);
+                index += usize::from(run);
+            }
+        }
+        index
+    }
+
     fn encode_cells_into(cells: &[TerminalCell], preserve_blink: bool, buf: &mut Vec<u8>) {
         buf.clear();
         buf.reserve_exact(cells.len() * 3);
-        let mut i = 0;
+        let mut i = Self::encode_ascii_color_prefix(cells, preserve_blink, buf);
         while i < cells.len() {
             let cell = &cells[i];
 
@@ -3589,6 +3649,74 @@ mod decoder_parity {
                 });
                 assert_eq!(actual, expected, "length {length}, width {width}");
             }
+        }
+    }
+
+    #[test]
+    fn reused_archive_colors_preserve_rendition_and_run_boundaries() {
+        let mut style = TerminalCell {
+            foreground: Color::Indexed(36),
+            background: Color::Rgb(31, 12, 177),
+            hyperlink_id: HyperlinkId::from_raw(42),
+            ..TerminalCell::default()
+        };
+        style.flags.set_blink(true);
+        style.flags.set_overline(true);
+
+        let recolored = TerminalCell {
+            foreground: Color::Rgb(182, 1, 9),
+            ..style
+        };
+        let relinked = TerminalCell {
+            hyperlink_id: HyperlinkId::from_raw(300),
+            ..style
+        };
+        let mut concealed = relinked;
+        concealed.flags.set_concealed(true);
+
+        let mut drawn_space = style;
+        drawn_space.flags.set_printed_space(true);
+        let mut tab_space = drawn_space;
+        tab_space.flags.set_tab_padding(true);
+
+        let records = [
+            ('a', 1, style),
+            ('b', 1, style),
+            ('c', 1, style),
+            ('d', 1, style),
+            ('e', 1, relinked),
+            (' ', 1, drawn_space),
+            (' ', 1, tab_space),
+            ('h', 1, concealed),
+            ('x', 255, style),
+            ('x', 3, style),
+            ('r', 1, recolored),
+            ('t', 1, recolored),
+            ('é', 1, style),
+            ('e', 1, style),
+            ('界', 1, style),
+            ('f', 1, recolored),
+            ('g', 1, relinked),
+            ('h', 1, concealed),
+            ('i', 1, concealed),
+            ('😀', 1, concealed),
+            ('z', 1, style),
+        ];
+
+        for preserve_blink in [false, true] {
+            let mut cells = Vec::new();
+            let mut expected = Vec::new();
+            for (character, run, mut cell) in records {
+                cell.character = character;
+                cells.extend(std::iter::repeat_n(cell, usize::from(run)));
+                let mut record = ScrollbackLine::encode_cells(&[cell], preserve_blink);
+                *record.last_mut().unwrap() = run;
+                expected.extend(record);
+            }
+            assert_eq!(
+                ScrollbackLine::encode_cells(&cells, preserve_blink),
+                expected
+            );
         }
     }
 
