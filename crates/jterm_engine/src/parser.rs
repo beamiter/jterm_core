@@ -668,6 +668,14 @@ impl Parser {
                                 match input.get(at) {
                                     Some(b'[') => {
                                         at += 1;
+                                        if at < input.len() {
+                                            if let Some((consumed, event)) =
+                                                complete_short_csi(&input[at..], self.profile)
+                                            {
+                                                at += consumed;
+                                                emit!(event);
+                                            }
+                                        }
                                         self.state = State::Csi {
                                             params: Vec::new(),
                                             intermediates: Vec::new(),
@@ -1180,6 +1188,14 @@ impl Parser {
                         match byte {
                             b'[' => {
                                 at += 1;
+                                if at < input.len() {
+                                    if let Some((consumed, event)) =
+                                        complete_short_csi(&input[at..], self.profile)
+                                    {
+                                        at += consumed;
+                                        emit!(event);
+                                    }
+                                }
                                 self.state = State::Csi {
                                     params: Vec::new(),
                                     intermediates: Vec::new(),
@@ -1369,6 +1385,39 @@ impl Parser {
             }
         }
     }
+}
+
+// Complete short CSI commands without building parser carry. The state machine
+// handles split input, intermediates and parameter lists beyond the lookahead.
+#[inline(never)]
+fn complete_short_csi(input: &[u8], profile: ParserProfile) -> Option<(usize, Event<'_>)> {
+    const MAX_SHORT_PARAMS: usize = 16;
+    let (private_prefix, body) = match input {
+        [first @ (b'<' | b'=' | b'>' | b'?'), rest @ ..] => (Some(*first), rest),
+        _ => (None, input),
+    };
+    let end = body
+        .iter()
+        .take(MAX_SHORT_PARAMS + 1)
+        .position(|&byte| !(0x30..=0x3b).contains(&byte))?;
+    let final_byte = body[end];
+    if !(0x40..=0x7e).contains(&final_byte) {
+        return None;
+    }
+    let consumed = end + 1 + usize::from(private_prefix.is_some());
+    let raw_params = &body[..end];
+    let (params, colon_flags) = parse_profiled_csi_params(raw_params, profile);
+    Some((
+        consumed,
+        Event::Csi {
+            raw_params: raw_params.to_vec(),
+            params,
+            colon_flags,
+            private_prefix,
+            intermediates: Vec::new(),
+            final_byte,
+        },
+    ))
 }
 
 // Keep whole-scalar validation out of the scanner's ASCII hot loop.
@@ -1646,12 +1695,17 @@ mod hot_path_parity {
             b"printable ABC xyz\r\n\t\x07\x0e\x0f".to_vec(),
             b"\x1b[;:12:;65536mX\x1b[2\n;4H".to_vec(),
             b"\x1b[?25h\x1b[>4;1f\x1b[?u".to_vec(),
+            b"\x1b[m\x1b[K\x1b[A\x1b[3D\x1b[?1048$py".to_vec(),
+            b"\x1b[38;2;12;93;255m\x1b[48:2::90:5:111m".to_vec(),
             b"\x1b]0;title\x07x\x1bP$qm\x1b\\Z".to_vec(),
             b"\x1b_Gi=4,m=1;x\x1b\\\x1b_Gi=4;\x18A".to_vec(),
             b"\x1b(0q\x1b(Bz\x1b( % 5\x1bcX".to_vec(),
             b"\xe0\x80A\xf0\x9f\x99\x82\xff\xc2Z".to_vec(),
             b"\x1b]8;;secret\x1b[6n\x07A".to_vec(),
         ];
+        for len in [16, 17] {
+            inputs.push([b"\x1b[?".as_slice(), &b"0".repeat(len), b"mX"].concat());
+        }
         // Every folded introducer, including prefix-only EOF, terminal and
         // cancelled payloads. The existing matrix also splits after ESC and
         // after the introducer, tests empty feeds, and compares capture/ownership.
