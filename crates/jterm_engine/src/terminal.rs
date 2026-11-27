@@ -7,7 +7,10 @@ use crate::{
     graphemes::{self, MAX_CLUSTER_BYTES},
     grid::{PrintCheckpoint, TerminalGrid, WrapCheckpoint},
     history_reflow::{history_rows_retained_bytes, HistoryCopyRow, HistoryLayout},
-    hyperlink::{resolve_resource, HyperlinkPolicy, HyperlinkResources, HyperlinkTable},
+    hyperlink::{
+        capture_row_hyperlinks, resolve_resource, HyperlinkPolicy, HyperlinkResources,
+        HyperlinkTable,
+    },
     kitty_graphics::{self, inline::InlineGraphics},
     mouse::MouseInput,
     parser::{Event, Parser, ParserLimits, ParserProfile, StringKind},
@@ -471,18 +474,6 @@ struct FrameLinks {
     scratch: Vec<HyperlinkId>,
 }
 
-fn capture_row_links(row: &Row, ids: &mut Vec<HyperlinkId>) {
-    ids.clear();
-    for cell in row.cells.iter() {
-        let id = cell.hyperlink_id;
-        if !id.is_none() && ids.last() != Some(&id) {
-            ids.push(id);
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-}
-
 impl FrameLinks {
     fn capture(
         &mut self,
@@ -503,7 +494,7 @@ impl FrameLinks {
                 {
                     std::mem::swap(&mut self.rows[origin], &mut self.relocated[index]);
                 } else {
-                    capture_row_links(row, &mut self.relocated[index]);
+                    capture_row_hyperlinks(&row.cells, &mut self.relocated[index]);
                 }
             }
             std::mem::swap(&mut self.rows, &mut self.relocated);
@@ -522,7 +513,7 @@ impl FrameLinks {
             if previous.is_some_and(|frame| Arc::ptr_eq(&frame.rows()[index].cells, &row.cells)) {
                 continue;
             }
-            capture_row_links(row, &mut self.scratch);
+            capture_row_hyperlinks(&row.cells, &mut self.scratch);
             if *ids != self.scratch {
                 std::mem::swap(ids, &mut self.scratch);
                 links_changed = true;
@@ -893,14 +884,6 @@ impl Terminal {
             input.active = None;
             input.provisional = None;
         }
-    }
-
-    fn hyperlink_snapshot<'a>(
-        &self,
-        rows: impl Iterator<Item = &'a Row>,
-    ) -> Option<HyperlinkResources> {
-        let (_, table) = self.hyperlinks.as_ref()?;
-        table.snapshot(rows.flat_map(|row| row.cells.iter().map(|cell| cell.hyperlink_id)))
     }
 
     /// Paint publication only; parsing, PTY draining and replies remain live.
@@ -1445,7 +1428,7 @@ impl Terminal {
             .take(end - start)
             .map(HistoryCopyRow::from_line)
             .collect();
-        self.make_history_page(offset, total_rows, rows)
+        self.make_history_page(offset, total_rows, rows, false)
     }
 
     fn make_history_page(
@@ -1453,14 +1436,30 @@ impl Terminal {
         offset: usize,
         total_rows: usize,
         rows: Arc<[HistoryCopyRow]>,
+        cached_links: bool,
     ) -> Result<HistoryPage, String> {
+        let hyperlinks = self.hyperlinks.as_ref().and_then(|(_, table)| {
+            if cached_links {
+                table.snapshot(
+                    rows.iter()
+                        .filter_map(|row| row.hyperlink_ids.as_deref())
+                        .flatten()
+                        .copied(),
+                )
+            } else {
+                table.snapshot(
+                    rows.iter()
+                        .flat_map(|row| row.row.cells.iter().map(|cell| cell.hyperlink_id)),
+                )
+            }
+        });
         let mut page = HistoryPage {
             revision: self.revision,
             offset,
             total_rows,
             row_count: rows.len(),
             text: String::new(),
-            hyperlinks: self.hyperlink_snapshot(rows.iter().map(|row| &row.row)),
+            hyperlinks,
             paint_colors: self.colors.clone(),
             rows,
         };
@@ -2868,6 +2867,7 @@ mod offset_specialization_tests {
                         },
                         underline_colors: None,
                         annotations: Some(Arc::new(annotations)),
+                        hyperlink_ids: None,
                         synthetic_gap: (row % 2 == 0).then_some(10),
                     }
                 })
@@ -2915,6 +2915,7 @@ mod offset_specialization_tests {
                 },
                 underline_colors: None,
                 annotations: None,
+                hyperlink_ids: None,
                 synthetic_gap: None,
             }];
             let expected = extract_selection::<true, true>(&rows, (0, 0), (1, 0), false, None);

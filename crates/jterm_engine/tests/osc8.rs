@@ -160,6 +160,45 @@ fn primary_history_owns_referenced_targets_after_alternate_and_reset() {
 }
 
 #[test]
+fn overlapping_history_pages_resolve_only_their_own_links() {
+    let mut terminal = terminal();
+    let third = "https://example.test/third";
+    let input = format!(
+        "{}first\x1b]8;;\x07\r\n{}second\x1b]8;;\x07\r\nplain\r\n{}third\x1b]8;;\x07\r\nlive\r\nhere",
+        open("", FIRST),
+        open("", SECOND),
+        open("", third),
+    );
+    terminal.feed(input.as_bytes()).unwrap();
+    let layout = terminal.history_layout().unwrap();
+    assert_eq!(layout.len(), 4);
+    let first = terminal
+        .projected_history_viewport_page(&layout, 0, 2)
+        .unwrap();
+    let first_id = first.row(0).unwrap().cells[0].hyperlink_id;
+    let second_id = first.row(1).unwrap().cells[0].hyperlink_id;
+    assert_eq!(first.hyperlink_target(first_id), Some(FIRST));
+    assert_eq!(first.hyperlink_target(second_id), Some(SECOND));
+
+    let next = terminal
+        .projected_history_viewport_page(&layout, 1, 2)
+        .unwrap();
+    assert_eq!(next.text, "second\nplain");
+    assert_eq!(next.hyperlink_target(first_id), None);
+    assert_eq!(next.hyperlink_target(second_id), Some(SECOND));
+
+    let last = terminal
+        .projected_history_viewport_page(&layout, 2, 2)
+        .unwrap();
+    let third_id = last.row(1).unwrap().cells[0].hyperlink_id;
+    assert_eq!(last.text, "plain\nthird");
+    assert_eq!(last.hyperlink_target(second_id), None);
+    assert_eq!(last.hyperlink_target(third_id), Some(third));
+    assert_eq!(first.hyperlink_target(first_id), Some(FIRST));
+    assert_eq!(first.hyperlink_target(third_id), None);
+}
+
+#[test]
 fn standalone_retains_at_most_one_mebibyte_of_unique_targets() {
     let mut terminal = terminal();
     let target = |index| {

@@ -1,8 +1,6 @@
-use crate::screen::ScreenState;
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::Arc,
-};
+use crate::{grid::TerminalCell, screen::ScreenState};
+use smallvec::{smallvec, SmallVec};
+use std::{collections::HashMap, sync::Arc};
 
 /// Compact reference stored in each terminal cell. Zero means no hyperlink.
 #[repr(transparent)]
@@ -48,6 +46,18 @@ pub struct HyperlinkTable {
 
 pub(crate) type HyperlinkResources = Arc<[(HyperlinkId, Arc<str>)]>;
 
+pub(crate) fn capture_row_hyperlinks(cells: &[TerminalCell], ids: &mut Vec<HyperlinkId>) {
+    ids.clear();
+    for cell in cells {
+        let id = cell.hyperlink_id;
+        if !id.is_none() && ids.last() != Some(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+}
+
 pub(crate) fn resolve_resource(
     resources: &Option<HyperlinkResources>,
     id: HyperlinkId,
@@ -61,25 +71,43 @@ pub(crate) fn retain_resources(
     resources: &HyperlinkResources,
     ids: impl Iterator<Item = HyperlinkId>,
 ) -> Option<HyperlinkResources> {
-    let mut retained = BTreeSet::new();
-    for id in ids.filter(|id| !id.is_none()) {
-        if resources.binary_search_by_key(&id, |(id, _)| *id).is_ok() {
-            retained.insert(id);
+    let maximum = usize::from(resources.last()?.0.as_raw());
+    // Track missing targets without a lookup for every cell in a linked run.
+    // The common interner range fits inline, with a bounded spill for sparse IDs.
+    let mut missing: SmallVec<[u64; MAX_HYPERLINKS.div_ceil(64)]> =
+        smallvec![0; maximum.div_ceil(64)];
+    for (id, _) in resources.iter() {
+        if let Some(index) = usize::from(id.as_raw()).checked_sub(1) {
+            missing[index / 64] |= 1 << (index % 64);
         }
     }
-    if retained.is_empty() {
-        None
-    } else if retained.len() == resources.len() {
-        Some(Arc::clone(resources))
-    } else {
-        Some(
-            resources
-                .iter()
-                .filter(|(id, _)| retained.contains(id))
-                .cloned()
-                .collect(),
-        )
+    let mut count = 0;
+    for id in ids {
+        let raw = usize::from(id.as_raw());
+        if raw != 0 && raw <= maximum {
+            let index = raw - 1;
+            let mask = 1 << (index % 64);
+            let word = &mut missing[index / 64];
+            if *word & mask != 0 {
+                *word &= !mask;
+                count += 1;
+                if count == resources.len() {
+                    return Some(Arc::clone(resources));
+                }
+            }
+        }
     }
+    let retained = resources.iter().filter(|(id, _)| {
+        usize::from(id.as_raw())
+            .checked_sub(1)
+            .is_some_and(|index| missing[index / 64] & (1 << (index % 64)) == 0)
+    });
+    if count == 0 {
+        return None;
+    }
+    let mut targets = Vec::with_capacity(count);
+    targets.extend(retained.cloned());
+    Some(targets.into())
 }
 
 impl HyperlinkTable {
@@ -369,6 +397,39 @@ mod frost_tests {
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
+
+    #[test]
+    fn filter_retains_only_references_to_sparse_resources() {
+        let resources: HyperlinkResources = [1, 64, 65, 4096, u16::MAX]
+            .into_iter()
+            .map(|raw| (HyperlinkId::from_raw(raw), Arc::from(format!("link-{raw}"))))
+            .collect();
+        let present = [u16::MAX, 65, 0, 65534, 65, 2, 64].map(HyperlinkId::from_raw);
+        let retained = retain_resources(&resources, present.into_iter()).unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|(id, _)| id.as_raw())
+                .collect::<Vec<_>>(),
+            [64, 65, u16::MAX]
+        );
+        assert!(retain_resources(
+            &resources,
+            [0, 2, 65534].map(HyperlinkId::from_raw).into_iter()
+        )
+        .is_none());
+        let all = retain_resources(
+            &resources,
+            resources
+                .iter()
+                .map(|(id, _)| *id)
+                .chain(std::iter::once_with(|| {
+                    panic!("stop reading cells once every stored link is referenced")
+                })),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&all, &resources));
+    }
 
     #[test]
     fn bounded_snapshots_order_unique_installed_ids_across_bitmap_words() {

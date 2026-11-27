@@ -1,5 +1,6 @@
 use crate::{
     frame::Row,
+    hyperlink::{capture_row_hyperlinks, HyperlinkId},
     retained_bytes::{RetainedBytes, RetainedBytesBudget},
     row_annotations::RowAnnotations,
     ScrollbackLine, TerminalCell, UnderlineColorRun,
@@ -164,6 +165,7 @@ pub(crate) struct HistoryCopyRow {
     pub(crate) row: Row,
     pub(crate) underline_colors: Option<Arc<[UnderlineColorRun]>>,
     pub(crate) annotations: Option<Arc<RowAnnotations>>,
+    pub(crate) hyperlink_ids: Option<Arc<[HyperlinkId]>>,
     // Physical addressing retains this slot. Only text extraction omits it.
     pub(crate) synthetic_gap: Option<usize>,
 }
@@ -178,8 +180,14 @@ impl HistoryCopyRow {
             underline_colors: (!line.underline_color_runs().is_empty())
                 .then(|| Arc::from(line.underline_color_runs())),
             annotations: line.row_annotations().cloned(),
+            hyperlink_ids: None,
             synthetic_gap: line.synthetic_margin_gap(),
         }
+    }
+
+    fn cache_hyperlinks(&mut self, ids: &mut Vec<HyperlinkId>) {
+        capture_row_hyperlinks(&self.row.cells, ids);
+        self.hyperlink_ids = (!ids.is_empty()).then(|| Arc::from(ids.as_slice()));
     }
 }
 
@@ -200,6 +208,10 @@ pub(crate) fn history_rows_retained_bytes(rows: &[HistoryCopyRow]) -> usize {
                         .annotations
                         .as_ref()
                         .map_or(0, |data| data.retained_bytes())
+                    + row
+                        .hyperlink_ids
+                        .as_deref()
+                        .map_or(0, |ids| header + std::mem::size_of_val(ids))
             })
             .sum::<usize>()
 }
@@ -215,6 +227,7 @@ pub(crate) struct HistoryViewportCache(Option<CachedViewport>);
 struct CachedViewport {
     first: usize,
     rows: Arc<[HistoryCopyRow]>,
+    links_cached: bool,
     lease: RetainedBytes,
 }
 
@@ -223,27 +236,44 @@ impl HistoryViewportCache {
         &mut self,
         range: Range<usize>,
         mut materialize: impl FnMut(usize) -> HistoryCopyRow,
+        collect_links: bool,
         budget: &Arc<RetainedBytesBudget>,
-    ) -> Arc<[HistoryCopyRow]> {
+    ) -> (Arc<[HistoryCopyRow]>, bool) {
         let first = range.start;
-        let cached = self.0.as_ref();
-        if let Some(window) =
-            cached.filter(|window| window.first == first && window.rows.len() == range.len())
-        {
-            return Arc::clone(&window.rows);
+        let cached = self
+            .0
+            .as_ref()
+            .filter(|window| window.first < range.end && first < window.first + window.rows.len());
+        // A page jump needs its link table once. Build row summaries when a
+        // later overlapping request can reuse them during scrolling.
+        let cache_links = collect_links && cached.is_some();
+        let links_ready = cached.is_some_and(|window| window.links_cached);
+        if let Some(window) = cached.filter(|window| {
+            window.first == first
+                && window.rows.len() == range.len()
+                && (!cache_links || links_ready)
+        }) {
+            return (Arc::clone(&window.rows), links_ready);
         }
-        let rows: Arc<[HistoryCopyRow]> = range
-            .map(|index| {
-                let retained = cached.and_then(|window| {
-                    index
+        let rows: Arc<[HistoryCopyRow]> = if let Some(window) = cached {
+            let mut ids = Vec::new();
+            range
+                .map(|index| {
+                    let retained = index
                         .checked_sub(window.first)
-                        .and_then(|row| window.rows.get(row))
-                });
-                retained.cloned().unwrap_or_else(|| materialize(index))
-            })
-            .collect();
+                        .and_then(|row| window.rows.get(row));
+                    let mut row = retained.cloned().unwrap_or_else(|| materialize(index));
+                    if cache_links && (!links_ready || retained.is_none()) {
+                        row.cache_hyperlinks(&mut ids);
+                    }
+                    row
+                })
+                .collect()
+        } else {
+            range.map(materialize).collect()
+        };
         if rows.is_empty() {
-            return rows;
+            return (rows, cache_links);
         }
         let bytes = history_rows_retained_bytes(&rows);
         // A cache miss or a full budget leaves delivery available. The layout
@@ -252,15 +282,17 @@ impl HistoryViewportCache {
             if window.lease.try_resize(bytes) {
                 window.first = first;
                 window.rows = Arc::clone(&rows);
+                window.links_cached = cache_links;
             }
         } else if let Some(lease) = budget.reserve(bytes) {
             self.0 = Some(CachedViewport {
                 first,
                 rows: Arc::clone(&rows),
+                links_cached: cache_links,
                 lease,
             });
         }
-        rows
+        (rows, cache_links)
     }
 }
 
@@ -278,6 +310,7 @@ fn viewport_cache_serves_larger_windows_when_the_retention_budget_is_full() {
             },
             underline_colors: None,
             annotations: None,
+            hyperlink_ids: None,
             synthetic_gap: None,
         }
     }
@@ -285,17 +318,17 @@ fn viewport_cache_serves_larger_windows_when_the_retention_budget_is_full() {
     let capacity = history_rows_retained_bytes(&[row(0)]);
     let budget = Arc::new(RetainedBytesBudget::new(capacity));
     let mut cache = HistoryViewportCache::default();
-    let first = cache.read(0..1, row, &budget);
+    let (first, _) = cache.read(0..1, row, false, &budget);
     assert_eq!(budget.usage().retained_bytes, capacity);
 
-    let larger = cache.read(0..2, row, &budget);
+    let (larger, _) = cache.read(0..2, row, false, &budget);
     assert!(Arc::ptr_eq(&first[0].row.cells, &larger[0].row.cells));
     assert_eq!(larger[1].row.cells[0].character, 'b');
     assert_eq!(budget.usage().retained_bytes, capacity);
-    let first_again = cache.read(0..1, |_| panic!("original cached row"), &budget);
+    let (first_again, _) = cache.read(0..1, |_| panic!("original cached row"), false, &budget);
     assert!(Arc::ptr_eq(&first, &first_again));
 
-    let replacement = cache.read(1..2, row, &budget);
+    let (replacement, _) = cache.read(1..2, row, false, &budget);
     assert!(!Arc::ptr_eq(
         &larger[1].row.cells,
         &replacement[0].row.cells

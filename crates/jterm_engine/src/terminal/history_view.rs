@@ -171,6 +171,7 @@ impl Terminal {
                         },
                         underline_colors: None,
                         annotations: line.row_annotations().cloned(),
+                        hyperlink_ids: None,
                         synthetic_gap: line.synthetic_margin_gap(),
                     }
                 } else {
@@ -182,6 +183,7 @@ impl Terminal {
                         },
                         underline_colors: None,
                         annotations: grid.row_annotations(index).cloned(),
+                        hyperlink_ids: None,
                         synthetic_gap: grid.synthetic_margin_gap(index),
                     }
                 }
@@ -433,12 +435,21 @@ impl Terminal {
             None => HistoryCopyRow::from_line(&self.history[index]),
         };
         let cache = use_cache.then(|| layout.viewport.lock().ok()).flatten();
-        let rows = if let Some(mut cache) = cache {
-            cache.read(first..end, materialize, process_history_viewport_budget())
+        let (rows, cached_links) = if let Some(mut cache) = cache {
+            let collect_links = self
+                .hyperlinks
+                .as_ref()
+                .is_some_and(|(_, table)| !table.is_empty());
+            cache.read(
+                first..end,
+                materialize,
+                collect_links,
+                process_history_viewport_budget(),
+            )
         } else {
-            (first..end).map(materialize).collect()
+            ((first..end).map(materialize).collect(), false)
         };
-        self.make_history_page(layout.len() - end, layout.len(), rows)
+        self.make_history_page(layout.len() - end, layout.len(), rows, cached_links)
     }
 }
 
@@ -479,6 +490,7 @@ impl<'a> HistoryReader<'a> {
                 },
                 underline_colors: None,
                 annotations: None,
+                hyperlink_ids: None,
                 synthetic_gap: None,
             };
         }
@@ -585,6 +597,7 @@ impl<'a> HistoryReader<'a> {
             },
             underline_colors: (!underline.is_empty()).then(|| underline.into()),
             annotations: (!annotations.is_empty()).then(|| Arc::new(annotations)),
+            hyperlink_ids: None,
             synthetic_gap: None,
         }
     }
