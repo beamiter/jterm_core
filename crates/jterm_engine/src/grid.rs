@@ -2121,20 +2121,18 @@ impl ScrollbackLine {
         preserve_blink: bool,
         scratch: Option<&mut Vec<u8>>,
     ) -> Self {
-        let needs_encoded_flags = |flags: StyleFlags| {
-            !flags.is_default_style()
-                || flags.0
-                    & (WIDE_BIT | WIDE_CONT_BIT | PRINTED_SPACE_BIT | OVERLINE_BIT | CONCEALED_BIT)
-                    != 0
-        };
+        let needs_encoded_flags =
+            |flags: StyleFlags| flags.0 & !(PROTECTED_BIT | TAB_PADDING_BIT) != 0;
         let default_colors_and_no_link = |cell: &TerminalCell| {
             cell.foreground == Color::Default
                 && cell.background == Color::Default
                 && cell.hyperlink_id.is_none()
         };
+        let mut scanned_flags = 0;
         let active_len = cells
             .iter()
             .rposition(|cell| {
+                scanned_flags |= cell.flags.0;
                 cell.character != ' '
                     || needs_encoded_flags(cell.flags)
                     || !default_colors_and_no_link(cell)
@@ -2147,7 +2145,11 @@ impl ScrollbackLine {
             .rposition(|cell| !cell.is_reflow_trimmable_blank())
             .map_or(0, |index| index + 1);
         // Include trimmed cells so their drawn spaces can still be restored.
-        let row_flags = StyleFlags(cells.iter().fold(0, |bits, cell| bits | cell.flags.0));
+        let row_flags = StyleFlags(
+            active
+                .iter()
+                .fold(scanned_flags, |bits, cell| bits | cell.flags.0),
+        );
         let mut reflow_wide_continuations: SmallVec<[u16; 2]> = if row_flags.wide_continuation() {
             cells[..reflow_content_len]
                 .iter()
