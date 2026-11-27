@@ -138,7 +138,7 @@ pub enum RejectReason {
 }
 #[derive(PartialEq, Eq)]
 pub enum Event<'a> {
-    /// Frost-only token boundary with no terminal semantic action.
+    /// Parser token boundary with no terminal semantic action.
     Boundary,
     Print(char),
     Ascii(&'a [u8]),

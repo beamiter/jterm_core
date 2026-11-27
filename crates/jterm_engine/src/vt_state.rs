@@ -205,7 +205,8 @@ impl VtState {
             Event::Control(10..=12) => {
                 h.native_effect(NativeEffect::Vertical(VerticalMotion::LineFeed))
             }
-            Event::Control(_) | Event::Charset { .. } | Event::Boundary => {}
+            Event::Control(_) | Event::Charset { .. } => {}
+            Event::Boundary => return,
             Event::Escape {
                 intermediates,
                 final_byte,
@@ -2200,6 +2201,24 @@ mod tests {
                 assert!(!host.vt.protocol.modes().contains(&1));
                 feed(&mut host, b"\x1b[?1r", None);
                 assert!(host.vt.protocol.modes().contains(&1));
+            }
+        }
+    }
+
+    #[test]
+    fn ember_discarded_csi_boundaries_do_not_observe_native_takeover() {
+        for packet in [b"\x1b[!6h".as_slice(), b"\x1b[?6?7h"] {
+            for split in 0..=packet.len() {
+                let mut host = Host::new(NativeProfile::Ember);
+                VtState::feed_ember(&mut host, &packet[..split], None);
+                VtState::feed_ember(&mut host, &packet[split..], None);
+                assert!(
+                    host.trace.is_empty(),
+                    "{packet:?} split {split}: {:?}",
+                    host.trace
+                );
+                VtState::feed_ember(&mut host, b"x", None);
+                assert!(host.trace.iter().any(|effect| effect == "observe"));
             }
         }
     }
