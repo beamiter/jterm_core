@@ -746,7 +746,8 @@ impl Parser {
                     intermediates,
                 } => {
                     if let Some(&byte) = input.get(at) {
-                        if (0x30..=0x3f).contains(&byte)
+                        let param_end = if self.bounded { 0x3b } else { 0x3f };
+                        if (0x30..=param_end).contains(&byte)
                             && (!self.bounded || intermediates.is_empty())
                         {
                             let limit = if self.profile == ParserProfile::FrostLegacyV1 {
@@ -756,7 +757,7 @@ impl Parser {
                             };
                             let length = input[at..]
                                 .iter()
-                                .take_while(|&&byte| (0x30..=0x3f).contains(&byte))
+                                .take_while(|&&byte| (0x30..=param_end).contains(&byte))
                                 .count();
                             let retained = length.min(limit - params.len());
                             params.extend_from_slice(&input[at..at + retained]);
@@ -1279,7 +1280,10 @@ impl Parser {
                     at += 1;
                     match byte {
                         0x30..=0x3f => {
-                            if self.bounded && !intermediates.is_empty() {
+                            if self.bounded
+                                && (!intermediates.is_empty()
+                                    || (byte >= 0x3c && !params.is_empty()))
+                            {
                                 self.state = State::DiscardCsi;
                                 abandon!(Some(Event::Boundary));
                             }
@@ -1312,6 +1316,7 @@ impl Parser {
                                 final_byte: byte
                             });
                         }
+                        0x7f if self.bounded => {}
                         8..=15 => {
                             self.state = State::Csi {
                                 params,

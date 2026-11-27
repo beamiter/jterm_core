@@ -174,3 +174,17 @@ fn embedded_escape_controls_keep_decsc_framing_at_every_partition() {
         }
     }
 }
+
+#[test]
+fn hosted_csi_del_preserves_cursor_parameters_and_following_query_at_every_split() {
+    let packet = b"\x1b[H\x1b[2\x7f;3H\x1b[6n";
+    for split in 0..=packet.len() {
+        let mut terminal = jterm_engine::terminal::Terminal::new(4, 8).unwrap();
+        let mut reply = terminal.feed(&packet[..split]).unwrap();
+        reply.extend(terminal.feed(&packet[split..]).unwrap());
+        assert_eq!(reply, b"\x1b[2;3R", "split {split}");
+        let frame = terminal.frame().unwrap();
+        assert_eq!((frame.cursor().row, frame.cursor().col), (1, 2));
+        assert_eq!(terminal.unsupported_count(), 0);
+    }
+}

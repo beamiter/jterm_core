@@ -378,6 +378,7 @@ pub(super) struct HistoryReader<'a> {
     raw: &'a VecDeque<ScrollbackLine>,
     cached: Option<usize>,
     decoded: Vec<TerminalCell>,
+    projected: Vec<TerminalCell>,
     first: u64,
     single_column: bool,
 }
@@ -388,6 +389,7 @@ impl<'a> HistoryReader<'a> {
             raw,
             cached: None,
             decoded: Vec::new(),
+            projected: Vec::new(),
             first: layout.extent.start,
             single_column: layout.columns == 1,
         }
@@ -395,7 +397,9 @@ impl<'a> HistoryReader<'a> {
 
     pub(super) fn read(&mut self, row: ProjectedHistoryRow) -> HistoryCopyRow {
         let width = usize::from(row.cells);
-        let mut cells = Vec::with_capacity(width);
+        let mut cells = std::mem::take(&mut self.projected);
+        cells.clear();
+        cells.reserve(width);
         let mut underline: Vec<UnderlineColorRun> = Vec::new();
         let mut annotations = RowAnnotations::default();
         let mut index = (row.anchor.row - self.first) as usize;
@@ -486,13 +490,15 @@ impl<'a> HistoryReader<'a> {
             column = 0;
             index += 1;
         }
+        let shared = if cells.is_empty() {
+            empty_projected_cells()
+        } else {
+            Arc::from(cells.as_slice())
+        };
+        self.projected = cells;
         HistoryCopyRow {
             row: Row {
-                cells: if cells.is_empty() {
-                    empty_projected_cells()
-                } else {
-                    cells.into()
-                },
+                cells: shared,
                 wrapped: row.wrapped,
             },
             underline_colors: (!underline.is_empty()).then(|| underline.into()),
@@ -549,6 +555,31 @@ mod underline_projection_tests {
                 line
             })
             .collect()
+    }
+
+    #[test]
+    fn projected_rows_remain_immutable_when_the_reader_reuses_its_cell_buffer() {
+        let raw = history(false);
+        let layout = HistoryLayout::new(&raw, 0..2, 3);
+        let rows = layout.projected.as_ref().unwrap();
+        let mut reader = HistoryReader::new(&raw, &layout);
+        let first = reader.read(rows[0]);
+        let original = first.row.cells.to_vec();
+        let original_underline = first.underline_colors.clone();
+        let second = reader.read(rows[1]);
+        let third = reader.read(rows[2]);
+        let text = |row: &HistoryCopyRow| {
+            row.row
+                .cells
+                .iter()
+                .map(|cell| cell.character)
+                .collect::<String>()
+        };
+        assert_eq!(text(&first), "ABC");
+        assert_eq!(text(&second), "DEF");
+        assert_eq!(text(&third), "GH");
+        assert_eq!(first.row.cells.as_ref(), original.as_slice());
+        assert_eq!(first.underline_colors, original_underline);
     }
 
     #[test]

@@ -180,7 +180,7 @@ fn csi_standard_syntax_and_xterm_extensions() {
 }
 #[test]
 fn empty_fields_and_colon_syntax_preserve_raw_bytes() {
-    let input = b"\x1b[;5H\x1b[38:2::1:2:3m\x1b[;;g\x1b[1?2;999999P";
+    let input = b"\x1b[;5H\x1b[38:2::1:2:3m\x1b[;;g\x1b[12;999999P";
     for (profile, cup, sgr, tbc) in [
         (
             ParserProfile::EmberV1,
@@ -205,7 +205,7 @@ fn empty_fields_and_colon_syntax_preserve_raw_bytes() {
                     csi(b";5", &cup, None, b"", b'H'),
                     Token::Csi(b"38:2::1:2:3".to_vec(), sgr, flags, None, vec![], b'm'),
                     csi(b";;", &tbc, None, b"", b'g'),
-                    csi(b"1?2;999999", &[12, u16::MAX], None, b"", b'P'),
+                    csi(b"12;999999", &[12, u16::MAX], None, b"", b'P'),
                 ],
                 rejected: 0,
                 abandoned_apc: 0,
@@ -703,6 +703,72 @@ fn bounded_csi_rejects_parameters_after_intermediates_until_final_or_restart() {
     );
     check(
         b"\x1b[ 4\x1b[6n",
+        vec![csi(b"6", &[6], None, b"", b'n')],
+        128,
+        0,
+        0,
+    );
+}
+
+#[test]
+fn bounded_csi_ignores_del_at_parameter_and_intermediate_positions() {
+    check(
+        b"\x1b[2\x7f;3H",
+        vec![csi(b"2;3", &[2, 3], None, b"", b'H')],
+        128,
+        0,
+        0,
+    );
+    check(
+        b"\x1b[4 \x7fq",
+        vec![csi(b"4", &[4], None, b" ", b'q')],
+        128,
+        0,
+        0,
+    );
+}
+
+#[test]
+fn bounded_csi_private_markers_only_start_the_parameter_field() {
+    for prefix in b"<=>?" {
+        for params in [b"4".as_slice(), b";", b":", b"?"] {
+            let mut bytes = b"\x1b[".to_vec();
+            bytes.extend_from_slice(params);
+            bytes.extend_from_slice(&[*prefix, b'C', b'Z']);
+            check(&bytes, text("Z"), 128, 0, 0);
+        }
+        let bytes = [0x1b, b'[', *prefix, b'4', b';', b'2', b'C'];
+        check(
+            &bytes,
+            vec![csi(b"4;2", &[4, 2], Some(*prefix), b"", b'C')],
+            128,
+            0,
+            0,
+        );
+    }
+    check(
+        b"\x1b[?4:2n",
+        vec![Token::Csi(
+            b"4:2".to_vec(),
+            vec![4, 2],
+            vec![false, true],
+            Some(b'?'),
+            vec![],
+            b'n',
+        )],
+        128,
+        0,
+        0,
+    );
+    check(
+        b"\x1b[4?\x07CZ",
+        vec![Token::Control(7), Token::Print('Z')],
+        128,
+        0,
+        0,
+    );
+    check(
+        b"\x1b[4?\x1b[6n",
         vec![csi(b"6", &[6], None, b"", b'n')],
         128,
         0,
