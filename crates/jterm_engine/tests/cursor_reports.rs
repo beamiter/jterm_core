@@ -148,3 +148,29 @@ fn fragmented_nonempty_dsr_intermediates_emit_no_reply_or_grid_change() {
         }
     }
 }
+
+#[test]
+fn embedded_escape_controls_keep_decsc_framing_at_every_partition() {
+    for (packet, reply) in [
+        (
+            b"\x1b[2;3H\x1b\x077\x1b[4;5H\x1b8\x1b[6n".as_slice(),
+            b"\x1b[2;3R".as_slice(),
+        ),
+        (b"\x1b[2;3H\x1b\x7f7\x1b[4;5H\x1b8\x1b[6n", b"\x1b[2;3R"),
+        (b"\x1b[2;3H\x1b\n7\x1b[4;5H\x1b8\x1b[6n", b"\x1b[3;3R"),
+    ] {
+        for split in 0..=packet.len() {
+            let mut terminal = jterm_engine::terminal::Terminal::new(8, 12).unwrap();
+            let mut actual = terminal.feed(&packet[..split]).unwrap();
+            actual.extend(terminal.feed(&packet[split..]).unwrap());
+            assert_eq!(actual, reply, "split {split}, input {packet:?}");
+            assert_eq!(terminal.unsupported_count(), 0);
+            assert!(terminal
+                .frame()
+                .unwrap()
+                .rows()
+                .iter()
+                .all(|row| row.cells.iter().all(|cell| cell.character == ' ')));
+        }
+    }
+}

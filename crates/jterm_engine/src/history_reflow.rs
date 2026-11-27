@@ -102,6 +102,12 @@ impl HistoryLayout {
         for (index, line) in history.iter().enumerate() {
             let row = first + index as u64;
             let length = source_columns(line);
+            if columns > 1 && start.is_none() && !line.is_wrapped && length <= columns {
+                // A complete logical line needs no wrapping or continuation checks.
+                push_projected(&mut rows, HistoryAnchor { row, column: 0 }, length, false)?;
+                wrapped_tail = false;
+                continue;
+            }
             let continuations = line.reflow_wide_continuations();
             let mut column = 0;
             start.get_or_insert(HistoryAnchor { row, column: 0 });

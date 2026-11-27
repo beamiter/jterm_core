@@ -226,9 +226,10 @@ impl HistoryPage {
     /// Blank padding and wide continuation cells can share an offset.
     pub fn copy_offsets_utf16(&self) -> Result<Vec<Vec<u32>>, String> {
         let mut offsets = Vec::with_capacity(self.row_count);
-        // Release offset delivery needs only lengths and trimming boundaries.
-        // Debug builds retain the original single text pass and consistency check.
-        let text = extract_selection::<{ cfg!(debug_assertions) }>(
+        // Page construction already checks the text byte limit. Release
+        // delivery needs only UTF-16 lengths and trimming boundaries.
+        // Debug builds also materialize text for the consistency check.
+        let text = extract_selection::<{ cfg!(debug_assertions) }, false>(
             &self.rows,
             (0, 0),
             (self.row_count, 0),
@@ -275,7 +276,7 @@ fn selection_text(
     end: (usize, usize),
     require_literal: bool,
 ) -> Result<String, String> {
-    extract_selection::<true>(rows, start, end, require_literal, None)
+    extract_selection::<true, true>(rows, start, end, require_literal, None)
 }
 
 fn append_copy_cell(
@@ -291,7 +292,7 @@ fn append_copy_cell(
     }
 }
 
-fn extract_selection<const MATERIALIZE: bool>(
+fn extract_selection<const MATERIALIZE: bool, const CHECK_COPY_BYTES: bool>(
     rows: &[HistoryCopyRow],
     start: (usize, usize),
     end: (usize, usize),
@@ -336,7 +337,9 @@ fn extract_selection<const MATERIALIZE: bool>(
                 if MATERIALIZE {
                     text.push_str(cluster);
                 } else {
-                    text_bytes += cluster.len();
+                    if CHECK_COPY_BYTES {
+                        text_bytes += cluster.len();
+                    }
                     let trailing = cluster.len() - cluster.trim_end_matches(' ').len();
                     trailing_spaces = if trailing == cluster.len() {
                         trailing_spaces + trailing
@@ -351,7 +354,9 @@ fn extract_selection<const MATERIALIZE: bool>(
                 if MATERIALIZE {
                     text.push(cell.character);
                 } else {
-                    text_bytes += cell.character.len_utf8();
+                    if CHECK_COPY_BYTES {
+                        text_bytes += cell.character.len_utf8();
+                    }
                     trailing_spaces = if cell.character == ' ' {
                         trailing_spaces + 1
                     } else {
@@ -363,7 +368,13 @@ fn extract_selection<const MATERIALIZE: bool>(
                 }
             }
             if cell.flags.printed_space() {
-                printed_space_end = if MATERIALIZE { text.len() } else { text_bytes };
+                printed_space_end = if MATERIALIZE {
+                    text.len()
+                } else if CHECK_COPY_BYTES {
+                    text_bytes
+                } else {
+                    units as usize
+                };
             }
         }
         if let (Some(offsets), Some(mut boundaries)) = (offsets.as_deref_mut(), boundaries) {
@@ -372,11 +383,17 @@ fn extract_selection<const MATERIALIZE: bool>(
         }
         if index < end.0 && !source.row.wrapped {
             // Physical trailing blank padding is not copied across a hard line.
-            let length = if MATERIALIZE { text.len() } else { text_bytes };
+            let length = if MATERIALIZE {
+                text.len()
+            } else if CHECK_COPY_BYTES {
+                text_bytes
+            } else {
+                units as usize
+            };
             let trimmed = if MATERIALIZE {
                 text.trim_end_matches(' ').len()
             } else {
-                text_bytes - trailing_spaces
+                length - trailing_spaces
             };
             let end = trimmed.max(printed_space_end);
             if let Some(offsets) = offsets.as_deref_mut() {
@@ -396,19 +413,24 @@ fn extract_selection<const MATERIALIZE: bool>(
                 text.truncate(end);
             } else {
                 trailing_spaces = trailing_spaces.saturating_sub(length - end);
-                text_bytes = end;
+                if CHECK_COPY_BYTES {
+                    text_bytes = end;
+                }
             }
             if index + 1 < rows.len() {
                 if MATERIALIZE {
                     text.push('\n');
                 } else {
-                    text_bytes += 1;
+                    if CHECK_COPY_BYTES {
+                        text_bytes += 1;
+                    }
                     trailing_spaces = 0;
                 }
                 units += 1;
             }
         }
-        if (if MATERIALIZE { text.len() } else { text_bytes }) > MAX_COPY_BYTES {
+        if CHECK_COPY_BYTES && (if MATERIALIZE { text.len() } else { text_bytes }) > MAX_COPY_BYTES
+        {
             return Err("selection byte limit".into());
         }
     }
@@ -2745,14 +2767,14 @@ mod offset_specialization_tests {
             for require_literal in [false, true] {
                 let mut expected = Vec::new();
                 let mut actual = Vec::new();
-                let materialized = extract_selection::<true>(
+                let materialized = extract_selection::<true, true>(
                     &rows,
                     (0, 0),
                     (4, 0),
                     require_literal,
                     Some(&mut expected),
                 );
-                let counted = extract_selection::<false>(
+                let counted = extract_selection::<false, true>(
                     &rows,
                     (0, 0),
                     (4, 0),
@@ -2787,8 +2809,8 @@ mod offset_specialization_tests {
                 annotations: None,
                 synthetic_gap: None,
             }];
-            let expected = extract_selection::<true>(&rows, (0, 0), (1, 0), false, None);
-            let actual = extract_selection::<false>(&rows, (0, 0), (1, 0), false, None);
+            let expected = extract_selection::<true, true>(&rows, (0, 0), (1, 0), false, None);
+            let actual = extract_selection::<false, true>(&rows, (0, 0), (1, 0), false, None);
             assert_eq!(expected.as_ref().map(|_| ()), actual.as_ref().map(|_| ()));
             assert_eq!(actual.is_ok(), count == MAX_COPY_BYTES / 4);
         }

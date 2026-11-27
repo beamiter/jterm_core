@@ -210,3 +210,55 @@ fn unsupported_hosted_designation_preserves_uk_nrcs_bank() {
         assert_eq!(terminal.unsupported_count(), 1);
     }
 }
+
+#[test]
+fn interrupted_scs_restarts_escape_or_cancels_without_printing_control_tail() {
+    for (packet, expected, cursor) in [
+        (b"\x1b(0\x1b(\x1b[31mq".as_slice(), "─", (0, 1)),
+        (b"\x1b(B\x1b(\x18q", "q", (0, 1)),
+        (b"\x1b(\n0q", "─", (1, 1)),
+        (b"\x1b(\x7f0q", "─", (0, 1)),
+    ] {
+        for split in 0..=packet.len() {
+            let mut terminal = Terminal::new(3, 12).unwrap();
+            terminal.feed(&packet[..split]).unwrap();
+            terminal.feed(&packet[split..]).unwrap();
+            let frame = terminal.frame().unwrap();
+            let text: String = frame.rows()[cursor.0]
+                .cells
+                .iter()
+                .take(cursor.1)
+                .map(|cell| cell.character)
+                .collect();
+            assert_eq!(text, expected, "packet {packet:?} split {split}");
+            assert_eq!((frame.cursor().row, frame.cursor().col), cursor);
+            assert_eq!(terminal.unsupported_count(), 0);
+        }
+    }
+}
+
+#[test]
+fn multibyte_scs_designations_are_rejected_atomically_at_every_partition() {
+    for (setup, designation, restore) in [
+        (
+            b"\x1b(0".as_slice(),
+            b"\x1b(%?".as_slice(),
+            b"\x1b(B".as_slice(),
+        ),
+        (
+            b"\x1b)0\x0e".as_slice(),
+            b"\x1b)%?".as_slice(),
+            b"\x1b)B".as_slice(),
+        ),
+    ] {
+        let packet = [setup, b"q", designation, b"q", restore, b"q"].concat();
+        for split in 0..=packet.len() {
+            let mut terminal = Terminal::new(3, 12).unwrap();
+            terminal.feed(&packet[..split]).unwrap();
+            terminal.feed(&packet[split..]).unwrap();
+            assert!(terminal.visible_text().starts_with("──q"), "split {split}");
+            assert_eq!(terminal.frame().unwrap().cursor().col, 3);
+            assert_eq!(terminal.unsupported_count(), 1);
+        }
+    }
+}

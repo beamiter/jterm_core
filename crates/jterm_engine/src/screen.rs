@@ -524,16 +524,32 @@ impl CursorControls<'_> {
 
     pub fn tab_forward(&mut self, count: usize) {
         *self.pending_wrap = false;
-        for _ in 0..count.min(self.cols) {
-            *self.col = next_tab_stop(self.tab_stops, self.cols, *self.col);
+        if count == 0 || self.cols == 0 {
+            return;
         }
+        let end = self.cols.min(self.tab_stops.len());
+        let start = self.col.saturating_add(1).min(end);
+        *self.col = self.tab_stops[start..end]
+            .iter()
+            .enumerate()
+            .filter(|(_, stop)| **stop)
+            .nth(count - 1)
+            .map_or(self.cols - 1, |(index, _)| start + index);
     }
 
     pub fn tab_backward(&mut self, count: usize) {
         *self.pending_wrap = false;
-        for _ in 0..count.min(self.cols) {
-            *self.col = previous_tab_stop(self.tab_stops, self.cols, *self.col);
+        if count == 0 || self.cols == 0 {
+            return;
         }
+        let end = (*self.col).min(self.cols).min(self.tab_stops.len());
+        *self.col = self.tab_stops[..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, stop)| **stop)
+            .nth(count - 1)
+            .map_or(0, |(index, _)| index);
     }
 
     pub fn set_tab_stop(&mut self, enabled: bool) {

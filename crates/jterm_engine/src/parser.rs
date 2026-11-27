@@ -246,6 +246,7 @@ enum State {
         previous_escape: bool,
     },
     DiscardEscape,
+    DiscardCsi,
     Escape(Vec<u8>),
     Charset(u8),
     Csi {
@@ -376,7 +377,7 @@ impl Parser {
             State::Ground => PendingKind::None,
             State::Escape(_) => PendingKind::Escape,
             State::Charset(_) => PendingKind::Charset,
-            State::Csi { .. } => PendingKind::Csi,
+            State::Csi { .. } | State::DiscardCsi => PendingKind::Csi,
             State::String { kind, .. } => PendingKind::String(kind),
             State::DiscardApc { .. } => PendingKind::DiscardApc,
             State::DiscardString { kind, .. } => PendingKind::String(kind),
@@ -419,7 +420,8 @@ impl Parser {
             State::String { .. }
             | State::DiscardApc { .. }
             | State::DiscardString { .. }
-            | State::DiscardEscape => private = true,
+            | State::DiscardEscape
+            | State::DiscardCsi => private = true,
             State::Ground => {}
         }
         *capture = Some(OpenCapture {
@@ -485,7 +487,7 @@ impl Parser {
                 target.extend([0x1b, intro]);
                 target.extend(data);
             }
-            State::DiscardString { .. } | State::DiscardEscape => {}
+            State::DiscardString { .. } | State::DiscardEscape | State::DiscardCsi => {}
             State::DiscardApc { previous_escape } => {
                 result.discarding_oversized_apc = true;
                 result.discarding_apc_prev_escape = *previous_escape;
@@ -513,6 +515,7 @@ impl Parser {
                 | State::DiscardApc { .. }
                 | State::DiscardString { .. }
                 | State::DiscardEscape
+                | State::DiscardCsi
         )
     }
     /// Bytes retained as scanner carry, excluding returned events/capture spans.
@@ -743,7 +746,9 @@ impl Parser {
                     intermediates,
                 } => {
                     if let Some(&byte) = input.get(at) {
-                        if (0x30..=0x3f).contains(&byte) {
+                        if (0x30..=0x3f).contains(&byte)
+                            && (!self.bounded || intermediates.is_empty())
+                        {
                             let limit = if self.profile == ParserProfile::FrostLegacyV1 {
                                 128
                             } else {
@@ -835,6 +840,27 @@ impl Parser {
                         abandon!(None);
                     }
                     abandon!(Some(Event::Boundary));
+                }
+                State::DiscardCsi => {
+                    while let Some(&byte) = input.get(at) {
+                        at += 1;
+                        match byte {
+                            0x1b => {
+                                self.state = State::Escape(Vec::new());
+                                abandon!(Some(Event::Boundary));
+                            }
+                            0x40..=0x7e | 0x18 | 0x1a => {
+                                abandon!(Some(Event::Boundary));
+                            }
+                            0x00..=0x1f => {
+                                self.state = State::DiscardCsi;
+                                emit_open!(Event::Control(byte));
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.state = State::DiscardCsi;
+                    abandon!(None);
                 }
                 State::DiscardEscape => {
                     let mut ended = false;
@@ -1099,6 +1125,33 @@ impl Parser {
                         abandon!(None);
                     };
                     at += 1;
+                    if self.bounded {
+                        match designator {
+                            0x1b => {
+                                self.state = State::Escape(Vec::new());
+                                abandon!(Some(Event::Boundary));
+                            }
+                            0x18 | 0x1a => abandon!(Some(Event::Boundary)),
+                            0x00..=0x1f => {
+                                self.state = State::Charset(bank);
+                                emit_open!(Event::Control(designator));
+                            }
+                            0x7f => {
+                                self.state = State::Charset(bank);
+                                continue;
+                            }
+                            0x20..=0x2f => {
+                                if self.limits.pending_bytes.min(8) < 2 {
+                                    self.rejected = self.rejected.saturating_add(1);
+                                    self.state = State::DiscardEscape;
+                                    abandon!(Some(Event::Boundary));
+                                }
+                                self.state = State::Escape(vec![bank, designator]);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     emit!(Event::Charset { bank, designator });
                 }
                 State::Escape(mut intermediates) => {
@@ -1106,6 +1159,21 @@ impl Parser {
                         self.state = State::Escape(intermediates);
                         abandon!(None);
                     };
+                    if self.bounded {
+                        match byte {
+                            0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                                at += 1;
+                                self.state = State::Escape(intermediates);
+                                emit_open!(Event::Control(byte));
+                            }
+                            0x7f => {
+                                at += 1;
+                                self.state = State::Escape(intermediates);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     if intermediates.is_empty() {
                         match byte {
                             b'[' => {
@@ -1211,6 +1279,10 @@ impl Parser {
                     at += 1;
                     match byte {
                         0x30..=0x3f => {
+                            if self.bounded && !intermediates.is_empty() {
+                                self.state = State::DiscardCsi;
+                                abandon!(Some(Event::Boundary));
+                            }
                             if params.len() < if self.frost() { 128 } else { 256 } {
                                 params.push(byte);
                             }
@@ -1569,7 +1641,12 @@ mod hot_path_parity {
                 inputs.push([&[0x1b, introducer], suffix].concat());
             }
         }
-        inputs.push((0..=255).collect());
+        let all_control_bytes: Vec<_> = (0..=255).collect();
+        let mut bounded_control_bytes = all_control_bytes.clone();
+        // Complete ESC before the next C0 in the legacy parity vector.
+        // Embedded C0 framing has its own bounded conformance tests.
+        bounded_control_bytes.insert(usize::from(b'\x1b') + 1, b'7');
+        inputs.push(all_control_bytes.clone());
         inputs.push([b"\x1b]0;".as_slice(), &[b'x'; 64], b"\x1b\\ok"].concat());
         for frost in [false, true] {
             for bounded in [false, true] {
@@ -1577,6 +1654,17 @@ mod hot_path_parity {
                     for inline in [false, true] {
                         for limit in [1, 8, 32] {
                             for input in &inputs {
+                                let input = if bounded && input == &all_control_bytes {
+                                    &bounded_control_bytes
+                                } else {
+                                    input
+                                };
+                                // Bounded G0/G1 SCS now consumes intermediate
+                                // designators atomically; its grammar and bounds
+                                // are checked independently in parser_conformance.
+                                if bounded && !frost && input == b"\x1b(0q\x1b(Bz\x1b( % 5\x1bcX" {
+                                    continue;
+                                }
                                 for split in 0..=input.len() {
                                     let np = if frost {
                                         ParserProfile::FrostLegacyV1

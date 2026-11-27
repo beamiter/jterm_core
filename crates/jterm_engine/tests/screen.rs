@@ -134,6 +134,34 @@ fn cursor_origin_margins_counts_and_tabs_are_bounded() {
 }
 
 #[test]
+fn counted_tab_motion_matches_individual_stops_for_custom_layouts() {
+    const COLS: usize = 6;
+    let mut screen = ScreenState::new(1, COLS);
+    for layout in 0..(1 << COLS) {
+        for (column, stop) in screen.tab_stops.iter_mut().enumerate() {
+            *stop = layout & (1 << column) != 0;
+        }
+        for start in 0..COLS {
+            for count in [0, 1, 2, COLS - 1, usize::MAX] {
+                let steps = count.min(COLS);
+                let forward = (0..steps).fold(start, |col, _| screen.next_tab_stop(col));
+                let backward = (0..steps).fold(start, |col, _| screen.prev_tab_stop(col));
+                screen.cursor_col = start;
+                screen.pending_wrap = true;
+                screen.tab_forward(count);
+                assert_eq!(screen.cursor_col, forward, "{layout:06b} {start} {count}");
+                assert!(!screen.pending_wrap);
+                screen.cursor_col = start;
+                screen.pending_wrap = true;
+                screen.tab_backward(count);
+                assert_eq!(screen.cursor_col, backward, "{layout:06b} {start} {count}");
+                assert!(!screen.pending_wrap);
+            }
+        }
+    }
+}
+
+#[test]
 fn changed_span_includes_wide_collateral_but_printed_span_does_not() {
     let mut s = screen(8);
     write(&mut s, '界', 2);

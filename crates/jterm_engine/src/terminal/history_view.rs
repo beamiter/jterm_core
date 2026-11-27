@@ -368,6 +368,12 @@ impl Terminal {
     }
 }
 
+fn empty_projected_cells() -> Arc<[TerminalCell]> {
+    static EMPTY: std::sync::LazyLock<Arc<[TerminalCell]>> =
+        std::sync::LazyLock::new(|| Arc::from([]));
+    Arc::clone(&EMPTY)
+}
+
 pub(super) struct HistoryReader<'a> {
     raw: &'a VecDeque<ScrollbackLine>,
     cached: Option<usize>,
@@ -482,7 +488,11 @@ impl<'a> HistoryReader<'a> {
         }
         HistoryCopyRow {
             row: Row {
-                cells: cells.into(),
+                cells: if cells.is_empty() {
+                    empty_projected_cells()
+                } else {
+                    cells.into()
+                },
                 wrapped: row.wrapped,
             },
             underline_colors: (!underline.is_empty()).then(|| underline.into()),
@@ -585,5 +595,30 @@ mod underline_projection_tests {
                 ][..]
             )
         );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn empty_projected_history_rows_share_cells_without_losing_copy_boundaries() {
+    let mut terminal = Terminal::new(3, 8).unwrap();
+    terminal.feed(b"\n\n\n\n\n\n").unwrap();
+    let layout = terminal.history_layout().unwrap();
+    assert_eq!(layout.len(), 4);
+    let first = terminal.projected_history_page(&layout, 0, 4).unwrap();
+    let second = terminal.projected_history_page(&layout, 1, 3).unwrap();
+    assert_eq!(first.text, "\n\n\n");
+    assert_eq!(second.text, "\n\n");
+    assert_eq!(
+        first.copy_offsets_utf16().unwrap(),
+        [vec![0], vec![1], vec![2], vec![3]]
+    );
+    let first_cells = &first.row(0).unwrap().cells;
+    for row in 0..first.row_count {
+        assert!(Arc::ptr_eq(first_cells, &first.row(row).unwrap().cells));
+        assert!(!first.row(row).unwrap().wrapped);
+    }
+    for row in 0..second.row_count {
+        assert!(Arc::ptr_eq(first_cells, &second.row(row).unwrap().cells));
     }
 }

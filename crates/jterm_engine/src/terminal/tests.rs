@@ -992,6 +992,34 @@ fn projected_history_keeps_clusters_styles_links_and_raw_anchors_across_widths()
 }
 
 #[test]
+fn projected_history_preserves_exact_width_wide_pairs_blank_lines_and_wraps() {
+    let mut terminal = Terminal::new(2, 6).unwrap();
+    terminal
+        .feed("a界b界\r\n\r\nabcdefghi\r\nlast\r\n".as_bytes())
+        .unwrap();
+
+    for (columns, widths) in [(6, &[6, 0, 6, 3][..]), (4, &[4, 2, 0, 4, 4, 1][..])] {
+        terminal.resize(2, columns).unwrap();
+        let layout = terminal.history_layout().unwrap();
+        let page = terminal
+            .projected_history_page(&layout, 0, widths.len())
+            .unwrap();
+
+        assert_eq!(layout.len(), widths.len());
+        assert_eq!(page.text, "a界b界\n\nabcdefghi");
+        for (row, &cells) in widths.iter().enumerate() {
+            assert_eq!(page.row(row).unwrap().cells.len(), cells);
+        }
+        let anchor = layout.anchor_at(0).unwrap();
+        assert_eq!((anchor.row, anchor.column), (0, 0));
+        assert!(page.row(0).unwrap().cells[2].flags.wide_continuation());
+        let last_wide_row = usize::from(columns == 4);
+        let last_wide = page.row(last_wide_row).unwrap();
+        assert!(last_wide.cells.last().unwrap().flags.wide_continuation());
+    }
+}
+
+#[test]
 fn plain_projected_history_copies_clipped_fragments_and_link_ids() {
     let mut terminal = Terminal::new(2, 6).unwrap();
     terminal.enable_hyperlinks(|_, target| target == "https://example.test/plain");
@@ -2199,6 +2227,39 @@ fn immutable_history_copy_boundaries_use_utf16_and_never_select_padding() {
     terminal.feed(b"\x1b[3J").unwrap();
     assert!(!terminal.retains_history_anchor(HistoryAnchor { row: 0, column: 2 }));
     assert_eq!(page.copy_offsets_utf16().unwrap(), offsets);
+}
+
+#[test]
+fn offset_only_history_copy_matches_materialized_utf16_boundaries() {
+    let mut terminal = Terminal::new(2, 6).unwrap();
+    terminal.enable_grapheme_clusters();
+    terminal.track_printed_spaces();
+    terminal
+        .feed(
+            "abcde界Z\r\n🧪e\u{301}  \r\n\x1b[44m\x1b[2K\x1b[0m\r\n\r\nlast\r\nmore\r\n".as_bytes(),
+        )
+        .unwrap();
+    let raw = terminal.history_page(0, 8).unwrap();
+    assert_eq!(raw.synthetic_margin_gap(0), Some(5));
+
+    terminal.resize(2, 4).unwrap();
+    let layout = terminal.history_layout().unwrap();
+    let projected = terminal
+        .projected_history_page(&layout, 0, layout.len())
+        .unwrap();
+    for page in [raw, projected] {
+        let mut offsets = Vec::new();
+        let text = extract_selection::<false, false>(
+            &page.rows,
+            (0, 0),
+            (page.row_count, 0),
+            false,
+            Some(&mut offsets),
+        )
+        .unwrap();
+        assert!(text.is_empty());
+        assert_eq!(offsets, page.copy_offsets_utf16().unwrap());
+    }
 }
 
 #[test]

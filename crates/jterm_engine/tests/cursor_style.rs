@@ -39,3 +39,29 @@ fn invalid_style_values_do_not_change_a_painted_cursor_or_grid() {
         }
     }
 }
+
+#[test]
+fn csi_parameters_after_intermediates_do_not_apply_cursor_style() {
+    for malformed in [
+        b"\x1b[ 4q".as_slice(),
+        b"\x1b[1 4q",
+        b"\x1b[ ;4q",
+        b"\x1b[ :4q",
+    ] {
+        let packet = [b"\x1b[6 q".as_slice(), malformed, b"\x1bP$q q\x1b\\"].concat();
+        for split in 0..=packet.len() {
+            let mut terminal = Terminal::new(3, 12).unwrap();
+            let mut reply = terminal.feed(&packet[..split]).unwrap();
+            reply.extend(terminal.feed(&packet[split..]).unwrap());
+            assert_eq!(
+                reply, b"\x1bP1$r6 q\x1b\\",
+                "split {split}, malformed {malformed:?}"
+            );
+            terminal.feed(b"\x1b[4 q").unwrap();
+            assert_eq!(
+                terminal.feed(b"\x1bP$q q\x1b\\").unwrap(),
+                b"\x1bP1$r4 q\x1b\\"
+            );
+        }
+    }
+}

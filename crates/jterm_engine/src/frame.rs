@@ -136,6 +136,18 @@ fn same_shared_table<T: ?Sized>(before: &Option<Arc<T>>, after: &Option<Arc<T>>)
     }
 }
 
+#[inline(never)]
+fn retain_delta_hyperlinks(
+    resources: &HyperlinkResources,
+    rows: &[Row],
+) -> Option<HyperlinkResources> {
+    retain_resources(
+        resources,
+        rows.iter()
+            .flat_map(|row| row.cells.iter().map(|cell| cell.hyperlink_id)),
+    )
+}
+
 fn same_underline_runs(
     before: Option<&Arc<[UnderlineColorRun]>>,
     after: Option<&Arc<[UnderlineColorRun]>>,
@@ -704,13 +716,15 @@ impl CellFrame {
             HyperlinkDelta::Inherit => &self.hyperlinks,
             HyperlinkDelta::Snapshot(resources) => resources,
         };
-        let hyperlinks = resources.as_ref().and_then(|resources| {
-            retain_resources(
-                resources,
-                rows.iter()
-                    .flat_map(|row| row.cells.iter().map(|cell| cell.hyperlink_id)),
-            )
-        });
+        let hyperlinks = if delta.rows.is_empty() && same_shared_table(resources, &self.hyperlinks)
+        {
+            // The validated base already retains exactly the targets used by these rows.
+            self.hyperlinks.clone()
+        } else {
+            resources
+                .as_ref()
+                .and_then(|resources| retain_delta_hyperlinks(resources, &rows))
+        };
         // The admitted base and validated edit set already establish all
         // invariants, including row widths. Do not rescan cloned rows.
         Ok(Self {
@@ -779,7 +793,10 @@ impl Receiver {
 fn applying_cursor_only_delta_reuses_rows_and_preserves_paint_metadata() {
     let mut terminal = crate::terminal::Terminal::new(3, 8).unwrap();
     terminal.enable_underline_colors();
-    terminal.feed(b"\x1b[4;58;2;12;34;56mX\x1b[0m").unwrap();
+    terminal.enable_hyperlinks(|_, _| true);
+    terminal
+        .feed(b"\x1b]8;;https://example.test/old\x07\x1b[4;58;2;12;34;56mX\x1b[0m\x1b]8;;\x07")
+        .unwrap();
     let base = terminal.frame().unwrap();
     terminal.feed(b"\x1b[2;3H").unwrap();
     let next = terminal.frame().unwrap();
@@ -796,6 +813,10 @@ fn applying_cursor_only_delta_reuses_rows_and_preserves_paint_metadata() {
         )
         .unwrap();
     assert!(Arc::ptr_eq(&base.shared_rows(), &applied.shared_rows()));
+    assert!(Arc::ptr_eq(
+        base.hyperlinks.as_ref().unwrap(),
+        applied.hyperlinks.as_ref().unwrap()
+    ));
     assert_eq!(applied, next);
     assert_eq!(
         applied.underline_color_runs(0),
@@ -834,4 +855,50 @@ fn changed_row_indices_match_delta_rows_and_admission_errors() {
     check(&terminal.frame().unwrap());
     terminal.resize(3, 7).unwrap();
     check(&terminal.frame().unwrap());
+}
+
+#[cfg(test)]
+#[test]
+fn cursor_only_delta_admits_resource_replacement_and_inherited_targets() {
+    let mut terminal = crate::terminal::Terminal::new(3, 8).unwrap();
+    terminal.enable_hyperlinks(|_, _| true);
+    terminal
+        .feed(b"\x1b]8;;https://example.test/old\x07X\x1b]8;;\x07")
+        .unwrap();
+    let base = terminal.frame().unwrap();
+    terminal.feed(b"\x1b[2;3H").unwrap();
+    let next = terminal.frame().unwrap();
+    let limits = Limits {
+        max_rows: 3,
+        max_cols: 8,
+        max_cells: 24,
+    };
+    let id = base.rows()[0].cells[0].hyperlink_id;
+    let inherited = Delta::new(base.stamp(), next.stamp(), next.cursor(), Vec::new());
+    let inherited_frame = base.apply(&inherited, limits).unwrap();
+    assert_eq!(inherited_frame, next);
+    assert!(Arc::ptr_eq(
+        base.hyperlinks.as_ref().unwrap(),
+        inherited_frame.hyperlinks.as_ref().unwrap()
+    ));
+
+    let mut changed = base.delta_to(&next).unwrap();
+    changed.hyperlinks = HyperlinkDelta::Snapshot(Some(Arc::from([
+        (id, Arc::from("https://example.test/new")),
+        (
+            HyperlinkId::from_raw(4096),
+            Arc::from("https://example.test/unused"),
+        ),
+    ])));
+    let replaced = base.apply(&changed, limits).unwrap();
+    assert_eq!(
+        replaced.hyperlink_target(id),
+        Some("https://example.test/new")
+    );
+    assert_eq!(replaced.hyperlink_target(HyperlinkId::from_raw(4096)), None);
+    assert_eq!(replaced.rows(), base.rows());
+    assert!(!Arc::ptr_eq(
+        base.hyperlinks.as_ref().unwrap(),
+        replaced.hyperlinks.as_ref().unwrap()
+    ));
 }

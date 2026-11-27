@@ -618,3 +618,94 @@ fn local_policy_csi_at_capacity_cancels_and_restarts() {
         }
     }
 }
+
+#[test]
+fn bounded_scs_intermediates_form_one_escape_under_the_shared_cap() {
+    for profile in [ParserProfile::EmberV1, ParserProfile::FrostLegacyV1] {
+        let mut tokens = vec![Token::Escape(vec![b'(', b'%'], b'?')];
+        tokens.extend(text("q"));
+        check_profile(
+            profile,
+            b"\x1b(%?q",
+            &Trace {
+                tokens,
+                rejected: 0,
+                abandoned_apc: 0,
+            },
+            128,
+        );
+        check_profile(
+            profile,
+            b"\x1b(%?q",
+            &Trace {
+                tokens: text("q"),
+                rejected: 1,
+                abandoned_apc: 0,
+            },
+            1,
+        );
+    }
+}
+
+#[test]
+fn bounded_escape_executes_c0_and_ignores_del_without_losing_intermediates() {
+    for profile in [ParserProfile::EmberV1, ParserProfile::FrostLegacyV1] {
+        check_profile(
+            profile,
+            b"\x1b\x077\x1b#\x0a8\x1b\x7f8",
+            &Trace {
+                tokens: vec![
+                    Token::Control(7),
+                    Token::Escape(vec![], b'7'),
+                    Token::Control(10),
+                    Token::Escape(vec![b'#'], b'8'),
+                    Token::Escape(vec![], b'8'),
+                ],
+                rejected: 0,
+                abandoned_apc: 0,
+            },
+            128,
+        );
+    }
+}
+
+#[test]
+fn bounded_escape_keeps_its_prefix_across_each_embedded_c0_control() {
+    for byte in (0..=0x17).chain([0x19]).chain(0x1c..=0x1f) {
+        check(
+            &[0x1b, byte, b'7'],
+            vec![Token::Control(byte), Token::Escape(vec![], b'7')],
+            128,
+            0,
+            0,
+        );
+    }
+}
+
+#[test]
+fn bounded_csi_rejects_parameters_after_intermediates_until_final_or_restart() {
+    for bytes in [
+        b"\x1b[ 4qZ".as_slice(),
+        b"\x1b[1 $ 2pZ",
+        b"\x1b[ ;4qZ",
+        b"\x1b[ :4qZ",
+        b"\x1b[ 4\x18Z",
+        b"\x1b[ 4\x1aZ",
+    ] {
+        check(bytes, text("Z"), 128, 0, 0);
+    }
+    check(
+        b"\x1b[ 4\x07qZ",
+        vec![Token::Control(7), Token::Print('Z')],
+        128,
+        0,
+        0,
+    );
+    check(
+        b"\x1b[ 4\x1b[6n",
+        vec![csi(b"6", &[6], None, b"", b'n')],
+        128,
+        0,
+        0,
+    );
+}
