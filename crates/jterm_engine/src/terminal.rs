@@ -215,6 +215,11 @@ impl HistoryPage {
             if let Some(offsets) = scalar_copy_offsets(&self.rows) {
                 return Ok(offsets);
             }
+            return Ok(if self.raw_rows {
+                copy_page_offsets::<true>(&self.rows)
+            } else {
+                copy_page_offsets::<false>(&self.rows)
+            });
         }
         if self.raw_rows {
             self.copy_offsets_for_rows::<true>()
@@ -268,6 +273,80 @@ impl HistoryPage {
             (end_row, end_col),
             false,
         )
+    }
+}
+
+#[inline(never)]
+fn copy_page_offsets<const TRIM_PADDING: bool>(rows: &[HistoryCopyRow]) -> Vec<Vec<u32>> {
+    let mut offsets = Vec::with_capacity(rows.len());
+    let mut units = 0u32;
+    let mut committed_units = 0u32;
+    for (index, source) in rows.iter().enumerate() {
+        let cells = &source.row.cells;
+        let scan_end = if TRIM_PADDING && !source.row.wrapped {
+            let annotated_end = source.annotations.as_deref().map_or(0, RowAnnotations::end);
+            copy_content_end(cells, annotated_end.min(cells.len()))
+        } else {
+            cells.len()
+        };
+        // Visit each grapheme annotation once in physical column order.
+        let mut clusters = source.annotations.iter().flat_map(|row| row.texts());
+        let mut next_cluster = clusters.next().unwrap_or((usize::MAX, ""));
+        let mut boundaries = Vec::with_capacity(cells.len() + 1);
+        for (column, cell) in cells[..scan_end].iter().enumerate() {
+            boundaries.push(units);
+            let cluster = if column == next_cluster.0 {
+                let text = next_cluster.1;
+                next_cluster = clusters.next().unwrap_or((usize::MAX, ""));
+                Some(text)
+            } else {
+                None
+            };
+            if cell.flags.wide_continuation() || source.synthetic_gap == Some(column) {
+                continue;
+            }
+            if let Some(cluster) = cluster {
+                units += cluster.encode_utf16().count() as u32;
+                let content_bytes = cluster.trim_end_matches(' ').len();
+                if cell.flags.printed_space() {
+                    committed_units = units;
+                } else if content_bytes > 0 {
+                    committed_units = units - (cluster.len() - content_bytes) as u32;
+                }
+            } else {
+                units += cell.character.len_utf16() as u32;
+                if cell.character != ' ' || cell.flags.printed_space() {
+                    committed_units = units;
+                }
+            }
+        }
+        boundaries.resize(cells.len() + 1, units);
+        offsets.push(boundaries);
+        if !source.row.wrapped {
+            if units != committed_units {
+                units = committed_units;
+                trim_copy_offsets(&mut offsets, units);
+            }
+            if index + 1 < rows.len() {
+                units += 1;
+                committed_units = units;
+            }
+        }
+    }
+    offsets
+}
+
+fn trim_copy_offsets(offsets: &mut [Vec<u32>], end: u32) {
+    // A hard break can trim padding from previous soft-wrapped rows.
+    for boundary in offsets
+        .iter_mut()
+        .rev()
+        .flat_map(|row| row.iter_mut().rev())
+    {
+        if *boundary <= end {
+            break;
+        }
+        *boundary = end;
     }
 }
 
@@ -485,16 +564,7 @@ fn extract_selection_bounded<
             let end = trimmed.max(printed_space_end);
             if let Some(offsets) = offsets.as_deref_mut() {
                 units -= (length - end) as u32;
-                for boundary in offsets
-                    .iter_mut()
-                    .rev()
-                    .flat_map(|row| row.iter_mut().rev())
-                {
-                    if *boundary <= units {
-                        break;
-                    }
-                    *boundary = units;
-                }
+                trim_copy_offsets(offsets, units);
             }
             if MATERIALIZE {
                 text.truncate(end);
@@ -3261,8 +3331,9 @@ mod offset_specialization_tests {
             let rows: Vec<_> = (0..4)
                 .map(|row| {
                     let mut annotations = RowAnnotations::default();
+                    annotations.set(5, Arc::from("skipped"));
                     annotations.set(7, Arc::from("e\u{301}"));
-                    annotations.set(11, Arc::from(if seed % 2 == 0 { "x  " } else { " " }));
+                    annotations.set(11, Arc::from(["🧑‍💻  ", " ", ""][seed % 3]));
                     HistoryCopyRow {
                         row: Row {
                             cells: Arc::from(&grid[row][..]),
@@ -3297,6 +3368,10 @@ mod offset_specialization_tests {
                     counted.as_ref().map(|_| ())
                 );
                 assert_eq!(actual, expected);
+                if !require_literal {
+                    assert_eq!(copy_page_offsets::<false>(&rows), expected);
+                    assert_eq!(copy_page_offsets::<true>(&rows), expected);
+                }
             }
         }
     }

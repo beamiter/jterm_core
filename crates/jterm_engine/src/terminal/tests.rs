@@ -2655,10 +2655,17 @@ fn bounded_history_text_counts_committed_bytes_and_defers_soft_wrap_padding() {
         assert_eq!(trimmed, reference);
         trimmed
     };
+    let boundaries = |rows: &[HistoryCopyRow]| {
+        let offsets = copy_page_offsets::<false>(rows);
+        assert_eq!(copy_page_offsets::<true>(rows), offsets);
+        offsets
+    };
     let mut padded = [row("🐍   ", true), row("   ", false)];
     assert_eq!(copy(&padded, 4).as_deref(), Some("🐍"));
     assert_eq!(copy(&padded, 3), None);
     assert_eq!(copy(&padded[..1], 4), None);
+    assert_eq!(boundaries(&padded), [vec![0, 2, 2, 2, 2], vec![2; 4]]);
+    assert_eq!(boundaries(&padded[..1]), [vec![0, 2, 3, 4, 5]]);
 
     let mut terminal = Terminal::new(2, 4).unwrap();
     terminal.track_printed_spaces();
@@ -2666,6 +2673,7 @@ fn bounded_history_text_counts_committed_bytes_and_defers_soft_wrap_padding() {
     Arc::make_mut(&mut padded[0].row.cells)[2] = terminal.frame().unwrap().rows()[0].cells[0];
     assert_eq!(copy(&padded, 4), None);
     assert_eq!(copy(&padded, 6).as_deref(), Some("🐍  "));
+    assert_eq!(boundaries(&padded), [vec![0, 2, 3, 4, 4], vec![4; 4]]);
 
     let separated = [row("🐍", false), row("", false)];
     assert_eq!(copy(&separated, 4), None);
