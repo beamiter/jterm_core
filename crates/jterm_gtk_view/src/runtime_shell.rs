@@ -500,6 +500,7 @@ impl RuntimeShell {
         &self,
         hyperlinks: HyperlinkPolicy,
         colors: TerminalDefaultColors,
+        pixel_mouse: bool,
     ) -> Result<Receiver<()>, String> {
         let mut state = self.lock()?;
         if state.closed || self.worker.get().is_some() {
@@ -509,6 +510,9 @@ impl RuntimeShell {
         state.session.enable_grapheme_clusters();
         state.session.enable_hyperlinks(hyperlinks);
         state.session.enable_window_updates();
+        if pixel_mouse {
+            state.session.enable_pixel_mouse();
+        }
         state.session.set_color_defaults(colors);
         state.session.enable_keyboard_disambiguation();
         state.session.enable_history_preserving_resize();
@@ -979,7 +983,7 @@ exit 17"#;
             let owner = RuntimeShell::new(session);
             notices.push(
                 owner
-                    .configure_view(|_, _| false, TerminalDefaultColors::default())
+                    .configure_view(|_, _| false, TerminalDefaultColors::default(), false)
                     .unwrap(),
             );
             owners.push(owner);
@@ -1073,7 +1077,7 @@ exit 17"#;
         )
         .expect("start the configured relative shell in the shared PTY");
         owner
-            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .configure_view(|_, _| false, TerminalDefaultColors::default(), false)
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut update = Update::default();
@@ -1112,7 +1116,7 @@ exit 17"#;
         }
         let owner = owner.expect("shared hosted attachment");
         owner
-            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .configure_view(|_, _| false, TerminalDefaultColors::default(), false)
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut update = Update::default();
@@ -1147,7 +1151,7 @@ exit 17"#;
             .expect("real PTY");
         let owner = RuntimeShell::new(session);
         owner
-            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .configure_view(|_, _| false, TerminalDefaultColors::default(), false)
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut update = Update::default();
@@ -1200,7 +1204,7 @@ exit 17"#;
         owner.lock().unwrap().viewport_budget = Arc::clone(&budget);
         let pid = owner.child_pid();
         let _notifications = owner
-            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .configure_view(|_, _| false, TerminalDefaultColors::default(), false)
             .unwrap();
         let has_marker = |frame: &jterm_engine::frame::CellFrame| {
             frame.rows().iter().any(|row| {
@@ -1260,7 +1264,7 @@ exit 17"#;
             .expect("real PTY");
         let owner = RuntimeShell::new(session);
         let _notifications = owner
-            .configure_view(|_, _| false, TerminalDefaultColors::default())
+            .configure_view(|_, _| false, TerminalDefaultColors::default(), false)
             .unwrap();
         let contains = |frame: &jterm_engine::frame::CellFrame, text: &str| {
             frame.rows().iter().any(|row| {

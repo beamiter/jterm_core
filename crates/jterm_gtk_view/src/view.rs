@@ -110,16 +110,69 @@ pub(crate) struct TerminalView {
 struct FontGeometry {
     cell_width: i32,
     cell_height: i32,
-    #[cfg(target_os = "linux")]
     space_advance: f64,
-    #[cfg(target_os = "linux")]
     text_height: i32,
+}
+
+impl FontGeometry {
+    fn text_height(self, cell_height: i32) -> i32 {
+        self.text_height.saturating_add(cell_height - self.cell_height)
+    }
 }
 
 struct CachedFontGeometry {
     context: pango::Context,
     serial: u32,
     dimensions: FontGeometry,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PixelViewport {
+    logical: (f64, f64),
+    size: (u16, u16),
+    scale: f64,
+}
+
+impl PixelViewport {
+    fn measure(logical: (f64, f64), scale: f64) -> Option<Self> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        let physical = |points: f64| {
+            let pixels = (points * scale).round();
+            (1.0..=f64::from(u16::MAX))
+                .contains(&pixels)
+                .then_some(pixels as u16)
+        };
+        Some(Self {
+            logical,
+            size: (physical(logical.0)?, physical(logical.1)?),
+            scale,
+        })
+    }
+
+    fn position(self, (x, y): (f64, f64)) -> Option<(u32, u32)> {
+        if !(0.0..self.logical.0).contains(&x) || !(0.0..self.logical.1).contains(&y) {
+            return None;
+        }
+        // A fractional final pixel can round the installed size down.
+        let x = ((x * self.scale).floor() as u32).min(u32::from(self.size.0) - 1);
+        let y = ((y * self.scale).floor() as u32).min(u32::from(self.size.1) - 1);
+        Some((x, y))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pointer_pixels_keep_fractional_offsets_and_clip_to_the_measured_grid() {
+    let viewport = PixelViewport::measure((17.65, 34.0), 1.5).unwrap();
+    assert_eq!(viewport.size, (26, 51));
+    assert_eq!(viewport.position((3.2, 4.0)), Some((4, 6)));
+    assert_eq!(viewport.position((4.2, 4.0)), Some((6, 6)));
+    assert_eq!(viewport.position((17.649, 33.999)), Some((25, 50)));
+    for outside in [(-0.01, 0.0), (17.65, 4.0), (0.0, 34.0), (f64::NAN, 1.0)] {
+        assert_eq!(viewport.position(outside), None);
+    }
 }
 
 struct Presentation {
@@ -508,32 +561,27 @@ impl TerminalView {
     ) -> ((usize, usize), Option<(u16, u16)>) {
         let font = self.font_geometry();
         let cell_height = self.scaled_cell_height(font.cell_height);
-        let text_height = font.text_height.saturating_add(cell_height - font.cell_height);
+        let text_height = font.text_height(cell_height);
         let (rows, columns) = fitted_grid(
             width,
             height,
             font.space_advance.max(f64::from(font.cell_width)),
             text_height.max(cell_height),
         );
-        let pixels = self.physical_viewport_pixels(
-            columns as f64 * font.space_advance,
-            rows as f64 * f64::from(text_height),
-        );
+        let pixels = self
+            .physical_viewport(
+                columns as f64 * font.space_advance,
+                rows as f64 * f64::from(text_height),
+            )
+            .map(|viewport| viewport.size);
         ((rows, columns), pixels)
     }
 
-    #[cfg(target_os = "linux")]
-    fn physical_viewport_pixels(&self, width: f64, height: f64) -> Option<(u16, u16)> {
+    fn physical_viewport(&self, width: f64, height: f64) -> Option<PixelViewport> {
         // GDK also exposes an integer scale factor for buffers. Use the
         // surface's actual scale for fractional-scale output.
         let scale = self.widget.native()?.surface()?.scale();
-        let physical = |points: f64| {
-            let pixels = (points * scale).round();
-            (1.0..=f64::from(u16::MAX))
-                .contains(&pixels)
-                .then_some(pixels as u16)
-        };
-        Some((physical(width)?, physical(height)?))
+        PixelViewport::measure((width, height), scale)
     }
 
     fn cell_geometry(&self) -> (i32, i32, i32) {
@@ -564,7 +612,6 @@ impl TerminalView {
         // GTK draws blank cells with the configured font's space advance
         // and rounds each line's height. The integer grid estimates can
         // differ from those measurements, especially for fractional advances.
-        #[cfg(target_os = "linux")]
         let (space_advance, text_height) = {
             let layout = pango::Layout::new(&context);
             layout.set_font_description(Some(&theme.font));
@@ -582,9 +629,7 @@ impl TerminalView {
         let dimensions = FontGeometry {
             cell_width,
             cell_height,
-            #[cfg(target_os = "linux")]
             space_advance,
-            #[cfg(target_os = "linux")]
             text_height,
         };
         self.font_geometry.replace(Some(CachedFontGeometry {
@@ -620,6 +665,43 @@ impl TerminalView {
                 &gtk4::graphene::Point::new((x - dx) as f32, (y - dy) as f32),
             )
             .map(|point| (f64::from(point.x()), f64::from(point.y())))
+    }
+
+    pub(crate) fn pixel_viewport(
+        &self,
+        (rows, columns): (usize, usize),
+        installed: (u32, u32),
+    ) -> Option<PixelViewport> {
+        let font = self.font_geometry();
+        let text_height = font.text_height(self.scaled_cell_height(font.cell_height));
+        let viewport = self.physical_viewport(
+            columns as f64 * font.space_advance,
+            rows as f64 * f64::from(text_height),
+        )?;
+        let (width, height) = viewport.size;
+        (installed == (u32::from(width), u32::from(height))).then_some(viewport)
+    }
+
+    pub(crate) fn pixel_at(
+        &self,
+        (x, y): (f64, f64),
+        viewport: PixelViewport,
+    ) -> Option<(u32, u32)> {
+        if !(0.0..f64::from(self.widget.width())).contains(&x)
+            || !(0.0..f64::from(self.widget.height())).contains(&y)
+        {
+            return None;
+        }
+        let (buffer_x, buffer_y) = self.widget.window_to_buffer_coords(
+            gtk4::TextWindowType::Widget,
+            x.floor() as i32,
+            y.floor() as i32,
+        );
+        // GTK's buffer y origin already accounts for the top margin.
+        viewport.position((
+            f64::from(buffer_x) - f64::from(MARGIN) + x.fract(),
+            f64::from(buffer_y) + y.fract(),
+        ))
     }
 
     pub(crate) fn cell_at(
@@ -1174,6 +1256,16 @@ fn live_update_preserves_unchanged_buffer_rows_and_moves_the_caret() {
     view.widget.grab_focus();
     let context = gtk4::glib::MainContext::default();
     while context.iteration(false) {}
+    let viewport = view.physical_viewport(60.0, 80.0).unwrap();
+    let first_cell = view.widget.iter_location(&first.start_iter());
+    let (x, y) = view.widget.buffer_to_window_coords(
+        gtk4::TextWindowType::Widget,
+        first_cell.x(),
+        first_cell.y(),
+    );
+    let origin = (f64::from(x), f64::from(y));
+    assert_eq!(view.pixel_at(origin, viewport), Some((0, 0)));
+    assert_eq!(view.pixel_at((origin.0, origin.1 - 1.0), viewport), None);
     let unchanged_tags = first.start_iter().tags();
     let initial = first.text(&first.start_iter(), &first.end_iter(), true);
     assert_eq!(initial.lines().next().unwrap().trim_end(), "stable");

@@ -14,7 +14,7 @@ use crate::{
         HyperlinkTable,
     },
     kitty_graphics::{self, inline::InlineGraphics},
-    mouse::MouseInput,
+    mouse::{MouseInput, MousePosition},
     native_window_ops::{self, NativeWindowGeometry, NativeWindowPixels},
     parser::{Event, Parser, ParserLimits, ParserProfile, StringKind},
     protocol_state::ProtocolState,
@@ -1219,7 +1219,7 @@ impl Terminal {
         row: usize,
         modifiers: u8,
     ) -> Option<Vec<u8>> {
-        self.encode_mouse_with_pixels(input, column, row, modifiers, None)
+        self.encode_mouse_at(input, MousePosition::Cell { column, row }, modifiers)
     }
 
     /// Encode a pointer report from zero-based cell and optional pixel positions.
@@ -1237,15 +1237,42 @@ impl Terminal {
             return None;
         }
         let modes = self.vt.protocol.modes();
-        let (column, row) = if modes.contains(&1016) && modes.is_mouse_enabled() {
+        let position = if modes.contains(&1016) && modes.is_mouse_enabled() {
             let (x, y) = pixels?;
-            let (width, height) = self.mouse_pixel_extent()?;
-            if x >= width || y >= height {
-                return None;
-            }
-            (x as usize, y as usize)
+            MousePosition::Pixel { x, y }
         } else {
-            (column, row)
+            MousePosition::Cell { column, row }
+        };
+        self.encode_mouse_at(input, position, modifiers)
+    }
+
+    /// Encode an event in the active mouse protocol's coordinate space.
+    #[inline]
+    pub fn encode_mouse_at(
+        &self,
+        input: MouseInput,
+        position: MousePosition,
+        modifiers: u8,
+    ) -> Option<Vec<u8>> {
+        let modes = self.vt.protocol.modes();
+        let (column, row) = match position {
+            MousePosition::Cell { column, row } => {
+                let grid = &self.vt.screen.grid;
+                if (modes.contains(&1016) && modes.is_mouse_enabled())
+                    || column >= grid.cols()
+                    || row >= grid.rows()
+                {
+                    return None;
+                }
+                (column, row)
+            }
+            MousePosition::Pixel { x, y } => {
+                let (width, height) = self.mouse_pixel_extent()?;
+                if x >= width || y >= height {
+                    return None;
+                }
+                (x as usize, y as usize)
+            }
         };
         let modifiers = modifiers & 0x1c;
         match input {

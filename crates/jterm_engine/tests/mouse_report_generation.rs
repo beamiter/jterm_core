@@ -1,5 +1,5 @@
 use jterm_engine::{
-    mouse::{MouseEncoding, MouseInput},
+    mouse::{MouseEncoding, MouseInput, MousePosition},
     native_window_ops::NativeWindowPixels,
     terminal::Terminal,
 };
@@ -136,6 +136,19 @@ fn pixel_mouse_requires_opt_in_and_encodes_measured_coordinates_at_every_split()
         ] {
             assert_eq!(
                 terminal
+                    .encode_mouse_at(
+                        input,
+                        MousePosition::Pixel {
+                            x: pixel.0,
+                            y: pixel.1
+                        },
+                        modifiers,
+                    )
+                    .as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                terminal
                     .encode_mouse_with_pixels(input, 0, 0, modifiers, Some(pixel))
                     .as_deref(),
                 Some(expected)
@@ -145,6 +158,16 @@ fn pixel_mouse_requires_opt_in_and_encodes_measured_coordinates_at_every_split()
             .encode_mouse(MouseInput::Press(0), 0, 0, 0)
             .is_none());
         for outside in [(144, 0), (0, 192)] {
+            assert!(terminal
+                .encode_mouse_at(
+                    MouseInput::Press(0),
+                    MousePosition::Pixel {
+                        x: outside.0,
+                        y: outside.1
+                    },
+                    0,
+                )
+                .is_none());
             assert!(terminal
                 .encode_mouse_with_pixels(MouseInput::Press(0), 0, 0, 0, Some(outside))
                 .is_none());
@@ -166,12 +189,22 @@ fn pixel_negotiation_and_baseline_reset_preserve_distinct_coordinate_formats() {
         terminal.encode_mouse(MouseInput::Press(0), 1, 2, 0),
         Some(b"\x1b[<0;2;3M".to_vec())
     );
+    assert!(terminal
+        .encode_mouse_at(MouseInput::Press(0), MousePosition::Pixel { x: 0, y: 0 }, 0)
+        .is_none());
     assert_eq!(terminal.mouse_report_generation(), generation + 1);
     assert_eq!(
         terminal.feed(b"\x1b[?1006r\x1b[?1016$p").unwrap(),
         b"\x1b[?1016;1$y"
     );
     assert_eq!(terminal.mouse_report_generation(), generation + 3);
+    assert!(terminal
+        .encode_mouse_at(
+            MouseInput::Press(0),
+            MousePosition::Pixel { x: 50, y: 75 },
+            0
+        )
+        .is_none());
     assert!(terminal
         .encode_mouse_with_pixels(MouseInput::Press(0), 1, 2, 0, Some((50, 75)))
         .is_none());

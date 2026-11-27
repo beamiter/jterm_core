@@ -8,7 +8,7 @@ use jterm_engine::{
     history_reflow::HistoryAnchor,
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
-    mouse::{MouseInput, MouseTracking},
+    mouse::{MouseEncoding, MouseInput, MousePosition, MouseTracking},
     terminal::{Terminal, TranscriptAnchor, WindowUpdates},
 };
 use jterm_runtime::exit_status::PtyExit;
@@ -27,7 +27,7 @@ use crate::inline_images::{InlineImageRequest, InlineImages, PendingInlineImage}
 #[cfg(target_os = "linux")]
 use crate::runtime_shell::RuntimeShell;
 use crate::text_link::{connect_links, link_modifier};
-use crate::view::TerminalView;
+use crate::view::{PixelViewport, TerminalView};
 use crate::viewport::{
     HistoricalWindow, HistoryRail, ScrollTarget, ViewportFrame, ViewportRequest,
 };
@@ -715,10 +715,15 @@ impl<P: Pty> EmbeddedTerminal<P> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PointerMotion {
-    column: usize,
-    row: usize,
+    position: MousePosition,
     button: Option<u8>,
     modifiers: u8,
+}
+
+#[derive(Clone, Copy)]
+enum PointerTarget {
+    Cell,
+    Pixel(PixelViewport),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -728,6 +733,7 @@ struct PointerState {
     active_buttons: u8,
     last_motion: Option<PointerMotion>,
     last_point: Option<(f64, f64)>,
+    last_pixel: Option<(u32, u32)>,
 }
 
 impl PointerState {
@@ -736,9 +742,14 @@ impl PointerState {
             return false;
         }
         self.generation = generation;
+        self.retire_reports();
+        true
+    }
+
+    fn retire_reports(&mut self) {
         self.active_buttons = 0;
         self.last_motion = None;
-        true
+        self.last_pixel = None;
     }
 
     fn first_button(buttons: u8) -> Option<u8> {
@@ -1151,7 +1162,7 @@ impl<P: Pty> TerminalPane<P> {
                     .update_property(&[gtk4::accessible::Property::Description(
                         "Shared runtime session",
                     )]);
-                let mut updates = owner.configure_view(links.admit, colors)?;
+                let mut updates = owner.configure_view(links.admit, colors, automatic_grid)?;
                 let pane = Rc::downgrade(&session);
                 glib::MainContext::default().spawn_local(async move {
                     while updates.next().await.is_some() {
@@ -1425,6 +1436,11 @@ impl<P: Pty> TerminalPane<P> {
         }
         let ticket = owner.switch_view(expected, attach)?;
         self.view_attached.set(attach);
+        let mut pointer = self.pointer.get();
+        pointer.retire_reports();
+        pointer.last_point = None;
+        self.pointer.set(pointer);
+        self.pointer_wheel.set(0.0);
         self.advance_paste_revision();
         self.view.clear_preedit();
         self.set_composition_active(false);
@@ -2138,6 +2154,43 @@ impl<P: Pty> TerminalPane<P> {
         self.view.widget.add_controller(events);
     }
 
+    fn pointer_target(&self, terminal: &Terminal, encoding: MouseEncoding) -> Option<PointerTarget> {
+        if encoding == MouseEncoding::SgrPixels {
+            let installed = terminal.mouse_pixel_extent()?;
+            return self
+                .view
+                .pixel_viewport(self.dimensions.get(), installed)
+                .map(PointerTarget::Pixel);
+        }
+        Some(PointerTarget::Cell)
+    }
+
+    fn mouse_position_at(
+        &self,
+        point: (f64, f64),
+        target: PointerTarget,
+        release: bool,
+    ) -> Option<MousePosition> {
+        match target {
+            PointerTarget::Cell => self
+                .view
+                .cell_at(point, self.dimensions.get(), release)
+                .map(|(column, row)| MousePosition::Cell { column, row }),
+            PointerTarget::Pixel(viewport) => {
+                // Only coordinates from the live display can produce a new
+                // pixel position. A captured release may use its saved hit.
+                if self.scroll_top.get().is_some()
+                    || self.painted_source.get().is_none_or(|(_, top)| top.is_some())
+                {
+                    return None;
+                }
+                self.view
+                    .pixel_at(point, viewport)
+                    .map(|(x, y)| MousePosition::Pixel { x, y })
+            }
+        }
+    }
+
     fn report_pointer(&self, event: &gdk::Event) -> bool {
         let state = event.modifier_state();
         let modifiers = mouse_modifiers(state);
@@ -2194,8 +2247,6 @@ impl<P: Pty> TerminalPane<P> {
         {
             return false;
         }
-        let cell =
-            point.and_then(|point| self.view.cell_at(point, self.dimensions.get(), released));
         let mut reporting = false;
         let mut admitted = None;
         let sent = self
@@ -2204,25 +2255,45 @@ impl<P: Pty> TerminalPane<P> {
                 if new_generation {
                     self.pointer_wheel.set(0.0);
                 }
-                if point.is_some() {
-                    pointer.last_point = point.filter(|_| cell.is_some());
+                if released && (new_generation || !release_was_active) {
+                    return Ok(Vec::new());
                 }
-                let cell = cell.or_else(|| {
-                    if released && !new_generation {
-                        pointer
+                let Some(profile) = terminal.mouse_report_profile() else {
+                    // Cell hit testing can wait until an app report or an
+                    // alternate-scroll event actually requires a position.
+                    if point.is_some() {
+                        pointer.last_point = point;
+                    }
+                    return Ok(Vec::new());
+                };
+                let Some(target) = self.pointer_target(terminal, profile.encoding) else {
+                    return Ok(Vec::new());
+                };
+                let position =
+                    point.and_then(|point| self.mouse_position_at(point, target, released));
+                if let Some(MousePosition::Pixel { x, y }) = position {
+                    pointer.last_pixel = Some((x, y));
+                }
+                if point.is_some() {
+                    pointer.last_point = point.filter(|_| position.is_some());
+                }
+                let position = position.or_else(|| {
+                    if !released {
+                        return None;
+                    }
+                    match target {
+                        PointerTarget::Cell => pointer
                             .last_point
-                            .and_then(|point| self.view.cell_at(point, self.dimensions.get(), true))
-                    } else {
-                        None
+                            .and_then(|point| self.mouse_position_at(point, target, true)),
+                        PointerTarget::Pixel(_) => pointer
+                            .last_pixel
+                            .map(|(x, y)| MousePosition::Pixel { x, y }),
                     }
                 });
-                let Some((column, row)) = cell else {
+                let Some(position) = position else {
                     return Ok(Vec::new());
                 };
                 let (input, motion) = match input {
-                    MouseInput::Release(_) if new_generation || !release_was_active => {
-                        return Ok(Vec::new());
-                    }
                     MouseInput::Motion(_) => {
                         let physical = pointer_buttons(state);
                         let button = PointerState::first_button(pointer.active_buttons & physical);
@@ -2231,13 +2302,12 @@ impl<P: Pty> TerminalPane<P> {
                             return Ok(Vec::new());
                         }
                         let motion = PointerMotion {
-                            column,
-                            row,
+                            position,
                             button,
                             modifiers,
                         };
                         if pointer.last_motion == Some(motion) {
-                            // This cell was sent in the current mouse and grid generation.
+                            // This position was sent in the current mouse generation.
                             reporting = true;
                             return Ok(Vec::new());
                         }
@@ -2245,23 +2315,21 @@ impl<P: Pty> TerminalPane<P> {
                     }
                     _ => (input, None),
                 };
-                let Some(bytes) = terminal.encode_mouse(input, column, row, modifiers) else {
+                let Some(bytes) = terminal.encode_mouse_at(input, position, modifiers) else {
                     pointer.last_motion = None;
                     return Ok(Vec::new());
                 };
                 reporting = true;
                 let press = match input {
-                    MouseInput::Press(button) => terminal
-                        .mouse_report_profile()
-                        .map(|profile| (button, profile.tracking)),
+                    MouseInput::Press(button) => Some((button, profile.tracking)),
                     _ => None,
                 };
-                admitted = Some((motion, press, column, row));
+                admitted = Some((motion, press, position));
                 Ok(bytes)
             })
             .unwrap_or(false);
         let mut focus = false;
-        if let Some((motion, press, column, row)) = admitted.filter(|_| sent) {
+        if let Some((motion, press, position)) = admitted.filter(|_| sent) {
             pointer.last_motion = motion;
             if let Some((button, tracking)) = press {
                 pointer.owned_buttons |= 1 << button;
@@ -2269,10 +2337,9 @@ impl<P: Pty> TerminalPane<P> {
                     pointer.active_buttons |= 1 << button;
                 }
                 if matches!(tracking, MouseTracking::Drag | MouseTracking::Any) {
-                    // GTK can deliver motion from the press cell as its grab starts.
+                    // GTK can report the same position again when the grab starts.
                     pointer.last_motion = Some(PointerMotion {
-                        column,
-                        row,
+                        position,
                         button: PointerState::first_button(pointer.active_buttons),
                         modifiers,
                     });
@@ -2300,10 +2367,7 @@ impl<P: Pty> TerminalPane<P> {
             self.pointer_wheel.set(0.0);
             return false;
         }
-        let cell = self
-            .view
-            .event_point(event)
-            .and_then(|point| self.view.cell_at(point, self.dimensions.get(), false));
+        let point = self.view.event_point(event);
         let delta = match event
             .downcast_ref::<gdk::ScrollEvent>()
             .map(|scroll| scroll.direction())
@@ -2318,14 +2382,29 @@ impl<P: Pty> TerminalPane<P> {
         let mut reporting = false;
         let result = self.queue_input(|terminal| {
             let new_generation = pointer.follow_generation(terminal.mouse_report_generation());
-            // Scroll events can omit their position. Re-hit-test the last
-            // widget point against today's cell geometry.
-            let cell = cell.or_else(|| {
-                pointer
-                    .last_point
-                    .and_then(|point| self.view.cell_at(point, self.dimensions.get(), false))
-            });
-            let Some((column, row)) = cell else {
+            let encoding = match terminal.mouse_report_profile() {
+                Some(profile) => profile.encoding,
+                None if terminal.alternate_scroll_active() => MouseEncoding::Legacy,
+                None => return Ok(Vec::new()),
+            };
+            let Some(target) = self.pointer_target(terminal, encoding) else {
+                return Ok(Vec::new());
+            };
+            // A positionless wheel event can use the most recent widget hit.
+            // Pixel hits from an earlier negotiation cannot seed that fallback.
+            let position = point
+                .and_then(|point| self.mouse_position_at(point, target, false))
+                .or_else(|| {
+                    if matches!(target, PointerTarget::Pixel(_))
+                        && (point.is_some() || pointer.last_pixel.is_none())
+                    {
+                        return None;
+                    }
+                    pointer
+                        .last_point
+                        .and_then(|point| self.mouse_position_at(point, target, false))
+                });
+            let Some(position) = position else {
                 return Ok(Vec::new());
             };
             let pending = if new_generation {
@@ -2339,7 +2418,7 @@ impl<P: Pty> TerminalPane<P> {
                 MouseInput::WheelDown
             };
             let Some(bytes) =
-                terminal.encode_mouse(input, column, row, mouse_modifiers(event.modifier_state()))
+                terminal.encode_mouse_at(input, position, mouse_modifiers(event.modifier_state()))
             else {
                 return Ok(Vec::new());
             };
@@ -2647,9 +2726,9 @@ mod transcript_tests {
             owned_buttons: 1,
             active_buttons: 1,
             last_point: Some((20.0, 10.0)),
+            last_pixel: Some((28, 14)),
             last_motion: Some(PointerMotion {
-                column: 2,
-                row: 1,
+                position: MousePosition::Pixel { x: 28, y: 14 },
                 button: Some(0),
                 modifiers: 0,
             }),
@@ -2659,6 +2738,7 @@ mod transcript_tests {
         assert!(pointer.follow_generation(4));
         assert_eq!(pointer.active_buttons, 0);
         assert!(pointer.last_motion.is_none());
+        assert_eq!(pointer.last_pixel, None);
         assert_eq!(pointer.last_point, Some((20.0, 10.0)));
         assert_eq!(pointer.release(0), Some(false));
         assert_eq!(pointer.release(0), None);
