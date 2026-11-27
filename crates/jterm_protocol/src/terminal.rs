@@ -35,7 +35,7 @@ pub enum CursorShape {
 }
 
 /// Compact RGB paint value serialized as a CSS `#RRGGBB` string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RgbColor(pub u8, pub u8, pub u8);
 
 impl RgbColor {

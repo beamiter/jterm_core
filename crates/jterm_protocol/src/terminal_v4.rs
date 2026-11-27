@@ -1,4 +1,4 @@
-//! Terminal Channel frames. Version 5 adds inline rasters and version 6 adds row moves.
+//! Terminal Channel frames with inline rasters, row moves, and packed rows.
 
 use crate::terminal::{self, Attachment, CursorShape, RgbColor, SessionStatus, WireFrame};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -8,6 +8,7 @@ pub use crate::terminal::{MAX_CELLS, MAX_COLUMNS, MAX_ROWS};
 pub const VERSION: u8 = 4;
 pub const IMAGE_VERSION: u8 = 5;
 pub const ROW_MOVE_VERSION: u8 = 6;
+pub const PACKED_VERSION: u8 = 7;
 pub const MAX_IMAGES: usize = 32;
 pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_IMAGE_DIMENSION: u32 = 4096;
@@ -25,6 +26,7 @@ pub enum SnapshotFormat {
     Channel,
     ChannelImages,
     ChannelRowMoves,
+    ChannelPacked,
 }
 
 impl SnapshotFormat {
@@ -34,6 +36,7 @@ impl SnapshotFormat {
             Some(VERSION) => Ok(Self::Channel),
             Some(IMAGE_VERSION) => Ok(Self::ChannelImages),
             Some(ROW_MOVE_VERSION) => Ok(Self::ChannelRowMoves),
+            Some(PACKED_VERSION) => Ok(Self::ChannelPacked),
             Some(_) => Err("unsupported terminal snapshot version"),
         }
     }
@@ -44,11 +47,23 @@ impl SnapshotFormat {
             Self::Channel => Some(VERSION),
             Self::ChannelImages => Some(IMAGE_VERSION),
             Self::ChannelRowMoves => Some(ROW_MOVE_VERSION),
+            Self::ChannelPacked => Some(PACKED_VERSION),
         }
     }
 
     pub fn supports_images(self) -> bool {
-        matches!(self, Self::ChannelImages | Self::ChannelRowMoves)
+        matches!(
+            self,
+            Self::ChannelImages | Self::ChannelRowMoves | Self::ChannelPacked
+        )
+    }
+
+    pub fn history_version(self) -> Option<u8> {
+        match self {
+            Self::ChannelPacked => Some(PACKED_VERSION),
+            Self::ChannelImages | Self::ChannelRowMoves => Some(IMAGE_VERSION),
+            _ => None,
+        }
     }
 }
 
@@ -63,22 +78,24 @@ pub struct HistorySource {
 }
 
 pub type HistoryRow = HistoryRowData<Cell>;
+pub type HistoryRowData<C> = HistoryRowWith<RowData<C>>;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename = "HistoryRow", deny_unknown_fields)]
-pub struct HistoryRowData<C> {
+pub struct HistoryRowWith<R> {
     pub source: HistorySource,
-    pub paint: RowData<C>,
+    pub paint: R,
     /// Physical cell boundaries in the selectable snapshot, measured in UTF-16.
     pub text_offsets: Vec<u32>,
 }
 
 pub type HistoryView = HistoryViewData<Cell>;
+pub type HistoryViewData<C> = HistoryViewRows<RowData<C>>;
 
 /// An immutable primary-history window. It does not participate in live ACKs.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename = "HistoryView", deny_unknown_fields)]
-pub struct HistoryViewData<C> {
+pub struct HistoryViewRows<R> {
     pub version: u8,
     pub owner: Attachment,
     pub revision: Counter,
@@ -88,7 +105,7 @@ pub struct HistoryViewData<C> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_background: Option<RgbColor>,
     pub text: String,
-    pub rows: Vec<HistoryRowData<C>>,
+    pub rows: Vec<HistoryRowWith<R>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hyperlinks: Vec<Hyperlink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -186,7 +203,7 @@ pub enum Screen {
     Alternate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Underline {
     Single,
@@ -230,6 +247,41 @@ pub struct RowData<C> {
     pub image_slices: Vec<ImageSlice>,
 }
 
+/// Version 7 can use a row-local style table and runs or the ordinary row data.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackedRow<Text, Paint> {
+    pub wrapped: bool,
+    pub columns: u16,
+    pub styles: Vec<PackedStyle<Paint>>,
+    pub runs: Vec<PackedRun<Text>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_slices: Vec<ImageSlice>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, bound(deserialize = "Paint: Deserialize<'de>"))]
+pub struct PackedStyle<Paint> {
+    pub foreground: Paint,
+    pub background: Paint,
+    pub style: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline: Option<Underline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline_color: Option<Paint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink_id: Option<u16>,
+}
+
+/// Two fields encode one single-column cell per scalar. Three fields
+/// encode one cell with explicit text and width, including wide continuations.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PackedRun<Text> {
+    Scalars(u16, String),
+    Cell(u16, Text, u8),
+}
+
 /// Row-relative location of one vertical slice of a retained image.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -252,12 +304,13 @@ pub struct ImageResource {
 }
 
 pub type ChangedRow = ChangedRowData<Cell>;
+pub type ChangedRowData<C> = ChangedRowWith<RowData<C>>;
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename = "ChangedRow", deny_unknown_fields)]
-pub struct ChangedRowData<C> {
+pub struct ChangedRowWith<R> {
     pub index: u16,
-    pub row: RowData<C>,
+    pub row: R,
 }
 
 /// Copy consecutive rows from the acknowledged base into the new frame.
@@ -298,6 +351,7 @@ pub struct Hyperlink {
 }
 
 pub type Update = UpdateData<Cell>;
+pub type UpdateData<C> = UpdateRows<RowData<C>>;
 
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(
@@ -306,11 +360,11 @@ pub type Update = UpdateData<Cell>;
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-pub enum UpdateData<C> {
+pub enum UpdateRows<R> {
     Snapshot {
         stamp: Stamp,
         cols: u16,
-        rows: Vec<RowData<C>>,
+        rows: Vec<R>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hyperlinks: Vec<Hyperlink>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -319,7 +373,7 @@ pub enum UpdateData<C> {
     Delta {
         stamp: Stamp,
         base_revision: Counter,
-        rows: Vec<ChangedRowData<C>>,
+        rows: Vec<ChangedRowWith<R>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         moves: Vec<RowMove>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -329,7 +383,7 @@ pub enum UpdateData<C> {
     },
 }
 
-impl<C> UpdateData<C> {
+impl<R> UpdateRows<R> {
     pub fn revision(&self) -> Counter {
         match self {
             Self::Snapshot { stamp, .. } | Self::Delta { stamp, .. } => stamp.revision,
@@ -384,7 +438,11 @@ mod tests {
         assert_eq!(moves, SnapshotFormat::ChannelRowMoves);
         assert!(images.supports_images() && moves.supports_images());
         assert_eq!(moves.channel_version(), Some(ROW_MOVE_VERSION));
-        assert!(SnapshotFormat::negotiate(Some(ROW_MOVE_VERSION + 1)).is_err());
+        let packed = SnapshotFormat::negotiate(Some(PACKED_VERSION)).unwrap();
+        assert_eq!(packed, SnapshotFormat::ChannelPacked);
+        assert_eq!(packed.channel_version(), Some(PACKED_VERSION));
+        assert!(packed.supports_images());
+        assert!(SnapshotFormat::negotiate(Some(PACKED_VERSION + 1)).is_err());
     }
 
     #[test]
