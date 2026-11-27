@@ -1327,8 +1327,14 @@ fn scrolling_keeps_existing_text_tags_and_moves_copy_and_caret_metadata() {
         .unwrap();
     present(&view, &terminal);
     let reference = TerminalView::new(theme);
-    present(&reference, &terminal);
     let expected = reference.widget.buffer();
+    let rebuild_insertions = Rc::new(Cell::new(0));
+    expected.connect_insert_text({
+        let count = rebuild_insertions.clone();
+        move |_, _, _| count.set(count.get() + 1)
+    });
+    present(&reference, &terminal);
+    assert_eq!(rebuild_insertions.get(), 1);
     assert_eq!(
         buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
         expected.text(&expected.start_iter(), &expected.end_iter(), true)
@@ -1704,7 +1710,6 @@ impl Presentation {
             font,
             styles: HashMap::new(),
         };
-        let mut end = buffer.end_iter();
         let height = viewport.frame.rows().len();
         let archived = viewport.history.into_iter().flat_map(|(_, page)| {
             (0..page.row_count).map(move |index| RowSource::History(page, index))
@@ -1713,19 +1718,42 @@ impl Presentation {
             (0..height).map(|index| RowSource::Live(viewport.frame, index, viewport.margin_gaps));
         let mut rows = Vec::with_capacity(height);
         let mut targets = HashMap::new();
+        let mut text = String::with_capacity(height * (viewport.frame.cols() + 1));
+        let mut run_lengths = Vec::with_capacity(height);
         for (index, source) in archived.chain(live).take(height).enumerate() {
             if index != 0 {
-                buffer.insert_with_tags(&mut end, "\n", &[&tags.font]);
+                text.push('\n');
             }
-            rows.push(paint_row(
-                &buffer,
-                &mut end,
+            rows.push(format_row(
                 source,
                 theme,
-                &mut tags,
                 viewport.caret(index),
                 &mut targets,
+                &mut text,
+                |_, length, style| {
+                    run_lengths.push(length);
+                    tags.style_tag(&buffer, style)
+                },
             ));
+        }
+        if !text.is_empty() {
+            // Publish the complete text and its shared font before applying
+            // the per-run attributes at GTK character offsets.
+            buffer.insert_with_tags(&mut buffer.end_iter(), &text, &[&tags.font]);
+            let mut end = buffer.start_iter();
+            let mut run_lengths = run_lengths.into_iter();
+            for (index, row) in rows.iter().enumerate() {
+                if index != 0 {
+                    end.forward_char();
+                }
+                for style in &row.tags {
+                    let start = end;
+                    end.forward_chars(run_lengths.next().expect("length of the styled run"));
+                    buffer.apply_tag(&style.tag, &start, &end);
+                }
+            }
+            debug_assert!(run_lengths.next().is_none());
+            debug_assert!(end.is_end());
         }
         Self {
             buffer,
@@ -1930,6 +1958,28 @@ fn paint_row(
     cursor: Option<Cursor>,
     targets: &mut HashMap<HyperlinkId, Option<Rc<str>>>,
 ) -> PresentedRow {
+    format_row(
+        source,
+        theme,
+        cursor,
+        targets,
+        &mut String::new(),
+        |text, _, style| {
+            let tag = tags.insert_run(buffer, end, text, style);
+            text.clear();
+            tag
+        },
+    )
+}
+
+fn format_row(
+    source: RowSource<'_>,
+    theme: &PaintTheme<'_>,
+    cursor: Option<Cursor>,
+    targets: &mut HashMap<HyperlinkId, Option<Rc<str>>>,
+    text: &mut String,
+    mut style_run: impl FnMut(&mut String, i32, Style) -> Rc<StyleTag>,
+) -> PresentedRow {
     let row = source
         .row()
         .expect("frame and history indices are admitted");
@@ -1958,7 +2008,7 @@ fn paint_row(
         }),
     };
     let mut offset = 0;
-    let mut run = String::new();
+    let mut run_offset = 0;
     let mut previous = None;
     // Repeated styles are common in text rows. Diverse rows retain the
     // ordinary resolver, including rows whose first cells only happen to match.
@@ -2029,14 +2079,14 @@ fn paint_row(
         if let Some(old_style) = previous.filter(|old| *old != style) {
             result
                 .tags
-                .push(tags.insert_run(buffer, end, &run, old_style));
-            run.clear();
+                .push(style_run(text, offset - run_offset, old_style));
+            run_offset = offset;
         }
         let length = if let Some(cluster) = source.cluster(column) {
             let mut length = 0;
             for character in cluster.chars() {
                 push_painted_character(
-                    &mut run,
+                    text,
                     &mut result.line_separators,
                     offset + length,
                     character,
@@ -2045,12 +2095,7 @@ fn paint_row(
             }
             length
         } else {
-            push_painted_character(
-                &mut run,
-                &mut result.line_separators,
-                offset,
-                cell.character,
-            );
+            push_painted_character(text, &mut result.line_separators, offset, cell.character);
             1
         };
         let end_offset = offset + length;
@@ -2088,7 +2133,9 @@ fn paint_row(
         previous = Some(style);
     }
     if let Some(style) = previous {
-        result.tags.push(tags.insert_run(buffer, end, &run, style));
+        result
+            .tags
+            .push(style_run(text, offset - run_offset, style));
     }
     result
 }
@@ -2196,6 +2243,12 @@ impl PaintTags {
         text: &str,
         style: Style,
     ) -> Rc<StyleTag> {
+        let tag = self.style_tag(buffer, style);
+        buffer.insert_with_tags(end, text, &[&self.font, &tag.tag]);
+        tag
+    }
+
+    fn style_tag(&mut self, buffer: &gtk4::TextBuffer, style: Style) -> Rc<StyleTag> {
         let entry = self.styles.entry(style).or_insert_with(|| {
             let tag = gtk4::TextTag::builder()
                 .foreground_rgba(&style.foreground)
@@ -2215,7 +2268,6 @@ impl PaintTags {
             buffer.tag_table().add(&tag);
             Rc::new(StyleTag { style, tag })
         });
-        buffer.insert_with_tags(end, text, &[&self.font, &entry.tag]);
         Rc::clone(entry)
     }
 
