@@ -269,6 +269,25 @@ impl<Row: RetainedRow> RetainedHistory<Row> {
 }
 
 impl RetainedHistory<ScrollbackLine> {
+    pub(crate) fn retain_latest_line(&mut self, row: ScrollbackLine, row_limit: usize) -> bool {
+        if self.rows.len() == row_limit
+            && self.bytes <= self.byte_limit
+            && self
+                .rows
+                .front()
+                .is_some_and(|oldest| oldest.retained_bytes() == row.retained_bytes())
+        {
+            // Transfer an equal charge to the new tail without touching the
+            // process counter. Both the owner and process totals stay bounded.
+            let oldest = self.rows.pop_front();
+            self.rows.push_back(row);
+            drop(oldest);
+            true
+        } else {
+            self.retain_latest(row, row_limit, drop)
+        }
+    }
+
     /// Normalize Frost's physical history after a resize. Source rows are
     /// consumed one at a time and the output retains only the newest tail.
     /// Every emitted row receives a fresh identity, including discarded rows.
@@ -290,7 +309,7 @@ impl RetainedHistory<ScrollbackLine> {
         });
         reflow_cell_rows(source, columns, blank, |cells, wrapped| {
             let line = ScrollbackLine::compress_frost_legacy(cells, wrapped);
-            result.retain_latest(line, row_limit, drop);
+            result.retain_latest_line(line, row_limit);
             #[cfg(test)]
             FROST_REFLOW_PEAK.with(|peak| {
                 let (source, row, retained) = peak.get();
@@ -339,6 +358,35 @@ mod tests {
         drop(peer);
         drop(active);
         assert_eq!(budget.usage().retained_bytes, 0);
+    }
+
+    #[test]
+    fn replacing_an_equal_charge_keeps_the_newest_tail_at_the_budget_limit() {
+        let line = |character| {
+            ScrollbackLine::compress(
+                &[TerminalCell {
+                    character,
+                    ..TerminalCell::default()
+                }; 80],
+                false,
+            )
+        };
+        let size = line('a').retained_bytes();
+        let budget = Arc::new(HistoryBudget::new(size * 3));
+        let mut history = RetainedHistory::with_process_budget(size * 2, Arc::clone(&budget));
+        let mut peer = history.empty_sibling();
+        assert!(peer.push_back(line('p')));
+        assert!(history.retain_latest_line(line('a'), 2));
+        assert!(history.retain_latest_line(line('b'), 2));
+        let before = budget.usage();
+        assert!(history.retain_latest_line(line('c'), 2));
+        assert_eq!(budget.usage(), before);
+        assert_eq!(history.retained_bytes(), size * 2);
+        assert_eq!(history[0].decompress()[0].character, 'b');
+        assert_eq!(history[1].decompress()[0].character, 'c');
+        assert_eq!(peer[0].decompress()[0].character, 'p');
+        drop(history);
+        assert_eq!(budget.usage().retained_bytes, size);
     }
 
     #[test]

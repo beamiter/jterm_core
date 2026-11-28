@@ -488,7 +488,7 @@ impl Terminal {
         let mut reader = HistoryReader::new(&self.history, layout);
         let materialize = |index: usize| match &layout.projected {
             Some(projected) => reader.read(projected[index]),
-            None => HistoryCopyRow::from_line(&self.history[index]),
+            None => HistoryCopyRow::from_line(&self.history[index], &mut reader.decoded),
         };
         let cache = use_cache.then(|| layout.viewport.lock().ok()).flatten();
         let (rows, cached_links) = if let Some(mut cache) = cache {

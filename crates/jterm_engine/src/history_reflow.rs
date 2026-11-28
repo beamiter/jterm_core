@@ -217,10 +217,11 @@ pub(crate) struct HistoryCopyRow {
 }
 
 impl HistoryCopyRow {
-    pub(crate) fn from_line(line: &ScrollbackLine) -> Self {
+    pub(crate) fn from_line(line: &ScrollbackLine, decoded: &mut Vec<TerminalCell>) -> Self {
+        line.decompress_into(decoded);
         Self {
             row: Row {
-                cells: Arc::from(line.decompress()),
+                cells: Arc::from(decoded.as_slice()),
                 wrapped: line.is_wrapped,
             },
             underline_colors: (!line.underline_color_runs().is_empty())

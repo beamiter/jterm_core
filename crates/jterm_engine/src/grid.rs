@@ -2195,7 +2195,7 @@ pub struct ScrollbackLine {
     /// the exact prefix retained by projection reflow. Keeping this compact
     /// geometry beside the compressed row lets the projection planner avoid
     /// decoding historical cells merely to preserve wide glyph boundaries.
-    reflow_wide_continuations: SmallVec<[u16; 2]>,
+    reflow_wide_continuations: SmallVec<[u16; 4]>,
     // Geometry occupies the prefix; packed drawn-space occupancy follows it.
     reflow_wide_count: u16,
     raw_row_id: RawRowId,
@@ -2203,13 +2203,17 @@ pub struct ScrollbackLine {
 
 const ARCHIVE_PRINTED_SPACES: u8 = 1 << 1;
 const ARCHIVE_EXTENDED_RENDITION: u8 = 1 << 3;
+const ARCHIVE_PLAIN_ASCII: u8 = 1 << 4;
 const ARCHIVE_CELL_OVERLINE: u8 = 1 << 5;
 const ARCHIVE_CELL_CONCEALED: u8 = 1 << 6;
 const ARCHIVE_SCRATCH_LIMIT: usize = 8 * 1024;
+// Fit short text in the space already required by the String variant.
+const INLINE_PLAIN_BYTES: usize = size_of::<String>();
 
 #[derive(Clone, Debug)]
 enum CompressedLineData {
     Plain(String, u16),
+    InlinePlain(inline_plain::Text, u16),
     Encoded(Box<[u8]>),
     Decorated(Box<DecoratedLineData>),
 }
@@ -2222,9 +2226,25 @@ struct DecoratedLineData {
 }
 
 impl CompressedLineData {
+    fn plain(cells: &[TerminalCell], trailing: u16, ascii: bool) -> Self {
+        if let Some(inline) = inline_plain::Text::from_cells(cells, ascii) {
+            return Self::InlinePlain(inline, trailing);
+        }
+        let text = if ascii {
+            let mut bytes = Vec::new();
+            bytes.extend(cells.iter().map(|cell| cell.character as u8 & 0x7f));
+            // SAFETY: Every byte is in the ASCII subset of UTF-8.
+            unsafe { String::from_utf8_unchecked(bytes) }
+        } else {
+            cells.iter().map(|cell| cell.character).collect()
+        };
+        Self::Plain(text, trailing)
+    }
+
     fn content(&self) -> ScrollbackContent<'_> {
         match self {
             Self::Plain(text, trailing) => ScrollbackContent::Plain(text, *trailing),
+            Self::InlinePlain(text, trailing) => ScrollbackContent::Plain(text.as_str(), *trailing),
             Self::Encoded(bytes) => ScrollbackContent::Encoded(bytes),
             Self::Decorated(data) => data.base.content(),
         }
@@ -2233,6 +2253,7 @@ impl CompressedLineData {
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Plain(text, _) => text.capacity(),
+            Self::InlinePlain(..) => 0,
             Self::Encoded(bytes) => bytes.len(),
             Self::Decorated(data) => {
                 size_of::<DecoratedLineData>()
@@ -2243,6 +2264,50 @@ impl CompressedLineData {
                         .as_ref()
                         .map_or(0, |row| row.retained_bytes())
             }
+        }
+    }
+}
+
+mod inline_plain {
+    use super::{TerminalCell, INLINE_PLAIN_BYTES};
+
+    #[derive(Clone, Debug)]
+    pub(super) struct Text {
+        bytes: [u8; INLINE_PLAIN_BYTES],
+        length: u8,
+    }
+
+    impl Text {
+        pub(super) fn from_cells(cells: &[TerminalCell], ascii: bool) -> Option<Self> {
+            if cells.is_empty() || cells.len() > INLINE_PLAIN_BYTES {
+                return None;
+            }
+            let mut bytes = [0; INLINE_PLAIN_BYTES];
+            let length = if ascii {
+                for (byte, cell) in bytes.iter_mut().zip(cells) {
+                    debug_assert!(cell.character.is_ascii());
+                    *byte = cell.character as u8 & 0x7f;
+                }
+                cells.len()
+            } else {
+                let mut length = 0;
+                for cell in cells {
+                    let end = length + cell.character.len_utf8();
+                    cell.character.encode_utf8(bytes.get_mut(length..end)?);
+                    length = end;
+                }
+                length
+            };
+            Some(Self {
+                bytes,
+                length: u8::try_from(length).ok()?,
+            })
+        }
+
+        pub(super) fn as_str(&self) -> &str {
+            // SAFETY: The constructor writes only ASCII bytes or complete
+            // UTF-8 scalars. This module exposes no writes to the stored prefix.
+            unsafe { std::str::from_utf8_unchecked(&self.bytes[..usize::from(self.length)]) }
         }
     }
 }
@@ -2344,7 +2409,7 @@ impl ScrollbackLine {
                 .iter()
                 .fold(scanned_flags, |bits, cell| bits | cell.flags.0),
         );
-        let mut reflow_wide_continuations: SmallVec<[u16; 2]> = if row_flags.wide_continuation() {
+        let mut reflow_wide_continuations: SmallVec<[u16; 4]> = if row_flags.wide_continuation() {
             cells[..reflow_content_len]
                 .iter()
                 .enumerate()
@@ -2405,16 +2470,10 @@ impl ScrollbackLine {
                 eligible
             };
         let (data, archive_flags) = if stores_plain {
-            let text = if ascii_only {
-                let mut bytes = Vec::new();
-                bytes.extend(active.iter().map(|cell| cell.character as u8));
-                String::from_utf8(bytes).expect("plain ASCII history contains valid UTF-8")
-            } else {
-                active.iter().map(|cell| cell.character).collect()
-            };
             (
-                CompressedLineData::Plain(text, (cells.len() - active_len) as u16),
+                CompressedLineData::plain(active, (cells.len() - active_len) as u16, ascii_only),
                 (u8::from(cells.len() > usize::from(u16::MAX)) << 2)
+                    | (u8::from(ascii_only) * ARCHIVE_PLAIN_ASCII)
                     | (u8::from(plain_printed_spaces) * ARCHIVE_PRINTED_SPACES),
             )
         } else {
@@ -2547,7 +2606,9 @@ impl ScrollbackLine {
     }
 
     fn decode_plain_into(&self, text: &str, trailing: u16, cells: &mut Vec<TerminalCell>) {
-        if text.is_ascii() {
+        let ascii = self.archive_flags & ARCHIVE_PLAIN_ASCII != 0;
+        debug_assert_eq!(ascii, text.is_ascii());
+        if ascii {
             cells.extend(text.bytes().map(|byte| self.plain_cell(char::from(byte))));
         } else {
             cells.extend(text.chars().map(|character| self.plain_cell(character)));
@@ -4307,15 +4368,18 @@ mod retained_drawn_space_tests {
     }
 
     #[test]
-    fn plain_archive_packing_preserves_short_row_charges_and_unicode_suffixes() {
+    fn plain_archive_packing_keeps_short_utf8_inline_and_preserves_its_suffix() {
         for text in [
-            "",
-            "x",
-            "\0\u{7f}  ",
-            "short  row",
-            "abc\u{80}",
-            "abcé  ",
-            "界 abc",
+            String::new(),
+            "x".into(),
+            "\0\u{7f}  ".into(),
+            "short  row".into(),
+            "abc\u{80}".into(),
+            "abcé  ".into(),
+            "界 abc".into(),
+            "x".repeat(INLINE_PLAIN_BYTES),
+            "x".repeat(INLINE_PLAIN_BYTES + 1),
+            "é".repeat(INLINE_PLAIN_BYTES / 2 + 1),
         ] {
             let mut cells: Vec<_> = text
                 .chars()
@@ -4328,20 +4392,38 @@ mod retained_drawn_space_tests {
                     cell
                 })
                 .collect();
-            let reference: String = cells.iter().map(|cell| cell.character).collect();
             cells.extend([TerminalCell::default(); 2]);
 
             let line = ScrollbackLine::compress(&cells, false);
             assert!(matches!(
                 line.content(),
-                ScrollbackContent::Plain(stored, 2) if stored == text
+                ScrollbackContent::Plain(stored, 2) if stored == text.as_str()
             ));
             assert_eq!(line.decompress(), cells);
+            let inline = !text.is_empty() && text.len() <= INLINE_PLAIN_BYTES;
             assert_eq!(
-                line.retained_bytes(),
-                size_of::<ScrollbackLine>() + reference.capacity()
+                matches!(line.data, CompressedLineData::InlinePlain(..)),
+                inline
             );
+            if text.is_empty() || inline {
+                assert_eq!(line.retained_bytes(), size_of::<ScrollbackLine>());
+            } else {
+                assert!(line.retained_bytes() >= size_of::<ScrollbackLine>() + text.len());
+            }
         }
+    }
+
+    #[test]
+    fn inline_archive_storage_stays_within_the_existing_row_layout() {
+        #[allow(dead_code)]
+        enum HeapLineData {
+            Plain(String, u16),
+            Encoded(Box<[u8]>),
+            Decorated(Box<DecoratedLineData>),
+        }
+
+        assert!(size_of::<CompressedLineData>() <= size_of::<HeapLineData>());
+        assert!(size_of::<SmallVec<[u16; 4]>>() <= size_of::<SmallVec<[u16; 2]>>());
     }
 
     #[test]
@@ -4373,11 +4455,18 @@ mod retained_drawn_space_tests {
             assert_eq!(scratch, cells);
             let cloned = line.clone();
             assert_eq!(cloned.decompress(), cells);
-            assert!(
-                line.retained_bytes()
-                    >= size_of::<ScrollbackLine>()
-                        + line.reflow_wide_continuations.capacity() * size_of::<u16>()
-            );
+            // A plain row fits all four occupancy words in the row. A wide
+            // continuation adds a fifth word and still incurs a heap charge.
+            assert_eq!(line.reflow_wide_continuations.spilled(), encoded);
+            if encoded {
+                assert!(
+                    line.retained_bytes()
+                        >= size_of::<ScrollbackLine>()
+                            + line.reflow_wide_continuations.capacity() * size_of::<u16>()
+                );
+            } else {
+                assert_eq!(line.retained_bytes(), size_of::<ScrollbackLine>());
+            }
         }
     }
 

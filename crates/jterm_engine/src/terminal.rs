@@ -1729,7 +1729,7 @@ impl Terminal {
         let row_id = line.raw_row_id();
         let retained = self
             .history
-            .retain_latest(line, self.history_row_limit, drop);
+            .retain_latest_line(line, self.history_row_limit);
         if let Some(sources) = &mut self.row_sources {
             if retained {
                 sources.appended(row_id, self.history_end);
@@ -1878,12 +1878,13 @@ impl Terminal {
         let offset = offset.min(total_rows);
         let end = total_rows - offset;
         let start = end.saturating_sub(limit);
+        let mut decoded = Vec::new();
         let rows = self
             .history
             .iter()
             .skip(start)
             .take(end - start)
-            .map(HistoryCopyRow::from_line)
+            .map(|line| HistoryCopyRow::from_line(line, &mut decoded))
             .collect();
         self.make_history_page::<true>(offset, total_rows, rows, false, text_limit)
     }
