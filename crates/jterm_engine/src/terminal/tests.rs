@@ -603,6 +603,85 @@ fn keyboard_mode_modifiers_and_unicode_are_rust_owned() {
 }
 
 #[test]
+fn application_keypad_follows_decnkm_and_preserves_numeric_and_enhanced_input() {
+    use crate::input::{KeypadKey, Modifiers};
+    let mut terminal = Terminal::new(3, 10).unwrap();
+    let key = |terminal: &Terminal, name, position, num_locked| {
+        terminal
+            .encode_key_with_keypad(name, None, Modifiers::default(), position, num_locked)
+            .unwrap()
+    };
+
+    assert_eq!(key(&terminal, "Enter", KeypadKey::Enter, false), b"\r");
+    assert_eq!(
+        key(&terminal, "Home", KeypadKey::Digit(7), false),
+        b"\x1b[H"
+    );
+    assert_eq!(
+        key(&terminal, "Clear", KeypadKey::Digit(5), false),
+        b"\x1b[E"
+    );
+    for (set, reset) in [
+        (b"\x1b=".as_slice(), b"\x1b>".as_slice()),
+        (b"\x1b[?66h".as_slice(), b"\x1b[?66l".as_slice()),
+    ] {
+        for &byte in set {
+            terminal.feed(&[byte]).unwrap();
+        }
+        assert_eq!(terminal.feed(b"\x1b[?66$p").unwrap(), b"\x1b[?66;1$y");
+        assert_eq!(key(&terminal, "Enter", KeypadKey::Enter, false), b"\x1bOM");
+        assert_eq!(
+            key(&terminal, "Home", KeypadKey::Digit(7), false),
+            b"\x1bOw"
+        );
+        assert_eq!(
+            key(&terminal, "Clear", KeypadKey::Digit(5), false),
+            b"\x1bOu"
+        );
+        assert_eq!(
+            key(&terminal, "Delete", KeypadKey::Decimal, false),
+            b"\x1bOn"
+        );
+        assert_eq!(key(&terminal, "+", KeypadKey::Add, false), b"\x1bOk");
+        assert_eq!(key(&terminal, "7", KeypadKey::Digit(7), true), b"7");
+        assert_eq!(key(&terminal, "Enter", KeypadKey::Enter, true), b"\r");
+        assert_eq!(
+            terminal.encode_key("Enter", false, false, false).unwrap(),
+            b"\r"
+        );
+        assert_eq!(
+            terminal.encode_key("Home", false, false, false).unwrap(),
+            b"\x1b[H"
+        );
+        for &byte in reset {
+            terminal.feed(&[byte]).unwrap();
+        }
+        assert_eq!(terminal.feed(b"\x1b[?66$p").unwrap(), b"\x1b[?66;2$y");
+        assert_eq!(
+            key(&terminal, "Home", KeypadKey::Digit(7), false),
+            b"\x1b[H"
+        );
+    }
+    terminal.enable_keyboard_disambiguation();
+    terminal.feed(b"\x1b=\x1b[>1u").unwrap();
+    assert_eq!(
+        terminal
+            .encode_key_with_keypad(
+                "Enter",
+                None,
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+                KeypadKey::Enter,
+                false,
+            )
+            .unwrap(),
+        b"\x1b[13;5u"
+    );
+}
+
+#[test]
 fn backarrow_keys_follow_the_queried_mode_and_keyboard_negotiation() {
     let stages: &[(&[u8], bool)] = &[
         (b"\x1b[67h\x1b[?67\x18h", false), // ANSI mode and canceled CSI.

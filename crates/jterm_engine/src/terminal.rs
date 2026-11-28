@@ -1188,14 +1188,77 @@ impl Terminal {
         alt: bool,
         ctrl: bool,
     ) -> Result<Vec<u8>, String> {
+        self.encode_key_input(
+            name,
+            base,
+            crate::input::Modifiers {
+                shift,
+                alt,
+                ctrl,
+                super_key: false,
+            },
+            None,
+        )
+    }
+
+    /// Encode a key whose physical keypad identity and Num Lock state are known.
+    /// The logical name remains available to the normal keyboard protocols.
+    pub fn encode_key_with_keypad(
+        &self,
+        name: &str,
+        base: Option<char>,
+        modifiers: crate::input::Modifiers,
+        key: crate::input::KeypadKey,
+        num_locked: bool,
+    ) -> Result<Vec<u8>, String> {
+        self.encode_key_input(name, base, modifiers, Some((key, num_locked)))
+    }
+
+    /// An unmodified keypad key that the application owns in legacy mode.
+    /// Text-input adapters can check this before handing the key to the IME.
+    pub fn encode_application_keypad(
+        &self,
+        key: crate::input::KeypadKey,
+        modifiers: crate::input::Modifiers,
+        num_locked: bool,
+    ) -> Option<[u8; 3]> {
+        if num_locked
+            || self.vt.protocol.keyboard_enhancement_flags() != 0
+            || modifiers != crate::input::Modifiers::default()
+            || !self.vt.protocol.modes().contains(&66)
+        {
+            return None;
+        }
+        key.application_sequence()
+    }
+
+    fn encode_key_input(
+        &self,
+        name: &str,
+        base: Option<char>,
+        modifiers: crate::input::Modifiers,
+        keypad: Option<(crate::input::KeypadKey, bool)>,
+    ) -> Result<Vec<u8>, String> {
         use crate::input::{
-            encode_kitty_disambiguated_key, legacy_backspace_sequence,
-            legacy_function_key_sequence, xterm_encode_modify_other_keys, Key, KittyKey, Modifiers,
+            encode_kitty_disambiguated_key, keypad_begin_sequence, legacy_backspace_sequence,
+            legacy_function_key_sequence, xterm_encode_modify_other_keys, Key, KeypadKey, KittyKey,
+            Modifiers,
         };
         let flags = self.vt.protocol.keyboard_enhancement_flags();
         if flags != 0 && self.vt.protocol.keyboard_enhancement_limit().is_none() {
             return Err("Kitty keyboard flags are unsupported".into());
         }
+        if let Some((key, num_locked)) = keypad {
+            if let Some(sequence) = self.encode_application_keypad(key, modifiers, num_locked) {
+                return Ok(sequence.to_vec());
+            }
+            if key == KeypadKey::Digit(5) && name == "Clear" {
+                return Ok(keypad_begin_sequence(modifiers).as_bytes().to_vec());
+            }
+        }
+        let Modifiers {
+            shift, alt, ctrl, ..
+        } = modifiers;
         let key = match name {
             "ArrowUp" => Key::ArrowUp,
             "ArrowDown" => Key::ArrowDown,
@@ -1231,12 +1294,6 @@ impl Terminal {
                 }
                 Key::Character(c)
             }
-        };
-        let modifiers = Modifiers {
-            shift,
-            alt,
-            ctrl,
-            super_key: false,
         };
         if flags != 0 {
             let kitty_key = match key {

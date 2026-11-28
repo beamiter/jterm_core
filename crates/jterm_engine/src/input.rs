@@ -44,6 +44,54 @@ pub struct Modifiers {
     pub super_key: bool,
 }
 
+/// Physical keys on a numeric keypad, independent of its current layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeypadKey {
+    Digit(u8),
+    Decimal,
+    Divide,
+    Multiply,
+    Subtract,
+    Add,
+    Enter,
+    Equal,
+    Separator,
+    Space,
+    Tab,
+}
+
+impl KeypadKey {
+    /// VT220 application-keypad encoding. The input adapter supplies
+    /// the physical key after resolving keyboard and shortcut ownership.
+    pub fn application_sequence(self) -> Option<[u8; 3]> {
+        let final_byte = match self {
+            Self::Digit(digit @ 0..=9) => b'p' + digit,
+            Self::Digit(_) => return None,
+            Self::Decimal => b'n',
+            Self::Divide => b'o',
+            Self::Multiply => b'j',
+            Self::Subtract => b'm',
+            Self::Add => b'k',
+            Self::Enter => b'M',
+            Self::Equal => b'X',
+            Self::Separator => b'l',
+            Self::Space => b' ',
+            Self::Tab => b'I',
+        };
+        Some([0x1b, b'O', final_byte])
+    }
+}
+
+/// PC keypad center in numeric mode when the OS reports Begin or Clear.
+pub fn keypad_begin_sequence(modifiers: Modifiers) -> Cow<'static, str> {
+    let parameter = kitty_modifier_value(modifiers);
+    if parameter == 1 {
+        Cow::Borrowed("\x1b[E")
+    } else {
+        Cow::Owned(format!("\x1b[1;{parameter}E"))
+    }
+}
+
 /// The negotiated flag for disambiguating key presses.
 pub const KITTY_DISAMBIGUATE: u8 = 1;
 

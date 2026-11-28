@@ -8,6 +8,7 @@ use jterm_engine::{
     history_reflow::HistoryAnchor,
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
+    input::{KeypadKey, Modifiers},
     mouse::{MouseEncoding, MouseInput, MousePosition, MouseTracking},
     terminal::{Terminal, TranscriptAnchor, WindowUpdates},
 };
@@ -832,6 +833,7 @@ pub struct TerminalPane<P: Pty> {
     input_method: gtk4::IMMulticontext,
     keys: gtk4::EventControllerKey,
     input_method_delegated: Cell<bool>,
+    preedit_active: Cell<bool>,
     input_style: InputStyle,
     input_cursor: Cell<Option<gdk::Rectangle>>,
     paste_revision: Cell<u64>,
@@ -1053,6 +1055,7 @@ impl<P: Pty> TerminalPane<P> {
             input_method: gtk4::IMMulticontext::new(),
             keys: gtk4::EventControllerKey::new(),
             input_method_delegated: Cell::new(false),
+            preedit_active: Cell::new(false),
             input_style,
             input_cursor: Cell::new(None),
             paste_revision: Cell::new(0),
@@ -1066,7 +1069,7 @@ impl<P: Pty> TerminalPane<P> {
         if automatic_grid && session.pty().is_some() {
             session.resize(rows, columns, None);
         }
-        session.connect_input();
+        session.connect_input(&page);
         let open_link = (links.attach_opener)(session.view.widget.upcast_ref());
         let weak = Rc::downgrade(&session);
         connect_links(
@@ -1724,11 +1727,7 @@ impl<P: Pty> TerminalPane<P> {
         revision
     }
 
-    fn allocated_grid(
-        &self,
-        width: i32,
-        height: i32,
-    ) -> ((usize, usize), Option<(u16, u16)>) {
+    fn allocated_grid(&self, width: i32, height: i32) -> ((usize, usize), Option<(u16, u16)>) {
         match &self.backend {
             Backend::Host { .. } => (self.view.dimensions(width, height), None),
             #[cfg(target_os = "linux")]
@@ -2154,7 +2153,11 @@ impl<P: Pty> TerminalPane<P> {
         self.view.widget.add_controller(events);
     }
 
-    fn pointer_target(&self, terminal: &Terminal, encoding: MouseEncoding) -> Option<PointerTarget> {
+    fn pointer_target(
+        &self,
+        terminal: &Terminal,
+        encoding: MouseEncoding,
+    ) -> Option<PointerTarget> {
         if encoding == MouseEncoding::SgrPixels {
             let installed = terminal.mouse_pixel_extent()?;
             return self
@@ -2180,7 +2183,10 @@ impl<P: Pty> TerminalPane<P> {
                 // Only coordinates from the live display can produce a new
                 // pixel position. A captured release may use its saved hit.
                 if self.scroll_top.get().is_some()
-                    || self.painted_source.get().is_none_or(|(_, top)| top.is_some())
+                    || self
+                        .painted_source
+                        .get()
+                        .is_none_or(|(_, top)| top.is_some())
                 {
                     return None;
                 }
@@ -2443,6 +2449,7 @@ impl<P: Pty> TerminalPane<P> {
 
     fn reset_preedit(&self) {
         self.input_method.reset();
+        self.preedit_active.set(false);
         self.view.clear_preedit();
     }
 
@@ -2489,7 +2496,7 @@ impl<P: Pty> TerminalPane<P> {
         self.set_composition_active(focused && !self.input_method_delegated.get());
     }
 
-    fn connect_input(self: &Rc<Self>) {
+    fn connect_input(self: &Rc<Self>, page: &gtk4::Widget) {
         let keys = &self.keys;
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let im = &self.input_method;
@@ -2526,8 +2533,15 @@ impl<P: Pty> TerminalPane<P> {
             }
         });
         let weak = Rc::downgrade(self);
+        im.connect_preedit_start(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.preedit_active.set(true);
+            }
+        });
+        let weak = Rc::downgrade(self);
         im.connect_preedit_end(move |_| {
             if let Some(session) = weak.upgrade() {
+                session.preedit_active.set(false);
                 session.view.clear_preedit();
             }
         });
@@ -2606,12 +2620,71 @@ impl<P: Pty> TerminalPane<P> {
             } else {
                 None
             };
-            session.send_input(|terminal| {
-                terminal.encode_key_with_base(&name, base, shift, alt, ctrl)
+            let keypad = keypad_key(key).map(|keypad| {
+                let num_locked = controller
+                    .current_event_device()
+                    .is_some_and(|device| device.is_num_locked());
+                (keypad, num_locked)
+            });
+            session.send_input(|terminal| match keypad {
+                Some((keypad, num_locked)) => terminal.encode_key_with_keypad(
+                    &name,
+                    base,
+                    Modifiers {
+                        shift,
+                        alt,
+                        ctrl,
+                        super_key: false,
+                    },
+                    keypad,
+                    num_locked,
+                ),
+                None => terminal.encode_key_with_base(&name, base, shift, alt, ctrl),
             });
             glib::Propagation::Stop
         });
         self.view.widget.add_controller(keys.clone());
+
+        // The page captures application-keypad keys before the screen's IM
+        // context can commit them as text without their physical identity.
+        let keypad = gtk4::EventControllerKey::new();
+        keypad.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        keypad.connect_key_pressed(move |controller, key, _, modifiers| {
+            let Some(session) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(position) = keypad_key(key) else {
+                return glib::Propagation::Proceed;
+            };
+            if !session.accepts_ime()
+                || session.input_method_delegated.get()
+                || session.preedit_active.get()
+                || modifiers.intersects(
+                    gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::CONTROL_MASK
+                        | gdk::ModifierType::META_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::HYPER_MASK,
+                )
+            {
+                return glib::Propagation::Proceed;
+            }
+            let num_locked = controller
+                .current_event_device()
+                .is_some_and(|device| device.is_num_locked());
+            let Ok(Some(sequence)) = session.inspect(|terminal| {
+                terminal.encode_application_keypad(position, Modifiers::default(), num_locked)
+            }) else {
+                return glib::Propagation::Proceed;
+            };
+            if !session.scroll_key(key, modifiers) {
+                session.send_input(|_| Ok(sequence.to_vec()));
+            }
+            glib::Propagation::Stop
+        });
+        page.add_controller(keypad);
     }
 }
 
@@ -2677,14 +2750,15 @@ fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {
     use gdk::Key;
     Some(
         match key {
-            Key::Up => "ArrowUp",
-            Key::Down => "ArrowDown",
-            Key::Left => "ArrowLeft",
-            Key::Right => "ArrowRight",
-            Key::Home => "Home",
-            Key::End => "End",
-            Key::Insert => "Insert",
-            Key::Delete => "Delete",
+            Key::Up | Key::KP_Up => "ArrowUp",
+            Key::Down | Key::KP_Down => "ArrowDown",
+            Key::Left | Key::KP_Left => "ArrowLeft",
+            Key::Right | Key::KP_Right => "ArrowRight",
+            Key::Home | Key::KP_Home => "Home",
+            Key::End | Key::KP_End => "End",
+            Key::Insert | Key::KP_Insert => "Insert",
+            Key::Delete | Key::KP_Delete => "Delete",
+            Key::KP_Begin => "Clear",
             Key::Page_Up | Key::KP_Page_Up => "PageUp",
             Key::Page_Down | Key::KP_Page_Down => "PageDown",
             Key::F1 => "F1",
@@ -2702,7 +2776,7 @@ fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {
             Key::Return | Key::KP_Enter => "Enter",
             Key::Escape => "Escape",
             Key::BackSpace => "Backspace",
-            Key::Tab | Key::ISO_Left_Tab => "Tab",
+            Key::Tab | Key::ISO_Left_Tab | Key::KP_Tab => "Tab",
             _ => {
                 return key
                     .to_unicode()
@@ -2712,6 +2786,33 @@ fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {
         }
         .into(),
     )
+}
+
+fn keypad_key(key: gdk::Key) -> Option<KeypadKey> {
+    use gdk::Key;
+    Some(match key {
+        Key::KP_0 | Key::KP_Insert => KeypadKey::Digit(0),
+        Key::KP_1 | Key::KP_End => KeypadKey::Digit(1),
+        Key::KP_2 | Key::KP_Down => KeypadKey::Digit(2),
+        Key::KP_3 | Key::KP_Page_Down => KeypadKey::Digit(3),
+        Key::KP_4 | Key::KP_Left => KeypadKey::Digit(4),
+        Key::KP_5 | Key::KP_Begin => KeypadKey::Digit(5),
+        Key::KP_6 | Key::KP_Right => KeypadKey::Digit(6),
+        Key::KP_7 | Key::KP_Home => KeypadKey::Digit(7),
+        Key::KP_8 | Key::KP_Up => KeypadKey::Digit(8),
+        Key::KP_9 | Key::KP_Page_Up => KeypadKey::Digit(9),
+        Key::KP_Decimal | Key::KP_Delete => KeypadKey::Decimal,
+        Key::KP_Divide => KeypadKey::Divide,
+        Key::KP_Multiply => KeypadKey::Multiply,
+        Key::KP_Subtract => KeypadKey::Subtract,
+        Key::KP_Add => KeypadKey::Add,
+        Key::KP_Enter => KeypadKey::Enter,
+        Key::KP_Equal => KeypadKey::Equal,
+        Key::KP_Separator => KeypadKey::Separator,
+        Key::KP_Space => KeypadKey::Space,
+        Key::KP_Tab => KeypadKey::Tab,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

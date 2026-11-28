@@ -2172,6 +2172,75 @@ mod tests {
     }
 
     #[test]
+    fn real_pty_application_keypad_distinguishes_main_keys_and_num_lock() {
+        use jterm_engine::input::{KeypadKey, Modifiers};
+
+        let script = r#"
+stty raw -echo || exit 30
+check() {
+    expected=$(printf '%b' "$2")
+    printf '\r\nKEYPAD_%s\r\n' "$1"
+    actual=$(dd bs=1 count="${#expected}" 2>/dev/null)
+    [ "$actual" = "$expected" ]
+}
+printf '\033>'
+check NORMAL '\r\033[H7' || exit 31
+printf '\033='
+check APPLICATION '\033OM\033Ow7' || exit 32
+check LOCKED '\r77' || exit 33
+printf '\033[?66l'
+check RESET '\r\033[H7' || exit 34
+printf DONE
+"#;
+        let argv = ["/bin/sh", "-c", script].map(OsString::from);
+        let mut session = Session::spawn_command(8, 32, &argv, None, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (mark, num_locked) in [
+            ("KEYPAD_NORMAL", false),
+            ("KEYPAD_APPLICATION", false),
+            ("KEYPAD_LOCKED", true),
+            ("KEYPAD_RESET", false),
+        ] {
+            while !session.terminal().visible_text().contains(mark) {
+                assert!(Instant::now() < deadline && !session.is_drained(), "{mark}");
+                session.drive().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let terminal = session.terminal();
+            let mut input = terminal
+                .encode_key_with_keypad(
+                    "Enter",
+                    None,
+                    Modifiers::default(),
+                    KeypadKey::Enter,
+                    num_locked,
+                )
+                .unwrap();
+            input.extend(
+                terminal
+                    .encode_key_with_keypad(
+                        if num_locked { "7" } else { "Home" },
+                        None,
+                        Modifiers::default(),
+                        KeypadKey::Digit(7),
+                        num_locked,
+                    )
+                    .unwrap(),
+            );
+            input.extend(terminal.encode_key("7", false, false, false).unwrap());
+            session.submit_input(input).unwrap();
+        }
+        while !session.is_drained() {
+            assert!(Instant::now() < deadline);
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.exit_code(), Some(0));
+        assert!(session.terminal().visible_text().contains("DONE"));
+        session.close().unwrap();
+    }
+
+    #[test]
     fn real_pty_backarrow_mode_controls_the_bytes_received_by_the_child() {
         let script = concat!(
             "stty raw -echo || exit 30; ",
