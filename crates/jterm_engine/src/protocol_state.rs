@@ -202,7 +202,9 @@ impl ProtocolState {
         self.keyboard_enhancement_flags
     }
 
-    pub(crate) fn keyboard_report_generation(&self) -> u64 {
+    /// Identity of the active keyboard report context, including screen and
+    /// mode transitions that return to the same flag value.
+    pub fn keyboard_report_generation(&self) -> u64 {
         self.keyboard_report_generation
     }
 
