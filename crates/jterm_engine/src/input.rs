@@ -94,8 +94,18 @@ pub fn keypad_begin_sequence(modifiers: Modifiers) -> Cow<'static, str> {
 
 /// The negotiated flag for disambiguating key presses.
 pub const KITTY_DISAMBIGUATE: u8 = 1;
+pub const KITTY_REPORT_EVENT_TYPES: u16 = 2;
+pub const KITTY_REPORT_ALTERNATE_KEYS: u16 = 4;
 pub const KITTY_REPORT_ALL_KEYS: u16 = 8;
 pub const KITTY_REPORT_ASSOCIATED_TEXT: u16 = 16;
+
+/// The phase of one physical key event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyEventType {
+    Press,
+    Repeat,
+    Release,
+}
 
 /// Layout values associated with a printable physical press.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +121,156 @@ pub struct KeyboardLocks {
     pub num_lock: bool,
 }
 
+/// The wire identity selected when a key is first admitted to the PTY.
+/// Hosts can retain it while the key is held, even if the layout changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KittyKeyReport {
+    code: u32,
+    trailer: u8,
+    alternates: (Option<char>, Option<char>),
+    legacy_press: Option<(bool, u8)>,
+}
+
+impl KittyKeyReport {
+    const fn new(code: u32, trailer: u8) -> Self {
+        Self {
+            code,
+            trailer,
+            alternates: (None, None),
+            legacy_press: None,
+        }
+    }
+
+    /// Retain the original key identity while using the repeat's shifted
+    /// value when it comes from the same layout key.
+    pub fn with_repeat_alternate(self, repeat: Self) -> Self {
+        if self.code != repeat.code || self.trailer != repeat.trailer {
+            return self;
+        }
+        Self {
+            alternates: (repeat.alternates.0, self.alternates.1),
+            ..self
+        }
+    }
+
+    /// Serialize an admitted event with its event-time modifiers.
+    pub fn encode(
+        self,
+        event: KittyEventType,
+        modifiers: Modifiers,
+        locks: KeyboardLocks,
+        flags: u16,
+        text: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let event = match (flags & KITTY_REPORT_EVENT_TYPES != 0, event) {
+            (false, KittyEventType::Release) => return None,
+            (false, KittyEventType::Repeat) => KittyEventType::Press,
+            (_, event) => event,
+        };
+        if event == KittyEventType::Release
+            && flags & KITTY_REPORT_ALL_KEYS == 0
+            && self.trailer == b'u'
+            && matches!(self.code, 9 | 13 | 127)
+        {
+            return None;
+        }
+        if event == KittyEventType::Press {
+            if let Some((escape, value)) = self.legacy_press {
+                return Some(if escape {
+                    vec![0x1b, value]
+                } else {
+                    vec![value]
+                });
+            }
+        }
+        let alternates = if flags & KITTY_REPORT_ALTERNATE_KEYS != 0 {
+            (
+                self.alternates.0.filter(|_| modifiers.shift),
+                self.alternates.1,
+            )
+        } else {
+            (None, None)
+        };
+        let associated = text.filter(|_| {
+            event != KittyEventType::Release
+                && flags & (KITTY_REPORT_ALL_KEYS | KITTY_REPORT_ASSOCIATED_TEXT)
+                    == (KITTY_REPORT_ALL_KEYS | KITTY_REPORT_ASSOCIATED_TEXT)
+        });
+        let parameter = u32::from(kitty_modifier_value(modifiers))
+            + 64 * u32::from(locks.caps_lock)
+            + 128 * u32::from(locks.num_lock);
+        Some(serialize_kitty_event(
+            self.code,
+            parameter,
+            self.trailer,
+            alternates,
+            event,
+            associated,
+        ))
+    }
+}
+
+/// Select a printable key report. Without all-key mode, only chords that
+/// produce no text are eligible. The adapter supplies native text separately.
+pub fn kitty_text_report(
+    key: KittyTextKey,
+    modifiers: Modifiers,
+    flags: u16,
+) -> Option<KittyKeyReport> {
+    if key.base.is_control() {
+        return None;
+    }
+    let report_all = flags & KITTY_REPORT_ALL_KEYS != 0;
+    let disambiguate = flags & u16::from(KITTY_DISAMBIGUATE) != 0;
+    if !report_all
+        && (!(disambiguate || flags & KITTY_REPORT_EVENT_TYPES != 0)
+            || !(modifiers.ctrl || modifiers.alt || modifiers.super_key))
+    {
+        return None;
+    }
+    Some(KittyKeyReport {
+        alternates: (
+            key.shifted.filter(|ch| *ch != key.base && !ch.is_control()),
+            key.base_layout
+                .filter(|ch| *ch != key.base && !ch.is_control()),
+        ),
+        legacy_press: if report_all || disambiguate {
+            None
+        } else {
+            legacy_event_only_text_press(key, modifiers)
+        },
+        ..KittyKeyReport::new(u32::from(key.base), b'u')
+    })
+}
+
+fn legacy_event_only_text_press(key: KittyTextKey, mods: Modifiers) -> Option<(bool, u8)> {
+    if mods.super_key {
+        return None;
+    }
+    let character = key.shifted.filter(|_| mods.shift).unwrap_or(key.base);
+    let ascii = character.is_ascii().then_some(character as u8)?;
+    let value = if mods.ctrl {
+        if mods.shift && key.base.is_ascii_lowercase() {
+            return None;
+        }
+        match ascii {
+            b'a'..=b'z' => ascii & 0x1f,
+            b' ' | b'2' | b'@' => 0,
+            b'3' | b'[' => 27,
+            b'4' | b'\\' => 28,
+            b'5' | b']' => 29,
+            b'6' | b'^' => 30,
+            b'7' | b'/' | b'_' => 31,
+            b'8' | b'?' => 127,
+            b'0' | b'1' | b'9' => ascii,
+            _ => return None,
+        }
+    } else {
+        ascii
+    };
+    Some((mods.alt, value))
+}
+
 /// Report a printable press in all-key mode. If the platform delivered only
 /// text, key zero carries the optional associated text without key modifiers.
 pub fn encode_kitty_text_press(
@@ -123,35 +283,25 @@ pub fn encode_kitty_text_press(
     if flags & KITTY_REPORT_ALL_KEYS == 0 {
         return None;
     }
-    let associated = text.filter(|_| flags & KITTY_REPORT_ASSOCIATED_TEXT != 0);
-    let Some(key) = key else {
-        return text
-            .filter(|value| value.chars().any(|ch| !ch.is_control()))
-            .map(|_| serialize_kitty_press(0, 1, b'u', (None, None), associated));
-    };
-    if key.base.is_control() {
-        return None;
+    match key {
+        Some(key) => kitty_text_report(key, modifiers, flags)?.encode(
+            KittyEventType::Press,
+            modifiers,
+            locks,
+            flags,
+            text,
+        ),
+        None => {
+            text.filter(|value| value.chars().any(|ch| !ch.is_control()))?;
+            KittyKeyReport::new(0, b'u').encode(
+                KittyEventType::Press,
+                Modifiers::default(),
+                KeyboardLocks::default(),
+                flags,
+                text,
+            )
+        }
     }
-    let alternates = if flags & 4 != 0 {
-        (
-            key.shifted
-                .filter(|ch| modifiers.shift && *ch != key.base && !ch.is_control()),
-            key.base_layout
-                .filter(|ch| *ch != key.base && !ch.is_control()),
-        )
-    } else {
-        (None, None)
-    };
-    let parameter = u32::from(kitty_modifier_value(modifiers))
-        + 64 * u32::from(locks.caps_lock)
-        + 128 * u32::from(locks.num_lock);
-    Some(serialize_kitty_press(
-        u32::from(key.base),
-        parameter,
-        b'u',
-        alternates,
-        associated,
-    ))
 }
 
 #[cfg(test)]
@@ -227,9 +377,52 @@ pub fn encode_kitty_keypad_press(
     flags: u16,
     text: Option<&str>,
 ) -> Option<Vec<u8>> {
+    kitty_keypad_report(
+        position,
+        logical,
+        modifiers,
+        flags & !KITTY_REPORT_EVENT_TYPES,
+    )?
+    .encode(
+        KittyEventType::Press,
+        modifiers,
+        KeyboardLocks {
+            num_lock: num_locked,
+            caps_lock: false,
+        },
+        flags,
+        text,
+    )
+}
+
+/// Select the physical or legacy logical identity of a keypad event.
+pub fn kitty_keypad_report(
+    position: KeypadKey,
+    logical: Key,
+    modifiers: Modifiers,
+    flags: u16,
+) -> Option<KittyKeyReport> {
     let report_all = flags & KITTY_REPORT_ALL_KEYS != 0;
-    if !report_all && flags & u16::from(KITTY_DISAMBIGUATE) == 0 {
-        return None;
+    let distinct_keypad = report_all || flags & u16::from(KITTY_DISAMBIGUATE) != 0;
+    if !distinct_keypad {
+        if flags & KITTY_REPORT_EVENT_TYPES == 0 {
+            return None;
+        }
+        return match logical {
+            Key::Unidentified if position == KeypadKey::Digit(5) => {
+                Some(KittyKeyReport::new(1, b'E'))
+            }
+            Key::Character(base) => kitty_text_report(
+                KittyTextKey {
+                    base,
+                    shifted: None,
+                    base_layout: None,
+                },
+                modifiers,
+                flags,
+            ),
+            _ => kitty_named_report(logical, modifiers, flags),
+        };
     }
     if !report_all
         && matches!(logical, Key::Character(ch) if !ch.is_control())
@@ -264,22 +457,15 @@ pub fn encode_kitty_keypad_press(
         Key::Unidentified if position == KeypadKey::Digit(5) => (1, b'E'),
         _ => (physical_code, b'u'),
     };
-    let parameter = u32::from(kitty_modifier_value(modifiers)) + 128 * u32::from(num_locked);
-    let associated = text.filter(|_| report_all && flags & KITTY_REPORT_ASSOCIATED_TEXT != 0);
-    Some(serialize_kitty_press(
-        code,
-        parameter,
-        final_byte,
-        (None, None),
-        associated,
-    ))
+    Some(KittyKeyReport::new(code, final_byte))
 }
 
-fn serialize_kitty_press(
+fn serialize_kitty_event(
     code: u32,
     parameter: u32,
     final_byte: u8,
     (shifted, base_layout): (Option<char>, Option<char>),
+    event: KittyEventType,
     text: Option<&str>,
 ) -> Vec<u8> {
     let mut characters = text
@@ -289,9 +475,16 @@ fn serialize_kitty_press(
         .peekable();
     let has_text = characters.peek().is_some();
     let has_alternates = shifted.is_some() || base_layout.is_some();
-    let mut output = Vec::with_capacity(13 + 16 * usize::from(has_alternates));
+    let event_suffix: &[u8] = match event {
+        KittyEventType::Press => b"",
+        KittyEventType::Repeat => b":2",
+        KittyEventType::Release => b":3",
+    };
+    let has_event = !event_suffix.is_empty();
+    let mut output = Vec::with_capacity(13 + event_suffix.len() + 16 * usize::from(has_alternates));
     output.extend_from_slice(b"\x1b[");
-    if code != 1 || final_byte == b'u' || parameter != 1 || has_text || has_alternates {
+    if code != 1 || final_byte == b'u' || parameter != 1 || has_text || has_alternates || has_event
+    {
         append_key_decimal(&mut output, code);
     }
     if has_alternates {
@@ -304,11 +497,12 @@ fn serialize_kitty_press(
             append_key_decimal(&mut output, u32::from(base_layout));
         }
     }
-    if parameter != 1 || has_text {
+    if parameter != 1 || has_text || has_event {
         output.push(b';');
-        if parameter != 1 {
+        if parameter != 1 || has_event {
             append_key_decimal(&mut output, parameter);
         }
+        output.extend_from_slice(event_suffix);
     }
     if let Some(first) = characters.next() {
         output.push(b';');
@@ -480,16 +674,30 @@ pub fn kitty_modifier_value(modifiers: Modifiers) -> u8 {
 /// Encode navigation, editing, F1–F12 and named control keys when Kitty
 /// disambiguation or all-key reporting has been negotiated.
 pub fn encode_kitty_named_press(key: Key, modifiers: Modifiers, flags: u16) -> Option<Vec<u8>> {
-    let report_all = flags & 8 != 0;
-    if !report_all && flags & u16::from(KITTY_DISAMBIGUATE) == 0 {
+    kitty_named_report(key, modifiers, flags & !KITTY_REPORT_EVENT_TYPES)?.encode(
+        KittyEventType::Press,
+        modifiers,
+        KeyboardLocks::default(),
+        flags,
+        None,
+    )
+}
+
+/// Select a named key for reporting. Main Enter, Tab and Backspace keep
+/// working in a shell while only event reporting is active.
+pub fn kitty_named_report(key: Key, modifiers: Modifiers, flags: u16) -> Option<KittyKeyReport> {
+    let report_all = flags & KITTY_REPORT_ALL_KEYS != 0;
+    let disambiguate = flags & u16::from(KITTY_DISAMBIGUATE) != 0;
+    let reports_events = flags & KITTY_REPORT_EVENT_TYPES != 0;
+    if !(report_all || disambiguate || reports_events) {
         return None;
     }
     let parameter = u32::from(kitty_modifier_value(modifiers));
     let (code, final_byte) = match key {
         Key::Escape => (27, b'u'),
-        Key::Enter if report_all || parameter != 1 => (13, b'u'),
-        Key::Tab if report_all || parameter != 1 => (9, b'u'),
-        Key::Backspace if report_all || parameter != 1 => (127, b'u'),
+        Key::Enter if report_all || (disambiguate && parameter != 1) => (13, b'u'),
+        Key::Tab if report_all || (disambiguate && parameter != 1) => (9, b'u'),
+        Key::Backspace if report_all || (disambiguate && parameter != 1) => (127, b'u'),
         Key::ArrowUp => (1, b'A'),
         Key::ArrowDown => (1, b'B'),
         Key::ArrowRight => (1, b'C'),
@@ -515,13 +723,121 @@ pub fn encode_kitty_named_press(key: Key, modifiers: Modifiers, flags: u16) -> O
         Key::F12 => (24, b'~'),
         _ => return None,
     };
-    Some(serialize_kitty_press(
-        code,
-        parameter,
-        final_byte,
-        (None, None),
-        None,
-    ))
+    Some(KittyKeyReport {
+        legacy_press: (key == Key::Escape && !report_all && !disambiguate && parameter == 1)
+            .then_some((false, 0x1b)),
+        ..KittyKeyReport::new(code, final_byte)
+    })
+}
+
+/// Modifier-only key identities. These are eligible only in all-key mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyModifierKey {
+    CapsLock,
+    ScrollLock,
+    NumLock,
+    ShiftLeft,
+    ControlLeft,
+    AltLeft,
+    SuperLeft,
+    ShiftRight,
+    ControlRight,
+    AltRight,
+    SuperRight,
+}
+
+pub fn kitty_modifier_report(key: KittyModifierKey, flags: u16) -> Option<KittyKeyReport> {
+    if flags & KITTY_REPORT_ALL_KEYS == 0 {
+        return None;
+    }
+    let code = match key {
+        KittyModifierKey::CapsLock => 57358,
+        KittyModifierKey::ScrollLock => 57359,
+        KittyModifierKey::NumLock => 57360,
+        KittyModifierKey::ShiftLeft => 57441,
+        KittyModifierKey::ControlLeft => 57442,
+        KittyModifierKey::AltLeft => 57443,
+        KittyModifierKey::SuperLeft => 57444,
+        KittyModifierKey::ShiftRight => 57447,
+        KittyModifierKey::ControlRight => 57448,
+        KittyModifierKey::AltRight => 57449,
+        KittyModifierKey::SuperRight => 57450,
+    };
+    Some(KittyKeyReport::new(code, b'u'))
+}
+
+#[cfg(test)]
+#[test]
+fn kitty_event_reports_keep_the_pressed_identity_and_gate_text() {
+    use KittyEventType::{Press, Release, Repeat};
+
+    let plain = Modifiers::default();
+    let locks = KeyboardLocks::default();
+    let f3 = kitty_named_report(Key::F3, plain, 2).unwrap();
+    assert_eq!(
+        f3.encode(Press, plain, locks, 2, None).unwrap(),
+        b"\x1b[13~"
+    );
+    assert_eq!(
+        f3.encode(Repeat, plain, locks, 2, None).unwrap(),
+        b"\x1b[13;1:2~"
+    );
+    assert_eq!(
+        f3.encode(Release, plain, locks, 2, None).unwrap(),
+        b"\x1b[13;1:3~"
+    );
+    assert_eq!(
+        f3.encode(Repeat, plain, locks, 8, None).unwrap(),
+        b"\x1b[13~"
+    );
+    assert_eq!(f3.encode(Release, plain, locks, 8, None), None);
+
+    let a = KittyTextKey {
+        base: 'a',
+        shifted: Some('A'),
+        base_layout: None,
+    };
+    assert!(kitty_text_report(a, plain, 2).is_none());
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..plain
+    };
+    let chord = kitty_text_report(a, ctrl, 2).unwrap();
+    assert_eq!(chord.encode(Press, ctrl, locks, 2, None).unwrap(), b"\x01");
+    assert_eq!(
+        chord.encode(Release, plain, locks, 2, None).unwrap(),
+        b"\x1b[97;1:3u"
+    );
+
+    let shift = Modifiers {
+        shift: true,
+        ..plain
+    };
+    let report = kitty_text_report(a, shift, 30).unwrap();
+    assert_eq!(
+        report.encode(Repeat, shift, locks, 30, Some("A")).unwrap(),
+        b"\x1b[97:65;2:2;65u"
+    );
+    assert_eq!(
+        report.encode(Release, shift, locks, 30, Some("A")).unwrap(),
+        b"\x1b[97:65;2:3u"
+    );
+
+    for key in [Key::Enter, Key::Tab, Key::Backspace] {
+        assert!(kitty_named_report(key, plain, 2).is_none());
+        let ctrl_key = kitty_named_report(key, ctrl, 3).unwrap();
+        assert!(ctrl_key.encode(Release, ctrl, locks, 3, None).is_none());
+    }
+    assert!(kitty_modifier_report(KittyModifierKey::ShiftLeft, 2).is_none());
+    let left_shift = kitty_modifier_report(KittyModifierKey::ShiftLeft, 10).unwrap();
+    assert_eq!(
+        left_shift.encode(Press, shift, locks, 10, None).unwrap(),
+        b"\x1b[57441;2u"
+    );
+    assert_eq!(
+        left_shift.encode(Release, plain, locks, 10, None).unwrap(),
+        b"\x1b[57441;1:3u"
+    );
 }
 
 #[cfg(test)]
@@ -613,11 +929,12 @@ pub fn encode_kitty_disambiguated_key(
         KittyKey::UnicodeWithText { base, .. } if non_shift => u32::from(base),
         _ => return None,
     };
-    Some(serialize_kitty_press(
+    Some(serialize_kitty_event(
         code,
         u32::from(kitty_modifier_value(modifiers)),
         b'u',
         (None, None),
+        KittyEventType::Press,
         None,
     ))
 }
