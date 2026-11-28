@@ -603,7 +603,7 @@ fn keyboard_mode_modifiers_and_unicode_are_rust_owned() {
 }
 
 #[test]
-fn application_keypad_follows_decnkm_and_preserves_numeric_and_enhanced_input() {
+fn application_keypad_follows_decnkm_and_yields_to_kitty_keypad_input() {
     use crate::input::{KeypadKey, Modifiers};
     let mut terminal = Terminal::new(3, 10).unwrap();
     let key = |terminal: &Terminal, name, position, num_locked| {
@@ -664,6 +664,33 @@ fn application_keypad_follows_decnkm_and_preserves_numeric_and_enhanced_input() 
     }
     terminal.enable_keyboard_disambiguation();
     terminal.feed(b"\x1b=\x1b[>1u").unwrap();
+    assert_eq!(terminal.feed(b"\x1b[?u").unwrap(), b"\x1b[?1u");
+    assert_eq!(
+        terminal.encode_key("Enter", false, false, false).unwrap(),
+        b"\r"
+    );
+    assert_eq!(
+        key(&terminal, "Enter", KeypadKey::Enter, false),
+        b"\x1b[57414u"
+    );
+    assert_eq!(
+        key(&terminal, "Enter", KeypadKey::Enter, true),
+        b"\x1b[57414;129u"
+    );
+    assert_eq!(
+        key(&terminal, "Home", KeypadKey::Digit(7), false),
+        b"\x1b[57423u"
+    );
+    assert_eq!(
+        key(&terminal, "Delete", KeypadKey::Decimal, false),
+        b"\x1b[57426u"
+    );
+    assert_eq!(
+        key(&terminal, "Clear", KeypadKey::Digit(5), false),
+        b"\x1b[E"
+    );
+    assert_eq!(key(&terminal, "+", KeypadKey::Add, false), b"+");
+    assert_eq!(key(&terminal, "7", KeypadKey::Digit(7), true), b"7");
     assert_eq!(
         terminal
             .encode_key_with_keypad(
@@ -677,8 +704,11 @@ fn application_keypad_follows_decnkm_and_preserves_numeric_and_enhanced_input() 
                 false,
             )
             .unwrap(),
-        b"\x1b[13;5u"
+        b"\x1b[57414;5u"
     );
+    terminal.feed(b"\x1b[<u").unwrap();
+    assert_eq!(terminal.feed(b"\x1b[?u").unwrap(), b"\x1b[?0u");
+    assert_eq!(key(&terminal, "Enter", KeypadKey::Enter, false), b"\x1bOM");
 }
 
 #[test]

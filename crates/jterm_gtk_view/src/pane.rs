@@ -2590,10 +2590,10 @@ impl<P: Pty> TerminalPane<P> {
             ) {
                 return glib::Propagation::Proceed;
             }
-            let shift =
-                key == gdk::Key::ISO_Left_Tab || modifiers.contains(gdk::ModifierType::SHIFT_MASK);
-            let alt = modifiers.contains(gdk::ModifierType::ALT_MASK);
-            let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+            let wire_modifiers = key_modifiers(key, modifiers);
+            let Modifiers {
+                shift, alt, ctrl, ..
+            } = wire_modifiers;
             if matches!(session.input_style, InputStyle::HostedAttachment { .. })
                 && key == gdk::Key::bracketright
                 && ctrl
@@ -2627,26 +2627,17 @@ impl<P: Pty> TerminalPane<P> {
                 (keypad, num_locked)
             });
             session.send_input(|terminal| match keypad {
-                Some((keypad, num_locked)) => terminal.encode_key_with_keypad(
-                    &name,
-                    base,
-                    Modifiers {
-                        shift,
-                        alt,
-                        ctrl,
-                        super_key: false,
-                    },
-                    keypad,
-                    num_locked,
-                ),
+                Some((keypad, num_locked)) => {
+                    terminal.encode_key_with_keypad(&name, base, wire_modifiers, keypad, num_locked)
+                }
                 None => terminal.encode_key_with_base(&name, base, shift, alt, ctrl),
             });
             glib::Propagation::Stop
         });
         self.view.widget.add_controller(keys.clone());
 
-        // The page captures application-keypad keys before the screen's IM
-        // context can commit them as text without their physical identity.
+        // Capture keypad sequences that require the physical key before an
+        // inactive IM context can commit only the corresponding text.
         let keypad = gtk4::EventControllerKey::new();
         keypad.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let weak = Rc::downgrade(self);
@@ -2655,6 +2646,9 @@ impl<P: Pty> TerminalPane<P> {
                 return glib::Propagation::Proceed;
             };
             let Some(position) = keypad_key(key) else {
+                return glib::Propagation::Proceed;
+            };
+            let Some(name) = logical_key(key) else {
                 return glib::Propagation::Proceed;
             };
             if !session.accepts_ime()
@@ -2675,12 +2669,17 @@ impl<P: Pty> TerminalPane<P> {
                 .current_event_device()
                 .is_some_and(|device| device.is_num_locked());
             let Ok(Some(sequence)) = session.inspect(|terminal| {
-                terminal.encode_application_keypad(position, Modifiers::default(), num_locked)
+                terminal.encode_keypad_override(
+                    &name,
+                    key_modifiers(key, modifiers),
+                    position,
+                    num_locked,
+                )
             }) else {
                 return glib::Propagation::Proceed;
             };
             if !session.scroll_key(key, modifiers) {
-                session.send_input(|_| Ok(sequence.to_vec()));
+                session.send_input(|_| Ok(sequence));
             }
             glib::Propagation::Stop
         });
@@ -2744,6 +2743,15 @@ fn mouse_modifiers(modifiers: gdk::ModifierType) -> u8 {
     (u8::from(modifiers.contains(gdk::ModifierType::SHIFT_MASK)) << 2)
         | (u8::from(modifiers.contains(gdk::ModifierType::ALT_MASK)) << 3)
         | (u8::from(modifiers.contains(gdk::ModifierType::CONTROL_MASK)) << 4)
+}
+
+fn key_modifiers(key: gdk::Key, state: gdk::ModifierType) -> Modifiers {
+    Modifiers {
+        shift: key == gdk::Key::ISO_Left_Tab || state.contains(gdk::ModifierType::SHIFT_MASK),
+        alt: state.contains(gdk::ModifierType::ALT_MASK),
+        ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
+        super_key: false,
+    }
 }
 
 fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {

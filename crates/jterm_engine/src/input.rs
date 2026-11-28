@@ -95,6 +95,197 @@ pub fn keypad_begin_sequence(modifiers: Modifiers) -> Cow<'static, str> {
 /// The negotiated flag for disambiguating key presses.
 pub const KITTY_DISAMBIGUATE: u8 = 1;
 
+/// Encode the selected keypad key when the application requested Kitty
+/// disambiguation or reporting of all keys. A plain printable keypad press
+/// can still take the text path under disambiguation alone.
+pub fn encode_kitty_keypad_press(
+    position: KeypadKey,
+    logical: Key,
+    modifiers: Modifiers,
+    num_locked: bool,
+    flags: u16,
+    text: Option<&str>,
+) -> Option<Vec<u8>> {
+    const REPORT_ALL: u16 = 8;
+    const ASSOCIATED_TEXT: u16 = 16;
+    let report_all = flags & REPORT_ALL != 0;
+    if !report_all && flags & u16::from(KITTY_DISAMBIGUATE) == 0 {
+        return None;
+    }
+    if !report_all
+        && matches!(logical, Key::Character(ch) if !ch.is_control())
+        && !(modifiers.ctrl || modifiers.alt || modifiers.super_key)
+    {
+        return None;
+    }
+
+    let physical_code = match position {
+        KeypadKey::Digit(digit @ 0..=9) => 57399 + u32::from(digit),
+        KeypadKey::Decimal => 57409,
+        KeypadKey::Divide => 57410,
+        KeypadKey::Multiply => 57411,
+        KeypadKey::Subtract => 57412,
+        KeypadKey::Add => 57413,
+        KeypadKey::Enter => 57414,
+        KeypadKey::Equal => 57415,
+        KeypadKey::Separator => 57416,
+        KeypadKey::Digit(_) | KeypadKey::Space | KeypadKey::Tab => return None,
+    };
+    let (code, final_byte) = match logical {
+        Key::ArrowLeft => (57417, b'u'),
+        Key::ArrowRight => (57418, b'u'),
+        Key::ArrowUp => (57419, b'u'),
+        Key::ArrowDown => (57420, b'u'),
+        Key::PageUp => (57421, b'u'),
+        Key::PageDown => (57422, b'u'),
+        Key::Home => (57423, b'u'),
+        Key::End => (57424, b'u'),
+        Key::Insert => (57425, b'u'),
+        Key::Delete => (57426, b'u'),
+        Key::Unidentified if position == KeypadKey::Digit(5) => (1, b'E'),
+        _ => (physical_code, b'u'),
+    };
+    let parameter = u32::from(kitty_modifier_value(modifiers)) + 128 * u32::from(num_locked);
+    let associated = text.filter(|_| report_all && flags & ASSOCIATED_TEXT != 0);
+    let mut characters = associated
+        .into_iter()
+        .flat_map(str::chars)
+        .filter(|ch| !ch.is_control())
+        .peekable();
+    let has_text = characters.peek().is_some();
+    let mut output = Vec::with_capacity(12);
+    output.extend_from_slice(b"\x1b[");
+    if code != 1 || parameter != 1 || has_text {
+        append_key_decimal(&mut output, code);
+    }
+    if parameter != 1 || has_text {
+        output.push(b';');
+        if parameter != 1 {
+            append_key_decimal(&mut output, parameter);
+        }
+    }
+    if let Some(first) = characters.next() {
+        output.push(b';');
+        append_key_decimal(&mut output, u32::from(first));
+        for character in characters {
+            output.push(b':');
+            append_key_decimal(&mut output, u32::from(character));
+        }
+    }
+    output.push(final_byte);
+    Some(output)
+}
+
+#[cfg(test)]
+#[test]
+fn kitty_keypad_reports_navigation_and_keeps_plain_text_in_disambiguation_mode() {
+    use KeypadKey as Pad;
+
+    let modifiers = Modifiers::default();
+    for (position, logical, expected) in [
+        (Pad::Digit(4), Key::ArrowLeft, b"\x1b[57417u".as_slice()),
+        (Pad::Digit(6), Key::ArrowRight, b"\x1b[57418u".as_slice()),
+        (Pad::Digit(8), Key::ArrowUp, b"\x1b[57419u".as_slice()),
+        (Pad::Digit(2), Key::ArrowDown, b"\x1b[57420u".as_slice()),
+        (Pad::Digit(9), Key::PageUp, b"\x1b[57421u".as_slice()),
+        (Pad::Digit(3), Key::PageDown, b"\x1b[57422u".as_slice()),
+        (Pad::Digit(7), Key::Home, b"\x1b[57423u".as_slice()),
+        (Pad::Digit(1), Key::End, b"\x1b[57424u".as_slice()),
+        (Pad::Digit(0), Key::Insert, b"\x1b[57425u".as_slice()),
+        (Pad::Decimal, Key::Delete, b"\x1b[57426u".as_slice()),
+        (Pad::Digit(5), Key::Unidentified, b"\x1b[E".as_slice()),
+    ] {
+        assert_eq!(
+            encode_kitty_keypad_press(position, logical, modifiers, false, 1, None).as_deref(),
+            Some(expected),
+        );
+    }
+    assert_eq!(
+        encode_kitty_keypad_press(
+            Pad::Digit(7),
+            Key::Character('7'),
+            modifiers,
+            true,
+            1,
+            Some("7")
+        ),
+        None,
+    );
+    assert_eq!(
+        encode_kitty_keypad_press(Pad::Enter, Key::Enter, modifiers, false, 4, None),
+        None,
+    );
+    assert_eq!(
+        encode_kitty_keypad_press(
+            Pad::Add,
+            Key::Character('+'),
+            Modifiers {
+                ctrl: true,
+                ..modifiers
+            },
+            false,
+            1,
+            None,
+        )
+        .unwrap(),
+        b"\x1b[57413;5u",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn kitty_keypad_report_all_keeps_locks_and_associated_text() {
+    let modifiers = Modifiers::default();
+    assert_eq!(
+        encode_kitty_keypad_press(
+            KeypadKey::Digit(7),
+            Key::Character('7'),
+            modifiers,
+            true,
+            8,
+            Some("7"),
+        )
+        .unwrap(),
+        b"\x1b[57406;129u",
+    );
+    assert_eq!(
+        encode_kitty_keypad_press(
+            KeypadKey::Decimal,
+            Key::Character(','),
+            modifiers,
+            true,
+            24,
+            Some("\r,\u{85}"),
+        )
+        .unwrap(),
+        b"\x1b[57409;129;44u",
+    );
+    assert_eq!(
+        encode_kitty_keypad_press(
+            KeypadKey::Multiply,
+            Key::Character('*'),
+            modifiers,
+            false,
+            24,
+            Some("*"),
+        )
+        .unwrap(),
+        b"\x1b[57411;;42u",
+    );
+    assert_eq!(
+        encode_kitty_keypad_press(
+            KeypadKey::Enter,
+            Key::Enter,
+            modifiers,
+            false,
+            24,
+            Some("\r"),
+        )
+        .unwrap(),
+        b"\x1b[57414u",
+    );
+}
+
 /// DECBKM selects the legacy backarrow byte. Xterm's Control modifier toggles
 /// the selection for hosts that forward Control+Backspace to this encoder.
 pub fn legacy_backspace_sequence(backarrow_mode: bool, ctrl: bool) -> &'static str {

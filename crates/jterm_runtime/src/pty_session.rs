@@ -2172,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn real_pty_application_keypad_distinguishes_main_keys_and_num_lock() {
+    fn real_pty_keypad_negotiates_application_and_kitty_sequences() {
         use jterm_engine::input::{KeypadKey, Modifiers};
 
         let script = r#"
@@ -2188,17 +2188,26 @@ check NORMAL '\r\033[H7' || exit 31
 printf '\033='
 check APPLICATION '\033OM\033Ow7' || exit 32
 check LOCKED '\r77' || exit 33
+printf '\033[>1u'
+check KITTY '\033[57414u\033[57423u7' || exit 35
+check KITTY_LOCKED '\033[57414;129u77' || exit 36
+printf '\033[<u'
+check RESTORED '\033OM\033Ow7' || exit 37
 printf '\033[?66l'
 check RESET '\r\033[H7' || exit 34
 printf DONE
 "#;
         let argv = ["/bin/sh", "-c", script].map(OsString::from);
         let mut session = Session::spawn_command(8, 32, &argv, None, &[]).unwrap();
+        session.enable_keyboard_disambiguation();
         let deadline = Instant::now() + Duration::from_secs(5);
         for (mark, num_locked) in [
             ("KEYPAD_NORMAL", false),
             ("KEYPAD_APPLICATION", false),
             ("KEYPAD_LOCKED", true),
+            ("KEYPAD_KITTY", false),
+            ("KEYPAD_KITTY_LOCKED", true),
+            ("KEYPAD_RESTORED", false),
             ("KEYPAD_RESET", false),
         ] {
             while !session.terminal().visible_text().contains(mark) {

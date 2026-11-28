@@ -1232,34 +1232,40 @@ impl Terminal {
         key.application_sequence()
     }
 
-    fn encode_key_input(
+    /// Preview a keypad sequence that needs the physical press before the
+    /// toolkit delivers it to the text input method.
+    pub fn encode_keypad_override(
         &self,
         name: &str,
-        base: Option<char>,
         modifiers: crate::input::Modifiers,
-        keypad: Option<(crate::input::KeypadKey, bool)>,
-    ) -> Result<Vec<u8>, String> {
-        use crate::input::{
-            encode_kitty_disambiguated_key, keypad_begin_sequence, legacy_backspace_sequence,
-            legacy_function_key_sequence, xterm_encode_modify_other_keys, Key, KeypadKey, KittyKey,
-            Modifiers,
-        };
+        position: crate::input::KeypadKey,
+        num_locked: bool,
+    ) -> Option<Vec<u8>> {
+        use crate::input::{encode_kitty_keypad_press, keypad_begin_sequence, Key, KeypadKey};
+
+        if let Some(sequence) = self.encode_application_keypad(position, modifiers, num_locked) {
+            return Some(sequence.to_vec());
+        }
         let flags = self.vt.protocol.keyboard_enhancement_flags();
         if flags != 0 && self.vt.protocol.keyboard_enhancement_limit().is_none() {
-            return Err("Kitty keyboard flags are unsupported".into());
+            return None;
         }
-        if let Some((key, num_locked)) = keypad {
-            if let Some(sequence) = self.encode_application_keypad(key, modifiers, num_locked) {
-                return Ok(sequence.to_vec());
-            }
-            if key == KeypadKey::Digit(5) && name == "Clear" {
-                return Ok(keypad_begin_sequence(modifiers).as_bytes().to_vec());
-            }
+        let center = position == KeypadKey::Digit(5) && name == "Clear";
+        if flags == 0 && !center {
+            return None;
         }
-        let Modifiers {
-            shift, alt, ctrl, ..
-        } = modifiers;
-        let key = match name {
+        let logical = if center {
+            Key::Unidentified
+        } else {
+            Self::key_from_name(name).ok()?
+        };
+        encode_kitty_keypad_press(position, logical, modifiers, num_locked, flags, None)
+            .or_else(|| center.then(|| keypad_begin_sequence(modifiers).as_bytes().to_vec()))
+    }
+
+    fn key_from_name(name: &str) -> Result<crate::input::Key, &'static str> {
+        use crate::input::Key;
+        Ok(match name {
             "ArrowUp" => Key::ArrowUp,
             "ArrowDown" => Key::ArrowDown,
             "ArrowLeft" => Key::ArrowLeft,
@@ -1290,11 +1296,37 @@ impl Terminal {
                 let mut chars = name.chars();
                 let c = chars.next().ok_or("empty key")?;
                 if chars.next().is_some() || c.is_control() {
-                    return Err("unsupported key".into());
+                    return Err("unsupported key");
                 }
                 Key::Character(c)
             }
+        })
+    }
+
+    fn encode_key_input(
+        &self,
+        name: &str,
+        base: Option<char>,
+        modifiers: crate::input::Modifiers,
+        keypad: Option<(crate::input::KeypadKey, bool)>,
+    ) -> Result<Vec<u8>, String> {
+        use crate::input::{
+            encode_kitty_disambiguated_key, legacy_backspace_sequence,
+            legacy_function_key_sequence, xterm_encode_modify_other_keys, Key, KittyKey, Modifiers,
         };
+        let flags = self.vt.protocol.keyboard_enhancement_flags();
+        if flags != 0 && self.vt.protocol.keyboard_enhancement_limit().is_none() {
+            return Err("Kitty keyboard flags are unsupported".into());
+        }
+        if let Some((key, num_locked)) = keypad {
+            if let Some(sequence) = self.encode_keypad_override(name, modifiers, key, num_locked) {
+                return Ok(sequence);
+            }
+        }
+        let Modifiers {
+            shift, alt, ctrl, ..
+        } = modifiers;
+        let key = Self::key_from_name(name)?;
         if flags != 0 {
             let kitty_key = match key {
                 Key::Enter => KittyKey::Enter,
