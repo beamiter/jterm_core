@@ -147,15 +147,21 @@ pub fn encode_kitty_keypad_press(
     };
     let parameter = u32::from(kitty_modifier_value(modifiers)) + 128 * u32::from(num_locked);
     let associated = text.filter(|_| report_all && flags & ASSOCIATED_TEXT != 0);
-    let mut characters = associated
+    Some(serialize_kitty_press(
+        code, parameter, final_byte, associated,
+    ))
+}
+
+fn serialize_kitty_press(code: u32, parameter: u32, final_byte: u8, text: Option<&str>) -> Vec<u8> {
+    let mut characters = text
         .into_iter()
         .flat_map(str::chars)
         .filter(|ch| !ch.is_control())
         .peekable();
     let has_text = characters.peek().is_some();
-    let mut output = Vec::with_capacity(12);
+    let mut output = Vec::with_capacity(13);
     output.extend_from_slice(b"\x1b[");
-    if code != 1 || parameter != 1 || has_text {
+    if code != 1 || final_byte == b'u' || parameter != 1 || has_text {
         append_key_decimal(&mut output, code);
     }
     if parameter != 1 || has_text {
@@ -173,7 +179,7 @@ pub fn encode_kitty_keypad_press(
         }
     }
     output.push(final_byte);
-    Some(output)
+    output
 }
 
 #[cfg(test)]
@@ -331,6 +337,114 @@ pub fn kitty_modifier_value(modifiers: Modifiers) -> u8 {
         + 8 * u8::from(modifiers.super_key)
 }
 
+/// Encode navigation, editing, F1–F12 and named control keys when Kitty
+/// disambiguation or all-key reporting has been negotiated.
+pub fn encode_kitty_named_press(key: Key, modifiers: Modifiers, flags: u16) -> Option<Vec<u8>> {
+    let report_all = flags & 8 != 0;
+    if !report_all && flags & u16::from(KITTY_DISAMBIGUATE) == 0 {
+        return None;
+    }
+    let parameter = u32::from(kitty_modifier_value(modifiers));
+    let (code, final_byte) = match key {
+        Key::Escape => (27, b'u'),
+        Key::Enter if report_all || parameter != 1 => (13, b'u'),
+        Key::Tab if report_all || parameter != 1 => (9, b'u'),
+        Key::Backspace if report_all || parameter != 1 => (127, b'u'),
+        Key::ArrowUp => (1, b'A'),
+        Key::ArrowDown => (1, b'B'),
+        Key::ArrowRight => (1, b'C'),
+        Key::ArrowLeft => (1, b'D'),
+        Key::Home => (1, b'H'),
+        Key::End => (1, b'F'),
+        Key::Insert => (2, b'~'),
+        Key::Delete => (3, b'~'),
+        Key::PageUp => (5, b'~'),
+        Key::PageDown => (6, b'~'),
+        Key::F1 => (1, b'P'),
+        Key::F2 => (1, b'Q'),
+        // The old CSI R form overlaps the cursor position reply.
+        Key::F3 => (13, b'~'),
+        Key::F4 => (1, b'S'),
+        Key::F5 => (15, b'~'),
+        Key::F6 => (17, b'~'),
+        Key::F7 => (18, b'~'),
+        Key::F8 => (19, b'~'),
+        Key::F9 => (20, b'~'),
+        Key::F10 => (21, b'~'),
+        Key::F11 => (23, b'~'),
+        Key::F12 => (24, b'~'),
+        _ => return None,
+    };
+    Some(serialize_kitty_press(code, parameter, final_byte, None))
+}
+
+#[cfg(test)]
+#[test]
+fn kitty_named_press_uses_unambiguous_function_keys_and_negotiated_controls() {
+    let plain = Modifiers::default();
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..plain
+    };
+    for (key, expected) in [
+        (Key::F1, b"\x1b[P".as_slice()),
+        (Key::F2, b"\x1b[Q".as_slice()),
+        (Key::F3, b"\x1b[13~".as_slice()),
+        (Key::F4, b"\x1b[S".as_slice()),
+        (Key::F5, b"\x1b[15~".as_slice()),
+        (Key::F6, b"\x1b[17~".as_slice()),
+        (Key::F7, b"\x1b[18~".as_slice()),
+        (Key::F8, b"\x1b[19~".as_slice()),
+        (Key::F9, b"\x1b[20~".as_slice()),
+        (Key::F10, b"\x1b[21~".as_slice()),
+        (Key::F11, b"\x1b[23~".as_slice()),
+        (Key::F12, b"\x1b[24~".as_slice()),
+        (Key::ArrowUp, b"\x1b[A".as_slice()),
+        (Key::Home, b"\x1b[H".as_slice()),
+        (Key::Insert, b"\x1b[2~".as_slice()),
+    ] {
+        assert_eq!(encode_kitty_named_press(key, plain, 0), None);
+        assert_eq!(encode_kitty_named_press(key, plain, 4), None);
+        for flags in [1, 8, 9] {
+            assert_eq!(
+                encode_kitty_named_press(key, plain, flags).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+    assert_eq!(
+        encode_kitty_named_press(Key::F3, ctrl, 1).unwrap(),
+        b"\x1b[13;5~"
+    );
+    assert_eq!(
+        encode_kitty_named_press(Key::ArrowUp, ctrl, 1).unwrap(),
+        b"\x1b[1;5A"
+    );
+    assert_eq!(
+        encode_kitty_named_press(Key::Escape, plain, 1).unwrap(),
+        b"\x1b[27u"
+    );
+    for (key, expected, modified) in [
+        (Key::Enter, b"\x1b[13u".as_slice(), b"\x1b[13;5u".as_slice()),
+        (Key::Tab, b"\x1b[9u".as_slice(), b"\x1b[9;5u".as_slice()),
+        (
+            Key::Backspace,
+            b"\x1b[127u".as_slice(),
+            b"\x1b[127;5u".as_slice(),
+        ),
+    ] {
+        assert_eq!(encode_kitty_named_press(key, plain, 1), None);
+        assert_eq!(
+            encode_kitty_named_press(key, ctrl, 1).as_deref(),
+            Some(modified)
+        );
+        assert_eq!(
+            encode_kitty_named_press(key, plain, 8).as_deref(),
+            Some(expected)
+        );
+    }
+}
+
 /// Encode keys that the disambiguation flag changes. A None result indicates
 /// that the terminal should use its regular key or committed-text encoding.
 pub fn encode_kitty_disambiguated_key(
@@ -353,18 +467,12 @@ pub fn encode_kitty_disambiguated_key(
         KittyKey::UnicodeWithText { base, .. } if non_shift => u32::from(base),
         _ => return None,
     };
-    let parameter = kitty_modifier_value(modifiers);
-    // Maximum wire length: CSI, seven Unicode decimal digits, semicolon,
-    // two modifier digits and the final byte.
-    let mut output = Vec::with_capacity(13);
-    output.extend_from_slice(b"\x1b[");
-    append_key_decimal(&mut output, code);
-    if parameter != 1 {
-        output.push(b';');
-        append_key_decimal(&mut output, u32::from(parameter));
-    }
-    output.push(b'u');
-    Some(output)
+    Some(serialize_kitty_press(
+        code,
+        u32::from(kitty_modifier_value(modifiers)),
+        b'u',
+        None,
+    ))
 }
 
 fn append_key_decimal(output: &mut Vec<u8>, mut value: u32) {

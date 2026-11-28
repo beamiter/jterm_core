@@ -1311,7 +1311,7 @@ impl Terminal {
         keypad: Option<(crate::input::KeypadKey, bool)>,
     ) -> Result<Vec<u8>, String> {
         use crate::input::{
-            encode_kitty_disambiguated_key, legacy_backspace_sequence,
+            encode_kitty_disambiguated_key, encode_kitty_named_press, legacy_backspace_sequence,
             legacy_function_key_sequence, xterm_encode_modify_other_keys, Key, KittyKey, Modifiers,
         };
         let flags = self.vt.protocol.keyboard_enhancement_flags();
@@ -1328,11 +1328,10 @@ impl Terminal {
         } = modifiers;
         let key = Self::key_from_name(name)?;
         if flags != 0 {
+            if let Some(bytes) = encode_kitty_named_press(key, modifiers, flags) {
+                return Ok(bytes);
+            }
             let kitty_key = match key {
-                Key::Enter => KittyKey::Enter,
-                Key::Escape => KittyKey::Escape,
-                Key::Backspace => KittyKey::Backspace,
-                Key::Tab => KittyKey::Tab,
                 Key::Character(' ') => KittyKey::Space,
                 Key::Character(ch) => KittyKey::Unicode(
                     base.filter(|ch| !ch.is_control())

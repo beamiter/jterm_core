@@ -2250,6 +2250,79 @@ printf DONE
     }
 
     #[test]
+    fn real_pty_kitty_function_keys_are_distinct_from_the_cursor_reply() {
+        let script = r#"
+stty raw -echo || exit 40
+read_exact() {
+    expected=$(printf '%b' "$1")
+    actual=$(dd bs=1 count="${#expected}" 2>/dev/null)
+    [ "$actual" = "$expected" ]
+}
+check() {
+    printf '\r\nFUNCTION_%s\r\n' "$1"
+    read_exact "$2"
+}
+printf '\033[?1h'
+check LEGACY '\033OR\033OA' || exit 41
+printf '\033[>1u\033[1;5H\033[6n'
+read_exact '\033[1;5R' || exit 42
+check KITTY 'a\033[13~\033[A\033[13;5~\rb' || exit 43
+printf '\033[<u'
+check RESTORED '\033OR\033OA' || exit 44
+printf DONE
+"#;
+        let argv = ["/bin/sh", "-c", script].map(OsString::from);
+        let mut session = Session::spawn_command(8, 40, &argv, None, &[]).unwrap();
+        session.enable_keyboard_disambiguation();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (marker, keys) in [
+            ("FUNCTION_LEGACY", &[("F3", false), ("ArrowUp", false)][..]),
+            (
+                "FUNCTION_KITTY",
+                &[
+                    ("a", false),
+                    ("F3", false),
+                    ("ArrowUp", false),
+                    ("F3", true),
+                    ("Enter", false),
+                    ("b", false),
+                ][..],
+            ),
+            (
+                "FUNCTION_RESTORED",
+                &[("F3", false), ("ArrowUp", false)][..],
+            ),
+        ] {
+            while !session.terminal().visible_text().contains(marker) {
+                assert!(
+                    Instant::now() < deadline && !session.is_drained(),
+                    "{marker}"
+                );
+                session.drive().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut input = Vec::new();
+            for &(key, ctrl) in keys {
+                input.extend(
+                    session
+                        .terminal()
+                        .encode_key(key, false, false, ctrl)
+                        .unwrap(),
+                );
+            }
+            session.submit_input(input).unwrap();
+        }
+        while !session.is_drained() {
+            assert!(Instant::now() < deadline);
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.exit_code(), Some(0));
+        assert!(session.terminal().visible_text().contains("DONE"));
+        session.close().unwrap();
+    }
+
+    #[test]
     fn real_pty_backarrow_mode_controls_the_bytes_received_by_the_child() {
         let script = concat!(
             "stty raw -echo || exit 30; ",
