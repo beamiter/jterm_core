@@ -8,7 +8,10 @@ use jterm_engine::{
     history_reflow::HistoryAnchor,
     history_search::{HistorySearch, HistorySearchProgress},
     hyperlink::HyperlinkPolicy,
-    input::{KeypadKey, Modifiers},
+    input::{
+        KeyboardLocks, KittyEventType, KittyKeyReport, Modifiers, KITTY_DISAMBIGUATE,
+        KITTY_REPORT_ALL_KEYS, KITTY_REPORT_EVENT_TYPES,
+    },
     mouse::{MouseEncoding, MouseInput, MousePosition, MouseTracking},
     terminal::{Terminal, TranscriptAnchor, WindowUpdates},
 };
@@ -25,6 +28,7 @@ use std::{
 
 use crate::history_search::HistorySearchView;
 use crate::inline_images::{InlineImageRequest, InlineImages, PendingInlineImage};
+use crate::keyboard::{self, key_modifiers, keypad_key, logical_key, NativeKeyboard, ReportState};
 #[cfg(target_os = "linux")]
 use crate::runtime_shell::RuntimeShell;
 use crate::text_link::{connect_links, link_modifier};
@@ -802,6 +806,15 @@ impl PaintedTranscript<'_> {
     }
 }
 
+/// A synchronous commit that might belong to the physical press currently
+/// passing through GTK's input method.
+#[derive(Clone, Copy)]
+struct KeyCommit {
+    expected: char,
+    matched: bool,
+    composed: bool,
+}
+
 pub struct TerminalPane<P: Pty> {
     backend: Backend<P>,
     status_text: fn(&str, usize) -> String,
@@ -834,6 +847,8 @@ pub struct TerminalPane<P: Pty> {
     keys: gtk4::EventControllerKey,
     input_method_delegated: Cell<bool>,
     preedit_active: Cell<bool>,
+    key_commit: Cell<Option<KeyCommit>>,
+    native_keyboard: RefCell<NativeKeyboard>,
     input_style: InputStyle,
     input_cursor: Cell<Option<gdk::Rectangle>>,
     paste_revision: Cell<u64>,
@@ -1056,6 +1071,8 @@ impl<P: Pty> TerminalPane<P> {
             keys: gtk4::EventControllerKey::new(),
             input_method_delegated: Cell::new(false),
             preedit_active: Cell::new(false),
+            key_commit: Cell::new(None),
+            native_keyboard: RefCell::default(),
             input_style,
             input_cursor: Cell::new(None),
             paste_revision: Cell::new(0),
@@ -1129,6 +1146,7 @@ impl<P: Pty> TerminalPane<P> {
                 terminal,
                 local_reader,
             } => {
+                terminal.enable_native_keyboard_reporting();
                 terminal.set_color_defaults(colors);
                 let pane = Rc::downgrade(&session);
                 terminal.on_update(move |update| {
@@ -2473,14 +2491,14 @@ impl<P: Pty> TerminalPane<P> {
 
     fn set_composition_active(&self, active: bool) {
         if active {
-            self.keys.set_im_context(Some(&self.input_method));
             self.input_method.focus_in();
             self.sync_input_cursor();
         } else {
             self.input_cursor.set(None);
+            self.key_commit.set(None);
+            self.native_keyboard.borrow_mut().clear();
             self.input_method.focus_out();
             self.reset_preedit();
-            self.keys.set_im_context(None::<&gtk4::IMContext>);
         }
     }
 
@@ -2494,6 +2512,242 @@ impl<P: Pty> TerminalPane<P> {
             self.advance_paste_revision();
         }
         self.set_composition_active(focused && !self.input_method_delegated.get());
+    }
+
+    fn commit_input_method(&self, text: &str) {
+        if let Some(mut pending) = self.key_commit.take() {
+            if !pending.composed && !pending.matched && text.chars().eq([pending.expected]) {
+                pending.matched = true;
+                self.key_commit.set(Some(pending));
+                return;
+            }
+            if pending.matched {
+                self.send_input(|terminal| {
+                    terminal.encode_text(pending.expected.encode_utf8(&mut [0; 4]))
+                });
+            }
+        }
+        self.send_input(|terminal| terminal.encode_text(text));
+    }
+
+    fn filter_key_press(
+        &self,
+        event: &gdk::KeyEvent,
+        expected: Option<char>,
+    ) -> (bool, Option<char>) {
+        if !self.input_focused.get() || self.input_method_delegated.get() {
+            return (false, None);
+        }
+        self.key_commit.set(expected.map(|expected| KeyCommit {
+            expected,
+            matched: false,
+            composed: false,
+        }));
+        let filtered = self.input_method.filter_keypress(event);
+        if let Some(pending) = self.key_commit.take().filter(|pending| pending.matched) {
+            if !pending.composed {
+                return (true, Some(pending.expected));
+            }
+            self.send_input(|terminal| {
+                terminal.encode_text(pending.expected.encode_utf8(&mut [0; 4]))
+            });
+            return (true, None);
+        }
+        (filtered, None)
+    }
+
+    fn send_keyboard_report(
+        &self,
+        state: ReportState,
+        report: KittyKeyReport,
+        phase: KittyEventType,
+        modifiers: Modifiers,
+        locks: KeyboardLocks,
+        text: Option<char>,
+    ) -> bool {
+        let mut encoded = false;
+        let result = self.submit_input(|terminal| {
+            let text_storage = &mut [0; 4];
+            let text = text.map(|ch| &*ch.encode_utf8(text_storage));
+            let current = terminal.keyboard_report_state();
+            if current != state {
+                // A runtime worker may have parsed a mode change while the
+                // input method was handling this key.
+                return match text {
+                    Some(text) if current.0 & KITTY_REPORT_ALL_KEYS == 0 => {
+                        terminal.encode_text(text)
+                    }
+                    _ => Ok(Vec::new()),
+                };
+            }
+            let bytes = report.encode(phase, modifiers, locks, state.0, text);
+            encoded = bytes.is_some();
+            Ok(bytes.unwrap_or_default())
+        });
+        match result {
+            Ok(accepted) => accepted && encoded,
+            Err(error) => {
+                self.report(&format!("Terminal input rejected: {error}"));
+                false
+            }
+        }
+    }
+
+    fn key_pressed(
+        &self,
+        controller: &gtk4::EventControllerKey,
+        key: gdk::Key,
+        keycode: u32,
+        state: gdk::ModifierType,
+    ) -> glib::Propagation {
+        let event = controller
+            .current_event()
+            .and_then(|event| event.downcast::<gdk::KeyEvent>().ok());
+        let context = self
+            .inspect(Terminal::keyboard_report_state)
+            .unwrap_or_default();
+        let flags = context.0;
+        let modifiers = {
+            let mut keyboard = self.native_keyboard.borrow_mut();
+            keyboard.sync(context);
+            keyboard.modifiers(key, state, true)
+        };
+        let direct_text = (flags & KITTY_REPORT_ALL_KEYS != 0
+            && !self.preedit_active.get()
+            && !modifiers.alt
+            && !modifiers.ctrl
+            && !modifiers.super_key)
+            .then(|| keyboard::printable(key))
+            .flatten();
+        let (filtered, commit) = event.as_ref().map_or((false, None), |event| {
+            self.filter_key_press(event, direct_text)
+        });
+        if (filtered && commit.is_none()) || self.scroll_key(key, state) {
+            return glib::Propagation::Stop;
+        }
+        if matches!(self.input_style, InputStyle::HostedAttachment { .. })
+            && key == gdk::Key::bracketright
+            && modifiers.ctrl
+            && !modifiers.shift
+            && !modifiers.alt
+        {
+            // The relay consumes this byte before writing to the provider.
+            self.send_input(|_| Ok(vec![0x1d]));
+            return glib::Propagation::Stop;
+        }
+        let display = self.view.widget.display();
+        if self.accepts_ime()
+            && flags & !u16::from(KITTY_DISAMBIGUATE) != 0
+            && !state.intersects(gdk::ModifierType::META_MASK | gdk::ModifierType::HYPER_MASK)
+        {
+            if let Some(event) = event.as_ref() {
+                if let Some(key) = keyboard::report(event, &display, key, modifiers, flags) {
+                    let held = self.native_keyboard.borrow().tracks(keycode);
+                    let (report, phase) = held.map_or((key, KittyEventType::Press), |held| {
+                        (held.with_repeat_alternate(key), KittyEventType::Repeat)
+                    });
+                    let text = commit.or(direct_text);
+                    let sent = self.send_keyboard_report(
+                        context,
+                        report,
+                        phase,
+                        modifiers,
+                        keyboard::locks(event, &display, flags),
+                        text,
+                    );
+                    if sent
+                        && phase == KittyEventType::Press
+                        && flags & KITTY_REPORT_EVENT_TYPES != 0
+                        && self.input_focused.get()
+                    {
+                        self.native_keyboard
+                            .borrow_mut()
+                            .admit(context, keycode, key);
+                    }
+                    return glib::Propagation::Stop;
+                }
+            }
+        }
+        if let Some(ch) = commit {
+            self.send_input(|terminal| terminal.encode_text(ch.encode_utf8(&mut [0; 4])));
+            return glib::Propagation::Stop;
+        }
+        if state.intersects(
+            gdk::ModifierType::META_MASK
+                | gdk::ModifierType::SUPER_MASK
+                | gdk::ModifierType::HYPER_MASK,
+        ) {
+            return glib::Propagation::Proceed;
+        }
+        let Some(name) = logical_key(key) else {
+            return glib::Propagation::Proceed;
+        };
+        let Modifiers {
+            shift, alt, ctrl, ..
+        } = key_modifiers(key, state);
+        let base = if (alt || ctrl) && keyboard::printable(key).is_some() {
+            event
+                .as_ref()
+                .and_then(|event| keyboard::base_character(event, &display))
+        } else {
+            None
+        };
+        let keypad = keypad_key(key).map(|keypad| {
+            let num_locked = controller
+                .current_event_device()
+                .is_some_and(|device| device.is_num_locked());
+            (keypad, num_locked)
+        });
+        self.send_input(|terminal| match keypad {
+            Some((keypad, num_locked)) => terminal.encode_key_with_keypad(
+                &name,
+                base,
+                key_modifiers(key, state),
+                keypad,
+                num_locked,
+            ),
+            None => terminal.encode_key_with_base(&name, base, shift, alt, ctrl),
+        });
+        glib::Propagation::Stop
+    }
+
+    fn key_released(
+        &self,
+        controller: &gtk4::EventControllerKey,
+        key: gdk::Key,
+        keycode: u32,
+        state: gdk::ModifierType,
+    ) {
+        let Some(event) = controller
+            .current_event()
+            .and_then(|event| event.downcast::<gdk::KeyEvent>().ok())
+        else {
+            return;
+        };
+        if self.input_focused.get() && !self.input_method_delegated.get() {
+            self.input_method.filter_keypress(&event);
+        }
+        let context = self
+            .inspect(Terminal::keyboard_report_state)
+            .unwrap_or_default();
+        let (modifiers, report) = {
+            let mut keyboard = self.native_keyboard.borrow_mut();
+            keyboard.sync(context);
+            (
+                keyboard.modifiers(key, state, false),
+                keyboard.release(keycode),
+            )
+        };
+        if let Some(report) = report.filter(|_| self.accepts_ime()) {
+            self.send_keyboard_report(
+                context,
+                report,
+                KittyEventType::Release,
+                modifiers,
+                keyboard::locks(&event, &self.view.widget.display(), context.0),
+                None,
+            );
+        }
     }
 
     fn connect_input(self: &Rc<Self>, page: &gtk4::Widget) {
@@ -2512,7 +2766,7 @@ impl<P: Pty> TerminalPane<P> {
                 .filter(|session| session.accepts_ime() && !session.input_method_delegated.get())
             {
                 session.view.clear_preedit();
-                session.send_input(|terminal| terminal.encode_text(text));
+                session.commit_input_method(text);
             }
         });
         let weak = Rc::downgrade(self);
@@ -2536,6 +2790,10 @@ impl<P: Pty> TerminalPane<P> {
         im.connect_preedit_start(move |_| {
             if let Some(session) = weak.upgrade() {
                 session.preedit_active.set(true);
+                if let Some(mut pending) = session.key_commit.get() {
+                    pending.composed = true;
+                    session.key_commit.set(Some(pending));
+                }
             }
         });
         let weak = Rc::downgrade(self);
@@ -2574,65 +2832,15 @@ impl<P: Pty> TerminalPane<P> {
         });
         let weak = Rc::downgrade(self);
         keys.connect_key_pressed(move |controller, key, keycode, modifiers| {
-            let Some(session) = weak.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            if session.scroll_key(key, modifiers) {
-                return glib::Propagation::Stop;
+            weak.upgrade().map_or(glib::Propagation::Proceed, |session| {
+                session.key_pressed(controller, key, keycode, modifiers)
+            })
+        });
+        let weak = Rc::downgrade(self);
+        keys.connect_key_released(move |controller, key, keycode, modifiers| {
+            if let Some(session) = weak.upgrade() {
+                session.key_released(controller, key, keycode, modifiers);
             }
-            let Some(name) = logical_key(key) else {
-                return glib::Propagation::Proceed;
-            };
-            if modifiers.intersects(
-                gdk::ModifierType::META_MASK
-                    | gdk::ModifierType::SUPER_MASK
-                    | gdk::ModifierType::HYPER_MASK,
-            ) {
-                return glib::Propagation::Proceed;
-            }
-            let wire_modifiers = key_modifiers(key, modifiers);
-            let Modifiers {
-                shift, alt, ctrl, ..
-            } = wire_modifiers;
-            if matches!(session.input_style, InputStyle::HostedAttachment { .. })
-                && key == gdk::Key::bracketright
-                && ctrl
-                && !shift
-                && !alt
-            {
-                // The relay consumes this byte before writing to the provider.
-                // Its meaning is independent of the provider's keyboard mode.
-                session.send_input(|_| Ok(vec![0x1d]));
-                return glib::Propagation::Stop;
-            }
-            let base = if (alt || ctrl) && key.to_unicode().is_some() {
-                controller
-                    .current_event()
-                    .and_then(|event| event.downcast::<gdk::KeyEvent>().ok())
-                    .and_then(|event| {
-                        session.view.widget.display().translate_key(
-                            keycode,
-                            gdk::ModifierType::empty(),
-                            event.layout() as i32,
-                        )
-                    })
-                    .and_then(|(base, _, _, _)| base.to_unicode())
-            } else {
-                None
-            };
-            let keypad = keypad_key(key).map(|keypad| {
-                let num_locked = controller
-                    .current_event_device()
-                    .is_some_and(|device| device.is_num_locked());
-                (keypad, num_locked)
-            });
-            session.send_input(|terminal| match keypad {
-                Some((keypad, num_locked)) => {
-                    terminal.encode_key_with_keypad(&name, base, wire_modifiers, keypad, num_locked)
-                }
-                None => terminal.encode_key_with_base(&name, base, shift, alt, ctrl),
-            });
-            glib::Propagation::Stop
         });
         self.view.widget.add_controller(keys.clone());
 
@@ -2669,6 +2877,9 @@ impl<P: Pty> TerminalPane<P> {
                 .current_event_device()
                 .is_some_and(|device| device.is_num_locked());
             let Ok(Some(sequence)) = session.inspect(|terminal| {
+                if terminal.keyboard_report_state().0 & (KITTY_REPORT_ALL_KEYS | KITTY_REPORT_EVENT_TYPES) != 0 {
+                    return None;
+                }
                 terminal.encode_keypad_override(
                     &name,
                     key_modifiers(key, modifiers),
@@ -2743,84 +2954,6 @@ fn mouse_modifiers(modifiers: gdk::ModifierType) -> u8 {
     (u8::from(modifiers.contains(gdk::ModifierType::SHIFT_MASK)) << 2)
         | (u8::from(modifiers.contains(gdk::ModifierType::ALT_MASK)) << 3)
         | (u8::from(modifiers.contains(gdk::ModifierType::CONTROL_MASK)) << 4)
-}
-
-fn key_modifiers(key: gdk::Key, state: gdk::ModifierType) -> Modifiers {
-    Modifiers {
-        shift: key == gdk::Key::ISO_Left_Tab || state.contains(gdk::ModifierType::SHIFT_MASK),
-        alt: state.contains(gdk::ModifierType::ALT_MASK),
-        ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
-        super_key: false,
-    }
-}
-
-fn logical_key(key: gdk::Key) -> Option<std::borrow::Cow<'static, str>> {
-    use gdk::Key;
-    Some(
-        match key {
-            Key::Up | Key::KP_Up => "ArrowUp",
-            Key::Down | Key::KP_Down => "ArrowDown",
-            Key::Left | Key::KP_Left => "ArrowLeft",
-            Key::Right | Key::KP_Right => "ArrowRight",
-            Key::Home | Key::KP_Home => "Home",
-            Key::End | Key::KP_End => "End",
-            Key::Insert | Key::KP_Insert => "Insert",
-            Key::Delete | Key::KP_Delete => "Delete",
-            Key::KP_Begin => "Clear",
-            Key::Page_Up | Key::KP_Page_Up => "PageUp",
-            Key::Page_Down | Key::KP_Page_Down => "PageDown",
-            Key::F1 => "F1",
-            Key::F2 => "F2",
-            Key::F3 => "F3",
-            Key::F4 => "F4",
-            Key::F5 => "F5",
-            Key::F6 => "F6",
-            Key::F7 => "F7",
-            Key::F8 => "F8",
-            Key::F9 => "F9",
-            Key::F10 => "F10",
-            Key::F11 => "F11",
-            Key::F12 => "F12",
-            Key::Return | Key::KP_Enter => "Enter",
-            Key::Escape => "Escape",
-            Key::BackSpace => "Backspace",
-            Key::Tab | Key::ISO_Left_Tab | Key::KP_Tab => "Tab",
-            _ => {
-                return key
-                    .to_unicode()
-                    .filter(|ch| !ch.is_control())
-                    .map(|ch| ch.to_string().into())
-            }
-        }
-        .into(),
-    )
-}
-
-fn keypad_key(key: gdk::Key) -> Option<KeypadKey> {
-    use gdk::Key;
-    Some(match key {
-        Key::KP_0 | Key::KP_Insert => KeypadKey::Digit(0),
-        Key::KP_1 | Key::KP_End => KeypadKey::Digit(1),
-        Key::KP_2 | Key::KP_Down => KeypadKey::Digit(2),
-        Key::KP_3 | Key::KP_Page_Down => KeypadKey::Digit(3),
-        Key::KP_4 | Key::KP_Left => KeypadKey::Digit(4),
-        Key::KP_5 | Key::KP_Begin => KeypadKey::Digit(5),
-        Key::KP_6 | Key::KP_Right => KeypadKey::Digit(6),
-        Key::KP_7 | Key::KP_Home => KeypadKey::Digit(7),
-        Key::KP_8 | Key::KP_Up => KeypadKey::Digit(8),
-        Key::KP_9 | Key::KP_Page_Up => KeypadKey::Digit(9),
-        Key::KP_Decimal | Key::KP_Delete => KeypadKey::Decimal,
-        Key::KP_Divide => KeypadKey::Divide,
-        Key::KP_Multiply => KeypadKey::Multiply,
-        Key::KP_Subtract => KeypadKey::Subtract,
-        Key::KP_Add => KeypadKey::Add,
-        Key::KP_Enter => KeypadKey::Enter,
-        Key::KP_Equal => KeypadKey::Equal,
-        Key::KP_Separator => KeypadKey::Separator,
-        Key::KP_Space => KeypadKey::Space,
-        Key::KP_Tab => KeypadKey::Tab,
-        _ => return None,
-    })
 }
 
 #[cfg(test)]

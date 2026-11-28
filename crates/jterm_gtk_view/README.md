@@ -80,9 +80,10 @@ dbus-run-session -- xvfb-run -a /usr/bin/python3 -B crates/jterm_gtk_view/tests/
 
 The shared terminal displays GTK input method preedit at the painted cursor
 and exposes the composition through accessibility. Only committed text enters
-the PTY. Ordinary and embedded panes both advertise Kitty keyboard
-disambiguation and deliver committed strings as UTF-8 while it is active.
-Leaving the tab or scrolling into history cancels composition.
+the PTY. Ordinary and embedded panes negotiate Kitty disambiguation, event
+types, alternate keys, full reporting and associated key text. An input
+method composition delivers its committed string as UTF-8. Leaving the tab
+or scrolling into history cancels composition.
 
 The native fixture needs Sway, `wtype`, `wl-copy`, `wl-paste`, PyGObject
 AT-SPI and the input-method-v2 test client from the sibling Frost checkout.
@@ -115,7 +116,8 @@ PTY, and a Wayland clipboard paste with a trailing newline. The pointer
 option verifies native double-click selection and external clipboard copy.
 Use `--structured-pane block`, `--structured-pane chat`, or
 `--structured-pane unified` with `--keyboard-disambiguation` to verify the
-default structured pane's keyboard negotiation and PTY key bytes.
+default structured pane's keyboard negotiation and PTY key bytes. Use
+`--keyboard-events` to check press and release reports alongside composition.
 
 ### Retained output
 

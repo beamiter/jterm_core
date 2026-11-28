@@ -10,6 +10,7 @@ mod finished_output;
 mod history_checkpoint;
 mod history_search;
 mod inline_images;
+mod keyboard;
 mod pane;
 #[cfg(target_os = "linux")]
 mod prepared_pty;

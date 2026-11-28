@@ -877,6 +877,32 @@ fn vim_modify_other_keys_does_not_block_plain_escape_or_function_keys() {
 }
 
 #[test]
+fn native_key_reports_follow_mode_and_screen_generation() {
+    let mut terminal = Terminal::new(4, 80).unwrap();
+    terminal.enable_native_keyboard_reporting();
+    assert_eq!(terminal.feed(b"\x1b[>31u\x1b[?u").unwrap(), b"\x1b[?31u");
+    let (flags, generation) = terminal.keyboard_report_state();
+    assert_eq!(flags, 31);
+    assert_eq!(terminal.encode_text("你").unwrap(), "你".as_bytes());
+    terminal.feed(b"\x1b[=0u\x1b[=31u").unwrap();
+    assert_ne!(terminal.keyboard_report_state(), (flags, generation));
+    let before_screen = terminal.keyboard_report_state();
+    terminal.feed(b"\x1b[?1049h\x1b[=31u\x1b[?1049l").unwrap();
+    assert_eq!(terminal.keyboard_report_state().0, 31);
+    assert_ne!(terminal.keyboard_report_state(), before_screen);
+    let before_reset = terminal.keyboard_report_state();
+    terminal.feed(b"\x1bc\x1b[=31u").unwrap();
+    assert_eq!(terminal.keyboard_report_state().0, 31);
+    assert_ne!(terminal.keyboard_report_state(), before_reset);
+
+    terminal.feed(b"\x1b=\x1b[=4u").unwrap();
+    assert_eq!(
+        terminal.encode_application_keypad(crate::input::KeypadKey::Digit(7), Default::default(), false),
+        Some(*b"\x1bOw")
+    );
+}
+
+#[test]
 fn native_keyboard_reports_only_disambiguation_and_keeps_ime_text_whole() {
     let mut terminal = Terminal::new(4, 80).unwrap();
     terminal.enable_keyboard_disambiguation();

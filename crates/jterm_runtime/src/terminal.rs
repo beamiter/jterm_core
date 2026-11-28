@@ -220,6 +220,14 @@ impl<P: Pty> TerminalHandle<P> {
             .set_color_defaults(colors);
     }
 
+    pub fn enable_native_keyboard_reporting(&self) {
+        self.state
+            .emulator
+            .borrow_mut()
+            .engine
+            .enable_native_keyboard_reporting();
+    }
+
     pub fn set_history_row_limit(&self, rows: usize) {
         self.state
             .emulator

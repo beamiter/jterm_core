@@ -54,7 +54,8 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
         print(f"{app} Wayland split reflow passed at scale {args.scale}", flush=True)
     witness = "waylandcopywitness"
     receipt = root / "pty-receipt"
-    negotiate = r"printf '\033[>31u\033[?u'; " if args.keyboard_disambiguation else ""
+    keyboard_flags = 26 if args.keyboard_events else 1 if args.keyboard_disambiguation else 0
+    negotiate = rf"printf '\033[>{keyboard_flags}u\033[?u'; " if keyboard_flags else ""
     command(f"printf '\\033[2J\\033[H%s\\033[H' {witness}; stty raw -echo; "
             + negotiate + "exec cat > " + shlex.quote(str(receipt)))
 
@@ -64,7 +65,7 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
 
     wait_for("AT-SPI terminal text", read_witness)
     wait_for("live shared PTY capture", receipt.exists)
-    keyboard_reply = b"\x1b[?1u" if args.keyboard_disambiguation else b""
+    keyboard_reply = f"\x1b[?{keyboard_flags}u".encode() if keyboard_flags else b""
     wait_for("keyboard negotiation reply", lambda: receipt.read_bytes() == keyboard_reply)
     (control / "start").touch()
     wait_for("compositor delivered input-method preedit", (control / "preedit").exists)
@@ -79,9 +80,11 @@ def exercise(args, process, root, env, ime, control, pointer_client, spawn):
     wait_for("GTK preedit cleared after commit", lambda: named("ni") is None)
     assert ime.wait(timeout=5) == 0
     expected = committed
-    if args.structured_pane and args.keyboard_disambiguation:
+    if keyboard_flags and (args.structured_pane or args.keyboard_events):
         key("-M", "ctrl", "-k", "u", "-m", "ctrl")
         expected += b"\x1b[117;5u"
+        if args.keyboard_events:
+            expected += b"\x1b[117;5:3u"
         wait_for("disambiguated Ctrl+U in the live PTY", lambda: receipt.read_bytes() == expected)
 
     clipboard_text = b"wayland-paste\n"
@@ -301,8 +304,11 @@ def main():
     pane.add_argument("--structured-pane", choices=("block", "chat", "unified"),
                       help="use the default structured startup terminal")
     pane.add_argument("--vim9", choices=("native", "compatibility"), help="compose and save inside real Vim9")
-    parser.add_argument("--keyboard-disambiguation", action="store_true",
-                        help="negotiate Kitty disambiguation before IME composition")
+    keyboard = parser.add_mutually_exclusive_group()
+    keyboard.add_argument("--keyboard-disambiguation", action="store_true",
+                          help="negotiate Kitty disambiguation before IME composition")
+    keyboard.add_argument("--keyboard-events", action="store_true",
+                          help="verify Kitty press and release reports alongside IME composition")
     parser.add_argument("--sway", default="sway")
     parser.add_argument("--wtype", default="wtype")
     parser.add_argument("--compositor-libraries", type=Path)

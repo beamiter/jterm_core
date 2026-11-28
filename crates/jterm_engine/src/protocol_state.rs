@@ -123,6 +123,7 @@ pub struct ProtocolState {
     alt_keyboard_enhancement_flags: u16,
     alt_keyboard_enhancement_stack: Vec<u16>,
     keyboard_feature_mask: Option<u16>,
+    keyboard_report_generation: u64,
     xterm_modify_other_keys: u16,
     xterm_format_other_keys: u16,
 }
@@ -201,9 +202,29 @@ impl ProtocolState {
         self.keyboard_enhancement_flags
     }
 
+    pub(crate) fn keyboard_report_generation(&self) -> u64 {
+        self.keyboard_report_generation
+    }
+
+    fn retire_keyboard_reports(&mut self) {
+        self.keyboard_report_generation = self.keyboard_report_generation.wrapping_add(1);
+    }
+
+    fn assign_keyboard_enhancements(&mut self, flags: u16) {
+        if self.keyboard_enhancement_flags != flags {
+            self.keyboard_enhancement_flags = flags;
+            self.retire_keyboard_reports();
+        }
+    }
+
+    pub(crate) fn retire_keyboard_reports_from(&mut self, before: &Self) {
+        self.keyboard_report_generation = before.keyboard_report_generation;
+        self.retire_keyboard_reports();
+    }
+
     pub(crate) fn limit_keyboard_enhancements(&mut self, mask: u16) {
         self.keyboard_feature_mask = Some(mask);
-        self.keyboard_enhancement_flags &= mask;
+        self.assign_keyboard_enhancements(self.keyboard_enhancement_flags & mask);
         self.alt_keyboard_enhancement_flags &= mask;
         for flags in self
             .keyboard_enhancement_stack
@@ -248,16 +269,18 @@ impl ProtocolState {
             &mut self.keyboard_enhancement_stack,
             &mut self.alt_keyboard_enhancement_stack,
         );
+        self.retire_keyboard_reports();
     }
 
     pub fn set_keyboard_enhancement_flags(&mut self, flags: u16, mode: u16) {
         let flags = flags & self.keyboard_feature_mask.unwrap_or(u16::MAX);
-        match mode {
-            1 => self.keyboard_enhancement_flags = flags,
-            2 => self.keyboard_enhancement_flags |= flags,
-            3 => self.keyboard_enhancement_flags &= !flags,
-            _ => {}
-        }
+        let flags = match mode {
+            1 => flags,
+            2 => self.keyboard_enhancement_flags | flags,
+            3 => self.keyboard_enhancement_flags & !flags,
+            _ => return,
+        };
+        self.assign_keyboard_enhancements(flags);
     }
 
     pub fn push_keyboard_enhancement_flags(&mut self, flags: u16) {
@@ -266,25 +289,27 @@ impl ProtocolState {
         }
         self.keyboard_enhancement_stack
             .push(self.keyboard_enhancement_flags);
-        self.keyboard_enhancement_flags = flags & self.keyboard_feature_mask.unwrap_or(u16::MAX);
+        self.assign_keyboard_enhancements(flags & self.keyboard_feature_mask.unwrap_or(u16::MAX));
     }
 
     pub fn pop_keyboard_enhancement_flags(&mut self, count: usize) {
+        let mut flags = self.keyboard_enhancement_flags;
         for _ in 0..count.max(1) {
             match self.keyboard_enhancement_stack.pop() {
-                Some(flags) => self.keyboard_enhancement_flags = flags,
+                Some(saved) => flags = saved,
                 None => {
-                    self.keyboard_enhancement_flags = 0;
+                    flags = 0;
                     break;
                 }
             }
         }
+        self.assign_keyboard_enhancements(flags);
     }
 
     /// Shell-prompt recovery clears only the currently active screen.
     /// DECSTR does not invoke this; RIS replaces the complete protocol state.
     pub fn reset_keyboard_enhancement(&mut self) {
-        self.keyboard_enhancement_flags = 0;
+        self.assign_keyboard_enhancements(0);
         self.keyboard_enhancement_stack.clear();
     }
 }

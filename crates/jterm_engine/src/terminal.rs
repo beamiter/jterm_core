@@ -1060,10 +1060,36 @@ impl Terminal {
     /// Native key controllers supply the base key in the active layout and
     /// deliver committed IME text separately from physical key presses.
     pub fn enable_keyboard_disambiguation(&mut self) {
+        self.configure_keyboard_reporting(u16::from(crate::input::KITTY_DISAMBIGUATE));
+    }
+
+    /// Enable all Kitty keyboard enhancements for a frontend that delivers
+    /// physical key events and associates ordinary committed key text.
+    pub fn enable_native_keyboard_reporting(&mut self) {
+        use crate::input::{
+            KITTY_DISAMBIGUATE, KITTY_REPORT_ALL_KEYS, KITTY_REPORT_ALTERNATE_KEYS,
+            KITTY_REPORT_ASSOCIATED_TEXT, KITTY_REPORT_EVENT_TYPES,
+        };
+        self.configure_keyboard_reporting(
+            u16::from(KITTY_DISAMBIGUATE)
+                | KITTY_REPORT_EVENT_TYPES
+                | KITTY_REPORT_ALTERNATE_KEYS
+                | KITTY_REPORT_ALL_KEYS
+                | KITTY_REPORT_ASSOCIATED_TEXT,
+        );
+    }
+
+    /// Active flags and the generation that owns their physical key holds.
+    pub fn keyboard_report_state(&self) -> (u16, u64) {
+        (
+            self.vt.protocol.keyboard_enhancement_flags(),
+            self.vt.protocol.keyboard_report_generation(),
+        )
+    }
+
+    fn configure_keyboard_reporting(&mut self, mask: u16) {
         let before = self.alternate_scroll_profile();
-        self.vt
-            .protocol
-            .limit_keyboard_enhancements(u16::from(crate::input::KITTY_DISAMBIGUATE));
+        self.vt.protocol.limit_keyboard_enhancements(mask);
         if self.alternate_scroll_profile() != before {
             self.retire_mouse_reports();
         }
@@ -1222,8 +1248,14 @@ impl Terminal {
         modifiers: crate::input::Modifiers,
         num_locked: bool,
     ) -> Option<[u8; 3]> {
+        use crate::input::{KITTY_DISAMBIGUATE, KITTY_REPORT_ALL_KEYS, KITTY_REPORT_EVENT_TYPES};
+        let flags = self.vt.protocol.keyboard_enhancement_flags();
+        let selects_keys = flags
+            & (u16::from(KITTY_DISAMBIGUATE) | KITTY_REPORT_EVENT_TYPES | KITTY_REPORT_ALL_KEYS)
+            != 0;
         if num_locked
-            || self.vt.protocol.keyboard_enhancement_flags() != 0
+            || selects_keys
+            || (flags != 0 && self.vt.protocol.keyboard_enhancement_limit().is_none())
             || modifiers != crate::input::Modifiers::default()
             || !self.vt.protocol.modes().contains(&66)
         {
@@ -2433,6 +2465,7 @@ impl Terminal {
         self.begin_revision(self.revision);
         let keyboard_limit = self.vt.protocol.keyboard_enhancement_limit();
         let mut protocol = initial_protocol();
+        protocol.retire_keyboard_reports_from(&self.vt.protocol);
         if self.vt.protocol.modes().supports_pixel_mouse() {
             protocol.modes_mut().enable_pixel_mouse();
         }

@@ -353,7 +353,7 @@ def check_keyboard_disambiguation(app, root, send, key, wait_text):
 mode = termios.tcgetattr(0)
 try:
     tty.setraw(0)
-    os.write(1, b"\\x1b[?1049h\\x1b[>31u\\x1b[?u\\x1b[2J\\x1b[Hkeyboard-mode-ready")
+    os.write(1, b"\\x1b[?1049h\\x1b[>1u\\x1b[?u\\x1b[2J\\x1b[Hkeyboard-mode-ready")
     with open(sys.argv[1], "wb", buffering=0) as output:
         while select.select([0], [], [], 10)[0]:
             data = os.read(0, 256)

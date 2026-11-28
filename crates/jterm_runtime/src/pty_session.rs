@@ -936,6 +936,10 @@ impl Session {
         self.terminal.engine.enable_keyboard_disambiguation();
     }
 
+    pub fn enable_native_keyboard_reporting(&mut self) {
+        self.terminal.engine.enable_native_keyboard_reporting();
+    }
+
     pub fn set_history_row_limit(&mut self, rows: usize) {
         self.terminal.engine.set_history_row_limit(rows);
     }

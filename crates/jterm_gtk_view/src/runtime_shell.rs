@@ -514,7 +514,7 @@ impl RuntimeShell {
             state.session.enable_pixel_mouse();
         }
         state.session.set_color_defaults(colors);
-        state.session.enable_keyboard_disambiguation();
+        state.session.enable_native_keyboard_reporting();
         state.session.enable_history_preserving_resize();
         let owner = Arc::downgrade(&self.state);
         let pending = self.updates.clone();

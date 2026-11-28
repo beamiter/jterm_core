@@ -120,7 +120,7 @@ fn one_embedded_view_keeps_the_app_grid_and_orders_the_fullscreen_reply() {
             TransportEvent::Input(b"run".to_vec()),
             TransportEvent::Resize(18, 8),
             TransportEvent::Reply(
-                b"\x1b[5;7R\x1b[?1;2c\x1b[?1u\x1b[>4;0m\x1bP>|jterm\x1b\\".to_vec()
+                b"\x1b[5;7R\x1b[?1;2c\x1b[?31u\x1b[>4;0m\x1bP>|jterm\x1b\\".to_vec()
             ),
             TransportEvent::Output,
             TransportEvent::BeforeInput,

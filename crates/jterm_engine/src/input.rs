@@ -402,6 +402,20 @@ pub fn kitty_keypad_report(
     modifiers: Modifiers,
     flags: u16,
 ) -> Option<KittyKeyReport> {
+    if matches!(position, KeypadKey::Space | KeypadKey::Tab) {
+        return match position {
+            KeypadKey::Space => kitty_text_report(
+                KittyTextKey {
+                    base: ' ',
+                    shifted: None,
+                    base_layout: None,
+                },
+                modifiers,
+                flags,
+            ),
+            _ => kitty_named_report(Key::Tab, modifiers, flags),
+        };
+    }
     let report_all = flags & KITTY_REPORT_ALL_KEYS != 0;
     let distinct_keypad = report_all || flags & u16::from(KITTY_DISAMBIGUATE) != 0;
     if !distinct_keypad {
