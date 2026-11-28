@@ -1295,7 +1295,8 @@ impl Terminal {
             .or_else(|| center.then(|| keypad_begin_sequence(modifiers).as_bytes().to_vec()))
     }
 
-    fn key_from_name(name: &str) -> Result<crate::input::Key, &'static str> {
+    /// Interpret the logical key names used by terminal frontends.
+    pub fn key_from_name(name: &str) -> Result<crate::input::Key, &'static str> {
         use crate::input::Key;
         Ok(match name {
             "ArrowUp" => Key::ArrowUp,
