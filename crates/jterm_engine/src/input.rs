@@ -47,6 +47,16 @@ pub struct Modifiers {
 /// The negotiated flag for disambiguating key presses.
 pub const KITTY_DISAMBIGUATE: u8 = 1;
 
+/// DECBKM selects the legacy backarrow byte. Xterm's Control modifier toggles
+/// the selection for hosts that forward Control+Backspace to this encoder.
+pub fn legacy_backspace_sequence(backarrow_mode: bool, ctrl: bool) -> &'static str {
+    if backarrow_mode ^ ctrl {
+        "\x08"
+    } else {
+        "\x7f"
+    }
+}
+
 /// Toolkit-independent keys in the disambiguation profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KittyKey {

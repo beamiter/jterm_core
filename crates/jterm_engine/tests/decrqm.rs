@@ -229,9 +229,9 @@ fn exhaustive_decrqm_matches_frozen_ember() {
                 };
                 // Query only current mode, independent of unrelated accumulated mode bits.
                 check(&mut t, &[mode], None, false);
-                // Newly supported X10, NRCS and reverse-wrap have independent wire
-                // tests rather than expectations from the frozen old oracle.
-                if !matches!(mode, 9 | 42 | 45) {
+                // X10, NRCS, reverse wrap and backarrow mode have independent
+                // wire expectations.
+                if !matches!(mode, 9 | 42 | 45 | 67) {
                     check(&mut t, &[mode], Some(b'?'), false);
                 }
             }

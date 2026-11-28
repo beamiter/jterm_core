@@ -2062,6 +2062,26 @@ mod tests {
     }
 
     #[test]
+    fn native_backarrow_mode_queries_and_restores_across_every_split() {
+        let packet =
+            b"\x1b[?67$p\x1b[?67h\x1b[?67$p\x1b[?67s\x1b[?67l\x1b[?67$p\x1b[?67r\x1b[!p\x1b[?67$p";
+        let expected = b"\x1b[?67;2$y\x1b[?67;1$y\x1b[?67;2$y\x1b[?67;1$y";
+        for profile in [NativeProfile::Ember, NativeProfile::FrostLegacy] {
+            let feed = match profile {
+                NativeProfile::Ember => VtState::feed_ember::<Host>,
+                NativeProfile::FrostLegacy => VtState::feed_frost::<Host>,
+            };
+            for split in 0..=packet.len() {
+                let mut host = Host::new(profile);
+                feed(&mut host, &packet[..split], None);
+                feed(&mut host, &packet[split..], None);
+                assert_eq!(host.replies, expected, "{profile:?} split={split}");
+                assert!(host.vt.protocol.modes().contains(&67));
+            }
+        }
+    }
+
+    #[test]
     fn opted_ember_wheel_negotiation_catches_parameter_aba_and_keyboard_transitions() {
         let stages: &[(&[u8], usize)] = &[
             (b"\x1b[?1h\x1b[?1l", 2),

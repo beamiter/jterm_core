@@ -79,6 +79,8 @@ impl TerminalModes {
             45 => Some(25),
             42 => Some(26),
             1016 => Some(27),
+            // DECBKM — send BS on the backarrow key when set.
+            67 => Some(28),
             _ => None,
         }
     }
@@ -115,7 +117,7 @@ pub struct ProtocolState {
     modes: TerminalModes,
     pub(crate) sgr_stack: crate::sgr_stack::SgrStack,
     attribute_change_extent: u8,
-    pub(crate) saved_dec_private_modes: [Option<u8>; 17],
+    pub(crate) saved_dec_private_modes: [Option<u8>; 18],
     keyboard_enhancement_flags: u16,
     keyboard_enhancement_stack: Vec<u16>,
     alt_keyboard_enhancement_flags: u16,

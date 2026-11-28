@@ -2172,6 +2172,56 @@ mod tests {
     }
 
     #[test]
+    fn real_pty_backarrow_mode_controls_the_bytes_received_by_the_child() {
+        let script = concat!(
+            "stty raw -echo || exit 30; ",
+            "check() { printf '\\033[?67%s\\033[?67$p' \"$1\"; ",
+            "expected=$(printf '\\033[?67;%s$y' \"$2\"); ",
+            "reply=$(dd bs=1 count=\"${#expected}\" 2>/dev/null); ",
+            "[ \"$reply\" = \"$expected\" ] || return 1; ",
+            "printf '\\r\\nBACKARROW_%s\\r\\n' \"$3\"; ",
+            "keys=$(dd bs=1 count=2 2>/dev/null); [ \"$keys\" = \"$4\" ]; }; ",
+            "check l 2 NUMERIC \"$(printf '\\177\\010')\" || exit 31; ",
+            "check h 1 BACKSPACE \"$(printf '\\010\\177')\" || exit 32; ",
+            "check l 2 RESET \"$(printf '\\177\\010')\" || exit 33; ",
+            "printf DONE",
+        );
+        let argv = ["/bin/sh", "-c", script].map(OsString::from);
+        let mut session = Session::spawn_command(8, 32, &argv, None, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for mark in [
+            "BACKARROW_NUMERIC",
+            "BACKARROW_BACKSPACE",
+            "BACKARROW_RESET",
+        ] {
+            while !session.terminal().visible_text().contains(mark) {
+                assert!(Instant::now() < deadline && !session.is_drained(), "{mark}");
+                session.drive().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut keys = session
+                .terminal()
+                .encode_key("Backspace", false, false, false)
+                .unwrap();
+            keys.extend(
+                session
+                    .terminal()
+                    .encode_key("Backspace", false, false, true)
+                    .unwrap(),
+            );
+            session.submit_input(keys).unwrap();
+        }
+        while !session.is_drained() {
+            assert!(Instant::now() < deadline);
+            session.drive().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.exit_code(), Some(0));
+        assert!(session.terminal().visible_text().contains("DONE"));
+        session.close().unwrap();
+    }
+
+    #[test]
     fn real_pty_text_area_queries_follow_the_family_session_after_resize() {
         use jterm_engine::native_window_ops::NativeWindowPixels;
 

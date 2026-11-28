@@ -603,6 +603,75 @@ fn keyboard_mode_modifiers_and_unicode_are_rust_owned() {
 }
 
 #[test]
+fn backarrow_keys_follow_the_queried_mode_and_keyboard_negotiation() {
+    let stages: &[(&[u8], bool)] = &[
+        (b"\x1b[67h\x1b[?67\x18h", false), // ANSI mode and canceled CSI.
+        (b"\x1b[?67h", true),
+        (b"\x1b[?67s\x1b[?67l", false),
+        (b"\x1b[?67r", true),
+        (b"\x1b[!p\x1b[?1049h\x1b[?1049l", true),
+        (b"\x1bc\x1b[?67r", false),
+    ];
+    for chunk in 1..=9 {
+        let mut terminal = Terminal::new(3, 10).unwrap();
+        for &(stage, sends_bs) in stages {
+            for part in stage.chunks(chunk) {
+                terminal.feed(part).unwrap();
+            }
+            let (status, plain, control) = if sends_bs {
+                (b"\x1b[?67;1$y", 8, 127)
+            } else {
+                (b"\x1b[?67;2$y", 127, 8)
+            };
+            assert_eq!(terminal.feed(b"\x1b[?67$p").unwrap(), status);
+            assert_eq!(
+                terminal
+                    .encode_key("Backspace", false, false, false)
+                    .unwrap(),
+                [plain]
+            );
+            assert_eq!(
+                terminal
+                    .encode_key("Backspace", false, false, true)
+                    .unwrap(),
+                [control]
+            );
+            assert_eq!(
+                terminal
+                    .encode_key("Backspace", false, true, false)
+                    .unwrap(),
+                [27, plain]
+            );
+            assert_eq!(
+                terminal.encode_key("Delete", false, false, false).unwrap(),
+                b"\x1b[3~"
+            );
+        }
+        terminal.enable_keyboard_disambiguation();
+        terminal.feed(b"\x1b[?67h\x1b[>4;2m\x1b[>1u").unwrap();
+        assert_eq!(
+            terminal
+                .encode_key("Backspace", false, false, true)
+                .unwrap(),
+            b"\x1b[127;5u"
+        );
+        terminal.feed(b"\x1b[<u").unwrap();
+        assert_eq!(
+            terminal
+                .encode_key("Backspace", false, false, true)
+                .unwrap(),
+            b"\x1b[27;5;127~"
+        );
+        assert_eq!(
+            terminal
+                .encode_key("Backspace", false, false, false)
+                .unwrap(),
+            [8]
+        );
+    }
+}
+
+#[test]
 fn paste_normalization_matches_literal_crlf_rules_for_mixed_utf8() {
     let mut terminal = Terminal::new(2, 8).unwrap();
     let pieces = ["", "界", "\r", "\n", "\t"];

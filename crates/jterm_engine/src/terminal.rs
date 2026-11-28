@@ -1189,8 +1189,8 @@ impl Terminal {
         ctrl: bool,
     ) -> Result<Vec<u8>, String> {
         use crate::input::{
-            encode_kitty_disambiguated_key, legacy_function_key_sequence,
-            xterm_encode_modify_other_keys, Key, KittyKey, Modifiers,
+            encode_kitty_disambiguated_key, legacy_backspace_sequence,
+            legacy_function_key_sequence, xterm_encode_modify_other_keys, Key, KittyKey, Modifiers,
         };
         let flags = self.vt.protocol.keyboard_enhancement_flags();
         if flags != 0 && self.vt.protocol.keyboard_enhancement_limit().is_none() {
@@ -1287,7 +1287,11 @@ impl Terminal {
         let mut bytes = match key {
             Key::Enter if !ctrl && !shift => vec![b'\r'],
             Key::Escape if !ctrl && !shift => vec![0x1b],
-            Key::Backspace if !shift => vec![if ctrl { 8 } else { 127 }],
+            Key::Backspace if !shift => {
+                legacy_backspace_sequence(self.vt.protocol.modes().contains(&67), ctrl)
+                    .as_bytes()
+                    .to_vec()
+            }
             Key::Tab if !ctrl => {
                 if shift {
                     b"\x1b[Z".to_vec()
@@ -2294,7 +2298,7 @@ impl Terminal {
                 return;
             }
             42 => self.vt.screen.national_replacement_mode = set,
-            1 | 9 | 25 | 45 | 66 | 1000 | 1002..=1007 | 1015 | 2004 => (),
+            1 | 9 | 25 | 45 | 66 | 67 | 1000 | 1002..=1007 | 1015 | 2004 => (),
             1016 if self.vt.protocol.modes().supports_pixel_mouse() => (),
             _ => {
                 self.unsupported();

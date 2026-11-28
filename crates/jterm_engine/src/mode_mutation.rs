@@ -36,6 +36,7 @@ fn saved_mode_slot(
         47 | 1047 | 1049 => (14, &[47][..]),
         45 => (15, &[45][..]),
         42 => (16, &[42][..]),
+        67 => (17, &[67][..]),
         _ => return None,
     };
     if profile != SavedDecModeProfile::Ember && matches!(mode, 12 | 1034 | 1036) {
@@ -228,7 +229,7 @@ pub fn apply_frost_mode(
             screen.national_replacement_mode = enabled;
             None
         }
-        1 | 7 | 25 | 45 | 66 | 1004 | 1007 | 2004 | 2031 | 5522 => None,
+        1 | 7 | 25 | 45 | 66 | 67 | 1004 | 1007 | 2004 | 2031 | 5522 => None,
         _ => return None,
     };
 
