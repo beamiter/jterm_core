@@ -98,33 +98,95 @@ impl GridCells {
         Self { storage, start: 0 }
     }
 
-    fn shift_full_up(&mut self, dropped_cells: usize, blank: TerminalCell) {
+    fn scroll_spare(visible: usize, expanded: bool) -> usize {
+        const MAX_SPARE_BYTES: usize = 64 * 1024;
+        let headroom = if expanded { visible } else { visible / 4 };
+        headroom.min(MAX_SPARE_BYTES / std::mem::size_of::<TerminalCell>())
+    }
+
+    fn slide_up(&mut self, region: Range<usize>, count: usize, blank: TerminalCell) {
+        let start = self.start;
         let end = self.storage.len();
-        let next_end = end + dropped_cells;
+        let visible = end - start;
+        let next_end = end + count;
         if next_end > self.storage.capacity() {
-            // Start with a small reserve and grow it once scrolling fills it.
-            const MAX_SPARE_BYTES: usize = 64 * 1024;
-            let visible = end - self.start;
-            let headroom = if self.start == 0 {
-                visible / 4
-            } else {
-                visible
-            };
-            let reserved_end =
-                visible + headroom.min(MAX_SPARE_BYTES / std::mem::size_of::<TerminalCell>());
+            let reserved_end = visible + Self::scroll_spare(visible, start != 0);
             if next_end > reserved_end
                 || self.storage.try_reserve_exact(reserved_end - end).is_err()
             {
-                // Reclaim the prefix and preserve the surviving cells in one copy.
-                self.storage.copy_within(self.start + dropped_cells..end, 0);
-                self.storage.truncate(visible - dropped_cells);
-                self.storage.resize(visible, blank);
+                // Reclaim the prefix, copying each surviving cell at most once.
+                if region.start != 0 {
+                    self.storage.copy_within(start..start + region.start, 0);
+                }
+                self.storage.copy_within(
+                    start + region.start + count..start + region.end,
+                    region.start,
+                );
+                if region.end != visible {
+                    self.storage
+                        .copy_within(start + region.end..end, region.end);
+                }
+                self.storage[region.end - count..region.end].fill(blank);
+                self.storage.truncate(visible);
                 self.start = 0;
                 return;
             }
         }
+
+        // Retained region cells already lie at their destination in the new
+        // window. Move the stationary rows before filling the vacated cells.
         self.storage.resize(next_end, blank);
-        self.start += dropped_cells;
+        if region.start != 0 {
+            self.storage
+                .copy_within(start..start + region.start, start + count);
+        }
+        if region.end != visible {
+            let suffix = start + region.end;
+            self.storage.copy_within(suffix..end, suffix + count);
+            self.storage[suffix..suffix + count].fill(blank);
+        }
+        self.start = start + count;
+    }
+
+    fn slide_down(&mut self, region: Range<usize>, count: usize, blank: TerminalCell) -> bool {
+        let visible = self.storage.len() - self.start;
+        if count > self.start {
+            // Put the spare cells before the live window so sustained downward
+            // scrolls can consume it just as upward scrolls consume the tail.
+            let end = self.storage.len();
+            let mut spare = self.storage.capacity() - visible;
+            let requested = Self::scroll_spare(visible, spare != 0);
+            if spare < requested
+                && requested > count
+                && self
+                    .storage
+                    .try_reserve_exact(visible + requested - end)
+                    .is_ok()
+            {
+                spare = requested;
+            }
+            if spare <= count {
+                return false;
+            }
+            self.storage.resize(visible + spare, blank);
+            self.storage.copy_within(self.start..end, spare);
+            self.start = spare;
+        }
+
+        let start = self.start;
+        let next_start = start - count;
+        if region.start != 0 {
+            self.storage
+                .copy_within(start..start + region.start, next_start);
+        }
+        if region.end != visible {
+            self.storage
+                .copy_within(start + region.end..start + visible, next_start + region.end);
+        }
+        self.storage[next_start + region.start..start + region.start].fill(blank);
+        self.storage.truncate(next_start + visible);
+        self.start = next_start;
+        true
     }
 }
 
@@ -1089,12 +1151,28 @@ impl TerminalGrid {
                 RegionDirection::Down => rows.rotate_right(count),
             }
         }
-        let full_up =
-            count < height && direction == RegionDirection::Up && top == 0 && end == self.rows;
+        let mut slid = false;
         if count < height {
-            if full_up {
-                self.cells.shift_full_up(count * self.cols, blank);
-            } else {
+            // Use the window when it moves fewer rows. A counted shift of a
+            // cache-sized region can instead copy it without rebasing often.
+            const SMALL_COPY_CELLS: usize = 48 * 1024 / std::mem::size_of::<TerminalCell>();
+            let retained = height - count;
+            let full_up = direction == RegionDirection::Up && height == self.rows;
+            let slide = full_up
+                || (self.rows - height < retained
+                    && (count == 1 || retained * self.cols >= SMALL_COPY_CELLS));
+            if slide {
+                let cells = top * self.cols..end * self.cols;
+                let count = count * self.cols;
+                slid = match direction {
+                    RegionDirection::Up => {
+                        self.cells.slide_up(cells, count, blank);
+                        true
+                    }
+                    RegionDirection::Down => self.cells.slide_down(cells, count, blank),
+                };
+            }
+            if !slid {
                 self.cells.copy_within(
                     source.start * self.cols..source.end * self.cols,
                     target * self.cols,
@@ -1108,7 +1186,7 @@ impl TerminalGrid {
             }
             self.row_ids.copy_within(source, target);
         }
-        if !full_up {
+        if !slid {
             self.cells[blank_rows.start * self.cols..blank_rows.end * self.cols].fill(blank);
         }
         self.reset_blank_row_metadata(blank_rows.clone(), blank);
@@ -2008,6 +2086,97 @@ fn full_screen_scroll_storage_grows_after_the_initial_reserve_fills() {
     for _ in 0..rows * 2 {
         grid.scroll_up_by(1, blank);
         assert_eq!(grid.cells.storage.capacity(), visible + capped_spare);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn scrolling_a_region_preserves_stationary_cells_across_storage_rebases() {
+    const ROWS: usize = 40;
+    const COLS: usize = 96;
+    let mut grid = TerminalGrid::new(ROWS, COLS);
+    let mut expected: Vec<TerminalCell> = (0..ROWS * COLS)
+        .map(|cell| TerminalCell {
+            character: char::from(b'a' + (cell % 26) as u8),
+            ..TerminalCell::default()
+        })
+        .collect();
+    grid.cells_mut().copy_from_slice(&expected);
+    let blank = TerminalCell {
+        background: Color::Rgb(1, 2, 3),
+        ..TerminalCell::default()
+    };
+
+    for (direction, top, end, count) in [
+        (RegionDirection::Up, 1, ROWS - 2, 1),
+        (RegionDirection::Down, 2, ROWS - 1, 3),
+    ] {
+        let mut advanced = false;
+        let mut retreated = false;
+        for i in 0..ROWS * 3 {
+            let row = top + i % (end - top);
+            let character = char::from(b'A' + (i % 26) as u8);
+            grid.get_mut(row, 0).character = character;
+            expected[row * COLS].character = character;
+
+            let previous = grid.cells.start;
+            assert_eq!(
+                grid.shift_rows(
+                    direction,
+                    top..=end - 1,
+                    count,
+                    blank,
+                    RegionWrapPolicy::MoveWithRows,
+                    || RawRowId::UNTRACKED,
+                ),
+                Some(top..end)
+            );
+            advanced |= grid.cells.start > previous;
+            retreated |= grid.cells.start < previous;
+
+            let region = &mut expected[top * COLS..end * COLS];
+            let shift = count * COLS;
+            match direction {
+                RegionDirection::Up => {
+                    region.rotate_left(shift);
+                    let blank_start = region.len() - shift;
+                    region[blank_start..].fill(blank);
+                }
+                RegionDirection::Down => {
+                    region.rotate_right(shift);
+                    region[..shift].fill(blank);
+                }
+            }
+            assert_eq!(&*grid.cells, expected.as_slice(), "{direction:?} step {i}");
+            assert!(
+                (grid.cells.storage.capacity() - expected.len())
+                    * std::mem::size_of::<TerminalCell>()
+                    <= 64 * 1024
+            );
+        }
+        assert!(advanced && retreated, "{direction:?} must slide and rebase");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn short_counted_region_scrolls_use_the_existing_storage() {
+    let (rows, cols) = (24, 132);
+    let mut grid = TerminalGrid::new(rows, cols);
+    for direction in [RegionDirection::Up, RegionDirection::Down] {
+        assert_eq!(
+            grid.shift_rows(
+                direction,
+                1..=rows - 2,
+                4,
+                TerminalCell::default(),
+                RegionWrapPolicy::MoveWithRows,
+                || RawRowId::UNTRACKED,
+            ),
+            Some(1..rows - 1)
+        );
+        assert_eq!(grid.cells.start, 0);
+        assert_eq!(grid.cells.storage.capacity(), rows * cols);
     }
 }
 
