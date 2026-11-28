@@ -1433,7 +1433,25 @@ fn complete_short_csi(input: &[u8], profile: ParserProfile) -> Option<(usize, Ev
 // Keep whole-scalar validation out of the scanner's ASCII hot loop.
 #[inline(never)]
 fn complete_utf8_scalar(bytes: &[u8]) -> Option<char> {
-    std::str::from_utf8(bytes).ok()?.chars().next()
+    let payload = |byte| u32::from(byte & 0x3f);
+    let (value, minimum) = match *bytes {
+        [lead @ 0xc2..=0xdf, b @ 0x80..=0xbf] => ((u32::from(lead & 0x1f) << 6) | payload(b), 0x80),
+        [lead @ 0xe0..=0xef, b @ 0x80..=0xbf, c @ 0x80..=0xbf] => (
+            (u32::from(lead & 0x0f) << 12) | (payload(b) << 6) | payload(c),
+            0x800,
+        ),
+        [lead @ 0xf0..=0xf4, b @ 0x80..=0xbf, c @ 0x80..=0xbf, d @ 0x80..=0xbf] => (
+            (u32::from(lead & 0x07) << 18) | (payload(b) << 12) | (payload(c) << 6) | payload(d),
+            0x10000,
+        ),
+        _ => return None,
+    };
+    if value < minimum {
+        return None;
+    }
+    // Surrogates and values beyond the Unicode range are handled by the
+    // caller's incremental decoder, just like other malformed scalars.
+    char::from_u32(value)
 }
 
 /// A single ordered scan replaces the legacy abort scan followed by a
@@ -1564,6 +1582,35 @@ mod frozen_f243_framing;
 #[cfg(test)]
 mod hot_path_parity {
     use super::*;
+
+    #[test]
+    fn complete_utf8_scalar_matches_standard_validation() {
+        for (leads, width) in [(0xc2..=0xdf, 2), (0xe0..=0xef, 3), (0xf0..=0xf4, 4)] {
+            for lead in leads {
+                let mut bytes = [lead, 0x80, 0x80, 0x80];
+                for mut payload in 0..(1 << (6 * (width - 1))) {
+                    for byte in bytes[1..width].iter_mut().rev() {
+                        *byte = 0x80 | (payload & 0x3f) as u8;
+                        payload >>= 6;
+                    }
+                    let bytes = &bytes[..width];
+                    let expected = std::str::from_utf8(bytes)
+                        .ok()
+                        .and_then(|text| text.chars().next());
+                    assert_eq!(complete_utf8_scalar(bytes), expected, "{bytes:x?}");
+                }
+                for index in 1..width {
+                    // Malformed continuations may be ASCII controls or starts
+                    // of later scalars that the incremental decoder must retain.
+                    let mut invalid = [lead, 0xa0, 0xa0, 0xa0];
+                    for byte in [0x1b, b'X', 0xc2, 0xff] {
+                        invalid[index] = byte;
+                        assert!(complete_utf8_scalar(&invalid[..width]).is_none());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn string_boundary_scan_matches_scalar_across_words_and_tails() {

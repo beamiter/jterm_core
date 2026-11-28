@@ -864,6 +864,7 @@ struct GraphemeInput {
     active: Option<GraphicPosition>,
     provisional: Option<ProvisionalPrint>,
     last_cluster: Option<RetainedGrapheme>,
+    scalars: Box<graphemes::ScalarCache>,
 }
 
 struct ProvisionalPrint {
@@ -1892,7 +1893,7 @@ impl Terminal {
     }
 
     fn extend_grapheme(&mut self, ch: char, translated: char) -> bool {
-        let Some(input) = &self.graphemes else {
+        let Some(input) = &mut self.graphemes else {
             return false;
         };
         let Some(mut anchor) = input.active else {
@@ -1904,15 +1905,12 @@ impl Terminal {
         if base.is_ascii() && ch.is_ascii() {
             return false;
         }
-        let mut scalar = [0; 4];
-        let preceding = self
-            .vt
-            .screen
-            .grid
-            .cluster_text(anchor.row, anchor.col)
-            .unwrap_or_else(|| base.encode_utf8(&mut scalar));
         let mut buf = [0; MAX_CLUSTER_BYTES + 4];
-        let Some(cluster) = graphemes::extension(preceding, translated, &mut buf) else {
+        let extension = match self.vt.screen.grid.cluster_text(anchor.row, anchor.col) {
+            Some(preceding) => graphemes::extension(preceding, translated, &mut buf),
+            None => input.scalars.scalar_extension(base, translated, &mut buf),
+        };
+        let Some(cluster) = extension else {
             return false;
         };
         if cluster.len() > MAX_CLUSTER_BYTES {
@@ -2089,13 +2087,10 @@ impl Terminal {
         }
         let origin_row = self.vt.screen.cursor_row;
         let origin_col = self.vt.screen.cursor_col;
-        let presentation_can_change = self.graphemes.is_some()
-            && self.vt.screen.grid.cols() >= 2
-            && if width == 1 {
-                graphemes::may_grow(translated)
-            } else {
-                graphemes::may_contract(translated)
-            };
+        let presentation_can_change = self.graphemes.as_mut().is_some_and(|input| {
+            self.vt.screen.grid.cols() >= 2
+                && input.scalars.presentation_can_change(translated, width)
+        });
         let early_wrap = self.vt.screen.prepare_character_width(width, wrap);
         let departure = (early_wrap && presentation_can_change && !self.vt.screen.wrap_target().1)
             .then(|| self.vt.screen.grid.checkpoint_wrap(origin_row));
@@ -2357,7 +2352,9 @@ impl Terminal {
             *pen = UnderlinePen::default();
         }
         if let Some(graphemes) = &mut self.graphemes {
-            *graphemes = GraphemeInput::default();
+            graphemes.active = None;
+            graphemes.provisional = None;
+            graphemes.last_cluster = None;
         }
         if let Some(colors) = &self.colors {
             self.publish_colors(ColorState::new(colors.defaults()));
